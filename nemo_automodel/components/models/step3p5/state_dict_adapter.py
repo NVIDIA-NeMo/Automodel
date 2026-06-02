@@ -22,14 +22,14 @@ HF Format (Step3p5):
     model.layers.{L}.moe.up_proj.weight      # [n_exp, inter, dim]
     model.layers.{L}.moe.down_proj.weight    # [n_exp, dim, inter]
     model.layers.{L}.moe.gate.weight         # [n_exp, dim] (router)
-    model.layers.{L}.moe.router_bias         # [n_exp] (router bias, optional)
+        model.layers.{L}.moe.router_bias         # [n_exp] (post-sigmoid router correction bias, optional)
     model.layers.{L}.share_expert.*.weight   # Shared expert
 
 Native Format (Automodel):
     model.layers.{L}.moe.experts.gate_and_up_projs  # [n_exp, dim, 2*inter]
     model.layers.{L}.moe.experts.down_projs         # [n_exp, inter, dim]
     model.layers.{L}.moe.gate.weight                # [n_exp, dim]
-    model.layers.{L}.moe.gate.bias                  # [n_exp]
+    model.layers.{L}.moe.gate.e_score_correction_bias # [n_exp]
     model.layers.{L}.share_expert.*.weight
 
 Note: Router gate weights and shared expert weights pass through with the same key names.
@@ -56,11 +56,32 @@ from nemo_automodel.components.moe.state_dict_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _swap_shard_placements_1_2(placements: tuple) -> tuple:
+    """Swap Shard dim 1 and dim 2 in DTensor placements after a transpose(1, 2).
+
+    When we transpose a 3-D tensor's dims 1 and 2, any Shard placement on those
+    dims must be swapped so that ``DTensor.from_local`` infers the correct global
+    shape.  Without this, the shard multiplier is applied to the wrong axis.
+    """
+    from torch.distributed._tensor import Shard
+
+    new = []
+    for p in placements:
+        if isinstance(p, Shard) and p.dim == 1:
+            new.append(Shard(2))
+        elif isinstance(p, Shard) and p.dim == 2:
+            new.append(Shard(1))
+        else:
+            new.append(p)
+    return tuple(new)
+
+
 def _create_dtensor_from_local_or_reference(
     local_tensor: torch.Tensor,
     reference_dtensor: Optional["torch.Tensor"],
     device_mesh: Optional["DeviceMesh"] = None,
     rank: Optional[int] = None,
+    placements_override: Optional[tuple] = None,
 ) -> torch.Tensor:
     """Create a DTensor from a local tensor.
 
@@ -73,6 +94,9 @@ def _create_dtensor_from_local_or_reference(
         reference_dtensor: Optional DTensor to copy mesh/placements from
         device_mesh: Device mesh for EP (used if reference is not DTensor)
         rank: Current rank for device placement
+        placements_override: If provided, use these placements instead of the
+            reference DTensor's placements. Useful after transposing the local
+            tensor, where shard dimensions need to be swapped.
 
     Returns:
         DTensor if mesh is available, otherwise local_tensor
@@ -80,8 +104,8 @@ def _create_dtensor_from_local_or_reference(
     from torch.distributed._tensor import DTensor
 
     if reference_dtensor is not None and is_dtensor(reference_dtensor):
-        # Use the exact same mesh and placements from the reference
-        return DTensor.from_local(local_tensor, reference_dtensor.device_mesh, reference_dtensor.placements)
+        placements = placements_override if placements_override is not None else reference_dtensor.placements
+        return DTensor.from_local(local_tensor, reference_dtensor.device_mesh, placements)
     elif device_mesh is not None:
         # Create DTensor using the provided mesh
         return create_dtensor_from_local(local_tensor, device_mesh, rank)
@@ -181,8 +205,9 @@ class Step3p5StateDictAdapter(StateDictAdapter):
             r"(?P<prefix>(?:model\.)?(?:language_model\.)?)layers\.(?P<layer>\d+)\.moe\.(?P<proj>gate_proj|up_proj|down_proj)\.weight"
         )
 
-        # Pattern for router gate weights that need expert slicing for EP
-        # HF Step3p5 uses moe.gate.weight and moe.router_bias (not moe.gate.bias)
+        # Pattern for router gate weights that need expert slicing for EP.
+        # HF Step3p5 uses moe.router_bias as a post-sigmoid expert-selection
+        # correction, not as a linear bias term.
         router_gate_pattern = re.compile(
             r"(?P<prefix>(?:model\.)?(?:language_model\.)?)layers\.(?P<layer>\d+)\.moe\.(?P<param>gate\.weight|gate\.bias|router_bias|gate\.e_score_correction_bias)"
         )
@@ -230,9 +255,15 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                         merged = torch.cat([gate_t, up_t], dim=-1).to(self.dtype)
 
                         native_key = f"{prefix}layers.{layer_num}.moe.experts.gate_and_up_projs"
-                        # Create DTensor using reference or device_mesh
+                        # Create DTensor using reference or device_mesh.
+                        # Swap Shard(1)↔Shard(2) because we transposed dims 1 and 2.
+                        swapped = (
+                            _swap_shard_placements_1_2(reference_dtensor.placements)
+                            if reference_dtensor is not None and is_dtensor(reference_dtensor)
+                            else None
+                        )
                         state_dict[native_key] = _create_dtensor_from_local_or_reference(
-                            merged, reference_dtensor, device_mesh, rank
+                            merged, reference_dtensor, device_mesh, rank, placements_override=swapped
                         )
 
                         # Clean up
@@ -247,9 +278,15 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                     down_t = down_local.transpose(1, 2).to(self.dtype)
 
                     native_key = f"{prefix}layers.{layer_num}.moe.experts.down_projs"
-                    # Create DTensor using reference or device_mesh
+                    # Create DTensor using reference or device_mesh.
+                    # Swap Shard(1)↔Shard(2) because we transposed dims 1 and 2.
+                    swapped = (
+                        _swap_shard_placements_1_2(reference_dtensor.placements)
+                        if reference_dtensor is not None and is_dtensor(reference_dtensor)
+                        else None
+                    )
                     state_dict[native_key] = _create_dtensor_from_local_or_reference(
-                        down_t, reference_dtensor, device_mesh, rank
+                        down_t, reference_dtensor, device_mesh, rank, placements_override=swapped
                     )
 
             elif router_m:
@@ -260,9 +297,10 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                 prefix = router_m.group("prefix") or ""
                 layer_num = router_m.group("layer")
 
-                # Map HF router_bias to native gate.bias
+                # Map HF router_bias to the native correction buffer used by
+                # Gate(score_func="sigmoid_with_bias").
                 if param == "router_bias":
-                    native_key = f"{prefix}layers.{layer_num}.moe.gate.bias"
+                    native_key = f"{prefix}layers.{layer_num}.moe.gate.e_score_correction_bias"
                 else:
                     native_key = key
 
@@ -343,10 +381,12 @@ class Step3p5StateDictAdapter(StateDictAdapter):
             gate_weight = gate_t.transpose(1, 2).contiguous()
             up_weight = up_t.transpose(1, 2).contiguous()
 
-            # Wrap in DTensor if original was DTensor
+            # Wrap in DTensor if original was DTensor.
+            # Swap Shard(1)↔Shard(2) because we transposed dims 1 and 2.
             if tensor_is_dtensor:
-                gate_weight = DTensor.from_local(gate_weight, device_mesh, placements)
-                up_weight = DTensor.from_local(up_weight, device_mesh, placements)
+                swapped = _swap_shard_placements_1_2(placements)
+                gate_weight = DTensor.from_local(gate_weight, device_mesh, swapped)
+                up_weight = DTensor.from_local(up_weight, device_mesh, swapped)
 
             return [
                 (f"{prefix}layers.{layer_num}.moe.gate_proj.weight", gate_weight),
@@ -373,15 +413,26 @@ class Step3p5StateDictAdapter(StateDictAdapter):
             # Transpose: [n_exp, inter, dim] -> [n_exp, dim, inter]
             down_weight = local_tensor.transpose(1, 2).contiguous()
 
-            # Wrap in DTensor if original was DTensor
+            # Wrap in DTensor if original was DTensor.
+            # Swap Shard(1)↔Shard(2) because we transposed dims 1 and 2.
             if tensor_is_dtensor:
-                down_weight = DTensor.from_local(down_weight, device_mesh, placements)
+                swapped = _swap_shard_placements_1_2(placements)
+                down_weight = DTensor.from_local(down_weight, device_mesh, swapped)
 
             return [
                 (f"{prefix}layers.{layer_num}.moe.down_proj.weight", down_weight),
             ]
 
-        # Handle moe.gate.bias -> router_bias mapping for to_hf
+        # Handle native correction bias -> HF router_bias mapping for to_hf.
+        if ".moe.gate.e_score_correction_bias" in fqn:
+            layer_match = re.search(r"layers\.(\d+)", fqn)
+            if layer_match is None:
+                return None
+            layer_num = layer_match.group(1)
+            return [(f"{prefix}layers.{layer_num}.moe.router_bias", tensor)]
+
+        # Backward compatibility for older native checkpoints that stored the
+        # Step3 router correction in gate.bias.
         if ".moe.gate.bias" in fqn:
             layer_match = re.search(r"layers\.(\d+)", fqn)
             if layer_match is None:

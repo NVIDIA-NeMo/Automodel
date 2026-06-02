@@ -31,6 +31,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     _DEFAULT_STRATEGY,
     PARALLELIZATION_STRATEGIES,
     DefaultParallelizationStrategy,
+    HunyuanParallelizationStrategy,
     NemotronHParallelizationStrategy,
     ParallelizationStrategy,
     WanParallelizationStrategy,
@@ -121,6 +122,9 @@ def mock_device_mesh():
     dp_replicate_mesh.ndim = 1
     dp_shard_mesh.ndim = 1
     tp_mesh.ndim = 1
+
+    # Mesh dimension names used by parallelizer to check for optional submeshes (e.g. "cp")
+    mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "tp")
 
     # Configure mesh access
     mesh.__getitem__.side_effect = lambda key: {
@@ -315,8 +319,6 @@ class TestDefaultParallelizationStrategy:
         expected_calls = [
             call(mock_layer.mlp),
             call(mock_layer.self_attn),
-            call(mock_layer.input_layernorm),
-            call(mock_layer.post_attention_layernorm),
         ]
         checkpoint_wrapper_mock.assert_has_calls(expected_calls, any_order=False)
 
@@ -325,6 +327,7 @@ class TestDefaultParallelizationStrategy:
         mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
 
         # Update mesh mock to support custom names
+        mesh.mesh_dim_names = ("custom_dp_replicate", "custom_dp_shard", "custom_tp")
         mesh.__getitem__.side_effect = lambda key: {
             "custom_dp_replicate": dp_replicate_mesh,
             "custom_dp_shard": dp_shard_mesh,
@@ -580,7 +583,15 @@ class TestWanParallelizationStrategy:
         }[key]
         return mesh, dp_mesh, tp_mesh
 
-    def _mock_env(self, monkeypatch):
+    def _mock_env(self, monkeypatch, dp_mesh_sentinel=None):
+        # Mock get_fsdp_dp_mesh to return the known dp_mesh sentinel from the fixture,
+        # so we can assert the correct mesh is forwarded to apply_fsdp.
+        if dp_mesh_sentinel is not None:
+            monkeypatch.setattr(
+                "nemo_automodel.components.distributed.parallelizer.get_fsdp_dp_mesh",
+                lambda mesh, *a, **kw: dp_mesh_sentinel,
+            )
+
         fully_shard_mock = MagicMock(side_effect=lambda model, **kwargs: model)
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.fully_shard",
@@ -609,8 +620,8 @@ class TestWanParallelizationStrategy:
         }
 
     def test_no_tp_when_group_size_is_one(self, wan_strategy, wan_model, mesh_tp1, monkeypatch):
-        env = self._mock_env(monkeypatch)
         mesh, dp_mesh, tp_mesh = mesh_tp1
+        env = self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
 
         result = wan_strategy.parallelize(model=wan_model, device_mesh=mesh)
 
@@ -622,26 +633,26 @@ class TestWanParallelizationStrategy:
         assert result is wan_model
 
     def test_tp_applied_to_condition_blocks_and_proj(self, wan_strategy, wan_model, mesh_tp2, monkeypatch):
-        env = self._mock_env(monkeypatch)
         mesh, dp_mesh, tp_mesh = mesh_tp2
+        env = self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
 
         result = wan_strategy.parallelize(model=wan_model, device_mesh=mesh)
 
         # parallelize_module should be called for text_embedder, time_embedder, time_proj, each block.ffn, and proj_out
         # There are 2 blocks with ffn → 2 calls + 3 condition embedder + 1 proj_out = 6
         assert env["parallelize_module"].call_count == 6
-        # FSDP applied
+        # FSDP applied with the correct dp_mesh
         from unittest.mock import ANY
 
-        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None)
+        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None, True, 2, 1)
         env["fully_shard"].assert_called()
         assert result is wan_model
 
     def test_exceptions_in_tp_paths_are_logged_and_ignored(
         self, wan_strategy, wan_model, mesh_tp2, monkeypatch, caplog
     ):
-        self._mock_env(monkeypatch)
         mesh, dp_mesh, tp_mesh = mesh_tp2
+        self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
 
         # Make parallelize_module raise once to hit logging branches
         calls = {"count": 0}
@@ -668,12 +679,12 @@ class TestWanParallelizationStrategy:
         assert result is wan_model
 
     def test_custom_mesh_names(self, wan_strategy, wan_model, monkeypatch):
-        env = self._mock_env(monkeypatch)
-
         mesh = MagicMock()
+        mesh.mesh_dim_names = ("custom_dp_repl", "custom_dp_shard", "custom_tp")
         tp_mesh = MagicMock()
         tp_mesh.size.return_value = 2
         dp_mesh = MagicMock()
+        env = self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
         mesh.__getitem__.side_effect = lambda key: {
             "custom_tp": tp_mesh,
             ("custom_dp_repl", "custom_dp_shard"): dp_mesh,
@@ -690,8 +701,63 @@ class TestWanParallelizationStrategy:
         # Ensure FSDP used the dp_mesh we provided via custom names
         from unittest.mock import ANY
 
-        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None)
+        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None, True, 2, 1)
         assert result is wan_model
+
+
+class TestHunyuanParallelizationStrategy:
+    """Tests for HunyuanParallelizationStrategy."""
+
+    @pytest.fixture
+    def hunyuan_strategy(self):
+        return HunyuanParallelizationStrategy()
+
+    @pytest.fixture
+    def hunyuan_model(self):
+        model = nn.Module()
+        model.transformer_blocks = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+        return model
+
+    def test_passes_prefetch_options_to_recursive_fsdp(self, hunyuan_strategy, hunyuan_model, monkeypatch):
+        mesh = MagicMock()
+        dp_mesh = MagicMock()
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.get_fsdp_dp_mesh",
+            lambda *_args, **_kwargs: dp_mesh,
+        )
+        checkpoint_wrapper_mock = MagicMock(side_effect=lambda module, **_kwargs: module)
+        apply_fsdp_mock = MagicMock()
+        fully_shard_mock = MagicMock(side_effect=lambda model, **_kwargs: model)
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
+            checkpoint_wrapper_mock,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively",
+            apply_fsdp_mock,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.fully_shard",
+            fully_shard_mock,
+            raising=False,
+        )
+
+        result = hunyuan_strategy.parallelize(
+            model=hunyuan_model,
+            device_mesh=mesh,
+            enable_fsdp2_prefetch=False,
+            fsdp2_backward_prefetch_depth=5,
+            fsdp2_forward_prefetch_depth=4,
+        )
+
+        from unittest.mock import ANY
+
+        assert result is hunyuan_model
+        assert checkpoint_wrapper_mock.call_count == 2
+        apply_fsdp_mock.assert_called_once_with(hunyuan_model, dp_mesh, ANY, None, False, 5, 4)
+        fully_shard_mock.assert_called_once()
 
 
 class TestFsdp2StrategyParallelizeIntegration:

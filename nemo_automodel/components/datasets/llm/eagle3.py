@@ -1,0 +1,327 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Data helpers for minimal EAGLE-3 training."""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+import torch
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
+
+logger = logging.getLogger(__name__)
+
+
+def _stack_batch(features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    """Stack a batch of pre-padded unshifted chat samples."""
+    batch = {}
+    for key in ("input_ids", "loss_mask", "attention_mask"):
+        batch[key] = torch.tensor([feature[key] for feature in features], dtype=torch.long)
+    return batch
+
+
+def build_eagle3_dataloader(
+    *,
+    data_path: str,
+    tokenizer,
+    seq_length: int,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int = 0,
+    split: str | None = None,
+    distributed: bool = False,
+    shuffle_seed: int | None = 42,
+) -> DataLoader:
+    """Build a dataloader backed by the repo's chat formatting utilities."""
+    dataset = ChatDataset(
+        data_path,
+        tokenizer=tokenizer,
+        split=split,
+        seq_length=seq_length,
+        padding="max_length",
+        truncation=True,
+        shuffle_seed=shuffle_seed,
+        unshifted=True,
+    )
+    sampler = DistributedSampler(dataset, shuffle=shuffle) if distributed else None
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        shuffle=shuffle and sampler is None,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=_stack_batch,
+        drop_last=False,
+    )
+
+
+def build_eagle3_token_mapping(
+    dataloader: DataLoader,
+    *,
+    target_vocab_size: int,
+    draft_vocab_size: int | None,
+    special_token_ids: list[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build draft-vocab mapping tensors from supervised token frequency.
+
+    Counts are accumulated as a dense ``[target_vocab_size]`` tensor and
+    ``all_reduce`` summed across ranks when ``torch.distributed`` is
+    initialized, so every rank ends up with the same draft vocabulary.
+
+    Returns:
+        Tuple ``(selected_token_ids, selected_token_mask)`` where:
+        - ``selected_token_ids`` has shape ``[draft_vocab_size]``
+        - ``selected_token_mask`` has shape ``[target_vocab_size]``
+    """
+    # Validate sizes up front. ``target_vocab_size`` must be positive (it
+    # sizes the dense count tensor + mask), and ``draft_vocab_size`` -- when
+    # supplied -- must be a positive integer. Without these guards a caller
+    # passing ``draft_vocab_size=0`` quietly gets an empty selection, and
+    # ``draft_vocab_size=-1`` interacts with the ``selected[:draft_vocab_size]``
+    # slice to drop the last special token instead of erroring -- both
+    # silently miscompile downstream rather than failing fast.
+    if not isinstance(target_vocab_size, int) or target_vocab_size <= 0:
+        raise ValueError(
+            f"build_eagle3_token_mapping requires target_vocab_size to be a "
+            f"positive integer, got target_vocab_size={target_vocab_size!r}."
+        )
+    if draft_vocab_size is not None and (not isinstance(draft_vocab_size, int) or draft_vocab_size <= 0):
+        raise ValueError(
+            f"build_eagle3_token_mapping requires draft_vocab_size to be a "
+            f"positive integer or None (= use the full target vocab), got "
+            f"draft_vocab_size={draft_vocab_size!r}."
+        )
+
+    if draft_vocab_size is None or draft_vocab_size >= target_vocab_size:
+        selected_token_ids = torch.arange(target_vocab_size, dtype=torch.long)
+        selected_token_mask = torch.ones(target_vocab_size, dtype=torch.bool)
+        return selected_token_ids, selected_token_mask
+
+    counts = torch.zeros(target_vocab_size, dtype=torch.long)
+    for batch in dataloader:
+        input_ids = batch["input_ids"]
+        loss_mask = batch["loss_mask"].bool()
+        supervised_ids = input_ids[loss_mask].to(torch.long).flatten()
+        if supervised_ids.numel() == 0:
+            continue
+        in_range = (supervised_ids >= 0) & (supervised_ids < target_vocab_size)
+        supervised_ids = supervised_ids[in_range]
+        counts.scatter_add_(0, supervised_ids, torch.ones_like(supervised_ids))
+
+    if dist.is_available() and dist.is_initialized():
+        # NCCL collectives require CUDA tensors; move counts onto the current
+        # device for the reduction and bring it back to CPU for the Python-side
+        # selection logic below.
+        if dist.get_backend() == "nccl" and torch.cuda.is_available():
+            counts_for_reduce = counts.to(torch.device("cuda", torch.cuda.current_device()))
+            dist.all_reduce(counts_for_reduce, op=dist.ReduceOp.SUM)
+            counts = counts_for_reduce.cpu()
+        else:
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+
+    selected: list[int] = []
+    seen: set[int] = set()
+    for token_id in special_token_ids or []:
+        if token_id is None or token_id < 0 or token_id >= target_vocab_size or token_id in seen:
+            continue
+        selected.append(int(token_id))
+        seen.add(int(token_id))
+
+    sorted_token_ids = torch.argsort(counts, descending=True, stable=True).tolist()
+    for token_id in sorted_token_ids:
+        if len(selected) >= draft_vocab_size:
+            break
+        if token_id in seen or counts[token_id].item() == 0:
+            continue
+        selected.append(token_id)
+        seen.add(token_id)
+
+    for token_id in range(target_vocab_size):
+        if len(selected) >= draft_vocab_size:
+            break
+        if token_id not in seen:
+            selected.append(token_id)
+            seen.add(token_id)
+
+    selected_token_ids = torch.tensor(selected[:draft_vocab_size], dtype=torch.long)
+    selected_token_mask = torch.zeros(target_vocab_size, dtype=torch.bool)
+    selected_token_mask[selected_token_ids] = True
+    return selected_token_ids, selected_token_mask
+
+
+def _expected_draft_vocab_size(target_vocab_size: int, draft_vocab_size: int | None) -> int:
+    """Return how many ids ``build_eagle3_token_mapping`` yields for this config.
+
+    Mirrors its selection branch: a ``None`` or too-large ``draft_vocab_size``
+    falls back to the full target vocab.
+    """
+    if draft_vocab_size is None or draft_vocab_size >= target_vocab_size:
+        return target_vocab_size
+    return draft_vocab_size
+
+
+def save_eagle3_token_mapping(path: str, selected_token_ids: torch.Tensor, target_vocab_size: int) -> None:
+    """Persist the draft-vocab selection so future runs skip the frequency scan.
+
+    Written atomically (``.tmp`` + ``os.replace``) so a crash mid-write never
+    leaves a half-written file a later run would load. Only ``selected_token_ids``
+    is stored -- ``selected_token_mask`` is fully derivable from it plus
+    ``target_vocab_size``.
+    """
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp_path = path + ".tmp"
+    torch.save(
+        {"selected_token_ids": selected_token_ids.detach().cpu(), "target_vocab_size": int(target_vocab_size)},
+        tmp_path,
+    )
+    os.replace(tmp_path, path)
+
+
+def load_eagle3_token_mapping(
+    path: str,
+    *,
+    target_vocab_size: int,
+    draft_vocab_size: int | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Load a cached draft-vocab mapping, or ``None`` if absent / incompatible.
+
+    The cache is keyed only on ``target_vocab_size`` and the resulting draft
+    vocab size -- it does NOT fingerprint the dataset or tokenizer. A cache built
+    from a different dataset still loads cleanly, so a caller that changes the
+    training data must point ``selected_token_ids_path`` at a fresh location (or
+    delete the file). Returns ``None`` -- so the caller rebuilds -- when the file
+    is missing, unreadable, or its stored vocab sizes do not match the config.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        # The payload is only ``{Tensor, int}``, so the safe loader suffices and
+        # avoids pickle's arbitrary-code-execution vector even though this path
+        # is user-controlled. Any load failure (legacy/foreign file) falls
+        # through to the rebuild below.
+        data = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:  # pragma: no cover - corrupted / foreign file -> rebuild
+        logger.warning("Failed to load EAGLE-3 token map from %s (%s); rebuilding.", path, exc)
+        return None
+    ids = data.get("selected_token_ids") if isinstance(data, dict) else None
+    saved_target = data.get("target_vocab_size") if isinstance(data, dict) else None
+    expected = _expected_draft_vocab_size(target_vocab_size, draft_vocab_size)
+    if not isinstance(ids, torch.Tensor) or saved_target != target_vocab_size:
+        logger.warning(
+            "Cached EAGLE-3 token map at %s is incompatible (target_vocab_size %s != %s); rebuilding.",
+            path,
+            saved_target,
+            target_vocab_size,
+        )
+        return None
+    ids = ids.to(torch.long)
+    if ids.numel() != expected:
+        logger.warning(
+            "Cached EAGLE-3 token map at %s has %d ids, expected %d for draft_vocab_size=%s; rebuilding.",
+            path,
+            ids.numel(),
+            expected,
+            draft_vocab_size,
+        )
+        return None
+    mask = torch.zeros(target_vocab_size, dtype=torch.bool)
+    mask[ids] = True
+    return ids, mask
+
+
+def _broadcast_cached_ids(
+    cache_path: str,
+    *,
+    target_vocab_size: int,
+    draft_vocab_size: int | None,
+) -> torch.Tensor | None:
+    """Rank 0 loads (and validates) the cached ids; broadcast the result to all ranks.
+
+    Only rank 0 touches the filesystem, so the load-vs-build decision is identical
+    on every rank even when ``cache_path`` lives on a node-local (non-shared)
+    filesystem. This matters because ``build_eagle3_token_mapping`` issues a
+    collective ``all_reduce``: if some ranks loaded a cache while others rebuilt,
+    that collective would mismatch and hang. Returns the ids (cpu, long) or
+    ``None`` (rebuild on every rank).
+    """
+    distributed = dist.is_available() and dist.is_initialized()
+    is_rank_0 = (not distributed) or dist.get_rank() == 0
+    loaded: torch.Tensor | None = None
+    if is_rank_0:
+        result = load_eagle3_token_mapping(
+            cache_path, target_vocab_size=target_vocab_size, draft_vocab_size=draft_vocab_size
+        )
+        loaded = result[0] if result is not None else None
+    if not distributed:
+        return loaded
+
+    use_cuda = dist.get_backend() == "nccl" and torch.cuda.is_available()
+    device = torch.device("cuda", torch.cuda.current_device()) if use_cuda else torch.device("cpu")
+    # Broadcast the id count first (0 == "no usable cache, rebuild"), then the payload.
+    count = torch.tensor([loaded.numel() if loaded is not None else 0], dtype=torch.long, device=device)
+    dist.broadcast(count, src=0)
+    num_ids = int(count.item())
+    if num_ids == 0:
+        return None
+    payload = loaded.to(device) if is_rank_0 else torch.empty(num_ids, dtype=torch.long, device=device)
+    dist.broadcast(payload, src=0)
+    return payload.cpu()
+
+
+def load_or_build_eagle3_token_mapping(
+    dataloader: DataLoader,
+    *,
+    target_vocab_size: int,
+    draft_vocab_size: int | None,
+    special_token_ids: list[int] | None = None,
+    cache_path: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the draft-vocab mapping, reusing a cached copy at ``cache_path``.
+
+    With ``cache_path`` set, present, and compatible, loads the mapping and skips
+    the full-dataset frequency scan ``build_eagle3_token_mapping`` performs.
+    Otherwise builds the mapping and -- on rank 0 -- writes it to ``cache_path``
+    for next time. With ``cache_path=None`` this is exactly
+    ``build_eagle3_token_mapping``.
+    """
+    if cache_path is not None:
+        cached_ids = _broadcast_cached_ids(
+            cache_path, target_vocab_size=target_vocab_size, draft_vocab_size=draft_vocab_size
+        )
+        if cached_ids is not None:
+            mask = torch.zeros(target_vocab_size, dtype=torch.bool)
+            mask[cached_ids] = True
+            logger.info("Loaded EAGLE-3 draft vocab (%d ids) from cache %s", cached_ids.numel(), cache_path)
+            return cached_ids, mask
+
+    selected_token_ids, selected_token_mask = build_eagle3_token_mapping(
+        dataloader,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+        special_token_ids=special_token_ids,
+    )
+    if cache_path is not None and ((not dist.is_initialized()) or dist.get_rank() == 0):
+        save_eagle3_token_mapping(cache_path, selected_token_ids, target_vocab_size)
+        logger.info("Cached EAGLE-3 draft vocab (%d ids) to %s", selected_token_ids.numel(), cache_path)
+    return selected_token_ids, selected_token_mask

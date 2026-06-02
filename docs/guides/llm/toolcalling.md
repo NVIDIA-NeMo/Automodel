@@ -1,4 +1,4 @@
-# Function Calling with NeMo AutoModel using FunctionGemma
+# Function Calling with FunctionGemma
 
 This tutorial walks through fine-tuning [FunctionGemma](https://huggingface.co/google/functiongemma-270m-it), Google's 270M function-calling model, with NeMo AutoModel on the xLAM function-calling dataset.
 
@@ -92,14 +92,13 @@ Use the ready-made config at [`examples/llm_finetune/gemma/functiongemma_xlam.ya
 With the config in place, launch training (8 GPUs shown; adjust `--nproc-per-node` as needed):
 
 ```bash
-torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
-  --config examples/llm_finetune/gemma/functiongemma_xlam.yaml
+automodel --nproc-per-node=8 examples/llm_finetune/gemma/functiongemma_xlam.yaml
 ```
 
 You should be able to see a training loss curve similar to the one shown below:
 
 <p align="center">
-  <img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/functiongemma-sft-loss.png" alt="FunctionGemma SFT loss" width="400">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/llm/functiongemma-sft-loss.png" alt="FunctionGemma SFT loss" width="400">
 </p>
 
 ## Run PEFT (LoRA)
@@ -108,17 +107,16 @@ To apply LoRA (PEFT), uncomment the `peft` block in the config and tune rank/alp
 ```yaml
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: true
+  target_modules: '*_proj'
   dim: 16
   alpha: 16
   use_triton: true
 ```
 Then fine-tune with the same recipe. Adjust the number of GPUs as needed.
 ```bash
-torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py \
-  --config examples/llm_finetune/gemma/functiongemma_xlam.yaml
+automodel examples/llm_finetune/gemma/functiongemma_xlam.yaml
 ```
 
 <p align="center">
-  <img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/functiongemma-peft-loss.png" alt="FunctionGemma PEFT loss" width="400">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/llm/functiongemma-peft-loss.png" alt="FunctionGemma PEFT loss" width="400">
 </p>

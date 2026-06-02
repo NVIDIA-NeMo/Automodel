@@ -13,10 +13,12 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
-# Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
+# To run this recipe:
+#   automodel examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad_peft.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 8
@@ -45,6 +47,12 @@ model:
     trust_remote_code: True
     attn_implementation_new: flash_attention_2
     _attn_implementation: flash_attention_2
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -99,10 +107,26 @@ lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
 
+ci:
+  vllm_deploy: true
+  recipe_owner: akoumpa
+  time: "00:15:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 5e-3
+    # tp_size=2 with bf16 row-parallel all-reduces produces ULP-level drift
+    # (~1e-3) between trainer and restored logits even with bit-identical
+    # weights; relax the Phase-3 threshold accordingly.
+    kl_threshold: 5e-3
+    distributed.tp_size: 2
+    tokenizer_name: nvidia/Nemotron-Flash-1B
+    trust_remote_code: true
+    check_fused_qkv_keys: true
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
+
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
-

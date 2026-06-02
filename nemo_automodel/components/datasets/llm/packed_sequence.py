@@ -15,7 +15,7 @@
 import logging
 
 import torch
-from datasets import Dataset
+from datasets import Dataset, DatasetDict
 from torch.nn import functional as F
 
 logger = logging.getLogger(__name__)
@@ -205,7 +205,7 @@ def pack_dataset(
     packed_sequence_size,
     max_packs=None,
     padding_idx=0,
-    drop_long_samples=False,
+    drop_long_samples=True,
     cp_size=1,
 ):
     """
@@ -225,11 +225,11 @@ def pack_dataset(
             divisible by 2*cp_size for context parallel processing. Default: 1 (no CP).
     """
     packs: list[PACK_TYPE] = []
-    try:
-        split_dataset = dataset[split]
-        dataset = split_dataset
-    except:
-        logger.warning(f"Dataset {split} not found. Using entire dataset.")
+    if isinstance(dataset, DatasetDict):
+        if split in dataset:
+            dataset = dataset[split]
+        else:
+            logger.warning(f"Dataset {split} not found. Using entire dataset.")
 
     # Buffer to hold samples until they are long enough to be added to packs
     current_pack = {
@@ -238,8 +238,8 @@ def pack_dataset(
         "position_ids": [],
         "seq_lens": [],
     }
-
     previous_sample_boundary: int = 0
+    logged_drop_long_samples = False
 
     # Calculate CP divisibility factor
     cp_divisibility_factor = 2 * cp_size if cp_size > 1 else 1
@@ -253,6 +253,9 @@ def pack_dataset(
         # one of the two parameters
         seq_len = len(input_ids)
         if drop_long_samples and seq_len > packed_sequence_size:
+            if not logged_drop_long_samples:
+                logged_drop_long_samples = True
+                logger.info(f"Dataset has sampels longer than {packed_sequence_size}, will be skipped")
             continue
 
         if seq_len > packed_sequence_size:
@@ -315,6 +318,12 @@ def pack_dataset(
 
     # After packing all samples, convert packs to a Dataset object
     logger.info("Total number of packs created: {}".format(len(packs)))
+    if not packs:
+        raise ValueError(
+            f"No packs were produced: every sample was longer than packed_sequence_size={packed_sequence_size} "
+            "and was dropped (drop_long_samples=True), or the input dataset was empty. "
+            "Increase `packed_sequence_size` or provide samples that fit."
+        )
     return Dataset.from_dict({key: [pack[key] for pack in packs] for key in packs[0].keys()})
 
 

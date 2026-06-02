@@ -25,6 +25,9 @@ from .fused_a2a import (
     hybrid_ep_combine,
     hybrid_ep_dispatch,
     set_deepep_num_sms,
+    set_uccl_num_sms,
+    uccl_fused_combine,
+    uccl_fused_dispatch,
 )
 from .fused_indices_converter import (
     fused_indices_to_multihot,
@@ -33,8 +36,6 @@ from .moe_utils import (
     permute,
     unpermute,
 )
-
-SHARING_DEEPEP_MANAGER = True
 
 """ We use the following notation throughout this file:
      H: hidden size
@@ -122,6 +123,8 @@ class _DeepepManager(_DispatchManager):
         num_local_experts: Optional[int] = None,
         router_dtype: Optional[str] = None,
         moe_router_expert_pad_multiple: Optional[int] = None,
+        _dispatch_fn=None,
+        _combine_fn=None,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -138,9 +141,14 @@ class _DeepepManager(_DispatchManager):
         # Handle used for combine operation
         self.handle = None
 
-        if fused_dispatch is None:
+        self._fused_dispatch = _dispatch_fn if _dispatch_fn is not None else fused_dispatch
+        self._fused_combine = _combine_fn if _combine_fn is not None else fused_combine
+
+        if self._fused_dispatch is None:
             raise ImportError(
-                "DeepEP is not installed. Please install DeepEP package from https://github.com/deepseek-ai/deepep."
+                "Neither DeepEP nor UCCL-EP is installed. "
+                "Install DeepEP from https://github.com/deepseek-ai/deepep "
+                "or UCCL-EP via: bash scripts/setup_uccl_ep.sh"
             )
 
     def setup_metadata(self, num_local_tokens: int, probs: torch.Tensor):
@@ -177,7 +185,7 @@ class _DeepepManager(_DispatchManager):
             dispatched_probs,
             num_tokens_per_expert,
             handle,
-        ) = fused_dispatch(
+        ) = self._fused_dispatch(
             hidden_states,
             self.token_indices,
             self.token_probs,
@@ -244,7 +252,7 @@ class _DeepepManager(_DispatchManager):
         """
         Reverse process using fused kernel to unpermute and perform all-to-all in single step
         """
-        hidden_states, _ = fused_combine(
+        hidden_states, _ = self._fused_combine(
             hidden_states,
             self.group,
             self.handle,
@@ -450,6 +458,8 @@ class _HybridEPManager(_DispatchManager):
 
 @dataclass
 class TokenDispatcherConfig:
+    """Configuration for MoE token dispatch and combine backends."""
+
     moe_enable_deepep: bool = True
     """Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
@@ -475,8 +485,8 @@ class TokenDispatcherConfig:
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
     None means no changes for dtype."""
 
-    moe_flex_dispatcher_backend: Literal["deepep", "hybridep"] = "deepep"
-    """Backend for the flex token dispatcher. Options: 'deepep' or 'hybridep'."""
+    moe_flex_dispatcher_backend: Literal["deepep", "hybridep", "uccl_ep"] = "deepep"
+    """Backend for the flex token dispatcher. Options: 'deepep', 'hybridep', or 'uccl_ep'."""
 
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP backend."""
@@ -484,14 +494,21 @@ class TokenDispatcherConfig:
     moe_hybridep_num_sms: int = 24
     """Number of SMs to use for HybridEP dispatch and combine APIs."""
 
+    moe_share_token_dispatcher: bool = True
+    """Share one communication manager instance across MoE layers for the configured backend."""
+
+    moe_deepep_async_dispatch: bool = False
+    """Use asynchronous DeepEP/UCCL-EP dispatch and allocate dispatched tensors on the communication stream."""
+
 
 class MoEFlexTokenDispatcher:
     """
-    Flex token dispatcher supporting both DeepEP and HybridEP backends.
+    Flex token dispatcher supporting DeepEP, HybridEP, and UCCL-EP backends.
     """
 
     shared_deepep_manager: _DeepepManager = None
     shared_hybridep_manager: _HybridEPManager = None
+    shared_uccl_manager: _DeepepManager = None
 
     def __init__(
         self,
@@ -523,10 +540,33 @@ class MoEFlexTokenDispatcher:
 
         backend = self.config.moe_flex_dispatcher_backend
 
-        if backend == "deepep":
+        if backend == "uccl_ep":
+            if set_uccl_num_sms is not None:
+                set_uccl_num_sms(self.config.moe_deepep_num_sms)
+            dispatch_fn = uccl_fused_dispatch
+            combine_fn = uccl_fused_combine
+            manager_kwargs = dict(
+                group=ep_group,
+                router_topk=self.tp_size * self.config.moe_router_topk,
+                permute_fusion=self.config.moe_permute_fusion,
+                capacity_factor=self.config.moe_expert_capacity_factor,
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                num_local_experts=self.num_local_experts,
+                router_dtype=self.config.moe_router_dtype,
+                moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
+                _dispatch_fn=dispatch_fn,
+                _combine_fn=combine_fn,
+            )
+            if self.config.moe_share_token_dispatcher:
+                if MoEFlexTokenDispatcher.shared_uccl_manager is None:
+                    MoEFlexTokenDispatcher.shared_uccl_manager = _DeepepManager(**manager_kwargs)
+                self._comm_manager = MoEFlexTokenDispatcher.shared_uccl_manager
+            else:
+                self._comm_manager = _DeepepManager(**manager_kwargs)
+        elif backend == "deepep":
             if set_deepep_num_sms is not None:
                 set_deepep_num_sms(self.config.moe_deepep_num_sms)
-            if SHARING_DEEPEP_MANAGER:
+            if self.config.moe_share_token_dispatcher:
                 if MoEFlexTokenDispatcher.shared_deepep_manager is None:
                     MoEFlexTokenDispatcher.shared_deepep_manager = _DeepepManager(
                         group=ep_group,
@@ -551,7 +591,7 @@ class MoEFlexTokenDispatcher:
                     moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
                 )
         elif backend == "hybridep":
-            if SHARING_DEEPEP_MANAGER:
+            if self.config.moe_share_token_dispatcher:
                 if MoEFlexTokenDispatcher.shared_hybridep_manager is None:
                     MoEFlexTokenDispatcher.shared_hybridep_manager = _HybridEPManager(
                         group=ep_group,
@@ -573,9 +613,7 @@ class MoEFlexTokenDispatcher:
                 )
         else:
             raise ValueError(
-                f"Invalid backend: {backend}. "
-                "Please set moe_flex_dispatcher_backend='deepep' or "
-                "moe_flex_dispatcher_backend='hybridep'"
+                f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'hybridep', or 'uccl_ep'"
             )
 
     def _initialize_metadata(self, num_local_tokens: int, probs: torch.Tensor) -> torch.Tensor:
@@ -679,7 +717,12 @@ class MoEFlexTokenDispatcher:
         hidden_states, _ = self.dispatch_preprocess(
             hidden_states=hidden_states, num_local_tokens=num_local_tokens, probs=probs
         )
-        hidden_states, _ = self.dispatch_all_to_all(hidden_states, async_finish=False, allocate_on_comm_stream=False)
+        async_dispatch = isinstance(self._comm_manager, _DeepepManager) and self.config.moe_deepep_async_dispatch
+        hidden_states, _ = self.dispatch_all_to_all(
+            hidden_states,
+            async_finish=async_dispatch,
+            allocate_on_comm_stream=async_dispatch,
+        )
         global_input_tokens, tokens_per_expert, permuted_probs = self.dispatch_postprocess(hidden_states)
 
         return global_input_tokens, tokens_per_expert, permuted_probs
@@ -705,7 +748,12 @@ class MoEFlexTokenDispatcher:
             token_probs=token_probs,
             token_indices=token_indices,
         )
-        hidden_states, _ = self.dispatch_all_to_all(hidden_states, async_finish=False, allocate_on_comm_stream=False)
+        async_dispatch = isinstance(self._comm_manager, _DeepepManager) and self.config.moe_deepep_async_dispatch
+        hidden_states, _ = self.dispatch_all_to_all(
+            hidden_states,
+            async_finish=async_dispatch,
+            allocate_on_comm_stream=async_dispatch,
+        )
         global_input_tokens, tokens_per_expert, permuted_probs = self.dispatch_postprocess(hidden_states)
 
         return global_input_tokens, tokens_per_expert, permuted_probs

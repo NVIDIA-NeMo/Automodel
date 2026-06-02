@@ -23,11 +23,13 @@ import torch
 from nemo_automodel._transformers.auto_model import (
     _MAX_BUILD_RETRIES,
     NeMoAutoModelForCausalLM,
+    _alias_remote_auto_map_for_target,
     _BaseNeMoAutoModelClass,
     _consume_config_overrides,
     _get_next_fallback_attn,
     _init_model,
     _patch_attention,
+    _patch_remote_code_compat,
 )
 from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 from nemo_automodel._transformers.model_init import (
@@ -179,6 +181,194 @@ class TestUtilityFunctions:
         # Test with numeric strings
         assert _get_next_fallback_attn("123") == "eager"
         assert _get_next_fallback_attn("0") == "eager"
+
+
+class TestModelRuntimePatches:
+    """Test cases for model runtime patch dispatch."""
+
+    class _DummyModel(torch.nn.Module):
+        def __init__(self, architectures=None):
+            super().__init__()
+            self.config = types.SimpleNamespace(architectures=architectures)
+
+    def test_apply_model_runtime_patches_dispatches_by_architecture(self):
+        from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
+
+        model = self._DummyModel(["Qwen3_5ForCausalLM"])
+        mesh = types.SimpleNamespace(cp_size=1)
+        calls = []
+
+        def fake_hook(model, mesh):
+            calls.append((model, mesh))
+            return model
+
+        fake_module = types.SimpleNamespace(apply_model_runtime_patches=fake_hook)
+
+        with patch(
+            "nemo_automodel._transformers.kernel_patches.importlib.import_module",
+            return_value=fake_module,
+        ) as mock_import:
+            assert apply_model_runtime_patches(model, mesh) is model
+
+        mock_import.assert_called_once_with("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn")
+        assert calls == [(model, mesh)]
+
+    def test_apply_model_runtime_patches_deduplicates_hook_specs(self):
+        from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
+
+        model = self._DummyModel(["Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"])
+        mesh = types.SimpleNamespace(cp_size=2)
+        calls = []
+
+        def fake_hook(model, mesh):
+            calls.append((model, mesh))
+            return model
+
+        fake_module = types.SimpleNamespace(apply_model_runtime_patches=fake_hook)
+
+        with patch(
+            "nemo_automodel._transformers.kernel_patches.importlib.import_module",
+            return_value=fake_module,
+        ):
+            assert apply_model_runtime_patches(model, mesh) is model
+
+        assert calls == [(model, mesh)]
+
+    def test_apply_model_runtime_patches_is_noop_for_unregistered_model(self):
+        from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
+
+        model = self._DummyModel(["LlamaForCausalLM"])
+        mesh = types.SimpleNamespace(cp_size=1)
+
+        with patch("nemo_automodel._transformers.kernel_patches.importlib.import_module") as mock_import:
+            assert apply_model_runtime_patches(model, mesh) is model
+
+        mock_import.assert_not_called()
+
+    def test_apply_model_runtime_patches_skips_unavailable_hook(self):
+        from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
+
+        model = self._DummyModel(["Qwen3_5ForCausalLM"])
+        mesh = types.SimpleNamespace(cp_size=1)
+
+        with patch(
+            "nemo_automodel._transformers.kernel_patches.importlib.import_module",
+            side_effect=ImportError,
+        ):
+            assert apply_model_runtime_patches(model, mesh) is model
+
+
+class TestPatchLegacyFlashAttnFlag:
+    """Bridge the legacy ``_supports_flash_attn_2`` flag to v5.5's ``_supports_flash_attn``.
+
+    transformers v5.5 renamed the FA2-support attribute and switched the dispatch
+    check to the new name only. Remote-code models pinned against <=v5.3 still set
+    the legacy flag; the patch installs a fallback property so they dispatch to FA2.
+    """
+
+    def test_installs_property_on_base(self):
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+        assert isinstance(mu.PreTrainedModel.__dict__["_supports_flash_attn"], property)
+
+    def test_is_idempotent(self):
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+        prop1 = mu.PreTrainedModel.__dict__["_supports_flash_attn"]
+        _patch_legacy_flash_attn_flag()
+        prop2 = mu.PreTrainedModel.__dict__["_supports_flash_attn"]
+        assert prop1 is prop2
+
+    def test_legacy_flag_bridged_to_true(self):
+        """Subclass with only ``_supports_flash_attn_2 = True`` resolves to True."""
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+
+        class _Legacy(mu.PreTrainedModel):
+            _supports_flash_attn_2 = True
+
+        assert _Legacy.__new__(_Legacy)._supports_flash_attn is True
+
+    def test_explicit_new_flag_true_wins(self):
+        """Subclass that sets ``_supports_flash_attn = True`` directly shadows the property."""
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+
+        class _Native(mu.PreTrainedModel):
+            _supports_flash_attn = True
+
+        assert _Native.__new__(_Native)._supports_flash_attn is True
+
+    def test_explicit_new_flag_false_wins_over_legacy_true(self):
+        """Explicit ``_supports_flash_attn = False`` shadows a legacy True."""
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+
+        class _Native(mu.PreTrainedModel):
+            _supports_flash_attn = False
+            _supports_flash_attn_2 = True
+
+        assert _Native.__new__(_Native)._supports_flash_attn is False
+
+    def test_neither_flag_falls_back_to_base_default(self):
+        """Subclass with neither flag falls back to the captured base default (False)."""
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+
+        class _Bare(mu.PreTrainedModel):
+            pass
+
+        assert _Bare.__new__(_Bare)._supports_flash_attn is False
+
+    def test_legacy_flag_false_does_not_bridge(self):
+        """Only ``_supports_flash_attn_2 is True`` bridges; False passes through."""
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+
+        class _LegacyFalse(mu.PreTrainedModel):
+            _supports_flash_attn_2 = False
+
+        assert _LegacyFalse.__new__(_LegacyFalse)._supports_flash_attn is False
+
+    def test_nearest_subclass_wins_in_mro(self):
+        """In multi-level inheritance, the nearest ``_supports_flash_attn`` in MRO wins."""
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+
+        class _Ancestor(mu.PreTrainedModel):
+            _supports_flash_attn_2 = True
+
+        class _Mid(_Ancestor):
+            _supports_flash_attn = False
+
+        class _Leaf(_Mid):
+            pass
+
+        assert _Leaf.__new__(_Leaf)._supports_flash_attn is False
 
 
 class DummyModel(torch.nn.Module):
@@ -489,6 +679,28 @@ class TestConsumeConfigOverrides:
         # Both should be kept since they're in init_param_names
         assert "output_hidden_states" in kwargs
         assert "explicit_param" in kwargs
+
+
+class TestAliasRemoteAutoMapForTarget:
+    """Tests for the auto_map alias fallback used when a trust-remote-code config
+    ships only ``auto_map[AutoModel]`` and HF's ``AutoModelFor*`` resolution
+    can't find the right class.
+    """
+
+    def test_aliases_automodel_to_target_when_conditions_met(self):
+        cfg = MagicMock()
+        cfg.auto_map = {"AutoModel": "modeling.MyModel"}
+        result = _alias_remote_auto_map_for_target(
+            ("/some/path",), {"trust_remote_code": True, "config": cfg}, "AutoModelForCausalLM"
+        )
+        assert result is cfg
+        assert result.auto_map["AutoModelForCausalLM"] == "modeling.MyModel"
+
+    def test_returns_none_when_trust_remote_code_not_set(self):
+        cfg = MagicMock()
+        cfg.auto_map = {"AutoModel": "modeling.MyModel"}
+        result = _alias_remote_auto_map_for_target(("/some/path",), {"config": cfg}, "AutoModelForCausalLM")
+        assert result is None
 
 
 class TestGetCheckpointTensorDtypes:
@@ -947,6 +1159,23 @@ class TestFromPretrainedSafetensorsFallback:
                 )
         assert NeMoAutoModelForCausalLM.__name__ == original_name
 
+    def test_aliases_and_retries_on_unrecognized_config_error(self):
+        """Unrecognized-config-class ValueError triggers auto_map alias + retry."""
+        patched_cfg = MagicMock()
+        sentinel = MagicMock()
+        error = ValueError("Unrecognized configuration class <class 'Foo'> for AutoModelForCausalLM")
+        with self._patch_parent_fp([error, sentinel]) as calls:
+            with patch(
+                "nemo_automodel._transformers.auto_model._alias_remote_auto_map_for_target",
+                return_value=patched_cfg,
+            ) as mock_alias:
+                result = NeMoAutoModelForCausalLM._from_pretrained_parent_class("test-model", trust_remote_code=True)
+        assert result is sentinel
+        assert len(calls) == 2
+        # Retry passes the patched config.
+        assert calls[1].get("config") is patched_cfg
+        mock_alias.assert_called_once()
+
 
 class TestBuildModelRetryDepth:
     """Tests for _build_model retry depth limiting (issue #1510)."""
@@ -1033,6 +1262,40 @@ class TestBuildModelRetryDepth:
             assert result is sentinel_model
             assert mock_init.call_count == 2
 
+    def test_build_model_applies_runtime_patches_before_infrastructure(self):
+        """Model runtime hooks run after construction and before sharding/checkpoint infra."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        order = []
+
+        def fake_runtime_patches(model, mesh):
+            order.append("runtime_patches")
+            return model
+
+        def fake_apply_infrastructure(*args, **kwargs):
+            order.append("infrastructure")
+            return sentinel_model
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model", return_value=(False, sentinel_model)),
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_runtime_patches", side_effect=fake_runtime_patches
+            ),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_infrastructure",
+                side_effect=fake_apply_infrastructure,
+            ),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+
+        assert result is sentinel_model
+        assert order == ["runtime_patches", "infrastructure"]
+
     def test_meta_tensor_runtime_error_retries_without_meta_device(self):
         """RuntimeError with 'meta tensors' triggers retry without meta device."""
         build_kwargs, mock_config = self._make_build_kwargs()
@@ -1053,6 +1316,70 @@ class TestBuildModelRetryDepth:
         ):
             mock_init.side_effect = [
                 RuntimeError("Tensor.item() cannot be called on meta tensors"),
+                (False, sentinel_model),
+            ]
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+            assert result is sentinel_model
+            assert mock_init.call_count == 2
+
+    def test_aten_equal_not_implemented_error_retries_without_meta_device(self):
+        """NotImplementedError for aten::equal on meta tensors triggers retry without meta device.
+
+        Reproduces the failure introduced by transformers >= 5.4.0 which added a
+        torch.equal() call inside tie_weights() (HF PR #44497). When the model is
+        initialised inside init_empty_weights() the tensors are on the meta device
+        and torch.equal() raises NotImplementedError.
+        """
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=2),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch(
+                "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
+                return_value=sentinel_model,
+            ),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=mock_config),
+            patch("nemo_automodel._transformers.auto_model._maybe_dequantize_fp8_for_peft", return_value=False),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            mock_init.side_effect = [
+                NotImplementedError(
+                    "aten::equal: attempted to run this operator with Meta tensors, "
+                    "but there was no fake impl or Meta kernel registered."
+                ),
+                (False, sentinel_model),
+            ]
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+            assert result is sentinel_model
+            assert mock_init.call_count == 2
+
+    def test_meta_tensor_not_implemented_error_retries_without_meta_device_on_hf_path(self):
+        """HF meta init errors should retry even when Automodel did not pick meta init."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        dummy_manager_cls = type("DummyManager", (), {})
+        build_kwargs["model_wrapper"] = dummy_manager_cls()
+        with (
+            patch("nemo_automodel._transformers.auto_model.MegatronFSDPManager", dummy_manager_cls),
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch(
+                "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
+                return_value=sentinel_model,
+            ),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=mock_config),
+            patch("nemo_automodel._transformers.auto_model._maybe_dequantize_fp8_for_peft", return_value=False),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            mock_init.side_effect = [
+                NotImplementedError("Cannot copy out of meta tensor; no data!"),
                 (False, sentinel_model),
             ]
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
@@ -1186,3 +1513,151 @@ class TestNoHfMetaDevice:
                 assert _get_hf_meta_device_disabled()
             assert _get_hf_meta_device_disabled()
         assert not _get_hf_meta_device_disabled()
+
+
+# =============================================================================
+# Tests for _patch_remote_code_compat
+# =============================================================================
+
+
+class TestPatchRemoteCodeCompat:
+    """Tests for the remote-code compatibility patch."""
+
+    @pytest.fixture(autouse=True)
+    def reset_patch_state(self):
+        """Reset the global patch state and restore original _finalize_model_loading."""
+        from transformers import PreTrainedModel
+
+        import nemo_automodel._transformers.auto_model as mod
+
+        orig_finalize = PreTrainedModel._finalize_model_loading
+        orig_flag = mod._remote_code_compat_applied
+        mod._remote_code_compat_applied = False
+        yield
+        PreTrainedModel._finalize_model_loading = orig_finalize
+        mod._remote_code_compat_applied = orig_flag
+
+    def test_patch_is_idempotent(self):
+        """Calling _patch_remote_code_compat twice should not double-wrap."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+        first = PreTrainedModel._finalize_model_loading
+        _patch_remote_code_compat()
+        second = PreTrainedModel._finalize_model_loading
+        assert first is second
+
+    def test_sets_all_tied_weights_keys(self):
+        """Patch should set all_tied_weights_keys if missing."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+
+        # Create a mock model missing the attribute
+        model = MagicMock(spec=[])
+        model.get_expanded_tied_weights_keys = MagicMock(return_value=["some.key"])
+        model.config = MagicMock()
+        model.config.use_cache = False
+
+        # The model class uses base tie_weights (no wrapping needed)
+        model_cls = type(model)
+        model_cls.tie_weights = PreTrainedModel.tie_weights
+
+        load_config = MagicMock()
+        loading_info = MagicMock()
+
+        # The patched finalize will call _orig_finalize which may fail on mock,
+        # but we can check the attribute was set before that point
+        try:
+            PreTrainedModel._finalize_model_loading(model, load_config, loading_info)
+        except Exception:
+            pass
+
+        assert hasattr(model, "all_tied_weights_keys")
+
+    def test_wraps_old_tie_weights_signature(self):
+        """Patch should wrap tie_weights that lacks `missing_keys` param."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+
+        # Create a real class with an old-style tie_weights (no missing_keys param)
+        class OldModel(PreTrainedModel):
+            config_class = type("DummyConfig", (), {"model_type": "dummy"})
+
+            def __init__(self):
+                # Skip PreTrainedModel.__init__ — we just need the class hierarchy
+                pass
+
+            def tie_weights(self):
+                self.tied = True
+
+        # Simulate what _compat_finalize does: inspect type(model) and wrap tie_weights
+        model = object.__new__(OldModel)
+        model.all_tied_weights_keys = []
+        model.config = types.SimpleNamespace(use_cache=False)
+        model.get_expanded_tied_weights_keys = lambda all_submodels=True: []
+
+        load_config = MagicMock()
+        loading_info = MagicMock()
+
+        try:
+            PreTrainedModel._finalize_model_loading(model, load_config, loading_info)
+        except Exception:
+            pass
+
+        # The wrapper should now accept missing_keys without TypeError
+        try:
+            OldModel.tie_weights(model, missing_keys=["foo"])
+        except TypeError:
+            pytest.fail("Wrapped tie_weights should accept missing_keys kwarg")
+
+    def test_sets_missing_config_defaults(self):
+        """Patch should set use_cache=False if missing from config."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+
+        model = MagicMock(spec=[])
+        model.get_expanded_tied_weights_keys = MagicMock(return_value=[])
+        model.config = types.SimpleNamespace()  # no use_cache attribute
+
+        model_cls = type(model)
+        model_cls.tie_weights = PreTrainedModel.tie_weights
+
+        load_config = MagicMock()
+        loading_info = MagicMock()
+
+        try:
+            PreTrainedModel._finalize_model_loading(model, load_config, loading_info)
+        except Exception:
+            pass
+
+        assert hasattr(model.config, "use_cache")
+        assert model.config.use_cache is False
+
+    def test_compatible_model_unaffected(self):
+        """A model that already has all required attributes should pass through unchanged."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+
+        model = MagicMock(spec=[])
+        model.all_tied_weights_keys = ["existing.key"]
+        model.config = MagicMock()
+        model.config.use_cache = True  # already set
+
+        model_cls = type(model)
+        model_cls.tie_weights = PreTrainedModel.tie_weights
+
+        load_config = MagicMock()
+        loading_info = MagicMock()
+
+        try:
+            PreTrainedModel._finalize_model_loading(model, load_config, loading_info)
+        except Exception:
+            pass
+
+        # Existing values should be preserved
+        assert model.all_tied_weights_keys == ["existing.key"]
+        assert model.config.use_cache is True

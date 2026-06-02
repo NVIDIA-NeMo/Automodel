@@ -14,6 +14,12 @@
 
 # Configuration for fine-tuning Gemma 3n VL 4B with MedPix dataset for image description
 
+# To run this recipe:
+#   automodel examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix_peft.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
@@ -108,3 +114,6 @@ freeze_config:
 #   wandb_entity: 
 #   wandb_exp_name:
 #   wandb_save_dir:
+
+ci:
+  recipe_owner: akoumpa

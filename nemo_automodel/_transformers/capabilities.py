@@ -78,9 +78,17 @@ def _has_backend(model: "nn.Module") -> bool:
 
 
 def _uses_te_attention(model: "nn.Module") -> bool:
-    """True when the model was constructed with the TE attention backend."""
+    """True when the model uses the TE attention backend.
+
+    Covers two cases:
+    - Custom models built with ``BackendConfig(attn='te')``.
+    - HF models that had TE injected via :func:`inject_te_attention`
+      (flagged by ``model._te_attention_injected``).
+    """
     backend = getattr(model, "backend", None)
-    return getattr(backend, "attn", None) == "te"
+    if getattr(backend, "attn", None) == "te":
+        return True
+    return getattr(model, "_te_attention_injected", False)
 
 
 def _is_hybrid(model: "nn.Module") -> bool:
@@ -88,15 +96,22 @@ def _is_hybrid(model: "nn.Module") -> bool:
 
     Detected via config attributes used by NemotronH (``layers_block_type``)
     and HF hybrid models (``hybrid_override_pattern``, ``is_hybrid_model``).
+    For VLM wrappers, also inspect the inner ``language_model``'s config.
     """
-    config = getattr(model, "config", None)
-    if config is None:
-        return False
-    for attr in ("layers_block_type", "hybrid_override_pattern"):
-        pattern = getattr(config, attr, None)
-        if pattern and any(str(c).upper() == "M" for c in pattern):
+    candidates = [getattr(model, "config", None)]
+    inner = getattr(model, "language_model", None)
+    if inner is not None:
+        candidates.append(getattr(inner, "config", None))
+    for config in candidates:
+        if config is None:
+            continue
+        for attr in ("layers_block_type", "hybrid_override_pattern"):
+            pattern = getattr(config, attr, None)
+            if pattern and any(str(c).upper() == "M" for c in pattern):
+                return True
+        if getattr(config, "is_hybrid_model", False) is True:
             return True
-    return getattr(config, "is_hybrid_model", False) is True
+    return False
 
 
 class ModelSupports:
@@ -178,6 +193,7 @@ class ModelSupports:
         | Model kind       | Attention      | CP?     |
         +------------------+----------------+---------+
         | Custom           | TE             | Yes     |
+        | Custom hybrid    | TE / SDPA      | Yes     |
         | Custom           | FlexAttention  | No      |
         | HF (pure attn)   | SDPA           | Yes     |
         | HF (pure attn)   | no SDPA        | No      |
@@ -185,6 +201,9 @@ class ModelSupports:
         +------------------+----------------+---------+
         """
         if _has_backend(self._model):
+            if _is_hybrid(self._model):
+                backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+                return backend_attn in ("te", "sdpa")
             return _uses_te_attention(self._model)
         if _is_hybrid(self._model):
             return False
@@ -211,7 +230,7 @@ class ModelSupports:
     @property
     def supports_gradient_checkpointing(self) -> bool:
         """Gradient checkpointing is supported."""
-        if self.supports_ep:
+        if self.supports_ep and self.ep_size > 1:
             return False
         for cls in type(self._model).__mro__:
             if "supports_gradient_checkpointing" in cls.__dict__:
@@ -293,7 +312,16 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
         )
 
     if cp_size > 1 and not supports.supports_cp:
-        if _is_hybrid(model):
+        if _is_hybrid(model) and _has_backend(model):
+            errors.append(
+                f"Context parallelism (cp_size={cp_size}) for hybrid model {arch} "
+                f"requires the TE or SDPA attention backend (backend.attn='te' or 'sdpa').\n"
+                f"Please switch attention backend:\n"
+                f"model:\n"
+                f"  backend:\n"
+                f"    attn: te  # or sdpa"
+            )
+        elif _is_hybrid(model):
             errors.append(
                 f"Context parallelism (cp_size={cp_size}) is not supported for "
                 f"hybrid model {arch} (contains Mamba/SSM layers).\n"

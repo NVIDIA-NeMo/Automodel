@@ -1,6 +1,6 @@
 (diffusion-finetune)=
 
-# Diffusion Model Fine-Tuning with NeMo AutoModel
+# Diffusion Model Fine-Tuning
 
 ## Introduction
 
@@ -54,7 +54,7 @@ docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:26.02
 ```
 
 :::{important}
-**Docker users:** Checkpoints are lost when the container exits unless you bind-mount the checkpoint directory to the host. See [Install with NeMo Docker Container](../installation.md#install-with-nemo-docker-container) and [Saving Checkpoints When Using Docker](../checkpointing.md#saving-checkpoints-when-using-docker).
+**Docker users:** Checkpoints are lost when the container exits unless you bind-mount the checkpoint directory to the host. See [Install with NeMo Docker Container](../installation.md#install-with-nemo-docker-container) and [Save Checkpoints When Using Docker](../checkpointing.md#save-checkpoints-when-using-docker).
 :::
 
 For the full set of installation methods, see the [installation guide](../installation.md).

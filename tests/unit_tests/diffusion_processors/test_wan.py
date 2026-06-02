@@ -117,10 +117,14 @@ class TestEncodeVideo:
         mock_dist.latent_dist.sample.return_value = latent_sample
         vae.encode.return_value = mock_dist
 
-        return {
-            "vae": vae,
-            "dtype": torch.float32,
-        }, latent_mean, latent_sample
+        return (
+            {
+                "vae": vae,
+                "dtype": torch.float32,
+            },
+            latent_mean,
+            latent_sample,
+        )
 
     def test_encode_video_deterministic(self, processor):
         models, latent_mean, _ = self._make_mock_models()
@@ -144,9 +148,7 @@ class TestEncodeVideo:
     def test_encode_video_applies_mean_std_normalization(self, processor):
         mean_vals = [0.5] * 16
         std_vals = [2.0] * 16
-        models, latent_mean, _ = self._make_mock_models(
-            latents_mean=mean_vals, latents_std=std_vals
-        )
+        models, latent_mean, _ = self._make_mock_models(latents_mean=mean_vals, latents_std=std_vals)
         video_tensor = torch.randn(1, 3, 5, 32, 32)
 
         result = processor.encode_video(video_tensor, models, device="cpu", deterministic=True)
@@ -337,9 +339,7 @@ class TestGetCacheData:
         assert result["video_latents"] is latent
         assert result["text_embeddings"] is text_encodings["text_embeddings"]
         assert isinstance(result["first_frame"], torch.Tensor)
-        torch.testing.assert_close(
-            result["first_frame"], torch.from_numpy(first_frame)
-        )
+        torch.testing.assert_close(result["first_frame"], torch.from_numpy(first_frame))
         assert result["model_type"] == "wan"
         assert result["model_version"] == "wan2.1"
         assert result["processing_mode"] == "video"

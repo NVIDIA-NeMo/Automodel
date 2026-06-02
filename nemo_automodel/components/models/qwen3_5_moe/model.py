@@ -80,6 +80,72 @@ class Qwen3_5MoeBlock(Block):
         if self.layer_type == "linear_attention":
             self.linear_attn = CPAwareGatedDeltaNet(config, layer_idx)
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        """Mirror :meth:`Block.forward` but thread NEAT-packing kwargs into
+        ``CPAwareGatedDeltaNet``.
+
+        The parent ``Block.forward`` calls ``linear_attn`` with only
+        ``hidden_states`` and ``attention_mask``; for packed sequences the
+        gated_delta_rule kernel additionally needs ``cu_seqlens`` /
+        ``indices`` to reset state at document boundaries (issue #2131).
+        Derived once per forward from the indexed attention mask.
+        """
+        if self.layer_type != "linear_attention":
+            return super().forward(
+                x,
+                freqs_cis=freqs_cis,
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                position_ids=position_ids,
+                **attn_kwargs,
+            )
+
+        # Local imports to avoid pulling packing utilities into the module
+        # import graph for non-Qwen3.5 callers.
+        from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
+
+        cu_seqlens: torch.Tensor | None = None
+        indices: torch.Tensor | None = None
+        linear_attn_mask = attention_mask
+        packed_seq_ids = attn_kwargs.get("_packed_seq_ids")
+        if is_indexed_packed_mask(attention_mask):
+            packing_mask = attention_mask
+        elif is_indexed_packed_mask(packed_seq_ids):
+            packing_mask = packed_seq_ids
+        else:
+            packing_mask = None
+
+        if packing_mask is not None:
+            indices_t, cu_seqlens_t, _ = get_unpad_data(packing_mask)
+            cu_seqlens = cu_seqlens_t.to(torch.long)
+            indices = indices_t
+            linear_attn_mask = packing_mask
+
+        if linear_attn_mask is not None and padding_mask is None:
+            padding_mask = linear_attn_mask.bool().logical_not()
+
+        normed_x = self.input_layernorm(x)
+        attn_out = self.linear_attn(
+            hidden_states=normed_x,
+            attention_mask=linear_attn_mask,
+            position_ids=position_ids,
+            cu_seqlens=cu_seqlens,
+            indices=indices,
+        )
+        x = x + attn_out
+
+        mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
+        return x + mlp_out
+
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
             norm.reset_parameters()
@@ -181,9 +247,9 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
             else:
                 raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
 
-        # If we have pixel values and a vision encoder, go through the full HF
+        # If we have visual pixel values and a vision encoder, go through the full HF
         # VL forward (vision encoding + multimodal scatter + text).
-        if pixel_values is not None and self.visual is not None:
+        if (pixel_values is not None or pixel_values_videos is not None) and self.visual is not None:
             return super().forward(
                 input_ids=None,
                 attention_mask=attention_mask,
@@ -224,10 +290,13 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
@@ -235,7 +304,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         # --------------- MoE config ---------------
         # Qwen3.5-MoE has MoE on every layer, with a shared expert + sigmoid gate.
         # No ``decoder_sparse_step`` — defaults to 1 so every layer is MoE.
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.hidden_size,  # unused — no dense MLP layers
             moe_inter_dim=config.moe_intermediate_size,
@@ -257,6 +326,9 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             shared_expert_gate=True,
             shared_expert_inter_dim=config.shared_expert_intermediate_size,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         # --------------- Layers ---------------
         embed_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
@@ -318,7 +390,14 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             padding_mask = None
 
         if padding_mask is None and attention_mask is not None:
-            padding_mask = attention_mask.bool().logical_not()
+            if attention_mask.ndim <= 2:
+                # 1D/2D mask (standard or indexed packing mask): invert directly
+                padding_mask = attention_mask.bool().logical_not()
+            else:
+                # 4D mask [B, 1, S, S] (e.g. from sdpa packing collater):
+                # extract per-token padding from the diagonal (a token is padded
+                # if it cannot attend to itself).
+                padding_mask = attention_mask[:, 0].diagonal(dim1=-2, dim2=-1).bool().logical_not()
 
         hidden_states = inputs_embeds
 
@@ -384,6 +463,10 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
       * ``lm_head`` with NeMo backend linear
     """
 
+    # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
+    # patch_hf_model_for_pp must not replace it under PP.
+    _pp_keep_self_forward: bool = True
+
     @classmethod
     def from_config(
         cls,
@@ -426,7 +509,10 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Replace HF text decoder with our NeMo backend
         text_config = config.text_config if hasattr(config, "text_config") else config
-        self.model.language_model = Qwen3_5MoeTextModelBackend(text_config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model.language_model = Qwen3_5MoeTextModelBackend(
+            text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
+        )
 
         # Replace lm_head with NeMo backend linear
         self.lm_head = initialize_linear_module(
@@ -475,23 +561,25 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     ):
         # PP VLM support: retrieve pixel_values from stored chunks if not passed
         pixel_values = kwargs.get("pixel_values", None)
+        pixel_values_videos = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
-        if (
-            pixel_values is None
-            and hasattr(self, "_vlm_pixel_values_chunks")
-            and self._vlm_pixel_values_chunks is not None
-        ):
-            image_token_id = self.config.image_token_id
-            vision_start_token_id = self.config.vision_start_token_id
-            has_media_tokens = input_ids is not None and (
-                (input_ids == image_token_id).any() or (input_ids == vision_start_token_id).any()
-            )
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        image_token_id = self.config.image_token_id
+        vision_start_token_id = self.config.vision_start_token_id
+        has_media_tokens = input_ids is not None and (
+            (input_ids == image_token_id).any() or (input_ids == vision_start_token_id).any()
+        )
 
-            if has_media_tokens:
-                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-                if chunk_idx < len(self._vlm_pixel_values_chunks):
-                    pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
-                    image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
+        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+        consumed_vlm_chunk = False
+
+        if pixel_values is None and has_media_tokens:
+            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
+            if image_chunks is not None and chunk_idx < len(image_chunks):
+                pixel_values = image_chunks[chunk_idx]
+                image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
+                if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
+                    image_grid_hws = image_grid_chunks[chunk_idx]
                     if image_grid_hws is not None and image_grid_hws.numel() > 0:
                         if image_grid_hws.shape[-1] == 2:
                             ones = torch.ones(
@@ -500,9 +588,25 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                             image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
                         else:
                             image_grid_thw = image_grid_hws
-                    kwargs["pixel_values"] = pixel_values
-                    kwargs["image_grid_thw"] = image_grid_thw
-                    self._vlm_chunk_idx = chunk_idx + 1
+                kwargs["pixel_values"] = pixel_values
+                kwargs["image_grid_thw"] = image_grid_thw
+                consumed_vlm_chunk = True
+
+        if pixel_values_videos is None and has_media_tokens:
+            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
+            if video_chunks is not None and chunk_idx < len(video_chunks):
+                video_chunk = video_chunks[chunk_idx]
+                if video_chunk.numel() > 0:
+                    pixel_values_videos = video_chunk
+                    video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
+                    if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
+                        video_grid_thw = video_grid_chunks[chunk_idx]
+                    kwargs["pixel_values_videos"] = pixel_values_videos
+                    kwargs["video_grid_thw"] = video_grid_thw
+                consumed_vlm_chunk = True
+
+        if consumed_vlm_chunk:
+            self._vlm_chunk_idx = chunk_idx + 1
 
         if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(

@@ -388,6 +388,10 @@ def safe_import_te():
        transformer_engine.common.load_framework_extension("torch")):
        FileNotFoundError: Could not find shared object file for Transformer Engine torch lib.
 
+    3) OSError when TE's core .so is dlopen'd against an incompatible CUDA lib,
+       e.g. a prebuilt wheel needing a newer cuBLAS than is installed:
+       OSError: .../libtransformer_engine.so: undefined symbol: cublasLtGroupedMatrixLayoutInit_internal, version libcublasLt.so.13
+
     Returns:
         Tuple[bool, Union[module, UnavailableMeta]]: (True, te_module) if import
         and TE torch lib load succeeded; (False, placeholder) otherwise.
@@ -398,6 +402,9 @@ def safe_import_te():
     # 2) FileNotFoundError when TE's load_framework_extension("torch") runs (e.g. in transformer_engine.pytorch):
     #    raise FileNotFoundError(
     #    FileNotFoundError: Could not find shared object file for Transformer Engine torch lib.
+    # 3) OSError when TE's core .so is dlopen'd against an incompatible CUDA lib:
+    #    OSError: .../libtransformer_engine.so: undefined symbol: cublasLtGroupedMatrixLayoutInit_internal, version libcublasLt.so.13
+    # FileNotFoundError is a subclass of OSError, so it must be caught first.
     msg = "transformer_engine could not be imported (e.g. CUDA symbol mismatch or TE torch lib not found)."
     try:
         import transformer_engine as te
@@ -406,6 +413,9 @@ def safe_import_te():
         return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
     except FileNotFoundError:
         logger.debug("safe_import_te: import transformer_engine failed (TE torch lib not found)", exc_info=True)
+        return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
+    except OSError:
+        logger.debug("safe_import_te: import transformer_engine failed (CUDA lib symbol mismatch)", exc_info=True)
         return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
 
     try:
@@ -416,6 +426,9 @@ def safe_import_te():
         return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
     except FileNotFoundError:
         logger.debug("safe_import_te: transformer_engine.pytorch failed (TE torch lib not found)", exc_info=True)
+        return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
+    except OSError:
+        logger.debug("safe_import_te: transformer_engine.pytorch failed (CUDA lib symbol mismatch)", exc_info=True)
         return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
 
     return True, te
@@ -503,27 +516,34 @@ def get_check_model_inputs_decorator():
     Returns:
         Decorator function to validate model inputs.
     """
+    # transformers >= 5.2.0: check_model_inputs was split into two decorators
+    # Check this FIRST because the old import still exists in 5.2+ as a deprecated wrapper
+    # with a different signature.
+    if is_transformers_min_version("5.2.0"):
+        try:
+            from transformers.utils.generic import merge_with_config_defaults
+            from transformers.utils.output_capturing import capture_outputs
+
+            def _combined_decorator(func):
+                return merge_with_config_defaults(capture_outputs(func))
+
+            return _combined_decorator
+        except ImportError:
+            pass
+
     try:
         from transformers.utils.generic import check_model_inputs
 
-        if is_transformers_min_version("4.57.3"):
-            # New API: check_model_inputs() returns a decorator
-            return check_model_inputs()
+        if is_transformers_min_version("4.57.3"):  # transformers >= 4.57.3
+            try:
+                # 4.57.3 – 5.3.x API: check_model_inputs() is a factory
+                return check_model_inputs()
+            except TypeError:
+                # >= 5.5.0 API: check_model_inputs is directly a decorator
+                return check_model_inputs
         else:
-            # Old API: check_model_inputs is directly a decorator
+            # Old API (transformers < 4.57.3): check_model_inputs is directly a decorator
             return check_model_inputs
-    except ImportError:
-        pass
-
-    # transformers >= 5.2.0: check_model_inputs was split into two decorators
-    try:
-        from transformers.utils.generic import merge_with_config_defaults
-        from transformers.utils.output_capturing import capture_outputs
-
-        def _combined_decorator(func):
-            return merge_with_config_defaults(capture_outputs(func))
-
-        return _combined_decorator
     except ImportError:
         pass
 

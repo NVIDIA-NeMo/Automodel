@@ -92,10 +92,11 @@ class GroupedExpertsLoRA(GroupedExperts):
         device = obj.gate_and_up_projs.device
 
         up_proj_dim = obj.config.moe_inter_dim * 2 if obj.is_gated else obj.config.moe_inter_dim
+        expert_dim = obj.config.expert_dim
 
         # LoRA weights for gate+up (or just up if non-gated) and down projections
         obj.lora_gate_and_up_A = nn.Parameter(
-            torch.empty(obj.n_routed_experts, obj.config.dim, lora_dim, dtype=dtype, device=device)
+            torch.empty(obj.n_routed_experts, expert_dim, lora_dim, dtype=dtype, device=device)
         )
         obj.lora_gate_and_up_B = nn.Parameter(
             torch.empty(obj.n_routed_experts, lora_dim, up_proj_dim, dtype=dtype, device=device)
@@ -105,7 +106,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             torch.empty(obj.n_routed_experts, obj.config.moe_inter_dim, lora_dim, dtype=dtype, device=device)
         )
         obj.lora_down_B = nn.Parameter(
-            torch.empty(obj.n_routed_experts, lora_dim, obj.config.dim, dtype=dtype, device=device)
+            torch.empty(obj.n_routed_experts, lora_dim, expert_dim, dtype=dtype, device=device)
         )
 
         # Initialize LoRA weights
@@ -410,10 +411,11 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         device = obj.gate_and_up_projs.device
 
         up_proj_dim = obj.config.moe_inter_dim * 2 if obj.is_gated else obj.config.moe_inter_dim
+        expert_dim = obj.config.expert_dim
 
         # LoRA weights
         obj.lora_gate_and_up_A = nn.Parameter(
-            torch.empty(obj.config.n_routed_experts, obj.config.dim, lora_dim, dtype=dtype, device=device)
+            torch.empty(obj.config.n_routed_experts, expert_dim, lora_dim, dtype=dtype, device=device)
         )
         obj.lora_gate_and_up_B = nn.Parameter(
             torch.empty(obj.config.n_routed_experts, lora_dim, up_proj_dim, dtype=dtype, device=device)
@@ -423,7 +425,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             torch.empty(obj.config.n_routed_experts, obj.config.moe_inter_dim, lora_dim, dtype=dtype, device=device)
         )
         obj.lora_down_B = nn.Parameter(
-            torch.empty(obj.config.n_routed_experts, lora_dim, obj.config.dim, dtype=dtype, device=device)
+            torch.empty(obj.config.n_routed_experts, lora_dim, expert_dim, dtype=dtype, device=device)
         )
 
         GroupedExpertsDeepEPLoRA.init_lora_weights(obj, lora_A_init_method)

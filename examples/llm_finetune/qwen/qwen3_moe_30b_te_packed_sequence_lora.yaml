@@ -18,6 +18,8 @@
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 32
   local_batch_size: 4
@@ -58,7 +60,7 @@ checkpoint:
   enabled: false
   checkpoint_dir: checkpoints/
   model_save_format: safetensors # LoRA only supports safetensors format
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: false
 
 distributed:
   strategy: fsdp2
@@ -122,3 +124,6 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: hemildesai

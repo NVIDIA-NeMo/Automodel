@@ -13,10 +13,12 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 examples/llm_pretrain/pretrain.py --config examples/llm_pretrain/megatron_pretrain_gpt2.yaml
-# Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
+# To run this recipe:
+#   automodel examples/llm_pretrain/megatron_pretrain_gpt2.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 512
@@ -45,7 +47,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: false
 
 distributed:
   strategy: fsdp2
@@ -92,10 +94,16 @@ validation_dataloader:
   dataloader_type: "single"
 
 optimizer:
-  _target_: torch.optim.AdamW
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   betas: [0.9, 0.95]
   lr: 0.0006
   weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
 
 lr_scheduler:
   lr_decay_style: cosine

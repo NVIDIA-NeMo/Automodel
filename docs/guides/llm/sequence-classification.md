@@ -1,4 +1,4 @@
-# Sequence Classification (SFT/PEFT) with NeMo AutoModel
+# Sequence Classification (SFT/PEFT)
 
 ## Introduction
 
@@ -54,7 +54,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
@@ -116,4 +116,3 @@ optimizer:
 torchrun --nproc-per-node=2 examples/llm_seq_cls/seq_cls.py --config examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
 ```
 You can adjust the number of GPUs as necessary using the `--nproc-per-node` knob.
-

@@ -23,6 +23,7 @@ from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_datas
     ColumnMappedTextInstructionDataset,
 )
 
+
 class _DummyTokenizer:
     """Minimal tokenizer stub used for init-time error paths."""
 
@@ -249,4 +250,3 @@ def test_dataset_two_column_mapping_non_chat(tmp_path: Path):
     assert len(sample["input_ids"]) == 32
     assert len(sample["labels"]) == 32
     assert len(sample["attention_mask"]) == 32
-

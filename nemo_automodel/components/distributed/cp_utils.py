@@ -124,6 +124,75 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
             module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
 
 
+def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
+    """Inject CP-aware SDPA into self_attn modules for compile + CP>1 correctness.
+
+    Problem: when per-layer torch.compile is active, Dynamo traces through the decoder
+    layer including Q/K/V projections.  At the F.scaled_dot_product_attention call site,
+    Q/K/V are already local tensors (DTensor metadata was never propagated through the
+    compiled graph).  The DTensor SDPA dispatch — which triggers the CP allgather — never
+    fires, so each rank silently attends only to its local sequence shard.
+
+    Fix: swap F.scaled_dot_product_attention with a @torch._dynamo.disable wrapper for
+    the duration of each self_attn forward.  Dynamo sees the disabled function and creates
+    a graph break there, so:
+      - Everything before (Q/K/V proj + RoPE) is compiled and fused.
+      - The disabled wrapper runs eagerly: re-wraps local Q/K/V as DTensors with
+        Shard(2) on the CP mesh so the DTensor SDPA dispatch fires the allgather.
+      - Everything after (O proj + residual + MLP) is compiled and fused.
+
+    Seq dim at the SDPA call is 2: tensors are [B, nH, S/cp_size, D] after HF reshape.
+    """
+    import torch.nn.functional as F_module
+    from torch.distributed.tensor import DTensor, Shard
+
+    _original_sdpa = F_module.scaled_dot_product_attention
+
+    @torch._dynamo.disable
+    def _cp_sdpa(
+        query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, **kwargs
+    ):
+        # Re-wrap local Q/K/V as DTensors so DTensor SDPA dispatch fires the CP allgather.
+        # Seq dim is 2: [B, nH, S/cp_size, D].
+        if not isinstance(query, DTensor):
+            query = DTensor.from_local(query, device_mesh=cp_mesh, placements=[Shard(2)])
+            key = DTensor.from_local(key, device_mesh=cp_mesh, placements=[Shard(2)])
+            value = DTensor.from_local(value, device_mesh=cp_mesh, placements=[Shard(2)])
+        out = _original_sdpa(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+            **kwargs,
+        )
+        # Unwrap back to local tensor for the compiled O-proj + MLP region.
+        return out.to_local() if isinstance(out, DTensor) else out
+
+    def _pre_hook(module, args, kwargs):
+        F_module.scaled_dot_product_attention = _cp_sdpa
+        return args, kwargs
+
+    def _post_hook(module, inputs, output):
+        F_module.scaled_dot_product_attention = _original_sdpa
+
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+    for name, module in model.named_modules():
+        if name.endswith("self_attn"):
+            # Hook on the inner attention module so the hook fires during both
+            # the original forward AND gradient-checkpointing recompute.
+            # CheckpointWrapper's recompute bypasses __call__ (and thus pre-hooks
+            # on the wrapper itself), so we must hook on the wrapped module directly.
+            target = module._checkpoint_wrapped_module if isinstance(module, CheckpointWrapper) else module
+            target.register_forward_pre_hook(_pre_hook, with_kwargs=True)
+            # always_call=True ensures _original_sdpa is restored even if the forward raises.
+            target.register_forward_hook(_post_hook, always_call=True)
+
+
 def make_cp_batch_and_ctx(
     device_mesh,
     batch,
@@ -182,11 +251,30 @@ def make_cp_batch_and_ctx(
     # so that SDPA handles causal masking internally.
     batch.pop("attention_mask", None)
 
-    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
-    if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
-        batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(batch["input_ids"].device)
+    # Determine the primary sequence tensor: inputs_embeds (VLM with CP, where
+    # multimodal token replacement happened pre-shard) or input_ids (standard LLM).
+    has_inputs_embeds = "inputs_embeds" in batch
+    has_input_ids = "input_ids" in batch
+    assert has_inputs_embeds ^ has_input_ids, (
+        "make_cp_batch_and_ctx requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
+    )
+    if has_inputs_embeds:
+        primary_seq_tensor = batch["inputs_embeds"]
+    else:
+        primary_seq_tensor = batch["input_ids"]
+    seq_len = primary_seq_tensor.shape[1]
 
-    input_ids = batch["input_ids"]
+    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
+    batch_size = primary_seq_tensor.shape[0]
+    if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
+        batch["position_ids"] = (
+            torch.arange(0, seq_len, device=primary_seq_tensor.device).unsqueeze(0).expand(batch_size, -1).contiguous()
+        )
+    elif "position_ids" in batch:
+        position_ids = batch["position_ids"]
+        if position_ids.ndim == 2 and position_ids.shape[0] == 1 and batch_size > 1:
+            batch["position_ids"] = position_ids.expand(batch_size, -1).contiguous()
+
     position_ids = batch["position_ids"]
 
     # Determine correct seq dim for CP sharding
@@ -195,12 +283,19 @@ def make_cp_batch_and_ctx(
 
     labels = batch["labels"]
 
-    # Collect all available tensors for context parallel
-    cp_buffers = [input_ids, labels, position_ids]
+    # Collect all available tensors for context parallel.  We track each
+    # cp_buffer's batch key (when sourced from ``batch``) so the padding pass
+    # below can pick the semantically-correct fill sentinel and mirror the
+    # padded tensor back into ``batch``.  ``loss_mask`` is passed as an arg
+    # (not in batch) so it has no key.
+    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
+    cp_buffers = [primary_seq_tensor, labels, position_ids]
+    # inputs_embeds is [B, S, H] → seq_dim=1; input_ids is [B, S] → seq_dim=1
     cp_seq_dims = [1, 1, pos_seq_dim]
-    cp_no_restore_buffers = {input_ids, labels}
+    cp_no_restore_buffers = {primary_seq_tensor, labels}
+    batch_buffer_keys: dict[int, str] = {0: primary_key, 1: "labels", 2: "position_ids"}
 
-    # Add loss_mask if available
+    # Add loss_mask if available (passed as arg, not in batch -> no key)
     if loss_mask is not None:
         cp_buffers.append(loss_mask)
         cp_seq_dims.append(1)
@@ -209,9 +304,49 @@ def make_cp_batch_and_ctx(
     # Add padding_mask if available in batch
     if "padding_mask" in batch:
         padding_mask = batch["padding_mask"]
+        batch_buffer_keys[len(cp_buffers)] = "padding_mask"
         cp_buffers.append(padding_mask)
         cp_seq_dims.append(1)
         cp_no_restore_buffers.add(padding_mask)
+
+    # Pad sequence length to be divisible by 2 * cp_size (required by
+    # context_parallel load balancing). The inputs_embeds path can hit
+    # arbitrary seq lengths from the VLM collator, so we pad here rather
+    # than relying on dataset-side padding.
+    #
+    # Per-buffer pad sentinels: each tensor's "ignore" value is semantic, not
+    # dtype-derived.  ``labels``/``padding_mask``/``attention_mask`` are all
+    # int/bool but have different ignore conventions.  Falling through to 0
+    # for ``padding_mask`` (== False == "real token") would tell the MoE
+    # router to route the cp-pad slots to experts -- silently wasting capacity
+    # and skewing load-balance loss.
+    PAD_FILL = {
+        "labels": -100,  # CE ignore_index
+        "padding_mask": True,  # bool: True == "this position is pad, ignore"
+        "attention_mask": False,  # HF: 0 == "this position is pad, ignore"
+        # everything else (input_ids, position_ids, ...) -> 0
+    }
+    cp_divisor = cp_mesh.size() * 2
+    if seq_len % cp_divisor != 0:
+        pad_len = cp_divisor - (seq_len % cp_divisor)
+        new_no_restore = set()
+        for i, (buf, dim) in enumerate(zip(cp_buffers, cp_seq_dims)):
+            pad_shape = list(buf.shape)
+            pad_shape[dim] = pad_len
+            if buf.dtype.is_floating_point:
+                pad_val = torch.zeros(pad_shape, dtype=buf.dtype, device=buf.device)
+            else:
+                fill_val = PAD_FILL.get(batch_buffer_keys.get(i), 0)
+                pad_val = torch.full(pad_shape, fill_val, dtype=buf.dtype, device=buf.device)
+            old_buf = buf
+            cp_buffers[i] = torch.cat([buf, pad_val], dim=dim)
+            if old_buf in cp_no_restore_buffers:
+                new_no_restore.add(cp_buffers[i])
+        cp_no_restore_buffers = new_no_restore
+        # Mirror every batch-sourced cp_buffer back into ``batch`` so any
+        # downstream consumer reading from the dict sees the padded shape.
+        for idx, key in batch_buffer_keys.items():
+            batch[key] = cp_buffers[idx]
 
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,

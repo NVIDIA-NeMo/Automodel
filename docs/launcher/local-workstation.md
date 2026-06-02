@@ -1,8 +1,7 @@
-# Run AutoModel on Your Local Workstation
+# Run on Your Local Workstation
 
-NeMo AutoModel supports training and fine-tuning jobs on configurations ranging from single-GPU workstations to multi-node, multi-GPU clusters.
-Use this guide for local, single-node workflows. For setup details, refer to our [Installation Guide](../guides/installation.md).
-For executing distributed multi-node jobs, please refer to our [Run on a Cluster](./cluster.md) guide.
+Use this guide for local, single-node workflows on a workstation or an interactive Slurm allocation. For setup details, refer to our [Installation Guide](../guides/installation.md).
+For batch multi-node jobs, see the [Slurm](./slurm.md) or [SkyPilot](./skypilot.md) guides.
 
 NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.md) guide.
 
@@ -10,41 +9,48 @@ NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipe
 
 - **CLI (recommended)**
   ```bash
-  automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+  automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
   ```
 
 - **Direct recipe script**
   - Single GPU
     ```bash
-    python examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+    python nemo_automodel/recipes/llm/train_ft.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
     ```
   - Multi-GPU (single node)
     ```bash
-    torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+    torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/train_ft.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
     ```
 
 ## Run with AutoModel CLI (Single Node)
 
-The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training scaling from a local workstation (this guide) to large clusters (see our [cluster guide](./cluster.md)).
+The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training scaling from a local workstation (this guide) to large clusters (see our [cluster guide](./slurm.md)).
 
 ### Basic Usage
 
 The CLI follows this format:
 ```bash
-automodel <command> <domain> -c <config_file> [options]
+automodel [--nproc-per-node N] <config.yaml> [--key.subkey=override ...]
 ```
 
+A short alias `am` is also available. Both commands also work with `uv run` (e.g., `uv run automodel <config.yaml>`).
+
 Where:
-- `<command>`: The operation to perform (`finetune`)
-- `<domain>`: The model domain (`llm` or `vlm`)
-- `<config_file>`: Path to your YAML configuration file
+- `<config.yaml>`: Path to your YAML configuration file (must contain a `recipe._target_` key)
+- `--nproc-per-node`: Optional override for the number of GPUs to use
+
+The recipe class is specified inside the YAML via the `recipe._target_` key:
+```yaml
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
+```
 
 ### Train on a Single GPU
 
 For simple fine-tuning on a single GPU:
 
 ```bash
-automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 ### Train on Multiple GPUs (Single Node)
@@ -53,12 +59,12 @@ For interactive single-node jobs, the CLI automatically detects the number of av
 uses `torchrun` for multi-GPU training. You can manually specify the number of GPUs using the `--nproc-per-node` option:
 
 ```bash
-automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node=2
+automodel --nproc-per-node 2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 If you don't specify `--nproc-per-node`, it will use all available GPUs on your system.
 
-Looking for Slurm or multi-node? See [Run on a Cluster](./cluster.md).
+Looking for Slurm or cloud training? See [Slurm](./slurm.md) or [SkyPilot](./skypilot.md).
 
 ## Run with uv (Development Mode)
 
@@ -67,7 +73,7 @@ When you need more control over the environment or are actively developing with 
 ### Train on a Single GPU
 
 ```bash
-uv run examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+uv run nemo_automodel/recipes/llm/train_ft.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 ### Train on Multiple GPUs with Torchrun (Single Node)
@@ -75,7 +81,7 @@ uv run examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama
 For multi-GPU single-node training, use `torchrun` directly:
 
 ```bash
-uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+uv run torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/train_ft.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 ### Why Use uv?
@@ -95,13 +101,13 @@ If you have NeMo AutoModel installed in your environment and prefer to run recip
 ### Train on a Single GPU
 
 ```bash
-python examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+python nemo_automodel/recipes/llm/train_ft.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 ### Train on Multiple GPUs (Single Node)
 
 ```bash
-torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/train_ft.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 This approach requires that you have already installed NeMo AutoModel and its dependencies in your Python environment (see the [installation guide](../guides/installation.md) for details).
@@ -113,7 +119,7 @@ All approaches use the same YAML configuration files. You can easily customize t
 1. **Override config values**: Use command-line arguments to directly replace default settings.
 For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/Llama-3.2-1B`, you can use:
    ```bash
-   automodel finetune llm -c config.yaml --model.pretrained_model_name_or_path Qwen/Qwen3-0.6B
+   automodel config.yaml --model.pretrained_model_name_or_path Qwen/Qwen3-0.6B
    ```
 
 2. **Edit the config file**: Modify the YAML directly for persistent changes.
@@ -141,4 +147,4 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
 - You're working in environments where uv is not available
 - You're integrating with existing PyTorch workflows
 
-All approaches use the same configuration files and provide the same training capabilities on a single node. For Slurm-based multi-node training, see [Run on a Cluster](./cluster.md).
+All approaches use the same configuration files and provide the same training capabilities on a single node. For multi-node training, see [Run on a Cluster](./slurm.md).

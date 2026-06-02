@@ -16,7 +16,7 @@
 # Fine-tune Llama-3.2-1B on SQuAD using SkyPilot for cloud execution.
 #
 # Usage:
-#   automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot.yaml
+#   automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot.yaml
 #
 # Prerequisites:
 #   pip install "skypilot[gcp]"   # or [aws], [azure], etc.
@@ -25,6 +25,12 @@
 # Monitor:
 #   sky status
 #   sky logs <cluster_name>
+
+# ---------------------------------------------------------------------------
+# Training config (forwarded to the VM unchanged)
+# ---------------------------------------------------------------------------
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
 
 # ---------------------------------------------------------------------------
 # SkyPilot launcher config (removed before the job config reaches the VM)
@@ -46,9 +52,6 @@ skypilot:
   # setup: |
   #   pip install some-extra-dependency
 
-# ---------------------------------------------------------------------------
-# Training config (forwarded to the VM unchanged)
-# ---------------------------------------------------------------------------
 step_scheduler:
   global_batch_size: 64
   local_batch_size: 8
@@ -123,3 +126,6 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
+
+ci:
+  recipe_owner: adil-a

@@ -13,15 +13,15 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc_per_node 8
-#     --nnodes $NNODES
-#     --master_addr $MASTER_ADDR
-#     --master_port 29400
-#     --node_rank $NODE_RANK
-#     examples/llm_pretrain/pretrain.py
-#     --config examples/llm_pretrain/deepseekv3_pretrain.yaml
 
+# To run this recipe on Slurm:
+#   cp slurm.sub my_cluster.sub
+#   # In my_cluster.sub, set CONFIG to this file and request 16 nodes x 8 GPUs.
+#   sbatch my_cluster.sub
+# This config uses pp_size=8, dp_size=16, and ep_size=16, so the configured
+# world size is 128 GPUs.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 512
@@ -42,6 +42,10 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  # Precision note: this config intentionally keeps the default bf16 training
+  # dtype. See docs/guides/mixed-precision-training.md for the fp32 optimizer-state
+  # options. We will update this path once DeepSeek can be validated cleanly;
+  # current attempts fail in DeepEP dispatch before we can compare memory.
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
@@ -70,7 +74,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: false
 
 distributed:
   strategy: fsdp2
@@ -148,4 +152,3 @@ lr_scheduler:
   lr_decay_style: cosine
   lr_warmup_steps: 500
   min_lr: 0.0
-

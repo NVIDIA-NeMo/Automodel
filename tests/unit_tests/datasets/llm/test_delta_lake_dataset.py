@@ -16,7 +16,6 @@
 
 import os
 import sys
-import tempfile
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -504,4 +503,3 @@ class TestDeletionVectorsFallback:
                     it = mod.DeltaLakeIterator(table_path="delta:///tmp/table")
                     with pytest.raises(ImportError, match=r"Spark|pyspark|Databricks"):
                         _ = list(it)
-

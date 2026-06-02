@@ -57,6 +57,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     HunyuanParallelizationStrategy,
     WanParallelizationStrategy,
 )
+from nemo_automodel.shared.import_utils import safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
 
 # diffusers is an optional dependency
@@ -204,6 +205,132 @@ def _ensure_params_trainable(module: nn.Module, module_name: Optional[str] = Non
     return num_trainable_parameters
 
 
+def _is_fp8_training_safe_linear(name: str, linear: nn.Linear) -> bool:
+    """Return whether a Linear has shapes that are safe for FP8 training kernels."""
+    if linear.weight.shape[0] % 16 != 0 or linear.weight.shape[1] % 16 != 0:
+        return False
+    if name.startswith(("time_text_embed.", "norm_out.")):
+        return False
+    if name.endswith(".linear") and any(norm_name in name for norm_name in (".norm.", ".norm1.", ".norm1_context.")):
+        return False
+    return True
+
+
+def _replace_linear_with_transformer_engine(
+    module: nn.Module,
+    module_name: str,
+    *,
+    fp8_safe_only: bool = False,
+) -> int:
+    """Replace torch Linear modules with Transformer Engine Linear modules."""
+    has_te, transformer_engine = safe_import_te()
+    if not has_te:
+        raise ImportError("model.transformer_engine_linear=true requires transformer_engine.pytorch to be importable")
+
+    te_linear_cls = transformer_engine.pytorch.Linear
+    converted = 0
+    skipped = 0
+
+    def replace_children(parent: nn.Module, prefix: str = "") -> None:
+        nonlocal converted, skipped
+        for child_name, child in list(parent.named_children()):
+            child_fqn = f"{prefix}.{child_name}" if prefix else child_name
+            if isinstance(child, nn.Linear):
+                if fp8_safe_only and not _is_fp8_training_safe_linear(child_fqn, child):
+                    skipped += 1
+                    logger.info(
+                        "[TE] Keeping %s.%s as torch.nn.Linear for FP8 shape compatibility; weight shape=%s",
+                        module_name,
+                        child_fqn,
+                        tuple(child.weight.shape),
+                    )
+                    continue
+                te_linear = te_linear_cls(
+                    child.in_features,
+                    child.out_features,
+                    bias=child.bias is not None,
+                    device=child.weight.device,
+                    params_dtype=child.weight.dtype,
+                )
+                te_linear.train(child.training)
+                with torch.no_grad():
+                    te_linear.weight.copy_(child.weight)
+                    te_linear.weight.requires_grad_(child.weight.requires_grad)
+                    if child.bias is not None:
+                        te_linear.bias.copy_(child.bias)
+                        te_linear.bias.requires_grad_(child.bias.requires_grad)
+                setattr(parent, child_name, te_linear)
+                converted += 1
+            elif not isinstance(child, te_linear_cls):
+                replace_children(child, child_fqn)
+
+    replace_children(module)
+    logger.info(
+        "[TE] Replaced %d torch.nn.Linear modules with Transformer Engine Linear in %s; skipped=%d fp8_safe_only=%s",
+        converted,
+        module_name,
+        skipped,
+        fp8_safe_only,
+    )
+    return converted
+
+
+def _remove_child_module(parent: nn.Module, child_name: str) -> int:
+    """Remove a child module and return the number of parameters it owned."""
+    child = getattr(parent, child_name, None)
+    if not isinstance(child, nn.Module):
+        return 0
+
+    parameter_count = sum(parameter.numel() for parameter in child.parameters())
+    delattr(parent, child_name)
+    return parameter_count
+
+
+def _compact_fused_qkv_projection_modules(module: nn.Module, module_name: str) -> tuple[int, int]:
+    """Remove original projection modules that are unused after Diffusers QKV fusion."""
+    removed_modules = 0
+    removed_parameters = 0
+
+    for child in list(module.modules()):
+        if not getattr(child, "fused_projections", False):
+            continue
+
+        if hasattr(child, "to_qkv"):
+            for projection_name in ("to_q", "to_k", "to_v"):
+                parameter_count = _remove_child_module(child, projection_name)
+                if parameter_count:
+                    removed_modules += 1
+                    removed_parameters += parameter_count
+
+        if hasattr(child, "to_added_qkv"):
+            for projection_name in ("add_q_proj", "add_k_proj", "add_v_proj"):
+                parameter_count = _remove_child_module(child, projection_name)
+                if parameter_count:
+                    removed_modules += 1
+                    removed_parameters += parameter_count
+
+    logger.info(
+        "[QKV] Removed %d original projection modules with %s parameters after fused QKV setup in %s",
+        removed_modules,
+        f"{removed_parameters:,}",
+        module_name,
+    )
+    return removed_modules, removed_parameters
+
+
+def _fuse_transformer_qkv_projections(module: nn.Module, module_name: str, *, compact: bool = False) -> int:
+    """Fuse Diffusers attention QKV projections when the transformer exposes that hook."""
+    if not hasattr(module, "fuse_qkv_projections"):
+        raise AttributeError(f"model.fuse_qkv_projections=true requires {module_name} to expose fuse_qkv_projections()")
+
+    module.fuse_qkv_projections()
+    fused = sum(1 for child in module.modules() if getattr(child, "fused_projections", False))
+    logger.info("[QKV] Fused QKV projections for %d attention modules in %s", fused, module_name)
+    if compact:
+        _compact_fused_qkv_projection_modules(module, module_name)
+    return fused
+
+
 def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
     """
     Factory function to create the appropriate parallel manager based on config.
@@ -260,8 +387,14 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
             backend=args.get("backend", "nccl"),
             sequence_parallel=args.get("sequence_parallel", False),
             tp_plan=args.get("tp_plan", None),
+            patch_is_packed_sequence=args.get("patch_is_packed_sequence", False),
             offload_policy=args.get("offload_policy", None),
             defer_fsdp_grad_sync=args.get("defer_fsdp_grad_sync", True),
+            enable_async_tensor_parallel=args.get("enable_async_tensor_parallel", False),
+            enable_compile=args.get("enable_compile", False),
+            enable_fsdp2_prefetch=args.get("enable_fsdp2_prefetch", False),
+            fsdp2_backward_prefetch_depth=args.get("fsdp2_backward_prefetch_depth", 2),
+            fsdp2_forward_prefetch_depth=args.get("fsdp2_forward_prefetch_depth", 1),
         )
 
         world_size = args.get("world_size") or torch.distributed.get_world_size()
@@ -303,6 +436,8 @@ def _apply_parallelization(
         manager = _create_parallel_manager(manager_args)
         created_managers[comp_name] = manager
         parallel_module = manager.parallelize(comp_module)
+        if hasattr(manager, "maybe_compile"):
+            manager.maybe_compile(parallel_module)
         setattr(pipe, comp_name, parallel_module)
 
     return created_managers
@@ -365,6 +500,12 @@ class NeMoAutoDiffusionPipeline:
         move_to_device: bool = True,
         load_for_training: bool = False,
         components_to_load: Optional[Iterable[str]] = None,
+        peft_cfg=None,
+        model_type=None,
+        transformer_engine_linear: bool = False,
+        transformer_engine_fp8_safe_only: bool = False,
+        fuse_qkv_projections: bool = False,
+        compact_fused_qkv_projections: bool = False,
         **kwargs,
     ) -> Tuple[DiffusionPipeline, Dict[str, ParallelManager]]:
         """
@@ -384,6 +525,14 @@ class NeMoAutoDiffusionPipeline:
             move_to_device: Whether to move modules to device
             load_for_training: Whether to make parameters trainable
             components_to_load: Which components to process (default: all)
+            peft_cfg: PeftConfig instance or None. When provided, LoRA is injected
+                before _apply_parallelization() (FSDP2 wrapping). Base weights
+                are frozen after FSDP2; LoRA params are collected pre-FSDP2 and stored on pipe.
+            model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
+            transformer_engine_linear: Whether to replace torch.nn.Linear modules in the transformer with TE Linear.
+            transformer_engine_fp8_safe_only: Whether to skip TE Linear conversion for known FP8-incompatible modules.
+            fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer.
+            compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
         Returns:
@@ -417,15 +566,102 @@ class NeMoAutoDiffusionPipeline:
                     logger.info("[INFO] Moving module: %s to device/dtype", name)
                     _move_module_to_device(module, dev, torch_dtype)
 
-        # If loading for training, ensure the target module parameters are trainable
-        if load_for_training:
+        if compact_fused_qkv_projections and not fuse_qkv_projections:
+            raise ValueError("model.compact_fused_qkv_projections=true requires model.fuse_qkv_projections=true")
+
+        if fuse_qkv_projections:
             for name, module in _iter_pipeline_modules(pipe):
-                if not components_to_load or name in components_to_load:
-                    logger.info("[INFO] Ensuring params trainable: %s", name)
-                    _ensure_params_trainable(module, module_name=name)
+                if name == "transformer" and (not components_to_load or name in components_to_load):
+                    _fuse_transformer_qkv_projections(module, name, compact=compact_fused_qkv_projections)
+
+        if transformer_engine_linear:
+            for name, module in _iter_pipeline_modules(pipe):
+                if name == "transformer" and (not components_to_load or name in components_to_load):
+                    _replace_linear_with_transformer_engine(
+                        module,
+                        name,
+                        fp8_safe_only=transformer_engine_fp8_safe_only,
+                    )
+
+        if peft_cfg is not None:
+            # ── LoRA path ─────────────────────────────────────────────────────
+            # LoRA injection MUST run before _apply_parallelization (FSDP2).
+            # FSDP2 must see the final module structure (with LoRA-patched linears)
+            # to correctly shard both base weights and LoRA weights.
+            # Pre-FSDP2 lora_params refs are stored on pipe and remain valid
+            # after wrapping (FSDP2 preserves original Parameter objects).
+            if model_type is None:
+                raise ValueError("model_type must be set when peft_cfg is provided. Options: 'flux', 'wan', 'hunyuan'")
+            import dataclasses
+
+            from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+
+            pipe._lora_params = {}
+            pipe._peft_config = None
+
+            for name, module in _iter_pipeline_modules(pipe):
+                if name == "transformer":
+                    # Pre-inject hook: Wan fuses to_q/to_k/to_v for inference
+                    # efficiency — must unfuse before injection so individual
+                    # Linear modules are visible to the module matcher.
+                    if model_type == "wan":
+                        for block in module.blocks:
+                            block.attn1.unfuse_projections()
+                            block.attn2.unfuse_projections()
+                        logger.info("[LoRA] Wan: unfused attention projection groups")
+
+                    # Ensure LoRA weights are bf16 to match base weights in the
+                    # FSDP2 unit — mixed dtypes cause reduce-scatter to malfunction.
+                    cfg = peft_cfg
+                    if cfg.lora_dtype is None:
+                        cfg = dataclasses.replace(cfg, lora_dtype=torch.bfloat16)
+
+                    # skip_freeze=True: global base-weight freeze happens after
+                    # FSDP2 wrapping (see below). FSDP2 must see all params as
+                    # trainable during fully_shard() so gradient reduction is set
+                    # up correctly for LoRA params.
+                    apply_lora_to_linear_modules(module, cfg, skip_freeze=True)
+
+                    lora_params = [p for n, p in module.named_parameters() if "lora_" in n and p.requires_grad]
+                    pipe._lora_params[name] = lora_params
+                    pipe._peft_config = cfg
+                    logger.info(
+                        "[LoRA] Stored %d lora_param tensors before FSDP2",
+                        len(lora_params),
+                    )
+        else:
+            # If loading for training, ensure the target module parameters are trainable
+            if load_for_training:
+                for name, module in _iter_pipeline_modules(pipe):
+                    if not components_to_load or name in components_to_load:
+                        logger.info("[INFO] Ensuring params trainable: %s", name)
+                        _ensure_params_trainable(module, module_name=name)
+
+        if peft_cfg is not None:
+            transformer_parallel_args = (parallel_scheme or {}).get("transformer", {})
+            manager_type = str(transformer_parallel_args.get("_manager_type", "fsdp2")).lower()
+            if manager_type == "ddp":
+                for param_name, param in pipe.transformer.named_parameters():
+                    if "lora_" not in param_name and param.requires_grad:
+                        param.requires_grad_(False)
+                logger.info("[LoRA] Froze base weights before DDP wrapping")
 
         # Apply parallelization (FSDP2 or DDP)
+        # FSDP2 LoRA: all params are trainable when fully_shard() runs so FSDP2
+        # sets up gradient reduction for lora_A/lora_B correctly. Freeze happens below.
+        # DDP LoRA: base weights are frozen before wrapping so DDP only reduces LoRA gradients.
         created_managers = _apply_parallelization(pipe, parallel_scheme)
+
+        # Freeze base weights after FSDP2 wrapping — mirrors the LLM pattern in
+        # nemo_automodel/_transformers/infrastructure.py lines 513-518.
+        # FSDP2 must see all params as trainable during fully_shard(); freezing
+        # before wrapping causes gradient reduction to malfunction for LoRA params.
+        # For DDP this is harmless because the base was already frozen before wrapping.
+        if peft_cfg is not None:
+            for name, param in pipe.transformer.named_parameters():
+                if "lora_" not in name and param.requires_grad:
+                    param.requires_grad_(False)
+            logger.info("[LoRA] Froze base weights after parallelization")
 
         return pipe, created_managers
 
@@ -439,6 +675,10 @@ class NeMoAutoDiffusionPipeline:
         parallel_scheme: Optional[Dict[str, Dict[str, Any]]] = None,
         move_to_device: bool = True,
         components_to_load: Optional[Iterable[str]] = None,
+        transformer_engine_linear: bool = False,
+        transformer_engine_fp8_safe_only: bool = False,
+        fuse_qkv_projections: bool = False,
+        compact_fused_qkv_projections: bool = False,
         **kwargs,
     ) -> Tuple["NeMoAutoDiffusionPipeline", Dict[str, ParallelManager]]:
         """
@@ -460,6 +700,10 @@ class NeMoAutoDiffusionPipeline:
             parallel_scheme: Dict mapping component names to parallel manager kwargs
             move_to_device: Whether to move modules to device
             components_to_load: Which components to process (default: all)
+            transformer_engine_linear: Whether to replace torch.nn.Linear modules in the transformer with TE Linear.
+            transformer_engine_fp8_safe_only: Whether to skip TE Linear conversion for known FP8-incompatible modules.
+            fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer.
+            compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
             **kwargs: Additional arguments
 
         Returns:
@@ -517,9 +761,23 @@ class NeMoAutoDiffusionPipeline:
                 transformer = transformer.to(dev)
             pipe = cls(transformer=transformer)
 
+        if compact_fused_qkv_projections and not fuse_qkv_projections:
+            raise ValueError("model.compact_fused_qkv_projections=true requires model.fuse_qkv_projections=true")
+
+        if fuse_qkv_projections:
+            for name, module in _iter_pipeline_modules(pipe):
+                if name == "transformer" and (not components_to_load or name in components_to_load):
+                    _fuse_transformer_qkv_projections(module, name, compact=compact_fused_qkv_projections)
+
         # Make parameters trainable (always true for from_config / pretraining)
         for name, module in _iter_pipeline_modules(pipe):
             if not components_to_load or name in components_to_load:
+                if transformer_engine_linear and name == "transformer":
+                    _replace_linear_with_transformer_engine(
+                        module,
+                        name,
+                        fp8_safe_only=transformer_engine_fp8_safe_only,
+                    )
                 _ensure_params_trainable(module, module_name=name)
 
         # Apply parallelization (FSDP2 or DDP)

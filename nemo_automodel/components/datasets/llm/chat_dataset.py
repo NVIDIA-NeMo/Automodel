@@ -52,11 +52,25 @@ def _as_iter(val: Union[str, Sequence[str]]) -> Iterator[str]:
 _SPLIT_SLICE_RE = re.compile(r"^(\w+)\[(\d*):(\d*)\]$")
 
 
+def _parse_split_slice(split: Optional[str]):
+    """Parse a split string like ``"train[1024:]"`` into ``(base_split, slice | None)``."""
+    if split is None:
+        return split, None
+    match = _SPLIT_SLICE_RE.match(split)
+    if not match:
+        return split, None
+    base = match.group(1)
+    start = int(match.group(2)) if match.group(2) else None
+    end = int(match.group(3)) if match.group(3) else None
+    return base, slice(start, end)
+
+
 def _load_openai_messages(
     path_or_dataset_id: Union[str, Sequence[str]],
     split: Optional[str] = None,
     name: Optional[str] = None,
     shuffle_seed: Optional[int] = None,
+    skip_invalid_samples: bool = False,
 ):
     """Load OpenAI chat messages datasets from HF or local JSON/JSONL files.
 
@@ -75,18 +89,11 @@ def _load_openai_messages(
         name: Dataset configuration/subset name
         shuffle_seed: Random seed for shuffling HF datasets before slicing.
             Set to ``None`` to disable shuffling.
+        skip_invalid_samples: If ``True``, skip malformed JSONL lines for local
+            files instead of failing fast.
     """
     if isinstance(path_or_dataset_id, str) and _is_hf_repo_id(path_or_dataset_id):
-        # Parse split string: "train[1024:]" -> base="train", slice(1024, None)
-        base_split = split
-        sl = None
-        if split is not None:
-            match = _SPLIT_SLICE_RE.match(split)
-            if match:
-                base_split = match.group(1)
-                start = int(match.group(2)) if match.group(2) else None
-                end = int(match.group(3)) if match.group(3) else None
-                sl = slice(start, end)
+        base_split, sl = _parse_split_slice(split)
 
         dataset = load_dataset(
             path_or_dataset_id,
@@ -113,15 +120,7 @@ def _load_openai_messages(
 
         if is_parquet_file or is_dataset_dir:
             logging.getLogger(__name__).info("Loading local dataset from %s via load_dataset", path_or_dataset_id)
-            base_split = split
-            sl = None
-            if split is not None:
-                match = _SPLIT_SLICE_RE.match(split)
-                if match:
-                    base_split = match.group(1)
-                    start = int(match.group(2)) if match.group(2) else None
-                    end = int(match.group(3)) if match.group(3) else None
-                    sl = slice(start, end)
+            base_split, sl = _parse_split_slice(split)
 
             load_path = str(p.parent) if is_parquet_file else str(p)
             # Cached Parquet datasets (from prefilter_dataset.py) are saved as a single
@@ -155,11 +154,23 @@ def _load_openai_messages(
             raise FileNotFoundError(f"File not found: {fp}")
         text = p.read_text(encoding="utf-8")
         if p.suffix.lower() in {".jsonl", ".ndjson"}:
+            skipped_lines = 0
             for line in text.splitlines():
                 line = line.strip()
                 if not line:
                     continue
-                rows.append(json.loads(line))
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    if not skip_invalid_samples:
+                        raise
+                    skipped_lines += 1
+            if skipped_lines:
+                logging.getLogger(__name__).warning(
+                    "Skipped %d malformed JSONL line(s) from %s (skip_invalid_samples=True)",
+                    skipped_lines,
+                    fp,
+                )
         else:
             obj = json.loads(text)
             if isinstance(obj, list):
@@ -179,28 +190,140 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     - Keeps tool_calling fields if present (e.g., tool calls in assistant messages, tool role messages).
     - If content is a list of parts, only keep text parts.
     """
+
+    def _normalize_content(value: Any) -> str:
+        if isinstance(value, list):
+            return " ".join(part["text"] for part in value if isinstance(part, dict) and "text" in part)
+        if value is None:
+            return ""
+        return str(value)
+
+    def _normalize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
+        if not isinstance(tool_calls, list):
+            raise ValueError("assistant message `tool_calls` must be a list")
+
+        normalized_tool_calls: List[Dict[str, Any]] = []
+        for idx, tool_call in enumerate(tool_calls):
+            if not isinstance(tool_call, dict):
+                raise ValueError(f"assistant message `tool_calls[{idx}]` must be a dict")
+
+            tool_call_id = tool_call.get("id")
+            if tool_call_id is None or tool_call_id == "":
+                tool_call_id = f"call_{idx}"
+            elif not isinstance(tool_call_id, str):
+                raise ValueError(f"assistant message `tool_calls[{idx}].id` must be a string when provided")
+
+            tool_call_type = tool_call.get("type")
+            if tool_call_type is None or tool_call_type == "":
+                tool_call_type = "function"
+            elif not isinstance(tool_call_type, str):
+                raise ValueError(f"assistant message `tool_calls[{idx}].type` must be a string when provided")
+
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                raise ValueError(f"assistant message `tool_calls[{idx}].function` must be a dict")
+
+            function_name = function.get("name")
+            if not isinstance(function_name, str) or not function_name:
+                raise ValueError(f"assistant message `tool_calls[{idx}].function.name` must be a non-empty string")
+
+            function_arguments = function.get("arguments")
+            if function_arguments is None:
+                raise ValueError(f"assistant message `tool_calls[{idx}].function.arguments` is required")
+
+            normalized_function = dict(function)
+            if not isinstance(function_arguments, str):
+                normalized_function["arguments"] = json.dumps(function_arguments)
+
+            normalized_tool_call = dict(tool_call)
+            normalized_tool_call["id"] = tool_call_id
+            normalized_tool_call["type"] = tool_call_type
+            normalized_tool_call["function"] = normalized_function
+            normalized_tool_calls.append(normalized_tool_call)
+
+        return normalized_tool_calls
+
     norm: List[Dict[str, Any]] = []
     for m in messages:
         role = m.get("role")
-        content = m.get("content")
         out = dict(m)
-        if isinstance(content, list):
-            out["content"] = " ".join(part["text"] for part in content if isinstance(part, dict) and "text" in part)
-        else:
-            out["content"] = str(content)
         if role not in {"system", "user", "assistant", "tool"}:
             raise ValueError(f"Unsupported role in messages: {role}")
+
+        out["content"] = _normalize_content(m.get("content"))
+
+        if role == "assistant":
+            if "reasoning_content" in m:
+                reasoning_content = m.get("reasoning_content")
+                if reasoning_content is None:
+                    out["reasoning_content"] = ""
+                else:
+                    if not isinstance(reasoning_content, str):
+                        raise ValueError("assistant message `reasoning_content` must be a string when provided")
+                    out["reasoning_content"] = reasoning_content
+            if "tool_calls" in m:
+                out["tool_calls"] = _normalize_tool_calls(m.get("tool_calls"))
+
+        if role == "tool":
+            tool_call_id = m.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                raise ValueError("tool message `tool_call_id` must be a non-empty string")
+
         norm.append(out)
     return norm
+
+
+# ShareGPT ``from`` role -> OpenAI ``role``. Covers the plain-chat roles that
+# datasets such as PerfectBlend ship under a ``conversations`` column. Tool-call
+# agent traces (``function_call`` / ``observation`` / ``tool_call``) are out of
+# scope here -- use the agent SFT dataset (``make_agent_chat_dataset``) for those.
+_SHAREGPT_ROLE_MAP = {
+    "system": "system",
+    "human": "user",
+    "user": "user",
+    "gpt": "assistant",
+    "assistant": "assistant",
+    "chatgpt": "assistant",
+    "model": "assistant",
+    "bot": "assistant",
+}
+
+
+def _conversations_to_messages(conversations: Any) -> List[Dict[str, Any]]:
+    """Convert a ShareGPT ``conversations`` list to OpenAI ``messages``.
+
+    ShareGPT-style rows store turns as ``{"from": <role>, "value": <text>}`` under
+    a ``conversations`` column instead of OpenAI ``{"role", "content"}`` under
+    ``messages``. Map the common plain-chat roles so such datasets load without a
+    manual rename. Raises on an unsupported role rather than guessing.
+    """
+    if not isinstance(conversations, list):
+        raise ValueError(f"`conversations` must be a list of turns, got {type(conversations).__name__}")
+    messages: List[Dict[str, Any]] = []
+    for turn in conversations:
+        if not isinstance(turn, dict):
+            raise ValueError(f"Each `conversations` turn must be a dict, got {type(turn).__name__}")
+        src_role = turn.get("from", turn.get("role"))
+        role = _SHAREGPT_ROLE_MAP.get(src_role)
+        if role is None:
+            raise ValueError(
+                f"Unsupported ShareGPT role {src_role!r} in `conversations`. Supported plain-chat "
+                f"roles: {sorted(_SHAREGPT_ROLE_MAP)}. For tool-calling traces use the agent SFT "
+                "dataset (make_agent_chat_dataset)."
+            )
+        messages.append({"role": role, "content": turn.get("value", turn.get("content", ""))})
+    return messages
 
 
 class ChatDataset(Dataset):
     """Dataset for OpenAI-format tool-calling chat transcripts.
 
-    This class expects each row to contain a `messages` list in OpenAI chat format,
-    potentially including tool calls and tool responses. The datasetformats the
-    conversation via the tokenizer's chat template to produce `input_ids`, `labels`,
-    and `attention_mask` suitable for SFT.
+    Each row should contain a `messages` list in OpenAI chat format (`role` /
+    `content`), potentially including tool calls and tool responses. Rows that
+    instead carry a ShareGPT `conversations` list (`from` / `value`, as used by
+    PerfectBlend and similar) are auto-converted, so no manual column rename is
+    needed. The conversation is formatted via the tokenizer's chat template to
+    produce `input_ids`, `labels`, and `attention_mask` suitable for SFT.
     """
 
     def __init__(
@@ -216,7 +339,29 @@ class ChatDataset(Dataset):
         start_of_turn_token: Optional[str] = None,
         chat_template: Optional[str] = None,
         shuffle_seed: Optional[int] = None,
+        mask_reasoning_content: bool = False,
+        unshifted: bool = False,
+        skip_invalid_samples: bool = False,
     ) -> None:
+        """Load OpenAI-format chat rows and tokenize via the chat template.
+
+        Args:
+            path_or_dataset_id: Hugging Face dataset id, local JSON/JSONL path(s), Parquet file, or Parquet directory.
+            tokenizer: Tokenizer with chat template support (required).
+            split: Dataset split or slice (e.g. ``train``, ``train[1024:]``).
+            name: Optional Hub subset / config name.
+            seq_length: Maximum sequence length for padding and truncation in formatting.
+            padding: Padding mode for ``format_chat_template``.
+            truncation: Truncation mode for ``format_chat_template``.
+            start_of_turn_token: Optional token marking assistant turns for answer-only loss.
+            chat_template: Optional Jinja template string overriding ``tokenizer.chat_template``.
+            shuffle_seed: If set, shuffles Hub/Parquet data before applying a split slice.
+            mask_reasoning_content: If ``True``, exclude rendered reasoning traces from the loss mask.
+            unshifted: Passed through to ``format_chat_template``.
+            skip_invalid_samples: If ``True``, skip malformed JSONL lines when reading local files (warning logs
+                include skip counts). If ``False``, a bad line raises. Does not skip invalid structured rows after
+                load; those still raise when a sample is accessed.
+        """
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
 
@@ -232,8 +377,17 @@ class ChatDataset(Dataset):
         self.padding = padding
         self.truncation = truncation
         self.start_of_turn_token = start_of_turn_token
+        self.mask_reasoning_content = mask_reasoning_content
+        self.unshifted = unshifted
+        self.skip_invalid_samples = skip_invalid_samples
 
-        self.dataset = _load_openai_messages(path_or_dataset_id, split=split, name=name, shuffle_seed=shuffle_seed)
+        self.dataset = _load_openai_messages(
+            path_or_dataset_id,
+            split=split,
+            name=name,
+            shuffle_seed=shuffle_seed,
+            skip_invalid_samples=skip_invalid_samples,
+        )
 
         # Ensure pad token presence for downstream padding
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
@@ -245,12 +399,29 @@ class ChatDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
         row = self.dataset[idx]
         messages = row.get("messages")
+        if messages is None and row.get("conversations") is not None:
+            # ShareGPT layout (PerfectBlend etc.): convert {from, value} turns to
+            # OpenAI {role, content} so no manual column rename is needed.
+            messages = _conversations_to_messages(row["conversations"])
         if not isinstance(messages, list):
-            raise ValueError("Each sample must contain a `messages` list in OpenAI format")
+            raise ValueError(
+                "Each sample must contain a `messages` list (OpenAI format) or a `conversations` list (ShareGPT format)"
+            )
 
         normalized = _normalize_messages(messages)
         tools = row.get("tools")
+        if isinstance(tools, str):
+            # JSONL-stored datasets often serialize the `tools` field as a JSON
+            # string. Parse it so the chat template receives the tool defs;
+            # silently dropping them would leave the assistant tool_calls
+            # without a matching schema and corrupt the training signal.
+            try:
+                tools = json.loads(tools)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"`tools` is a string but not valid JSON: {e}") from e
         if tools is not None and not isinstance(tools, list):
+            raise ValueError(f"`tools` must be a list or JSON-encoded list, got {type(tools).__name__}")
+        if isinstance(tools, list) and len(tools) == 0:
             tools = None
 
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
@@ -263,5 +434,7 @@ class ChatDataset(Dataset):
             padding=self.padding,
             truncation=self.truncation,
             tools=tools,
+            mask_reasoning_content=self.mask_reasoning_content,
+            unshifted=self.unshifted,
         )
         return sample

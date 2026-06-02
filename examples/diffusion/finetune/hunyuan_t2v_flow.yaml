@@ -50,6 +50,8 @@ step_scheduler:
   global_batch_size: 8
   ckpt_every_steps: 1000
   log_every: 10
+  # max_steps: null  # Set to limit training to a specific number of steps
+  # save_checkpoint_every_epoch: true  # Set to false to disable epoch-boundary checkpoints
 
 data:
   dataloader:
@@ -66,7 +68,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
   diffusers_compatible: true
   restore_from: null
 
@@ -80,3 +82,7 @@ dist_env:
   init_method: "env://"
 
 seed: 42
+
+ci:
+  recipe_owner: pthombre
+  time: "01:30:00"

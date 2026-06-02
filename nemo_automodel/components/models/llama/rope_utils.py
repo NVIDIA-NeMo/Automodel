@@ -67,6 +67,31 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+def apply_rotary_pos_emb_fused(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Applies RoPE using TE's fused kernel.
+
+    Args:
+        q: Query tensor [batch, num_heads, seq_len, head_dim]
+        k: Key tensor [batch, num_kv_heads, seq_len, head_dim]
+        freqs_cis: Raw angles [seq_len, 1, 1, head_dim] in TE format
+
+    Returns:
+        Rotated (q, k) tensors
+    """
+    from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb as te_apply_rope
+
+    # TE expects bshd format: [batch, seq, heads, head_dim]
+    q_bshd = q.permute(0, 2, 1, 3)
+    k_bshd = k.permute(0, 2, 1, 3)
+    q_bshd = te_apply_rope(q_bshd, freqs_cis, tensor_format="bshd", fused=True)
+    k_bshd = te_apply_rope(k_bshd, freqs_cis, tensor_format="bshd", fused=True)
+    return q_bshd.permute(0, 2, 1, 3), k_bshd.permute(0, 2, 1, 3)
+
+
 def _get_rope_config(config) -> tuple[float, dict]:
     """Extract rope parameters from config (handles both Llama and Qwen2 formats).
 
@@ -138,9 +163,10 @@ class LlamaRotaryEmbedding(nn.Module):
 
     inv_freq: torch.Tensor
 
-    def __init__(self, config, device: Optional[torch.device] = None):
+    def __init__(self, config, device: Optional[torch.device] = None, rope_fusion: bool = False):
         super().__init__()
         self.max_seq_len_cached = 0
+        self.rope_fusion = rope_fusion
         self.dtype = getattr(config, "torch_dtype", None) or torch.float32
 
         # Map rope types to their respective computation functions
@@ -160,6 +186,7 @@ class LlamaRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("_cos_cache", None, persistent=False)
         self.register_buffer("_sin_cache", None, persistent=False)
+        self.register_buffer("_freqs_cache", None, persistent=False)
 
     def _build_cache(self, seq_len: int, device: torch.device) -> None:
         """Build cos/sin cache in config dtype for positions [0, seq_len)."""
@@ -173,6 +200,14 @@ class LlamaRotaryEmbedding(nn.Module):
 
         self._cos_cache = (emb.cos() * self.attention_scaling).to(self.dtype)
         self._sin_cache = (emb.sin() * self.attention_scaling).to(self.dtype)
+        if self.rope_fusion:
+            # TE fused rope expects raw angles in [seq, 1, 1, head_dim] format
+            self._freqs_cache = emb.to(self.dtype).unsqueeze(1).unsqueeze(1).contiguous()
+
+    def _ensure_cache(self, seq_len: int, device: torch.device) -> None:
+        """Build or grow the cos/sin cache so it covers positions ``[0, seq_len)``."""
+        if self._cos_cache is None or seq_len > self.max_seq_len_cached:
+            self._build_cache(seq_len, device)
 
     @torch.no_grad()
     def forward(
@@ -182,6 +217,21 @@ class LlamaRotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (cos, sin) for the given positions.
 
+        In the non-fused path ``cos`` / ``sin`` are gathered by the *values* in
+        ``position_ids``, so non-contiguous positions receive the correct rotary
+        phase: EAGLE TTT depth offsets (``arange(seq_len) + step_idx``), packed
+        sequences, and context parallelism all pass
+        ``position_ids != arange(seq_len)``. The earlier implementation returned
+        ``cos_cache[:seq_len]``, which keyed only on the sequence *length* and
+        silently ignored the position values. For the common
+        ``position_ids == arange(seq_len)`` case the gather is numerically
+        identical to that slice.
+
+        The fused TE path (``rope_fusion=True``) consumes raw angles indexed by
+        sequence position and assumes contiguous ``[0, seq_len)`` positions, so
+        it keeps the legacy contiguous slice and does NOT honor non-contiguous
+        ``position_ids``.
+
         Args:
             x: Input tensor (used for device and dtype)
             position_ids: Position IDs tensor [batch, seq_len]
@@ -189,16 +239,26 @@ class LlamaRotaryEmbedding(nn.Module):
         Returns:
             (cos, sin) tensors [batch, seq_len, head_dim]
         """
-        seq_len = position_ids.shape[-1]
+        if self.rope_fusion:
+            # The fused TE kernel indexes raw angles by sequence position and
+            # assumes contiguous ``[0, seq_len)`` positions, so it only needs the
+            # cache sized to ``seq_len`` -- and must avoid the ``position_ids``
+            # host-device sync below on this default GPU training path.
+            seq_len = position_ids.shape[-1]
+            self._ensure_cache(seq_len, x.device)
+            cos = self._cos_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
+            sin = self._sin_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
+            return cos, sin, self._freqs_cache[:seq_len]
 
-        # Build cache if needed
-        if self._cos_cache is None or seq_len > self.max_seq_len_cached:
-            self._build_cache(seq_len, x.device)
-
-        # Slice cache and expand for batch
-        cos = self._cos_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
-        sin = self._sin_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
-
+        # Non-fused: gather per-position. Size the cache to the highest requested
+        # position -- ``position_ids`` can exceed its own length (e.g. EAGLE TTT
+        # passes ``arange(seq_len) + k``), so ``seq_len`` alone is not a safe
+        # upper bound. This ``.item()`` sync only runs on the non-fused path.
+        needed = max(int(position_ids.max().item()) + 1, position_ids.shape[-1])
+        self._ensure_cache(needed, x.device)
+        # Gather per-position; identical to ``cos_cache[:seq_len]`` for arange.
+        cos = self._cos_cache[position_ids]
+        sin = self._sin_cache[position_ids]
         return cos, sin
 
 
@@ -213,4 +273,5 @@ __all__ = [
     "Qwen2RotaryEmbedding",
     "rotate_half",
     "apply_rotary_pos_emb",
+    "apply_rotary_pos_emb_fused",
 ]

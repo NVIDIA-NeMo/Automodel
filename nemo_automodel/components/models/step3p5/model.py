@@ -34,11 +34,11 @@ from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
-def parse_moe_layers_enum(moe_layers_enum: str | tuple | list | None, num_hidden_layers: int) -> set[int]:
+def parse_moe_layers_enum(moe_layers_enum: str | int | tuple | list | None, num_hidden_layers: int) -> set[int]:
     """Parse moe_layers_enum to get set of MoE layer indices.
 
     Args:
-        moe_layers_enum: Tuple/list of layer indices, comma-separated string, or None.
+        moe_layers_enum: Tuple/list of layer indices, integer, comma-separated string, or None.
             HF Step-3.5-Flash uses tuple format like (3, 4, 5, ..., 44).
         num_hidden_layers: Total number of hidden layers.
 
@@ -48,6 +48,8 @@ def parse_moe_layers_enum(moe_layers_enum: str | tuple | list | None, num_hidden
     if moe_layers_enum is not None:
         if isinstance(moe_layers_enum, (tuple, list)):
             return set(int(i) for i in moe_layers_enum)
+        elif isinstance(moe_layers_enum, int):
+            return {moe_layers_enum}
         elif isinstance(moe_layers_enum, str):
             return set(int(i) for i in moe_layers_enum.strip().split(","))
         else:
@@ -55,6 +57,18 @@ def parse_moe_layers_enum(moe_layers_enum: str | tuple | list | None, num_hidden
     else:
         # Default: all layers except layer 0 are MoE
         return set(range(1, num_hidden_layers))
+
+
+def _keep_step_router_bias_fp32(module: nn.Module) -> None:
+    """Keep Step router correction bias in fp32 after module-wide dtype casts."""
+    for submodule in module.modules():
+        bias = getattr(submodule, "e_score_correction_bias", None)
+        if bias is not None:
+            submodule.e_score_correction_bias.data = bias.data.float()
+
+        master = getattr(submodule, "e_score_correction_bias_master", None)
+        if master is not None:
+            submodule.e_score_correction_bias_master.data = master.data.float()
 
 
 class Block(nn.Module):
@@ -124,6 +138,8 @@ class Block(nn.Module):
                 expert_activation=moe_config.expert_activation,
                 activation_limit=swiglu_limit if swiglu_limit else moe_config.activation_limit,
                 dtype=moe_config.dtype,
+                softmax_before_topk=moe_config.softmax_before_topk,
+                force_e_score_correction_bias=moe_config.force_e_score_correction_bias,
             )
             self.moe = MoE(layer_moe_config, backend)
 
@@ -215,14 +231,24 @@ class Step3p5Model(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
     ) -> None:
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
         self.config.num_experts = config.moe_num_experts
 
         # Build MoE config from Step3p5 config
-        self.moe_config = moe_config or MoEConfig(
+        use_router_bias = getattr(config, "use_moe_router_bias", False)
+        router_activation = getattr(config, "moe_router_activation", "softmax")
+        if use_router_bias and router_activation == "sigmoid":
+            score_func = "sigmoid_with_bias"
+        else:
+            score_func = "sigmoid" if router_activation == "sigmoid" else "softmax"
+
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=getattr(config, "moe_intermediate_size", config.intermediate_size),
@@ -233,15 +259,19 @@ class Step3p5Model(nn.Module):
             n_limited_groups=0,
             train_gate=True,
             gate_bias_update_factor=0.0,
-            score_func="sigmoid" if getattr(config, "moe_router_activation", "softmax") == "sigmoid" else "softmax",
+            score_func=score_func,
             route_scale=getattr(config, "moe_router_scaling_factor", 1.0),
             aux_loss_coeff=0.0,
             norm_topk_prob=True,
-            router_bias=getattr(config, "use_moe_router_bias", False),
+            router_bias=False,
             expert_bias=False,
             expert_activation="swiglu",
             dtype=get_dtype(getattr(config, "torch_dtype", "bfloat16"), torch.bfloat16),
+            force_e_score_correction_bias=use_router_bias,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         # Embedding
         self.embed_tokens = nn.Embedding(
@@ -288,18 +318,39 @@ class Step3p5Model(nn.Module):
         layer_types = getattr(config, "layer_types", [])
         self.has_sliding_layers = "sliding_attention" in layer_types
 
+    def _apply(self, fn):
+        result = super()._apply(fn)
+        _keep_step_router_bias_fp32(self)
+        return result
+
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         *,
+        inputs_embeds: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("Step3p5Model requires input_ids or inputs_embeds.")
+
+        if inputs_embeds is None and self.embed_tokens is None:
+            if input_ids is not None and input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                inputs_embeds = input_ids
+                input_ids = None
+            else:
+                raise ValueError("inputs_embeds must be provided when embed_tokens is not present.")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
         if position_ids is None:
             position_ids = (
-                torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
+                torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
+                .unsqueeze(0)
+                .expand(inputs_embeds.shape[0], -1)
             )
 
         # Compute freqs_cis from RotaryEmbedding
@@ -311,7 +362,7 @@ class Step3p5Model(nn.Module):
             cp_size=attn_kwargs.get("cp_size", 1),
         )
 
-        h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
+        h = inputs_embeds
 
         for layer in self.layers.values():
             h = layer(
@@ -347,6 +398,8 @@ class Step3p5Model(nn.Module):
 
 class Step3p5ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Step3p5 model for causal language modeling."""
+
+    _keep_in_fp32_modules = ["rotary_emb"]
 
     @classmethod
     def from_config(
@@ -387,7 +440,8 @@ class Step3p5ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = Step3p5Model(config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model = Step3p5Model(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
 
         if self.backend.enable_hf_state_dict_adapter:

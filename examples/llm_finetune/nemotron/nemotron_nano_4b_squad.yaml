@@ -16,6 +16,8 @@
 # torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_4b_squad.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 64
   local_batch_size: 8
@@ -62,7 +64,7 @@ dataset:
   split: train
 
 packed_sequence:
-  packed_sequence_size: 1024
+  packed_sequence_size: 0
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -89,3 +91,7 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
+
+ci:
+  recipe_owner: adil-a
+  known_issue_id: AM-153

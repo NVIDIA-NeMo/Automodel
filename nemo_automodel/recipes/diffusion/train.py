@@ -14,8 +14,11 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
+import time
+from contextlib import nullcontext
 from math import ceil
 from typing import Any, Dict, Optional
 
@@ -27,14 +30,320 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.components.training.utils import (
+    clip_grad_norm,
+    prepare_after_first_microbatch,
+    prepare_for_final_backward,
+    prepare_for_grad_accumulation,
+)
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import build_distributed, build_wandb
+from nemo_automodel.shared.import_utils import safe_import_from
+from nemo_automodel.shared.utils import dtype_from_str
+
+_OPTIMIZER_DEFAULT_TARGET = "torch.optim.AdamW"
+_TORCH_DTYPE_ALIASES = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+}
+
+
+def _resolve_optimizer_dtype_strings(optimizer_cfg: Any) -> None:
+    """Resolve dtype strings in optimizer config objects in place."""
+    for attr in ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype"):
+        val = getattr(optimizer_cfg, attr, None)
+        if isinstance(val, str):
+            setattr(optimizer_cfg, attr, dtype_from_str(val))
+
+
+def _resolve_model_dtypes(cfg: Any) -> tuple[torch.dtype, torch.dtype]:
+    """Resolve model storage and compute dtypes from the recipe config."""
+    return (
+        dtype_from_str(cfg.get("model.torch_dtype", None), default=torch.bfloat16),
+        dtype_from_str(cfg.get("model.compute_dtype", None), default=torch.bfloat16),
+    )
+
+
+def _validate_precision_configuration(
+    dtype: torch.dtype,
+    compute_dtype: torch.dtype,
+    *,
+    ddp_cfg: Optional[Dict[str, Any]],
+    peft_cfg: Any,
+) -> None:
+    """Reject split storage/compute dtypes on paths without FSDP param casting."""
+    if dtype == compute_dtype:
+        return
+
+    unsupported_modes = []
+    if ddp_cfg is not None:
+        unsupported_modes.append("DDP")
+    if peft_cfg is not None:
+        unsupported_modes.append("PEFT/LoRA")
+    if not unsupported_modes:
+        return
+
+    modes = " and ".join(unsupported_modes)
+    raise ValueError(
+        f"model.torch_dtype ({dtype}) and model.compute_dtype ({compute_dtype}) must match for {modes}. "
+        "Split storage/compute dtypes require FSDP full-parameter training, where FSDP can cast gathered "
+        "parameters to the compute dtype."
+    )
+
+
+def _build_optimizer(
+    trainable_params: list[torch.nn.Parameter],
+    optimizer_cfg: Any,
+    learning_rate: float,
+    is_peft: bool = False,
+) -> torch.optim.Optimizer:
+    """Build optimizer from config, falling back to AdamW for legacy configs."""
+    optimizer_cfg = optimizer_cfg or {}
+    if isinstance(optimizer_cfg, dict) and "_target_" in optimizer_cfg:
+        optimizer_cfg = ConfigNode(optimizer_cfg)
+
+    if hasattr(optimizer_cfg, "_target_"):
+        _resolve_optimizer_dtype_strings(optimizer_cfg)
+        optimizer_target = optimizer_cfg._target_
+        optimizer_target_name = _get_optimizer_target_name(optimizer_target)
+        optimizer_cls = _resolve_optimizer_class(optimizer_target)
+        optimizer_dict = optimizer_cfg.to_dict() if hasattr(optimizer_cfg, "to_dict") else dict(optimizer_cfg)
+
+        optimizer_kwargs = {"lr": learning_rate}
+        for key, value in optimizer_dict.items():
+            if key in {"_target_", "lr", "learning_rate"}:
+                continue
+            if value is not None:
+                optimizer_kwargs[key] = _normalize_optimizer_value(value)
+
+        if (
+            optimizer_cls is torch.optim.AdamW
+            and optimizer_kwargs.get("foreach", False)
+            and optimizer_kwargs.get("fused", False)
+        ):
+            raise ValueError("torch.optim.AdamW does not support foreach=True and fused=True at the same time")
+        optimizer_kwargs = _filter_optimizer_kwargs(optimizer_target_name, optimizer_cls, optimizer_kwargs)
+        optimizer = optimizer_cls(trainable_params, **optimizer_kwargs)
+        logging.info("[INFO] Optimizer target: %s", optimizer_target_name)
+        logging.info("[INFO] Optimizer config: %s", optimizer_kwargs)
+        warn_if_torch_adam_with_bf16_params(
+            optimizer=optimizer,
+            optimizer_cfg=optimizer_cfg,
+            parameters=trainable_params,
+            is_peft=is_peft,
+            context="diffusion",
+            logger=logging.getLogger(__name__),
+        )
+        return optimizer
+
+    optimizer_dict = optimizer_cfg.to_dict() if hasattr(optimizer_cfg, "to_dict") else dict(optimizer_cfg)
+    weight_decay = optimizer_dict.get("weight_decay", 0.01)
+    betas = tuple(optimizer_dict.get("betas", (0.9, 0.999)))
+    adamw_kwargs = {
+        "lr": learning_rate,
+        "weight_decay": weight_decay,
+        "betas": betas,
+        "eps": optimizer_dict.get("eps", 1e-8),
+        "amsgrad": optimizer_dict.get("amsgrad", False),
+    }
+    for key in ("foreach", "fused", "capturable", "maximize"):
+        value = optimizer_dict.get(key, None)
+        if value is not None:
+            adamw_kwargs[key] = value
+    if adamw_kwargs.get("foreach", False) and adamw_kwargs.get("fused", False):
+        raise ValueError("torch.optim.AdamW does not support foreach=True and fused=True at the same time")
+    optimizer = torch.optim.AdamW(trainable_params, **adamw_kwargs)
+
+    logging.info("[INFO] Optimizer config: %s", adamw_kwargs)
+    warn_if_torch_adam_with_bf16_params(
+        optimizer=optimizer,
+        optimizer_cfg=optimizer_cfg,
+        parameters=trainable_params,
+        is_peft=is_peft,
+        context="diffusion",
+        logger=logging.getLogger(__name__),
+    )
+    return optimizer
+
+
+def _get_diffusion_microbatch_size(batch: Dict[str, Any]) -> int:
+    """Return the number of samples in one local diffusion micro-batch."""
+    for key in ("video_latents", "image_latents", "latents", "text_embeddings", "text_embeddings_2"):
+        value = batch.get(key)
+        if value is not None and hasattr(value, "shape") and len(value.shape) > 0:
+            return int(value.shape[0])
+    return 0
+
+
+def _count_local_batch_group_samples(batch_group: list[Dict[str, Any]]) -> int:
+    """Count local samples processed by one optimizer step."""
+    return sum(_get_diffusion_microbatch_size(batch) for batch in batch_group)
+
+
+def _calculate_throughput_metrics(
+    *,
+    elapsed_seconds: float,
+    optimizer_steps: int,
+    global_samples: int,
+    world_size: int,
+) -> Dict[str, float]:
+    """Calculate directly measured training throughput metrics."""
+    elapsed_seconds = max(float(elapsed_seconds), 1e-12)
+    optimizer_steps = max(int(optimizer_steps), 0)
+    global_samples = max(int(global_samples), 0)
+    world_size = max(int(world_size), 1)
+    nonzero_steps = max(optimizer_steps, 1)
+
+    samples_per_sec = global_samples / elapsed_seconds
+    return {
+        "step_time": elapsed_seconds / nonzero_steps,
+        "optimizer_steps_per_sec": optimizer_steps / elapsed_seconds,
+        "samples_per_sec": samples_per_sec,
+        "samples_per_sec_per_gpu": samples_per_sec / world_size,
+        "samples_per_step": global_samples / nonzero_steps,
+        "log_window_seconds": elapsed_seconds,
+        "log_window_steps": float(optimizer_steps),
+        "log_window_samples": float(global_samples),
+    }
+
+
+def _normalize_optimizer_value(value: Any) -> Any:
+    """Convert CLI-friendly optimizer scalar values into Python objects."""
+    if isinstance(value, str):
+        normalized = value.removeprefix("torch.").lower()
+        return _TORCH_DTYPE_ALIASES.get(normalized, value)
+    return value
+
+
+def _get_optimizer_target_name(target: Any) -> str:
+    """Return a stable display name for an optimizer target."""
+    if isinstance(target, str):
+        return target
+    module_name = getattr(target, "__module__", None)
+    qualname = getattr(target, "__qualname__", None)
+    if module_name and qualname:
+        return f"{module_name}.{qualname}"
+    return repr(target)
+
+
+def _resolve_optimizer_class(target: Any) -> Any:
+    """Resolve an optimizer class from a fully qualified `_target_` string."""
+    if not isinstance(target, str):
+        if callable(target):
+            return target
+        raise ValueError(f"Optimizer target must be a fully qualified import path or callable, got {target!r}.")
+
+    if target == _OPTIMIZER_DEFAULT_TARGET:
+        return torch.optim.AdamW
+
+    module_name, _, symbol_name = target.rpartition(".")
+    if not module_name or not symbol_name:
+        raise ValueError(
+            f"Optimizer target must be a fully qualified import path, got {target!r}. "
+            f"Example: {_OPTIMIZER_DEFAULT_TARGET!r}."
+        )
+
+    available, optimizer_cls = safe_import_from(
+        module_name,
+        symbol_name,
+        msg=f"Optimizer target {target!r} could not be imported",
+    )
+    if not available:
+        raise ImportError(f"Optimizer target {target!r} could not be imported")
+    return optimizer_cls
+
+
+def _filter_optimizer_kwargs(target: str, optimizer_cls: Any, optimizer_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop kwargs unsupported by an opt-in optimizer target."""
+    try:
+        signature = inspect.signature(optimizer_cls)
+    except (TypeError, ValueError):
+        logging.info("[INFO] Could not inspect optimizer target %s; passing all optimizer kwargs", target)
+        return optimizer_kwargs
+
+    parameters = signature.parameters
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return optimizer_kwargs
+
+    accepted = {
+        name
+        for name, parameter in parameters.items()
+        if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    accepted.discard("params")
+
+    filtered_kwargs = {key: value for key, value in optimizer_kwargs.items() if key in accepted}
+    ignored_kwargs = sorted(set(optimizer_kwargs) - set(filtered_kwargs))
+    if ignored_kwargs:
+        logging.info("[INFO] Optimizer target %s does not accept kwargs %s; ignoring them", target, ignored_kwargs)
+    return filtered_kwargs
+
+
+def _build_transformer_engine_fp8_recipe(
+    recipe_name: str,
+    *,
+    amax_history_len: int,
+    amax_compute_algo: str,
+) -> Any:
+    """Build a Transformer Engine FP8 recipe from CLI-friendly config values."""
+    normalized_recipe_name = recipe_name.replace("-", "_").lower()
+    if normalized_recipe_name in {"delayed", "delayed_scaling"}:
+        available, delayed_scaling = safe_import_from(
+            "transformer_engine.common.recipe",
+            "DelayedScaling",
+            msg="model.transformer_engine_fp8=true requires Transformer Engine DelayedScaling",
+        )
+        if not available:
+            raise ImportError("model.transformer_engine_fp8=true requires Transformer Engine DelayedScaling")
+        return delayed_scaling(amax_history_len=amax_history_len, amax_compute_algo=amax_compute_algo)
+
+    if normalized_recipe_name in {"current", "current_scaling"}:
+        available, current_scaling = safe_import_from(
+            "transformer_engine.common.recipe",
+            "Float8CurrentScaling",
+            msg="model.transformer_engine_fp8_recipe=current requires Transformer Engine Float8CurrentScaling",
+        )
+        if not available:
+            raise ImportError("model.transformer_engine_fp8_recipe=current requires Float8CurrentScaling")
+        return current_scaling()
+
+    if normalized_recipe_name in {"mxfp8", "mx", "mx_fp8"}:
+        available, mxfp8_block_scaling = safe_import_from(
+            "transformer_engine.common.recipe",
+            "MXFP8BlockScaling",
+            msg="model.transformer_engine_fp8_recipe=mxfp8 requires Transformer Engine MXFP8BlockScaling",
+        )
+        if not available:
+            raise ImportError("model.transformer_engine_fp8_recipe=mxfp8 requires MXFP8BlockScaling")
+        return mxfp8_block_scaling()
+
+    raise ValueError(
+        f"model.transformer_engine_fp8_recipe must be one of 'delayed', 'current', or 'mxfp8', got {recipe_name!r}"
+    )
+
+
+def _resolve_transformer_engine_autocast() -> Any:
+    """Resolve Transformer Engine's quantization autocast context manager."""
+    available, te_autocast = safe_import_from(
+        "transformer_engine.pytorch.quantization",
+        "autocast",
+        msg="model.transformer_engine_fp8=true requires transformer_engine.pytorch.quantization.autocast",
+    )
+    if not available:
+        raise ImportError("model.transformer_engine_fp8=true requires transformer_engine.pytorch.quantization.autocast")
+    return te_autocast
 
 
 def build_model_and_optimizer(
@@ -44,12 +353,19 @@ def build_model_and_optimizer(
     learning_rate: float,
     device: torch.device,
     dtype: torch.dtype,
+    compute_dtype: Optional[torch.dtype] = None,
     cpu_offload: bool = False,
     fsdp_cfg: Optional[Dict[str, Any]] = None,
     ddp_cfg: Optional[Dict[str, Any]] = None,
     attention_backend: Optional[str] = None,
     optimizer_cfg: Optional[Dict[str, Any]] = None,
+    transformer_engine_linear: bool = False,
+    transformer_engine_fp8_safe_only: bool = False,
+    fuse_qkv_projections: bool = False,
+    compact_fused_qkv_projections: bool = False,
     pipeline_spec: Optional[Dict[str, Any]] = None,
+    peft_cfg=None,
+    model_type=None,
 ) -> tuple[NeMoAutoDiffusionPipeline, torch.optim.Optimizer, Any]:
     """Build the diffusion model, parallel scheme, and optimizer.
 
@@ -58,17 +374,25 @@ def build_model_and_optimizer(
         finetune_mode: Whether to load for finetuning (True) or pretraining (False).
         learning_rate: Learning rate for optimizer.
         device: Target device.
-        dtype: Model dtype.
+        dtype: Model parameter storage dtype.
+        compute_dtype: Forward/FSDP compute dtype. Defaults to dtype when unset.
         cpu_offload: Whether to enable CPU offload (FSDP only).
         fsdp_cfg: FSDP configuration dict. Mutually exclusive with ddp_cfg.
         ddp_cfg: DDP configuration dict. Mutually exclusive with fsdp_cfg.
         attention_backend: Optional attention backend override.
         optimizer_cfg: Optional optimizer configuration.
+        transformer_engine_linear: Whether to replace transformer torch.nn.Linear modules with Transformer Engine Linear.
+        transformer_engine_fp8_safe_only: Whether to skip TE conversion for known FP8-incompatible modules.
+        fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer before FSDP.
+        compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
         pipeline_spec: Pipeline specification for pretraining (from_config).
             Required when finetune_mode is False. Should contain:
             - transformer_cls: str (e.g., "WanTransformer3DModel", "FluxTransformer2DModel")
             - subfolder: str (e.g., "transformer")
             - Optional: pipeline_cls, load_full_pipeline
+        peft_cfg: PeftConfig instance or None. When provided, only LoRA params
+            are trained; base weights are frozen and sharded by FSDP2 for memory.
+        model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
 
     Returns:
         Tuple of (pipeline, optimizer, device_mesh or None).
@@ -90,6 +414,16 @@ def build_model_and_optimizer(
         logging.info("[WARN] torch.distributed not initialized; proceeding in single-process mode")
 
     world_size = dist.get_world_size() if dist.is_initialized() else 1
+    if compute_dtype is None:
+        compute_dtype = dtype
+
+    lora_enabled = peft_cfg is not None
+    _validate_precision_configuration(dtype, compute_dtype, ddp_cfg=ddp_cfg, peft_cfg=peft_cfg)
+
+    # param_dtype=None when LoRA: FSDP2 does not cast any parameter.
+    # In full training, FSDP2 casts gathered params to compute_dtype while
+    # the model can still be initialized in a different storage dtype.
+    param_dtype = None if lora_enabled else compute_dtype
 
     # Build manager args based on which config is provided
     if ddp_cfg is not None:
@@ -130,11 +464,20 @@ def build_model_and_optimizer(
             "backend": "nccl",
             "world_size": world_size,
             "use_hf_tp_plan": fsdp_cfg.get("use_hf_tp_plan", False),
+            "sequence_parallel": fsdp_cfg.get("sequence_parallel", False),
+            "tp_plan": fsdp_cfg.get("tp_plan", None),
+            "patch_is_packed_sequence": fsdp_cfg.get("patch_is_packed_sequence", False),
             "activation_checkpointing": fsdp_cfg.get("activation_checkpointing", True),
+            "defer_fsdp_grad_sync": fsdp_cfg.get("defer_fsdp_grad_sync", True),
+            "enable_async_tensor_parallel": fsdp_cfg.get("enable_async_tensor_parallel", False),
+            "enable_compile": fsdp_cfg.get("enable_compile", False),
+            "enable_fsdp2_prefetch": fsdp_cfg.get("enable_fsdp2_prefetch", True),
+            "fsdp2_backward_prefetch_depth": fsdp_cfg.get("fsdp2_backward_prefetch_depth", 2),
+            "fsdp2_forward_prefetch_depth": fsdp_cfg.get("fsdp2_forward_prefetch_depth", 1),
             "mp_policy": MixedPrecisionPolicy(
-                param_dtype=dtype,
+                param_dtype=param_dtype,
                 reduce_dtype=torch.float32,
-                output_dtype=dtype,
+                output_dtype=compute_dtype,
             ),
         }
 
@@ -151,6 +494,12 @@ def build_model_and_optimizer(
             components_to_load=["transformer"],
             load_for_training=True,
             low_cpu_mem_usage=True,
+            peft_cfg=peft_cfg,
+            model_type=model_type,
+            transformer_engine_linear=transformer_engine_linear,
+            transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
+            fuse_qkv_projections=fuse_qkv_projections,
+            compact_fused_qkv_projections=compact_fused_qkv_projections,
         )
     else:
         # Pretraining: initialize with random weights using pipeline_spec
@@ -170,24 +519,41 @@ def build_model_and_optimizer(
             device=device,
             parallel_scheme=parallel_scheme,
             components_to_load=["transformer"],
+            transformer_engine_linear=transformer_engine_linear,
+            transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
+            fuse_qkv_projections=fuse_qkv_projections,
+            compact_fused_qkv_projections=compact_fused_qkv_projections,
         )
     fsdp2_manager = created_managers["transformer"]
     transformer_module = pipe.transformer
+    transformer_module_for_attrs = getattr(transformer_module, "module", transformer_module)
     if attention_backend is not None:
         logging.info(f"[INFO] Setting attention backend to {attention_backend}")
-        transformer_module.set_attention_backend(attention_backend)
+        transformer_module_for_attrs.set_attention_backend(attention_backend)
 
-    trainable_params = [p for p in transformer_module.parameters() if p.requires_grad]
-    if not trainable_params:
-        raise RuntimeError("No trainable parameters found in transformer module!")
+    if lora_enabled:
+        # Collect lora_params AFTER FSDP2 wrapping from the live wrapped module.
+        # Pre-FSDP2 refs (pipe._lora_params) are stale after fully_shard() —
+        # FSDP2 replaces parameter storage, so AdamW with stale refs never commits
+        # updates to the actual sharded parameters. Mirrors the LLM pattern in
+        # nemo_automodel/recipes/llm/train_ft.py line 313.
+        trainable_params = [p for n, p in transformer_module.named_parameters() if "lora_" in n and p.requires_grad]
+        if not trainable_params:
+            raise RuntimeError(
+                "peft_cfg is set but no LoRA params found. "
+                "Check that peft.target_modules match module names in the transformer."
+            )
+        logging.info(
+            "[LoRA] Optimizer: %d param tensors, %s elements",
+            len(trainable_params),
+            f"{sum(p.numel() for p in trainable_params):,}",
+        )
+    else:
+        trainable_params = [p for p in transformer_module.parameters() if p.requires_grad]
+        if not trainable_params:
+            raise RuntimeError("No trainable parameters found in transformer module!")
 
-    optimizer_cfg = optimizer_cfg or {}
-    weight_decay = optimizer_cfg.get("weight_decay", 0.01)
-    betas = optimizer_cfg.get("betas", (0.9, 0.999))
-    # TODO: Support other optimizers
-    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay, betas=betas)
-
-    logging.info("[INFO] Optimizer config: lr=%s, weight_decay=%s, betas=%s", learning_rate, weight_decay, betas)
+    optimizer = _build_optimizer(trainable_params, optimizer_cfg, learning_rate, is_peft=lora_enabled)
 
     trainable_count = sum(1 for p in transformer_module.parameters() if p.requires_grad)
     frozen_count = sum(1 for p in transformer_module.parameters() if not p.requires_grad)
@@ -295,6 +661,7 @@ def build_lr_scheduler(
 
 
 def is_main_process():
+    """Return whether the current process should perform rank-zero work."""
     return (not dist.is_initialized()) or dist.get_rank() == 0
 
 
@@ -319,9 +686,27 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         self.model_id = self.cfg.get("model.pretrained_model_name_or_path")
         self.attention_backend = self.cfg.get("model.attention_backend")
+        self.transformer_engine_linear = bool(self.cfg.get("model.transformer_engine_linear", False))
+        self.transformer_engine_fp8 = bool(self.cfg.get("model.transformer_engine_fp8", False))
+        self.transformer_engine_fp8_recipe_name = str(self.cfg.get("model.transformer_engine_fp8_recipe", "delayed"))
+        self.transformer_engine_fp8_amax_history_len = int(
+            self.cfg.get("model.transformer_engine_fp8_amax_history_len", 1024)
+        )
+        self.transformer_engine_fp8_amax_compute_algo = str(
+            self.cfg.get("model.transformer_engine_fp8_amax_compute_algo", "max")
+        )
+        self.fuse_qkv_projections = bool(self.cfg.get("model.fuse_qkv_projections", False))
+        self.compact_fused_qkv_projections = bool(self.cfg.get("model.compact_fused_qkv_projections", False))
+        if self.transformer_engine_fp8:
+            self.transformer_engine_linear = True
+        if self.compact_fused_qkv_projections and not self.fuse_qkv_projections:
+            raise ValueError("model.compact_fused_qkv_projections=true requires model.fuse_qkv_projections=true")
         self.learning_rate = self.cfg.get("optim.learning_rate", 5e-6)
         self.clip_grad_max_norm = float(self.cfg.get("optim.clip_grad", 1.0))
-        self.bf16 = torch.bfloat16
+        self.model_dtype, self.compute_dtype = _resolve_model_dtypes(self.cfg)
+        performance_cfg = self.cfg.get("performance", {}) or {}
+        self.check_loss = bool(performance_cfg.get("check_loss", False))
+        self.grad_clip_foreach = bool(performance_cfg.get("grad_clip_foreach", True))
 
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -334,6 +719,17 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.local_world_size = max(self.local_world_size, 1)
         self.num_nodes = max(1, self.world_size // self.local_world_size)
         self.node_rank = dist.get_rank() // self.local_world_size if dist.is_initialized() else 0
+        self._te_fp8_autocast = None
+        self._te_fp8_recipe = None
+        self._te_fp8_group = None
+        if self.transformer_engine_fp8:
+            self._te_fp8_autocast = _resolve_transformer_engine_autocast()
+            self._te_fp8_recipe = _build_transformer_engine_fp8_recipe(
+                self.transformer_engine_fp8_recipe_name,
+                amax_history_len=self.transformer_engine_fp8_amax_history_len,
+                amax_compute_algo=self.transformer_engine_fp8_amax_compute_algo,
+            )
+            self._te_fp8_group = dist.group.WORLD if dist.is_initialized() else None
 
         logging.info("[INFO] Diffusion Trainer with Flow Matching")
         logging.info(
@@ -341,6 +737,22 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info(f"[INFO] Node rank: {self.node_rank}, Local rank: {self.local_rank}")
         logging.info(f"[INFO] Learning rate: {self.learning_rate}")
+        logging.info("[INFO] Transformer Engine Linear: %s", self.transformer_engine_linear)
+        logging.info(
+            "[INFO] Transformer Engine FP8: %s (recipe=%s, amax_history_len=%s, amax_compute_algo=%s)",
+            self.transformer_engine_fp8,
+            self.transformer_engine_fp8_recipe_name,
+            self.transformer_engine_fp8_amax_history_len,
+            self.transformer_engine_fp8_amax_compute_algo,
+        )
+        logging.info("[INFO] Fuse QKV projections: %s", self.fuse_qkv_projections)
+        logging.info("[INFO] Compact fused QKV projections: %s", self.compact_fused_qkv_projections)
+        logging.info("[INFO] Precision: model_dtype=%s, compute_dtype=%s", self.model_dtype, self.compute_dtype)
+        logging.info(
+            "[INFO] Performance config: check_loss=%s, grad_clip_foreach=%s",
+            self.check_loss,
+            self.grad_clip_foreach,
+        )
 
         # Get distributed training configs (mutually exclusive)
         fsdp_cfg = self.cfg.get("fsdp", None)
@@ -370,6 +782,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.i2v_prob = fm_cfg.get("i2v_prob", 0.3)
         self.cfg_dropout_prob = fm_cfg.get("cfg_dropout_prob", 0.1)
         self.use_loss_weighting = fm_cfg.get("use_loss_weighting", True)
+        self.loss_weighting_scheme = fm_cfg.get("loss_weighting_scheme", "linear")
         self.log_interval = fm_cfg.get("log_interval", 100)
         self.summary_log_interval = fm_cfg.get("summary_log_interval", 10)
 
@@ -387,27 +800,57 @@ class TrainDiffusionRecipe(BaseRecipe):
         logging.info(f"[INFO]   - Use sigma noise: {self.use_sigma_noise}")
         logging.info(f"[INFO]   - CFG dropout prob: {self.cfg_dropout_prob}")
         logging.info(f"[INFO]   - Use loss weighting: {self.use_loss_weighting}")
+        logging.info(f"[INFO]   - Loss weighting scheme: {self.loss_weighting_scheme}")
 
         # Get pipeline_spec for pretraining mode (required when mode != "finetune")
         pipeline_spec_cfg = self.cfg.get("model.pipeline_spec", None)
         pipeline_spec = pipeline_spec_cfg.to_dict() if pipeline_spec_cfg is not None else None
+
+        # ── PEFT / LoRA configuration ─────────────────────────────────────────
+        # Mirrors the LLM recipe pattern: peft block in YAML with _target_ pointing
+        # to PeftConfig is instantiated directly, no intermediate wrapper class.
+        self.peft_cfg = None
+        if self.cfg.get("peft", None) is not None:
+            self.peft_cfg = self.cfg.peft.instantiate()
+
+        # model_type is explicit in yaml — no fragile string detection.
+        # Required when peft block is present.
+        self.model_type = self.cfg.get("model.model_type", None)
+        if self.peft_cfg is not None and not self.model_type:
+            raise ValueError(
+                "model.model_type must be set when peft config is provided. Options: 'flux', 'wan', 'hunyuan'"
+            )
+
+        lora_status = (
+            f"enabled (dim={self.peft_cfg.dim}, alpha={self.peft_cfg.alpha})"
+            if self.peft_cfg is not None
+            else "disabled (full fine-tune)"
+        )
+        logging.info(f"[INFO] LoRA: {lora_status}")
 
         (self.pipe, self.optimizer, self.device_mesh) = build_model_and_optimizer(
             model_id=self.model_id,
             finetune_mode=self.cfg.get("model.mode", "finetune").lower() == "finetune",
             learning_rate=self.learning_rate,
             device=self.device,
-            dtype=self.bf16,
+            dtype=self.model_dtype,
+            compute_dtype=self.compute_dtype,
             cpu_offload=self.cpu_offload,
             fsdp_cfg=fsdp_cfg,
             ddp_cfg=ddp_cfg,
             optimizer_cfg=self.cfg.get("optim.optimizer", {}),
+            transformer_engine_linear=self.transformer_engine_linear,
+            transformer_engine_fp8_safe_only=self.transformer_engine_fp8,
+            fuse_qkv_projections=self.fuse_qkv_projections,
+            compact_fused_qkv_projections=self.compact_fused_qkv_projections,
             attention_backend=self.attention_backend,
             pipeline_spec=pipeline_spec,
+            peft_cfg=self.peft_cfg,
+            model_type=self.model_type,
         )
 
         self.model = self.pipe.transformer
-        self.peft_config = None
+        self.peft_config = getattr(self.pipe, "_peft_config", None)
 
         checkpoint_cfg = self.cfg.get("checkpoint", None)
 
@@ -429,8 +872,8 @@ class TrainDiffusionRecipe(BaseRecipe):
             model_save_format=checkpoint_cfg.get("model_save_format"),
             model_cache_dir=model_cache_dir if model_cache_dir is not None else HF_HUB_CACHE,
             model_repo_id=self.model_id,
-            save_consolidated=checkpoint_cfg.get("save_consolidated"),
-            is_peft=False,
+            save_consolidated=checkpoint_cfg.get("save_consolidated", False),
+            is_peft=self.peft_cfg is not None,
             model_state_dict_keys=model_state_dict_keys,
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
         )
@@ -482,6 +925,9 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         # Calculate total optimizer steps for LR scheduler
         total_steps = self.num_epochs * self.steps_per_epoch
+        max_steps = self.cfg.get("step_scheduler.max_steps", None)
+        if max_steps is not None:
+            total_steps = min(total_steps, max_steps)
 
         # Build LR scheduler (returns None if lr_scheduler not in config)
         # Wrap in list for compatibility with checkpointing (OptimizerState expects list)
@@ -500,11 +946,13 @@ class TrainDiffusionRecipe(BaseRecipe):
             local_batch_size=self.cfg.step_scheduler.local_batch_size,
             dp_size=int(self.dp_size),
             ckpt_every_steps=self.cfg.step_scheduler.ckpt_every_steps,
+            save_checkpoint_every_epoch=self.cfg.get("step_scheduler.save_checkpoint_every_epoch", False),
             dataloader=self.dataloader,
             val_every_steps=None,
             start_step=int(self.global_step),
             start_epoch=int(self.start_epoch),
             num_epochs=int(self.num_epochs),
+            max_steps=max_steps,
         )
 
         self.load_checkpoint(self.restore_from)
@@ -525,6 +973,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             sigma_min=self.sigma_min,
             sigma_max=self.sigma_max,
             use_loss_weighting=self.use_loss_weighting,
+            loss_weighting_scheme=self.loss_weighting_scheme,
             log_interval=self.log_interval,
             summary_log_interval=self.summary_log_interval,
             device=self.device,
@@ -537,6 +986,16 @@ class TrainDiffusionRecipe(BaseRecipe):
         if dist.is_initialized():
             dist.barrier()
 
+    def _transformer_engine_fp8_context(self) -> Any:
+        """Return the per-forward Transformer Engine FP8 context."""
+        if not self.transformer_engine_fp8:
+            return nullcontext()
+        return self._te_fp8_autocast(
+            enabled=True,
+            recipe=self._te_fp8_recipe,
+            amax_reduction_group=self._te_fp8_group,
+        )
+
     def run_train_validation_loop(self):
         logging.info("[INFO] Starting T2V training with Flow Matching")
         logging.info(f"[INFO] Global Batch size: {self.global_batch_size}; Local Batch size: {self.local_batch_size}")
@@ -544,6 +1003,12 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         # Keep global_step synchronized with scheduler
         global_step = int(self.step_scheduler.step)
+        self._sync_device()
+        perf_window_start_time = time.perf_counter()
+        perf_window_steps = 0
+        perf_window_local_samples = 0
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
         for epoch in self.step_scheduler.epochs:
             if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
@@ -564,15 +1029,23 @@ class TrainDiffusionRecipe(BaseRecipe):
                 self.optimizer.zero_grad(set_to_none=True)
 
                 micro_losses = []
-                for micro_batch in batch_group:
+                prepare_for_grad_accumulation([self.model], pp_enabled=False)
+                num_microbatches = len(batch_group)
+                for microbatch_idx, micro_batch in enumerate(batch_group):
+                    if microbatch_idx == num_microbatches - 1:
+                        prepare_for_final_backward([self.model], pp_enabled=False)
+
                     try:
-                        weighted_loss, average_weighted_loss, loss_mask, metrics = self.flow_matching_pipeline.step(
-                            model=self.model,
-                            batch=micro_batch,
-                            device=self.device,
-                            dtype=self.bf16,
-                            global_step=global_step,
-                        )
+                        with self._transformer_engine_fp8_context():
+                            _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
+                                model=self.model,
+                                batch=micro_batch,
+                                device=self.device,
+                                dtype=self.compute_dtype,
+                                global_step=global_step,
+                                collect_metrics=False,
+                                check_loss=self.check_loss,
+                            )
                     except Exception as exc:
                         logging.info(f"[ERROR] Training step failed at epoch {epoch}, step {num_steps}: {exc}")
                         video_shape = micro_batch.get("video_latents", torch.tensor([])).shape
@@ -581,22 +1054,55 @@ class TrainDiffusionRecipe(BaseRecipe):
                         raise
 
                     # Use average_weighted_loss for backprop (scalar for gradient accumulation)
-                    (average_weighted_loss / len(batch_group)).backward()
-                    micro_losses.append(float(average_weighted_loss.item()))
+                    (average_weighted_loss / num_microbatches).backward()
+                    micro_losses.append(average_weighted_loss.detach())
 
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.clip_grad_max_norm)
+                    if microbatch_idx == 0:
+                        prepare_after_first_microbatch()
+
+                grad_norm = clip_grad_norm(self.clip_grad_max_norm, [self.model], foreach=self.grad_clip_foreach)
                 grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
+
+                # ── LoRA gradient diagnostic (step 1 only) ───────────────────
+                if global_step == 1 and self.peft_cfg is not None:
+                    for n, p in self.model.named_parameters():
+                        if "lora_B" in n:
+                            try:
+                                grad_val = p.grad.to_local().float().norm().item() if p.grad is not None else None
+                            except Exception:
+                                grad_val = p.grad.float().norm().item() if p.grad is not None else None
+                            logging.info(
+                                f"[GRAD CHECK] {n}: grad_norm={grad_val}, param_norm={p.data.float().norm().item():.6f}"
+                            )
+                            break
 
                 self.optimizer.step()
                 if self.lr_scheduler is not None:
                     self.lr_scheduler[0].step(1)
 
-                group_loss_mean = float(sum(micro_losses) / len(micro_losses))
+                perf_window_steps += 1
+                perf_window_local_samples += _count_local_batch_group_samples(batch_group)
+                group_loss_mean = float(torch.stack(micro_losses).mean().item())
                 epoch_loss += group_loss_mean
                 num_steps += 1
                 global_step = int(self.step_scheduler.step)
 
-                if self.log_every and self.log_every > 0 and is_main_process() and (global_step % self.log_every == 0):
+                should_log = self.log_every and self.log_every > 0 and global_step % self.log_every == 0
+                if should_log:
+                    elapsed_seconds, perf_window_end_time = self._elapsed_seconds_since(perf_window_start_time)
+                    perf_window_global_samples = self._count_global_samples(perf_window_local_samples)
+                    throughput_metrics = _calculate_throughput_metrics(
+                        elapsed_seconds=elapsed_seconds,
+                        optimizer_steps=perf_window_steps,
+                        global_samples=perf_window_global_samples,
+                        world_size=self.world_size,
+                    )
+                    memory_metrics = self._get_memory_metrics()
+                    perf_window_start_time = perf_window_end_time
+                    perf_window_steps = 0
+                    perf_window_local_samples = 0
+
+                if should_log and is_main_process():
                     avg_loss = epoch_loss / num_steps
                     log_dict = {
                         "train_loss": group_loss_mean,
@@ -605,9 +1111,25 @@ class TrainDiffusionRecipe(BaseRecipe):
                         "grad_norm": grad_norm,
                         "epoch": epoch,
                         "global_step": global_step,
+                        **throughput_metrics,
+                        **memory_metrics,
                     }
                     if wandb.run is not None:
                         wandb.log(log_dict, step=global_step)
+                    logging.info(
+                        "[TRAIN] step=%s epoch=%s loss=%.6f avg_loss=%.6f lr=%.3e grad_norm=%.3f "
+                        "step_time=%.3fs samples_per_sec=%.2f samples_per_sec_per_gpu=%.2f mem=%.2fGB",
+                        global_step,
+                        epoch,
+                        group_loss_mean,
+                        avg_loss,
+                        self.optimizer.param_groups[0]["lr"],
+                        grad_norm,
+                        throughput_metrics["step_time"],
+                        throughput_metrics["samples_per_sec"],
+                        throughput_metrics["samples_per_sec_per_gpu"],
+                        memory_metrics["max_memory_allocated_gb"],
+                    )
 
                     # Update tqdm if present
                     if hasattr(self.step_scheduler.dataloader, "set_postfix"):
@@ -617,12 +1139,17 @@ class TrainDiffusionRecipe(BaseRecipe):
                                 "avg": f"{(avg_loss):.4f}",
                                 "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
                                 "gn": f"{grad_norm:.2f}",
+                                "s/s": f"{throughput_metrics['samples_per_sec']:.1f}",
+                                "s/s/gpu": f"{throughput_metrics['samples_per_sec_per_gpu']:.2f}",
                             }
                         )
 
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, global_step, epoch_loss / num_steps)
 
+            if num_steps == 0:
+                logging.info(f"[INFO] Epoch {epoch + 1} skipped (already completed in previous run)")
+                continue
             avg_loss = epoch_loss / num_steps
             logging.info(f"[INFO] Epoch {epoch + 1} complete. avg_loss={avg_loss:.6f}")
 
@@ -653,3 +1180,68 @@ class TrainDiffusionRecipe(BaseRecipe):
             return dist.get_world_size() if dist.is_initialized() else 1
         # Otherwise, use the parent implementation
         return super()._get_dp_group_size(include_cp=include_cp)
+
+    def _sync_device(self) -> None:
+        """Wait for queued CUDA work so timing reflects completed training work."""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+
+    def _get_collective_device(self) -> torch.device:
+        """Return a tensor device compatible with the active distributed backend."""
+        if dist.is_initialized() and str(dist.get_backend()).lower() == "nccl" and torch.cuda.is_available():
+            return self.device
+        return torch.device("cpu")
+
+    def _elapsed_seconds_since(self, start_time: float) -> tuple[float, float]:
+        """Return the max elapsed wall-clock seconds across ranks since start_time."""
+        self._sync_device()
+        end_time = time.perf_counter()
+        elapsed_seconds = max(end_time - start_time, 1e-12)
+        if dist.is_initialized():
+            elapsed = torch.tensor(elapsed_seconds, device=self._get_collective_device(), dtype=torch.float64)
+            dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+            elapsed_seconds = float(elapsed.item())
+        return elapsed_seconds, end_time
+
+    def _count_global_samples(self, local_samples: int) -> int:
+        """Count samples processed across the data-parallel group."""
+        global_samples = int(local_samples)
+        if dist.is_initialized():
+            sample_count = torch.tensor(global_samples, device=self._get_collective_device(), dtype=torch.long)
+            dist.all_reduce(sample_count, op=dist.ReduceOp.SUM, group=self._get_dp_group())
+            global_samples = int(sample_count.item())
+        return global_samples
+
+    def _get_memory_metrics(self) -> Dict[str, float]:
+        """Return PyTorch CUDA allocator memory counters, max-reduced across ranks."""
+        if not torch.cuda.is_available():
+            return {
+                "mem": 0.0,
+                "memory_allocated_gb": 0.0,
+                "memory_reserved_gb": 0.0,
+                "max_memory_allocated_gb": 0.0,
+                "max_memory_reserved_gb": 0.0,
+            }
+
+        scale = 1024**3
+        memory = torch.tensor(
+            [
+                torch.cuda.memory_allocated(self.device) / scale,
+                torch.cuda.memory_reserved(self.device) / scale,
+                torch.cuda.max_memory_allocated(self.device) / scale,
+                torch.cuda.max_memory_reserved(self.device) / scale,
+            ],
+            device=self._get_collective_device(),
+            dtype=torch.float64,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(memory, op=dist.ReduceOp.MAX)
+
+        allocated, reserved, max_allocated, max_reserved = memory.tolist()
+        return {
+            "mem": max_allocated,
+            "memory_allocated_gb": allocated,
+            "memory_reserved_gb": reserved,
+            "max_memory_allocated_gb": max_allocated,
+            "max_memory_reserved_gb": max_reserved,
+        }

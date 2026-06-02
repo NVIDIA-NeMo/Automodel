@@ -13,13 +13,10 @@
 # limitations under the License.
 
 import json
-import os
 import threading
 
-import pytest
-
-from nemo_automodel.components.loggers.metric_logger import MetricLogger, MetricLoggerDist
 import nemo_automodel.components.loggers.metric_logger as metric_logger_mod
+from nemo_automodel.components.loggers.metric_logger import MetricLogger, MetricLoggerDist
 
 
 def _read_jsonl(path):
@@ -169,5 +166,3 @@ def test_metric_logger_dist_nonzero_noop(tmp_path, monkeypatch):
     else:
         # If file was not created, that's also acceptable
         assert True
-
-

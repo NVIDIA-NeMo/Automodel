@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.02-py3
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.04-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
@@ -38,13 +38,14 @@ ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Address CVE-2025-68973
-RUN apt-get update && apt install -y --only-upgrade gnupg && \
+# Address CVE-2025-68973; install ffmpeg dev libs for torchcodec source build
+RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
+    apt-get install -y --no-install-recommends ffmpeg libavdevice-dev pkg-config && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
-ENV UV_VERSION="0.8.22"
+ENV UV_VERSION="0.10.11"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
@@ -61,8 +62,8 @@ RUN if [ -f /usr/local/bin/torchrun ]; then \
 FROM update_base_container AS automodel_dep
 
 # Install TE
-ARG INSTALL_TE=False
-ARG TE_COMMIT=release_v2.11
+ARG INSTALL_TE=True
+ARG TE_COMMIT=release_v2.14
 RUN if [ "$INSTALL_TE" = "True" ]; then \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \
@@ -115,14 +116,26 @@ RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
     cd ../ && rm -rf bitsandbytes; \
     fi
 
+# Install UCCL-EP (Azure-compatible RDMA for expert parallelism)
+COPY scripts/setup_uccl_ep.sh /opt/setup_uccl_ep.sh
+ARG INSTALL_UCCL_EP=False
+RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
+    bash /opt/setup_uccl_ep.sh --no-efa && \
+    rm -f /opt/setup_uccl_ep.sh; \
+    fi
+
 # Address base image CVE
 RUN pip install "aiohttp>=3.13.3" \
+        "black>=26.3.1" \
         "jaraco-context>=6.1.0" \
         "nbconvert>=7.17.0" \
-        "pillow>=12.1.1" \
+        "onnx>=1.21.0" \
+        "pillow>=12.2.0" \
         "protobuf>=6.33.5" \
         "setuptools>=80.10.2" \
-        "urllib3>=2.6.0"
+        "tornado>=6.5.5" \
+        "urllib3>=2.6.0" && \
+    rm -rf /opt/pytorch/pytorch/third_party/onnx
 
 FROM automodel_dep as automodel_final
 
@@ -137,16 +150,22 @@ COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
 ARG UV_SYNC_ARGS="--locked"
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    --mount=type=cache,target=/root/.cache/uv \
-    if [ "$BASE_IMAGE" = "pytorch" ]; then \
+RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
-    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
-    uv cache prune --ci
+    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS --no-cache
+
+# Rebuild torchcodec from source to match the container's PyTorch ABI
+RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
+    pip install --no-build-isolation --force-reinstall --no-deps \
+        git+https://github.com/pytorch/torchcodec.git@v0.8.0
 
 COPY . /opt/Automodel
+
+# Re-apply PyTorch overrides after full COPY (which overwrites the modified pyproject.toml/uv.lock)
+RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
+        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
+    fi
 
 WORKDIR /opt/Automodel
 

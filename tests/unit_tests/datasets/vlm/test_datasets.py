@@ -17,8 +17,10 @@ import json
 from typing import Dict, List
 
 import pytest
+from PIL import Image
 
 import nemo_automodel.components.datasets.vlm.datasets as ds
+import nemo_automodel.components.datasets.vlm.utils as vlm_utils
 
 
 @pytest.fixture(autouse=True)
@@ -176,8 +178,195 @@ def test_make_medpix_dataset(monkeypatch):
         assert assistant_payload == {"type": "text", "text": src["answer"]}
 
 
+class _FakeHFDataset:
+    """Minimal stand-in for ``datasets.Dataset`` covering the slice of API
+    ``make_tulu3_magicoder_text_mix_dataset`` uses: ``column_names``,
+    ``map(fn, remove_columns=...)``, ``filter(fn)``, and iteration.
+    """
+
+    def __init__(self, rows: List[Dict], column_names: List[str]):
+        self.rows = rows
+        self.column_names = list(column_names)
+
+    def map(self, fn, remove_columns=None):
+        new_rows = [fn(r) for r in self.rows]
+        new_cols = (
+            [c for c in self.column_names if c not in (remove_columns or [])]
+            if remove_columns
+            else list(self.column_names)
+        )
+        if new_rows:
+            new_cols = sorted(set(new_cols) | set(new_rows[0].keys()))
+        return _FakeHFDataset(new_rows, new_cols)
+
+    def filter(self, fn):
+        return _FakeHFDataset([r for r in self.rows if fn(r)], self.column_names)
+
+    def __iter__(self):
+        return iter(self.rows)
+
+
+class TestMakeTulu3MagicoderTextMixDataset:
+    """End-to-end checks for ``make_tulu3_magicoder_text_mix_dataset``.
+
+    The function is intentionally heavy on filtering rules
+    (``max_turns`` cap, missing assistant turn, blank text, invalid role)
+    plus the 80/20 ``interleave_datasets`` mix and a ``limit_total`` cap.
+    The tests below pin each of those branches against fake HF datasets so
+    the recipe-side contract is fixed:
+
+      * Output rows expose exactly one ``conversation`` key and no ``image``
+        entry anywhere (text-only training).
+      * Per-turn ``content`` is the ``[{"type": "text", "text": ...}]`` shape
+        the VLM collate consumes.
+      * Filter rules drop Tulu rows with > ``max_turns`` turns, no assistant
+        turn, empty text, or unknown roles; Magicoder rows with empty
+        ``problem`` or ``solution`` are dropped too.
+      * ``limit_total`` caps the merged stream early.
+    """
+
+    def _patch_loader_and_mixer(self, monkeypatch, tulu_rows, magicoder_rows, mixed_order=None):
+        tulu_cols = list(tulu_rows[0].keys()) if tulu_rows else ["messages"]
+        magicoder_cols = list(magicoder_rows[0].keys()) if magicoder_rows else ["problem", "solution"]
+        tulu_ds = _FakeHFDataset(tulu_rows, tulu_cols)
+        magicoder_ds = _FakeHFDataset(magicoder_rows, magicoder_cols)
+
+        def _fake_load_dataset(name, split, **kwargs):
+            if "tulu" in name:
+                return tulu_ds
+            if "Magicoder" in name or "magicoder" in name:
+                return magicoder_ds
+            raise AssertionError(f"unexpected load_dataset call for {name!r}")
+
+        monkeypatch.setattr(ds, "load_dataset", _fake_load_dataset)
+
+        # ``interleave_datasets`` is imported *inside* the function, so we
+        # patch the underlying ``datasets`` module attribute the import
+        # resolves against.
+        import datasets as _datasets
+
+        def _fake_interleave(parts, probabilities, stopping_strategy, seed):
+            # Deterministic deterministic interleave: concatenate post-filter
+            # rows in (tulu, magicoder) order so tests can assert on row
+            # identity. The real function is randomized; we don't care here.
+            assert stopping_strategy == "all_exhausted"
+            assert sum(probabilities) == pytest.approx(1.0)
+            if mixed_order is not None:
+                # Allow a test to assert ordering. ``mixed_order`` is a list
+                # of (source_idx, row_idx) tuples.
+                rows = [parts[s].rows[r] for s, r in mixed_order]
+            else:
+                rows = []
+                for part in parts:
+                    rows.extend(part.rows)
+            return _FakeHFDataset(rows, ["conversation"])
+
+        monkeypatch.setattr(_datasets, "interleave_datasets", _fake_interleave)
+
+    def test_happy_path_two_sources(self, monkeypatch):
+        tulu_rows = [
+            {
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ]
+            },
+        ]
+        magicoder_rows = [{"problem": "p1", "solution": "s1"}]
+        self._patch_loader_and_mixer(monkeypatch, tulu_rows, magicoder_rows)
+
+        result = ds.make_tulu3_magicoder_text_mix_dataset()
+
+        assert len(result) == 2
+        # Every row exposes exactly one ``conversation`` key.
+        assert all(set(r.keys()) == {"conversation"} for r in result)
+        # All content blocks are text-only (no ``image`` entries anywhere).
+        for r in result:
+            for turn in r["conversation"]:
+                for block in turn["content"]:
+                    assert block["type"] == "text"
+
+    def test_tulu_row_exceeding_max_turns_is_dropped(self, monkeypatch):
+        too_long = [
+            {"role": "user", "content": f"u{i}"} if i % 2 == 0 else {"role": "assistant", "content": f"a{i}"}
+            for i in range(6)
+        ]
+        tulu_rows = [{"messages": too_long}]
+        magicoder_rows = [{"problem": "p1", "solution": "s1"}]
+        self._patch_loader_and_mixer(monkeypatch, tulu_rows, magicoder_rows)
+        result = ds.make_tulu3_magicoder_text_mix_dataset(max_turns=4)
+        # The over-long Tulu row gets filtered; only the Magicoder row survives.
+        assert len(result) == 1
+        # And it must be the Magicoder pair (user "p1" / assistant "s1").
+        conv = result[0]["conversation"]
+        assert conv[0]["content"][0]["text"] == "p1"
+        assert conv[1]["content"][0]["text"] == "s1"
+
+    def test_tulu_row_without_assistant_is_dropped(self, monkeypatch):
+        """At least one assistant turn is required for the chat template to
+        produce a non-empty label sequence."""
+        tulu_rows = [
+            {
+                "messages": [
+                    {"role": "user", "content": "u1"},
+                    {"role": "user", "content": "u2"},
+                ]
+            }
+        ]
+        self._patch_loader_and_mixer(monkeypatch, tulu_rows, [])
+        result = ds.make_tulu3_magicoder_text_mix_dataset()
+        assert result == []
+
+    def test_tulu_row_with_blank_text_and_unknown_roles_filtered_per_turn(self, monkeypatch):
+        """Per-turn filtering: blanks and roles outside
+        ``{system, user, assistant}`` are skipped, but the surviving turns
+        still build a valid conversation."""
+        tulu_rows = [
+            {
+                "messages": [
+                    {"role": "tool", "content": "I should be skipped"},
+                    {"role": "user", "content": "   "},  # blank
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ]
+            }
+        ]
+        self._patch_loader_and_mixer(monkeypatch, tulu_rows, [])
+        result = ds.make_tulu3_magicoder_text_mix_dataset()
+        assert len(result) == 1
+        roles = [t["role"] for t in result[0]["conversation"]]
+        assert roles == ["user", "assistant"]
+
+    def test_magicoder_row_with_missing_fields_is_dropped(self, monkeypatch):
+        magicoder_rows = [
+            {"problem": "", "solution": "s"},  # empty problem
+            {"problem": "p", "solution": ""},  # empty solution
+            {"problem": "p2", "solution": "s2"},  # keep
+        ]
+        self._patch_loader_and_mixer(monkeypatch, [], magicoder_rows)
+        result = ds.make_tulu3_magicoder_text_mix_dataset()
+        assert len(result) == 1
+        assert result[0]["conversation"][0]["content"][0]["text"] == "p2"
+
+    def test_limit_total_caps_output(self, monkeypatch):
+        tulu_rows = [
+            {
+                "messages": [
+                    {"role": "user", "content": f"u{i}"},
+                    {"role": "assistant", "content": f"a{i}"},
+                ]
+            }
+            for i in range(5)
+        ]
+        magicoder_rows = [{"problem": f"p{i}", "solution": f"s{i}"} for i in range(5)]
+        self._patch_loader_and_mixer(monkeypatch, tulu_rows, magicoder_rows)
+        result = ds.make_tulu3_magicoder_text_mix_dataset(limit_total=3)
+        assert len(result) == 3
+
+
 def test_make_cv17_dataset(monkeypatch):
     """End-to-end sanity check for `make_cv17_dataset`."""
+
     # Mock dataset with audio data and extra columns to test column removal
     class MockDataset:
         def __init__(self, data):
@@ -195,18 +384,12 @@ def test_make_cv17_dataset(monkeypatch):
 
     fake_audio_data = [
         {
-            "audio": {
-                "array": [0.1, 0.2, 0.3, -0.1, -0.2],
-                "sampling_rate": 16000
-            },
-            "transcription": "Merhaba, nasılsınız?"
+            "audio": {"array": [0.1, 0.2, 0.3, -0.1, -0.2], "sampling_rate": 16000},
+            "transcription": "Merhaba, nasılsınız?",
         },
         {
-            "audio": {
-                "array": [0.5, -0.3, 0.8, 0.2, -0.1],
-                "sampling_rate": 16000
-            },
-            "transcription": "Bu bir test cümlesidir."
+            "audio": {"array": [0.5, -0.3, 0.8, 0.2, -0.1], "sampling_rate": 16000},
+            "transcription": "Bu bir test cümlesidir.",
         },
     ]
 
@@ -299,3 +482,1535 @@ def test_make_unimm_chat_dataset(monkeypatch):
 
     assert assistant_turn_b["role"] == "assistant"
     assert assistant_turn_b["content"] == [{"type": "text", "text": "Answer 2"}]
+
+
+# ---------------------------------------------------------------------------
+# Tests for _convert_sharegpt_to_conversation
+# ---------------------------------------------------------------------------
+
+
+class TestConvertSharegptToConversation:
+    """Tests for the sharegpt-to-conversation conversion helper."""
+
+    def test_basic_text_only(self):
+        """Text-only messages without media."""
+        example = {
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there"},
+            ],
+        }
+        result = ds._convert_sharegpt_to_conversation(example)
+        assert result == {
+            "conversation": [
+                {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Hi there"}]},
+            ],
+        }
+
+    def test_image_placeholder(self):
+        """User message with <image> placeholder replaced by actual path."""
+        example = {
+            "messages": [
+                {"role": "user", "content": "<image>\nDescribe this image."},
+                {"role": "assistant", "content": "A cat."},
+            ],
+            "images": ["cat.jpg"],
+        }
+        result = ds._convert_sharegpt_to_conversation(example)
+        conv = result["conversation"]
+        assert conv[0]["role"] == "user"
+        assert conv[0]["content"] == [
+            {"type": "image", "image": "cat.jpg"},
+            {"type": "text", "text": "Describe this image."},
+        ]
+        assert conv[1] == {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "A cat."}],
+        }
+
+    def test_video_placeholder(self):
+        """User message with <video> placeholder."""
+        example = {
+            "messages": [
+                {"role": "user", "content": "<video>\nDescribe this video."},
+                {"role": "assistant", "content": "A video of a dog."},
+            ],
+            "videos": ["dog.mp4"],
+        }
+        result = ds._convert_sharegpt_to_conversation(example)
+        conv = result["conversation"]
+        assert conv[0]["content"] == [
+            {"type": "video", "video": "dog.mp4"},
+            {"type": "text", "text": "Describe this video."},
+        ]
+
+    def test_media_dir_prepended(self):
+        """Relative media paths are joined with media_dir."""
+        example = {
+            "messages": [
+                {"role": "user", "content": "<image>\nWhat is this?"},
+                {"role": "assistant", "content": "A photo."},
+            ],
+            "images": ["sub/img.jpg"],
+        }
+        result = ds._convert_sharegpt_to_conversation(
+            example,
+            media_dir="/data/media",
+        )
+        assert result["conversation"][0]["content"][0] == {
+            "type": "image",
+            "image": "/data/media/sub/img.jpg",
+        }
+
+    def test_absolute_media_path_not_modified(self):
+        """Absolute media paths are not modified even when media_dir is set."""
+        example = {
+            "messages": [
+                {"role": "user", "content": "<image>\nDescribe."},
+                {"role": "assistant", "content": "Ok."},
+            ],
+            "images": ["/abs/path/img.jpg"],
+        }
+        result = ds._convert_sharegpt_to_conversation(
+            example,
+            media_dir="/data/media",
+        )
+        assert result["conversation"][0]["content"][0]["image"] == "/abs/path/img.jpg"
+
+    def test_multiple_images_and_videos(self):
+        """Multiple <image> and <video> placeholders consumed in order."""
+        example = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "<image>\n<video>\n<image>\nDescribe all.",
+                },
+                {"role": "assistant", "content": "Done."},
+            ],
+            "images": ["a.jpg", "b.jpg"],
+            "videos": ["v.mp4"],
+        }
+        result = ds._convert_sharegpt_to_conversation(example)
+        user_content = result["conversation"][0]["content"]
+        assert user_content[0] == {"type": "image", "image": "a.jpg"}
+        assert user_content[1] == {"type": "video", "video": "v.mp4"}
+        assert user_content[2] == {"type": "image", "image": "b.jpg"}
+        assert user_content[3] == {"type": "text", "text": "Describe all."}
+
+    def test_custom_columns_and_tags(self):
+        """Custom column names and tag mappings."""
+        example = {
+            "conversations": [
+                {"from": "human", "value": "Hi"},
+                {"from": "gpt", "value": "Hello"},
+            ],
+        }
+        result = ds._convert_sharegpt_to_conversation(
+            example,
+            columns={"messages": "conversations"},
+            tags={
+                "role_tag": "from",
+                "content_tag": "value",
+                "user_tag": "human",
+                "assistant_tag": "gpt",
+            },
+        )
+        conv = result["conversation"]
+        assert conv[0] == {"role": "user", "content": [{"type": "text", "text": "Hi"}]}
+        assert conv[1] == {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Hello"}],
+        }
+
+    def test_unknown_role_skipped(self):
+        """Messages with unrecognized roles are silently skipped."""
+        example = {
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi"},
+            ],
+        }
+        result = ds._convert_sharegpt_to_conversation(example)
+        assert len(result["conversation"]) == 2
+
+    def test_mm_inputs_meta_passthrough(self):
+        """mm_inputs_meta is passed through to the output."""
+        example = {
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello"},
+            ],
+            "mm_inputs_meta": {"fps": 1, "nframes": 64},
+        }
+        result = ds._convert_sharegpt_to_conversation(example)
+        assert result["mm_inputs_meta"] == {"fps": 1, "nframes": 64}
+
+
+# ---------------------------------------------------------------------------
+# Tests for make_meta_dataset
+# ---------------------------------------------------------------------------
+
+
+class TestMakeMetaDataset:
+    """Tests for the meta-file dataset loading function."""
+
+    def test_basic_jsonl(self, tmp_path):
+        """Load a single dataset from a JSONL file."""
+        # Create data file
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(
+            json.dumps(
+                {
+                    "messages": [
+                        {"role": "user", "content": "<image>\nWhat is this?"},
+                        {"role": "assistant", "content": "A photo of a cat."},
+                    ],
+                    "images": ["cat.jpg"],
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "messages": [
+                        {"role": "user", "content": "Hello"},
+                        {"role": "assistant", "content": "Hi there"},
+                    ],
+                }
+            )
+            + "\n",
+        )
+
+        # Create meta file
+        meta_file = tmp_path / "dataset_info.json"
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "my_dataset": {
+                        "file_name": "train.jsonl",
+                        "media_dir": "/data/images",
+                    },
+                }
+            )
+        )
+
+        result = ds.make_meta_dataset(str(meta_file))
+
+        assert len(result) == 2
+        # First example: image + text
+        conv0 = result[0]["conversation"]
+        assert conv0[0]["content"][0] == {"type": "image", "image": "/data/images/cat.jpg"}
+        assert conv0[0]["content"][1] == {"type": "text", "text": "What is this?"}
+        assert conv0[1]["content"][0] == {"type": "text", "text": "A photo of a cat."}
+        # Second example: text only
+        conv1 = result[1]["conversation"]
+        assert conv1[0]["content"] == [{"type": "text", "text": "Hello"}]
+
+    def test_json_array_file(self, tmp_path):
+        """Load from a plain JSON array file."""
+        data_file = tmp_path / "train.json"
+        data_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "messages": [
+                            {"role": "user", "content": "Hi"},
+                            {"role": "assistant", "content": "Hello"},
+                        ],
+                    },
+                ]
+            )
+        )
+
+        meta_file = tmp_path / "meta.json"
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.json"},
+                }
+            )
+        )
+
+        result = ds.make_meta_dataset(str(meta_file))
+        assert len(result) == 1
+
+    def test_multiple_datasets_combined(self, tmp_path):
+        """Multiple datasets in one meta file are merged."""
+        for name in ("a.jsonl", "b.jsonl"):
+            (tmp_path / name).write_text(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"From {name}"},
+                            {"role": "assistant", "content": "Ok"},
+                        ],
+                    }
+                )
+                + "\n",
+            )
+
+        meta_file = tmp_path / "meta.json"
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "dataset_a": {"file_name": "a.jsonl"},
+                    "dataset_b": {"file_name": "b.jsonl"},
+                }
+            )
+        )
+
+        result = ds.make_meta_dataset(str(meta_file))
+        assert len(result) == 2
+
+    def test_dataset_names_filter(self, tmp_path):
+        """Only selected datasets are loaded when dataset_names is specified."""
+        for name in ("a.jsonl", "b.jsonl"):
+            (tmp_path / name).write_text(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"From {name}"},
+                            {"role": "assistant", "content": "Ok"},
+                        ],
+                    }
+                )
+                + "\n",
+            )
+
+        meta_file = tmp_path / "meta.json"
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "dataset_a": {"file_name": "a.jsonl"},
+                    "dataset_b": {"file_name": "b.jsonl"},
+                }
+            )
+        )
+
+        result = ds.make_meta_dataset(str(meta_file), dataset_names=["dataset_a"])
+        assert len(result) == 1
+        assert result[0]["conversation"][0]["content"][0]["text"] == "From a.jsonl"
+
+    def test_dataset_names_missing_raises(self, tmp_path):
+        """Requesting a non-existent dataset name raises ValueError."""
+        meta_file = tmp_path / "meta.json"
+        meta_file.write_text(json.dumps({"ds1": {"file_name": "x.jsonl"}}))
+
+        with pytest.raises(ValueError, match="not found in meta file"):
+            ds.make_meta_dataset(str(meta_file), dataset_names=["nonexistent"])
+
+    def test_missing_file_name_raises(self, tmp_path):
+        """Dataset entry without file_name raises ValueError."""
+        meta_file = tmp_path / "meta.json"
+        meta_file.write_text(json.dumps({"ds1": {"media_dir": "/tmp"}}))
+
+        with pytest.raises(ValueError, match="missing 'file_name'"):
+            ds.make_meta_dataset(str(meta_file))
+
+    def test_sample_ratio(self, tmp_path):
+        """sample_ratio < 1.0 reduces the number of loaded examples."""
+        data_file = tmp_path / "train.jsonl"
+        lines = []
+        for i in range(10):
+            lines.append(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"Q{i}"},
+                            {"role": "assistant", "content": f"A{i}"},
+                        ],
+                    }
+                )
+            )
+        data_file.write_text("\n".join(lines) + "\n")
+
+        meta_file = tmp_path / "meta.json"
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.jsonl", "sample_ratio": 0.5},
+                }
+            )
+        )
+
+        result = ds.make_meta_dataset(str(meta_file))
+        assert len(result) == 5
+
+    def test_sample_ratio_upsample(self, tmp_path):
+        """sample_ratio > 1.0 duplicates data (integer ratio)."""
+        data_file = tmp_path / "train.jsonl"
+        lines = []
+        for i in range(10):
+            lines.append(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"Q{i}"},
+                            {"role": "assistant", "content": f"A{i}"},
+                        ],
+                    }
+                )
+            )
+        data_file.write_text("\n".join(lines) + "\n")
+
+        meta_file = tmp_path / "meta.json"
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.jsonl", "sample_ratio": 2.0},
+                }
+            )
+        )
+
+        result = ds.make_meta_dataset(str(meta_file))
+        assert len(result) == 20
+
+    def test_sample_ratio_upsample_fractional(self, tmp_path):
+        """sample_ratio with fractional part (e.g. 1.5) adds partial extra copy."""
+        data_file = tmp_path / "train.jsonl"
+        lines = []
+        for i in range(10):
+            lines.append(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"Q{i}"},
+                            {"role": "assistant", "content": f"A{i}"},
+                        ],
+                    }
+                )
+            )
+        data_file.write_text("\n".join(lines) + "\n")
+
+        meta_file = tmp_path / "meta.json"
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.jsonl", "sample_ratio": 1.5},
+                }
+            )
+        )
+
+        result = ds.make_meta_dataset(str(meta_file))
+        # 1 full copy (10) + floor(10 * 0.5) = 5 extra = 15
+        assert len(result) == 15
+
+    def test_absolute_file_path(self, tmp_path):
+        """Absolute file_name paths are used as-is."""
+        data_file = tmp_path / "data.jsonl"
+        data_file.write_text(
+            json.dumps(
+                {
+                    "messages": [
+                        {"role": "user", "content": "Hi"},
+                        {"role": "assistant", "content": "Hello"},
+                    ],
+                }
+            )
+            + "\n",
+        )
+
+        meta_file = tmp_path / "meta.json"
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": str(data_file)},
+                }
+            )
+        )
+
+        result = ds.make_meta_dataset(str(meta_file))
+        assert len(result) == 1
+
+    def test_custom_tags(self, tmp_path):
+        """Custom tags mapping works end-to-end through make_meta_dataset."""
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(
+            json.dumps(
+                {
+                    "conversations": [
+                        {"from": "human", "value": "Hi"},
+                        {"from": "gpt", "value": "Hello"},
+                    ],
+                }
+            )
+            + "\n",
+        )
+
+        meta_file = tmp_path / "meta.json"
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {
+                        "file_name": "train.jsonl",
+                        "columns": {"messages": "conversations"},
+                        "tags": {
+                            "role_tag": "from",
+                            "content_tag": "value",
+                            "user_tag": "human",
+                            "assistant_tag": "gpt",
+                        },
+                    },
+                }
+            )
+        )
+
+        result = ds.make_meta_dataset(str(meta_file))
+        conv = result[0]["conversation"]
+        assert conv[0] == {"role": "user", "content": [{"type": "text", "text": "Hi"}]}
+        assert conv[1] == {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Hello"}],
+        }
+
+    # -----------------------------------------------------------------------
+    # shard_data tests
+    # -----------------------------------------------------------------------
+
+    def _make_10_sample_meta(self, tmp_path):
+        """Helper: create a 10-sample JSONL file with a meta JSON."""
+        data_file = tmp_path / "train.jsonl"
+        lines = []
+        for i in range(10):
+            lines.append(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"Q{i}"},
+                            {"role": "assistant", "content": f"A{i}"},
+                        ],
+                    }
+                )
+            )
+        data_file.write_text("\n".join(lines) + "\n")
+
+        meta_file = tmp_path / "meta.json"
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.jsonl"},
+                }
+            )
+        )
+        return meta_file
+
+    def test_shard_data_rank0_of_2(self, tmp_path):
+        """Rank 0 of 2 loads even-indexed samples (0, 2, 4, 6, 8)."""
+        meta_file = self._make_10_sample_meta(tmp_path)
+        result = ds.make_meta_dataset(str(meta_file), shard_data=True, rank=0, world_size=2)
+        assert len(result) == 5
+        texts = [r["conversation"][0]["content"][0]["text"] for r in result]
+        assert texts == ["Q0", "Q2", "Q4", "Q6", "Q8"]
+
+    def test_shard_data_rank1_of_2(self, tmp_path):
+        """Rank 1 of 2 loads odd-indexed samples (1, 3, 5, 7, 9)."""
+        meta_file = self._make_10_sample_meta(tmp_path)
+        result = ds.make_meta_dataset(str(meta_file), shard_data=True, rank=1, world_size=2)
+        assert len(result) == 5
+        texts = [r["conversation"][0]["content"][0]["text"] for r in result]
+        assert texts == ["Q1", "Q3", "Q5", "Q7", "Q9"]
+
+    def test_shard_data_all_ranks_cover_full_dataset(self, tmp_path):
+        """All shards combined cover the dataset with equal counts per rank (tail dropped)."""
+        meta_file = self._make_10_sample_meta(tmp_path)
+        world_size = 3
+        per_rank = 10 // world_size  # 3
+        all_texts = []
+        for rank in range(world_size):
+            result = ds.make_meta_dataset(str(meta_file), shard_data=True, rank=rank, world_size=world_size)
+            assert len(result) == per_rank
+            all_texts.extend(r["conversation"][0]["content"][0]["text"] for r in result)
+        # Tail samples are dropped to ensure equal counts across ranks
+        assert len(all_texts) == per_rank * world_size
+        assert len(set(all_texts)) == len(all_texts)  # no duplicates
+
+    def test_shard_data_with_sample_ratio(self, tmp_path):
+        """sample_ratio is applied before sharding."""
+        data_file = tmp_path / "train.jsonl"
+        lines = []
+        for i in range(10):
+            lines.append(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"Q{i}"},
+                            {"role": "assistant", "content": f"A{i}"},
+                        ],
+                    }
+                )
+            )
+        data_file.write_text("\n".join(lines) + "\n")
+
+        meta_file = tmp_path / "meta.json"
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.jsonl", "sample_ratio": 0.6},
+                }
+            )
+        )
+
+        # sample_ratio=0.6 on 10 items -> 6 items, then rank 0/2 gets 3
+        result = ds.make_meta_dataset(str(meta_file), shard_data=True, rank=0, world_size=2)
+        assert len(result) == 3
+
+    def test_shard_data_with_upsample(self, tmp_path):
+        """sample_ratio > 1.0 is applied before sharding."""
+        data_file = tmp_path / "train.jsonl"
+        lines = []
+        for i in range(10):
+            lines.append(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"Q{i}"},
+                            {"role": "assistant", "content": f"A{i}"},
+                        ],
+                    }
+                )
+            )
+        data_file.write_text("\n".join(lines) + "\n")
+
+        meta_file = tmp_path / "meta.json"
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.jsonl", "sample_ratio": 2.0},
+                }
+            )
+        )
+
+        # sample_ratio=2.0 on 10 items -> 20 items, then rank 0/2 gets 10
+        result = ds.make_meta_dataset(str(meta_file), shard_data=True, rank=0, world_size=2)
+        assert len(result) == 10
+
+    def test_shard_data_world_size_1_returns_all(self, tmp_path):
+        """world_size=1 returns all data (no-op shard)."""
+        meta_file = self._make_10_sample_meta(tmp_path)
+        result = ds.make_meta_dataset(str(meta_file), shard_data=True, rank=0, world_size=1)
+        assert len(result) == 10
+
+    def test_shard_data_false_returns_all(self, tmp_path):
+        """shard_data=False (default) always returns full dataset."""
+        meta_file = self._make_10_sample_meta(tmp_path)
+        result = ds.make_meta_dataset(str(meta_file), shard_data=False, rank=0, world_size=2)
+        assert len(result) == 10
+
+
+# ---------------------------------------------------------------------------
+# Tests for _preload_media
+# ---------------------------------------------------------------------------
+
+
+class TestPreloadMedia:
+    """Tests for the _preload_media helper function."""
+
+    def test_loads_image_from_path(self, tmp_path):
+        """String path is loaded and converted to a PIL RGB Image."""
+        img = Image.new("RGBA", (4, 4), color="red")
+        img_path = tmp_path / "test.png"
+        img.save(str(img_path))
+
+        example = {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": str(img_path)},
+                        {"type": "text", "text": "Describe."},
+                    ],
+                },
+            ],
+        }
+
+        result = vlm_utils._preload_media(example)
+        loaded = result["conversation"][0]["content"][0]["image"]
+        assert isinstance(loaded, Image.Image)
+        assert loaded.mode == "RGB"
+
+    def test_converts_pil_image_to_rgb(self):
+        """An existing PIL Image in non-RGB mode is converted to RGB."""
+        rgba_img = Image.new("RGBA", (4, 4), color="blue")
+        example = {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": rgba_img}],
+                },
+            ],
+        }
+
+        result = vlm_utils._preload_media(example)
+        loaded = result["conversation"][0]["content"][0]["image"]
+        assert isinstance(loaded, Image.Image)
+        assert loaded.mode == "RGB"
+
+    @pytest.fixture
+    def _mock_decord(self, monkeypatch):
+        """Mock decord so video tests don't need real files."""
+        import numpy as np
+
+        total = 120
+        all_frames = np.random.randint(0, 255, (total, 4, 4, 3), dtype=np.uint8)
+
+        class FakeVideoReader:
+            def __init__(self, path):
+                self.path = path
+
+            def __len__(self):
+                return total
+
+            def get_avg_fps(self):
+                return 30.0
+
+            def get_batch(self, indices):
+                class FakeBatch:
+                    def asnumpy(self_inner):
+                        return all_frames[list(indices)]
+
+                return FakeBatch()
+
+        fake_decord = type(
+            "decord",
+            (),
+            {
+                "VideoReader": FakeVideoReader,
+                "bridge": type("bridge", (), {"set_bridge": staticmethod(lambda x: None)})(),
+            },
+        )()
+        monkeypatch.setitem(__import__("sys").modules, "decord", fake_decord)
+
+    def test_video_preloaded_to_pil_frames(self, _mock_decord):
+        """Video path is decoded into a list of PIL RGB Images."""
+        example = {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": "/data/clip.mp4"},
+                        {"type": "text", "text": "Describe."},
+                    ],
+                },
+            ],
+        }
+
+        result = vlm_utils._preload_media(example)
+        loaded = result["conversation"][0]["content"][0]["video"]
+        assert isinstance(loaded, list)
+        assert len(loaded) == 120
+        assert all(isinstance(f, Image.Image) for f in loaded)
+        assert all(f.mode == "RGB" for f in loaded)
+
+    def test_video_with_frame_indices(self, _mock_decord):
+        """Video with frame_indices only reads the specified frames (padded to even)."""
+        example = {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "video",
+                            "video": "/data/clip.mp4",
+                            "frame_indices": [0, 15, 30, 45, 60],
+                        },
+                        {"type": "text", "text": "Describe."},
+                    ],
+                },
+            ],
+        }
+
+        result = vlm_utils._preload_media(example)
+        loaded = result["conversation"][0]["content"][0]["video"]
+        assert isinstance(loaded, list)
+        # 5 frames → padded to 6 (even alignment)
+        assert len(loaded) == 6
+        assert all(isinstance(f, Image.Image) for f in loaded)
+
+    def test_text_only_passthrough(self):
+        """Examples with only text content are returned unchanged."""
+        example = {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Hello"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Hi"}],
+                },
+            ],
+        }
+
+        result = vlm_utils._preload_media(example)
+        assert result["conversation"][0]["content"][0]["text"] == "Hello"
+
+    def test_no_conversation_key(self):
+        """Example without a 'conversation' key is returned as-is."""
+        example = {"other_key": "value"}
+        result = vlm_utils._preload_media(example)
+        assert result == {"other_key": "value"}
+
+    def test_missing_image_file_raises(self):
+        """Missing image file raises an exception."""
+        example = {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": "/nonexistent/path.png"}],
+                },
+            ],
+        }
+
+        with pytest.raises(FileNotFoundError):
+            vlm_utils._preload_media(example)
+
+
+# ---------------------------------------------------------------------------
+# Tests for _read_video_frames
+# ---------------------------------------------------------------------------
+
+
+class TestReadVideoFrames:
+    """Tests for the _read_video_frames helper function."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_decord(self, monkeypatch):
+        """Mock decord so tests don't need real video files."""
+        import numpy as np
+
+        self._total_frames = 120
+        self._video_fps = 30.0
+        all_frames = np.random.randint(0, 255, (self._total_frames, 4, 4, 3), dtype=np.uint8)
+
+        class FakeVideoReader:
+            def __init__(vr, path):
+                vr.path = path
+
+            def __len__(vr):
+                return self._total_frames
+
+            def get_avg_fps(vr):
+                return self._video_fps
+
+            def get_batch(vr, indices):
+                class FakeBatch:
+                    def asnumpy(self_inner):
+                        return all_frames[list(indices)]
+
+                return FakeBatch()
+
+        fake_decord = type(
+            "decord",
+            (),
+            {
+                "VideoReader": FakeVideoReader,
+                "bridge": type("bridge", (), {"set_bridge": staticmethod(lambda x: None)})(),
+            },
+        )()
+        monkeypatch.setitem(__import__("sys").modules, "decord", fake_decord)
+
+    def test_returns_pil_images(self):
+        """Returns a list of PIL RGB Images."""
+        frames = vlm_utils._read_video_frames("/fake.mp4")
+        assert isinstance(frames, list)
+        assert all(isinstance(f, Image.Image) for f in frames)
+        assert all(f.mode == "RGB" for f in frames)
+
+    def test_respects_max_frames(self):
+        """Frame count is clamped to max_frames from processor."""
+        processor = type(
+            "P",
+            (),
+            {
+                "video_processor": type("VP", (), {"fps": None, "max_frames": 8, "min_frames": 4})(),
+            },
+        )()
+        frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
+        assert len(frames) == 8
+
+    def test_respects_fps_sampling(self):
+        """Frames are subsampled according to target fps."""
+        # 120 frames at 30fps video, target 2fps → interval=15 → 8 frames
+        processor = type(
+            "P",
+            (),
+            {
+                "video_processor": type("VP", (), {"fps": 2, "max_frames": None, "min_frames": 4})(),
+            },
+        )()
+        frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
+        assert len(frames) == 8
+
+    def test_no_processor_reads_all_frames(self):
+        """Without processor, all frames are returned."""
+        frames = vlm_utils._read_video_frames("/fake.mp4")
+        assert len(frames) == self._total_frames
+
+    def test_fps_with_max_frames_clamp(self):
+        """fps sampling + max_frames clamp work together."""
+        # 120 frames at 30fps, target 10fps → interval=3 → 40 frames, clamp to 16
+        processor = type(
+            "P",
+            (),
+            {
+                "video_processor": type("VP", (), {"fps": 10, "max_frames": 16, "min_frames": 4})(),
+            },
+        )()
+        frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
+        assert len(frames) == 16
+
+    def test_explicit_frame_indices(self):
+        """Explicit frame_indices overrides processor fps/max_frames, padded to even."""
+        processor = type(
+            "P",
+            (),
+            {
+                "video_processor": type(
+                    "VP",
+                    (),
+                    {
+                        "fps": 2,
+                        "max_frames": 4,
+                        "min_frames": 2,
+                        "temporal_patch_size": 2,
+                    },
+                )(),
+            },
+        )()
+        indices = [0, 15, 30, 45, 60]
+        frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor, frame_indices=indices)
+        # 5 frames → padded to 6 (next even)
+        assert len(frames) == 6
+
+    def test_frame_indices_clamped_to_valid_range(self):
+        """frame_indices beyond total_frames are clamped to the last frame."""
+        # total_frames = 120, so index 999 → 119; 3 frames → padded to 4 (even)
+        frames = vlm_utils._read_video_frames("/fake.mp4", frame_indices=[0, 10, 999])
+        assert len(frames) == 4
+
+    def test_even_frame_indices_not_padded(self):
+        """Even number of frame_indices is not padded."""
+        frames = vlm_utils._read_video_frames("/fake.mp4", frame_indices=[0, 10, 20, 30])
+        assert len(frames) == 4
+
+    def test_temporal_patch_size_alignment(self):
+        """Frame count is aligned to temporal_patch_size from processor."""
+        processor = type(
+            "P",
+            (),
+            {
+                "video_processor": type(
+                    "VP",
+                    (),
+                    {
+                        "fps": None,
+                        "max_frames": None,
+                        "min_frames": 4,
+                        "temporal_patch_size": 4,
+                    },
+                )(),
+            },
+        )()
+        # 120 frames, no fps sampling → 120 frames, 120 % 4 == 0, no padding
+        frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
+        assert len(frames) % 4 == 0
+
+    def test_round_up_not_down(self):
+        """Frame count rounds UP to temporal_patch_size boundary, not down.
+
+        This ensures consistency with the sampler, HF video processor,
+        and LLaMA-Factory (all round up).
+        """
+        # 120 frames at 30fps, target 1fps → nframes = 120/30*1 = 4.0
+        # max_frames=5 → min(4,5)=4, but let's use a case where rounding matters:
+        # 120 frames at 30fps, target 3fps → nframes = 120/30*3 = 12.0
+        # max_frames=5 → min(12,5)=5, temporal_patch_size=4
+        # Round UP: 5 → 8 (next multiple of 4)
+        # Round DOWN would give: 5 → 4
+        processor = type(
+            "P",
+            (),
+            {
+                "video_processor": type(
+                    "VP",
+                    (),
+                    {
+                        "fps": 3,
+                        "max_frames": 5,
+                        "min_frames": 2,
+                        "temporal_patch_size": 4,
+                    },
+                )(),
+            },
+        )()
+        frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
+        assert len(frames) == 8  # rounded UP from 5 to 8, not down to 4
+
+
+# ---------------------------------------------------------------------------
+# Tests for RobustDatasetWrapper preload toggle
+# ---------------------------------------------------------------------------
+
+
+class TestRobustDatasetWrapperPreload:
+    """Tests for the preload_media toggle on RobustDatasetWrapper."""
+
+    def test_preload_default_false(self):
+        """preload_media defaults to False and processor to None."""
+        wrapper = ds.RobustDatasetWrapper([{"conversation": []}])
+        assert wrapper.preload_media is False
+        assert wrapper.processor is None
+
+    def test_preload_enabled_returns_pil(self, tmp_path):
+        """When preload_media=True, __getitem__ returns PIL Images."""
+        img = Image.new("RGB", (4, 4), color="green")
+        img_path = tmp_path / "img.png"
+        img.save(str(img_path))
+
+        data = [
+            {
+                "conversation": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", "image": str(img_path)}],
+                    },
+                ],
+            },
+        ]
+        wrapper = ds.RobustDatasetWrapper(data)
+        wrapper.preload_media = True
+
+        result = wrapper[0]
+        loaded = result["conversation"][0]["content"][0]["image"]
+        assert isinstance(loaded, Image.Image)
+        assert loaded.mode == "RGB"
+
+    def test_preload_disabled_returns_string(self, tmp_path):
+        """When preload_media=False, __getitem__ returns path strings."""
+        img = Image.new("RGB", (4, 4), color="green")
+        img_path = tmp_path / "img.png"
+        img.save(str(img_path))
+
+        data = [
+            {
+                "conversation": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", "image": str(img_path)}],
+                    },
+                ],
+            },
+        ]
+        wrapper = ds.RobustDatasetWrapper(data)
+        # preload_media is False by default
+
+        result = wrapper[0]
+        assert result["conversation"][0]["content"][0]["image"] == str(img_path)
+
+    def test_preload_failure_retries(self):
+        """When preload fails on one sample, retry picks a different sample."""
+        good_img = Image.new("RGB", (4, 4), color="red")
+        data = [
+            {
+                "conversation": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", "image": "/nonexistent.png"}],
+                    },
+                ],
+            },
+            {
+                "conversation": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", "image": good_img}],
+                    },
+                ],
+            },
+        ]
+        wrapper = ds.RobustDatasetWrapper(data, max_retries=10)
+        wrapper.preload_media = True
+
+        # Requesting index 0 (bad path) should eventually retry and succeed
+        # with a random fallback sample
+        result = wrapper[0]
+        loaded = result["conversation"][0]["content"][0]["image"]
+        assert isinstance(loaded, Image.Image)
+
+
+# ---------------------------------------------------------------------------
+# Tests for dataset-level fake image injection (FSDP / Zero3)
+# ---------------------------------------------------------------------------
+
+
+class TestRobustDatasetWrapperFakeImageInjection:
+    """RobustDatasetWrapper injects fake images into pure-text samples at __getitem__ time."""
+
+    def test_text_only_gets_fake_image_when_preload(self):
+        """Pure-text sample gets a fake image injected when preload_media=True."""
+        data = [
+            {
+                "conversation": [
+                    {"role": "user", "content": [{"type": "text", "text": "What is 1+1?"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "2"}]},
+                ],
+            },
+        ]
+        wrapper = ds.RobustDatasetWrapper(data)
+        wrapper.preload_media = True
+
+        result = wrapper[0]
+        # Should have _injected_fake flag
+        assert result.get("_injected_fake") is True
+        # First user content item should now be a fake image
+        user_content = result["conversation"][0]["content"]
+        assert user_content[0]["type"] == "image"
+        assert isinstance(user_content[0]["image"], Image.Image)
+        # Original text should still be present
+        assert user_content[1] == {"type": "text", "text": "What is 1+1?"}
+
+    def test_image_sample_not_injected(self, tmp_path):
+        """Sample with real image should NOT get fake image injected."""
+        img = Image.new("RGB", (4, 4), color="blue")
+        img_path = tmp_path / "img.png"
+        img.save(str(img_path))
+
+        data = [
+            {
+                "conversation": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": str(img_path)},
+                            {"type": "text", "text": "Describe"},
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": "A blue image"}]},
+                ],
+            },
+        ]
+        wrapper = ds.RobustDatasetWrapper(data)
+        wrapper.preload_media = True
+
+        result = wrapper[0]
+        assert "_injected_fake" not in result
+        # Only the original image + text, no extra fake image
+        user_content = result["conversation"][0]["content"]
+        assert len(user_content) == 2
+        assert user_content[0]["type"] == "image"
+
+    def test_no_injection_when_preload_disabled(self):
+        """When preload_media=False (eval mode), no injection happens."""
+        data = [
+            {
+                "conversation": [
+                    {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+                ],
+            },
+        ]
+        wrapper = ds.RobustDatasetWrapper(data)
+        # preload_media defaults to False
+
+        result = wrapper[0]
+        assert "_injected_fake" not in result
+        # Content should be unchanged
+        user_content = result["conversation"][0]["content"]
+        assert len(user_content) == 1
+        assert user_content[0]["type"] == "text"
+
+    def test_does_not_mutate_original(self):
+        """Injection should not mutate the original dataset sample."""
+        original_conv = [
+            {"role": "user", "content": [{"type": "text", "text": "test"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        ]
+        data = [{"conversation": original_conv}]
+        wrapper = ds.RobustDatasetWrapper(data)
+        wrapper.preload_media = True
+
+        result = wrapper[0]
+        assert result.get("_injected_fake") is True
+        # Original conversation should be unchanged
+        assert len(original_conv[0]["content"]) == 1
+        assert original_conv[0]["content"][0]["type"] == "text"
+
+
+# ---------------------------------------------------------------------------
+# HF audio ASR dataset builder (Qwen3-Omni)
+# ---------------------------------------------------------------------------
+import io as _io
+import sys as _sys
+
+import numpy as _np
+import soundfile as _sf
+
+
+def _make_wav_bytes(sampling_rate=16000, duration_seconds=0.5, frequency_hz=440.0):
+    """Generate a short mono WAV blob for synthetic tests."""
+    t = _np.linspace(0, duration_seconds, int(sampling_rate * duration_seconds), endpoint=False)
+    waveform = 0.1 * _np.sin(2 * _np.pi * frequency_hz * t).astype(_np.float32)
+    buf = _io.BytesIO()
+    _sf.write(buf, waveform, sampling_rate, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def _SyntheticHFRows(rows):
+    """Build a real HF ``Dataset`` from a list of ``{audio: {bytes,path}, text}`` rows.
+
+    The audio column is stored as a plain ``struct<bytes, path>`` (no ``Audio``
+    feature), because HF's ``Audio.encode_example`` requires ``torchcodec`` even
+    for ``decode=False`` and that is absent from this env. The builder's
+    downstream ``cast_column(audio, Audio(decode=False))`` is monkey-patched
+    away below; the storage layout already matches what the builder's lazy
+    ``with_transform`` callback consumes, so the cast is functionally a no-op.
+    """
+    from datasets import Dataset as _Dataset
+
+    columns = sorted({k for row in rows for k in row.keys()}) if rows else ["audio", "text"]
+    data = {col: [r.get(col) for r in rows] for col in columns}
+    dataset = _Dataset.from_dict(data)
+    # Replace cast_column on the produced instance so the builder's call
+    # ``cast_column(audio, Audio(decode=False))`` does not pull torchcodec.
+    dataset.cast_column = lambda column_name, _feature: dataset  # type: ignore[assignment]
+    return dataset
+
+
+def test_make_hf_audio_asr_dataset_bytes_branch(monkeypatch):
+    """The bytes branch decodes via soundfile and emits the Qwen3-Omni schema."""
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": wav, "path": None}, "text": "你好"},
+            {"audio": {"bytes": wav, "path": None}, "text": "侬好"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(
+        path_or_dataset="ignored",
+        split="train",
+        sampling_rate=16000,
+    )
+
+    assert len(rows) == 2
+    for row, src in zip(rows, fake_rows):
+        assert list(row.keys()) == ["conversation"]
+        conv = row["conversation"]
+        # Default system_prompt is None → no system turn.
+        assert [t["role"] for t in conv] == ["user", "assistant"]
+
+        # user turn carries the decoded audio
+        user_content = conv[0]["content"]
+        assert isinstance(user_content, list) and len(user_content) == 1
+        audio_item = user_content[0]
+        assert audio_item["type"] == "audio"
+        waveform = audio_item["audio"]
+        assert isinstance(waveform, _np.ndarray)
+        assert waveform.dtype == _np.float32
+        assert waveform.ndim == 1
+
+        # assistant turn carries the transcript
+        assistant_content = conv[1]["content"]
+        assert assistant_content == [{"type": "text", "text": src["text"]}]
+
+
+def test_make_hf_audio_asr_dataset_path_branch(monkeypatch, tmp_path):
+    """The path branch decodes via soundfile when no in-memory bytes are present."""
+    wav_path = tmp_path / "sample.wav"
+    _sf.write(str(wav_path), _np.zeros(800, dtype=_np.float32), 16000, format="WAV", subtype="PCM_16")
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": None, "path": str(wav_path)}, "text": "侬好"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
+    assert len(rows) == 1
+    # Default system_prompt is None → user turn at index 0.
+    waveform = rows[0]["conversation"][0]["content"][0]["audio"]
+    assert waveform.dtype == _np.float32
+    assert waveform.ndim == 1
+
+
+def test_make_hf_audio_asr_dataset_raises_when_audio_cell_empty(monkeypatch):
+    """Both ``bytes`` and ``path`` missing must raise a clear ValueError.
+
+    With the lazy ``with_transform`` builder this fires at access time, not at
+    construction time — so the assertion is anchored on ``rows[0]``.
+    """
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": None, "path": None}, "text": "x"}])
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
+    with pytest.raises(ValueError, match="neither 'bytes' nor 'path'"):
+        _ = rows[0]
+
+
+def test_make_hf_audio_asr_dataset_drops_empty_text(monkeypatch):
+    """Default behaviour skips samples whose transcript is empty/whitespace."""
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": wav, "path": None}, "text": "  "},
+            {"audio": {"bytes": wav, "path": None}, "text": "侬好"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
+    assert len(rows) == 1
+    # Default system_prompt is None → assistant turn at index 1.
+    assert rows[0]["conversation"][1]["content"][0]["text"] == "侬好"
+
+
+def test_make_hf_audio_asr_dataset_module_does_not_import_torchcodec():
+    """The dataset module must not transitively pull in torchcodec."""
+    assert "torchcodec" not in _sys.modules
+    # The module under test (already imported at the top of this file as ``ds``)
+    # must not import torchcodec at module load time either.
+    # ``ds.__dict__`` should not contain a top-level ``torchcodec`` binding.
+    assert "torchcodec" not in ds.__dict__
+
+
+def test_make_hf_audio_asr_dataset_resamples_when_sr_differs(monkeypatch):
+    """When source SR != target SR, the waveform is resampled and stays float32 mono."""
+    wav = _make_wav_bytes(sampling_rate=8000, duration_seconds=0.25)
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(
+        path_or_dataset="ignored",
+        sampling_rate=16000,
+    )
+    # Default system_prompt is None → user turn at index 0.
+    waveform = rows[0]["conversation"][0]["content"][0]["audio"]
+    assert waveform.dtype == _np.float32
+    assert waveform.ndim == 1
+    # 0.25s at 16 kHz target ≈ 4000 samples (allow ±a few for resample_poly polyphase rounding).
+    assert abs(waveform.shape[0] - 4000) <= 8
+
+
+def test_make_hf_audio_asr_dataset_user_prompt_appears_before_audio(monkeypatch):
+    """When ``user_prompt`` is set, it becomes the first text item in the user turn."""
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(
+        path_or_dataset="ignored",
+        system_prompt="Transcribe.",
+        user_prompt="please transcribe",
+    )
+    assert len(rows) == 1
+    conv = rows[0]["conversation"]
+    # Explicit system_prompt is set → full three-turn shape.
+    assert [t["role"] for t in conv] == ["system", "user", "assistant"]
+    user_content = conv[1]["content"]
+    # First user item is the text prompt, second is the audio ndarray.
+    assert user_content[0] == {"type": "text", "text": "please transcribe"}
+    assert user_content[1]["type"] == "audio"
+    assert isinstance(user_content[1]["audio"], _np.ndarray)
+
+
+def test_make_hf_audio_asr_dataset_system_none_drops_system_turn(monkeypatch):
+    """``system_prompt=None`` (or empty) must drop the system turn entirely."""
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(
+        path_or_dataset="ignored",
+        system_prompt=None,
+        user_prompt="please transcribe",
+    )
+    assert len(rows) == 1
+    conv = rows[0]["conversation"]
+    # No system turn.
+    assert [t["role"] for t in conv] == ["user", "assistant"]
+    user_content = conv[0]["content"]
+    assert user_content[0]["type"] == "text"
+    assert user_content[1]["type"] == "audio"
+
+
+def test_make_hf_audio_asr_dataset_both_prompts_none(monkeypatch):
+    """When both prompts are None the user turn carries only the audio item."""
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(
+        path_or_dataset="ignored",
+        system_prompt=None,
+        user_prompt=None,
+    )
+    conv = rows[0]["conversation"]
+    assert [t["role"] for t in conv] == ["user", "assistant"]
+    assert len(conv[0]["content"]) == 1
+    assert conv[0]["content"][0]["type"] == "audio"
+
+
+def test_make_hf_audio_asr_dataset_blank_prompts_drop(monkeypatch):
+    """Whitespace-only prompts are treated as absent."""
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(
+        path_or_dataset="ignored",
+        system_prompt="   ",
+        user_prompt="\t\n",
+    )
+    conv = rows[0]["conversation"]
+    assert [t["role"] for t in conv] == ["user", "assistant"]
+    assert len(conv[0]["content"]) == 1
+    assert conv[0]["content"][0]["type"] == "audio"
+
+
+def test_make_hf_audio_asr_dataset_is_lazy_no_decode_at_construction(monkeypatch):
+    """Builder must NOT call the audio decoder at construction time.
+
+    The decode helper is recorded on each call; constructing the dataset must
+    not trigger any decode. Only ``rows[0]`` (the lazy transform access) should.
+    """
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": wav, "path": None}, "text": "你好"},
+            {"audio": {"bytes": wav, "path": None}, "text": "侬好"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    decode_calls = []
+    original_decode = ds._decode_audio_cell_to_mono_float32
+
+    def _spy(audio_cell, target_sampling_rate):
+        decode_calls.append(target_sampling_rate)
+        return original_decode(audio_cell, target_sampling_rate)
+
+    monkeypatch.setattr(ds, "_decode_audio_cell_to_mono_float32", _spy)
+
+    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
+    # Construction must not have decoded any audio.
+    assert decode_calls == [], f"decode ran at construction time: {len(decode_calls)} calls"
+    # Length is O(1) (Arrow row count); does not iterate.
+    assert len(rows) == 2
+    assert decode_calls == []
+    # First __getitem__ triggers exactly one decode.
+    _ = rows[0]
+    assert len(decode_calls) == 1
+    # Second __getitem__ triggers one more (no caching at this layer).
+    _ = rows[1]
+    assert len(decode_calls) == 2
+
+
+def test_make_hf_audio_asr_dataset_default_system_prompt_is_none(monkeypatch):
+    """Without overriding ``system_prompt``, the builder emits no system turn.
+
+    Pins down the post-rename default: the builder is dataset-agnostic, so its
+    default prompt shape is the most neutral one (``user → assistant``).
+    """
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
+    conv = rows[0]["conversation"]
+    assert [t["role"] for t in conv] == ["user", "assistant"]
+    # User turn carries only the audio (no text item).
+    assert conv[0]["content"][0]["type"] == "audio"
+
+
+def test_make_hf_audio_asr_dataset_passes_name_to_load_dataset(monkeypatch):
+    """``name`` is forwarded to ``datasets.load_dataset`` as the subset/config.
+
+    AMI requires ``name='ihm'`` or ``name='sdm'``; CommonVoice requires the
+    language code. The builder must expose this as a first-class parameter so
+    YAML files don't have to round-trip through ``**load_kwargs``.
+    """
+    wav = _make_wav_bytes()
+    captured_kwargs = {}
+
+    def _spy_load_dataset(path, *args, **kwargs):
+        captured_kwargs["path"] = path
+        captured_kwargs.update(kwargs)
+        # Return a real fake dataset so the rest of the builder can run.
+        return _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "x"}])
+
+    monkeypatch.setattr(ds, "load_dataset", _spy_load_dataset)
+
+    ds.make_hf_audio_asr_dataset(
+        path_or_dataset="edinburghcstr/ami",
+        name="ihm",
+        split="train[:1]",
+    )
+    assert captured_kwargs["path"] == "edinburghcstr/ami"
+    assert captured_kwargs["name"] == "ihm"
+    assert captured_kwargs["split"] == "train[:1]"
+
+
+def test_make_hf_audio_asr_dataset_min_duration_filters_short_bytes(monkeypatch):
+    """``min_audio_duration_seconds`` drops sub-threshold samples in the bytes branch.
+
+    The HF Qwen3-Omni Whisper feature extractor crashes on sub-second clips
+    due to an off-by-one between ``input_features`` and
+    ``feature_attention_mask``; the builder exposes this filter to keep
+    AMI / CommonVoice-style corpora trainable.
+    """
+    short_wav = _make_wav_bytes(duration_seconds=0.25)
+    long_wav = _make_wav_bytes(duration_seconds=1.5)
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": short_wav, "path": None}, "text": "short"},
+            {"audio": {"bytes": long_wav, "path": None}, "text": "long"},
+            {"audio": {"bytes": short_wav, "path": None}, "text": "short2"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(
+        path_or_dataset="ignored",
+        min_audio_duration_seconds=1.0,
+    )
+    assert len(rows) == 1
+    assert rows[0]["conversation"][1]["content"][0]["text"] == "long"
+
+
+def test_make_hf_audio_asr_dataset_min_duration_filters_short_paths(monkeypatch, tmp_path):
+    """``min_audio_duration_seconds`` also covers the path branch via sf.info."""
+    short_path = tmp_path / "short.wav"
+    long_path = tmp_path / "long.wav"
+    _sf.write(str(short_path), _np.zeros(800, dtype=_np.float32), 16000, format="WAV", subtype="PCM_16")
+    _sf.write(str(long_path), _np.zeros(24000, dtype=_np.float32), 16000, format="WAV", subtype="PCM_16")
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": None, "path": str(short_path)}, "text": "short"},
+            {"audio": {"bytes": None, "path": str(long_path)}, "text": "long"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(
+        path_or_dataset="ignored",
+        min_audio_duration_seconds=1.0,
+    )
+    assert len(rows) == 1
+    assert rows[0]["conversation"][1]["content"][0]["text"] == "long"
+
+
+def test_make_hf_audio_asr_dataset_min_duration_none_keeps_all(monkeypatch):
+    """``min_audio_duration_seconds=None`` (default) skips the filter entirely."""
+    short_wav = _make_wav_bytes(duration_seconds=0.25)
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": short_wav, "path": None}, "text": "a"},
+            {"audio": {"bytes": short_wav, "path": None}, "text": "b"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
+    assert len(rows) == 2

@@ -16,6 +16,8 @@
 # change model id to Qwen/Qwen3.5-2B and Qwen/Qwen3.5-0.8B to finetune smaller models
 
 
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 16
   local_batch_size: 1
@@ -96,6 +98,7 @@ optimizer:
   weight_decay: 0.1
 
 ci:
+  recipe_owner: HuiyingLi
   time: "00:30:00"
 
 # wandb:

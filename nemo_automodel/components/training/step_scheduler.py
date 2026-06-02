@@ -57,6 +57,7 @@ class StepScheduler(Stateful):
         dp_size: int,
         dataloader: Optional[int],
         ckpt_every_steps: Optional[int] = None,
+        save_checkpoint_every_epoch: bool = True,
         val_every_steps: Optional[int] = None,
         log_remote_every_steps: int = 1,
         gc_every_steps: Optional[int] = None,
@@ -74,6 +75,10 @@ class StepScheduler(Stateful):
             dp_size (int): Number of GPUs for data parallelism.
             dataloader: The training dataloader.
             ckpt_every_steps (Optional[int]): Frequency of checkpoint steps.
+            save_checkpoint_every_epoch (bool): Whether to save checkpoints at epoch boundaries.
+                When True, checkpoints are saved at the end of each epoch (is_last_batch).
+                When False, only periodic, last-step, and SIGTERM checkpoints are saved.
+                Default: True.
             val_every_steps (Optional[int]): Number of training steps between validation.
             log_remote_every_steps (int): Frequency of remote logging (e.g., WandB, MLflow). Default: 1 (every step).
             gc_every_steps (Optional[int]): Frequency of manual garbage collection steps.
@@ -82,23 +87,36 @@ class StepScheduler(Stateful):
             num_epochs (Optional[int]): Total number of epochs. Default: None or calculated from max_steps if num_epochs is None or 10 if max_steps and num_epochs are both None.
             max_steps (Optional[int]): Maximum number of steps to run. If None, calculated from num_epochs.
         """
-        assert global_batch_size % (local_batch_size * dp_size) == 0, (
-            f"global_batch_size ({global_batch_size}) must be divisible by local_batch_size * dp_size ({local_batch_size} * {dp_size})"
-        )
+        if global_batch_size <= 0:
+            raise ValueError(f"global_batch_size must be greater than 0, got {global_batch_size}")
+        if local_batch_size <= 0:
+            raise ValueError(f"local_batch_size must be greater than 0, got {local_batch_size}")
+        if dp_size <= 0:
+            raise ValueError(f"dp_size must be greater than 0, got {dp_size}")
+        local_global_batch_size = local_batch_size * dp_size
+        if global_batch_size % local_global_batch_size != 0:
+            raise ValueError(
+                f"global_batch_size ({global_batch_size}) must be divisible by local_batch_size * dp_size "
+                f"({local_batch_size} * {dp_size})"
+            )
         self.grad_acc_steps = global_batch_size // (local_batch_size * dp_size)
-        assert self.grad_acc_steps >= 1, (
-            f"grad_acc_steps ({self.grad_acc_steps}) must be greater than or equal to 1. Please ensure that global_batch_size >= (local_batch_size * dp_size)"
-        )
+        if self.grad_acc_steps < 1:
+            raise ValueError(
+                f"grad_acc_steps ({self.grad_acc_steps}) must be greater than or equal to 1. "
+                "Please ensure that global_batch_size >= (local_batch_size * dp_size)"
+            )
         self.dataloader = dataloader
         self.step = start_step
-        assert start_step >= 0, "start_step must be greater than or equal to 0"
+        if start_step < 0:
+            raise ValueError(f"start_step must be greater than or equal to 0, got {start_step}")
         self.epoch = start_epoch
-        assert start_epoch >= 0, "start_epoch must be greater than or equal to 0"
+        if start_epoch < 0:
+            raise ValueError(f"start_epoch must be greater than or equal to 0, got {start_epoch}")
 
         # Throws with IterableDataset.
         try:
             self.epoch_len = ceil(len(dataloader) / self.grad_acc_steps)
-        except:
+        except (NotImplementedError, TypeError, RuntimeError):
             self.epoch_len = None
 
         # This is for backward compatibility in the sense that num_epochs's default value was 10
@@ -109,30 +127,37 @@ class StepScheduler(Stateful):
             )
 
         self.num_epochs = num_epochs
-        assert num_epochs is None or num_epochs > 0, (
-            "num_epochs must be greater than 0 or None if max_steps is provided"
-        )
+        if num_epochs is not None and num_epochs <= 0:
+            raise ValueError(f"num_epochs must be greater than 0 or None if max_steps is provided, got {num_epochs}")
 
         self.val_every_steps = val_every_steps
-        assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
+        if val_every_steps is not None and val_every_steps <= 0:
+            raise ValueError(f"val_every_steps must be greater than 0 if not None, got {val_every_steps}")
         self.log_remote_every_steps = log_remote_every_steps
-        assert log_remote_every_steps > 0, "log_remote_every_steps must be greater than 0"
+        if log_remote_every_steps <= 0:
+            raise ValueError(f"log_remote_every_steps must be greater than 0, got {log_remote_every_steps}")
         self.gc_every_steps = gc_every_steps
-        assert gc_every_steps is None or gc_every_steps > 0, "gc_every_steps must be greater than 0 if not None"
+        if gc_every_steps is not None and gc_every_steps <= 0:
+            raise ValueError(f"gc_every_steps must be greater than 0 if not None, got {gc_every_steps}")
         if max_steps is None:
-            assert self.epoch_len is not None, "epoch_len must be provided if max_steps is not provided"
+            if self.epoch_len is None:
+                raise ValueError("epoch_len must be provided if max_steps is not provided")
             max_steps = _calculate_max_steps(self.num_epochs, self.epoch_len)
             logger.info("max_steps not provided; will run for up to {} steps".format(max_steps))
         self.max_steps = max_steps
-        assert max_steps > 0, "max_steps must be greater than 0"
+        if max_steps <= 0:
+            raise ValueError(f"max_steps must be greater than 0, got {max_steps}")
 
         if ckpt_every_steps is None:
             if self.epoch_len is None:
-                ckpt_every_steps = self.max_steps // 2
+                ckpt_every_steps = max(1, self.max_steps // 2)
             else:
                 ckpt_every_steps = self.epoch_len
             logger.info("ckpt_every_steps not provided; will save checkpoint every {} steps".format(ckpt_every_steps))
+        if ckpt_every_steps <= 0:
+            raise ValueError(f"ckpt_every_steps must be greater than 0, got {ckpt_every_steps}")
         self.ckpt_every_steps = ckpt_every_steps
+        self.save_checkpoint_every_epoch = save_checkpoint_every_epoch
 
         self.sig_handler = DistributedSignalHandler().__enter__()
         self.sigterm_flag = False
@@ -197,7 +222,8 @@ class StepScheduler(Stateful):
             bool: if true, the checkpoint should run.
         """
         is_ckpt_step = (self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1
-        return is_ckpt_step or self.is_last_batch or self.is_last_step or self.sigterm_received
+        is_epoch_boundary = self.save_checkpoint_every_epoch and self.is_last_batch
+        return is_ckpt_step or is_epoch_boundary or self.is_last_step or self.sigterm_received
 
     @property
     def is_gc_step(self):

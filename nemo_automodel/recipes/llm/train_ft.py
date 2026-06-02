@@ -14,6 +14,18 @@
 
 from __future__ import annotations
 
+import warnings
+
+# Suppress pydantic v2 UnsupportedFieldAttributeWarning before heavy imports
+# (transformers, huggingface_hub) trigger schema generation.
+try:
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+
+    warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
+except ImportError:
+    pass
+
+import gc
 import inspect
 import logging
 import pathlib
@@ -21,6 +33,7 @@ import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+import mlflow
 import torch
 import torch.nn as nn
 import wandb
@@ -48,7 +61,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
-from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
@@ -60,15 +73,22 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sy
 from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
-from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
+from nemo_automodel.components.loggers.mlflow_utils import (
+    configure_mlflow,
+    end_mlflow_active_run_as_killed,
+    to_float_metrics,
+)
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
+from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -116,11 +136,21 @@ def _get_model_name(cfg_model):
         return None
 
 
-def _uses_te_dot_product_attention(cfg_model):
+def _uses_te_dot_product_attention(model_or_cfg):
+    """Check whether the model uses TE DotProductAttention.
+
+    Accepts either an instantiated nn.Module (preferred — inspects actual modules)
+    or a config object (fallback — checks backend.attn string).
+    """
+    if isinstance(model_or_cfg, torch.nn.Module):
+        try:
+            from transformer_engine.pytorch.attention import DotProductAttention
+        except ImportError:
+            return False
+        return any(isinstance(m, DotProductAttention) for m in model_or_cfg.modules())
+    # Config fallback for call sites before model is built
     return (
-        True
-        if hasattr(cfg_model, "backend") and hasattr(cfg_model.backend, "attn") and cfg_model.backend.attn == "te"
-        else False
+        hasattr(model_or_cfg, "backend") and hasattr(model_or_cfg.backend, "attn") and model_or_cfg.backend.attn == "te"
     )
 
 
@@ -132,6 +162,11 @@ def _uses_thd_collater(cfg_dataloader):
         if hasattr(cfg_dataloader, "collate_fn") and cfg_dataloader.collate_fn == packed_sequence_thd_collater
         else False
     )
+
+
+def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
+    """Return whether the recipe should attach PP causal-mask precomputation."""
+    return getattr(model_config, "model_type", None) != "deepseek_v4"
 
 
 def _get_num_thd_chunks(pp_enabled, cfg):
@@ -289,7 +324,7 @@ def build_model(
     return model
 
 
-def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh, is_peft: bool = False):
     """Build an optimizer for the model.
 
     Args:
@@ -297,6 +332,7 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         cfg_opt: The configuration for the optimizer.
         distributed_config: The distributed configuration.
         device_mesh: The device mesh.
+        is_peft: Whether the optimizer is for a PEFT run.
     """
     # Resolve dtype strings (e.g. "torch.bfloat16") to torch.dtype objects for
     # optimizers like TE FusedAdam that accept dtype kwargs.
@@ -306,8 +342,16 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             setattr(cfg_opt, attr, dtype_from_str(val))
 
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
-        # TP does not support foreach
-        cfg_opt.foreach = False
+        # TP does not support foreach for torch optimizers. Do not add this kwarg
+        # to optimizer classes that do not declare it, such as TE FusedAdam.
+        target = getattr(cfg_opt, "_target_", None)
+        if isinstance(target, str):
+            target_name = target
+        else:
+            target_module = getattr(target, "__module__", "")
+            target_name = f"{target_module}.{getattr(target, '__qualname__', '')}"
+        if target_name.startswith("torch.optim.") or hasattr(cfg_opt, "foreach"):
+            cfg_opt.foreach = False
 
     optimizer = []
     has_dion_optimizer = is_dion_optimizer(cfg_opt)
@@ -327,6 +371,14 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             assert not has_dion_optimizer, "Dion optimizer does not support fully_shard_optimizer"
             tmp_optimizer = fully_shard_optimizer(part, tmp_optimizer)
         optimizer.append(tmp_optimizer)
+
+    warn_if_torch_adam_with_bf16_params(
+        optimizer=optimizer,
+        optimizer_cfg=cfg_opt,
+        is_peft=is_peft,
+        context="llm",
+        logger=logger,
+    )
 
     return optimizer
 
@@ -351,17 +403,23 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
         model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
-        save_consolidated=True,
+        save_consolidated="final",
         is_peft=is_peft,
     )
+    user_cfg = {}
     if cfg_ckpt is not None:
-        cfg_ckpt = cfg_ckpt.to_dict()
-        cfg_ckpt.pop("restore_from", None)
-        ckpt_kwargs |= cfg_ckpt
-    if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
-        raise ValueError(
-            "PEFT checkpointing is not supported for torch_save format. Save using `safetensors` format instead."
+        user_cfg = cfg_ckpt.to_dict()
+        user_cfg.pop("restore_from", None)
+    if is_peft and user_cfg.get("model_save_format") == "torch_save":
+        logger.warning(
+            "PEFT checkpointing is not supported for `torch_save` format; "
+            "discarding user checkpoint config and using safetensors defaults "
+            "(preserving `checkpoint_dir` if set)."
         )
+        if "checkpoint_dir" in user_cfg:
+            ckpt_kwargs["checkpoint_dir"] = user_cfg["checkpoint_dir"]
+    else:
+        ckpt_kwargs |= user_cfg
     checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
     return checkpoint_config
 
@@ -505,6 +563,8 @@ def build_dataloader(
 
             if packing_strategy == "neat":
                 from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
+                from nemo_automodel.components.datasets.utils import neat_packed_collater
+                from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
                 ds = neat_pack_dataset(
                     ds,
@@ -512,8 +572,13 @@ def build_dataloader(
                     pack_size=packed_sequence_size,
                     max_packs=getattr(cfg_ps, "max_packs", None),
                     padding_idx=getattr(tokenizer, "pad_token_id", 0),
-                    drop_long_samples=getattr(cfg_ps, "drop_long_samples", False),
+                    drop_long_samples=getattr(cfg_ps, "drop_long_samples", True),
                 )
+                _attn_impl = get_attn_implementation(cfg_model)
+                configure_packing(attn_implementation=_attn_impl)
+                # Set collater with attn_implementation so it produces the right mask format
+                cfg_dl.collate_fn = lambda batch, _ai=_attn_impl: neat_packed_collater(batch, attn_implementation=_ai)
+                logger.info(f"Configured neat packing for attn_implementation={_attn_impl}")
             else:
                 # "thd" — existing packing logic
                 ds = pack_dataset(
@@ -544,17 +609,34 @@ def build_dataloader(
             if "shuffle" in cfg_dl:
                 del cfg_dl.shuffle
 
-            dist_sampler_kwargs = {
-                "num_replicas": dp_world_size,
-                "rank": dp_rank,
-                "shuffle": shuffle,
-            }
-            sampler = StatefulDistributedSampler(
-                ds,
-                seed=seed,
-                drop_last=True,
-                **dist_sampler_kwargs,
-            )
+            group_by_length = cfg_dl.get("group_by_length", False)
+            if "group_by_length" in cfg_dl:
+                del cfg_dl.group_by_length
+
+            if group_by_length:
+                from nemo_automodel.components.datasets.llm.length_grouped_sampler import (
+                    LengthGroupedSampler as LLMLengthGroupedSampler,
+                )
+
+                sampler = LLMLengthGroupedSampler(
+                    dataset=ds,
+                    batch_size=local_batch_size,
+                    seed=seed,
+                    num_replicas=dp_world_size,
+                    rank=dp_rank,
+                )
+            else:
+                dist_sampler_kwargs = {
+                    "num_replicas": dp_world_size,
+                    "rank": dp_rank,
+                    "shuffle": shuffle,
+                }
+                sampler = StatefulDistributedSampler(
+                    ds,
+                    seed=seed,
+                    drop_last=True,
+                    **dist_sampler_kwargs,
+                )
             dl_kwargs = {"sampler": sampler, "batch_size": local_batch_size}
             if pp_enabled:
                 dl_kwargs["drop_last"] = True
@@ -616,7 +698,12 @@ def build_dataloader(
                     "Pipeline parallel mask precomputation will be skipped."
                 )
             else:
-                if "collate_fn" in dl_kwargs:
+                if not _should_precompute_pp_causal_masks(hf_model_config):
+                    logger.info(
+                        "Skipping pipeline parallel causal mask precomputation for model_type=%s.",
+                        getattr(hf_model_config, "model_type", None),
+                    )
+                elif "collate_fn" in dl_kwargs:
                     # Case 1: PP enabled + collate_fn exists -> chain them
                     # base_collate_fn -> add_causal_masks_to_batch
                     base_collate_fn = dl_kwargs["collate_fn"]
@@ -697,15 +784,22 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
     if cfg is None:
         return None
 
-    # Calculate total steps for the training run
+    # Calculate total steps for the training run.
+    # `step_scheduler.epoch_len` is already in optimizer-step units
+    # (microbatches // grad_acc_steps) and is None for IterableDataset, in which
+    # case `max_steps` governs the total step count.
     total_epochs = step_scheduler.num_epochs
-    epoch_len = len(step_scheduler.dataloader)
-    grad_acc_steps = step_scheduler.grad_acc_steps
-
-    # Total optimizer steps (accounting for gradient accumulation)
-    total_steps = (total_epochs * epoch_len) // grad_acc_steps
-    if step_scheduler.max_steps is not None:
-        total_steps = min(total_steps, step_scheduler.max_steps)
+    if step_scheduler.epoch_len is not None:
+        total_steps = total_epochs * step_scheduler.epoch_len
+        if step_scheduler.max_steps is not None:
+            total_steps = min(total_steps, step_scheduler.max_steps)
+    else:
+        if step_scheduler.max_steps is None:
+            raise ValueError(
+                "build_lr_scheduler: dataloader has no __len__ (iterable dataset) and "
+                "step_scheduler.max_steps is not set. Set step_scheduler.max_steps in your config."
+            )
+        total_steps = step_scheduler.max_steps
 
     # Set defaults for scheduler parameters
     optimizer_param_schedulers = []
@@ -766,54 +860,9 @@ def build_wandb(cfg) -> wandb.Run:
     return run
 
 
-def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
-    """Calculate the loss.
-
-    Args:
-        loss_fn: Loss function.
-        **kwargs: Keyword arguments for the loss function.
-
-    Returns:
-        The loss.
-    """
-    loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
-    if isinstance(loss_fn, FusedLinearCrossEntropy):
-        model = kwargs.pop("model")
-        labels = kwargs.pop("labels")
-
-        # find the lm_head in the model
-        lm_head = None
-        if hasattr(model, "get_output_embeddings"):
-            lm_head = model.get_output_embeddings().weight
-        else:
-            for n, p in model.named_parameters(remove_duplicate=False):
-                if "lm_head" in n and n.endswith(".weight"):
-                    lm_head = p
-                    break
-        if lm_head is None:
-            raise ValueError("lm_head.weight not found in model")
-
-        # unshard the possibly sharded lm_head
-        lm_head = lm_head.full_tensor() if hasattr(lm_head, "full_tensor") else lm_head
-        loss_fn_kwargs.update(
-            {
-                "hidden_states": kwargs.pop("hidden_states"),
-                "labels": labels,
-                "lm_weight": lm_head,
-            }
-        )
-    else:
-        loss_fn_kwargs.update(
-            {
-                "logits": kwargs.pop("logits"),
-                "labels": kwargs.pop("labels"),
-            }
-        )
-
-    return loss_fn(**loss_fn_kwargs)
-
-
 def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: Optional[nn.Module] = None):
+    """Build validation dataloaders from validation dataset config entries."""
+
     def _prepare_val_ds_name(val_ds_name):
         val_ds_name = val_ds_name.replace("validation_dataset", "")
         if len(val_ds_name) > 1 and val_ds_name[0] in ("_", "-", "."):
@@ -841,7 +890,7 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             val_check_interval=cfg.get("step_scheduler.val_every_steps", None),
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
-            pp_enabled=False,
+            pp_enabled=pp_enabled,
             cp_size=cfg.get("distributed.cp_size", 1),
             model=model,
         )[0]
@@ -901,11 +950,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
-        self.mlflow_logger = None
         if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
-            self.mlflow_logger = build_mlflow(self.cfg)
-            self.mlflow_logger.log_params(self.cfg.to_dict())
-            logging.info("MLflow experiment tracking enabled")
+            if configure_mlflow(self.cfg) is not None:
+                logging.info("MLflow experiment tracking enabled")
 
         self.comet_logger = None
         if self.dist_env.is_main and hasattr(self.cfg, "comet"):
@@ -1011,7 +1058,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             activation_checkpointing=self.dist_setup.activation_checkpointing,
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        self.optimizer = build_optimizer(
+            model,
+            self.cfg.optimizer,
+            self.distributed_config,
+            self.device_mesh,
+            is_peft=self.peft_config is not None,
+        )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -1037,6 +1090,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
+
+        if self.pp_enabled:
+            self._configure_pipeline_loss_fn()
 
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
         if self.dist_setup.cp_size > 1 and _packed_seq_size > 0:
@@ -1077,6 +1133,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.pp_enabled,
             model=self.model_parts[0],
         )
+        # Optional tool-call accuracy evaluator for agent SFT runs.
+        # Presence of the ``tool_call_eval`` block enables it; absence skips it.
+        self.tool_call_evaluator = None
+        tool_call_eval_cfg = self.cfg.get("tool_call_eval", None)
+        if tool_call_eval_cfg is not None:
+            self.tool_call_evaluator = tool_call_eval_cfg.instantiate()
+        self._warned_tool_call_eval_skipped = False
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
         self.step_scheduler = build_step_scheduler(
@@ -1105,6 +1168,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 enable_load_balance_tracking(mp)
 
         self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
+
+        # NEFTune: noisy embeddings for improved instruction fine-tuning
+        neftune_cfg = self.cfg.get("neftune", None)
+        self.neftune = None
+        if neftune_cfg is not None:
+            from nemo_automodel.components.training.neftune import NEFTune
+
+            noise_alpha = neftune_cfg.get("noise_alpha", 5.0) if hasattr(neftune_cfg, "get") else neftune_cfg
+            self.neftune = NEFTune(noise_alpha=float(noise_alpha))
+            self.neftune.activate(self.model_parts[0])
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         # Initialize JSONL loggers
@@ -1175,6 +1248,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         else:
             wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
 
+    def _configure_pipeline_loss_fn(self):
+        if self.pp is None or not self.pp.info.has_last_stage:
+            return
+
+        last_stage_model = None
+        for model_part, stage in zip(self.model_parts, self.pp.info.stages):
+            if stage.is_last:
+                last_stage_model = model_part
+                break
+        if last_stage_model is None:
+            raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
+
+        self.pp.info.schedule._loss_fn = PipelineCausalLMLoss(self.loss_fn, last_stage_model)
+
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
             return None, None, None
@@ -1228,46 +1315,56 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             mp.train()
         self.timestamp = time.perf_counter()
 
-        for epoch in self.step_scheduler.epochs:
-            self.step_scheduler.set_epoch(epoch)
-            # The step scheduler yields a list of batches with the following properties:
-            # 1. len(batches) == grad_acc_steps
-            # 2. len(batches[0]) == batch_size
-            for batches in self.step_scheduler:
-                # If QAT delayed fake-quant is configured, enable after threshold
-                self._enable_qat_if_delayed(self.step_scheduler.step)
-                train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                # Collect MoE load balance metrics (all ranks participate in all-reduce)
-                self._collect_moe_load_balance()
-                # log
-                self.log_train_metrics(train_log_data)
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
+                # The step scheduler yields a list of batches with the following properties:
+                # 1. len(batches) == grad_acc_steps
+                # 2. len(batches[0]) == batch_size
+                for batches in self.step_scheduler:
+                    # If QAT delayed fake-quant is configured, enable after threshold
+                    self._enable_qat_if_delayed(self.step_scheduler.step)
+                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    # Collect MoE load balance metrics (all ranks participate in all-reduce)
+                    self._collect_moe_load_balance()
+                    # log
+                    self.log_train_metrics(train_log_data)
+                    self._update_progress_bar(pbar, train_log_data.metrics)
 
-                # Run validation every val_every_steps
-                val_losses = {}
-                if self.step_scheduler.is_val_step:
-                    for val_name, val_dataloader in self.val_dataloaders.items():
-                        val_log_data = self._run_validation_epoch(val_dataloader)
-                        val_losses[val_name] = val_log_data.metrics["val_loss"]
-                        self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
-                    for mp in self.model_parts:
-                        mp.train()
+                    # Run validation every val_every_steps
+                    val_losses = {}
+                    if self.step_scheduler.is_val_step:
+                        for val_name, val_dataloader in self.val_dataloaders.items():
+                            val_log_data = self._run_validation_epoch(val_dataloader)
+                            val_losses[val_name] = val_log_data.metrics["val_loss"]
+                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                        for mp in self.model_parts:
+                            mp.train()
 
-                # Save the checkpoint every ckpt_every_steps
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(
-                        epoch,
-                        self.step_scheduler.step,
-                        train_log_data.metrics["loss"],
-                        val_losses,
-                        best_metric_key=self.best_metric_key,
-                    )
-                self._maybe_collect_garbage()
+                    # Save the checkpoint every ckpt_every_steps
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            train_log_data.metrics["loss"],
+                            val_losses,
+                            best_metric_key=self.best_metric_key,
+                        )
+                    self._maybe_collect_garbage()
+        finally:
+            if pbar is not None:
+                pbar.close()
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
             v.close()
 
         self.checkpointer.close()
+
+        # Mark the MLflow run KILLED if training exited via SIGTERM.
+        if self.step_scheduler.sigterm_flag:
+            end_mlflow_active_run_as_killed()
 
     # ------------------ helpers ------------------
     def _forward_backward_step(
@@ -1292,7 +1389,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
             batch,
-            use_te=_uses_te_dot_product_attention(self.cfg.model) and _uses_thd_collater(self.cfg.dataloader),
+            use_te=_uses_te_dot_product_attention(
+                self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
+            )
+            and _uses_thd_collater(self.cfg.dataloader),
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
@@ -1309,6 +1409,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
+
+                # Update PP stage shapes for the current batch's seq_len.
+                # This is a no-op when the length hasn't changed.
+                self.pp.update_seq_len(input_ids.shape[1])
 
                 # Filter out None values and empty dicts from batch to avoid PP chunking errors
                 batch_filtered = {
@@ -1365,9 +1469,28 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     hidden_states=get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
+                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
+                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    local_loss = local_loss + calculate_mtp_loss(
+                        self.loss_fn,
+                        mtp_per_depth_h=mtp_per_depth_h,
+                        mtp_per_depth_logits=mtp_per_depth_logits,
+                        labels=labels,
+                        model=model,
+                        scaling_factor=out.mtp_loss_scaling_factor,
+                        num_label_tokens=num_label_tokens,
+                    )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+
+    def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
+        pp_group = self.device_mesh["pp"].get_group()
+        pp_src_rank = torch.distributed.get_global_rank(pp_group, torch.distributed.get_world_size(pp_group) - 1)
+        torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
+        return tensor
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -1503,12 +1626,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.pp_enabled:
             reporting_loss = reporting_loss / num_label_tokens
             reporting_loss = reporting_loss.to(self.dist_env.device)
-            # Send loss to first rank if pp group rank is 0
-            src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-            if self.dist_env.rank == src_rank:
-                torch.distributed.send(reporting_loss, dst=0)
-            elif self.dist_env.is_main:
-                torch.distributed.recv(reporting_loss, src=src_rank)
+            reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
 
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
@@ -1560,30 +1678,90 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 total_num_label_tokens += num_label_tokens
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True)
-        total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
+        total_num_label_tokens = self._dp_allreduce(
+            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+        ).item()
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
 
-        # For PP, send val_loss from last stage to main rank for logging
+        # For PP, send val_loss and num_label_tokens from last stage to main rank
         if self.pp_enabled:
             val_loss = val_loss.to(self.dist_env.device)
-            # Send loss to first rank from the last stage
-            src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-            if self.dist_env.rank == src_rank:
-                torch.distributed.send(val_loss, dst=0)
-            elif self.dist_env.is_main:
-                torch.distributed.recv(val_loss, src=src_rank)
+            # On non-last ranks total_num_label_tokens is 0; this tensor is just a recv buffer.
+            pp_num_tokens = torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+            val_loss = self._broadcast_from_last_pp_stage(val_loss)
+            pp_num_tokens = self._broadcast_from_last_pp_stage(pp_num_tokens)
+            if self.dist_env.is_main:
+                total_num_label_tokens = pp_num_tokens.item()
 
         val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
+
+        metrics = {
+            "val_loss": val_loss,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "num_label_tokens": total_num_label_tokens,
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+        }
+
+        # Tool-call accuracy is the only signal that catches "loss going
+        # down because format was learned but the model picks wrong tools".
+        # Generation on an FSDP2 training model is intentionally opt-in:
+        # generate() repeatedly unshards parameters and can leave enough
+        # allocator pressure to OOM the next backward pass.
+        if getattr(self, "tool_call_evaluator", None) is not None:
+            count_key = f"{self.tool_call_evaluator.metric_prefix}/_count"
+            if isinstance(self.distributed_config, FSDP2Config) and not getattr(
+                self.tool_call_evaluator, "run_on_fsdp2", False
+            ):
+                if not self._warned_tool_call_eval_skipped:
+                    logging.warning(
+                        "Skipping tool_call_evaluator during FSDP2 training. "
+                        "Set tool_call_eval.run_on_fsdp2=true to force in-loop generation, "
+                        "or run the evaluator offline from a checkpoint."
+                    )
+                    self._warned_tool_call_eval_skipped = True
+                metrics[f"{self.tool_call_evaluator.metric_prefix}/_disabled_fsdp2"] = 1.0
+            else:
+                try:
+                    tool_metrics = self.tool_call_evaluator.evaluate(self.model_parts[0], self.tokenizer)
+                    # The evaluator returns per-rank means and count-like
+                    # diagnostics. Weighted all-reduce the means by scored
+                    # sample count, and sum diagnostics directly.
+                    local_count = float(tool_metrics.pop(count_key, 0.0))
+                    device = self.dist_env.device
+                    count_t = torch.tensor(local_count, dtype=torch.float32, device=device)
+                    total_count = self._dp_allreduce(count_t).item()
+
+                    count_like_metrics = {
+                        k: v
+                        for k, v in list(tool_metrics.items())
+                        if k.startswith(f"{self.tool_call_evaluator.metric_prefix}/_")
+                    }
+                    for k in count_like_metrics:
+                        tool_metrics.pop(k, None)
+
+                    if total_count > 0:
+                        for k, v in list(tool_metrics.items()):
+                            local_sum = torch.tensor(float(v) * local_count, dtype=torch.float32, device=device)
+                            total_sum = self._dp_allreduce(local_sum).item()
+                            tool_metrics[k] = total_sum / total_count
+
+                    for k, v in count_like_metrics.items():
+                        local_total = torch.tensor(float(v), dtype=torch.float32, device=device)
+                        tool_metrics[k] = self._dp_allreduce(local_total).item()
+
+                    tool_metrics[count_key] = total_count
+                    metrics.update(tool_metrics)
+                except Exception as exc:
+                    logging.warning("tool_call_evaluator.evaluate failed: %s", exc)
+                finally:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "val_loss": val_loss,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "num_label_tokens": total_num_label_tokens,
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-            },
+            metrics=metrics,
         )
 
     def log_val_metrics(self, val_name, log_data, metric_logger=None):
@@ -1605,8 +1783,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if wandb.run is not None:
             wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
 
-        if self.mlflow_logger is not None:
-            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+        if mlflow.active_run() is not None:
+            mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
 
         if self.comet_logger is not None:
             self.comet_logger.log_metrics(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
@@ -1615,14 +1793,25 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not metric_logger is None:
             metric_logger.log(log_data)
 
+        tool_call_suffix = ""
+        if "tool_call/_count" in log_data.metrics:
+            tool_call_suffix = (
+                " | tool_name_acc {:.3f} | args_json_valid {:.3f} | args_exact_match {:.3f} (n={})".format(
+                    log_data.metrics.get("tool_call/name_correct", 0.0),
+                    log_data.metrics.get("tool_call/args_json_valid", 0.0),
+                    log_data.metrics.get("tool_call/args_exact_match", 0.0),
+                    int(log_data.metrics.get("tool_call/_count", 0)),
+                )
+            )
         logging.info(
-            '[val] name "{}" | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}'.format(
+            '[val] name "{}" | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}{}'.format(
                 val_name,
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["val_loss"],
                 log_data.metrics["lr"],
                 log_data.metrics["num_label_tokens"],
+                tool_call_suffix,
             )
         )
 
@@ -1649,8 +1838,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.step_scheduler.is_remote_logging_step:
             if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
-            if self.mlflow_logger is not None:
-                self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+            if mlflow.active_run() is not None:
+                mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
             if self.comet_logger is not None:
                 self.comet_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
@@ -1661,6 +1850,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if self.comet_logger is not None:
                 self._log_moe_metrics(
                     self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)
+                )
+            if mlflow.active_run() is not None:
+                self._log_moe_metrics(
+                    self.step_scheduler.step, lambda m, step: mlflow.log_metrics(to_float_metrics(m), step=step)
                 )
 
         # JSONL training log (always log for detailed local records)
