@@ -105,6 +105,19 @@ redirects:
     destination: "/nemo/automodel/latest/:path*"
   - source: "/nemo/automodel/0.1.0/:path*/index.html"
     destination: "/nemo/automodel/latest/:path*"
+  # Legacy Sphinx page URLs (foo.html) for remapped version slugs. These MUST
+  # precede the bare /<slug>/:path* catch-alls below — otherwise the catch-all
+  # matches /0.4/foo.html first and the .html is only stripped later by the
+  # global /:path*.html rule, costing an extra redirect hop (skill redirect
+  # quirk #3: specific rules before catch-alls).
+  - source: "/nemo/automodel/0.4/:path*.html"
+    destination: "/nemo/automodel/v0.4/:path*"
+  - source: "/nemo/automodel/0.3.0/:path*.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.2.0/:path*.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.1.0/:path*.html"
+    destination: "/nemo/automodel/latest/:path*"
   - source: "/nemo/automodel/0.4"
     destination: "/nemo/automodel/v0.4"
   - source: "/nemo/automodel/0.4/:path*"
@@ -121,16 +134,9 @@ redirects:
     destination: "/nemo/automodel/latest"
   - source: "/nemo/automodel/0.1.0/:path*"
     destination: "/nemo/automodel/latest/:path*"
+  # Global catch-alls — strip /index.html and .html for the current version
+  # slugs (v0.4, latest, nightly). Must be last; first-match wins.
   - source: "/nemo/automodel/:path*/index.html"
     destination: "/nemo/automodel/:path*"
-  # Sphinx page URLs (foo.html); must follow all :path*/index.html rules above
-  - source: "/nemo/automodel/0.4/:path*.html"
-    destination: "/nemo/automodel/v0.4/:path*"
-  - source: "/nemo/automodel/0.3.0/:path*.html"
-    destination: "/nemo/automodel/latest/:path*"
-  - source: "/nemo/automodel/0.2.0/:path*.html"
-    destination: "/nemo/automodel/latest/:path*"
-  - source: "/nemo/automodel/0.1.0/:path*.html"
-    destination: "/nemo/automodel/latest/:path*"
   - source: "/nemo/automodel/:path*.html"
     destination: "/nemo/automodel/:path*"
