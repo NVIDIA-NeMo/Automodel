@@ -42,6 +42,7 @@ place of eager/SDPA/flash for convergence-parity comparisons.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -69,6 +70,158 @@ def set_active_cp_group(cp_group: Optional["dist.ProcessGroup"]) -> None:
 def get_active_cp_group() -> Optional["dist.ProcessGroup"]:
     """Return the CP group set by :func:`set_active_cp_group` (may be None)."""
     return _ACTIVE_CP_GROUP
+
+
+# ---------------------------------------------------------------------------
+# Arbitrary attention masks (AttnSlice / flex key)
+#
+# MagiAttention's FFA expresses any mask as a set of rectangles: for each
+# (q_range, k_range) pair, an AttnMaskType in {full, causal, ...}. This covers
+# plain causal, varlen/block-diagonal (sequence packing), sliding-window, and the
+# block-sparse prefix-tree mask needed for shared-prefix RL training (verl RFC
+# #6401 / Automodel #2385): each tree node attends FULL to its ancestor chain and
+# CAUSAL to itself. ``AttnMaskSpec`` is a backend-agnostic description of such a
+# mask; ``build_flex_key`` turns it into a magi dist-attn key.
+# ---------------------------------------------------------------------------
+
+# Active mask spec for the custom-model attn_func (set per step by the caller;
+# None -> plain causal self-key). Keyed implicitly by the single active cp_group.
+_ACTIVE_ATTN_SPEC: Optional["AttnMaskSpec"] = None
+# id(cp_group) -> (spec_fingerprint, built_key), so all layers in a step reuse one key.
+_FLEX_KEY_CACHE: dict = {}
+
+
+@dataclass
+class AttnMaskSpec:
+    """Backend-agnostic description of an attention mask as AttnSlice rectangles.
+
+    Attributes:
+        q_ranges: list of ``[start, end)`` query token ranges (one per rectangle).
+        k_ranges: list of ``[start, end)`` key token ranges (one per rectangle).
+        mask_types: per-rectangle mask type, ``"full"`` or ``"causal"``.
+        total_seqlen: total number of tokens in the (flat) sequence.
+    """
+
+    q_ranges: list
+    k_ranges: list
+    mask_types: list
+    total_seqlen: int
+
+    def fingerprint(self) -> tuple:
+        """Hashable identity used to cache the built key across layers."""
+        return (
+            self.total_seqlen,
+            tuple(map(tuple, self.q_ranges)),
+            tuple(map(tuple, self.k_ranges)),
+            tuple(self.mask_types),
+        )
+
+    @classmethod
+    def causal(cls, seqlen: int) -> "AttnMaskSpec":
+        """A single full causal sequence."""
+        return cls([[0, seqlen]], [[0, seqlen]], ["causal"], seqlen)
+
+    @classmethod
+    def varlen(cls, seqlens: list[int], causal: bool = True) -> "AttnMaskSpec":
+        """Block-diagonal mask for packed sequences (one block per document)."""
+        q_ranges, k_ranges, mask_types, off = [], [], [], 0
+        for n in seqlens:
+            q_ranges.append([off, off + n])
+            k_ranges.append([off, off + n])
+            mask_types.append("causal" if causal else "full")
+            off += n
+        return cls(q_ranges, k_ranges, mask_types, off)
+
+    @classmethod
+    def prefix_tree(cls, node_lengths: list[int], sample_paths: list[list[int]]):
+        """Build a prefix-tree mask over a flat deduplicated token layout.
+
+        Args:
+            node_lengths: token count of each node, in flat layout order. The flat
+                layout is ``[node_0 | node_1 | ...]`` with node ``i`` occupying
+                ``[offset_i, offset_i + node_lengths[i])``.
+            sample_paths: one list of node indices per sample, root -> leaf. Every
+                sample is the causal concatenation of its nodes; a shared prefix
+                node simply appears in multiple paths.
+
+        Returns:
+            (spec, sample_token_ranges): ``spec`` is the AttnMaskSpec; the second
+            value lists, per sample, the flat ``[start, end)`` ranges of its nodes
+            (in path order) for reconstructing per-sample outputs.
+
+        Each node attends FULL to every ancestor node in its path and CAUSAL to
+        itself; duplicate rectangles (shared nodes) are emitted once.
+        """
+        offsets, acc = [], 0
+        for n in node_lengths:
+            offsets.append(acc)
+            acc += n
+        total = acc
+        q_ranges, k_ranges, mask_types, seen = [], [], [], set()
+        for path in sample_paths:
+            for pos, node in enumerate(path):
+                q_rng = (offsets[node], offsets[node] + node_lengths[node])
+                # self -> causal
+                rect = (q_rng, q_rng, "causal")
+                if rect not in seen:
+                    seen.add(rect)
+                    q_ranges.append(list(q_rng)); k_ranges.append(list(q_rng)); mask_types.append("causal")
+                # ancestors -> full
+                for anc in path[:pos]:
+                    k_rng = (offsets[anc], offsets[anc] + node_lengths[anc])
+                    rect = (q_rng, k_rng, "full")
+                    if rect not in seen:
+                        seen.add(rect)
+                        q_ranges.append(list(q_rng)); k_ranges.append(list(k_rng)); mask_types.append("full")
+        sample_token_ranges = [
+            [[offsets[n], offsets[n] + node_lengths[n]] for n in path] for path in sample_paths
+        ]
+        return cls(q_ranges, k_ranges, mask_types, total), sample_token_ranges
+
+
+def set_active_attn_spec(spec: Optional["AttnMaskSpec"]) -> None:
+    """Set the mask spec the custom-model magi attn_func should apply this step."""
+    global _ACTIVE_ATTN_SPEC
+    _ACTIVE_ATTN_SPEC = spec
+
+
+def get_active_attn_spec() -> Optional["AttnMaskSpec"]:
+    """Return the active mask spec (None -> plain causal self-key)."""
+    return _ACTIVE_ATTN_SPEC
+
+
+def build_flex_key(spec: "AttnMaskSpec", *, num_heads_q, num_heads_kv, head_dim, cp_group):
+    """Build a magi dist-attn key for an arbitrary AttnSlice mask (no extra padding)."""
+    from magi_attention.api import magi_attn_flex_key
+    from magi_attention.common import AttnRanges
+
+    return magi_attn_flex_key(
+        q_ranges=AttnRanges.from_ranges([list(r) for r in spec.q_ranges]),
+        k_ranges=AttnRanges.from_ranges([list(r) for r in spec.k_ranges]),
+        attn_mask_type=list(spec.mask_types),
+        total_seqlen_q=spec.total_seqlen,
+        total_seqlen_k=spec.total_seqlen,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        head_dim=head_dim,
+        pad_size=0,
+        cp_group_or_mesh=cp_group,
+        chunk_size=DEFAULT_CHUNK_SIZE,
+    )
+
+
+def _flex_key_for(cp_group, spec, *, num_heads_q, num_heads_kv, head_dim):
+    """Return the flex key for ``spec``, rebuilding only when the mask changes."""
+    fp = spec.fingerprint()
+    cached = _FLEX_KEY_CACHE.get(id(cp_group))
+    if cached is not None and cached[0] == fp:
+        return cached[1]
+    key = build_flex_key(
+        spec, num_heads_q=num_heads_q, num_heads_kv=num_heads_kv,
+        head_dim=head_dim, cp_group=cp_group,
+    )
+    _FLEX_KEY_CACHE[id(cp_group)] = (fp, key)
+    return key
 
 
 def _build_self_key(cp_group, *, seqlen, num_heads_q, num_heads_kv, head_dim, device):
@@ -110,15 +263,23 @@ def _self_key_for(cp_group, *, seqlen, num_heads_q, num_heads_kv, head_dim, devi
     return key
 
 
-def make_magi_attn_func():
+def make_magi_attn_func(softmax_scale: Optional[float] = None):
     """Build the attn_func used by the custom-model attention factory.
 
     The returned callable accepts q/k/v in either THD ``[t, nh, hd]`` or BSHD
     ``[b, s, nh, hd]`` (b must be 1) layout — the same layouts the custom models
-    feed to their backend attn_func — runs the MagiAttention FFA kernel via a
-    cp=1 causal self-key, and returns the output in the matching layout. If no CP
-    group is active it falls back to a plain causal SDPA so non-magi modules
+    feed to their backend attn_func — and runs the MagiAttention FFA kernel.
+
+    Mask selection (no CP dispatch; cp=1 in-order tokens):
+      * if an :class:`AttnMaskSpec` is active (``set_active_attn_spec``), use its
+        flex key — this covers packing, sliding-window and prefix-tree masks;
+      * otherwise build a plain causal self-key from the q length.
+    If no CP group is active it falls back to causal SDPA so non-magi modules
     (e.g. a VLM vision tower routed through the same factory) keep working.
+
+    Args:
+        softmax_scale: attention softmax scale (defaults to 1/sqrt(head_dim) inside
+            FFA when None); forwarded so non-default scales stay correct.
     """
     from einops import rearrange
 
@@ -140,11 +301,18 @@ def make_magi_attn_func():
             qf, kf, vf = q, k, v
         dtype = qf.dtype
         qf, kf, vf = (e.to(torch.bfloat16).contiguous() for e in (qf, kf, vf))
-        key = _self_key_for(
-            cp_group, seqlen=qf.shape[0], num_heads_q=qf.shape[1],
-            num_heads_kv=kf.shape[1], head_dim=qf.shape[2], device=qf.device,
-        )
-        o = calc_attn(qf, kf, vf, key)[0].to(dtype)
+        spec = get_active_attn_spec()
+        if spec is not None:
+            key = _flex_key_for(
+                cp_group, spec, num_heads_q=qf.shape[1],
+                num_heads_kv=kf.shape[1], head_dim=qf.shape[2],
+            )
+        else:
+            key = _self_key_for(
+                cp_group, seqlen=qf.shape[0], num_heads_q=qf.shape[1],
+                num_heads_kv=kf.shape[1], head_dim=qf.shape[2], device=qf.device,
+            )
+        o = calc_attn(qf, kf, vf, key, softmax_scale=softmax_scale)[0].to(dtype)
         if bshd:
             o = rearrange(o, "(b s) nh hd -> b s nh hd", b=b)
         return o

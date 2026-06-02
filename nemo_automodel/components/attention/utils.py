@@ -108,7 +108,7 @@ def initialize_attn_module_and_func(
             )
         from nemo_automodel.components.distributed.magi_attn_utils import make_magi_attn_func
 
-        attn_func = make_magi_attn_func()
+        attn_func = make_magi_attn_func(softmax_scale=softmax_scale)
         return None, attn_func
     else:
         raise ValueError(f"Unsupported attention implementation: {attn_impl}")
