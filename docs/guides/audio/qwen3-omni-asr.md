@@ -41,7 +41,7 @@ design points:
   WenetSpeech out of the box; per-dataset overrides go in the recipe YAML.
 
 ```python
-from nemo_automodel.components.datasets.vlm.datasets import (
+from nemo_automodel.components.datasets.audio.datasets import (
     make_hf_audio_asr_dataset,
 )
 
