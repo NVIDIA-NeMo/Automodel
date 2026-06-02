@@ -82,6 +82,9 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.agent_chat.make_agent_chat_dataset
   dataset_name: llamafactory/glaive_toolcall_en
   split: train
+  # NOTE: seq_length only caps length when truncation is enabled (or pads when
+  # padding: max_length). With the defaults it does NOT truncate, so long
+  # dialogues pass through uncapped. Add `truncation: true` to enforce the cap.
   seq_length: 4096
   tokenizer:
     pretrained_model_name_or_path: Qwen/Qwen2.5-3B
