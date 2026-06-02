@@ -52,27 +52,104 @@ logger = logging.getLogger(__name__)
 _MAGI_REGISTERED = False
 # Default dispatch chunk size used by the load-balancing solver.
 DEFAULT_CHUNK_SIZE = 512
-# VLM self-key path: id(cp_group) -> last LM sequence length a key was built for.
+# Self-key path: id(cp_group) -> last sequence length a key was built for.
 _MAGI_SELF_KEY_LEN: dict = {}
+# Active CP group for the custom-model attention factory (set by the recipe).
+# The custom factory's attn_func is a closure with no access to the attention
+# module, so it reads the cp_group from here. One CP group is active per process.
+_ACTIVE_CP_GROUP: Optional["dist.ProcessGroup"] = None
 
 
-def _build_self_key(query, key_tensor, value, cp_group, q_seqlen):
-    """Build a cp=1 causal varlen key matching the actual q length (VLM path)."""
+def set_active_cp_group(cp_group: Optional["dist.ProcessGroup"]) -> None:
+    """Record the CP group the custom-model magi attn_func should use."""
+    global _ACTIVE_CP_GROUP
+    _ACTIVE_CP_GROUP = cp_group
+
+
+def get_active_cp_group() -> Optional["dist.ProcessGroup"]:
+    """Return the CP group set by :func:`set_active_cp_group` (may be None)."""
+    return _ACTIVE_CP_GROUP
+
+
+def _build_self_key(cp_group, *, seqlen, num_heads_q, num_heads_kv, head_dim, device):
+    """Build a cp=1 causal varlen key matching the actual q length (no dispatch)."""
     from magi_attention.api import magi_attn_varlen_key
 
-    device = query.device
-    cu = torch.tensor([0, q_seqlen], dtype=torch.int32, device=device)
+    cu = torch.tensor([0, seqlen], dtype=torch.int32, device=device)
     return magi_attn_varlen_key(
         cu_seqlens_q=cu,
         cu_seqlens_k=cu,
-        num_heads_q=query.shape[1],
-        num_heads_kv=key_tensor.shape[1],
-        head_dim=query.shape[3],
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        head_dim=head_dim,
         pad_size=0,
         cp_group_or_mesh=cp_group,
         causal=True,
         chunk_size=DEFAULT_CHUNK_SIZE,
     )
+
+
+def _self_key_for(cp_group, *, seqlen, num_heads_q, num_heads_kv, head_dim, device):
+    """Return a causal self-key for ``seqlen``, (re)building only when it changes.
+
+    All attention layers in one forward share the same sequence length, so the
+    first layer builds the key and the rest reuse it via ``get_most_recent_key``.
+    """
+    from magi_attention.api import get_most_recent_key
+
+    if _MAGI_SELF_KEY_LEN.get(id(cp_group)) == seqlen:
+        try:
+            return get_most_recent_key(cp_group)
+        except Exception:
+            pass
+    key = _build_self_key(
+        cp_group, seqlen=seqlen, num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv, head_dim=head_dim, device=device,
+    )
+    _MAGI_SELF_KEY_LEN[id(cp_group)] = seqlen
+    return key
+
+
+def make_magi_attn_func():
+    """Build the attn_func used by the custom-model attention factory.
+
+    The returned callable accepts q/k/v in either THD ``[t, nh, hd]`` or BSHD
+    ``[b, s, nh, hd]`` (b must be 1) layout — the same layouts the custom models
+    feed to their backend attn_func — runs the MagiAttention FFA kernel via a
+    cp=1 causal self-key, and returns the output in the matching layout. If no CP
+    group is active it falls back to a plain causal SDPA so non-magi modules
+    (e.g. a VLM vision tower routed through the same factory) keep working.
+    """
+    from einops import rearrange
+
+    from magi_attention.api import calc_attn
+
+    def magi_attn_func(q, k, v, **call_kwargs):
+        cp_group = get_active_cp_group()
+        if cp_group is None:
+            import torch.nn.functional as F
+
+            qh, kh, vh = (e.transpose(1, 2) if e.dim() == 4 else e for e in (q, k, v))
+            return F.scaled_dot_product_attention(qh, kh, vh, is_causal=True, enable_gqa=True)
+
+        bshd = q.dim() == 4
+        if bshd:
+            b = q.shape[0]
+            qf, kf, vf = (rearrange(e, "b s nh hd -> (b s) nh hd") for e in (q, k, v))
+        else:
+            qf, kf, vf = q, k, v
+        dtype = qf.dtype
+        qf, kf, vf = (e.to(torch.bfloat16).contiguous() for e in (qf, kf, vf))
+        key = _self_key_for(
+            cp_group, seqlen=qf.shape[0], num_heads_q=qf.shape[1],
+            num_heads_kv=kf.shape[1], head_dim=qf.shape[2], device=qf.device,
+        )
+        o = calc_attn(qf, kf, vf, key)[0].to(dtype)
+        if bshd:
+            o = rearrange(o, "(b s) nh hd -> b s nh hd", b=b)
+        return o
+
+    return magi_attn_func
 
 
 def is_magi_available() -> bool:
@@ -124,20 +201,12 @@ def register_magi_attention() -> None:
 
         if getattr(module, "_magi_self_key", False):
             # VLM (cp_size==1) path: the post-image-merge LM sequence length is only
-            # known here (query dim 2), and may differ from input_ids length. Build a
-            # no-dispatch causal key matching the actual q length, rebuilding only when
-            # the length changes (all layers in a step share it via get_most_recent_key).
-            q_seqlen = query.shape[2]
-            need_build = _MAGI_SELF_KEY_LEN.get(id(cp_group)) != q_seqlen
-            magi_attn_key = None
-            if not need_build:
-                try:
-                    magi_attn_key = get_most_recent_key(cp_group)
-                except Exception:
-                    need_build = True
-            if need_build:
-                magi_attn_key = _build_self_key(query, key, value, cp_group, q_seqlen)
-                _MAGI_SELF_KEY_LEN[id(cp_group)] = q_seqlen
+            # known here (query dim 2: [b, nh, s, hd]) and may differ from input_ids
+            # length. Build a no-dispatch causal key matching the actual q length.
+            magi_attn_key = _self_key_for(
+                cp_group, seqlen=query.shape[2], num_heads_q=query.shape[1],
+                num_heads_kv=key.shape[1], head_dim=query.shape[3], device=query.device,
+            )
         else:
             magi_attn_key = get_most_recent_key(cp_group)
 

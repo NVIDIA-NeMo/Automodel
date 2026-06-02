@@ -91,6 +91,25 @@ def initialize_attn_module_and_func(
         # We still return the module and a reference to its call for parity with other backends
         attn_func = attn_module.__call__
         return attn_module, attn_func
+    elif attn_impl == "magi":
+        # MagiAttention (Flex-Flash-Attention / context-parallel). The FFA kernel
+        # requires q/k/v to share a single head_dim <= 128, so MLA-style attention
+        # (e.g. DeepSeek-V3, where num_qk_channels != num_v_channels) is unsupported.
+        if num_qk_channels != num_v_channels:
+            raise ValueError(
+                f"attn_impl='magi' requires equal q/k and v head_dim, got "
+                f"num_qk_channels={num_qk_channels} != num_v_channels={num_v_channels}. "
+                "MLA-style attention (e.g. DeepSeek-V3 / Moonlight) is not supported by MagiAttention."
+            )
+        if num_qk_channels > 128:
+            raise ValueError(
+                f"attn_impl='magi' supports head_dim <= 128, got {num_qk_channels} "
+                "(e.g. Gemma3 / Qwen3.5 full-attention layers use 256)."
+            )
+        from nemo_automodel.components.distributed.magi_attn_utils import make_magi_attn_func
+
+        attn_func = make_magi_attn_func()
+        return None, attn_func
     else:
         raise ValueError(f"Unsupported attention implementation: {attn_impl}")
 
@@ -170,6 +189,10 @@ def preprocess_args_and_kwargs_for_attn(
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
+    elif attn_impl == "magi":
+        # magi's attn_func consumes the native [b, s, nh, hd] / [t, nh, hd] layout
+        # directly (no transpose); the FFA kernel handles causal masking + GQA.
+        attn_kwargs = {}
     else:  # sdpa
         attn_kwargs = {}
         # Transpose for SDPA

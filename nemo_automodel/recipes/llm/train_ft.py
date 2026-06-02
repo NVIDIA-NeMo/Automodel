@@ -932,21 +932,27 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.pp_enabled = self.dist_setup.pp_enabled
         self.pipeline_config = self.dist_setup.pipeline_config
 
-        # MagiAttention (FFA / context-parallel) backend. Enabled when the model is
-        # configured with attn_implementation="magi". Registers the HF attention
-        # backend before the model is built and resolves the CP process group.
-        self.magi_enabled = str(self.cfg.get("model.attn_implementation", "")) == "magi"
+        # MagiAttention (FFA / context-parallel) backend. Two entry points:
+        #   - HF models: model.attn_implementation="magi" (dispatch/undispatch path)
+        #   - custom models: model.backend.attn="magi" (factory attn_func + active cp_group)
+        self.magi_custom = str(self.cfg.get("model.backend.attn", "")) == "magi"
+        self.magi_enabled = self.magi_custom or str(self.cfg.get("model.attn_implementation", "")) == "magi"
         self.magi_cp_group = None
         if self.magi_enabled:
             from nemo_automodel.components.distributed.magi_attn_utils import (
                 get_cp_group,
                 register_magi_attention,
+                set_active_cp_group,
             )
 
             register_magi_attention()
             self.magi_cp_group = get_cp_group(self.device_mesh)
+            if self.magi_custom:
+                # custom-model attn_func is a closure; it reads the cp_group from here.
+                set_active_cp_group(self.magi_cp_group)
             logging.info(
-                "MagiAttention enabled (cp_size=%d).",
+                "MagiAttention enabled (%s, cp_size=%d).",
+                "custom-model factory" if self.magi_custom else "HF backend",
                 self.magi_cp_group.size() if self.magi_cp_group is not None else 1,
             )
 
@@ -1460,8 +1466,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else nullcontext()
             )
             with train_ctx(), sync_ctx, fp8_ctx:
-                magi_active = getattr(self, "magi_enabled", False)
-                if magi_active:
+                # HF magi path dispatches the sequence across CP and undispatches logits.
+                # Custom-model magi path runs the FFA kernel in-place via the factory
+                # attn_func (active cp_group), so no dispatch/undispatch is needed here.
+                magi_dispatch = getattr(self, "magi_enabled", False) and not getattr(self, "magi_custom", False)
+                if magi_dispatch:
                     # MagiAttention: dispatch the packed sequence across the CP group,
                     # run the forward through the FFA kernel, then undispatch the
                     # logits back to the global sequence before the loss so the loss
@@ -1473,7 +1482,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                     batch, _magi_key = magi_prepare_batch(model, batch, self.magi_cp_group)
                 batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy) and not magi_active:
+                if isinstance(self.loss_fn, FusedLinearCrossEntropy) and not magi_dispatch:
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
                     if "hidden_states" not in out:
@@ -1484,7 +1493,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     out = model(**batch)
 
                 logits = getattr(out, "logits", out)
-                if magi_active:
+                if magi_dispatch:
                     logits = magi_undispatch_logits(logits, self.magi_cp_group)
 
                 local_loss = calculate_loss(
@@ -1492,7 +1501,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     logits=logits,
                     labels=labels,
                     model=model,
-                    hidden_states=None if magi_active else get_final_hidden_states(out),
+                    hidden_states=None if magi_dispatch else get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
