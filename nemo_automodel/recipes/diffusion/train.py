@@ -697,6 +697,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         self.fuse_qkv_projections = bool(self.cfg.get("model.fuse_qkv_projections", False))
         self.compact_fused_qkv_projections = bool(self.cfg.get("model.compact_fused_qkv_projections", False))
+        self.optimize_hunyuan_flash_varlen_mask = bool(self.cfg.get("model.optimize_hunyuan_flash_varlen_mask", False))
         if self.transformer_engine_fp8:
             self.transformer_engine_linear = True
         if self.compact_fused_qkv_projections and not self.fuse_qkv_projections:
@@ -747,6 +748,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info("[INFO] Fuse QKV projections: %s", self.fuse_qkv_projections)
         logging.info("[INFO] Compact fused QKV projections: %s", self.compact_fused_qkv_projections)
+        logging.info("[INFO] Optimize Hunyuan flash-varlen mask: %s", self.optimize_hunyuan_flash_varlen_mask)
         logging.info("[INFO] Precision: model_dtype=%s, compute_dtype=%s", self.model_dtype, self.compute_dtype)
         logging.info(
             "[INFO] Performance config: check_loss=%s, grad_clip_foreach=%s",
@@ -791,6 +793,15 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.adapter_kwargs = (
             adapter_kwargs.to_dict() if hasattr(adapter_kwargs, "to_dict") else dict(adapter_kwargs or {})
         )
+        if self.optimize_hunyuan_flash_varlen_mask:
+            if self.adapter_type != "hunyuan":
+                raise ValueError(
+                    "model.optimize_hunyuan_flash_varlen_mask=true requires flow_matching.adapter_type=hunyuan"
+                )
+            if self.attention_backend != "flash_varlen":
+                raise ValueError(
+                    "model.optimize_hunyuan_flash_varlen_mask=true requires model.attention_backend=flash_varlen"
+                )
 
         logging.info("[INFO] Flow Matching V2 Pipeline")
         logging.info(f"[INFO]   - Adapter type: {self.adapter_type}")
@@ -850,6 +861,15 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
 
         self.model = self.pipe.transformer
+        if self.optimize_hunyuan_flash_varlen_mask:
+            from nemo_automodel.components.flow_matching.adapters.hunyuan import (
+                enable_hunyuan_flash_varlen_mask_optimization,
+            )
+
+            if not enable_hunyuan_flash_varlen_mask_optimization():
+                raise RuntimeError("Failed to enable Hunyuan flash-varlen mask optimization")
+            logging.info("[INFO] Enabled Hunyuan flash-varlen 2D mask optimization")
+
         self.peft_config = getattr(self.pipe, "_peft_config", None)
 
         checkpoint_cfg = self.cfg.get("checkpoint", None)
