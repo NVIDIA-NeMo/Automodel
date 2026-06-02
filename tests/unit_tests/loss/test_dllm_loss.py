@@ -365,6 +365,20 @@ class TestDFlashDraftAccuracy:
         assert result.draft_correct_per_pos.tolist() == [1.0, 1.0, 1.0, 0.0]
         assert result.draft_count_per_pos.tolist() == [1.0, 1.0, 1.0, 0.0]
 
+    def test_none_when_block_size_does_not_partition_tokens(self):
+        """Irregular T cannot be reshaped into [B, N, block_size-1]."""
+        correct = torch.ones(1, 5, dtype=torch.bool)
+        block_mask = torch.ones(1, 5)
+
+        correct_per_pos, count_per_pos = DFlashDecayLoss._draft_acc_per_pos(
+            correct,
+            block_mask,
+            block_size=4,
+        )
+
+        assert correct_per_pos is None
+        assert count_per_pos is None
+
     def test_fused_matches_nonfused(self):
         """forward_fused and forward must agree on loss and per-position sums."""
         torch.manual_seed(3)
@@ -372,13 +386,22 @@ class TestDFlashDraftAccuracy:
         T = N * (bs - 1)
         hidden = torch.randn(B, T, D)
         weight = torch.randn(V, D)
+        bias = torch.randn(V)
         target_ids = torch.randint(0, V, (B, T))
         block_mask = torch.ones(B, T)
         loss_fn = DFlashDecayLoss(loss_gamma=7.0, use_fused_linear_ce=True, chunk_size=4)
 
-        logits = torch.nn.functional.linear(hidden, weight)
+        logits = torch.nn.functional.linear(hidden, weight, bias)
         ref = loss_fn(logits, target_ids, block_mask, num_tokens=B * T, block_size=bs)
-        fused = loss_fn.forward_fused(hidden, weight, target_ids, block_mask, num_tokens=B * T, block_size=bs)
+        fused = loss_fn.forward_fused(
+            hidden,
+            weight,
+            target_ids,
+            block_mask,
+            num_tokens=B * T,
+            block_size=bs,
+            lm_head_bias=bias,
+        )
 
         assert torch.allclose(ref.total_loss, fused.total_loss, atol=1e-4)
         assert torch.equal(ref.draft_correct_per_pos, fused.draft_correct_per_pos)

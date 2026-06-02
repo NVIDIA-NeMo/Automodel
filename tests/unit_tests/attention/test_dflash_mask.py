@@ -19,7 +19,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from nemo_automodel.components.attention.dflash_mask import create_dflash_sdpa_mask
+import nemo_automodel.components.attention.dflash_mask as dflash_mask
+from nemo_automodel.components.attention.dflash_mask import create_dflash_block_mask, create_dflash_sdpa_mask
 
 
 def _reference_dflash_mask(anchor_positions, block_keep_mask, ctx_len, block_size):
@@ -115,6 +116,40 @@ def test_sdpa_mask_overlapping_anchors():
     ref = _reference_dflash_mask(anchor_positions, block_keep_mask, ctx_len, block_size)
     attended = sdpa == 0.0
     assert torch.equal(attended, ref)
+
+
+def test_compiled_create_block_mask_is_cached(monkeypatch):
+    sentinel = object()
+    calls = []
+
+    def compile_fn(fn, dynamic):
+        calls.append((fn, dynamic))
+        return sentinel
+
+    monkeypatch.setattr(dflash_mask, "_compiled_create_block_mask", None)
+    monkeypatch.setattr(dflash_mask.torch, "compile", compile_fn)
+
+    assert dflash_mask._get_compiled_create_block_mask() is sentinel
+    assert dflash_mask._get_compiled_create_block_mask() is sentinel
+    assert calls == [(dflash_mask.create_block_mask, False)]
+
+
+def test_block_mask_uncompiled_cpu_smoke():
+    """The FlexAttention helper can build an uncompiled BlockMask on CPU.
+
+    This exercises the ``use_compile=False`` path without needing a CUDA
+    runner or invoking torch.compile.
+    """
+    block_mask = create_dflash_block_mask(
+        anchor_positions=torch.tensor([[2, 5]], dtype=torch.long),
+        block_keep_mask=torch.tensor([[True, False]]),
+        ctx_len=8,
+        block_size=4,
+        device=torch.device("cpu"),
+        use_compile=False,
+    )
+
+    assert block_mask.shape == (1, 1, 8, 16)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention requires CUDA")
