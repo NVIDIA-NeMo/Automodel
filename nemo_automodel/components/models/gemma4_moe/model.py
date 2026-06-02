@@ -19,6 +19,7 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -474,6 +475,23 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     replaces the HF-native language model with ``Gemma4MoETextModelBackend``
     (NeMo GroupedExperts + Gemma4Gate).  Otherwise falls through to vanilla HF.
     """
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism / packing capabilities for this model class.
+
+        These flags are the model authors' contract: each flag should be set to
+        ``True`` only when the corresponding feature has a working,
+        verified implementation for this class.  Validation of the contract
+        (e.g. KL-divergence parity tests) lives separately under
+        ``tests/capability_registry/``.
+        """
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
+        supports_packing: bool = False
 
     @classmethod
     def from_config(
