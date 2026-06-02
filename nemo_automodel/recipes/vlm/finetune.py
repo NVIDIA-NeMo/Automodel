@@ -58,7 +58,7 @@ from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.magi_attn_utils import setup_magi
+from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -725,6 +725,11 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
 
 class FinetuneRecipeForVLM(BaseRecipe):
     """Recipe for fine-tuning a VLM model."""
+
+    # MagiAttention is disabled until setup() resolves it from config; this
+    # disabled default keeps the train step working if setup() is skipped (e.g.
+    # unit tests that exercise the step directly). It is read-only.
+    magi = MagiState()
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.

@@ -66,7 +66,7 @@ from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
 )
-from nemo_automodel.components.distributed.magi_attn_utils import setup_magi
+from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.megatron_fsdp import fully_shard_optimizer
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
@@ -896,6 +896,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
     This class orchestrates training, from setup to main training loop.
     """
+
+    # MagiAttention is disabled until setup() resolves it from config; this
+    # disabled default keeps _forward_backward_step working if setup() is skipped
+    # (e.g. unit tests that exercise the step directly). It is read-only.
+    magi = MagiState()
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
