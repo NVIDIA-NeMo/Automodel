@@ -57,9 +57,6 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Fern CLI
-        run: npm install -g fern-api
-
       - name: Generate preview URL
         id: generate-docs
         env:
@@ -67,7 +64,10 @@ jobs:
           HEAD_REF: ${{ steps.metadata.outputs.head_ref }}
         working-directory: ./docs/fern
         run: |
-          OUTPUT=$(fern generate --docs --preview --id "$HEAD_REF" 2>&1)
+          # Pin the Fern CLI to the version in fern.config.json so CI matches
+          # local `make docs-check` (and the global-theme-capable 5.29.0+ pin).
+          fern_version=$(jq -r .version fern.config.json)
+          OUTPUT=$(npx -y "fern-api@$fern_version" generate --docs --preview --id "$HEAD_REF" 2>&1)
           echo "$OUTPUT"
           URL=$(echo "$OUTPUT" | grep -oP 'Published docs to \K.*(?= \()')
           if [ -z "$URL" ]; then
