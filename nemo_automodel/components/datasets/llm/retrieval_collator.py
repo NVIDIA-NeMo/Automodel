@@ -16,7 +16,7 @@ import hashlib
 from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 import torch
-from transformers import AutoConfig, AutoProcessor, DataCollatorWithPadding, PreTrainedTokenizerBase
+from transformers import AutoConfig, AutoProcessor, DataCollatorWithPadding, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.file_utils import PaddingStrategy
 
 from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
@@ -310,7 +310,22 @@ class CrossEncoderCollator(DataCollatorWithPadding):
         return batch_dict
 
 
-def make_vision_retrieval_collator_from_processor(model_name_or_path: str, **kwargs):
+def make_vision_collator_from_processor_method(tokenizer: ProcessorMixin, collator_fn_name: str):
+    """
+    Turns a method of a processor into a collator function.
+
+    Args:
+        tokenizer: The processor instance.
+        collator_fn_name: The name of the proceessor method to turn into a collator function.
+
+    Returns:
+        A collator for vision/multimodal retrieval datasets.
+    """
+    return getattr(tokenizer, collator_fn_name)
+
+
+# Deprecated: To be replaced by make_vision_collator_from_processor_method()
+def make_vision_retrieval_collator_from_processor_path(model_name_or_path: str, **kwargs):
     """ "
     Make a vision retrieval collator from a processor.
 
