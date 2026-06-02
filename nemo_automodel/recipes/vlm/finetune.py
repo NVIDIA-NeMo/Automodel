@@ -57,6 +57,7 @@ from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp, wrap_vlm_collate_for_pp
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.magi_attn_utils import setup_magi
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
@@ -759,29 +760,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.pipeline_config = self.dist_setup.pipeline_config
 
         # MagiAttention (FFA) backend for the language backbone; the vision tower
-        # stays on SDPA. Two entry points:
-        #   - HF VLMs: model.attn_implementation="magi" (per-step magi_prepare_vlm)
-        #   - custom VLMs (e.g. qwen3_vl_moe): model.backend.attn="magi" (factory
-        #     attn_func on the custom LM blocks + active cp_group; vision is HF/SDPA)
-        self.magi_custom = str(self.cfg.get("model.backend.attn", "")) == "magi"
-        self.magi_enabled = self.magi_custom or str(self.cfg.get("model.attn_implementation", "")) == "magi"
-        self.magi_cp_group = None
-        if self.magi_enabled:
-            from nemo_automodel.components.distributed.magi_attn_utils import (
-                get_cp_group,
-                register_magi_attention,
-                set_active_cp_group,
-            )
-
-            register_magi_attention()
-            self.magi_cp_group = get_cp_group(self.device_mesh)
-            if self.magi_custom:
-                set_active_cp_group(self.magi_cp_group)
-            logging.info(
-                "MagiAttention enabled for VLM language backbone (%s, cp_size=%d).",
-                "custom-model factory" if self.magi_custom else "HF backend",
-                self.magi_cp_group.size() if self.magi_cp_group is not None else 1,
-            )
+        # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
+        # model.backend.attn="magi" (custom VLMs, e.g. qwen3_vl_moe).
+        self.magi = setup_magi(self.cfg, self.device_mesh, label="VLM language backbone")
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -1121,16 +1102,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     if k != "input_ids":
                         batch.pop(k, None)
 
-        if getattr(self, "magi_enabled", False):
-            # MagiAttention manages the language-backbone attention itself; skip the
-            # torch-native DTensor CP context. HF VLMs need per-step prep to stamp
-            # cp_group on the LM attention modules; custom VLMs use the factory
-            # attn_func with the active cp_group set at setup (vision stays on SDPA).
-            if not getattr(self, "magi_custom", False):
-                from nemo_automodel.components.distributed.magi_attn_utils import magi_prepare_vlm
-
-                batch, _magi_key = magi_prepare_vlm(self.model_parts[0], batch, self.magi_cp_group)
-            train_ctx = nullcontext
+        if self.magi.enabled:
+            # magi manages the language-backbone attention itself (vision stays on
+            # SDPA); skip the torch-native DTensor CP context.
+            train_ctx, batch = self.magi.prepare_vlm_batch(self.model_parts[0], batch)
         else:
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")

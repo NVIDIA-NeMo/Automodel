@@ -62,15 +62,8 @@ from nemo_automodel.components.datasets.llm.megatron.sampler import create_megat
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.config import FSDP2Config, MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx, make_cp_batch_for_te
-from nemo_automodel.components.distributed.magi_attn_utils import (
-    get_cp_group,
-    magi_prepare_batch,
-    magi_prepare_packed_cp,
-    magi_undispatch_logits,
-    register_magi_attention,
-    set_active_cp_group,
-)
+from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.magi_attn_utils import setup_magi
 from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
 )
@@ -940,28 +933,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.pp_enabled = self.dist_setup.pp_enabled
         self.pipeline_config = self.dist_setup.pipeline_config
 
-        # MagiAttention (FFA / context-parallel) backend. Two entry points:
-        #   - HF models: model.attn_implementation="magi" (dispatch/undispatch path)
-        #   - custom models: model.backend.attn="magi" (factory attn_func + active cp_group)
-        self.magi_custom = str(self.cfg.get("model.backend.attn", "")) == "magi"
-        self.magi_enabled = self.magi_custom or str(self.cfg.get("model.attn_implementation", "")) == "magi"
-        # HF magi dispatches the sequence across CP and undispatches logits; the
-        # custom-model path runs the FFA kernel in place. Both are fixed by config.
-        self.magi_dispatch = self.magi_enabled and not self.magi_custom
-        self.magi_cp_group = None
-        self.magi_cp_size = 1
-        if self.magi_enabled:
-            register_magi_attention()
-            self.magi_cp_group = get_cp_group(self.device_mesh)
-            self.magi_cp_size = self.magi_cp_group.size() if self.magi_cp_group is not None else 1
-            if self.magi_custom:
-                # custom-model attn_func is a closure; it reads the cp_group from here.
-                set_active_cp_group(self.magi_cp_group)
-            logging.info(
-                "MagiAttention enabled (%s, cp_size=%d).",
-                "custom-model factory" if self.magi_custom else "HF backend",
-                self.magi_cp_size,
-            )
+        # MagiAttention (FFA / context-parallel) backend, enabled via
+        # model.attn_implementation="magi" (HF) or model.backend.attn="magi" (custom).
+        self.magi = setup_magi(self.cfg, self.device_mesh)
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -1405,7 +1379,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for k, v in batch.items()
         }
         pad_id = self.tokenizer.pad_token_id if self.tokenizer else 0
-        if not self.magi_enabled:
+        if self.magi.enabled:
+            train_ctx, batch = self.magi.prepare_llm_batch(
+                self.model_parts[0] if hasattr(self, "model_parts") else None,
+                batch,
+                device_mesh=self.device_mesh,
+                is_thd=_uses_thd_collater(self.cfg.dataloader),
+                pad_id=pad_id,
+                num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
+            )
+        else:
             train_ctx, batch = make_cp_batch_and_ctx(
                 self.device_mesh,
                 batch,
@@ -1416,25 +1399,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 padding_token_id=pad_id,
                 num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
             )
-        else:
-            # MagiAttention does its own CP sharding (sequence dispatch); skip the
-            # torch-native DTensor CP context. Sequence packing still needs the THD
-            # conversion so the batch carries cu_seqlens.
-            if self.magi_custom and self.magi_cp_size > 1 and _uses_thd_collater(self.cfg.dataloader):
-                # Context-parallel packed path: build the *global* THD layout
-                # (cp_mesh=None -> no TE sharding), then dispatch it with magi's own
-                # load-balancing solver. Labels are dispatched alongside the input, so
-                # the loss is computed per-shard (like TE-CP) and reduced across CP.
-                batch = make_cp_batch_for_te(None, batch, qkv_format="thd", padding_token_id=pad_id, num_chunks=1)
-                batch, _ = magi_prepare_packed_cp(self.model_parts[0], batch, self.magi_cp_group)
-            elif _uses_thd_collater(self.cfg.dataloader):
-                # cp=1 packing: THD conversion (no sharding) so the batch carries
-                # cu_seqlens -> magi attn_func builds the per-document mask.
-                _, batch = make_cp_batch_and_ctx(
-                    self.device_mesh, batch, use_te=True, padding_token_id=pad_id,
-                    num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
-                )
-            train_ctx = nullcontext
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
@@ -1489,16 +1453,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else nullcontext()
             )
             with train_ctx(), sync_ctx, fp8_ctx:
-                # HF magi path (self.magi_dispatch) dispatches the packed sequence across
-                # the CP group, runs the forward through the FFA kernel, then undispatches
-                # the logits to the global sequence before the loss so it is numerically
-                # identical to a non-CP run. (The custom-model path runs the FFA kernel in
-                # place and computes a per-shard loss, so it neither dispatches here nor
-                # undispatches.)
-                if self.magi_dispatch:
-                    batch, _ = magi_prepare_batch(model, batch, self.magi_cp_group)
                 batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy) and not self.magi_dispatch:
+                if isinstance(self.loss_fn, FusedLinearCrossEntropy) and not self.magi.hf_dispatch:
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
                     if "hidden_states" not in out:
@@ -1508,16 +1464,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else:
                     out = model(**batch)
 
-                logits = getattr(out, "logits", out)
-                if self.magi_dispatch:
-                    logits = magi_undispatch_logits(logits, self.magi_cp_group)
+                logits = self.magi.undispatch_logits(getattr(out, "logits", out))
 
                 local_loss = calculate_loss(
                     self.loss_fn,
                     logits=logits,
                     labels=labels,
                     model=model,
-                    hidden_states=None if self.magi_dispatch else get_final_hidden_states(out),
+                    hidden_states=None if self.magi.hf_dispatch else get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)

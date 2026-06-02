@@ -42,11 +42,14 @@ place of eager/SDPA/flash for convergence-parity comparisons.
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
+
+from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx, make_cp_batch_for_te
 
 logger = logging.getLogger(__name__)
 
@@ -660,3 +663,94 @@ def magi_undispatch_logits(
         logits = logits.squeeze(0)
     logits = undispatch(logits, key)
     return logits.unsqueeze(0)
+
+
+@dataclass
+class MagiState:
+    """Resolved MagiAttention wiring for a recipe, produced by :func:`setup_magi`.
+
+    A single handle (stored as ``self.magi``) replacing the scattered
+    ``magi_enabled``/``magi_custom``/``magi_cp_group``/``magi_cp_size`` recipe
+    attributes. When MagiAttention is not configured, ``enabled`` is False and the
+    per-step methods are no-ops, so recipes can call them unconditionally.
+    """
+
+    enabled: bool = False
+    custom: bool = False  # custom-model factory backend (vs HF attn_implementation)
+    cp_group: Optional["dist.ProcessGroup"] = None
+    cp_size: int = 1
+
+    @property
+    def hf_dispatch(self) -> bool:
+        """HF path: dispatch the sequence across CP and undispatch logits before the loss.
+
+        The custom-model path runs the FFA kernel in place (and shards labels for a
+        per-shard loss at cp>1), so it neither dispatches the input nor undispatches
+        logits here.
+        """
+        return self.enabled and not self.custom
+
+    def undispatch_logits(self, logits):
+        """Undispatch logits to the global sequence on the HF dispatch path; else identity."""
+        return magi_undispatch_logits(logits, self.cp_group) if self.hf_dispatch else logits
+
+    def prepare_llm_batch(self, model, batch, *, device_mesh, is_thd, pad_id, num_chunks):
+        """Per-step batch prep for the LLM recipe (assumes ``enabled``).
+
+        Returns ``(train_ctx, batch)``. magi does its own CP, so ``train_ctx`` is
+        always ``nullcontext`` (no torch-native DTensor CP context).
+        """
+        if self.hf_dispatch:
+            # HF path: dispatch the (single causal) sequence across the CP group.
+            batch, _ = magi_prepare_batch(model, batch, self.cp_group)
+        elif self.custom and self.cp_size > 1 and is_thd:
+            # Custom-model CP packed path: build the *global* THD layout (no TE
+            # sharding) then dispatch it with magi's own load-balancing solver.
+            batch = make_cp_batch_for_te(None, batch, qkv_format="thd", padding_token_id=pad_id, num_chunks=1)
+            batch, _ = magi_prepare_packed_cp(model, batch, self.cp_group)
+        elif is_thd:
+            # cp=1 packing: THD conversion (no sharding) so the batch carries
+            # cu_seqlens -> the magi attn_func builds the per-document mask.
+            _, batch = make_cp_batch_and_ctx(
+                device_mesh, batch, use_te=True, padding_token_id=pad_id, num_chunks=num_chunks
+            )
+        return nullcontext, batch
+
+    def prepare_vlm_batch(self, model, batch):
+        """Per-step batch prep for the VLM recipe (assumes ``enabled``).
+
+        HF VLMs stamp the cp_group on the language-backbone attention; custom VLMs
+        use the factory attn_func with the active cp_group set in :func:`setup_magi`
+        (the vision tower stays on SDPA either way). Returns ``(train_ctx, batch)``.
+        """
+        if not self.custom:
+            batch, _ = magi_prepare_vlm(model, batch, self.cp_group)
+        return nullcontext, batch
+
+
+def setup_magi(cfg, device_mesh, *, label: str = "") -> MagiState:
+    """Resolve MagiAttention from config: register the backend and CP group.
+
+    Enabled when the model is configured with ``attn_implementation="magi"`` (HF) or
+    ``backend.attn="magi"`` (custom models). Returns a :class:`MagiState`
+    (``enabled=False`` when magi is not configured). ``label`` is an optional suffix
+    for the log line (e.g. ``"VLM language backbone"``).
+    """
+    custom = str(cfg.get("model.backend.attn", "")) == "magi"
+    enabled = custom or str(cfg.get("model.attn_implementation", "")) == "magi"
+    if not enabled:
+        return MagiState()
+
+    register_magi_attention()
+    cp_group = get_cp_group(device_mesh)
+    cp_size = cp_group.size() if cp_group is not None else 1
+    if custom:
+        # the custom-model attn_func is a closure; it reads the cp_group from here.
+        set_active_cp_group(cp_group)
+    logger.info(
+        "MagiAttention enabled%s (%s, cp_size=%d).",
+        f" for {label}" if label else "",
+        "custom-model factory" if custom else "HF backend",
+        cp_size,
+    )
+    return MagiState(enabled=True, custom=custom, cp_group=cp_group, cp_size=cp_size)
