@@ -21,6 +21,7 @@ configs:
   - falcon/falcon_h1_1p5b_instruct_squad.yaml
   - falcon/falcon_h1_7b_instruct_squad.yaml
   - falcon/falcon_h1_7b_instruct_squad_peft.yaml
+  - falcon/falcon_h1_7b_instruct_hellaswag_peft.yaml
   - falcon/falcon_h1_34b_instruct_squad_peft.yaml
   - gemma/gemma_3_270m_squad.yaml
   - gemma/gemma_3_270m_squad_peft.yaml
