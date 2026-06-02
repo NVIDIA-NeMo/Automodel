@@ -88,9 +88,9 @@ def is_tokenizer(object):
         object (any): the object to check.
 
     Returns:
-        bool: returns True if object is a tokenizer or VLM processor.
+        bool: returns True if object is a VLM processor or tokenizer.
     """
-    return isinstance(object, (PreTrainedTokenizerBase, ProcessorMixin))
+    return isinstance(object, (ProcessorMixin, PreTrainedTokenizerBase))
 
 
 def is_lr_scheduler(object):

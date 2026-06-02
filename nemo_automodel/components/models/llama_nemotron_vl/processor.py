@@ -13,7 +13,7 @@ import torch
 import torchvision.transforms as T
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
-from transformers import BatchEncoding, ProcessorMixin
+from transformers import AutoProcessor, BatchEncoding, PretrainedConfig, ProcessorMixin
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -165,6 +165,13 @@ def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnai
     return processed_images
 
 
+class LlamaNemotronVLProcessorConfig(PretrainedConfig):
+    """Dummy Configuration for LlamaNemotronVLProcessor,
+    just to register the processor with AutoProcessor."""
+
+    pass
+
+
 class LlamaNemotronVLProcessor(ProcessorMixin):
     """Processor for LlamaNemotronVL model."""
 
@@ -174,6 +181,7 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
     def __init__(
         self,
         tokenizer: Any,
+        config: Optional[LlamaNemotronVLProcessorConfig] = None,
         q_max_length: Optional[int] = None,
         p_max_length: Optional[int] = None,
         pad_to_multiple_of: Optional[int] = None,
@@ -528,3 +536,8 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
         labels = torch.zeros(len(questions), dtype=torch.long)
         merged_batch_dict["labels"] = labels
         return merged_batch_dict
+
+def _register_with_hf_auto_classes():
+    LlamaNemotronVLProcessor.register_for_auto_class("AutoProcessor")
+
+_register_with_hf_auto_classes()
