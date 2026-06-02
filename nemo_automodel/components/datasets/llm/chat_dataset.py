@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 
@@ -313,6 +314,54 @@ def _conversations_to_messages(conversations: Any) -> List[Dict[str, Any]]:
             )
         messages.append({"role": role, "content": turn.get("value", turn.get("content", ""))})
     return messages
+
+
+@dataclass
+class ChatDatasetConfig:
+    """Construction-time configuration for :class:`ChatDataset` (tokenizer is a build arg)."""
+
+    path_or_dataset_id: Union[str, Sequence[str]]
+    """HF dataset id, local JSON/JSONL path(s), Parquet file, or Parquet directory."""
+    split: Optional[str] = None
+    """Dataset split or slice (e.g. ``train``, ``train[1024:]``)."""
+    name: Optional[str] = None
+    """Optional Hub subset / config name."""
+    seq_length: Optional[int] = None
+    """Maximum sequence length for padding and truncation in formatting."""
+    padding: Union[str, bool] = "do_not_pad"
+    """Padding mode for ``format_chat_template``."""
+    truncation: Union[str, bool] = "do_not_truncate"
+    """Truncation mode for ``format_chat_template``."""
+    start_of_turn_token: Optional[str] = None
+    """Optional token marking assistant turns for answer-only loss."""
+    chat_template: Optional[str] = None
+    """Optional Jinja template string overriding ``tokenizer.chat_template``."""
+    shuffle_seed: Optional[int] = None
+    """If set, shuffles Hub/Parquet data before applying a split slice."""
+    mask_reasoning_content: bool = False
+    """If ``True``, exclude rendered reasoning traces from the loss mask."""
+    unshifted: bool = False
+    """Passed through to ``format_chat_template``."""
+    skip_invalid_samples: bool = False
+    """If ``True``, skip malformed JSONL lines when reading local files."""
+
+    def build(self, *, tokenizer) -> "ChatDataset":
+        """Build a :class:`ChatDataset` from this :class:`ChatDatasetConfig` and a runtime tokenizer."""
+        return ChatDataset(
+            path_or_dataset_id=self.path_or_dataset_id,
+            tokenizer=tokenizer,
+            split=self.split,
+            name=self.name,
+            seq_length=self.seq_length,
+            padding=self.padding,
+            truncation=self.truncation,
+            start_of_turn_token=self.start_of_turn_token,
+            chat_template=self.chat_template,
+            shuffle_seed=self.shuffle_seed,
+            mask_reasoning_content=self.mask_reasoning_content,
+            unshifted=self.unshifted,
+            skip_invalid_samples=self.skip_invalid_samples,
+        )
 
 
 class ChatDataset(Dataset):

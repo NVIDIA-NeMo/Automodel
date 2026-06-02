@@ -12,9 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 from datasets import load_dataset
 
 from nemo_automodel.components.datasets.utils import SFTSingleTurnPreprocessor
+
+
+@dataclass
+class HellaSwagConfig:
+    """Construction-time configuration for :class:`HellaSwag`."""
+
+    path_or_dataset: str
+    """Path to the dataset or a HuggingFace dataset id."""
+    split: str = "train"
+    """Dataset split to use (e.g. ``train``, ``validation``)."""
+    num_samples_limit: int | None = None
+    """If set, limit the dataset to this many samples via slicing."""
+    pad_to_max_length: bool = True
+    """Whether to pad sequences to the dataset max length."""
+
+    def build(self, *, tokenizer) -> "HellaSwag":
+        """Build a :class:`HellaSwag` dataset from this :class:`HellaSwagConfig` and a runtime tokenizer."""
+        return HellaSwag(
+            path_or_dataset=self.path_or_dataset,
+            tokenizer=tokenizer,
+            split=self.split,
+            num_samples_limit=self.num_samples_limit,
+            pad_to_max_length=self.pad_to_max_length,
+        )
 
 
 class HellaSwag:

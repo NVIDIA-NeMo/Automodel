@@ -12,9 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import random
+from dataclasses import dataclass
 
 from torch.utils.data import Dataset
+
+
+@dataclass
+class MockSequenceClassificationDatasetConfig:
+    """Construction-time configuration for :class:`MockSequenceClassificationDataset`."""
+
+    num_samples: int = 64
+    """Number of synthetic samples to generate."""
+    num_labels: int = 2
+    """Number of classification labels."""
+    vocab_size: int = 256
+    """Vocabulary size for the random token ids."""
+    max_seq_len: int = 32
+    """Maximum sequence length (each sample length is sampled in ``[4, max_seq_len]``)."""
+    seed: int = 0
+    """Seed for the random generator."""
+
+    def build(self, *, tokenizer=None) -> "MockSequenceClassificationDataset":
+        """Build a :class:`MockSequenceClassificationDataset` from this :class:`MockSequenceClassificationDatasetConfig`."""
+        return MockSequenceClassificationDataset(
+            num_samples=self.num_samples,
+            num_labels=self.num_labels,
+            vocab_size=self.vocab_size,
+            max_seq_len=self.max_seq_len,
+            seed=self.seed,
+            tokenizer=tokenizer,
+        )
 
 
 class MockSequenceClassificationDataset(Dataset):
