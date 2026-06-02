@@ -38,11 +38,8 @@ import torch
 import torch.nn as nn
 import wandb
 from huggingface_hub import constants as hf_constants
-from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -53,15 +50,12 @@ from nemo_automodel._transformers.infrastructure import (
 from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
-from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
-from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.config import FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import build_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -92,7 +86,6 @@ from nemo_automodel.components.utils.compile_utils import (
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
-    _supports_seq_lens,
     filter_forward_kwargs,
     resolve_trust_remote_code,
 )
@@ -355,279 +348,41 @@ def _build_tokenizer(cfg_model, cfg_ds):
     return kwargs, tokenizer
 
 
-def build_dataloader(
-    cfg_ds,
-    cfg_dl,
-    cfg_model,
-    cfg_ps,
-    seed,
-    local_batch_size,
-    global_batch_size,
-    max_steps,
-    val_check_interval,
-    dp_rank,
-    dp_world_size,
-    pp_enabled,
-    cp_size=1,
-    model: Optional[nn.Module] = None,
-) -> tuple[DataLoader, PreTrainedTokenizerBase]:
-    """Build a DataLoader for the dataset.
+def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
+    """Return a collate-fn wrapper that precomputes pipeline-parallel causal masks, or ``None``.
 
-    Args:
-        cfg_ds: Dataset configuration.
-        cfg_dl: DataLoader configuration.
-        cfg_model: Model configuration.
-        cfg_ps: Packed sequence configuration.
-        seed: Random seed.
-        local_batch_size: Local batch size.
-        global_batch_size: Global batch size.
-        max_steps: Maximum number of steps.
-        val_check_interval: Validation check interval.
-        dp_rank: Data parallel rank.
-        dp_world_size: Data parallel world size.
-        pp_enabled: Whether pipeline parallelism is enabled.
-        cp_size: Context parallel size.
-        model: Optional model instance. If provided and packed sequences are enabled,
-            seq_lens will only be included if the model's forward() accepts it.
-    Returns:
-        The instantiated DataLoader and tokenizer.
+    ``None`` when PP is disabled, the model config can't be loaded, or the model
+    computes masks internally (e.g. ``deepseek_v4``).  Passed to
+    :meth:`DataloaderConfig.build` as ``collate_wrapper``.
     """
-    with ScopedRNG(seed=seed, ranked=True):
-        kwargs, tokenizer = _build_tokenizer(cfg_model, cfg_ds)
-        # Megatron specific kwargs
-        if cfg_ds._target_ == MegatronPretraining:
-            kwargs["global_batch_size"] = global_batch_size
-            kwargs["trainer_max_steps"] = max_steps if max_steps is not None else None
-            kwargs["trainer_val_check_interval"] = val_check_interval
-            ds = cfg_ds.instantiate(**kwargs)
-            ds.build()
-        else:
-            with FirstRankPerNode():
-                ds = cfg_ds.instantiate(**kwargs)
+    if not pp_enabled:
+        return None
+    try:
+        hf_model_config = AutoConfig.from_pretrained(
+            _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
+        )
+    except Exception:
+        logger.warning(
+            "Failed to load model config for causal mask precomputation. "
+            "Pipeline parallel mask precomputation will be skipped."
+        )
+        return None
+    if not _should_precompute_pp_causal_masks(hf_model_config):
+        logger.info(
+            "Skipping pipeline parallel causal mask precomputation for model_type=%s.",
+            getattr(hf_model_config, "model_type", None),
+        )
+        return None
 
-        # If using an IterableDataset, per-rank sharding for unique samples
-        if isinstance(ds, IterableDataset):
-            if callable(getattr(ds, "shard", None)):
-                ds = ds.shard(dp_world_size, dp_rank)
-                logging.info(f"Sharded IterableDataset via dataset.shard: world_size={dp_world_size}, rank={dp_rank}")
-            elif hasattr(ds, "dataset"):
-                # HuggingFace streaming datasets: split by file shards when possible.
-                from datasets.distributed import split_dataset_by_node
+    from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
 
-                assert hasattr(ds, "dataset"), "dataset must have a dataset attribute"
-                ds.dataset = split_dataset_by_node(ds.dataset, world_size=dp_world_size, rank=dp_rank)
-                logging.info(f"Sharded dataset via split_dataset_by_node: world_size={dp_world_size}")
-            else:
-                logging.warning("IterableDataset does not support sharding; Data may be duplicated across ranks.")
+    def wrapper(base_collate_fn):
+        def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
+            return add_causal_masks_to_batch(base_fn(batch), model_config=config)
 
-        packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
-        packing_strategy = getattr(cfg_ps, "packing_strategy", "thd")
+        return chained_collate_fn
 
-        # check if packed sequence is supported (only for thd strategy)
-        supports_seq_lens = _supports_seq_lens(model)
-        if packed_sequence_size > 0 and packing_strategy == "thd" and not supports_seq_lens:
-            logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
-            packed_sequence_size = 0
-
-        # Apply packing if configured
-        if packed_sequence_size > 0:
-            logger.info(f"Packing dataset with size: {packed_sequence_size}, strategy: {packing_strategy}")
-            if hasattr(ds, "shuffle"):
-                ds = ds.shuffle(seed)
-
-            if packing_strategy == "neat":
-                from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
-                from nemo_automodel.components.datasets.utils import neat_packed_collater
-                from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
-
-                ds = neat_pack_dataset(
-                    ds,
-                    split=cfg_ds.split,
-                    pack_size=packed_sequence_size,
-                    max_packs=getattr(cfg_ps, "max_packs", None),
-                    padding_idx=getattr(tokenizer, "pad_token_id", 0),
-                    drop_long_samples=getattr(cfg_ps, "drop_long_samples", True),
-                )
-                _attn_impl = get_attn_implementation(cfg_model)
-                configure_packing(attn_implementation=_attn_impl)
-                # Set collater with attn_implementation so it produces the right mask format
-                cfg_dl.collate_fn = lambda batch, _ai=_attn_impl: neat_packed_collater(batch, attn_implementation=_ai)
-                logger.info(f"Configured neat packing for attn_implementation={_attn_impl}")
-            else:
-                # "thd" — existing packing logic
-                ds = pack_dataset(
-                    ds,
-                    split=cfg_ds.split,
-                    packed_sequence_size=packed_sequence_size,
-                    max_packs=getattr(cfg_ps, "max_packs", None),
-                    padding_idx=getattr(tokenizer, "pad_token_id", 0),
-                    cp_size=cp_size,
-                )
-
-        if isinstance(ds, MegatronPretraining):
-            ds = ds.get_dataset(split=cfg_ds.splits_to_build)
-            dataloader_type = cfg_dl.get("dataloader_type", "single")
-            if "dataloader_type" in cfg_dl:
-                del cfg_dl.dataloader_type
-            batch_sampler = create_megatron_sampler(
-                dataset_len=len(ds),
-                micro_batch_size=local_batch_size,
-                global_batch_size=global_batch_size,
-                dataloader_type=dataloader_type,
-                rank=dp_rank,
-                world_size=dp_world_size,
-            )
-            dl_kwargs = {"batch_sampler": batch_sampler}
-        elif not isinstance(ds, IterableDataset):
-            shuffle = cfg_dl.get("shuffle", True)
-            if "shuffle" in cfg_dl:
-                del cfg_dl.shuffle
-
-            group_by_length = cfg_dl.get("group_by_length", False)
-            if "group_by_length" in cfg_dl:
-                del cfg_dl.group_by_length
-
-            if group_by_length:
-                from nemo_automodel.components.datasets.llm.length_grouped_sampler import (
-                    LengthGroupedSampler as LLMLengthGroupedSampler,
-                )
-
-                sampler = LLMLengthGroupedSampler(
-                    dataset=ds,
-                    batch_size=local_batch_size,
-                    seed=seed,
-                    num_replicas=dp_world_size,
-                    rank=dp_rank,
-                )
-            else:
-                dist_sampler_kwargs = {
-                    "num_replicas": dp_world_size,
-                    "rank": dp_rank,
-                    "shuffle": shuffle,
-                }
-                sampler = StatefulDistributedSampler(
-                    ds,
-                    seed=seed,
-                    drop_last=True,
-                    **dist_sampler_kwargs,
-                )
-            dl_kwargs = {"sampler": sampler, "batch_size": local_batch_size}
-            if pp_enabled:
-                dl_kwargs["drop_last"] = True
-        else:
-            logging.info("Using IterableDataset; skipping sampler.")
-            # Optional shuffle for streaming IterableDataset (uses HF dataset shuffle if available)
-            shuffle = cfg_dl.get("shuffle", False)
-            shuffle_buffer_size = cfg_dl.get("shuffle_buffer_size", 10000)
-            # Do not pass shuffle-related kwargs to the DataLoader when using IterableDataset
-            # But leave them in dl config to be consistent
-            if hasattr(cfg_dl, "shuffle"):
-                del cfg_dl.shuffle
-            if hasattr(cfg_dl, "shuffle_buffer_size"):
-                del cfg_dl.shuffle_buffer_size
-
-            if shuffle and hasattr(ds, "shuffle"):
-                try:
-                    ds = ds.shuffle(buffer_size=shuffle_buffer_size, seed=seed)
-                    logging.info(f"Shuffling IterableDataset with buffer_size={shuffle_buffer_size}, seed={seed}")
-                except Exception as e:
-                    logging.warning(f"IterableDataset shuffle skipped due to error: {e}")
-            dl_kwargs = {}
-
-        # Handle collate_fn with optional mask precomputation for pipeline parallelism
-        dl_kwargs = dl_kwargs | {"dataset": ds}
-
-        # Handle collate_fn instantiation if it's a ConfigNode
-        if hasattr(cfg_dl, "collate_fn"):
-            if hasattr(cfg_dl.collate_fn, "_target_"):
-                collate_cfg = cfg_dl.collate_fn
-                dl_kwargs["collate_fn"] = lambda batch: collate_cfg.instantiate(batch=batch)
-            else:
-                dl_kwargs["collate_fn"] = cfg_dl.collate_fn
-            assert callable(dl_kwargs["collate_fn"]), "collate_fn must be callable"
-
-        # Chain with mask precomputation if PP is enabled
-        if pp_enabled:
-            from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
-
-            try:
-                hf_model_config = AutoConfig.from_pretrained(
-                    _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to load model config for causal mask precomputation. "
-                    "Pipeline parallel mask precomputation will be skipped."
-                )
-            else:
-                if not _should_precompute_pp_causal_masks(hf_model_config):
-                    logger.info(
-                        "Skipping pipeline parallel causal mask precomputation for model_type=%s.",
-                        getattr(hf_model_config, "model_type", None),
-                    )
-                elif "collate_fn" in dl_kwargs:
-                    # Case 1: PP enabled + collate_fn exists -> chain them
-                    # base_collate_fn -> add_causal_masks_to_batch
-                    base_collate_fn = dl_kwargs["collate_fn"]
-
-                    def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
-                        batch = base_fn(batch)  # Apply base collate (padding, batching, etc.)
-                        batch = add_causal_masks_to_batch(batch, model_config=config)  # Add masks
-                        return batch
-
-                    dl_kwargs["collate_fn"] = chained_collate_fn
-                else:
-                    # Case 2: PP enabled + no collate_fn -> only add masks
-                    dl_kwargs["collate_fn"] = lambda batch, config=hf_model_config: add_causal_masks_to_batch(
-                        batch, model_config=config
-                    )
-
-        try:
-            import torch.multiprocessing as mp
-
-            if mp.get_start_method(allow_none=True) is None:
-                mp.set_start_method("spawn", force=True)
-        except RuntimeError:
-            pass
-        return cfg_dl.instantiate(**dl_kwargs), tokenizer
-
-
-def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: Optional[nn.Module] = None):
-    """Build validation dataloaders from validation dataset config entries."""
-
-    def _prepare_val_ds_name(val_ds_name):
-        val_ds_name = val_ds_name.replace("validation_dataset", "")
-        if len(val_ds_name) > 1 and val_ds_name[0] in ("_", "-", "."):
-            val_ds_name = val_ds_name[1:]
-        if val_ds_name == "":
-            val_ds_name = "default"
-        return val_ds_name
-
-    # Build validation dataloader if the config provides it
-    val_dataloaders = {}
-    for val_ds_name in filter(lambda x: x.startswith("validation_dataset"), cfg.to_dict().keys()):
-        val_ds_cfg = cfg.get(val_ds_name, None)
-        val_ds_name = _prepare_val_ds_name(val_ds_name)
-        val_dataloaders[val_ds_name] = build_dataloader(
-            val_ds_cfg,
-            cfg.validation_dataloader,
-            cfg.model,
-            cfg_ps=cfg.get("packed_sequence", None)
-            if _uses_te_dot_product_attention(cfg.model) and _uses_thd_collater(cfg.dataloader)
-            else None,
-            seed=cfg.get("seed", 42),
-            local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
-            global_batch_size=cfg.get("step_scheduler.global_batch_size", 1),
-            max_steps=cfg.get("step_scheduler.max_steps", None),
-            val_check_interval=cfg.get("step_scheduler.val_every_steps", None),
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            pp_enabled=pp_enabled,
-            cp_size=cfg.get("distributed.cp_size", 1),
-            model=model,
-        )[0]
-
-    return val_dataloaders
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -843,29 +598,31 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     f"      attn: te"
                 )
 
-        self.dataloader, self.tokenizer = build_dataloader(
-            self.cfg.dataset,
-            self.cfg.dataloader,
-            self.cfg.model,
-            self.cfg.get("packed_sequence", None),
-            seed=self.cfg.get("seed", 42),
-            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-            global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
-            max_steps=self.cfg.get("step_scheduler.max_steps", None),
-            val_check_interval=self.cfg.get("step_scheduler.val_every_steps", None),
+        # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
+        # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
+        _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
+        attn_implementation = None
+        if (
+            self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
+            and self.cfg.get("packed_sequence.packing_strategy", "thd") == "neat"
+        ):
+            from nemo_automodel.components.models.common.packing import get_attn_implementation
+
+            attn_implementation = get_attn_implementation(self.cfg.model)
+        loader_runtime = dict(
+            tokenizer=self.tokenizer,
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
+            model=self.model_parts[0],
             cp_size=self.cfg.get("distributed.cp_size", 1),
-            model=self.model_parts[0],
+            attn_implementation=attn_implementation,
+            collate_wrapper=_build_pp_collate_wrapper(self.cfg.model, self.pp_enabled),
         )
-        self.val_dataloaders = build_validation_dataloader(
-            self.cfg,
-            self._get_dp_group_size(),
-            self._get_dp_rank(),
-            self.pp_enabled,
-            model=self.model_parts[0],
-        )
+        self.dataloader = self.cfg.dataloader.build(**loader_runtime)
+        self.val_dataloaders = {
+            name: dl_config.build(**loader_runtime) for name, dl_config in self.cfg.validation_dataloaders.items()
+        }
         # Optional tool-call accuracy evaluator for agent SFT runs.
         # Presence of the ``tool_call_eval`` block enables it; absence skips it.
         self.tool_call_evaluator = None

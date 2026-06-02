@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -26,6 +27,41 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from .text_to_video_dataset import collate_optional_video_fields, load_optional_video_fields
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MetaFilesDatasetConfig:
+    """Construction-time configuration for :class:`MetaFilesDataset`."""
+
+    meta_folder: str
+    """Path to the folder containing `.meta` files."""
+    device: str = "cpu"
+    """Device to load tensors to."""
+    max_files: Optional[int] = None
+    """Maximum number of `.meta` files to use (None means no limit)."""
+
+    def build(
+        self,
+        *,
+        transform_text: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        transform_video: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        filter_fn: Optional[Callable[[Dict], bool]] = None,
+    ) -> "MetaFilesDataset":
+        """Build a :class:`MetaFilesDataset` from this :class:`MetaFilesDatasetConfig`.
+
+        Args:
+            transform_text: Optional callable applied to text embeddings at load time.
+            transform_video: Optional callable applied to video latents at load time.
+            filter_fn: Optional callable that filters samples by their metadata dict.
+        """
+        return MetaFilesDataset(
+            meta_folder=self.meta_folder,
+            transform_text=transform_text,
+            transform_video=transform_video,
+            filter_fn=filter_fn,
+            device=self.device,
+            max_files=self.max_files,
+        )
 
 
 class MetaFilesDataset(Dataset):

@@ -86,9 +86,12 @@ Environment Variables:
     - GOOGLE_APPLICATION_CREDENTIALS
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
@@ -691,6 +694,32 @@ class DeltaLakeIterator:
         assert index >= 0 and index < num_shards, "index must be in [0, num_shards)"
         self._shard_info = (num_shards, index)
         return self
+
+
+@dataclass
+class DeltaLakeDatasetConfig:
+    """Construction-time configuration for :class:`DeltaLakeDataset`."""
+
+    table_path: str
+    """Path to the Delta Lake table."""
+    columns: Optional[list] = None
+    """Optional list of column names to read."""
+    storage_options: Optional[Dict[str, str]] = None
+    """Optional dict of storage options for cloud authentication."""
+    version: Optional[int] = None
+    """Optional specific version of the Delta table to read."""
+    sql_query: Optional[str] = None
+    """Optional SQL query applied to the table."""
+
+    def build(self) -> "DeltaLakeDataset":
+        """Build a :class:`DeltaLakeDataset` from this :class:`DeltaLakeDatasetConfig`."""
+        return DeltaLakeDataset(
+            table_path=self.table_path,
+            columns=self.columns,
+            storage_options=self.storage_options,
+            version=self.version,
+            sql_query=self.sql_query,
+        )
 
 
 class DeltaLakeDataset:
