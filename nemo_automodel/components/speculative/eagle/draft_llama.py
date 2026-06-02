@@ -660,8 +660,11 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         # when ``parallel_drafting`` is set so EAGLE-3 / EAGLE-3.1 checkpoints
         # round-trip with no extra keys.
         if getattr(config, "parallel_drafting", False):
+            # Initialized with unit-variance noise to match speculators'
+            # ``torch.randn(1, 1, 3 * hidden_size)`` exactly (NOT the 0.02
+            # ``initializer_range`` used for ordinary weights).
             self.mask_hidden = nn.Parameter(torch.empty(1, 1, self.model.fc.in_features))
-            nn.init.normal_(self.mask_hidden, mean=0.0, std=getattr(config, "initializer_range", 0.02))
+            nn.init.normal_(self.mask_hidden, mean=0.0, std=1.0)
 
         self.post_init()
 

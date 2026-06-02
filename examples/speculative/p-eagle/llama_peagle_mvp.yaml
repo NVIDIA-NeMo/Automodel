@@ -39,7 +39,9 @@ recipe_args:
   num_workers: 0
   num_epochs: 1
   draft_vocab_size: 8192
-  freeze_embeddings: true
+  # P-EAGLE trains the draft embeddings (speculators' embed_requires_grad=True);
+  # do not freeze them.
+  freeze_embeddings: false
   trust_remote_code: false
   shuffle_seed: 42
   log_every_steps: 10

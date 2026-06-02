@@ -308,13 +308,14 @@ class PEagleTrainerModule(nn.Module):
             )
             logits = draft.compute_logits(hidden)[0]  # [total_sampled, draft_vocab]
 
-            # Project target logits to the draft vocab at the sampled positions
-            # and drop positions whose target top-1 falls outside the draft vocab
-            # (the shared draft-vocab-shrink rule, applied per sampled element).
+            # Gather target logits to the draft vocab at the sampled positions.
+            # This index_select equals speculators' draft-vocab ``verifier_lm_head``
+            # (= target lm_head restricted to the t2d rows). Supervision is the
+            # loss mask at the sampled positions ONLY -- speculators does not drop
+            # positions whose full-vocab argmax falls outside the draft vocab, so
+            # neither do we here.
             target_sel = target_logits[b, orig_positions]  # [total_sampled, target_vocab]
-            target_top = target_sel.argmax(dim=-1)
-            in_vocab = self.selected_token_mask[target_top]
-            sampled_loss_mask = row_loss_mask[0, orig_positions].bool() & in_vocab  # [total_sampled]
+            sampled_loss_mask = row_loss_mask[0, orig_positions].bool()  # [total_sampled]
             draft_target_logits = target_sel.index_select(
                 dim=-1, index=self.selected_token_ids.to(target_sel.device)
             )  # [total_sampled, draft_vocab]

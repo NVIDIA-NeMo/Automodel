@@ -279,7 +279,11 @@ class TrainEagle3Recipe(BaseRecipe):
         draft_config_obj = type(target_config).from_dict(draft_config)
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
-        if recipe_cfg.get("freeze_embeddings", True):
+        # EAGLE-3 TTT freezes the draft embeddings by default; P-EAGLE trains them
+        # (speculators sets ``embed_requires_grad=True`` for parallel drafting).
+        # Either default can still be overridden via ``recipe_args.freeze_embeddings``.
+        freeze_embeddings_default = not parallel_drafting
+        if recipe_cfg.get("freeze_embeddings", freeze_embeddings_default):
             self.draft_model.freeze_embeddings()
 
         if parallel_drafting:

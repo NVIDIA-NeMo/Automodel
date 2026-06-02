@@ -340,18 +340,24 @@ def test_peagle_flat_inputs_mask_depth_ge_1_slots():
         torch.testing.assert_close(h, mask_proj)
 
 
-def test_peagle_masks_out_of_draft_vocab_targets():
-    """Targets whose top-1 token is outside the draft vocab must be masked out."""
+def test_peagle_supervision_depends_only_on_loss_mask():
+    """Supervised-token count is driven by loss_mask + COD, NOT by target vocab.
+
+    Unlike EAGLE-3 TTT, speculators' P-EAGLE does not drop positions whose
+    full-vocab argmax falls outside the draft vocab (its ``verifier_lm_head``
+    is natively draft-vocab). So ``valid_tokens`` must be identical whether or
+    not the target argmax lands in the draft vocab.
+    """
     draft = _build_tiny_draft_model(parallel_drafting=True, mask_token_id=7)
     trainer = _make_trainer(draft, num_depths=2, mask_token_id=7)
 
     torch.manual_seed(0)
-    full = trainer(**_random_batch(draft.config, targets_in_draft_vocab=True)).valid_tokens.item()
+    in_vocab = trainer(**_random_batch(draft.config, targets_in_draft_vocab=True)).valid_tokens.item()
     torch.manual_seed(0)
-    partial = trainer(**_random_batch(draft.config, targets_in_draft_vocab=False)).valid_tokens.item()
+    out_vocab = trainer(**_random_batch(draft.config, targets_in_draft_vocab=False)).valid_tokens.item()
 
-    assert full > 0
-    assert partial < full, "out-of-draft-vocab targets are not being masked out"
+    assert in_vocab > 0
+    assert out_vocab == in_vocab, "P-EAGLE supervision must not depend on whether targets are in the draft vocab"
 
 
 def test_peagle_loss_decreases_over_optimizer_steps():
@@ -401,6 +407,8 @@ def test_peagle_mvp_example_config_uses_cod_knobs_not_ttt():
     assert recipe_args.get("mask_token_id") is not None
     assert int(recipe_args.get("num_depths")) >= 1
     assert "ttt_steps" not in recipe_args.to_dict()
+    # P-EAGLE trains the draft embeddings (speculators embed_requires_grad=True).
+    assert recipe_args.get("freeze_embeddings") is False
 
 
 def test_peagle_checkpoint_save_round_trip(tmp_path):
