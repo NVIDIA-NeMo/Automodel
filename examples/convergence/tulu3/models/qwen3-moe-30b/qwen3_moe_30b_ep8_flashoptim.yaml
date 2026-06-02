@@ -35,7 +35,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints_convergence/qwen3_moe_30b_flashoptim/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2

@@ -56,7 +56,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig

@@ -418,8 +418,15 @@ class TrainEagle3Recipe(BaseRecipe):
         if is_dist_initialized:
             dist.barrier()
 
+        step_scheduler = getattr(self, "step_scheduler", None)
+        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
         draft_model = self._module().draft_model
-        self.checkpointer.save_model(draft_model, path, tokenizer=self.tokenizer)
+        self.checkpointer.save_model(
+            draft_model,
+            path,
+            tokenizer=self.tokenizer,
+            is_final_checkpoint=is_final_checkpoint,
+        )
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
         self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
