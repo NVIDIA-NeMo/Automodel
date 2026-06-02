@@ -166,43 +166,51 @@ class Eagle3TrainerModule(nn.Module):
         return Eagle3StepMetrics(loss=avg_loss, accuracy=accuracy, valid_tokens=running_valid)
 
 
+def _kl_div_loss(logits: torch.Tensor, target_logits: torch.Tensor) -> torch.Tensor:
+    """Per-position KL(target || draft) over the draft vocabulary.
+
+    Matches speculators' ``kl_div_loss``: ``log_softmax`` the draft logits,
+    ``softmax`` the target logits, and sum the elementwise KL over the vocab
+    axis. Shapes ``[*, draft_vocab]`` -> ``[*]``.
+    """
+    log_p = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+    target_p = torch.nn.functional.softmax(target_logits.float(), dim=-1)
+    return torch.nn.functional.kl_div(log_p, target_p, reduction="none", log_target=False).sum(dim=-1)
+
+
 class PEagleTrainerModule(nn.Module):
     """Draft-side P-EAGLE (parallel-drafting EAGLE-3) trainer module.
 
-    P-EAGLE replaces EAGLE-3's autoregressive test-time-training recurrence
-    with *parallel* multi-token prediction. At inference vLLM emits all
-    ``num_draft_tokens`` tokens in a single forward over a flat
-    ``[context, mask_1, .., mask_{K-1}]`` sequence. **This module does not run a
-    single forward at training time** -- it reproduces that exact layout by
-    running ``num_draft_tokens`` sequential ``cache_hidden`` steps that are
-    numerically equivalent to the flat parallel forward (the equivalence is
-    pinned to ~1e-7 by
-    ``test_peagle_parallel_forward_matches_expanded_reference`` and relies on
-    ``LlamaRotaryEmbedding`` honoring the per-depth position offset). Depths
-    ``>= 1`` are conditioned on fixed learnable placeholders instead of the
-    previous step's own output. For depth ``d``:
+    Faithful port of speculators' P-EAGLE
+    (https://github.com/vllm-project/speculators/pull/480): the draft predicts
+    all ``num_depths`` tokens in a *single* parallel forward over a flat,
+    COD-subsampled sequence -- it does NOT run EAGLE-3's autoregressive TTT
+    recurrence.
 
-    * depth 0 (next-token prediction) consumes the real token embedding and
-      the projected target auxiliary hidden states -- identical to
-      ``Eagle3TrainerModule`` step 0;
-    * depths ``1..K-1`` (multi-token prediction) consume the *masked* token
-      ``ptd_token_id`` and the single learnable ``mask_hidden`` placeholder
-      (projected through ``model.fc``), with **no** recurrence -- the inputs
-      are identical across all masked depths and only the supervision target
-      rolls forward.
+    Per training sequence:
 
-    The cross-depth attention is the same EAGLE-3 ``cache_hidden``
-    diagonal-extension pattern: depth ``d`` attends to the causal real prefix
-    (the ``T x T`` block over depth-0 keys) plus the same base position at
-    every earlier depth, with RoPE phase ``position + d``. This is exactly
-    what vLLM's parallel-drafting runtime sees at inference -- one base
-    position is expanded per decode step and the KV cache holds committed
-    depth-0 tokens only -- so training through ``cache_hidden`` is numerically
-    faithful to deployment despite running K sequential forwards here (the
-    single-forward parallelism is an inference-time property).
+    1. **COD sampling** (:func:`generate_cod_sample_indices`) draws
+       ``(anchor_pos, depth)``: depth 0 keeps every position, depth ``d`` keeps a
+       geometrically decaying ``down_sample_ratio**d`` fraction. The reference
+       position of each element is ``anchor_pos + depth``.
+    2. **Flat input assembly.** All depths are concatenated into one
+       ``[1, total_sampled]`` sequence. Depth-0 slots take the real token id and
+       the ``fc``-projected target aux hidden state; depth >= 1 slots take the
+       masked ``mask_token_id`` and the single learnable ``mask_hidden``
+       placeholder (projected through the same ``fc``).
+    3. **COD flex attention.** A single ``flex_attention`` forward with the
+       :func:`create_peagle_mask_mod` block mask: each element attends to the
+       causal depth-0 context of its document plus earlier-or-equal depths of
+       its own rollout. This is exactly what vLLM's parallel-drafting runtime
+       sees at inference.
+    4. **Count-normalized KL loss.** ``KL(target || draft)`` over the draft vocab
+       at every supervised sampled position, normalized by a single total token
+       count -- deeper depths (fewer COD positions) naturally contribute less
+       gradient. No ``0.8**d`` schedule.
 
-    The draft-vocab projection, ``0.8 ** d`` weighted-mean loss schedule, and
-    accuracy metrics are shared verbatim with :class:`Eagle3TrainerModule`.
+    Batches with ``batch_size > 1`` are processed row-by-row (speculators is
+    batch-size-1); per-row losses are accumulated with a shared denominator so
+    the normalization stays count-based across the whole batch.
     """
 
     def __init__(
@@ -211,14 +219,16 @@ class PEagleTrainerModule(nn.Module):
         *,
         selected_token_ids: torch.Tensor,
         selected_token_mask: torch.Tensor,
-        num_draft_tokens: int,
-        ptd_token_id: int,
+        num_depths: int,
+        mask_token_id: int,
+        down_sample_ratio: float = 0.7,
+        down_sample_ratio_min: float = 0.2,
     ):
         super().__init__()
-        if not isinstance(num_draft_tokens, int) or num_draft_tokens < 1:
+        if not isinstance(num_depths, int) or num_depths < 1:
             raise ValueError(
-                f"PEagleTrainerModule requires num_draft_tokens to be an integer >= 1 "
-                f"(the draft must produce at least one token), got num_draft_tokens={num_draft_tokens!r}."
+                f"PEagleTrainerModule requires num_depths to be an integer >= 1 "
+                f"(the draft must produce at least one token), got num_depths={num_depths!r}."
             )
         if getattr(draft_model, "mask_hidden", None) is None:
             raise ValueError(
@@ -228,8 +238,10 @@ class PEagleTrainerModule(nn.Module):
         self.draft_model = draft_model
         self.register_buffer("selected_token_ids", selected_token_ids, persistent=True)
         self.register_buffer("selected_token_mask", selected_token_mask, persistent=True)
-        self.num_draft_tokens = num_draft_tokens
-        self.ptd_token_id = int(ptd_token_id)
+        self.num_depths = num_depths
+        self.mask_token_id = int(mask_token_id)
+        self.down_sample_ratio = float(down_sample_ratio)
+        self.down_sample_ratio_min = float(down_sample_ratio_min)
 
     def forward(
         self,
@@ -241,75 +253,81 @@ class PEagleTrainerModule(nn.Module):
     ) -> Eagle3StepMetrics:
         """Run the P-EAGLE parallel-drafting loss for one batch.
 
-        ``attention_mask`` is held constant across depths -- only the
-        supervision (``loss_mask`` / ``position_mask`` / ``target_probs``)
-        rolls forward by one position per depth, mirroring
-        ``Eagle3TrainerModule``. Unlike EAGLE-3 TTT, the per-depth *inputs* at
-        depths ``>= 1`` are the fixed masked token / ``mask_hidden`` placeholder
-        rather than the previous depth's output.
+        ``attention_mask`` supplies the per-row valid length so padded positions
+        are excluded from attention (document mask) and from supervision.
         """
-        hidden_states = self.draft_model.project_hidden_states(aux_hidden_states)
-        # Single projected ``mask_hidden`` placeholder, broadcast across the
-        # batch / sequence and shared by every masked depth. Computed once: it
-        # is independent of the base position, so all masked depths backprop
-        # into the same parameter through this one projection. It shares the
-        # ``project_hidden_states`` (``fc``) output dtype with ``hidden_states``,
-        # so no cast is needed.
-        mask_hidden = self.draft_model.masked_projected_hidden()
-        masked_hidden_states = mask_hidden.view(1, 1, -1).expand(input_ids.shape[0], input_ids.shape[1], -1)
-        masked_input_ids = torch.full_like(input_ids, self.ptd_token_id)
+        from nemo_automodel.components.speculative.eagle.peagle_data import generate_cod_sample_indices
 
-        target_probs, position_mask = _compute_target_distribution(
-            target_logits=target_logits,
-            selected_token_ids=self.selected_token_ids,
-            selected_token_mask=self.selected_token_mask,
-            loss_mask=loss_mask,
-        )
+        draft = self.draft_model
+        batch_size, seq_len = input_ids.shape
+        mask_hidden_proj = draft.masked_projected_hidden()  # [1, H]
 
-        running_loss = hidden_states.new_zeros(())
-        running_correct = hidden_states.new_zeros(())
-        running_valid = hidden_states.new_zeros(())
+        loss_num = mask_hidden_proj.new_zeros(())
+        loss_den = mask_hidden_proj.new_zeros(())
+        running_correct = mask_hidden_proj.new_zeros(())
+        running_valid = mask_hidden_proj.new_zeros(())
 
-        cur_input_ids = input_ids
-        cur_hidden_states = hidden_states
-        cur_position_mask = position_mask
-        cur_target_probs = target_probs
-
-        # Shared EAGLE-3 TTT KV cache [K_list, V_list]; the attention layer
-        # appends each depth's K/V so depth ``d`` attends to the same base
-        # position at depths ``0..d-1``. Re-created per batch.
-        cache_hidden: list[list[torch.Tensor]] = [[], []]
-
-        weight_sum = sum(0.8**i for i in range(self.num_draft_tokens))
-        for step_idx in range(self.num_draft_tokens):
-            step_hidden = self.draft_model(
-                input_ids=cur_input_ids,
-                projected_hidden_states=cur_hidden_states,
-                attention_mask=attention_mask,
-                cache_hidden=cache_hidden,
+        for b in range(batch_size):
+            row_loss_mask = loss_mask[b : b + 1].long()  # [1, seq_len]
+            anchor_pos, depth = generate_cod_sample_indices(
+                seq_length=seq_len,
+                loss_mask=row_loss_mask,
+                num_depths=self.num_depths,
+                down_sample_ratio=self.down_sample_ratio,
+                down_sample_ratio_min=self.down_sample_ratio_min,
             )
-            logits = self.draft_model.compute_logits(step_hidden)
-            step_loss = masked_soft_cross_entropy(
-                logits=logits,
-                target_probs=cur_target_probs,
-                position_mask=cur_position_mask,
-            )
-            running_loss = running_loss + step_loss * (0.8**step_idx)
+            orig_positions = anchor_pos + depth  # [total_sampled]
+            is_depth0 = depth == 0  # [total_sampled]
 
-            valid_mask = cur_position_mask.squeeze(-1).bool()
-            correct = (logits.argmax(dim=-1) == cur_target_probs.argmax(dim=-1)) & valid_mask
+            # Flat input ids: real token at depth 0, masked token elsewhere.
+            sampled_ids = torch.where(
+                is_depth0,
+                input_ids[b, orig_positions],
+                torch.full_like(orig_positions, self.mask_token_id),
+            ).unsqueeze(0)  # [1, total_sampled]
+
+            # Flat projected hidden: real aux at depth 0, mask_hidden elsewhere.
+            real_proj = draft.project_hidden_states(aux_hidden_states[b : b + 1])[0]  # [seq_len, H]
+            sampled_hidden = torch.where(
+                is_depth0.unsqueeze(-1),
+                real_proj[orig_positions],
+                mask_hidden_proj.expand(orig_positions.shape[0], -1),
+            ).unsqueeze(0)  # [1, total_sampled, H]
+
+            position_ids = orig_positions.unsqueeze(0)  # [1, total_sampled]
+            lengths = attention_mask[b].sum().clamp_min(1).reshape(1).to(orig_positions.device)
+            block_mask = draft.build_peagle_block_mask(
+                anchor_pos=anchor_pos, depth=depth, lengths=lengths, total_seq_len=seq_len
+            )
+
+            hidden = draft.forward_peagle(
+                sampled_input_ids=sampled_ids,
+                sampled_projected_hidden=sampled_hidden,
+                position_ids=position_ids,
+                block_mask=block_mask,
+            )
+            logits = draft.compute_logits(hidden)[0]  # [total_sampled, draft_vocab]
+
+            # Project target logits to the draft vocab at the sampled positions
+            # and drop positions whose target top-1 falls outside the draft vocab
+            # (the shared draft-vocab-shrink rule, applied per sampled element).
+            target_sel = target_logits[b, orig_positions]  # [total_sampled, target_vocab]
+            target_top = target_sel.argmax(dim=-1)
+            in_vocab = self.selected_token_mask[target_top]
+            sampled_loss_mask = row_loss_mask[0, orig_positions].bool() & in_vocab  # [total_sampled]
+            draft_target_logits = target_sel.index_select(
+                dim=-1, index=self.selected_token_ids.to(target_sel.device)
+            )  # [total_sampled, draft_vocab]
+
+            elementwise = _kl_div_loss(logits, draft_target_logits)  # [total_sampled]
+            mask_f = sampled_loss_mask.to(elementwise.dtype)
+            loss_num = loss_num + (elementwise * mask_f).sum()
+            loss_den = loss_den + mask_f.sum()
+
+            correct = (logits.argmax(dim=-1) == draft_target_logits.argmax(dim=-1)) & sampled_loss_mask
             running_correct = running_correct + correct.sum()
-            running_valid = running_valid + valid_mask.sum()
+            running_valid = running_valid + sampled_loss_mask.sum()
 
-            if step_idx + 1 < self.num_draft_tokens:
-                # Masked depths share fixed inputs (no recurrence): the
-                # ``ptd_token_id`` token embedding and the projected
-                # ``mask_hidden`` placeholder. Only supervision rolls forward.
-                cur_input_ids = masked_input_ids
-                cur_hidden_states = masked_hidden_states
-                cur_position_mask = _shift_left_with_zero(cur_position_mask)
-                cur_target_probs = _shift_left_with_zero(cur_target_probs)
-
-        avg_loss = running_loss / weight_sum
+        avg_loss = loss_num / loss_den.clamp_min(1e-5)
         accuracy = running_correct / running_valid.clamp_min(1.0)
-        return Eagle3StepMetrics(loss=avg_loss, accuracy=accuracy, valid_tokens=running_valid)
+        return Eagle3StepMetrics(loss=avg_loss.to(mask_hidden_proj.dtype), accuracy=accuracy, valid_tokens=running_valid)

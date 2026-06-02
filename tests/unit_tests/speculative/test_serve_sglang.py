@@ -94,7 +94,7 @@ def test_resolve_draft_artifacts_rejects_parallel_drafting_head(tmp_path: Path):
     model_dir.mkdir(parents=True)
     config_path = model_dir / "config.json"
     config_path.write_text(
-        json.dumps({"architectures": ["LlamaForCausalLMEagle3"], "parallel_drafting": True, "ptd_token_id": 0}),
+        json.dumps({"architectures": ["LlamaForCausalLMEagle3"], "parallel_drafting": True, "mask_token_id": 0}),
         encoding="utf-8",
     )
     (model_dir / "model.safetensors").write_bytes(b"weights")

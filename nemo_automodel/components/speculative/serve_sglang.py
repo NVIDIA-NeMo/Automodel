@@ -171,11 +171,11 @@ def _raise_if_parallel_drafting(config_path: Path) -> None:
 
     A P-EAGLE head carries ``parallel_drafting: true`` (and a ``mask_hidden``
     tensor) and only loads into vLLM's parallel-drafting runtime
-    (https://github.com/vllm-project/vllm/pull/32887, vLLM >= 0.16). Serving it
-    through SGLang's EAGLE-3 path would silently produce wrong drafts because
-    SGLang ignores ``mask_hidden`` / ``ptd_token_id``. SGLang support is tracked
-    upstream in https://github.com/sgl-project/sglang/issues/23171; until it
-    lands, fail loudly with an actionable message instead.
+    (https://github.com/vllm-project/speculators/pull/480). Serving it through
+    SGLang's EAGLE-3 path would silently produce wrong drafts because SGLang
+    ignores ``mask_hidden`` / ``mask_token_id`` / the COD config. SGLang support
+    is tracked upstream in https://github.com/sgl-project/sglang/issues/23171;
+    until it lands, fail loudly with an actionable message instead.
     """
     if not config_path.exists():
         return

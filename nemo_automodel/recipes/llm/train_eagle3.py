@@ -219,40 +219,48 @@ class TrainEagle3Recipe(BaseRecipe):
         draft_config["attn_implementation"] = recipe_cfg.get("draft_attn_implementation", "eager")
         # P-EAGLE (parallel drafting). When enabled, the draft registers a
         # learnable ``mask_hidden`` placeholder and the trainer predicts all
-        # draft tokens in parallel (masked depths) instead of EAGLE-3's
-        # autoregressive TTT unroll. ``ptd_token_id`` is the reserved token id
-        # placed at masked multi-token-prediction slots; it must be written to
-        # the draft ``config.json`` because vLLM's parallel-drafting runtime
-        # reads ``ptd_token_id`` from there at inference time. Both keys are
-        # serialized into the draft config so the saved checkpoint loads into
-        # vLLM >= 0.16 unchanged.
+        # ``num_depths`` draft tokens in a single COD-subsampled parallel forward
+        # (https://github.com/vllm-project/speculators/pull/480) instead of
+        # EAGLE-3's autoregressive TTT unroll. ``mask_token_id`` is the reserved
+        # token id placed at masked multi-token-prediction slots; ``num_depths``
+        # and the COD ratios are serialized into the draft ``config.json`` so the
+        # saved checkpoint loads into vLLM's parallel-drafting runtime unchanged.
         parallel_drafting = bool(recipe_cfg.get("parallel_drafting", False))
         draft_config["parallel_drafting"] = parallel_drafting
-        ptd_token_id = None
+        mask_token_id = None
         if parallel_drafting:
-            # ``ptd_token_id`` must be chosen deliberately: it indexes the draft
+            # ``mask_token_id`` must be chosen deliberately: it indexes the draft
             # ``embed_tokens`` table for the masked draft slots and (with frozen
             # embeddings) that row's vector is the only "mask token" signal. A
             # silent default (e.g. 0) usually maps to a meaningful token and
             # pollutes the masked-slot semantics, so require it explicitly and
             # range-check it. The value is serialized into the draft config so
             # vLLM reads the same id at serve time.
-            ptd_token_id = recipe_cfg.get("ptd_token_id", None)
-            if ptd_token_id is None:
+            mask_token_id = recipe_cfg.get("mask_token_id", None)
+            if mask_token_id is None:
                 raise ValueError(
-                    "parallel_drafting=True requires recipe_args.ptd_token_id to be set explicitly. "
+                    "parallel_drafting=True requires recipe_args.mask_token_id to be set explicitly. "
                     "Pick a reserved / rarely-used token id for the masked draft slots (e.g. one of "
                     "Llama-3's reserved special tokens) so the masked-slot embedding does not collide "
                     "with real content; the same id must be present in the draft config.json vLLM reads "
                     "at serve time."
                 )
-            ptd_token_id = int(ptd_token_id)
-            if not 0 <= ptd_token_id < target_config.vocab_size:
+            mask_token_id = int(mask_token_id)
+            if not 0 <= mask_token_id < target_config.vocab_size:
                 raise ValueError(
-                    f"ptd_token_id={ptd_token_id} is out of range for the target vocab "
+                    f"mask_token_id={mask_token_id} is out of range for the target vocab "
                     f"[0, {target_config.vocab_size}); it indexes the draft embed_tokens table."
                 )
-            draft_config["ptd_token_id"] = ptd_token_id
+            draft_config["mask_token_id"] = mask_token_id
+            draft_config["num_depths"] = int(recipe_cfg.get("num_depths", 8))
+            draft_config["down_sample_ratio"] = float(recipe_cfg.get("down_sample_ratio", 0.7))
+            draft_config["down_sample_ratio_min"] = float(recipe_cfg.get("down_sample_ratio_min", 0.2))
+            # P-EAGLE stacks ``num_draft_layers`` draft decoder layers (the fused
+            # first layer + vanilla Llama layers). The speculators reference uses
+            # 4. This overrides the draft's ``num_hidden_layers`` (which would
+            # otherwise inherit the target's full depth); the EAGLE-3 TTT path
+            # ignores it and always builds a single layer.
+            draft_config["num_hidden_layers"] = int(recipe_cfg.get("num_draft_layers", 1))
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
@@ -268,19 +276,17 @@ class TrainEagle3Recipe(BaseRecipe):
             self.draft_model.freeze_embeddings()
 
         if parallel_drafting:
-            # ``num_draft_tokens`` is P-EAGLE's K (parallel depths). Falls back
-            # to ``ttt_steps`` so an existing EAGLE-3 config's K knob carries
-            # over, else 4. Both fallbacks go through ``.get`` with a literal
-            # default -- a bare ``recipe_cfg.ttt_steps`` here would be evaluated
-            # eagerly (Python always computes the ``dict.get`` default argument)
-            # and raise AttributeError for a P-EAGLE config that omits it.
-            num_draft_tokens = recipe_cfg.get("num_draft_tokens", recipe_cfg.get("ttt_steps", 4))
+            # ``num_depths`` is P-EAGLE's K (number of parallel COD depths),
+            # default 8 to match speculators. The COD ratios shape how
+            # aggressively deeper depths are subsampled.
             trainer_module = PEagleTrainerModule(
                 self.draft_model,
                 selected_token_ids=selected_token_ids,
                 selected_token_mask=selected_token_mask,
-                num_draft_tokens=int(num_draft_tokens),
-                ptd_token_id=ptd_token_id,
+                num_depths=int(recipe_cfg.get("num_depths", 8)),
+                mask_token_id=mask_token_id,
+                down_sample_ratio=float(recipe_cfg.get("down_sample_ratio", 0.7)),
+                down_sample_ratio_min=float(recipe_cfg.get("down_sample_ratio_min", 0.2)),
             ).to(self.device)
         else:
             trainer_module = Eagle3TrainerModule(
