@@ -55,6 +55,12 @@ class _ServerClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self._session = requests.Session()
+        # The target server is a direct in-cluster peer; never route requests
+        # through an ambient HTTP(S) proxy (e.g. a corporate ``http_proxy``),
+        # which cannot reach a pod-local or intra-cluster address. trust_env
+        # also disables ``no_proxy`` parsing, so this works without per-host
+        # ``no_proxy`` configuration on every node.
+        self._session.trust_env = False
         self._nccl_rank_offset = nccl_rank_offset
         self._nccl_enabled = os.environ.get("NEMO_EAGLE_ENABLE_NCCL", "1") == "1"
         self._nccl: Optional[NCCLTransport] = None
