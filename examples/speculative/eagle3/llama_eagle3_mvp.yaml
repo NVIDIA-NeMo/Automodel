@@ -17,10 +17,9 @@ recipe_args:
   #     {"role": "assistant", "content": "Paris."}
   #   ]}
   #
-  # If a dataset ships the conversations under a different key (e.g.
-  # PerfectBlend uses ``conversations``), rename the column locally
-  # before pointing the recipe at it. See the inline one-liner in
-  # ``llama_eagle3_perfectblend.yaml``.
+  # ShareGPT-style datasets (e.g. PerfectBlend) that ship turns under a
+  # ``conversations`` column of ``{from, value}`` entries are auto-converted to
+  # the ``messages`` schema -- no manual column rename needed.
   train_data_path: /path/to/train.jsonl
   val_data_path: null
   train_split: null
@@ -33,7 +32,20 @@ recipe_args:
   num_epochs: 1
   ttt_steps: 4
   draft_vocab_size: 8192
+  # Optional cache for the draft-vocab selection. The recipe otherwise scans
+  # the whole training set every run to rank token frequencies; set this to a
+  # path and the first run writes it while later runs load it and skip the scan.
+  # The cache is keyed only on the target/draft vocab sizes -- point it at a
+  # fresh path (or delete the file) if you change the training data.
+  # selected_token_ids_path: ./outputs/eagle3_llama_mvp/draft_token_map.pt
   freeze_embeddings: true
+  # SpecForge OFFLINE path (legacy, disk-heavy): point this at a cache produced
+  # by `python -m nemo_automodel.components.speculative.precompute_eagle3` and the
+  # recipe streams the precomputed target supervision instead of loading/running
+  # the target. It costs ~80 MB/sample (tens of TB for a large corpus) and is
+  # largely superseded by the default online path -- leave it unset unless you
+  # are repeatedly re-training a draft on a fixed, bounded dataset.
+  # cached_target_path: /data/eagle3_cache/sharegpt_llama31
   trust_remote_code: false
   shuffle_seed: 42
   log_every_steps: 10

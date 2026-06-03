@@ -362,7 +362,7 @@ YAML sketch:
 checkpoint:
 enabled: true
 checkpoint_dir: ./checkpoints
-save_consolidated: true
+save_consolidated: final
 model_save_format: safetensors
 ``` -->
 
