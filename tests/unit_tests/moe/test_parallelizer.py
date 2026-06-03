@@ -2175,7 +2175,7 @@ def test_apply_cp_skips_non_te_attention(monkeypatch):
 
 
 def test_apply_cp_skips_attention_without_attn_module(monkeypatch):
-    """Gemma4 HF attention has no attn_module; PyTorch CP hooks handle it later."""
+    """HF attention without attn_module is skipped by the TE CP path."""
     P = _import_parallelizer_with_stubs(monkeypatch)
 
     te_attn_stub = types.ModuleType("transformer_engine.pytorch.attention")
@@ -2188,14 +2188,14 @@ def test_apply_cp_skips_attention_without_attn_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", types.ModuleType("transformer_engine.pytorch"))
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", te_attn_stub)
 
-    class Gemma4StyleBlock:
+    class AttentionWithoutAttnModuleBlock:
         layer_type = "full_attention"
 
         def __init__(self):
             self.self_attn = _FakeAttnModule()
             self.mlp = object()
 
-    model = DummyModel([Gemma4StyleBlock()])
+    model = DummyModel([AttentionWithoutAttnModuleBlock()])
     cp_mesh = MagicMock()
 
     P.apply_cp(model, cp_mesh)
