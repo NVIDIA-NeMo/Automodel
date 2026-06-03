@@ -170,6 +170,11 @@ class MiniMaxM3TextModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        # Pipeline stages after the first receive the previous stage's hidden
+        # states in the input_ids slot (a float tensor) with embed_tokens=None.
+        if inputs_embeds is None and input_ids is not None and torch.is_floating_point(input_ids):
+            inputs_embeds = input_ids
+            input_ids = None
         h = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
 
         if position_ids is None:
@@ -186,7 +191,8 @@ class MiniMaxM3TextModel(nn.Module):
                 **attn_kwargs,
             )
 
-        return self.norm(h)
+        # norm is None on non-final pipeline stages.
+        return self.norm(h) if self.norm is not None else h
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -424,6 +430,92 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     def get_output_embeddings(self):
         return self.lm_head
 
+    def customize_pipeline_stage_modules(
+        self,
+        module_names_per_stage: list[list[str]],
+        *,
+        layers_prefix: str,
+        text_model: nn.Module | None = None,
+    ) -> list[list[str]]:
+        """Rewrite auto-generated pipeline FQNs to M3's real module paths.
+
+        M3's text stack lives directly under ``self.model`` and the vision tower
+        is a top-level sibling (``vision_tower``). The framework, seeing the
+        ``language_model`` property, derives a nested ``model.language_model.``
+        prefix for the text modules and a ``model.`` prefix for the multimodal
+        encoders. Map both back to M3's actual paths so per-stage module nulling
+        keeps/drops the correct submodules.
+        """
+        if getattr(self.model, "mtp", None) is not None:
+            raise NotImplementedError(
+                "MiniMax M3 VL does not support MTP modules under pipeline parallelism yet; "
+                "set text_config.num_mtp_modules=0 for pp_size>1 runs."
+            )
+        from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES
+
+        text_prefix = "model."  # M3's text stack lives directly under self.model
+        fixed: list[list[str]] = []
+        for stage in module_names_per_stage:
+            names: list[str] = []
+            for name in stage:
+                if layers_prefix != text_prefix and name.startswith(layers_prefix):
+                    names.append(text_prefix + name[len(layers_prefix) :])
+                elif name.startswith(text_prefix) and name[len(text_prefix) :] in MULTIMODAL_SUFFIXES:
+                    names.append(name[len(text_prefix) :])
+                else:
+                    names.append(name)
+            fixed.append(names)
+        return fixed
+
+    def _is_pipeline_parallel_stage(self) -> bool:
+        """True when this is a partial pipeline stage (some text modules nulled)."""
+        if self.lm_head is None:
+            return True
+        if getattr(self.model, "embed_tokens", None) is None:
+            return True
+        try:
+            return len(self.model.layers) != int(self.config.text_config.num_hidden_layers)
+        except (TypeError, AttributeError):
+            return False
+
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Per-stage input/output meta tensors for the PP schedule's shape inference.
+
+        First stage consumes token ids ``[mb, seq]``; later stages consume hidden
+        states ``[mb, seq, hidden]``. The final stage (owning ``lm_head``) emits
+        logits ``[mb, seq, vocab]``; earlier stages emit hidden states.
+        """
+        text_config = self.config.text_config
+        hidden_size = text_config.hidden_size
+        vocab_size = text_config.vocab_size
+
+        def meta(*shape: int) -> torch.Tensor:
+            return torch.empty(*shape, device="meta", dtype=dtype)
+
+        # Inter-stage tensors (hidden states) carry the model/activation dtype the
+        # framework passes in. token ids are always long.
+        if is_first:
+            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+        else:
+            inputs_meta = (meta(microbatch_size, seq_len, hidden_size),)
+
+        if self.lm_head is not None:
+            # Logits follow lm_head's own param dtype, which may diverge from the
+            # model dtype if lm_head is ever kept in fp32 (_keep_in_fp32_modules);
+            # deriving it here keeps the schedule's output buffer correctly sized.
+            head_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", dtype)
+            outputs_meta = (torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=head_dtype),)
+        else:
+            outputs_meta = (meta(microbatch_size, seq_len, hidden_size),)
+        return inputs_meta, outputs_meta
+
     @staticmethod
     def _to_grid_list(grid_thw) -> list[list[int]]:
         if isinstance(grid_thw, torch.Tensor):
@@ -462,6 +554,57 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        is_pp_stage = self._is_pipeline_parallel_stage()
+
+        # Authoritative MTP-under-PP guard: keyed on the config (which survives the
+        # splitter nulling the mtp module) and is_pp_stage, so it fires for both the
+        # auto-generated split (also caught earlier in customize_pipeline_stage_modules)
+        # and a manually supplied module_fqns_per_model_part that bypasses that hook.
+        if is_pp_stage and int(getattr(self.config.text_config, "num_mtp_modules", 0) or 0) > 0:
+            raise NotImplementedError(
+                "MiniMax M3 VL does not support MTP modules under pipeline parallelism yet; "
+                "set text_config.num_mtp_modules=0 for pp_size>1 runs."
+            )
+
+        # Pipeline stage 0 does not receive media in the batch: the VLM-PP collate
+        # strips pixel_values/grids and stage_vlm_media_for_pp attaches them here as
+        # per-microbatch chunks. Pull this microbatch's media off the cursor before
+        # embedding so vision features still get spliced (mirrors KimiVL/Step3p7).
+        # `_vlm_image_grid_hws_chunks` holds M3's image_grid_thw values (the PP media
+        # prep stores whatever grid the model emits under that key), so no reshape.
+        chunks = getattr(self, "_vlm_pixel_values_chunks", None)
+        if (
+            pixel_values is None
+            and pixel_values_videos is None
+            and input_ids is not None
+            and not torch.is_floating_point(input_ids)
+            and (chunks is not None or getattr(self, "_vlm_pixel_values_videos_chunks", None) is not None)
+        ):
+            chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+            consumed = False
+            if chunks is not None and (input_ids == self.image_token_index).any() and chunk_idx < len(chunks):
+                pixel_values = chunks[chunk_idx]
+                image_grid_thw = self._vlm_image_grid_hws_chunks[chunk_idx]
+                consumed = True
+            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
+            if (
+                video_chunks is not None
+                and (input_ids == self.video_token_index).any()
+                and chunk_idx < len(video_chunks)
+            ):
+                pixel_values_videos = video_chunks[chunk_idx]
+                video_grid_thw = self._vlm_video_grid_thw_chunks[chunk_idx]
+                consumed = True
+            if consumed:
+                self._vlm_chunk_idx = chunk_idx + 1
+
+        # Pipeline stages after the first receive the previous stage's hidden
+        # states in the input_ids slot (a float tensor); route them straight to
+        # the text model (no embedding / vision splicing on non-first stages).
+        if inputs_embeds is None and input_ids is not None and torch.is_floating_point(input_ids):
+            inputs_embeds = input_ids
+            input_ids = None
+
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
             if pixel_values is not None or pixel_values_videos is not None:
@@ -482,7 +625,14 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             attention_mask=attention_mask,
             **kwargs,
         )
-        logits = self.lm_head(hidden)
+        # lm_head is None on non-final pipeline stages -> forward hidden states.
+        logits = self.lm_head(hidden) if self.lm_head is not None else hidden
+
+        # Pipeline stages return a plain tensor; the schedule wires each stage's
+        # output to the next stage's input and only the final stage owns lm_head.
+        if is_pp_stage:
+            return logits
+
         if self.model.mtp is not None and self.training and input_ids is not None:
             mtp_logits = self.model.mtp_logits(
                 hidden, input_ids, self.lm_head, position_ids=position_ids, attention_mask=attention_mask, **kwargs
