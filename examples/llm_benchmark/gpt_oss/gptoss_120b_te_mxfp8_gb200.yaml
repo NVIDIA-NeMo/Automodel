@@ -31,8 +31,9 @@
 # (fp8_ctx); the BenchmarkingRecipe reuses that step, so the expert GEMMs run under
 # MXFP8BlockScaling. attn/linear/rms_norm stay TE bf16 unless a wider fp8 scope is set.
 #
-# Parallelism/data match the bf16 baseline for an apples-to-apples iter-time comparison:
-#   8 nodes/32 GPUs, ep_size=16, local_batch_size=2, GBS=512, seq_len=4096.
+# Operating point (matches the reported number): 8 nodes/32 GPUs, ep_size=16,
+#   local_batch_size=8, GBS=1280 (GA=5), activation_checkpointing=true, seq_len=4096.
+#   -> 6.918 s/iter, 14.38% MFU@5000, 132.5 GB peak (loss descends 12.75->12.40).
 # peak_tflops=5000 (GB200 MXFP8/FP8 dense peak) so MFU is reported against the FP8
 # roofline, not the bf16 2500 peak the gmm/bf16 configs use.
 
@@ -50,8 +51,8 @@ benchmark:
 
 step_scheduler:
   gc_every_steps: 10
-  global_batch_size: 512
-  local_batch_size: 2
+  global_batch_size: 1280
+  local_batch_size: 8
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
@@ -65,7 +66,7 @@ distributed:
   ep_size: 16
 
   sequence_parallel: false
-  activation_checkpointing: false
+  activation_checkpointing: true
 
   pipeline:
     pp_schedule: interleaved1f1b
