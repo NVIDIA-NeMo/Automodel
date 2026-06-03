@@ -171,11 +171,6 @@ class BackendConfig:
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP for token dispatch,
             "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
-        compile_experts: When True, torch.compile only the local expert grouped-GEMM
-            compute (not whole-model, not per-layer), leaving the dispatch/all-to-all
-            eager so the hybridep collective is not traced. Applies to the torch_mm /
-            torch_mm_mxfp8 paths; for mxfp8 the payoff is fusing the to_mx quant into the
-            scaled grouped GEMM. Default False ⇒ behavior unchanged.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
@@ -213,7 +208,6 @@ class BackendConfig:
         else "torch"
     )
     dispatcher_num_sms: int = 20
-    compile_experts: bool = False
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
     disable_shared_expert_overlap: bool = False
