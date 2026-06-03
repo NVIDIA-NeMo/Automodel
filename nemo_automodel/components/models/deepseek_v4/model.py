@@ -58,6 +58,7 @@ from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFChe
 from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4.config import (
     DeepseekV4Config,
+    deepseek_v4_compress_rope_scaling,
     deepseek_v4_is_hash_routing_layer,
 )
 from nemo_automodel.components.models.deepseek_v4.layers import (
@@ -370,19 +371,23 @@ class DeepseekV4Model(nn.Module):
         # to the compress-rope path: when compress_ratio>0 it uses
         # ``original_seq_len=args.original_seq_len`` and theta=compress_rope_theta;
         # otherwise ``original_seq_len=0`` (YaRN disabled) and theta=rope_theta.
-        rope_scaling = getattr(config, "rope_scaling", None)
         self.rotary_emb = DeepseekV4RotaryEmbedding(
             rope_theta=float(config.rope_theta),
             head_dim=int(config.head_dim),
             partial_rotary_factor=partial_rotary_factor,
             rope_scaling=None,
         )
-        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        # TF 5.8.1 nests YaRN under ``rope_parameters["compress"]`` (and renames
+        # the ``type`` key to ``rope_type``); the helper normalizes both the
+        # native and the legacy flat ``rope_scaling`` shapes. Reading the raw
+        # ``config.rope_scaling`` here would silently disable YaRN on the
+        # compress path under transformers 5.8.1.
+        compress_rope_scaling = deepseek_v4_compress_rope_scaling(config) or {}
         self.rotary_emb_compress = DeepseekV4RotaryEmbedding(
             rope_theta=float(getattr(config, "compress_rope_theta", 160000.0) or 160000.0),
             head_dim=int(config.head_dim),
             partial_rotary_factor=partial_rotary_factor,
-            rope_scaling=rope_scaling,
+            rope_scaling=compress_rope_scaling,
         )
 
     def forward(
