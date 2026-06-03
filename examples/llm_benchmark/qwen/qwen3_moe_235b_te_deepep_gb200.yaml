@@ -21,16 +21,18 @@
 #   - pp_size: 4 -> 1, ep_size: 32 -> 32  (pure expert parallelism, no pipeline)
 #   - dispatcher: deepep -> hybridep  (GB200: deepep fails EP-buffer init)
 #
-# Parallelism: ep_size=32 (==world=32), tp=pp=cp=1. With dp_size=32 and
-# global_batch_size=512, lbs=4 gives 512 / (32*4) = 4 gradient-accumulation
-# micro-batches (most memory margin). seq_len=4096. pp=1 -> no pipeline / moe blocks.
+# Parallelism: ep_size=32 (==world=32), tp=pp=cp=1, dp_size=32. With lbs=4 and
+# global_batch_size=32768, GA = 32768 / (32*4) = 256 gradient-accumulation
+# micro-batches/step. seq_len=4096. pp=1 -> no pipeline / moe blocks.
+# warmup=2 + max_steps=5: each step is 256 microbatches so MFU is steady within
+# the first step; a couple measured steps give a stable number.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 
 seed: 1234
 
 benchmark:
-  warmup_steps: 10
+  warmup_steps: 2
   peak_tflops: 2500  # GB200 BF16 dense peak TFLOPs
   nsys_start: -1
   nsys_end: -1
@@ -49,12 +51,12 @@ distributed:
 
 step_scheduler:
   gc_every_steps: 10
-  global_batch_size: 512
+  global_batch_size: 32768  # GA = GBS / (world*lbs) = 32768 / (32*4) = 256
   local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
-  max_steps: 30
+  max_steps: 5  # GA=256 -> each step is 256 microbatches; steady state in 1 step, a few measured steps suffice
 
 dist_env:
   backend: nccl
