@@ -40,6 +40,18 @@ logger = logging.getLogger(__name__)
 _CP_STREAM = None
 
 
+def _moe_shard_placement(param):
+    """FSDP shard placement for grouped-expert params.
+
+    Shard on dim=1 for the (>=2D) expert weights since there may be more shards than
+    experts (dim=0). A 1D param (e.g. the per-expert bias of the experts="te"
+    GroupedLinear path, shape [out_features]) has no dim 1, so shard it on dim 0
+    instead. FSDP all-gathers before use, so the shard dim is a storage detail and does
+    not change compute.
+    """
+    return Shard(0) if param.ndim < 2 else Shard(1)
+
+
 def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
     config = getattr(model, "config", None)
     if getattr(config, "model_type", None) == "deepseek_v4":
@@ -282,14 +294,8 @@ def apply_fsdp(
     for block in _iter_moe_blocks(model, _model):
         moe_module = _get_moe_module(block)
         if isinstance(moe_module, MoE) and ep_shard_enabled:
-            # Apply FSDP on dim=1 for grouped experts since we may have more
-            # shards than experts (dim=0). 1D params (e.g. the per-expert bias of
-            # the experts="te" GroupedLinear path, shape [out_features]) have no
-            # dim 1 -> shard them on dim 0 instead. FSDP all-gathers before use, so
-            # the shard dim is a storage detail and does not change compute.
-            def _moe_shard_placement(param):
-                return Shard(0) if param.ndim < 2 else Shard(1)
-
+            # ndim-aware: >=2D expert weights shard on dim 1, 1D bias on dim 0
+            # (see _moe_shard_placement).
             fully_shard(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
