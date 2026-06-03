@@ -305,6 +305,9 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
             - ``checkpointer``: a Checkpointer instance for distributed saves.
             - ``peft_config``: PEFT configuration (forwarded to checkpointer).
             - ``tokenizer``: tokenizer instance (forwarded to checkpointer).
+            - ``is_final_checkpoint``: Whether this is the final scheduled
+              training checkpoint. Defaults to ``False`` for direct callers
+              that do not have recipe step-scheduler context.
     """
     checkpointer = kwargs.get("checkpointer", None)
     if checkpointer is not None:
@@ -313,6 +316,7 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
             weights_path=save_directory,
             peft_config=kwargs.get("peft_config", None),
             tokenizer=kwargs.get("tokenizer", None),
+            is_final_checkpoint=kwargs.get("is_final_checkpoint", False),
         )
         return
 
