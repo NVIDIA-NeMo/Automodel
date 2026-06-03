@@ -71,11 +71,11 @@ def _resolve_mxfp8_grouped_mm():
         if _has_wgrad_hp:
 
             def _impl(A, B, offs, _fn=_to_mxfp8_then_scaled_grouped_mm):
-                return _fn(A, B, offs=offs, wgrad_with_hp=True)
+                return _fn(A, B, offs=offs, wgrad_with_hp=True)  # pragma: no cover
         else:
 
             def _impl(A, B, offs, _fn=_to_mxfp8_then_scaled_grouped_mm):
-                return _fn(A, B, offs=offs)
+                return _fn(A, B, offs=offs)  # pragma: no cover
 
         _MXFP8_GROUPED_MM = _impl
         return _MXFP8_GROUPED_MM
@@ -91,7 +91,7 @@ def _resolve_mxfp8_grouped_mm():
             from torchao.prototype.moe_training.scaled_grouped_mm import _quantize_then_scaled_grouped_mm
 
             def _impl(A, B, offs, _fn=_quantize_then_scaled_grouped_mm, _st=MoEScalingType.MXFP8):
-                return _fn(A, B, offs=offs, scaling_type=_st)
+                return _fn(A, B, offs=offs, scaling_type=_st)  # pragma: no cover
 
             _MXFP8_GROUPED_MM = _impl
             return _MXFP8_GROUPED_MM
@@ -102,7 +102,7 @@ def _resolve_mxfp8_grouped_mm():
         from torchao.prototype.moe_training import _scaled_grouped_mm
 
         def _impl(A, B, offs, _fn=_scaled_grouped_mm, _st=MoEScalingType.MXFP8):
-            return _fn(A, B, offs=offs, scaling_type=_st)
+            return _fn(A, B, offs=offs, scaling_type=_st)  # pragma: no cover
 
         _MXFP8_GROUPED_MM = _impl
         return _MXFP8_GROUPED_MM
@@ -178,6 +178,7 @@ def select_grouped_mm(use_mxfp8):
         return _default_grouped_mm
 
     def grouped_mm(A, B, offs, _fn=mxfp8_grouped_mm):
-        return _fn(A.contiguous(), _mxfp8_weight_relayout(B), offs)
+        # Executes the torchao MXFP8 kernel — SM100-only, not reachable on CPU CI.
+        return _fn(A.contiguous(), _mxfp8_weight_relayout(B), offs)  # pragma: no cover
 
     return grouped_mm
