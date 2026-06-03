@@ -35,7 +35,7 @@ on:
 
 jobs:
   code-freeze:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@v0.86.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@v1.4.1
     with:
       library-name: NeMo-Automodel
       python-package: nemo_automodel
