@@ -12,7 +12,7 @@ step_scheduler:
   global_batch_size: 512
   local_batch_size: 8
   ckpt_every_steps: 100
-  val_every_steps: 100
+  val_every_steps: 25
   log_remote_every_steps: 1
   gc_every_steps: 10
   max_steps: 100
