@@ -76,3 +76,55 @@ def test_mxfp8_dequant_e8m0():
     deq = dequantize_mxfp8(w_fp8, scale_inv, dtype=torch.float32)
     assert torch.allclose(deq[0], w_fp8[0].float() * 1.0)
     assert torch.allclose(deq[1], w_fp8[1].float() * 2.0)
+
+
+def test_to_hf_quantization_emits_scale_inv_for_quantized_keys(model):
+    """to_hf(quantization=True) must re-emit the MXFP8 key-set (e4m3 weight +
+    e8m0 scale_inv) so the load planner requests the checkpoint's scales -- but
+    only for quantized projections, never for norms/embed/lm_head/router gate."""
+    adapter = model.state_dict_adapter
+    hf = adapter.to_hf(model.state_dict(), quantization=True)
+
+    # Quantized projections: a companion _scale_inv exists; weight is e4m3, scale uint8.
+    proj_keys = [
+        k
+        for k in hf
+        if k.endswith(".weight") and (".self_attn.q_proj" in k or ".mlp.gate_proj" in k or ".experts." in k)
+    ]
+    assert proj_keys, "expected some quantized projection keys"
+    for k in proj_keys:
+        assert k + "_scale_inv" in hf, f"missing scale_inv for {k}"
+        assert hf[k].dtype == torch.float8_e4m3fn
+        si = hf[k + "_scale_inv"]
+        assert si.dtype == torch.uint8
+        # e8m0 block scale: [out, ceil(in/32)]
+        assert si.shape == (hf[k].shape[-2], (hf[k].shape[-1] + 31) // 32)
+
+    # Non-quantized keys must NOT get a scale_inv.
+    for k in hf:
+        if k.endswith(".weight") and (
+            "norm" in k or k.endswith("embed_tokens.weight") or "lm_head" in k or ".block_sparse_moe.gate.weight" in k
+        ):
+            assert k + "_scale_inv" not in hf, f"unexpected scale_inv for non-quantized {k}"
+
+    # No scale_inv leaks when quantization is off.
+    hf_plain = adapter.to_hf(model.state_dict(), quantization=False)
+    assert not any(k.endswith("_scale_inv") for k in hf_plain)
+
+
+def test_from_hf_dequantizes_loaded_scale_inv(model):
+    """from_hf must dequantize the e4m3 weight + scale_inv pairs the load produces,
+    yielding a finite native weight (not the raw ~e4m3-magnitude values)."""
+    adapter = model.state_dict_adapter
+    native = model.state_dict()
+    hf_q = adapter.to_hf(native, quantization=True)  # e4m3 + scale_inv (as the load delivers)
+    back = adapter.from_hf({k: v.clone() if hasattr(v, "clone") else v for k, v in hf_q.items()})
+
+    qkey = next(k for k in native if k.endswith(".self_attn.q_proj.weight"))
+    assert qkey in back
+    w = back[qkey]
+    assert w.dtype == adapter.dtype  # dequantized to model dtype, not float8
+    assert torch.isfinite(w.float()).all()
+    # placeholder scale_inv is 127 (scale 1.0), so dequant ~= the e4m3-rounded weight,
+    # i.e. bounded -- emphatically NOT left as raw ~±448 e4m3 magnitudes.
+    assert w.float().abs().max().item() < 50.0

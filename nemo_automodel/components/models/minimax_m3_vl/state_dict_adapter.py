@@ -40,9 +40,79 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAda
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
+from nemo_automodel.components.moe.state_dict_utils import is_dtensor
 
 # MXFP8 block layout from config.json: weight_block_size = [1, 32] (1 row, 32 cols).
 MXFP8_BLOCK_SIZE = 32
+# e8m0 exponent for scale 2**0 == 1.0 (bias 127); load-time placeholder value.
+_MXFP8_SCALE_INV_IDENTITY = 127
+
+# HF-format weight keys stored as MXFP8 in the released checkpoint: attention +
+# dense-MLP + (shared) expert projections. NOT quantized (no *_scale_inv): the
+# router gate, DSA indexer, norms, embed_tokens, lm_head, vision/projector.
+_MXFP8_QUANT_KEY_RE = re.compile(
+    r"\.layers\.\d+\.(?:"
+    r"self_attn\.[qkvo]_proj"
+    r"|mlp\.(?:gate|up|down)_proj"
+    r"|block_sparse_moe\.experts\.\d+\.w[123]"
+    r"|block_sparse_moe\.shared_experts\.(?:gate|up|down)_proj"
+    r")\.weight$"
+)
+
+
+def _should_quantize_mxfp8_key(key: str) -> bool:
+    """True for HF-format weight keys stored as MXFP8 in the checkpoint."""
+    return bool(_MXFP8_QUANT_KEY_RE.search(key))
+
+
+def create_mxfp8_scale_inv(weight: torch.Tensor, block_size: int = MXFP8_BLOCK_SIZE) -> torch.Tensor:
+    """Load-time placeholder scale_inv (e8m0/uint8, GLOBAL shape ``[out, ceil(in/block)]``).
+
+    Emitted by ``to_hf(quantization=True)`` so the DCP planner requests the
+    checkpoint's ``*_scale_inv`` tensors; the values here are overwritten by the
+    load. Kept a regular (non-DTensor) tensor with global shape -- the per-shard
+    slice happens in ``dequantize_mxfp8`` (mirrors deepseek_v3).
+    """
+    out_dim, in_dim = weight.shape[-2], weight.shape[-1]
+    n_blocks = (in_dim + block_size - 1) // block_size
+    dev = weight.to_local().device if is_dtensor(weight) else weight.device
+    return torch.full((out_dim, n_blocks), _MXFP8_SCALE_INV_IDENTITY, dtype=torch.uint8, device=dev)
+
+
+def _slice_mxfp8_scale_for_dtensor(
+    scale_inv: torch.Tensor, weight_dtensor: torch.Tensor, weight_local: torch.Tensor, block_size: int
+) -> torch.Tensor:
+    """Slice a global scale_inv to a DTensor weight's local shard.
+
+    MXFP8 block is ``[1, block_size]``: dim 0 (out) is full-resolution (block 1, so a
+    row range maps 1:1) and dim 1 (in) is grouped by ``block_size``. Custom MoE is
+    always tp=1, so sharding is on dim 0 (FSDP / ep_shard); dim 1 handled for safety.
+    """
+    from torch.distributed.tensor import Shard
+
+    block_per_dim = (1, block_size)
+    slices = [slice(None), slice(None)]
+    for mesh_dim, placement in enumerate(weight_dtensor.placements):
+        if isinstance(placement, Shard) and placement.dim < 2:
+            sdim = placement.dim
+            bs = block_per_dim[sdim]
+            mesh_size = weight_dtensor.device_mesh.size(mesh_dim)
+            coord = weight_dtensor.device_mesh.get_local_rank(mesh_dim=mesh_dim)
+            local_size = weight_local.shape[sdim]
+            global_blocks = scale_inv.shape[sdim]
+            chunk = ((global_blocks * bs) + mesh_size - 1) // mesh_size
+            g_start = coord * chunk
+            g_end = g_start + local_size
+            slices[sdim] = slice(g_start // bs, min((g_end + bs - 1) // bs, global_blocks))
+    return scale_inv[slices[0], slices[1]].contiguous()
+
+
+def _dequantize_mxfp8_local(w_local: torch.Tensor, scale_local: torch.Tensor, block_size: int, dtype) -> torch.Tensor:
+    w = w_local.to(torch.float32)
+    scale = torch.exp2(scale_local.to(torch.float32) - 127.0).repeat_interleave(block_size, dim=1)
+    if scale.shape[1] != w.shape[1]:
+        scale = scale[:, : w.shape[1]]
+    return (w * scale).to(dtype)
 
 
 def dequantize_mxfp8(
@@ -52,19 +122,26 @@ def dequantize_mxfp8(
     block_size: int = MXFP8_BLOCK_SIZE,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Dequantize an MXFP8 weight to ``dtype``.
+    """Dequantize an MXFP8 weight (FP8 e4m3 + e8m0/uint8 block scales) to ``dtype``.
 
-    ``weight`` is FP8 ``e4m3`` of shape ``[out, in]``; ``scale_inv`` holds e8m0
-    (uint8) exponents of shape ``[out, in / block_size]`` where the dequant
-    scale for block ``b`` is ``2 ** (scale_inv[:, b] - 127)`` (the MX e8m0
-    convention; confirmed against the sglang reference).
+    ``weight`` is FP8 ``e4m3`` ``[out, in]``; ``scale_inv`` holds e8m0 (uint8)
+    exponents ``[out, ceil(in/block_size)]`` with dequant scale for input-block
+    ``b`` = ``2 ** (scale_inv[:, b] - 127)`` (MX e8m0; confirmed vs sglang). Handles
+    DTensor weights: the local shard is dequantized against the matching slice of a
+    global ``scale_inv`` and rewrapped with the weight's placements.
     """
-    w = weight.to(torch.float32)
-    scale = torch.exp2(scale_inv.to(torch.float32) - 127.0)
-    scale = scale.repeat_interleave(block_size, dim=1)
-    if scale.shape[1] != w.shape[1]:
-        scale = scale[:, : w.shape[1]]
-    return (w * scale).to(dtype)
+    weight_is_dtensor = is_dtensor(weight)
+    scale_is_dtensor = is_dtensor(scale_inv)
+    w_local = weight.to_local() if weight_is_dtensor else weight
+    s_local = scale_inv.to_local() if scale_is_dtensor else scale_inv
+    if weight_is_dtensor and not scale_is_dtensor and s_local.shape[0] != w_local.shape[0]:
+        s_local = _slice_mxfp8_scale_for_dtensor(scale_inv, weight, w_local, block_size)
+    out_local = _dequantize_mxfp8_local(w_local, s_local.to(w_local.device), block_size, dtype)
+    if weight_is_dtensor:
+        from torch.distributed.tensor import DTensor
+
+        return DTensor.from_local(out_local, weight.device_mesh, weight.placements)
+    return out_local
 
 
 class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
@@ -187,7 +264,7 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         hf_state_dict = {}
         for fqn, tensor in state_dict.items():
             for key, value in self.convert_single_tensor_to_hf(
-                fqn, tensor, exclude_key_regex=exclude_key_regex, **kwargs
+                fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
             ):
                 hf_state_dict[key] = value
         return hf_state_dict
@@ -197,6 +274,7 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
             return self._mtp_tensor_to_hf(fqn, tensor, **kwargs)
 
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
+        quantization = kwargs.get("quantization", False)
 
         expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         if expert_result is not None:
@@ -206,6 +284,21 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
 
         if exclude_key_regex:
             result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
+
+        if quantization:
+            # Re-emit the MXFP8 key-set (e4m3 weight + e8m0 scale_inv placeholder) so
+            # the DCP load planner requests the checkpoint's scales; from_hf then
+            # dequantizes. Placeholder values are overwritten by the load.
+            quantized: list[tuple[str, Any]] = []
+            for key, value in result:
+                if _should_quantize_mxfp8_key(key):
+                    value = value.to(dtype=torch.float8_e4m3fn)
+                    quantized.append((key, value))
+                    quantized.append((key + "_scale_inv", create_mxfp8_scale_inv(value)))
+                else:
+                    quantized.append((key, value))
+            return quantized
+
         return result
 
     def _mtp_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
