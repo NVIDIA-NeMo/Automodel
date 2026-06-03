@@ -43,7 +43,7 @@ def test_contrastive_scores_and_labels_shapes_and_labels():
     assert torch.all(labels == 0) and labels.shape == (2,)
 
 
-@pytest.mark.parametrize("pool_type", ["avg", "weighted_avg", "cls", "colbert"])
+@pytest.mark.parametrize("pool_type", ["avg", "weighted_avg", "cls", "colbert", "multi_vector"])
 def test_pool_basic_modes(pool_type):
     last_hidden = torch.tensor(
         [
@@ -61,7 +61,7 @@ def test_pool_basic_modes(pool_type):
         assert torch.allclose(out[0], torch.tensor([1.0 + 3.0, 2.0 + 4.0]))
     elif pool_type == "cls":
         assert torch.allclose(out[:, :], last_hidden[:, 0])
-    elif pool_type == "colbert":
+    elif pool_type in {"colbert", "multi_vector"}:
         assert out.shape == last_hidden.shape
 
 

@@ -1,4 +1,4 @@
-# Pretraining Megatron Core Datasets
+# Pretrain Megatron Core Datasets
 
 ## Introduction
 
@@ -14,7 +14,7 @@ In this guide, we pretrain OpenAI’s `GPT2-124M` model on a FineWeb-Edu subset 
 
 ### About the FineWeb-Edu Dataset
 
-[FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) is a dataset consisting of 1.3T tokens of educational web pages filtered from the larger [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset. The educational web pages were filtered from the main dataset using a fine-tuned [Bert](https://huggingface.co/docs/transformers/en/model_doc/bert)-like classifier. Further reading on the filtering process can be found [here](https://huggingface.co/spaces/HuggingFaceFW/blogpost-fineweb-v1).
+[FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) is a dataset consisting of 1.3T tokens of educational web pages filtered from the larger [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset. The educational web pages were filtered from the main dataset using a fine-tuned [BERT](https://huggingface.co/docs/transformers/en/model_doc/bert)-like classifier. Further reading on the filtering process can be found [here](https://huggingface.co/spaces/HuggingFaceFW/blogpost-fineweb-v1).
 
 Here’s a glimpse of what the data looks like:
 ```json
@@ -38,7 +38,7 @@ Here’s a glimpse of what the data looks like:
 
 #### Download the FineWeb-Edu Dataset
 
-For this guide, we use the FineWeb-Edu 10BT sample—a collection of approximately 10 billion tokens randomly drawn from the full FineWeb-Edu dataset. To prepare the data, run the following commands:
+For this guide, we use the FineWeb-Edu 10BT sample — a collection of approximately 10 billion tokens randomly drawn from the full FineWeb-Edu dataset. To prepare the data, run the following commands:
 
 ```bash
 # run this inside the AutoModel directory
@@ -55,7 +55,8 @@ Replace `<MEMORY>` with the amount of system memory allocated to `terashuf` (the
 python setup/download_prepare_hf_data.py fineweb_edu_10bt 16 --data_dir ./fineweb_edu --seed 42 --nchunks 1
 ```
 
-The expected directory structure is like this:
+The expected directory structure is as follows:
+
 ```bash
 $ tree fineweb_edu/
 fineweb_edu/
@@ -172,7 +173,7 @@ The `TrainFinetuneRecipeForNextTokenPrediction` class is one such recipe. It inh
 
 - `run_train_validation_loop()`: executes training + validation steps
 
-- Misc: Checkpoint handling, logging, and RNG setup.
+- Additional responsibilities: Checkpoint handling, logging, and RNG setup.
 
 ### Recipe Config Example
 
@@ -260,7 +261,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: false # Sharded save; run <checkpoint>/model/consolidate.sh after training to export HF weights.
 
 # For distributed processing, we use FSDP2.
 distributed:
@@ -737,7 +738,7 @@ cfg-path: examples/llm_pretrain/megatron_pretrain_gpt2.yaml
 2025-09-01 07:13:44 | INFO | root | step 4 | epoch 0 | loss 9.6514 | grad_norm 2.2812 | lr 6.31e-05 | mem 38.63 GiB | tps 144882.21(72441.11/gpu) | num_label_tokens 524288
 2025-09-01 07:13:48 | INFO | root | step 5 | epoch 0 | loss 9.5964 | grad_norm 2.2188 | lr 6.39e-05 | mem 38.63 GiB | tps 144711.55(72355.78/gpu) | num_label_tokens 524288
 ```
-For each training batch, the fine-tuning recipe logs the current loss, along with current peak memory usage and tokens per second (TPS).
+For each training batch, the pretraining recipe logs the current loss, along with current peak memory usage and tokens per second (TPS).
 
 As training progresses, you should observe the model loss beginning to converge. To verify your results, you can compare your convergence curves against the baseline benchmarks provided in the [llm.c repository](https://github.com/karpathy/llm.c/discussions/481).
 

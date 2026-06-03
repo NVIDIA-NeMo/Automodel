@@ -384,8 +384,15 @@ class TrainEagle1Recipe(BaseRecipe):
         if is_dist_initialized:
             dist.barrier()
 
+        step_scheduler = getattr(self, "step_scheduler", None)
+        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
         draft_model = self._module().draft_model
-        self.checkpointer.save_model(draft_model, path, tokenizer=self.tokenizer)
+        self.checkpointer.save_model(
+            draft_model,
+            path,
+            tokenizer=self.tokenizer,
+            is_final_checkpoint=is_final_checkpoint,
+        )
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
         self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
@@ -620,6 +627,17 @@ class TrainEagle1Recipe(BaseRecipe):
             # ``pending_micro_batches / grad_accumulation_steps`` of a normal
             # step; rescale by the inverse so the trailing step's gradient is on
             # the same scale as every other step.
+            #
+            # Assumption: every data-parallel rank reaches this flush with the
+            # same ``pending_micro_batches``. That holds here because the loader
+            # uses ``DistributedSampler`` with ``drop_last=False`` (and the
+            # DataLoader likewise), which pads every rank to an equal sample
+            # count -> equal batches per epoch -> equal trailing windows. If a
+            # non-padding / variable-length sampler is ever introduced, revisit
+            # this: a divergent per-rank ``scale`` would desync parameters, and
+            # a rank that lands on ``pending_micro_batches == 0`` would skip the
+            # flush (and the ``clip_grad_norm_`` collective inside it) while its
+            # peers step, hanging on the mismatched collective.
             if pending_micro_batches > 0:
                 scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                 for p in self.trainer_module.parameters():

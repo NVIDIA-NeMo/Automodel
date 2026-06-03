@@ -263,7 +263,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: false # Sharded save; run <checkpoint>/model/consolidate.sh after training to export HF weights.
 
 # For distributed processing, we use FSDP2.
 distributed:

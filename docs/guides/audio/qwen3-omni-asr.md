@@ -126,7 +126,7 @@ public AMI IHM corpus. Defaults:
 | `freeze_config`    | `freeze_vision_tower=true`, `freeze_audio_tower=false`, `freeze_language_model=false`  |
 | `step_scheduler`   | `global_batch_size=64`, `local_batch_size=8`, `ckpt_every_steps=200`, `num_epochs=1`   |
 | `optimizer`        | `AdamW(lr=2.0e-5, betas=[0.9, 0.95], weight_decay=0.0)`                                |
-| `checkpoint`       | `result/checkpoints/...`, `model_save_format=safetensors`, `save_consolidated=true`    |
+| `checkpoint`       | `result/checkpoints/...`, `model_save_format=safetensors`, `save_consolidated=final`   |
 | `dataset`          | `make_hf_audio_asr_dataset(path_or_dataset="edinburghcstr/ami", name="ihm")`           |
 
 `peft:` is intentionally omitted — both the language model and the audio
