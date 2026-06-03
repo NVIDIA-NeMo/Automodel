@@ -365,8 +365,9 @@ def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog
     assert config.model_save_format == SerializationFormat.SAFETENSORS
     # checkpoint_dir is preserved from the user config
     assert config.checkpoint_dir == "/user/ckpt/"
-    # save_consolidated is forced back to the safetensors default
-    assert config.save_consolidated is True
+    # other user-provided torch_save options are discarded; save_consolidated falls back to the default "final"
+    assert config.save_consolidated.value == "final"
+    assert config.is_async is False
 
 
 def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatch):

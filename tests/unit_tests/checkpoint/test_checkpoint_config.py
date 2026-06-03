@@ -91,7 +91,8 @@ class TestCheckpointingConfig:
         assert cfg.enabled is True
         assert str(cfg.checkpoint_dir) == "checkpoints/"
         assert cfg.model_save_format.value == "safetensors"
-        assert cfg.save_consolidated is True
+        # save_consolidated defaults to "final" and is normalized to SaveConsolidatedMode.FINAL.
+        assert cfg.save_consolidated.value == "final"
         assert cfg.is_peft is False
         assert cfg.model_repo_id is None
         # model_cache_dir falls back to the HF hub cache when None.
@@ -109,7 +110,8 @@ class TestCheckpointingConfig:
             is_peft=True,
         )
         assert cfg.model_save_format.value == "safetensors"
-        assert cfg.save_consolidated is True
+        # PEFT + torch_save resets save_consolidated to the FINAL default.
+        assert cfg.save_consolidated.value == "final"
         assert str(cfg.checkpoint_dir) == "/keep/this"
 
     def test_non_peft_torch_save_preserved(self):

@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import json
+import logging
 
 import pytest
 
@@ -620,3 +621,243 @@ def test_format_example_forwards_drop_history_reasoning_content(monkeypatch):
 
     agent_chat._format_example(example, Tok(), 0, 0, drop_history_reasoning_content=True)
     assert captured["drop_history_reasoning_content"] is True
+
+
+def test_format_example_malformed_tools_json_reports_example_id():
+    # A row whose `tools` is malformed JSON must fail with the example id, not an
+    # opaque JSONDecodeError surfacing deep in the lazy dataloader map.
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"id": 99, "tools": "{not valid json", "messages": [{"role": "user", "content": "hi"}]}
+    with pytest.raises(ValueError, match="id=99"):
+        agent_chat._format_example(example, Tok(), 0, 0)
+
+
+def test_format_example_malformed_tool_call_reports_example_id():
+    # A malformed tool_call payload must also surface the example id.
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {
+        "id": "abc",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool_call", "content": "{bad json"},
+        ],
+    }
+    with pytest.raises(ValueError, match="id='abc'"):
+        agent_chat._format_example(example, Tok(), 0, 0)
+
+
+def test_format_example_wraps_missing_fields_with_example_id():
+    # The existing field-validation errors keep their text but gain the id tag.
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    with pytest.raises(ValueError, match="missing both `messages` and `conversations`"):
+        agent_chat._format_example({"id": 7}, Tok(), 0, 0)
+    with pytest.raises(ValueError, match="id=7"):
+        agent_chat._format_example({"id": 7}, Tok(), 0, 0)
+
+
+class _LenTok:
+    """Tokenizer stub whose rendered length equals the total content words.
+
+    ``apply_chat_template`` returns one id per whitespace token across all
+    message contents, so a test controls the rendered length precisely.
+    """
+
+    def apply_chat_template(
+        self,
+        messages,
+        tools=None,
+        tokenize=True,
+        return_dict=True,
+        return_assistant_tokens_mask=False,
+        padding=False,
+        truncation=None,
+        max_length=None,
+    ):
+        n = sum(len(str(m.get("content", "")).split()) for m in messages)
+        return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+
+def test_truncate_messages_to_fit_unchanged_when_already_fits():
+    tok = _LenTok()
+    messages = [
+        {"role": "user", "content": "a b"},
+        {"role": "assistant", "content": "c"},
+    ]
+    assert agent_chat._truncate_messages_to_fit(tok, messages, None, seq_length=100) == messages
+
+
+def test_truncate_messages_to_fit_drops_oldest_exchanges():
+    tok = _LenTok()
+    messages = [
+        {"role": "system", "content": "s"},  # 1
+        {"role": "user", "content": "a a a"},  # 3  exchange 1
+        {"role": "assistant", "content": "b"},  # 1
+        {"role": "user", "content": "c c c"},  # 3  exchange 2
+        {"role": "assistant", "content": "d"},  # 1
+        {"role": "user", "content": "e"},  # 1  exchange 3 (final)
+        {"role": "assistant", "content": "f"},  # 1
+    ]
+    # full = 11; budget 6: system(1) + ex3(2) = 3 fits, + ex2(4) = 7 overflows.
+    out = agent_chat._truncate_messages_to_fit(tok, messages, None, seq_length=6)
+    assert [m["role"] for m in out] == ["system", "user", "assistant"]
+    assert out[1]["content"] == "e"
+
+
+def test_truncate_messages_to_fit_returns_final_exchange_when_nothing_fits():
+    tok = _LenTok()
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c c c c c"},
+        {"role": "assistant", "content": "d d d d d"},
+    ]
+    # final exchange alone = system(1) + 5 + 5 = 11 > budget 4; minimal suffix kept.
+    out = agent_chat._truncate_messages_to_fit(tok, messages, None, seq_length=4)
+    assert [m["role"] for m in out] == ["system", "user", "assistant"]
+    assert out[1]["content"] == "c c c c c"
+
+
+def test_truncate_messages_to_fit_no_user_boundary_unchanged():
+    tok = _LenTok()
+    messages = [
+        {"role": "system", "content": "s s s"},
+        {"role": "assistant", "content": "a a a"},
+    ]
+    assert agent_chat._truncate_messages_to_fit(tok, messages, None, seq_length=1) == messages
+
+
+def test_format_example_truncate_history_runs_before_render(monkeypatch):
+    # _format_example must truncate the converted messages before handing them
+    # to format_chat_template, so only the kept suffix is rendered/supervised.
+    tok = _LenTok()
+    captured = {}
+
+    def fake_format_chat_template(**kwargs):
+        captured.update(kwargs)
+        return {"input_ids": [1], "labels": [-100]}
+
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    example = {
+        "messages": [
+            {"role": "user", "content": "old old old"},
+            {"role": "assistant", "content": "x"},
+            {"role": "user", "content": "new"},
+            {"role": "assistant", "content": "y"},
+        ]
+    }
+    agent_chat._format_example(example, tok, 0, 0, seq_length=3, truncate_history=True)
+    assert [m["role"] for m in captured["formatted_text"]] == ["user", "assistant"]
+    assert captured["formatted_text"][0]["content"] == "new"
+
+
+def _patch_minimal_loader(monkeypatch):
+    """Patch load_dataset / pad-token / formatter so dataset build does no real work."""
+
+    class DummyDataset:
+        def __init__(self, items):
+            self.items = items
+
+        def __getitem__(self, idx):
+            return self.items[idx]
+
+        def __len__(self):
+            return len(self.items)
+
+    monkeypatch.setattr(
+        agent_chat, "load_dataset", lambda *a, **k: DummyDataset([{"id": 0, "messages": [], "tools": []}])
+    )
+    monkeypatch.setattr(agent_chat, "_add_pad_token", lambda tok: 0)
+    monkeypatch.setattr(agent_chat, "_format_example", lambda ex, *a, **kw: {"formatted": ex["id"]})
+
+
+def test_make_agent_chat_dataset_warns_when_seq_length_inert(monkeypatch, caplog):
+    # seq_length is forwarded to apply_chat_template(max_length=...), which the
+    # tokenizer ignores unless truncation is on or padding == "max_length". With
+    # the defaults the cap silently does nothing, so the builder must warn.
+    _patch_minimal_loader(monkeypatch)
+
+    class Tok:
+        eos_token_id = 0
+
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        agent_chat.make_agent_chat_dataset(tokenizer=Tok(), dataset_name="dummy/agent", seq_length=4096)
+    assert any("has no effect" in r.getMessage() for r in caplog.records)
+
+
+def test_make_agent_chat_dataset_no_warning_when_seq_length_used(monkeypatch, caplog):
+    # When truncation is enabled (or padding == "max_length") the cap is real, so
+    # there must be no spurious warning.
+    _patch_minimal_loader(monkeypatch)
+
+    class Tok:
+        eos_token_id = 0
+
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        agent_chat.make_agent_chat_dataset(
+            tokenizer=Tok(), dataset_name="dummy/agent", seq_length=4096, truncation=True
+        )
+    assert not any("has no effect" in r.getMessage() for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        agent_chat.make_agent_chat_dataset(
+            tokenizer=Tok(), dataset_name="dummy/agent", seq_length=4096, padding="max_length"
+        )
+    assert not any("has no effect" in r.getMessage() for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        agent_chat.make_agent_chat_dataset(tokenizer=Tok(), dataset_name="dummy/agent")
+    assert not any("has no effect" in r.getMessage() for r in caplog.records)
+
+
+def test_format_example_warns_and_keeps_when_all_labels_masked(monkeypatch, caplog):
+    # If truncation drops every assistant token the loss mask is all-ignore. A
+    # single such sample is harmless (it contributes nothing to the batch-normalized
+    # loss), so the renderer warns with the id and returns the sample as-is rather
+    # than hard-failing the run.
+    monkeypatch.setattr(
+        agent_chat,
+        "format_chat_template",
+        lambda **kw: {"input_ids": [1, 2, 3], "labels": [-100, -100, -100]},
+    )
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"id": 123, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}]}
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        result = agent_chat._format_example(example, Tok(), 0, 0)
+    # Sample is kept unchanged (not dropped, not raised on).
+    assert result["labels"] == [-100, -100, -100]
+    # Warning fired and names the offending example id.
+    warnings = [r.getMessage() for r in caplog.records if "no supervised tokens" in r.getMessage()]
+    assert warnings and "123" in warnings[0]
+
+
+def test_format_example_ok_when_some_label_supervised(monkeypatch):
+    # A sample with at least one supervised label passes through unchanged.
+    monkeypatch.setattr(
+        agent_chat,
+        "format_chat_template",
+        lambda **kw: {"input_ids": [1, 2, 3], "labels": [-100, 2, 3]},
+    )
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"id": 1, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}]}
+    assert agent_chat._format_example(example, Tok(), 0, 0)["labels"] == [-100, 2, 3]
