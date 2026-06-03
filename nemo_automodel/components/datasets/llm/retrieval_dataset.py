@@ -28,6 +28,8 @@ EXAMPLE_TEMPLATE = {"text": "", "image": "", "nr_ocr": ""}
 
 _OVERSAMPLING_WARNED_CORPORA: set[str] = set()
 
+_VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
+
 
 class AbstractDataset(ABC):
     """Interface for corpus datasets addressable by document id."""
@@ -650,6 +652,8 @@ class RetrievalTransform:
         model_type: str = "bi_encoder",
         cycle_positive_docs: bool = False,
     ):
+        if model_type not in _VALID_MODEL_TYPES:
+            raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
         self.num_neg_docs = num_neg_docs
         self.corpus_dict = corpus_dict
         self.use_dataset_instruction = use_dataset_instruction
@@ -738,7 +742,6 @@ def make_retrieval_dataset(
         which is more efficient for batch padding and supports dynamic processing.
     """
 
-    _VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
     if model_type not in _VALID_MODEL_TYPES:
         raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
 
@@ -789,6 +792,10 @@ def make_retrieval_dataset(
         )
         dataset.set_transform(transform)
         if cycle_positive_docs:
+            # NOTE: set_epoch is monkey-patched onto this Dataset instance. It is only
+            # reachable as long as the recipe uses this exact object. If the dataset is
+            # later wrapped/copied (e.g. IterableDataset.from_generator), re-expose
+            # set_epoch on the wrapper or move the epoch into a dataset wrapper class.
             dataset.set_epoch = transform.set_epoch
 
     elif data_type == "eval":
