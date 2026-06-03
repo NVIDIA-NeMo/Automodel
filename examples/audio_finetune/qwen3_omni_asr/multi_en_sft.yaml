@@ -12,8 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Full-FT English ASR of Qwen/Qwen2.5-Omni-3B on a six-corpus English mix
-# (AMI + earnings22 + voxpopuli_en + gigaspeech + spgispeech + librispeech).
+# Full-FT English ASR of Qwen/Qwen3-Omni-30B-A3B-Instruct on a six-corpus
+# English mix (AMI + earnings22 + voxpopuli_en + gigaspeech + spgispeech +
+# librispeech) via make_multi_en_asr_dataset.
+#
+# This is the multi-corpus companion to ami_sft.yaml: it keeps the Qwen3-Omni
+# MoE model / distributed / freeze / optimizer setup and swaps only the
+# `dataset:` block for the multi_en builder (and the grad-sync knob that the
+# resulting gradient accumulation requires).
 #
 # NOTE: gigaspeech and spgispeech are gated on the Hugging Face Hub. Accept
 # their dataset terms (and allow trust_remote_code for gigaspeech) before
@@ -23,10 +29,10 @@ recipe: FinetuneRecipeForVLM
 
 step_scheduler:
   global_batch_size: 64
-  local_batch_size: 4         # long clips inflate audio activations; 4 keeps headroom on 80GB
-  ckpt_every_steps: 4000
+  local_batch_size: 4         # long clips inflate audio activations; 4 keeps headroom on 80GB for the 30B MoE
+  ckpt_every_steps: 5000
   num_epochs: 3
-  max_steps: 30000            # safety cap (~3 epochs of the ~500k-sample mix at GBS 64)
+  max_steps: 30000             # safety cap (~1 epoch of the ~500k-sample mix at GBS 64)
 
 dist_env:
   backend: nccl
@@ -42,18 +48,21 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForMultimodalLM.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen2.5-Omni-3B
+  pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
+    experts: te
+    enable_deepep: true
+    fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
 checkpoint:
   enabled: true
-  checkpoint_dir: result/checkpoints/qwen2_5_omni_asr_multi_en
+  checkpoint_dir: result/checkpoints/qwen3_omni_asr_multi_en
   model_save_format: safetensors
   save_consolidated: true
 
@@ -62,6 +71,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
+  ep_size: 8
   sequence_parallel: false
   # GBS 64 / (LBS 4 x 8 GPUs) = 2 grad-accum microbatches. The bundled torch 2.11
   # FSDP2 build crashes in the deferred-grad-sync path on non-final microbatches
@@ -69,8 +79,8 @@ distributed:
   # gradients every microbatch instead of deferring.
   defer_fsdp_grad_sync: false
 
-# Full fine-tune: audio tower + language model trainable; vision tower frozen
-# (we never feed images on these English ASR corpora).
+# Full fine-tune: audio tower + language model trainable; only the vision tower
+# stays frozen (we never feed images on these English ASR corpora). No PEFT.
 freeze_config:
   freeze_embeddings: false
   freeze_vision_tower: true
@@ -106,7 +116,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 2
   collate_fn:
-    _target_: nemo_automodel.components.datasets.audio.collate_fns.qwen2_5_omni_asr_collate_fn
+    _target_: nemo_automodel.components.datasets.audio.collate_fns.qwen3_omni_asr_collate_fn
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -116,8 +126,8 @@ optimizer:
   weight_decay: 0.0
 
 wandb:
-  project: ${oc.env:WANDB_PROJECT,qwen2_5-omni-asr-multi-en}
-  name: ${oc.env:WANDB_NAME,qwen2_5_omni_3b_asr_multi_en_fullft}
+  project: ${oc.env:WANDB_PROJECT,qwen3-omni-asr-multi-en}
+  name: ${oc.env:WANDB_NAME,qwen3_omni_asr_multi_en_fullft}
   dir: ${oc.env:WANDB_DIR,result/wandb}
 
 ci:
