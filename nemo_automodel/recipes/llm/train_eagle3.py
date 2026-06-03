@@ -39,7 +39,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import (
     build_eagle3_dataloader,
-    build_eagle3_token_mapping,
+    load_or_build_eagle3_token_mapping,
 )
 from nemo_automodel.components.datasets.llm.eagle3_cache import (
     build_cached_eagle3_dataloader,
@@ -281,6 +281,11 @@ class TrainEagle3Recipe(BaseRecipe):
         # re-trigger ``BaseRecipe.__setattr__`` state-tracking and raise.
         if self.dist_setup is None:
             self.target_model.to(self.device)
+        # The target is frozen: it only supplies aux hidden states / logits as
+        # supervision and is never optimized (the optimizer is built solely from
+        # the draft trainer module). Mark the parameters explicitly so no future
+        # code path accidentally trains the target -- matching EAGLE-1/2.
+        self.target_model.requires_grad_(False)
         self.target_wrapper = HFEagle3TargetModel(
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
@@ -317,11 +322,17 @@ class TrainEagle3Recipe(BaseRecipe):
             getattr(self.tokenizer, "pad_token_id", None),
             getattr(self.tokenizer, "unk_token_id", None),
         ]
-        return build_eagle3_token_mapping(
+        # ``selected_token_ids_path`` (optional) caches the draft-vocab selection
+        # so reruns skip the full-dataset frequency scan. When unset, the mapping
+        # is rebuilt every setup (original behavior). On resume this still runs,
+        # but ``_load_extra_state`` then overrides it with the checkpoint's saved
+        # mapping -- so the cache only matters for cold starts.
+        return load_or_build_eagle3_token_mapping(
             self.train_dataloader,
             target_vocab_size=target_config.vocab_size,
             draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
             special_token_ids=special_token_ids,
+            cache_path=recipe_cfg.get("selected_token_ids_path", None),
         )
 
     def _setup_cached_target(self, recipe_cfg, target_config):
@@ -505,8 +516,15 @@ class TrainEagle3Recipe(BaseRecipe):
         if is_dist_initialized:
             dist.barrier()
 
+        step_scheduler = getattr(self, "step_scheduler", None)
+        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
         draft_model = self._module().draft_model
-        self.checkpointer.save_model(draft_model, path, tokenizer=self.tokenizer)
+        self.checkpointer.save_model(
+            draft_model,
+            path,
+            tokenizer=self.tokenizer,
+            is_final_checkpoint=is_final_checkpoint,
+        )
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
         self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
