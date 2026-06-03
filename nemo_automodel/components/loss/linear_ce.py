@@ -117,6 +117,8 @@ if HAVE_CUT_CROSS_ENTROPY:
 
 
 class FusedLinearCrossEntropy(nn.Module):
+    """Fused linear-projection and cross-entropy loss module."""
+
     def __init__(self, ignore_index: int = -100, logit_softcapping: float = 0, reduction: str = "sum"):
         """
         Fused linear cross entropy loss.

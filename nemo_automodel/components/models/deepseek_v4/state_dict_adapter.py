@@ -44,7 +44,9 @@ Both suffixes are handled by the dequantization step.
 from __future__ import annotations
 
 import enum
+import os
 import re
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -62,10 +64,10 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_utils import (
     create_dtensor_from_local,
     get_expert_range_for_rank_from_mesh,
-    get_expert_slice_for_rank,
     get_submesh,
     is_dtensor,
     should_load_expert_for_rank,
+    split_experts_weights_dtensor_aware,
 )
 
 # V4 Flash routed-expert weights are stored as FP4 (e2m1fn) packed two values per
@@ -106,7 +108,7 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     #      attributes onto the Indexer itself (``indexer.{ape,kv_norm,wgate,wkv}``).
     #
     # Both renames must run before the generic ``attn.(.+)`` catch-all.
-    (re.compile(r"^layers\.(\d+)\.attn\.attn_sink$"), r"model.layers.\1.self_attn.sinks"),
+    (re.compile(r"^layers\.(\d+)\.attn\.attn_sink$"), r"model.layers.\1.self_attn.sinks_param.weight"),
     # Indexer in HF is nested under Compressor (Compressor.indexer); on disk
     # Indexer is a sibling of Compressor with its OWN nested compressor:
     #   on-disk  layers.X.attn.indexer.compressor.{ape,norm,wgate,wkv}
@@ -121,7 +123,7 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     ),
     (
         re.compile(r"^layers\.(\d+)\.attn\.indexer\.compressor\.ape$"),
-        r"model.layers.\1.self_attn.compressor.indexer.ape",
+        r"model.layers.\1.self_attn.compressor.indexer.ape_param.weight",
     ),
     (
         re.compile(r"^layers\.(\d+)\.attn\.indexer\.compressor\.wgate\.(.+)$"),
@@ -140,6 +142,10 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     (
         re.compile(r"^layers\.(\d+)\.attn\.compressor\.norm\.(.+)$"),
         r"model.layers.\1.self_attn.compressor.kv_norm.\2",
+    ),
+    (
+        re.compile(r"^layers\.(\d+)\.attn\.compressor\.ape$"),
+        r"model.layers.\1.self_attn.compressor.ape_param.weight",
     ),
     (re.compile(r"^layers\.(\d+)\.attn\.(.+)$"), r"model.layers.\1.self_attn.\2"),
     # MoE gate (score weight + optional bias correction + hash table)
@@ -173,6 +179,9 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     #   layers.{i}.hc_ffn_{fn,base,scale}   ->  model.layers.{i}.ffn_hc.{fn,base,scale}
     (re.compile(r"^layers\.(\d+)\.hc_attn_(base|fn|scale)$"), r"model.layers.\1.attn_hc.\2"),
     (re.compile(r"^layers\.(\d+)\.hc_ffn_(base|fn|scale)$"), r"model.layers.\1.ffn_hc.\2"),
+    # MTP-local HC head.  Native MTP keys are normalized to temporary
+    # ``layers.{k}.*`` keys before the rename table is applied.
+    (re.compile(r"^layers\.(\d+)\.hc_head_(fn|base|scale)$"), r"model.layers.\1.hc_head.hc_\2"),
     # Final HC-head collapse module:
     #   hc_head_{fn,base,scale}  ->  model.hc_head.hc_{fn,base,scale}
     # (HF uses ``hc_fn`` / ``hc_base`` / ``hc_scale`` inside HyperHead, in
@@ -189,6 +198,13 @@ class _HashBiasScope(enum.Enum):
 
     INTERNAL = re.compile(r"^model\.layers\.(\d+)\.mlp\.gate\.e_score_correction_bias$")
     HF = re.compile(r"^layers\.(\d+)\.ffn\.gate\.bias$")
+
+
+class _ExpertQuantLayout(enum.Enum):
+    """On-disk routed-expert quantization layout for DeepSeek V4 checkpoints."""
+
+    FP4 = "fp4"
+    FP8 = "fp8"
 
 
 def _rename_hf_key(key: str) -> str:
@@ -214,6 +230,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         self.moe_config = moe_config
         self.backend = backend
         self.dtype = dtype
+        self._checkpoint_expert_quant_layout_cache: _ExpertQuantLayout | None = None
 
     # ------------------------------------------------------------------
     # from_hf
@@ -228,13 +245,81 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         """Convert HF checkpoint to internal format.
 
         Steps:
-          1. Dequantize FP8 weights (scale suffix is either `.scale` or `_scale_inv`).
-          2. Aggregate per-expert routed weights into stacked tensors.
-          3. Rename remaining keys using the HF -> internal mapping table.
+          1. Split native ``mtp.{k}.*`` keys (and legacy
+             ``layers.{num_hidden_layers+k}.*`` keys) from backbone keys and
+             renumber them as temporary ``layers.{k}.*`` keys so the standard
+             pipeline (dequantize / aggregate-experts / rename) handles them too.
+          2. Dequantize FP8 / FP4 weights for both backbone and MTP.
+          3. Aggregate per-expert routed weights into stacked tensors.
+          4. Rename keys using the HF -> internal mapping table.
+          5. Re-prefix MTP keys: ``model.layers.{k}.*`` -> ``mtp.layers.{k}.*``.
         """
+        N = self.config.num_hidden_layers
+        num_mtp = int(getattr(self.config, "num_nextn_predict_layers", 0) or 0)
+        # HF V4 emits both prefixed (``model.layers.{N+k}.*`` for self_attn /
+        # mlp / norms) and unprefixed (``layers.{N+k}.*`` for V4 fusion-only
+        # modules eh_proj / enorm / hnorm / final_layernorm) MTP keys, so the
+        # split regex must accept either form.
+        _layer_re = re.compile(r"^(model\.)?layers\.(\d+)\.")
+
+        # Split MTP keys from backbone keys.  Current DSV4-Flash stores MTP as
+        # ``mtp.{k}.*``; HF/intermediate exports can also use
+        # ``[model.]layers.{N+k}.*``.  Normalize either format to temporary
+        # ``layers.{k}.*`` keys so the standard dequantize / aggregate / rename
+        # pipeline can handle FP4 routed experts and FP8 projections uniformly.
+        mtp_hf: dict[str, Any] = {}
+        backbone_hf: dict[str, Any] = {}
+        native_mtp_re = re.compile(r"^mtp\.(\d+)\.")
+        for key in list(hf_state_dict.keys()):
+            val = hf_state_dict[key]
+            native_m = native_mtp_re.match(key)
+            if native_m is not None:
+                mtp_depth = int(native_m.group(1))
+                if mtp_depth < num_mtp:
+                    renumbered = f"layers.{mtp_depth}." + key[native_m.end() :]
+                    mtp_hf[renumbered] = val
+                # Drop checkpoint MTP tensors when the runtime config disables
+                # MTP.  Otherwise loading DSV4-Flash with
+                # num_nextn_predict_layers=0 produces a large set of dangling
+                # ``mtp.0.*`` keys.
+                continue
+
+            m = _layer_re.match(key)
+            if m and int(m.group(2)) >= N and num_mtp > 0:
+                orig_idx = int(m.group(2))
+                mtp_depth = orig_idx - N
+                if mtp_depth < num_mtp:
+                    renumbered = f"layers.{mtp_depth}." + key[m.end() :]
+                    mtp_hf[renumbered] = val
+                continue
+
+            backbone_hf[key] = val
+        hf_state_dict = backbone_hf
+
         hf_state_dict = self._dequantize(hf_state_dict)
         hf_state_dict = self._aggregate_experts(hf_state_dict, device_mesh)
-        return self._rename_all(hf_state_dict)
+        state_dict = self._rename_all(hf_state_dict)
+
+        if mtp_hf:
+            mtp_hf = self._dequantize(mtp_hf)
+            mtp_hf = self._aggregate_experts(mtp_hf, device_mesh)
+            mtp_renamed = self._rename_all(mtp_hf)
+            for key, val in mtp_renamed.items():
+                # After _rename_all, layer-indexed keys are in one of two forms:
+                #   - ``model.layers.{k}.*`` if a rename rule matched (norms,
+                #     attn, mlp, experts, hc), or
+                #   - ``layers.{k}.*`` if no rule matched — V4 MTP-only
+                #     modules (``e_proj`` / ``h_proj`` / ``enorm`` / ``hnorm`` /
+                #     ``norm``) have no backbone rename rule.
+                # Re-prefix both forms into the ``mtp.layers.{k}.*`` namespace.
+                if key.startswith("model.layers."):
+                    state_dict["mtp" + key[len("model") :]] = val
+                elif key.startswith("layers."):
+                    state_dict["mtp." + key] = val
+                else:
+                    state_dict[key] = val
+
+        return state_dict
 
     def _dequantize(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Dequantize FP8 weights.  Handles both `.scale` and `_scale_inv` suffixes."""
@@ -256,7 +341,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             if scale_key is not None:
                 scale = state_dict[scale_key]
                 if self._is_expert_weight_key(key):
-                    state_dict[key] = self._dequantize_expert_fp4(weight, scale, self.dtype)
+                    state_dict[key] = self._dequantize_expert_weight(key, weight, scale)
                 else:
                     state_dict[key] = dequantize_from_fp8(weight, scale, dtype=self.dtype, name=key)
                 scale_keys_to_remove.append(scale_key)
@@ -452,7 +537,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         (re.compile(r"^lm_head\.(.+)$"), r"head.\1"),
         (re.compile(r"^model\.layers\.(\d+)\.input_layernorm\.(.+)$"), r"layers.\1.attn_norm.\2"),
         (re.compile(r"^model\.layers\.(\d+)\.post_attention_layernorm\.(.+)$"), r"layers.\1.ffn_norm.\2"),
-        (re.compile(r"^model\.layers\.(\d+)\.self_attn\.sinks$"), r"layers.\1.attn.attn_sink"),
+        (re.compile(r"^model\.layers\.(\d+)\.self_attn\.sinks_param\.weight$"), r"layers.\1.attn.attn_sink"),
         # Indexer reverse: our ``compressor.indexer.*`` -> on-disk ``indexer.*``
         # with the nested compressor un-flattened for projections.
         (
@@ -460,7 +545,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             r"layers.\1.attn.indexer.compressor.norm.\2",
         ),
         (
-            re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.indexer\.ape$"),
+            re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.indexer\.ape_param\.weight$"),
             r"layers.\1.attn.indexer.compressor.ape",
         ),
         (
@@ -479,6 +564,10 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         (
             re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.kv_norm\.(.+)$"),
             r"layers.\1.attn.compressor.norm.\2",
+        ),
+        (
+            re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.ape_param\.weight$"),
+            r"layers.\1.attn.compressor.ape",
         ),
         (re.compile(r"^model\.layers\.(\d+)\.self_attn\.(.+)$"), r"layers.\1.attn.\2"),
         # Gate (bias correction key mapped back to `bias`)
@@ -510,6 +599,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         # Reverse of the HC submodule renames above.
         (re.compile(r"^model\.layers\.(\d+)\.attn_hc\.(fn|base|scale)$"), r"layers.\1.hc_attn_\2"),
         (re.compile(r"^model\.layers\.(\d+)\.ffn_hc\.(fn|base|scale)$"), r"layers.\1.hc_ffn_\2"),
+        (re.compile(r"^model\.layers\.(\d+)\.hc_head\.hc_(fn|base|scale)$"), r"layers.\1.hc_head_\2"),
         (re.compile(r"^model\.hc_head\.hc_(fn|base|scale)$"), r"hc_head_\1"),
     ]
 
@@ -521,6 +611,20 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         return key
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        # MTP keys (``mtp.layers.{k}.*``) share the same per-block layout as
+        # backbone layers, but current DSV4-Flash stores them under native
+        # ``mtp.{k}.*`` keys.  Rewrite to an equivalent temporary
+        # ``model.layers.{k}.*`` form for splitting / renaming / quantization,
+        # then replace the emitted ``layers.{k}.`` prefix with ``mtp.{k}.``.
+        mtp_depth: int | None = None
+        if fqn.startswith("mtp."):
+            rest = fqn[len("mtp.") :]
+            m = re.match(r"^layers\.(\d+)\.", rest)
+            if m is None:
+                return [(fqn, tensor)]
+            mtp_depth = int(m.group(1))
+            fqn = f"model.layers.{mtp_depth}." + rest[m.end() :]
+
         quantization = kwargs.get("quantization", False)
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
@@ -533,21 +637,46 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         # Rename internal keys to HF keys
         result = [(self._internal_key_to_hf(k), v) for k, v in result]
 
+        if mtp_depth is not None:
+            # MTP-only modules (``e_proj`` / ``h_proj`` / ``enorm`` /
+            # ``hnorm`` / ``norm``) have no generic backbone rename rule, so
+            # they can still carry ``model.layers.{k}.`` here.  Normalize both
+            # possible temporary prefixes to the checkpoint's native MTP prefix.
+            internal_prefix = f"model.layers.{mtp_depth}."
+            layer_prefix = f"layers.{mtp_depth}."
+            mtp_prefix = f"mtp.{mtp_depth}."
+            result = [
+                (
+                    mtp_prefix + k[len(internal_prefix) :]
+                    if k.startswith(internal_prefix)
+                    else mtp_prefix + k[len(layer_prefix) :]
+                    if k.startswith(layer_prefix)
+                    else k,
+                    v,
+                )
+                for k, v in result
+            ]
+
         if quantization:
             quantized = []
             for key, value in result:
                 if key.endswith(".weight") and not self._is_non_quantized(key):
                     base = key[: -len(".weight")]
                     if self._is_expert_weight_key(key):
-                        # V4 Flash routed experts are stored as FP4 e2m1 packed two
-                        # values per int8 byte, with per-row / 32-col e8m0 scales.
-                        # DCP validates shape + dtype against the checkpoint BEFORE
-                        # dequantization happens, so the placeholders must match the
-                        # on-disk layout exactly.  We emit empty tensors (content is
-                        # overwritten by dcp.load) with the packed shape/dtype.
-                        int8_val, e8m0_scale = self._build_fp4_expert_placeholders(value)
-                        quantized.append((key, int8_val))
-                        quantized.append((base + ".scale", e8m0_scale))
+                        if self._checkpoint_expert_quant_layout() is _ExpertQuantLayout.FP8:
+                            fp8_val, scale = self._build_fp8_expert_placeholders(value)
+                            quantized.append((key, fp8_val))
+                            quantized.append((base + ".scale", scale))
+                        else:
+                            # V4 Flash routed experts are stored as FP4 e2m1 packed two
+                            # values per int8 byte, with per-row / 32-col e8m0 scales.
+                            # DCP validates shape + dtype against the checkpoint BEFORE
+                            # dequantization happens, so the placeholders must match the
+                            # on-disk layout exactly.  We emit empty tensors (content is
+                            # overwritten by dcp.load) with the packed shape/dtype.
+                            int8_val, e8m0_scale = self._build_fp4_expert_placeholders(value)
+                            quantized.append((key, int8_val))
+                            quantized.append((base + ".scale", e8m0_scale))
                         continue
                     if is_dtensor(value):
                         # Preserve DTensor structure so DCP knows the global shape
@@ -555,11 +684,12 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                         # only the local shard to a plain tensor strips the mesh /
                         # placement metadata and causes a shape mismatch (e.g.
                         # local [128, 4096] vs checkpoint global [512, 4096]).
-                        local_fp8 = value.to_local().to(torch.float8_e4m3fn)
+                        local = value.to_local()
+                        local_fp8 = self._empty_or_cast_fp8(local)
                         fp8_val = DTensor.from_local(local_fp8, value.device_mesh, value.placements)
                     else:
-                        fp8_val = value.cpu().to(torch.float8_e4m3fn)
-                    scale = torch.ones(self._scale_shape(value), dtype=torch.float32)
+                        fp8_val = self._empty_or_cast_fp8(value)
+                    scale = self._build_fp8_global_scale_placeholder(value)
                     quantized.append((key, fp8_val))
                     quantized.append((base + ".scale", scale))
                 else:
@@ -599,6 +729,49 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         packed = torch.empty(*value.shape[:-1], in_dim // 2, dtype=torch.int8)
         scale = torch.empty(*value.shape[:-1], in_dim // FP4_COL_BLOCK, dtype=torch.float8_e8m0fnu)
         return packed, scale
+
+    @staticmethod
+    def _build_fp8_expert_placeholders(value: Any) -> tuple[Any, Any]:
+        """Return placeholders for the DeepSeek V4 Base routed-expert FP8 layout."""
+        if is_dtensor(value):
+            local_fp8 = DeepSeekV4StateDictAdapter._empty_or_cast_fp8(value.to_local())
+            fp8_val = DTensor.from_local(local_fp8, value.device_mesh, value.placements)
+        else:
+            fp8_val = DeepSeekV4StateDictAdapter._empty_or_cast_fp8(value)
+
+        scale = DeepSeekV4StateDictAdapter._build_fp8_dtensor_scale_placeholder(value)
+        return fp8_val, scale
+
+    @staticmethod
+    def _build_fp8_global_scale_placeholder(value: Any) -> torch.Tensor:
+        if is_dtensor(value):
+            local = value.to_local()
+            return torch.ones(
+                DeepSeekV4StateDictAdapter._scale_shape_from_shape(value.shape),
+                dtype=torch.float32,
+                device=local.device,
+            )
+
+        return torch.ones(DeepSeekV4StateDictAdapter._scale_shape_from_shape(value.shape), dtype=torch.float32)
+
+    @staticmethod
+    def _build_fp8_dtensor_scale_placeholder(value: Any) -> Any:
+        if is_dtensor(value):
+            local = value.to_local()
+            scale_local = torch.ones(
+                DeepSeekV4StateDictAdapter._scale_shape_from_shape(local.shape),
+                dtype=torch.float32,
+                device=local.device,
+            )
+            return DTensor.from_local(scale_local, value.device_mesh, value.placements)
+
+        return DeepSeekV4StateDictAdapter._build_fp8_global_scale_placeholder(value)
+
+    @staticmethod
+    def _empty_or_cast_fp8(value: torch.Tensor) -> torch.Tensor:
+        if value.is_meta:
+            return torch.empty(tuple(value.shape), dtype=torch.float8_e4m3fn, device=value.device)
+        return value.to(torch.float8_e4m3fn)
 
     _NON_QUANTIZED_PATTERNS = [
         "attn_norm.weight",
@@ -642,7 +815,11 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         return "ffn.experts." in key
 
     def _scale_shape(self, weight: torch.Tensor) -> tuple[int, int]:
-        r, c = weight.shape
+        return self._scale_shape_from_shape(weight.shape)
+
+    @staticmethod
+    def _scale_shape_from_shape(shape: torch.Size | tuple[int, ...]) -> tuple[int, int]:
+        r, c = shape
         return ((r + BLOCK_SIZE - 1) // BLOCK_SIZE, (c + BLOCK_SIZE - 1) // BLOCK_SIZE)
 
     def _expert_scale_shape(self, weight: torch.Tensor) -> tuple[int, int]:
@@ -654,6 +831,67 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         """
         r, c = weight.shape
         return (r, (c + FP4_COL_BLOCK - 1) // FP4_COL_BLOCK)
+
+    def _dequantize_expert_weight(self, key: str, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        layout = self._expert_quant_layout_from_tensors(weight, scale)
+        if layout is _ExpertQuantLayout.FP4:
+            return self._dequantize_expert_fp4(weight, scale, self.dtype)
+        return dequantize_from_fp8(weight, scale, dtype=self.dtype, name=key)
+
+    def _expert_quant_layout_from_tensors(self, weight: torch.Tensor, scale: torch.Tensor) -> _ExpertQuantLayout:
+        weight_local = weight.to_local() if is_dtensor(weight) else weight
+        scale_local = scale.to_local() if is_dtensor(scale) else scale
+
+        if weight_local.dtype == torch.int8:
+            return _ExpertQuantLayout.FP4
+
+        if weight_local.dtype == torch.float8_e4m3fn:
+            return _ExpertQuantLayout.FP8
+
+        if tuple(scale_local.shape) == self._scale_shape(weight_local):
+            return _ExpertQuantLayout.FP8
+
+        return _ExpertQuantLayout.FP4
+
+    def _checkpoint_expert_quant_layout(self) -> _ExpertQuantLayout:
+        override = os.environ.get("NEMO_AUTOMODEL_DSV4_EXPERT_LAYOUT")
+        if override:
+            normalized = override.lower()
+            if normalized in {"fp4", "mxfp4", "flash"}:
+                return _ExpertQuantLayout.FP4
+            if normalized in {"fp8", "base"}:
+                return _ExpertQuantLayout.FP8
+            raise ValueError("NEMO_AUTOMODEL_DSV4_EXPERT_LAYOUT must be one of: fp4, mxfp4, flash, fp8, base")
+
+        if self._checkpoint_expert_quant_layout_cache is not None:
+            return self._checkpoint_expert_quant_layout_cache
+
+        self._checkpoint_expert_quant_layout_cache = self._detect_checkpoint_expert_quant_layout()
+        return self._checkpoint_expert_quant_layout_cache
+
+    def _detect_checkpoint_expert_quant_layout(self) -> _ExpertQuantLayout:
+        ckpt_path = getattr(self.config, "_name_or_path", None) or getattr(self.config, "name_or_path", None)
+        if not ckpt_path:
+            return _ExpertQuantLayout.FP4
+
+        path = Path(ckpt_path)
+        if not path.is_dir():
+            return _ExpertQuantLayout.FP4
+
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            return _ExpertQuantLayout.FP4
+
+        for sf_path in sorted(path.glob("*.safetensors")):
+            with safe_open(sf_path, framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    if not _EXPERT_PATTERN.match(key):
+                        continue
+                    weight = handle.get_tensor(key)
+                    return _ExpertQuantLayout.FP4 if weight.dtype == torch.int8 else _ExpertQuantLayout.FP8
+
+        return _ExpertQuantLayout.FP4
 
     @staticmethod
     def _dequantize_expert_fp4(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -702,13 +940,14 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         if m:
             layer_num = m.group(2)
             n_total = self.moe_config.n_routed_experts
-            local_tensor, start_eid, end_eid = get_expert_slice_for_rank(tensor, n_total)
-            inter_dim = local_tensor.shape[-1] // 2
+            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(tensor, n_total)
             result = []
-            for local_i in range(local_tensor.shape[0]):
-                t = local_tensor[local_i]  # [hidden_dim, 2*inter_dim]
+            for t, eid in zip(expert_tensors, expert_ids):
+                inter_dim = t.shape[-1] // 2
+                # t is [hidden_dim, 2*inter_dim]. If the expert tensor is
+                # sharded on hidden dim, keep it as a DTensor so DCP sees the
+                # checkpoint's global expert shape.
                 gate_t, up_t = t.split(inter_dim, dim=-1)
-                eid = start_eid + local_i
                 result.append((f"layers.{layer_num}.ffn.experts.{eid}.w1.weight", gate_t.T))
                 result.append((f"layers.{layer_num}.ffn.experts.{eid}.w3.weight", up_t.T))
             return result
@@ -717,11 +956,10 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         if m:
             layer_num = m.group(2)
             n_total = self.moe_config.n_routed_experts
-            local_tensor, start_eid, end_eid = get_expert_slice_for_rank(tensor, n_total)
+            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(tensor, n_total)
             result = []
-            for local_i in range(local_tensor.shape[0]):
-                eid = start_eid + local_i
-                result.append((f"layers.{layer_num}.ffn.experts.{eid}.w2.weight", local_tensor[local_i].T))
+            for t, eid in zip(expert_tensors, expert_ids):
+                result.append((f"layers.{layer_num}.ffn.experts.{eid}.w2.weight", t.T))
             return result
 
         return [(fqn, tensor)]

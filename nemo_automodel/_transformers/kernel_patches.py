@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Kernel and attention patching utilities.
+"""Kernel, attention, and model runtime patching utilities.
 
-Functions for SDPA, Liger-kernel, and attention-implementation overrides.
-These are stateless helpers used during model construction.
+Functions for SDPA, Liger-kernel, model runtime hooks, and
+attention-implementation overrides. These are stateless helpers used during
+model construction.
 """
 
 import functools
-import importlib.util
+import importlib
 import inspect
 import logging
 import types
@@ -40,6 +41,17 @@ HAS_FA, _ = safe_import("flash_attn")
 DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
 logger = logging.getLogger(__name__)
+
+_MODEL_RUNTIME_PATCHES = {
+    "Qwen3_5ForCausalLM": (
+        "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn",
+        "apply_model_runtime_patches",
+    ),
+    "Qwen3_5ForConditionalGeneration": (
+        "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn",
+        "apply_model_runtime_patches",
+    ),
+}
 
 
 def _assert_same_signature(original, patched):
@@ -134,6 +146,34 @@ def _patch_liger_kernel(model):
         logger.warning("Failed to apply liger-kernels to model; falling back to eager")
         del model
         raise RuntimeError("Failed to patch model")
+
+
+def _model_runtime_patch_keys(model):
+    config = getattr(model, "config", None)
+    keys = list(getattr(config, "architectures", None) or [])
+    model_cls_name = type(model).__name__
+    if model_cls_name not in keys:
+        keys.append(model_cls_name)
+    return keys
+
+
+def apply_model_runtime_patches(model, mesh):
+    """Apply registered architecture-specific runtime patches to a model."""
+    seen_hooks = set()
+    for key in _model_runtime_patch_keys(model):
+        hook_spec = _MODEL_RUNTIME_PATCHES.get(key)
+        if hook_spec is None or hook_spec in seen_hooks:
+            continue
+        seen_hooks.add(hook_spec)
+
+        module_name, hook_name = hook_spec
+        try:
+            hook = getattr(importlib.import_module(module_name), hook_name)
+        except ImportError:
+            logger.debug("Runtime patch hook for %s is unavailable: %s.%s", key, module_name, hook_name)
+            continue
+        model = hook(model, mesh=mesh)
+    return model
 
 
 def _patch_legacy_flash_attn_flag():

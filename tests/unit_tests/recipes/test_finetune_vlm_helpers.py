@@ -20,6 +20,13 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.vlm.pp_media import (
+    VLM_PP_MEDIA_KEY,
+    chunk_step3_media,
+    chunk_vlm_media,
+    prepare_vlm_media_for_pp,
+    stage_vlm_media_for_pp,
+)
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
@@ -32,6 +39,8 @@ from nemo_automodel.recipes.vlm.finetune import (
 class _Cfg(SimpleNamespace):
     def get(self, key, default=None):
         return getattr(self, key, default)
+
+
 def test_get_model_name_prefers_pretrained_path():
     cfg = _Cfg(pretrained_model_name_or_path="org/model")
     assert _get_model_name(cfg) == "org/model"
@@ -44,6 +53,7 @@ def test_get_model_name_prefers_pretrained_path():
 
 def _count_trainable(parameters):
     return sum(p.numel() for p in parameters if getattr(p, "requires_grad", False))
+
 
 @pytest.fixture(autouse=True)
 def _mock_missing_cuda(monkeypatch):
@@ -83,6 +93,7 @@ class DummyOptConfig:
     def __init__(self, lr: float = 0.01):
         self.lr = lr
         self.foreach = None
+
     def instantiate(self, params):
         # Always return an SGD optimizer for the given params
         return torch.optim.SGD(params, lr=self.lr)
@@ -90,11 +101,13 @@ class DummyOptConfig:
     def get(self, key, default):
         return getattr(self, key, default)
 
+
 class DummyModelConfig:
     """Mimics the Hydra/OmegaConf model config with an *instantiate* method."""
 
     def __init__(self):
         from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
         # Add _target_ to make the config valid for VLM finetuning
         self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
 
@@ -109,12 +122,13 @@ class DummyModelConfig:
 # build_model / build_optimizer
 # -----------------------------------------------------------------------------
 
+
 def test_build_model_and_optimizer_basic():
     """Test basic build_model and build_optimizer for VLM."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig(lr=0.01)
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -153,8 +167,8 @@ def test_build_model_passes_freeze_config():
         def to_dict(self):
             return {"freeze_language_model": False, "freeze_vision_tower": True}
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model = build_model(
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
+        build_model(
             cfg_model=cfg_model,
             cfg_freeze=FreezeConfig(),
             cfg_peft=None,
@@ -187,7 +201,7 @@ def test_build_model_passes_moe_config_from_parallelizer_config():
     cfg_model = CapturingModelConfig()
     moe_cfg = MoEParallelizerConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -229,7 +243,7 @@ def test_build_model_passes_moe_config_from_dict_like():
 
     cfg_model = CapturingModelConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -263,7 +277,7 @@ def test_build_model_no_moe_config_when_cfg_moe_is_none():
 
     cfg_model = CapturingModelConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -274,6 +288,77 @@ def test_build_model_no_moe_config_when_cfg_moe_is_none():
 
     assert "moe_config" not in captured_kwargs
     assert "activation_checkpointing" not in captured_kwargs
+
+
+def test_build_model_passes_quantization_config():
+    """cfg_quantization is converted via create_bnb_config and forwarded as quantization_config."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+    cfg_quantization = SimpleNamespace(load_in_4bit=True)
+    sentinel_bnb = object()
+
+    with (
+        patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True),
+        patch(
+            "nemo_automodel.components.quantization.qlora.create_bnb_config",
+            return_value=sentinel_bnb,
+        ) as mock_create,
+    ):
+        build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=123,
+            cfg_quantization=cfg_quantization,
+        )
+
+    # Wiring: cfg_quantization -> create_bnb_config(...) -> kwargs["quantization_config"]
+    mock_create.assert_called_once_with(cfg_quantization)
+    assert captured_kwargs.get("quantization_config") is sentinel_bnb
+
+
+def test_build_model_no_quantization_config_when_none():
+    """No quantization_config kwarg when cfg_quantization is None (the default)."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
+        build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=123,
+        )
+
+    assert "quantization_config" not in captured_kwargs
 
 
 # -----------------------------------------------------------------------------
@@ -314,7 +399,10 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     recipe.model_parts = [model]  # Now uses model_parts instead of model
     recipe.pp_enabled = False  # Pipeline parallelism disabled
     recipe.optimizer = [_DummyOptimizer()]  # Now a list
-    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
+    # ``is_remote_logging_step`` is read by ``_forward_backward_step`` when the
+    # composite (gemma4 joint drafter) attaches drafter logits; default False
+    # so non-drafter test paths skip the log line.
+    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0, is_remote_logging_step=False)
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
     recipe.cfg = _Cfg(fp8=None)
     recipe.lr_scheduler = None
@@ -388,7 +476,7 @@ def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
     recipe.model_parts = [_TensorModel()]
     recipe.pp_enabled = True
     recipe.optimizer = [_DummyOptimizer()]
-    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
+    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0, is_remote_logging_step=False)
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
     recipe.cfg = _Cfg(fp8=None)
     recipe.lr_scheduler = None
@@ -422,6 +510,53 @@ def _patch_pp_optim_step_dependencies(monkeypatch):
         "nemo_automodel.recipes.vlm.finetune.prepare_for_final_backward",
         lambda model_parts, pp_enabled: None,
     )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_after_first_microbatch",
+        lambda: None,
+    )
+
+
+@pytest.mark.cuda(False)
+def test_run_train_step_clears_first_microbatch_after_first_batch(monkeypatch):
+    recipe, _ = _build_pp_recipe_for_optim_step(num_label_tokens_in_batch=2)
+    batches = [
+        {
+            "labels": torch.tensor([[1, -100, 2, -100]]),
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        },
+        {
+            "labels": torch.tensor([[-100, 3, -100, 4]]),
+            "input_ids": torch.tensor([[5, 6, 7, 8]]),
+        },
+    ]
+    events = []
+
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_grad_accumulation",
+        lambda model_parts, pp_enabled: events.append("prepare"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_final_backward",
+        lambda model_parts, pp_enabled: events.append("final"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_after_first_microbatch",
+        lambda: events.append("after_first"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.scale_grads_and_clip_grad_norm",
+        lambda **kwargs: 0.0,
+    )
+
+    def fake_forward_backward_step(idx, batch, loss_buffer, num_label_tokens, num_batches):
+        events.append(f"forward_{idx}")
+        loss_buffer.append(torch.tensor(1.0))
+
+    recipe._forward_backward_step = fake_forward_backward_step
+
+    recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert events == ["prepare", "forward_0", "after_first", "final", "forward_1"]
 
 
 @pytest.mark.cuda(False)
@@ -472,10 +607,11 @@ def test_run_train_step_pp_nonzero_label_tokens_divides(monkeypatch):
 # AutoProcessor exception handling test
 # -----------------------------------------------------------------------------
 
+
 def test_autoprocessor_success():
     """Test successful AutoProcessor creation."""
 
-    with patch('transformers.AutoProcessor') as mock_auto_processor:
+    with patch("transformers.AutoProcessor") as mock_auto_processor:
         mock_processor = MagicMock()
         mock_auto_processor.from_pretrained.return_value = mock_processor
 
@@ -493,11 +629,12 @@ def test_autoprocessor_exception_handling(caplog):
 
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
-    with patch('transformers.AutoProcessor.from_pretrained') as mock_from_pretrained, \
-         patch('nemo_automodel.components.training.rng.StatefulRNG'), \
-         patch('torch.utils.data.distributed.DistributedSampler'), \
-         patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'NoneType': MagicMock()}):
-
+    with (
+        patch("transformers.AutoProcessor.from_pretrained") as mock_from_pretrained,
+        patch("nemo_automodel.components.training.rng.StatefulRNG"),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"NoneType": MagicMock()}),
+    ):
         # Set up the exception
         mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
 
@@ -506,8 +643,11 @@ def test_autoprocessor_exception_handling(caplog):
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
         cfg_ds.get.side_effect = lambda key, default=None: {
-            "pretokenize": False, "packing": None, "max_length": None,
-            "chat_template": None, "preload_media": False,
+            "pretokenize": False,
+            "packing": None,
+            "max_length": None,
+            "chat_template": None,
+            "preload_media": False,
         }.get(key, default)
 
         cfg_dl = MagicMock()
@@ -541,19 +681,24 @@ def test_autoprocessor_retries_on_layer_types_mismatch():
             raise StrictDataclassClassValidationError(validator="validate_layer_type", cause=cause)
         return stub_processor
 
-    with patch('transformers.AutoProcessor.from_pretrained', side_effect=fake_from_pretrained), \
-         patch('nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator',
-               return_value=True) as mock_relax, \
-         patch('nemo_automodel.components.training.rng.StatefulRNG'), \
-         patch('torch.utils.data.distributed.DistributedSampler'), \
-         patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'MagicMock': MagicMock()}):
-
+    with (
+        patch("transformers.AutoProcessor.from_pretrained", side_effect=fake_from_pretrained),
+        patch(
+            "nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator", return_value=True
+        ) as mock_relax,
+        patch("nemo_automodel.components.training.rng.StatefulRNG"),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"MagicMock": MagicMock()}),
+    ):
         cfg_ds = MagicMock()
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
         cfg_ds.get.side_effect = lambda key, default=None: {
-            "pretokenize": False, "packing": None, "max_length": None,
-            "chat_template": None, "preload_media": False,
+            "pretokenize": False,
+            "packing": None,
+            "max_length": None,
+            "chat_template": None,
+            "preload_media": False,
         }.get(key, default)
 
         cfg_dl = MagicMock()
@@ -587,12 +732,13 @@ def test_autoprocessor_loads_inside_first_rank_per_node():
         call_order.append("autoprocessor")
         return MagicMock()
 
-    with patch('nemo_automodel.recipes.vlm.finetune.FirstRankPerNode', TrackingFirstRankPerNode), \
-         patch('transformers.AutoProcessor.from_pretrained', side_effect=tracking_from_pretrained), \
-         patch('nemo_automodel.components.training.rng.StatefulRNG'), \
-         patch('torch.utils.data.distributed.DistributedSampler'), \
-         patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'NoneType': MagicMock()}):
-
+    with (
+        patch("nemo_automodel.recipes.vlm.finetune.FirstRankPerNode", TrackingFirstRankPerNode),
+        patch("transformers.AutoProcessor.from_pretrained", side_effect=tracking_from_pretrained),
+        patch("nemo_automodel.components.training.rng.StatefulRNG"),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"NoneType": MagicMock()}),
+    ):
         cfg_ds = MagicMock()
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
@@ -625,11 +771,12 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         def to_dict(self):
             return {"trust_remote_code": True, "some_param": "value"}
 
-    with patch('transformers.AutoProcessor.from_pretrained') as mock_from_pretrained, \
-         patch('nemo_automodel.components.training.rng.StatefulRNG'), \
-         patch('torch.utils.data.distributed.DistributedSampler'), \
-         patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'NoneType': MagicMock()}):
-
+    with (
+        patch("transformers.AutoProcessor.from_pretrained") as mock_from_pretrained,
+        patch("nemo_automodel.components.training.rng.StatefulRNG"),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"NoneType": MagicMock()}),
+    ):
         # Set up the exception
         mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
 
@@ -638,8 +785,11 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
         cfg_ds.get.side_effect = lambda key, default=None: {
-            "pretokenize": False, "packing": None, "max_length": None,
-            "chat_template": None, "preload_media": False,
+            "pretokenize": False,
+            "packing": None,
+            "max_length": None,
+            "chat_template": None,
+            "preload_media": False,
         }.get(key, default)
 
         cfg_dl = MagicMock()
@@ -684,9 +834,11 @@ def test_build_dataloader_chat_template_applied():
     cfg_dl.get.return_value = None
     cfg_dl.instantiate.return_value = MagicMock()
 
-    with patch("transformers.AutoProcessor.from_pretrained", return_value=processor), \
-         patch("torch.utils.data.distributed.DistributedSampler"), \
-         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}):
+    with (
+        patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}),
+    ):
         _, built_processor = build_dataloader(cfg_ds, cfg_dl, "model", None, None, 42, 1)
 
     assert built_processor.chat_template == "{{ custom }}"
@@ -712,9 +864,11 @@ def test_build_dataloader_no_chat_template():
     cfg_dl.get.return_value = None
     cfg_dl.instantiate.return_value = MagicMock()
 
-    with patch("transformers.AutoProcessor.from_pretrained", return_value=processor), \
-         patch("torch.utils.data.distributed.DistributedSampler"), \
-         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}):
+    with (
+        patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}),
+    ):
         _, built_processor = build_dataloader(cfg_ds, cfg_dl, "model", None, None, 42, 1)
 
     assert built_processor.chat_template == "{{ original }}"
@@ -752,6 +906,7 @@ class DummyModelConfigWithAdapter:
 
     def __init__(self):
         from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
         # Add _target_ to make the config valid for VLM finetuning
         self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
 
@@ -764,8 +919,6 @@ class DummyModelConfigWithAdapter:
 
 def test_vlm_build_model_with_adapter():
     """Test that model with state_dict_adapter is properly instantiated in VLM."""
-
-    cfg_opt = DummyOptConfig(lr=0.01)
 
     # Create a config that simulates NeMoAutoModel's internal infrastructure handling
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
@@ -782,7 +935,7 @@ def test_vlm_build_model_with_adapter():
 
     cfg_model = NeMoModelConfigWithAdapter()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -813,7 +966,7 @@ def test_vlm_build_model_without_adapter():
 
     cfg_model = NeMoModelConfigNoAdapter()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -846,7 +999,7 @@ def test_vlm_build_model_with_quantization_config():
 
     cfg_model = DummyQuantizedVLMModelConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -876,7 +1029,7 @@ def test_vlm_build_model_without_quantization_config():
 
     cfg_model = DummyNoQuantVLMModelConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -919,8 +1072,6 @@ def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
         )
 
 
-
-
 def test_vlm_build_optimizer_disables_foreach_with_tp():
     """Test that when device_mesh has tp > 1, cfg_opt.foreach is set to False in VLM."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
@@ -946,7 +1097,7 @@ def test_vlm_build_optimizer_disables_foreach_with_tp():
     mock_device_mesh.mesh_dim_names = ("dp", "tp")
     mock_device_mesh.__getitem__ = lambda self, key: mock_tp_submesh if key == "tp" else MagicMock()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -954,7 +1105,7 @@ def test_vlm_build_optimizer_disables_foreach_with_tp():
             seed=42,
             device_mesh=mock_device_mesh,
         )
-        optimizer = build_optimizer(model, cfg_opt, None, mock_device_mesh)
+        build_optimizer(model, cfg_opt, None, mock_device_mesh)
 
     assert cfg_opt.foreach is False
 
@@ -1148,7 +1299,7 @@ class TestBuildCheckpointConfig:
         assert config.model_save_format.value == "safetensors"
         assert config.model_repo_id == "org/model"
         assert config.model_cache_dir == "/tmp/cache"
-        assert config.save_consolidated is True
+        assert config.save_consolidated.value == "final"
         assert config.is_peft is False
 
     def test_build_checkpoint_config_with_custom_config(self):
@@ -1168,7 +1319,7 @@ class TestBuildCheckpointConfig:
         )
 
         assert config.checkpoint_dir == "/custom/ckpt/"
-        assert config.save_consolidated is False
+        assert config.save_consolidated.value == "false"
         assert config.is_peft is True
 
     def test_build_checkpoint_config_warns_on_peft_with_torch_save(self, caplog):
@@ -1198,7 +1349,7 @@ class TestBuildCheckpointConfig:
         # checkpoint_dir is preserved from the user config
         assert config.checkpoint_dir == "/user/ckpt/"
         # other user-provided torch_save options are discarded (defaults restored)
-        assert config.save_consolidated is True
+        assert config.save_consolidated.value == "final"
         assert config.is_async is False
 
     def test_build_checkpoint_config_uses_hf_hub_cache_when_cache_dir_none(self):
@@ -1389,6 +1540,14 @@ def _create_pp_recipe(model=None):
     return recipe
 
 
+def _prepare_pp_vlm_batch(batch, n_microbatches=2):
+    return prepare_vlm_media_for_pp(
+        batch,
+        batch_size=batch["input_ids"].shape[0],
+        n_microbatches=n_microbatches,
+    )
+
+
 class TestForwardBackwardStepPP:
     """Tests for _forward_backward_step with pipeline parallelism enabled."""
 
@@ -1435,7 +1594,6 @@ class TestForwardBackwardStepPP:
         )
 
         batch_size = 4
-        n_images = 4
         # image_grid_hws: 4 images, each with different patch counts
         image_grid_hws = torch.tensor([[2, 2], [3, 3], [2, 3], [4, 4]])  # patch counts: 4, 9, 6, 16
         total_patches = 4 + 9 + 6 + 16  # = 35
@@ -1447,7 +1605,19 @@ class TestForwardBackwardStepPP:
             "pixel_values": pixel_values,
             "image_grid_hws": image_grid_hws,
         }
+        _prepare_pp_vlm_batch(batch)
         loss_buffer = []
+        captured_chunks = {}
+
+        def step_side_effect(*args, **kwargs):
+            model = pp_recipe.model_parts[0]
+            captured_chunks["pixel_values"] = [chunk.clone() for chunk in model._vlm_pixel_values_chunks]
+            captured_chunks["image_grid"] = [chunk.clone() for chunk in model._vlm_image_grid_hws_chunks]
+            captured_chunks["chunk_idx"] = model._vlm_chunk_idx
+            for _ in range(2):
+                kwargs["losses"].append(torch.tensor(0.5))
+
+        pp_recipe.pp.info.schedule.step = MagicMock(side_effect=step_side_effect)
 
         pp_recipe._forward_backward_step(
             idx=0,
@@ -1460,6 +1630,11 @@ class TestForwardBackwardStepPP:
 
         # Verify chunking happened correctly
         model = pp_recipe.model_parts[0]
+        assert captured_chunks["chunk_idx"] == 0
+        assert torch.equal(captured_chunks["pixel_values"][0], pixel_values[:13])
+        assert torch.equal(captured_chunks["pixel_values"][1], pixel_values[13:])
+        assert torch.equal(captured_chunks["image_grid"][0], image_grid_hws[:2])
+        assert torch.equal(captured_chunks["image_grid"][1], image_grid_hws[2:])
         assert model._vlm_pixel_values_chunks is None  # Cleared after step
         assert model._vlm_image_grid_hws_chunks is None
         assert model._vlm_chunk_idx is None
@@ -1468,6 +1643,145 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp.info.schedule.step.assert_called_once()
 
         # Verify loss was computed
+        assert len(loss_buffer) == 1
+
+    def test_pp_vlm_chunking_videos_uses_video_grid_and_counts(self, pp_recipe, monkeypatch):
+        """Video tensors are chunked by per-sample video counts before schedule.step."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+        )
+
+        batch_size = 4
+        video_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3], [1, 4, 4]])
+        pixel_values_videos = torch.randn(int(video_grid_thw.prod(dim=1).sum().item()), 64)
+        n_videos_per_sample = torch.tensor([1, 0, 2, 1])
+
+        def step_side_effect(*args, **kwargs):
+            model = pp_recipe.model_parts[0]
+            assert "pixel_values_videos" not in kwargs
+            assert "video_grid_thw" not in kwargs
+            assert len(model._vlm_pixel_values_videos_chunks) == 2
+            assert len(model._vlm_video_grid_thw_chunks) == 2
+            assert model._vlm_video_grid_thw_chunks[0].shape[0] == 1
+            assert model._vlm_video_grid_thw_chunks[1].shape[0] == 3
+            assert model._vlm_pixel_values_videos_chunks[0].shape[0] == 4
+            assert model._vlm_pixel_values_videos_chunks[1].shape[0] == 9 + 6 + 16
+            for _ in range(2):
+                kwargs["losses"].append(torch.tensor(0.5))
+
+        pp_recipe.pp.info.schedule.step.side_effect = step_side_effect
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values_videos": pixel_values_videos,
+            "video_grid_thw": video_grid_thw,
+            "n_videos_per_sample": n_videos_per_sample,
+        }
+        _prepare_pp_vlm_batch(batch)
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_videos_chunks is None
+        assert model._vlm_video_grid_thw_chunks is None
+        assert model._vlm_chunk_idx is None
+        assert len(loss_buffer) == 1
+
+    def test_pp_vlm_chunking_image_and_video_mixed(self, pp_recipe, monkeypatch):
+        """When a batch carries both images and videos, both streams chunk independently
+        but share a single _vlm_chunk_idx initialized once at 0; both clean up to None."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+        )
+
+        batch_size = 4
+
+        # n_images_per_sample=[2,0,1,0]: mb0 (samples 0..1) covers images 0..1; mb1 covers image 2.
+        image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3]])  # patch counts: 4, 9, 6
+        pixel_values = torch.randn(int(image_grid_thw.prod(dim=1).sum().item()), 32)
+        n_images_per_sample = torch.tensor([2, 0, 1, 0])
+
+        # n_videos_per_sample=[1,0,2,1]: mb0 covers video 0; mb1 covers videos 1..3.
+        video_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3], [1, 4, 4]])  # patch counts: 4, 9, 6, 16
+        pixel_values_videos = torch.randn(int(video_grid_thw.prod(dim=1).sum().item()), 64)
+        n_videos_per_sample = torch.tensor([1, 0, 2, 1])
+
+        def step_side_effect(*args, **kwargs):
+            model = pp_recipe.model_parts[0]
+
+            # Both modalities are popped before schedule.step so the schedule never
+            # tries to chunk the misaligned multimodal tensors along dim 0.
+            assert "pixel_values" not in kwargs
+            assert "image_grid_hws" not in kwargs
+            assert "image_grid_thw" not in kwargs
+            assert "pixel_values_videos" not in kwargs
+            assert "video_grid_thw" not in kwargs
+
+            assert len(model._vlm_pixel_values_chunks) == 2
+            assert len(model._vlm_image_grid_hws_chunks) == 2
+            assert model._vlm_image_grid_hws_chunks[0].shape[0] == 2
+            assert model._vlm_image_grid_hws_chunks[1].shape[0] == 1
+            assert model._vlm_pixel_values_chunks[0].shape[0] == 4 + 9
+            assert model._vlm_pixel_values_chunks[1].shape[0] == 6
+
+            assert len(model._vlm_pixel_values_videos_chunks) == 2
+            assert len(model._vlm_video_grid_thw_chunks) == 2
+            assert model._vlm_video_grid_thw_chunks[0].shape[0] == 1
+            assert model._vlm_video_grid_thw_chunks[1].shape[0] == 3
+            assert model._vlm_pixel_values_videos_chunks[0].shape[0] == 4
+            assert model._vlm_pixel_values_videos_chunks[1].shape[0] == 9 + 6 + 16
+
+            # Single shared cursor: image-branch sets it to 0 first, video branch resets to 0 again.
+            assert model._vlm_chunk_idx == 0
+
+            for _ in range(2):
+                kwargs["losses"].append(torch.tensor(0.5))
+
+        pp_recipe.pp.info.schedule.step.side_effect = step_side_effect
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "n_images_per_sample": n_images_per_sample,
+            "pixel_values_videos": pixel_values_videos,
+            "video_grid_thw": video_grid_thw,
+            "n_videos_per_sample": n_videos_per_sample,
+        }
+        _prepare_pp_vlm_batch(batch)
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_chunks is None
+        assert model._vlm_image_grid_hws_chunks is None
+        assert model._vlm_pixel_values_videos_chunks is None
+        assert model._vlm_video_grid_thw_chunks is None
+        assert model._vlm_chunk_idx is None
         assert len(loss_buffer) == 1
 
     def test_pp_vlm_chunking_with_image_grid_thw(self, pp_recipe, monkeypatch):
@@ -1480,7 +1794,6 @@ class TestForwardBackwardStepPP:
         )
 
         batch_size = 4
-        n_images = 4
         # image_grid_thw: 4 images with T, H, W dimensions (uses .prod(dim=1) for patch counts)
         image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3], [1, 4, 4]])  # patch counts: 4, 9, 6, 16
         total_patches = 4 + 9 + 6 + 16  # = 35
@@ -1492,6 +1805,7 @@ class TestForwardBackwardStepPP:
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,  # Using thw instead of hws
         }
+        _prepare_pp_vlm_batch(batch)
         loss_buffer = []
 
         pp_recipe._forward_backward_step(
@@ -1515,10 +1829,8 @@ class TestForwardBackwardStepPP:
         # Verify loss was computed
         assert len(loss_buffer) == 1
 
-    def test_pp_vlm_chunking_mismatched_images_and_batch(self, pp_recipe, monkeypatch, caplog):
-        """Test VLM chunking when n_images != batch_size (fallback path)."""
-        import logging
-
+    def test_pp_vlm_chunking_qwen35_ep4_pp2_local_batch_images(self, pp_recipe, monkeypatch):
+        """Qwen3.5 35B EP4/PP2-style local batch keeps proper image chunks during schedule.step."""
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
@@ -1526,8 +1838,49 @@ class TestForwardBackwardStepPP:
             lambda device_mesh, batch: (lambda: nullcontext(), batch),
         )
 
+        image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3]])
+        patch_counts = image_grid_thw.prod(dim=1)
+        pixel_values = torch.arange(int(patch_counts.sum()) * 4, dtype=torch.float32).reshape(-1, 4)
+        batch = {
+            "labels": torch.randint(0, 100, (2, 10)),
+            "input_ids": torch.randint(0, 100, (2, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "n_images_per_sample": torch.tensor([1, 1]),
+        }
+        _prepare_pp_vlm_batch(batch)
+        loss_buffer = []
+        captured_chunks = {}
+
+        def step_side_effect(*args, **kwargs):
+            model = pp_recipe.model_parts[0]
+            captured_chunks["pixel_values"] = [chunk.clone() for chunk in model._vlm_pixel_values_chunks]
+            captured_chunks["image_grid"] = [chunk.clone() for chunk in model._vlm_image_grid_hws_chunks]
+            for _ in range(2):
+                kwargs["losses"].append(torch.tensor(0.5))
+
+        pp_recipe.pp.info.schedule.step = MagicMock(side_effect=step_side_effect)
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=20,
+            num_batches=1,
+            is_train=True,
+        )
+
+        split_at = int(patch_counts[0].item())
+        assert torch.equal(captured_chunks["pixel_values"][0], pixel_values[:split_at])
+        assert torch.equal(captured_chunks["pixel_values"][1], pixel_values[split_at:])
+        assert torch.equal(captured_chunks["image_grid"][0], image_grid_thw[:1])
+        assert torch.equal(captured_chunks["image_grid"][1], image_grid_thw[1:])
+        assert pp_recipe.model_parts[0]._vlm_pixel_values_chunks is None
+        assert len(loss_buffer) == 1
+
+    def test_pp_vlm_chunking_mismatched_images_raises(self):
+        """When media cannot be aligned to samples, VLM PP data prep raises."""
         batch_size = 4
-        n_images = 2  # Different from batch_size
         image_grid_hws = torch.tensor([[2, 2], [3, 3]])
         total_patches = 4 + 9
         pixel_values = torch.randn(total_patches, 3, 14, 14)
@@ -1538,20 +1891,9 @@ class TestForwardBackwardStepPP:
             "pixel_values": pixel_values,
             "image_grid_hws": image_grid_hws,
         }
-        loss_buffer = []
 
-        with caplog.at_level(logging.WARNING):
-            pp_recipe._forward_backward_step(
-                idx=0,
-                batch=batch,
-                loss_buffer=loss_buffer,
-                num_label_tokens=40,
-                num_batches=1,
-                is_train=True,
-            )
-
-        # Should log warning about mismatched images
-        assert any("giving all images to first microbatch" in record.message for record in caplog.records)
+        with pytest.raises(ValueError, match="VLM PP chunking cannot align"):
+            _prepare_pp_vlm_batch(batch)
 
     def test_pp_vlm_chunking_with_image_sizes(self, pp_recipe, monkeypatch):
         """Test VLM pixel_values chunking with image_sizes fallback (e.g., Mistral4-style)."""
@@ -1574,6 +1916,7 @@ class TestForwardBackwardStepPP:
             "pixel_values": pixel_values,
             "image_sizes": image_sizes,
         }
+        _prepare_pp_vlm_batch(batch)
         loss_buffer = []
 
         pp_recipe._forward_backward_step(
@@ -1612,6 +1955,7 @@ class TestForwardBackwardStepPP:
             "pixel_values": pixel_values,
             "image_grid_hws": image_grid_hws,
         }
+        _prepare_pp_vlm_batch(batch)
         loss_buffer = []
 
         pp_recipe._forward_backward_step(
@@ -1863,6 +2207,10 @@ def _create_non_pp_recipe(model, device="cpu"):
     recipe.__dict__["distributed_config"] = None
     recipe.__dict__["model_parts"] = [model]
     recipe.__dict__["_get_dp_group_size"] = lambda include_cp=True: 1
+    # ``is_remote_logging_step`` is read by ``_forward_backward_step`` to
+    # gate the joint-drafter loss-log line; default False so non-drafter
+    # test paths don't trip on the new attribute.
+    recipe.__dict__["step_scheduler"] = SimpleNamespace(is_remote_logging_step=False)
     return recipe
 
 
@@ -2198,7 +2546,7 @@ def test_build_optimizer_disables_foreach_with_tp():
     mock_device_mesh.mesh_dim_names = ("dp", "tp")
     mock_device_mesh.__getitem__ = lambda self, key: mock_tp_submesh if key == "tp" else MagicMock()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -2232,7 +2580,7 @@ def test_vlm_build_model_and_optimizer_return_values():
     cfg_model = NeMoVLMModelConfig()
     cfg_opt = DummyOptConfig(lr=0.01)
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -2264,7 +2612,7 @@ def test_vlm_build_model_validates_nemo_auto_model_entry_points(entry_point):
 
     cfg_model = NeMoVLMModelConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         # Should not raise - entry point should be recognized
         model = build_model(
             cfg_model=cfg_model,
@@ -2295,7 +2643,7 @@ def test_vlm_build_model_accepts_multimodal_lm_entry_points(entry_point):
 
     cfg_model = NeMoVLMModelConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -2383,8 +2731,12 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
         lambda *a, **k: None,
     )
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.torch.cuda.reset_peak_memory_stats", lambda: None)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_dp_rank", lambda self, include_cp=False: 0)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_dp_group_size", lambda self, include_cp=False: 1)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_dp_rank", lambda self, include_cp=False: 0
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_dp_group_size", lambda self, include_cp=False: 1
+    )
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_cp_group_size", lambda self: 1)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_tp_rank", lambda self: 0)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_pp_rank", lambda self: 0)
@@ -2440,53 +2792,53 @@ def test_vlm_rope_fusion_stays_false_when_already_disabled(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _chunk_vlm_media tests
+# chunk_vlm_media tests
 # ---------------------------------------------------------------------------
 
 
 class TestChunkVlmMedia:
-    """Tests for _chunk_vlm_media PP microbatch splitting."""
+    """Tests for PP VLM media microbatch splitting."""
 
     def test_4d_pixel_values_simple_chunk(self):
-        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
-
         pixel_values = torch.randn(4, 3, 56, 56)
         image_grid = torch.tensor([[1, 2, 2]] * 4)
-        pv_chunks, ig_chunks = _chunk_vlm_media(pixel_values, image_grid, batch_size=4, n_microbatches=2)
+        pv_chunks, ig_chunks = chunk_vlm_media(pixel_values, image_grid, batch_size=4, n_microbatches=2)
         assert len(pv_chunks) == 2
         assert pv_chunks[0].shape[0] == 2
         assert pv_chunks[1].shape[0] == 2
 
     def test_n_images_per_sample_packed(self):
         """Packed sequences: each batch item has variable number of images."""
-        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
-
         # 2 batch items: first has 3 images, second has 1 image
         # image_grid: 4 images total, each 2x2 patches = 4 patches each
         image_grid = torch.tensor([[1, 2, 2], [1, 2, 2], [1, 2, 2], [1, 2, 2]])
         pixel_values = torch.randn(16, 64)  # 4 images * 4 patches = 16 patches
         n_images_per_sample = torch.tensor([3, 1])
 
-        pv_chunks, ig_chunks = _chunk_vlm_media(
-            pixel_values, image_grid, batch_size=2, n_microbatches=2,
+        pv_chunks, ig_chunks = chunk_vlm_media(
+            pixel_values,
+            image_grid,
+            batch_size=2,
+            n_microbatches=2,
             n_images_per_sample=n_images_per_sample,
         )
         assert len(pv_chunks) == 2
         assert ig_chunks[0].shape[0] == 3  # first batch item: 3 images
         assert ig_chunks[1].shape[0] == 1  # second batch item: 1 image
         assert pv_chunks[0].shape[0] == 12  # 3 images * 4 patches
-        assert pv_chunks[1].shape[0] == 4   # 1 image * 4 patches
+        assert pv_chunks[1].shape[0] == 4  # 1 image * 4 patches
 
     def test_legacy_one_image_per_sample(self):
-        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
-
         # 4 samples, 1 image each with different patch counts
         image_grid = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 2], [1, 3, 3]])
         patch_counts = image_grid.prod(dim=1)  # [4, 9, 4, 9] = 26 total
         pixel_values = torch.randn(int(patch_counts.sum()), 64)
 
-        pv_chunks, ig_chunks = _chunk_vlm_media(
-            pixel_values, image_grid, batch_size=4, n_microbatches=2,
+        pv_chunks, ig_chunks = chunk_vlm_media(
+            pixel_values,
+            image_grid,
+            batch_size=4,
+            n_microbatches=2,
         )
         assert len(pv_chunks) == 2
         assert ig_chunks[0].shape[0] == 2
@@ -2494,16 +2846,324 @@ class TestChunkVlmMedia:
         assert pv_chunks[0].shape[0] == 4 + 9  # first 2 images
         assert pv_chunks[1].shape[0] == 4 + 9  # last 2 images
 
-    def test_fallback_mismatched_images(self):
-        """When n_images != batch_size and no n_images_per_sample, all go to first mb."""
-        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
+    def test_qwen35_ep4_pp2_style_n_images_per_sample(self):
+        """EP does not affect chunking; PP2 should split media by batch sample ownership."""
+        image_grid = torch.tensor([[1, 2, 2], [1, 1, 3], [1, 3, 3], [1, 2, 4]])
+        patch_counts = image_grid.prod(dim=1)
+        pixel_values = torch.randn(int(patch_counts.sum()), 64)
+        n_images_per_sample = torch.tensor([1, 0, 2, 1])
 
+        pv_chunks, ig_chunks = chunk_vlm_media(
+            pixel_values,
+            image_grid,
+            batch_size=4,
+            n_microbatches=2,
+            n_images_per_sample=n_images_per_sample,
+        )
+
+        assert len(pv_chunks) == 2
+        assert torch.equal(ig_chunks[0], image_grid[:1])
+        assert torch.equal(ig_chunks[1], image_grid[1:])
+        assert pv_chunks[0].shape[0] == int(patch_counts[:1].sum())
+        assert pv_chunks[1].shape[0] == int(patch_counts[1:].sum())
+
+    def test_fallback_mismatched_images_raises(self):
+        """n_images != batch_size with no n_images_per_sample now raises rather
+        than silently emptying mb1..N (which previously caused trailing microbatches
+        to scatter media tokens into empty pixel_values)."""
         image_grid = torch.tensor([[1, 2, 2], [1, 2, 2], [1, 2, 2]])
         pixel_values = torch.randn(12, 64)  # 3 images but batch_size=2
 
-        pv_chunks, ig_chunks = _chunk_vlm_media(
-            pixel_values, image_grid, batch_size=2, n_microbatches=2,
+        with pytest.raises(ValueError, match="VLM PP chunking cannot align"):
+            chunk_vlm_media(
+                pixel_values,
+                image_grid,
+                batch_size=2,
+                n_microbatches=2,
+            )
+
+    def test_n_videos_per_sample_packed(self):
+        """The media chunk helper also handles video grids/counts."""
+
+        video_grid = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3], [1, 4, 4]])
+        pixel_values_videos = torch.randn(int(video_grid.prod(dim=1).sum().item()), 64)
+        n_videos_per_sample = torch.tensor([1, 0, 2, 1])
+
+        pv_chunks, vg_chunks = chunk_vlm_media(
+            pixel_values_videos,
+            video_grid,
+            batch_size=4,
+            n_microbatches=2,
+            n_images_per_sample=n_videos_per_sample,
         )
+
         assert len(pv_chunks) == 2
-        assert pv_chunks[0].shape[0] == 12  # all in first
-        assert pv_chunks[1].shape[0] == 0   # empty
+        assert vg_chunks[0].shape[0] == 1
+        assert vg_chunks[1].shape[0] == 3
+        assert pv_chunks[0].shape[0] == 4
+        assert pv_chunks[1].shape[0] == 9 + 6 + 16
+
+    def test_uneven_batch_size_general_branch_covers_all_samples(self):
+        """batch_size not divisible by n_microbatches must not drop trailing samples.
+
+        torch.tensor.chunk(n) used by schedule.step on input_ids returns ceil-sized
+        chunks. chunk_vlm_media must mirror that or the last sample's images are
+        silently lost while its text still flows through the schedule.
+        """
+
+        # 7 samples across 3 microbatches: ceil(7/3)=3, expect splits [3, 3, 1].
+        batch_size, n_microbatches = 7, 3
+        image_grid = torch.tensor([[1, 2, 2]] * batch_size)  # 4 patches/image
+        pixel_values = torch.randn(int(image_grid.prod(dim=1).sum().item()), 64)
+        n_images_per_sample = torch.tensor([1] * batch_size)
+
+        pv_chunks, ig_chunks = chunk_vlm_media(
+            pixel_values,
+            image_grid,
+            batch_size=batch_size,
+            n_microbatches=n_microbatches,
+            n_images_per_sample=n_images_per_sample,
+        )
+
+        assert len(ig_chunks) == n_microbatches
+        assert [c.shape[0] for c in ig_chunks] == [3, 3, 1]
+        assert sum(c.shape[0] for c in ig_chunks) == batch_size  # no sample dropped
+        assert sum(c.shape[0] for c in pv_chunks) == pixel_values.shape[0]
+
+    def test_uneven_batch_size_legacy_branch_covers_all_images(self):
+        """Legacy 1-image-per-sample branch must also use ceil division."""
+
+        # 5 images across 3 microbatches: ceil(5/3)=2, expect splits [2, 2, 1].
+        batch_size, n_microbatches = 5, 3
+        image_grid = torch.tensor([[1, 2, 2]] * batch_size)
+        pixel_values = torch.randn(int(image_grid.prod(dim=1).sum().item()), 64)
+
+        pv_chunks, ig_chunks = chunk_vlm_media(
+            pixel_values,
+            image_grid,
+            batch_size=batch_size,
+            n_microbatches=n_microbatches,
+        )
+
+        assert len(ig_chunks) == n_microbatches
+        assert [c.shape[0] for c in ig_chunks] == [2, 2, 1]
+        assert sum(c.shape[0] for c in ig_chunks) == batch_size
+
+    def test_uneven_batch_size_gemma4_multi_image_branch_covers_all_samples(self):
+        """Gemma4 multi-image branch (3D pixel_values + counts) must also use ceil."""
+        # 7 samples across 3 microbatches: ceil(7/3)=3, expect sample splits [3, 3, 1].
+        # Image counts per split are [2 + 1 + 0, 3 + 1 + 2, 1] = [3, 6, 1].
+        batch_size, n_microbatches = 7, 3
+        max_patches = 4
+        n_images_per_sample = torch.tensor([2, 1, 0, 3, 1, 2, 1])
+        n_images = int(n_images_per_sample.sum().item())
+        image_grid = torch.tensor([[1, 2, 2]] * n_images)
+        pixel_values = torch.randn(n_images, max_patches, 64)  # 3D, one row per image.
+
+        pv_chunks, ig_chunks = chunk_vlm_media(
+            pixel_values,
+            image_grid,
+            batch_size=batch_size,
+            n_microbatches=n_microbatches,
+            n_images_per_sample=n_images_per_sample,
+        )
+
+        assert len(ig_chunks) == n_microbatches
+        assert [c.shape[0] for c in ig_chunks] == [3, 6, 1]
+        assert [c.shape[0] for c in pv_chunks] == [3, 6, 1]
+        assert sum(c.shape[0] for c in pv_chunks) == n_images
+
+    def test_step3_media_chunks_full_images_and_flat_patches(self):
+        pixel_values = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
+        patch_pixel_values = torch.arange(6 * 2, dtype=torch.float32).reshape(6, 2)
+        patch_newline_mask = torch.tensor([True, False, False, True, False, True])
+        num_patches = torch.tensor([2, 0, 3, 1])
+
+        chunks = chunk_step3_media(
+            pixel_values,
+            batch_size=4,
+            n_microbatches=2,
+            num_patches=num_patches,
+            patch_pixel_values=patch_pixel_values,
+            patch_newline_mask=patch_newline_mask,
+        )
+
+        assert torch.equal(chunks["pixel_values"][0], pixel_values[:2])
+        assert torch.equal(chunks["pixel_values"][1], pixel_values[2:])
+        assert torch.equal(chunks["num_patches"][0], torch.tensor([2, 0]))
+        assert torch.equal(chunks["num_patches"][1], torch.tensor([3, 1]))
+        assert torch.equal(chunks["patch_pixel_values"][0], patch_pixel_values[:2])
+        assert torch.equal(chunks["patch_pixel_values"][1], patch_pixel_values[2:])
+        assert torch.equal(chunks["patch_newline_mask"][0], patch_newline_mask[:2])
+        assert torch.equal(chunks["patch_newline_mask"][1], patch_newline_mask[2:])
+
+    def test_step3_media_defaults_num_patches_and_validates_shapes(self):
+        pixel_values = torch.randn(3, 2)
+        chunks = chunk_step3_media(pixel_values, batch_size=3, n_microbatches=2)
+        assert [chunk.tolist() for chunk in chunks["num_patches"]] == [[0, 0], [0]]
+        assert "patch_pixel_values" not in chunks
+        assert "patch_newline_mask" not in chunks
+
+        with pytest.raises(ValueError, match="one full image tensor per sample"):
+            chunk_step3_media(pixel_values[:2], batch_size=3, n_microbatches=2)
+        with pytest.raises(ValueError, match="num_patches must have length"):
+            chunk_step3_media(pixel_values, batch_size=3, n_microbatches=2, num_patches=torch.tensor([1, 2]))
+
+    def test_prepare_step3_media_without_image_grid_and_stage_cleanup(self):
+        model = SimpleNamespace()
+        pp = SimpleNamespace(info=SimpleNamespace(has_first_stage=True))
+        batch = {
+            "input_ids": torch.ones(4, 3, dtype=torch.long),
+            "pixel_values": torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3),
+            "patch_pixel_values": torch.arange(4 * 2, dtype=torch.float32).reshape(4, 2),
+            "num_patches": torch.tensor([1, 0, 2, 1]),
+            "patch_newline_mask": torch.tensor([True, False, True, False]),
+        }
+
+        prepared = prepare_vlm_media_for_pp(batch, batch_size=4, n_microbatches=2)
+
+        assert "pixel_values" not in prepared
+        assert "patch_pixel_values" not in prepared
+        assert "num_patches" not in prepared
+        assert "patch_newline_mask" not in prepared
+        assert VLM_PP_MEDIA_KEY in prepared
+
+        with stage_vlm_media_for_pp(pp, [model], prepared):
+            assert len(model._vlm_pixel_values_chunks) == 2
+            assert len(model._vlm_patch_pixel_values_chunks) == 2
+            assert len(model._vlm_num_patches_chunks) == 2
+            assert len(model._vlm_patch_newline_mask_chunks) == 2
+            assert model._vlm_chunk_idx == 0
+
+        assert model._vlm_pixel_values_chunks is None
+        assert model._vlm_patch_pixel_values_chunks is None
+        assert model._vlm_num_patches_chunks is None
+        assert model._vlm_patch_newline_mask_chunks is None
+        assert model._vlm_chunk_idx is None
+
+
+# -----------------------------------------------------------------------------
+# get_rope_index forwarding tests for build_dataloader
+#
+# Guard against a regression where the VLM recipe forgot to pass
+# get_rope_index to neat_pack_dataset_vlm, silently degrading mRoPE to
+# plain 1D positions for packed Qwen2.5-VL / Qwen3-VL training.
+# -----------------------------------------------------------------------------
+
+
+def _make_packing_cfg(pack_size=128):
+    cfg = MagicMock()
+    cfg.pack_size = pack_size
+    cfg.pretokenize = True
+    cfg.max_length = pack_size
+    cfg.get.side_effect = lambda key, default=None: {
+        "pack_size": pack_size,
+        "drop_long_samples": True,
+        "max_packs": None,
+        "packing_ratio": 1.0,
+        "balance_media_tokens": True,
+        "collate_max_length": None,
+        "post_tokenize_hook_fn": None,
+    }.get(key, default)
+    return cfg
+
+
+def _make_dataset_cfg():
+    cfg = MagicMock(spec=["get", "instantiate", "path_or_dataset"])
+    cfg.get.side_effect = lambda key, default=None: {
+        "path_or_dataset": None,
+        "truncate": True,
+    }.get(key, default)
+    cfg.path_or_dataset = None
+    cfg.instantiate.return_value = []
+    return cfg
+
+
+def _patches_for_packing(neat_pack_side_effect):
+    processor = MagicMock()
+    processor.tokenizer.pad_token_id = 0
+    processor.chat_template = "{{ x }}"
+    return processor, [
+        patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch(
+            "nemo_automodel.components.datasets.vlm.datasets.PreTokenizedDatasetWrapper",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
+            side_effect=neat_pack_side_effect,
+        ),
+        patch("nemo_automodel.components.models.common.packing.configure_packing"),
+        patch(
+            "nemo_automodel.components.models.common.packing.get_attn_implementation",
+            return_value="sdpa",
+        ),
+    ]
+
+
+def test_build_dataloader_forwards_get_rope_index_to_packing():
+    """get_rope_index passed to build_dataloader must reach neat_pack_dataset_vlm."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    sentinel = MagicMock(name="get_rope_index")
+    captured = {}
+
+    def fake_neat_pack(*args, **kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        build_dataloader(
+            _make_dataset_cfg(),
+            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            "test/model",
+            None,
+            None,
+            42,
+            1,
+            cfg_ps=_make_packing_cfg(pack_size=64),
+            get_rope_index=sentinel,
+        )
+
+    assert captured.get("get_rope_index") is sentinel, (
+        f"build_dataloader must forward get_rope_index to neat_pack_dataset_vlm; got kwargs={list(captured.keys())}"
+    )
+
+
+def test_build_dataloader_default_get_rope_index_is_none():
+    """When the model does not expose get_rope_index, packing must receive None."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    captured = {}
+
+    def fake_neat_pack(*args, **kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        build_dataloader(
+            _make_dataset_cfg(),
+            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            "test/model",
+            None,
+            None,
+            42,
+            1,
+            cfg_ps=_make_packing_cfg(pack_size=64),
+        )
+
+    assert "get_rope_index" in captured, "neat_pack_dataset_vlm must receive get_rope_index kwarg even when None"
+    assert captured["get_rope_index"] is None

@@ -1,0 +1,103 @@
+---
+title: "Hy3-preview"
+description: ""
+position: 7
+---
+## Introduction
+
+[tencent/Hy3-preview](https://huggingface.co/tencent/Hy3-preview) is a 295B Mixture-of-Experts language model from Tencent. It features 80 transformer layers (layer 0 dense, layers 1–79 MoE), 192 routed experts plus one shared expert per MoE block with top-8 sigmoid routing, Grouped Query Attention (64 Q / 8 KV heads, `head_dim=128`), per-head QK RMSNorm applied before RoPE, and an `expert_bias` buffer (surfaced as `e_score_correction_bias` in the Automodel gate) for expert-load correction during inference. The model supports a 256K context window via long-context RoPE (`rope_theta=11158840`).
+
+This guide walks you through fine-tuning Hy3-preview on HellaSwag using NVIDIA NeMo Automodel. You will learn how to configure the recipe, launch training, and inspect the results.
+
+To set up your environment to run NeMo Automodel, follow the [installation guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
+
+## Data
+
+### HellaSwag
+
+We use [HellaSwag](https://huggingface.co/datasets/Rowan/hellaswag), a commonsense natural-language-inference dataset consisting of context + four candidate continuations. The version used here is the standard `rowan/hellaswag` HuggingFace split, formatted for next-token-prediction fine-tuning.
+
+- **Train / validation splits** taken directly from the HuggingFace dataset.
+- **Tokenizer**: shared with the base model (`AutoTokenizer.from_pretrained` on the Hy3-preview checkpoint).
+- **Padding**: `pad_seq_len_divisible=64` via the default collater.
+
+For the full HellaSwag dataset wrapper used in NeMo Automodel, see [`nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/hellaswag.py).
+
+## Architecture Notes
+
+Hy3-preview is a large-scale MoE with a few details that are worth calling out explicitly. The NeMo Automodel state-dict adapter and training recipe handle all of these transparently:
+
+- **Dense-first MoE layout**: layer 0 is a standard dense MLP (`intermediate_size=1536`); layers 1–79 use the MoE block (192 routed experts + 1 shared expert). This is controlled by `first_k_dense_replace=1` in the config.
+- **GQA with per-head QK RMSNorm**: 64 Q heads and 8 KV heads (`head_dim=128`). A separate RMSNorm is applied independently to each head's Q and K projections before RoPE is applied — this is distinct from a single pre-attention layer norm and requires care when remapping projection weights.
+- **Sigmoid routing with expert-bias correction**: expert selection uses a sigmoid score (not softmax). The `e_score_correction_bias` buffer tracks per-expert load imbalance; during fine-tuning the bias update factor is set to zero (`gate_bias_update_factor=0.0`) so the bias stays frozen. The buffer is created in the Automodel gate to ensure the HF checkpoint loads cleanly.
+- **Shared expert**: each MoE block contains one always-active shared expert (`num_shared_experts=1`) whose output is added unconditionally alongside the routed output.
+- **MTP layers**: the released checkpoint contains additional multi-token-prediction layers at indices ≥ 80 (`num_nextn_predict_layers`). These are filtered out by the state-dict adapter on load and are not used during standard SFT.
+- **Long-context RoPE**: `rope_theta=11158840` with dynamic NTK-aware scaling (`beta_slow` / `beta_fast`) extending the context to 256K tokens.
+
+## Checkpoint Format
+
+The released `tencent/Hy3-preview` safetensors use a per-expert split layout and Tencent-specific key names that differ from the batched `GroupedExperts` convention used inside Automodel. The `HYV3StateDictAdapter` converts between the two transparently in three steps:
+
+**1. Per-expert tensors → grouped form.**
+On disk every expert is stored as three separate rank-3 tensors:
+
+```
+model.layers.{L}.mlp.experts.{E}.gate_proj.weight   # [moe_inter, hidden]
+model.layers.{L}.mlp.experts.{E}.up_proj.weight     # [moe_inter, hidden]
+model.layers.{L}.mlp.experts.{E}.down_proj.weight   # [hidden, moe_inter]
+```
+
+The adapter merges these across all 192 experts and stacks gate + up into a single fused tensor, landing at the Automodel layout:
+
+```
+model.layers.{L}.mlp.experts.gate_and_up_projs      # [n_local, hidden, 2*moe_inter]
+model.layers.{L}.mlp.experts.down_projs             # [n_local, moe_inter, hidden]
+```
+
+where `n_local = n_experts / ep_size` (the slice owned by the current EP rank).
+
+**2. Three HYV3-specific key renames.**
+
+| On-disk (HF) key | Native Automodel key |
+|---|---|
+| `mlp.expert_bias` | `mlp.gate.e_score_correction_bias` |
+| `mlp.router.gate.weight` | `mlp.gate.weight` |
+| `mlp.shared_mlp.*` | `mlp.shared_experts.*` |
+
+All other keys (attention projections, norms, embeddings, `lm_head`) are identical between formats.
+
+**3. MTP layer filtering.**
+Keys at layer indices ≥ `num_hidden_layers` (default 80) are silently dropped on load.
+
+## Launch Training
+
+A ready-to-use recipe ships at [`examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml). The yaml header documents how to adjust `ep_size` and `pp_size` for different cluster configurations.
+
+NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide.
+
+### Standalone Slurm Script
+
+Below is a standalone Slurm script example for the HellaSwag recipe. Before running it, ensure your cluster environment is configured following the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide. Then submit the job:
+
+```bash
+export TRANSFORMERS_OFFLINE=1
+export HF_HOME=your/path/to/hf_cache
+export HF_DATASETS_OFFLINE=1
+export WANDB_API_KEY=your_wandb_key
+
+srun --output=output.out \
+     --error=output.err \
+     --container-image /your/path/to/automodel.image.sqsh --no-container-mount-home bash -c "
+  CUDA_DEVICE_MAX_CONNECTIONS=1 automodel \
+  examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml \
+  --nproc-per-node=8 \
+  --model.config.pretrained_model_name_or_path=/your/local/hy3-preview \
+  --model.config.name_or_path=/your/local/hy3-preview "
+```
+
+**Before you start**:
+- Hugging Face applies rate limits on downloads. We recommend cloning the model repository to your local filesystem beforehand.
+- Ensure your Hugging Face cache (`HF_HOME`) is configured and that the dataset is already cached locally.
+- To enable Weights & Biases logging, set your `WANDB_API_KEY` and uncomment the `wandb` section at the bottom of the YAML file.
+- The full recipe uses `pp_size=4` and `ep_size=32` (128 GPUs total). Valid `ep_size` values are any divisor of 192 (e.g. 8, 16, 24, 32, 48, 64, 96, 192); adjust `pp_size` and `--nproc-per-node` to match your node count.
+- For a quick end-to-end smoke test on 8 GPUs use [`examples/llm_finetune/hy_v3/hy3_4layer_p0_smoke.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_4layer_p0_smoke.yaml), which builds only the first 4 layers.

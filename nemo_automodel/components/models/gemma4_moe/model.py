@@ -795,6 +795,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                     per_layer_inputs=per_layer_inputs,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
+                    mm_token_type_ids=mm_token_type_ids,
                     past_key_values=past_key_values,
                     use_cache=use_cache,
                     **kwargs,

@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import types
-
 from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn as nn
@@ -858,16 +857,17 @@ class TestAutoPipelineUpdateSeqLen:
         # Track the call args
         import nemo_automodel.components.distributed.pipelining.autopipeline as ap_mod
         captured_args = []
-        def mock_reset(schedule, stages, model_config, microbatch_size, seq_len):
-            captured_args.append((schedule, stages, model_config, microbatch_size, seq_len))
+        def mock_reset(schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype=None):
+            captured_args.append((schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype))
         monkeypatch.setattr(ap_mod, "reset_pp_stage_shapes", mock_reset)
 
         ap.update_seq_len(256)
 
         assert len(captured_args) == 1
-        _, _, _, mb_size, sl = captured_args[0]
+        _, _, _, mb_size, sl, tensor_dtype = captured_args[0]
         assert mb_size == 2  # pp_microbatch_size
         assert sl == 256
+        assert tensor_dtype is ap.dtype
 
     def test_update_seq_len_tracks_current(self, monkeypatch):
         """update_seq_len should track current seq_len and reset on change."""

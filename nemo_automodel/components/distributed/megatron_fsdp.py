@@ -32,9 +32,7 @@ try:
     from megatron_fsdp.fully_shard import fully_shard_optimizer as megatron_fsdp_fully_shard_optimizer
 
     HAS_MEGATRON_FSDP = True
-except (ImportError, FileNotFoundError):
-    # raise FileNotFoundError(
-    # E   FileNotFoundError: Could not find shared object file for Transformer Engine torch lib.
+except (ImportError, FileNotFoundError, OSError):
     MegatronFSDP = None
     megatron_fsdp_fully_shard_optimizer = None
     HAS_MEGATRON_FSDP = False
@@ -126,6 +124,7 @@ class MegatronFSDPManager:
                 model,
                 sequence_parallel=False,  # explicit: SP not supported here
                 tp_shard_plan=None,
+                tp_size=self.device_mesh["tp"].size(),
             )
         else:
             tp_shard_plan = None

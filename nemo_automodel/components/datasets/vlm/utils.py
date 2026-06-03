@@ -234,6 +234,7 @@ def _build_video_metadata(conversation):
 
 
 def default_stop_tokens(processor) -> Iterable[str]:
+    """Return default generation stop tokens for a processor tokenizer."""
     tokenizer = getattr(processor, "tokenizer", None)
     eos_token = getattr(tokenizer, "eos_token", None) if tokenizer is not None else None
     candidates = [

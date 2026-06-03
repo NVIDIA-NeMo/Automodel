@@ -406,6 +406,52 @@ def _parallelize_ministral3(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+def _parallelize_nemotron_labs_diffusion(
+    model,  # NemotronLabsDiffusionModel — loaded via trust_remote_code, not importable.
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """TP plan for ``NemotronLabsDiffusionModel`` (Nemotron-Labs-Diffusion).
+
+    Same shape as :func:`_parallelize_ministral3` but the model uses
+    ``encoder.*`` (not ``model.*``) and the output head is ``diffusion_head``
+    (not ``lm_head``).
+    """
+    base_model_tp_plan: dict[str, ParallelStyle] = {
+        "encoder.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        "encoder.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "encoder.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "encoder.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "encoder.layers.*.self_attn.o_proj": RowwiseParallel(),
+        "encoder.layers.*.mlp.up_proj": ColwiseParallel(),
+        "encoder.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "encoder.layers.*.mlp.down_proj": RowwiseParallel(),
+        "diffusion_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    base_model_sp_plan = {
+        "encoder.embed_tokens": VocabParallelEmbedding(
+            input_layouts=Replicate(),
+            output_layouts=Shard(1),
+            use_local_output=False,
+        ),
+        "encoder.norm": SequenceParallel(),
+        "encoder.layers.*.input_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
+        "encoder.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+        "encoder.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
+        "encoder.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+        "diffusion_head": ColwiseParallel(
+            input_layouts=Shard(1),
+            output_layouts=Shard(-1),
+            use_local_output=False,
+        ),
+    }
+
+    if sequence_parallel:
+        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
 def _parallelize_mistral3_vlm(
     model,
     sequence_parallel: bool = False,
@@ -645,4 +691,7 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
     _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,
     _get_class_qualname(CustomQwen2ForCausalLM): _parallelize_qwen,
+    # trust_remote_code models — matched by bare class __name__ in parallelizer
+    # because their qualname includes a snapshot-hash-bearing module path.
+    "NemotronLabsDiffusionModel": _parallelize_nemotron_labs_diffusion,
 }
