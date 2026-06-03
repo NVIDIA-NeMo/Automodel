@@ -150,8 +150,10 @@ class TestBlock:
         bsz, seq = 2, 4
         x = torch.randn(bsz, seq, HIDDEN, device=device, dtype=torch.bfloat16)
         freqs = torch.zeros(1, seq, HEAD_DIM, device=device)
-        with patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn, \
-             patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp:
+        with (
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+        ):
             out = block(x, freqs_cis=freqs)
         assert out.shape == x.shape
         mock_attn.assert_called_once()
@@ -162,8 +164,10 @@ class TestBlock:
         x = torch.randn(1, 3, HIDDEN, device=device, dtype=torch.bfloat16)
         freqs = torch.zeros(1, 3, HEAD_DIM, device=device)
         mask = torch.tensor([[1, 1, 0]], dtype=torch.bool, device=device)
-        with patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)), \
-             patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp:
+        with (
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)),
+            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+        ):
             block(x, freqs_cis=freqs, attention_mask=mask)
         _, kwargs = mock_mlp.call_args
         torch.testing.assert_close(kwargs["padding_mask"], mask.logical_not())
@@ -181,10 +185,12 @@ class TestBlock:
 
     def test_init_weights_invokes_subcomponents(self, config, moe_config, backend_config, device):
         block = Block(layer_idx=1, config=config, moe_config=moe_config, backend=backend_config).to(device)
-        with patch.object(block.input_layernorm, "reset_parameters") as in_norm, \
-             patch.object(block.post_attention_layernorm, "reset_parameters") as post_norm, \
-             patch.object(block.self_attn, "init_weights") as attn_init, \
-             patch.object(block.mlp, "init_weights") as mlp_init:
+        with (
+            patch.object(block.input_layernorm, "reset_parameters") as in_norm,
+            patch.object(block.post_attention_layernorm, "reset_parameters") as post_norm,
+            patch.object(block.self_attn, "init_weights") as attn_init,
+            patch.object(block.mlp, "init_weights") as mlp_init,
+        ):
             block.init_weights(buffer_device=device)
         in_norm.assert_called_once()
         post_norm.assert_called_once()
@@ -242,7 +248,9 @@ class TestHYV3Model:
         model = HYV3Model(config, backend=backend_config).to(device)
         bsz, seq = 1, 4
         input_ids = torch.randint(0, config.vocab_size, (bsz, seq), device=device)
-        with patch.object(Block, "forward", side_effect=lambda x=None, **kw: x if x is not None else kw["x"]) as mock_block:
+        with patch.object(
+            Block, "forward", side_effect=lambda x=None, **kw: x if x is not None else kw["x"]
+        ) as mock_block:
             out = model(input_ids)
         assert out.shape == (bsz, seq, HIDDEN)
         assert mock_block.call_count == config.num_hidden_layers
@@ -258,8 +266,10 @@ class TestHYV3Model:
     def test_init_weights_resets_layers_norm_embeddings(self, config, backend_config, device):
         model = HYV3Model(config, backend=backend_config).to(device)
         embed_before = model.embed_tokens.weight.detach().clone()
-        with patch.object(model.norm, "reset_parameters") as mock_norm, \
-             patch.object(Block, "init_weights") as mock_layer_init:
+        with (
+            patch.object(model.norm, "reset_parameters") as mock_norm,
+            patch.object(Block, "init_weights") as mock_layer_init,
+        ):
             model.init_weights(buffer_device=device)
         mock_norm.assert_called_once()
         assert mock_layer_init.call_count == config.num_hidden_layers
@@ -314,8 +324,9 @@ class TestHYV3ForCausalLM:
         input_ids = torch.randint(0, config.vocab_size, (bsz, seq), device=device)
         fake_hidden = torch.randn(bsz, seq, config.hidden_size, device=device, dtype=torch.bfloat16)
         with patch.object(model.model, "forward", return_value=fake_hidden):
-            logits = model(input_ids)
-        assert logits.shape == (bsz, seq, config.vocab_size)
+            out = model(input_ids)
+        # forward now returns a CausalLMOutputWithPast; logits live on `.logits`.
+        assert out.logits.shape == (bsz, seq, config.vocab_size)
 
     def test_initialize_weights_invokes_inner_init(self, config, backend_config, device):
         model = HYV3ForCausalLM(config, backend=backend_config).to(device)
@@ -354,9 +365,9 @@ class TestHYV3ForCausalLM:
             update_mock.assert_not_called()
 
     def test_update_moe_gate_bias_calls_when_factor_positive(self, config, backend_config, device):
-        model = HYV3ForCausalLM(
-            config, backend=backend_config, moe_overrides={"gate_bias_update_factor": 1e-3}
-        ).to(device)
+        model = HYV3ForCausalLM(config, backend=backend_config, moe_overrides={"gate_bias_update_factor": 1e-3}).to(
+            device
+        )
         called = 0
         for layer in model.model.layers.values():
             if isinstance(layer.mlp, MoE):
@@ -371,8 +382,10 @@ class TestHYV3ForCausalLM:
         assert isinstance(model, HYV3ForCausalLM)
 
     def test_from_pretrained_resolves_config_then_delegates(self, config, backend_config):
-        with patch("transformers.AutoConfig.from_pretrained", return_value=config) as mock_acfg, \
-             patch.object(HYV3ForCausalLM, "from_config", wraps=HYV3ForCausalLM.from_config) as mock_fc:
+        with (
+            patch("transformers.AutoConfig.from_pretrained", return_value=config) as mock_acfg,
+            patch.object(HYV3ForCausalLM, "from_config", wraps=HYV3ForCausalLM.from_config) as mock_fc,
+        ):
             model = HYV3ForCausalLM.from_pretrained("tencent/Hy3-preview", backend=backend_config)
         mock_acfg.assert_called_once()
         mock_fc.assert_called_once()

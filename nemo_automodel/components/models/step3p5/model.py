@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import BackendConfig, get_rope_config, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -471,9 +472,40 @@ class Step3p5ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+    ) -> CausalLMOutputWithPast:
+        """Forward pass returning :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`.
+
+        Supports both BSHD format (``input_ids`` shape ``[B, S]``) and THD format
+        (``input_ids`` shape ``[1, T]``); when ``attn_kwargs["qkv_format"] == "thd"``,
+        inputs are squeezed to THD before the base-model forward and ``logits`` (and the
+        final ``hidden_states``) are unsqueezed back to a leading-batch dimension on exit.
+
+        Args:
+            input_ids: Input token IDs.
+            position_ids: Optional position indices.
+            attention_mask: Optional 2D padding mask.
+            padding_mask: Optional padding mask used by the THD squeeze helper.
+            logits_to_keep: If ``0`` (default), compute logits for all positions; if ``> 0``
+                (or a tensor), only compute logits for the last ``logits_to_keep`` positions
+                (avoids materialising the full logit matrix during generation / fused CE).
+            output_hidden_states: Whether to carry the final hidden states on the output.
+            **attn_kwargs: Additional arguments forwarded to the base model.
+
+        Returns:
+            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with ``logits`` and,
+            when ``output_hidden_states`` is set, the final ``hidden_states``.
+        """
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = attn_kwargs.get("qkv_format") == "thd"
+        if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
@@ -486,12 +518,31 @@ class Step3p5ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        logits = self.lm_head(hidden) if self.lm_head else hidden
 
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+        # Only compute necessary logits (optimization for training and generation).
+        # DTensor compatibility: when logits_to_keep == 0, slice(0, None) would select all
+        # elements but DTensor cannot be sliced over its full range; skip slicing entirely.
+        if self.lm_head is None:
+            logits = hidden
+        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden)
+        else:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            # THD hidden is 2D [T, H]; BSHD hidden is 3D [B, S, H].
+            if hidden.dim() == 2:
+                logits = self.lm_head(hidden[slice_indices, :])
+            else:
+                logits = self.lm_head(hidden[:, slice_indices, :])
+
+        final_hidden_states = hidden
+        if is_thd:
             logits = logits.unsqueeze(0)
+            final_hidden_states = final_hidden_states.unsqueeze(0)
 
-        return logits
+        return CausalLMOutputWithPast(
+            logits=logits,
+            hidden_states=final_hidden_states if output_hidden_states else None,
+        )
 
     @torch.no_grad()
     def initialize_weights(

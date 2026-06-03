@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTextConfig,
     Qwen3OmniMoeThinkerConfig,
@@ -283,8 +284,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         output_router_logits: bool | None = None,
         use_audio_in_video: bool | None = None,
         video_second_per_grid: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor | dict:
+    ) -> torch.Tensor | dict | CausalLMOutputWithPast:
         """Forward pass with multimodal fusion.
 
         Args:
@@ -304,11 +307,26 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             output_router_logits: Whether to output router logits
             use_audio_in_video: Whether audio is in video
             video_second_per_grid: Seconds per grid for videos
+            logits_to_keep: If > 0, only compute logits for the last
+                ``logits_to_keep`` token positions (0 = all positions). Enables
+                memory-efficient fused cross-entropy by letting the recipe request
+                a single-position lm_head projection alongside the final hidden
+                states.
+            output_hidden_states: When set, the returned output carries the final
+                hidden states (the input to ``lm_head``) so the recipe can run
+                fused linear cross-entropy.
             **attn_kwargs: Additional attention arguments
 
         Returns:
-            Logits tensor or dict with loss/aux_loss if labels provided
+            Logits tensor, a dict with loss/aux_loss if labels provided, or a
+            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`
+            carrying the final hidden states when ``output_hidden_states`` is set.
         """
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
         if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
@@ -447,7 +465,20 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             **attn_kwargs,
         )
 
-        logits = self.lm_head(hidden) if self.lm_head else hidden
+        # Optionally restrict the lm_head projection to the last few positions
+        # (memory-efficient fused cross-entropy / generation). When
+        # logits_to_keep == 0 we project all positions; we deliberately avoid
+        # slicing in that case because DTensor cannot slice a full range.
+        if not self.lm_head:
+            logits = hidden
+        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden)
+        else:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            if hidden.dim() == 2:
+                logits = self.lm_head(hidden[slice_indices, :])
+            else:
+                logits = self.lm_head(hidden[:, slice_indices, :])
 
         if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
             logits = logits.unsqueeze(0)
@@ -473,7 +504,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 aux_loss = torch.tensor(0.0, device=logits.device)
                 output["aux_loss"] = aux_loss
 
+            if output_hidden_states:
+                output["hidden_states"] = hidden
+
             return output
+
+        if output_hidden_states:
+            return CausalLMOutputWithPast(logits=logits, hidden_states=hidden)
 
         return logits
 

@@ -14,10 +14,11 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.ernie4_5.configuration_ernie4_5 import Ernie4_5Config
 from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import Ernie4_5_MoeConfig
 
@@ -479,10 +480,18 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+    ) -> CausalLMOutputWithPast:
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
@@ -495,13 +504,23 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        if not (isinstance(logits_to_keep, int) and logits_to_keep == 0):
+
+        # Only compute necessary logits. When logits_to_keep == 0, project all
+        # positions without slicing (DTensor cannot slice a full range).
+        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden)
+        else:
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            hidden = hidden[:, slice_indices, :]
-        logits = self.lm_head(hidden)
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+            if hidden.dim() == 2:
+                logits = self.lm_head(hidden[slice_indices, :])
+            else:
+                logits = self.lm_head(hidden[:, slice_indices, :])
+        if is_thd:
             logits = logits.unsqueeze(0)
-        return logits
+        return CausalLMOutputWithPast(
+            logits=logits,
+            hidden_states=hidden if output_hidden_states else None,
+        )
 
 
 class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
@@ -591,10 +610,18 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+    ) -> CausalLMOutputWithPast:
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
@@ -607,13 +634,23 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        if not (isinstance(logits_to_keep, int) and logits_to_keep == 0):
+
+        # Only compute necessary logits. When logits_to_keep == 0, project all
+        # positions without slicing (DTensor cannot slice a full range).
+        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden)
+        else:
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            hidden = hidden[:, slice_indices, :]
-        logits = self.lm_head(hidden)
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+            if hidden.dim() == 2:
+                logits = self.lm_head(hidden[slice_indices, :])
+            else:
+                logits = self.lm_head(hidden[:, slice_indices, :])
+        if is_thd:
             logits = logits.unsqueeze(0)
-        return logits
+        return CausalLMOutputWithPast(
+            logits=logits,
+            hidden_states=hidden if output_hidden_states else None,
+        )
 
 
 ModelClass = Ernie4_5_MoeForCausalLM

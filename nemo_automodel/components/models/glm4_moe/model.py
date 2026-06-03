@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 
 from nemo_automodel.components.models.common import (
@@ -282,9 +283,18 @@ class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+    ) -> CausalLMOutputWithPast:
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = attn_kwargs.get("qkv_format") == "thd"
+        if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
@@ -297,10 +307,33 @@ class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        logits = self.lm_head(hidden) if self.lm_head else hidden
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+
+        # Final hidden states feeding the lm_head; in THD they are 2D [T, H], in BSHD 3D [B, S, H].
+        final_hidden_states = hidden
+
+        # Only compute necessary logits (optimization for training and generation).
+        # DTensor compatibility: when logits_to_keep == 0, slice(0, None, None) would select all
+        # elements but DTensor cannot slice a full range; skip slicing in that case.
+        if self.lm_head is None:
+            logits = hidden
+        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden)
+        else:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            if hidden.dim() == 2:
+                logits = self.lm_head(hidden[slice_indices, :])
+            else:
+                logits = self.lm_head(hidden[:, slice_indices, :])
+
+        if is_thd:
             logits = logits.unsqueeze(0)
-        return logits
+            # Keep the (full-sequence) hidden states aligned with the unsqueezed logits' batch dim.
+            final_hidden_states = final_hidden_states.unsqueeze(0)
+
+        return CausalLMOutputWithPast(
+            logits=logits,
+            hidden_states=final_hidden_states if output_hidden_states else None,
+        )
 
     @torch.no_grad()
     def initialize_weights(

@@ -16,6 +16,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration as HFQwen3VLMoeForConditionalGeneration,
@@ -526,8 +527,17 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         padding_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        output_hidden_states: bool | None = None,
         **kwargs: Any,
     ):
+        text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(text_config, "output_hidden_states", False)
+        )
+
         # PP VLM support: retrieve pixel_values from stored chunks if not passed directly
         pixel_values = kwargs.get("pixel_values", None)
         pixel_values_videos = kwargs.get("pixel_values_videos", None)
@@ -604,12 +614,27 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
 
         hidden_states = outputs.last_hidden_state
 
-        if self.lm_head is not None:
+        # Pipeline-parallel intermediate stage (no lm_head): pass hidden states through
+        # unchanged so the next stage receives the raw tensor it expects.
+        if self.lm_head is None:
+            return hidden_states
+
+        # Only compute necessary logits (optimization for training and generation).
+        # DTensor compatibility: when logits_to_keep == 0, slicing slice(0, None) would
+        # select all elements but DTensor cannot slice a full range, so skip slicing.
+        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
             logits = self.lm_head(hidden_states)
         else:
-            logits = hidden_states
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            if hidden_states.dim() == 2:
+                logits = self.lm_head(hidden_states[slice_indices, :])
+            else:
+                logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        return logits
+        return CausalLMOutputWithPast(
+            logits=logits,
+            hidden_states=hidden_states if output_hidden_states else None,
+        )
 
     @torch.no_grad()
     def initialize_weights(

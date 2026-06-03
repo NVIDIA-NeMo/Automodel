@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import (
@@ -283,9 +284,18 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+    ) -> CausalLMOutputWithPast:
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
@@ -298,10 +308,27 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        logits = self.lm_head(hidden) if self.lm_head else hidden
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+
+        # Only compute necessary logits. When logits_to_keep == 0 we compute all
+        # positions (training default); slicing a full range would break DTensor.
+        if self.lm_head is None:
+            logits = hidden
+        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden)
+        else:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            if hidden.dim() == 2:
+                logits = self.lm_head(hidden[slice_indices, :])
+            else:
+                logits = self.lm_head(hidden[:, slice_indices, :])
+
+        if is_thd:
             logits = logits.unsqueeze(0)
-        return logits
+
+        return CausalLMOutputWithPast(
+            logits=logits,
+            hidden_states=hidden if output_hidden_states else None,
+        )
 
     @torch.no_grad()
     def initialize_weights(

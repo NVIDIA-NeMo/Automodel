@@ -14,10 +14,11 @@
 
 """Qwen3.5-MoE (VL) NeMo Automodel support."""
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 
@@ -557,8 +558,18 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         padding_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
     ):
+        # Resolve from the text/decoder sub-config for this VL model.
+        text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(text_config, "output_hidden_states", False)
+        )
+
         # PP VLM support: retrieve pixel_values from stored chunks if not passed
         pixel_values = kwargs.get("pixel_values", None)
         pixel_values_videos = kwargs.get("pixel_values_videos", None)
@@ -627,12 +638,29 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         hidden_states = outputs.last_hidden_state
 
-        if self.lm_head is not None:
-            logits = self.lm_head(hidden_states)
+        # Optionally restrict logit computation to the last few positions.
+        # When logits_to_keep == 0 we compute all positions (training default).
+        # DTensor cannot slice a full range (slice(0, None)), so skip slicing then.
+        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            lm_head_input = hidden_states
         else:
-            logits = hidden_states
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            if hidden_states.dim() == 2:
+                # THD / packed: [T, H]
+                lm_head_input = hidden_states[slice_indices, :]
+            else:
+                # BSHD: [B, S, H]
+                lm_head_input = hidden_states[:, slice_indices, :]
 
-        return logits
+        if self.lm_head is not None:
+            logits = self.lm_head(lm_head_input)
+        else:
+            logits = lm_head_input
+
+        return CausalLMOutputWithPast(
+            logits=logits,
+            hidden_states=(hidden_states if output_hidden_states else None),
+        )
 
     @torch.no_grad()
     def initialize_weights(

@@ -305,7 +305,7 @@ class TestMistral4ForCausalLM:
     def test_forward_shape(self, text_config, backend, device):
         model = Mistral4ForCausalLM(text_config, backend=backend).to(device).to(torch.bfloat16)
         input_ids = torch.randint(0, 256, (1, 8), device=device)
-        logits = model(input_ids)
+        logits = model(input_ids).logits
         assert logits.shape == (1, 8, 256)
 
     def test_model_class_export(self):

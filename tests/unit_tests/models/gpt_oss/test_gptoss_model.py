@@ -433,7 +433,7 @@ class TestGptOssForCausalLM:
                 batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
             )
 
-            output = model(input_ids)
+            output = model(input_ids).logits
 
             assert output.shape == (batch_size, seq_len, gpt_config.vocab_size)
             assert output.device == device
@@ -466,7 +466,7 @@ class TestGptOssForCausalLM:
                 position_ids=position_ids,
                 qkv_format="thd",
                 cu_seqlens=cu_seqlens,
-            )
+            ).logits
 
             # Logits must be 3D [1, T, V] after unsqueeze
             assert output.ndim == 3
@@ -491,7 +491,7 @@ class TestGptOssForCausalLM:
                 batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
             )
 
-            output = model(input_ids)
+            output = model(input_ids).logits
 
             # Standard 3D output [B, S, V] without unsqueeze
             assert output.ndim == 3

@@ -265,7 +265,7 @@ class TestHyMT2ForCausalLM:
         bf16_hidden = torch.randn(1, 4, HIDDEN, device=device, dtype=torch.bfloat16)
         with patch.object(model.model, "forward", return_value=bf16_hidden):
             input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
-            logits = model(input_ids)
+            logits = model(input_ids).logits
         # Output dtype must be the input dtype (bf16), not fp32.
         assert logits.dtype == torch.bfloat16
 
@@ -282,7 +282,7 @@ class TestHyMT2ForCausalLM:
         bf16_hidden = torch.randn(1, 4, HIDDEN, device=device, dtype=torch.bfloat16)
         with patch.object(model.model, "forward", return_value=bf16_hidden):
             input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
-            logits = model(input_ids)
+            logits = model(input_ids).logits
         assert logits.dtype == torch.bfloat16
 
     def test_lm_head_no_upcast_when_disabled(self, config, backend_config, device):
@@ -291,7 +291,7 @@ class TestHyMT2ForCausalLM:
         bf16_hidden = torch.randn(1, 4, HIDDEN, device=device, dtype=torch.bfloat16)
         with patch.object(model.model, "forward", return_value=bf16_hidden):
             input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
-            logits = model(input_ids)
+            logits = model(input_ids).logits
         assert logits.dtype == torch.bfloat16
 
     def test_get_set_input_embeddings(self, config, backend_config):

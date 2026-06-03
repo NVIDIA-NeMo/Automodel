@@ -540,8 +540,15 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -560,7 +567,10 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
             logits = self.lm_head(hidden_states)
         else:
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
+            if hidden_states.dim() == 2:
+                logits = self.lm_head(hidden_states[slice_indices, :])
+            else:
+                logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:
@@ -570,7 +580,9 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
+            # Surface the FINAL hidden states (the input to lm_head) so the
+            # train_ft recipe can route through FusedLinearCrossEntropy (cut-CE).
+            hidden_states=(hidden_states if output_hidden_states else None),
             attentions=outputs.attentions,
         )
 

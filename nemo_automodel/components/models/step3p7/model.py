@@ -17,10 +17,11 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -41,10 +42,18 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class Step3p7CausalLMOutput:
-    """Step3.7 CausalLM output with optional per-depth MTP logits."""
+class Step3p7CausalLMOutput(CausalLMOutputWithPast):
+    """``CausalLMOutputWithPast`` plus optional per-depth MTP logits.
 
-    logits: torch.Tensor
+    Subclassing the HF ``ModelOutput`` gives this output the standard
+    ``logits``/``hidden_states`` fields (so ``"hidden_states" in out`` and
+    ``getattr(out, "hidden_states")`` behave like every other model and the
+    fused-CE path can read the final hidden states), while the MTP fields stay
+    declared dataclass fields so they survive output-restructuring layers like
+    FSDP2's mixed-precision output cast, which rebuild ``ModelOutput``
+    instances from declared fields only.
+    """
+
     mtp_per_depth_logits: list[torch.Tensor] | None = None
     mtp_loss_scaling_factor: float | None = None
 
@@ -496,8 +505,16 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         padding_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | Step3p7CausalLMOutput:
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config.text_config, "output_hidden_states", False)
+        )
+
         if kwargs.pop("_pre_embed_only", False):
             if input_ids is None:
                 raise ValueError("Step3p7 CP pre-embedding requires input_ids.")
@@ -596,7 +613,20 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             **kwargs,
         )
 
-        logits = self.lm_head(hidden_states) if self.lm_head is not None else hidden_states
+        # Optionally restrict logit computation to the last few positions.
+        # When logits_to_keep == 0 we compute all positions (training default).
+        # DTensor (pytorch 2.9) cannot slice a full range, so skip slicing then.
+        if self.lm_head is None:
+            # PP intermediate stage: pass hidden states through untouched.
+            logits = hidden_states
+        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden_states)
+        else:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            if hidden_states.dim() == 2:
+                logits = self.lm_head(hidden_states[slice_indices, :])
+            else:
+                logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         if pp_mtp_enabled and self.lm_head is None:
             return (logits, *mtp_embed_inputs)
@@ -641,10 +671,17 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             return logits
 
         if mtp_per_depth_logits is None:
-            return logits
+            # Preserve the historical bare-tensor return on the default path so
+            # existing callers/tests are unaffected; only wrap into a
+            # ``ModelOutput`` (carrying the final hidden states) when the
+            # fused-CE path asks for hidden states via ``output_hidden_states``.
+            if not output_hidden_states:
+                return logits
+            return Step3p7CausalLMOutput(logits=logits, hidden_states=hidden_states)
 
         return Step3p7CausalLMOutput(
             logits=logits,
+            hidden_states=(hidden_states if output_hidden_states else None),
             mtp_per_depth_logits=mtp_per_depth_logits,
             mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
         )

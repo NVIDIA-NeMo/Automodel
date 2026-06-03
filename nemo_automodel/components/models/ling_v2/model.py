@@ -35,10 +35,11 @@ model:
 ```
 """
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -341,9 +342,42 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+    ) -> CausalLMOutputWithPast:
+        """Forward pass returning ``CausalLMOutputWithPast``.
+
+        Supports BSHD (``input_ids`` shape ``[B, S]``) and THD (squeezed to ``[T]``
+        when ``attn_kwargs["qkv_format"] == "thd"``) formats.
+
+        Args:
+            input_ids: Input token IDs.
+            position_ids: Optional position indices.
+            attention_mask: Optional 2D padding mask.
+            padding_mask: Optional padding mask used by the THD squeeze helper.
+            logits_to_keep: If > 0, only compute logits for the last
+                ``logits_to_keep`` positions (avoids materialising the full logit
+                matrix during generation / fused-CE training). ``0`` computes all
+                positions.
+            output_hidden_states: Whether to return the final hidden states (the
+                input to ``lm_head``) on the output. Required by the fused
+                cross-entropy (cut-CE) training path.
+            **attn_kwargs: Additional arguments forwarded to the base model.
+
+        Returns:
+            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with
+            ``logits`` and, when ``output_hidden_states`` is set, ``hidden_states``
+            carrying the final (full-sequence) hidden states.
+        """
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
@@ -356,10 +390,31 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        logits = self.lm_head(hidden) if self.lm_head else hidden
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+
+        # Only compute necessary logits (optimization for training and generation).
+        # When logits_to_keep == 0 we project all positions; DTensor cannot slice a
+        # full range, so skip slicing in that case.
+        if self.lm_head:
+            if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+                logits = self.lm_head(hidden)
+            else:
+                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+                if hidden.dim() == 2:
+                    logits = self.lm_head(hidden[slice_indices, :])
+                else:
+                    logits = self.lm_head(hidden[:, slice_indices, :])
+        else:
+            logits = hidden
+
+        if is_thd:
             logits = logits.unsqueeze(0)
-        return logits
+            if hidden.dim() == 2:
+                hidden = hidden.unsqueeze(0)
+
+        return CausalLMOutputWithPast(
+            logits=logits,
+            hidden_states=hidden if output_hidden_states else None,
+        )
 
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():

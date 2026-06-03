@@ -699,13 +699,21 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         labels=None,
         use_cache=None,
         output_attentions=None,
-        output_hidden_states=None,
+        output_hidden_states: Optional[bool] = None,
         return_dict=None,
         pixel_values=None,
         image_grid_hws=None,
         padding_mask=None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ):
+        # Resolve from the text/decoder sub-config (the language model produces text logits).
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config.text_config, "output_hidden_states", False)
+        )
+
         # Retrieve pre-chunked VLM inputs from model attributes
         # This allows native forward to work with pipeline parallelism
         # finetune.py stores chunks on model, we retrieve them here per microbatch
@@ -738,7 +746,21 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
             **kwargs,
         )
 
-        logits = self.lm_head(hidden_states) if self.lm_head is not None else hidden_states
+        # Only compute the necessary logits (optimization for training and generation).
+        # When logits_to_keep == 0 we project all positions (training default); slicing a
+        # full range would break DTensor, so we skip slicing in that case. Otherwise keep
+        # only the last logits_to_keep positions, handling both 2D [T, H] (THD/packed) and
+        # 3D [B, S, H] hidden states.
+        if self.lm_head is None:
+            logits = hidden_states
+        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden_states)
+        else:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            if hidden_states.dim() == 2:
+                logits = self.lm_head(hidden_states[slice_indices, :])
+            else:
+                logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None and self.lm_head is not None:

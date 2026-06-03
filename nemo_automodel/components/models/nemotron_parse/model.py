@@ -493,9 +493,17 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutput]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        # Whether to surface the final decoder hidden states (input to lm_head) so
+        # downstream fused-linear-cross-entropy can read them off the output.
+        return_final_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config.decoder, "output_hidden_states", False)
+        )
         kwargs_encoder = {k: v for k, v in kwargs.items() if not k.startswith("decoder_")}
         kwargs_decoder = {k[len("decoder_") :]: v for k, v in kwargs.items() if k.startswith("decoder_")}
 
@@ -518,8 +526,6 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         if (labels is not None) and (decoder_input_ids is None and decoder_inputs_embeds is None):
             decoder_input_ids = shift_tokens_right(labels, self.config.pad_token_id, self.config.decoder_start_token_id)
 
-        output_hidden_states = True
-
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
@@ -527,19 +533,32 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
             encoder_attention_mask=encoder_attention_mask,
             inputs_embeds=decoder_inputs_embeds,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=True,
             use_cache=use_cache,
             past_key_values=past_key_values,
             return_dict=return_dict,
             **kwargs_decoder,
         )
 
-        logits = self.lm_head(decoder_outputs.last_hidden_state)
+        # Final decoder hidden states feeding the lm_head.
+        final_hidden_states = decoder_outputs.last_hidden_state
+
+        # Only compute necessary logits (optimization for training/generation).
+        # When logits_to_keep == 0 we project all positions; DTensor cannot slice a
+        # full range, so the slicing branch is skipped entirely in that case.
+        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(final_hidden_states)
+        else:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            if final_hidden_states.dim() == 2:
+                logits = self.lm_head(final_hidden_states[slice_indices, :])
+            else:
+                logits = self.lm_head(final_hidden_states[:, slice_indices, :])
 
         if not return_dict:
             return decoder_outputs + encoder_outputs
 
-        return Seq2SeqLMOutput(
+        out = Seq2SeqLMOutput(
             loss=None,
             logits=logits,
             past_key_values=decoder_outputs.past_key_values,
@@ -550,6 +569,12 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
             encoder_hidden_states=getattr(encoder_outputs, "hidden_states", None),
             encoder_attentions=getattr(encoder_outputs, "attentions", None),
         )
+        # Expose the final decoder hidden states under ``hidden_states`` for fused
+        # cross-entropy. Item assignment (not attribute set) registers the key so
+        # both ``"hidden_states" in out`` and ``out.hidden_states`` resolve to it.
+        if return_final_hidden_states:
+            out["hidden_states"] = final_hidden_states
+        return out
 
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
         return shift_tokens_right(labels, self.config.pad_token_id, self.config.decoder_start_token_id)
