@@ -213,8 +213,7 @@ def _accepted_targets() -> set:
 
 
 def _is_recipe_target(target) -> bool:
-    """True if ``target`` is on this recipe's allowlist of model entrypoints.
-    """
+    """True if ``target`` is on this recipe's allowlist of model entrypoints."""
     if target is None:
         return False
     return target in _accepted_targets()
