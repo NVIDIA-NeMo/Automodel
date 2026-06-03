@@ -82,10 +82,6 @@ def create_peagle_mask_mod(
         in_depth_order = q_depth >= kv_depth
         is_anchor_causal = q_anchor_pos >= kv_anchor_pos
 
-        return (
-            is_not_padding
-            & same_document
-            & ((kv_depth0 & is_anchor_causal) | (same_rollout & in_depth_order))
-        )
+        return is_not_padding & same_document & ((kv_depth0 & is_anchor_causal) | (same_rollout & in_depth_order))
 
     return peagle_mask_mod

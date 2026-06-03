@@ -331,4 +331,6 @@ class PEagleTrainerModule(nn.Module):
 
         avg_loss = loss_num / loss_den.clamp_min(1e-5)
         accuracy = running_correct / running_valid.clamp_min(1.0)
-        return Eagle3StepMetrics(loss=avg_loss.to(mask_hidden_proj.dtype), accuracy=accuracy, valid_tokens=running_valid)
+        return Eagle3StepMetrics(
+            loss=avg_loss.to(mask_hidden_proj.dtype), accuracy=accuracy, valid_tokens=running_valid
+        )

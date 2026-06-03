@@ -96,8 +96,6 @@ def generate_cod_sample_indices(
         n_per_depth.append(sampled_idx.shape[0])
 
     anchor_pos = torch.cat(sample_indices)
-    depth = torch.cat(
-        [torch.full((n,), i, device=device, dtype=torch.long) for i, n in enumerate(n_per_depth)]
-    )
+    depth = torch.cat([torch.full((n,), i, device=device, dtype=torch.long) for i, n in enumerate(n_per_depth)])
 
     return anchor_pos, depth
