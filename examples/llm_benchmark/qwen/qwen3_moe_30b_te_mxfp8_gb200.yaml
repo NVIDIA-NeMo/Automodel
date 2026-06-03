@@ -121,6 +121,11 @@ optimizer:
   eps: 1e-8
   lr: 0.0001
   weight_decay: 0
+  # experts=te params are FSDP-sharded to DTensor only when ep<world (ep_shard dim
+  # exists). At ep==world (e.g. ep=8 on 8 GPUs) they stay plain Tensors while the rest
+  # of the model is DTensor; foreach=false runs Adam per-param so it never batches a
+  # mixed Tensor/DTensor group ("_foreach_lerp_ got mixed torch.Tensor and DTensor").
+  foreach: false
 
 
 ci:

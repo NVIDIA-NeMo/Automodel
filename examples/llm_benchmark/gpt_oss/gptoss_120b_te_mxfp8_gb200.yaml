@@ -126,6 +126,12 @@ optimizer:
   eps: 1e-8
   lr: 0.0001
   weight_decay: 0
+  # experts=te params are FSDP-sharded to DTensor only when ep<world (ep_shard dim
+  # exists). At ep==world they stay plain Tensors while the rest of the model is DTensor;
+  # foreach=false runs Adam per-param so it never batches a mixed Tensor/DTensor group
+  # ("_foreach_lerp_ got mixed torch.Tensor and DTensor"). gpt-oss runs ep=16<world=32
+  # so it already gets DTensor experts, but keep this for ep==world robustness.
+  foreach: false
 
 
 ci:
