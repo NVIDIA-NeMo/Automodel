@@ -47,6 +47,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      # Backward version trees (frozen GA snapshots) are not kept on main -- only
+      # the nightly tree (top-level docs/) is. Restore them from their archive ref
+      # so `fern generate --docs` (a full-site snapshot publish) sees every train.
+      - name: Stitch archived version pages
+        uses: ./.github/actions/stitch-fern-versions
+        with:
+          archived-versions: |
+            v0.4=docs-archive
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:

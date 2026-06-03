@@ -44,6 +44,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The frozen v0.4 pages are archived off main; restore them into the working
+      # copy so the uploaded artifact carries every version train. The companion
+      # comment workflow never checks out the repo -- it only consumes this
+      # artifact -- so the stitch must happen here, before upload. Fetching the
+      # base repo's own archive ref uses the checkout credentials, no extra secret.
+      - name: Stitch archived version pages
+        uses: ./.github/actions/stitch-fern-versions
+        with:
+          archived-versions: |
+            v0.4=docs-archive
+
       - name: Save PR metadata
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}

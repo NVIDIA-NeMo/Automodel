@@ -15,9 +15,15 @@
 
 PUBLISH_WORKFLOW := Publish Fern Docs
 
+# Git ref holding the frozen backward-version page trees (see docs-stitch).
+# Override to pull a version from an immutable tag instead, e.g.
+#   make docs-check ARCHIVE_REF=docs/v0.4.0
+ARCHIVE_REF ?= docs-archive
+REPO_ROOT := $(shell git rev-parse --show-toplevel)
+
 .DEFAULT_GOAL := help
 
-.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library
+.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch
 
 help:
 	@echo ""
@@ -29,6 +35,7 @@ help:
 	@echo ""
 	@echo "  make docs-login             FIRST-TIME SETUP — provision Fern account + CLI auth"
 	@echo "  make docs                   Generate library reference and start Fern dev server"
+	@echo "  make docs-stitch            Restore frozen backward-version pages from the $(ARCHIVE_REF) branch"
 	@echo "  make docs-check             Run 'fern check' (config + MDX validation)"
 	@echo "  make docs-preview           Build a shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)"
 	@echo "  make docs-publish           Trigger the 'Publish Fern Docs' workflow on origin/main"
@@ -87,11 +94,20 @@ docs-login:
 # `fern docs dev` then serves the site on localhost:3002. Re-run `make docs` only
 # when the library source changes — for prose-only iteration, `fern docs dev`
 # alone is enough after the first generate.
-docs: docs-generate-library
+docs: docs-stitch docs-generate-library
 	fern docs dev
 
-docs-check:
+docs-check: docs-stitch
 	fern check
+
+# Restore the frozen backward-version page trees into the working copy. They
+# live on the `$(ARCHIVE_REF)` branch (not on main), so a fresh clone has only
+# the nightly tree; without this, local `fern check` / `fern docs dev` fatal on
+# the missing v0.4 paths. Mirrors the stitch-fern-versions CI action; idempotent.
+docs-stitch:
+	@git -C "$(REPO_ROOT)" fetch --depth=1 origin $(ARCHIVE_REF) --quiet
+	@git -C "$(REPO_ROOT)" restore --source=FETCH_HEAD --worktree --no-overlay -- docs/fern/versions/v0.4/pages
+	@echo "Stitched frozen v0.4 pages from $(ARCHIVE_REF)."
 
 # Wraps the autodoc generate step. If it fails (the most common cause is
 # the HTTP 403 from missing dashboard provisioning), print the recovery
@@ -116,7 +132,7 @@ docs-generate-library:
 # Shared preview hosted at <repo-slug>.docs.buildwithfern.com — useful for sharing a
 # work-in-progress link before merge. Requires DOCS_FERN_TOKEN in the environment
 # (org secret of the same name is wired into CI).
-docs-preview:
+docs-preview: docs-stitch
 	fern generate --docs --preview
 
 # Trigger the Publish Fern Docs workflow on origin/main via workflow_dispatch.
