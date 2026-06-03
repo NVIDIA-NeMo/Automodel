@@ -88,7 +88,10 @@ class Eagle3TrainerModule(nn.Module):
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         aux_hidden_states: torch.Tensor,
-        target_logits: torch.Tensor,
+        target_logits: torch.Tensor | None = None,
+        *,
+        target_probs: torch.Tensor | None = None,
+        position_mask: torch.Tensor | None = None,
     ) -> Eagle3StepMetrics:
         """Run the EAGLE-3 unrolled draft loss for one batch.
 
@@ -103,14 +106,33 @@ class Eagle3TrainerModule(nn.Module):
         ``attention_mask`` is held constant across TTT steps -- only
         ``input_ids`` / ``loss_mask`` / ``position_mask`` /
         ``target_probs`` roll forward by one position per step.
+
+        Two supervision sources are accepted: the live path passes the
+        target's full-vocab ``target_logits`` and the draft distribution is
+        derived here; the offline-cache path (``precompute_eagle3``) passes the
+        already-derived ``target_probs`` (over the draft vocab) and
+        ``position_mask`` directly, so the full-vocab logits never have to be
+        stored. Provide exactly one of the two.
         """
+        precomputed = target_probs is not None and position_mask is not None
+        if target_logits is not None and precomputed:
+            raise ValueError(
+                "Eagle3TrainerModule.forward got both target_logits and precomputed "
+                "(target_probs, position_mask); pass exactly one supervision source."
+            )
         hidden_states = self.draft_model.project_hidden_states(aux_hidden_states)
-        target_probs, position_mask = _compute_target_distribution(
-            target_logits=target_logits,
-            selected_token_ids=self.selected_token_ids,
-            selected_token_mask=self.selected_token_mask,
-            loss_mask=loss_mask,
-        )
+        if not precomputed:
+            if target_logits is None:
+                raise ValueError(
+                    "Eagle3TrainerModule.forward requires either target_logits (live path) or both "
+                    "target_probs and position_mask (offline-cache path); got neither."
+                )
+            target_probs, position_mask = _compute_target_distribution(
+                target_logits=target_logits,
+                selected_token_ids=self.selected_token_ids,
+                selected_token_mask=self.selected_token_mask,
+                loss_mask=loss_mask,
+            )
 
         running_loss = hidden_states.new_zeros(())
         running_correct = hidden_states.new_zeros(())
