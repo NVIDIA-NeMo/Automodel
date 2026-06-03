@@ -637,6 +637,12 @@ class LlamaEagle3DraftModel(PreTrainedModel):
 
     config_class = PretrainedConfig
     base_model_prefix = "model"
+    # Declare the attention backends this draft actually implements so
+    # ``PreTrainedModel.__init__`` allows them. ``Eagle3LlamaAttention`` supports
+    # ``eager`` and ``flash_attention_2`` (see ``_SUPPORTED_ATTN_IMPLEMENTATIONS``)
+    # but NOT SDPA; without this flag transformers defaults ``_supports_flash_attn``
+    # to ``False`` and rejects ``attn_implementation="flash_attention_2"``.
+    _supports_flash_attn = True
 
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)

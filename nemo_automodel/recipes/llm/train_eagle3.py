@@ -156,6 +156,13 @@ class TrainEagle3Recipe(BaseRecipe):
         # raise ``RuntimeError: State key 'target_model' is already tracked``.
         if self.dist_setup is None:
             self.target_model.to(self.device)
+        # The target is frozen: it only supplies aux hidden states / logits as
+        # supervision and is never optimized (the optimizer is built solely
+        # from the draft trainer module). ``generate_batch`` already runs under
+        # ``@torch.no_grad()``, but mark the parameters explicitly so the intent
+        # is unambiguous and no future code path accidentally trains the target
+        # -- matching the EAGLE-1/2 recipe.
+        self.target_model.requires_grad_(False)
         self.target_wrapper = HFEagle3TargetModel(
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
@@ -481,8 +488,15 @@ class TrainEagle3Recipe(BaseRecipe):
         if is_dist_initialized:
             dist.barrier()
 
+        step_scheduler = getattr(self, "step_scheduler", None)
+        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
         draft_model = self._module().draft_model
-        self.checkpointer.save_model(draft_model, path, tokenizer=self.tokenizer)
+        self.checkpointer.save_model(
+            draft_model,
+            path,
+            tokenizer=self.tokenizer,
+            is_final_checkpoint=is_final_checkpoint,
+        )
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
         self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
