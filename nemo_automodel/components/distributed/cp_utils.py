@@ -530,9 +530,16 @@ def make_cp_batch_and_ctx(
     primary_seq_tensor = batch[primary_key]
     seq_len = primary_seq_tensor.shape[1]
 
-    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed).
+    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
+    batch_size = primary_seq_tensor.shape[0]
     if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
-        batch["position_ids"] = torch.arange(0, seq_len).unsqueeze(0).to(primary_seq_tensor.device)
+        batch["position_ids"] = (
+            torch.arange(0, seq_len, device=primary_seq_tensor.device).unsqueeze(0).expand(batch_size, -1).contiguous()
+        )
+    elif "position_ids" in batch:
+        position_ids = batch["position_ids"]
+        if position_ids.ndim == 2 and position_ids.shape[0] == 1 and batch_size > 1:
+            batch["position_ids"] = position_ids.expand(batch_size, -1).contiguous()
 
     position_ids = batch["position_ids"]
     pos_seq_dim = 2 if position_ids.ndim == 3 else 1

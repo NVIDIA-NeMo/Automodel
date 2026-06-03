@@ -13,8 +13,6 @@
 
 import json
 
-import pytest
-
 from nemo_automodel.components.datasets.llm import xlam
 
 
@@ -65,6 +63,28 @@ def test_convert_tool_calls_preserves_arguments_and_ids():
     assert [c["function"]["name"] for c in converted] == ["foo", "bar"]
     assert [c["id"] for c in converted] == ["call_10_0", "call_10_1"]
     assert converted[0]["function"]["arguments"] == '{"x":1}'
+
+
+def test_convert_tool_calls_serializes_dict_arguments_to_json_string():
+    # OpenAI tool calling format requires `function.arguments` to be a string.
+    # Derivative xLAM-style datasets may carry it as a dict; the adapter must
+    # serialize so chat templates render a valid JSON payload.
+    raw_calls = [
+        {"name": "weather", "arguments": {"city": "Beijing", "days": 3}},
+        {"name": "echo", "arguments": ["a", "b"]},
+    ]
+
+    converted = xlam._convert_tool_calls(raw_calls)
+    assert isinstance(converted[0]["function"]["arguments"], str)
+    assert json.loads(converted[0]["function"]["arguments"]) == {"city": "Beijing", "days": 3}
+    assert json.loads(converted[1]["function"]["arguments"]) == ["a", "b"]
+
+
+def test_convert_tool_calls_preserves_unicode_in_dict_arguments():
+    raw_calls = [{"name": "search", "arguments": {"query": "北京天气"}}]
+    converted = xlam._convert_tool_calls(raw_calls)
+    # ensure_ascii=False keeps CJK characters readable in the rendered chat.
+    assert "北京天气" in converted[0]["function"]["arguments"]
 
 
 def test_format_example_builds_chat_payload(monkeypatch):

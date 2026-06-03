@@ -17,23 +17,22 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.modeling_outputs import SequenceClassifierOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 
+from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import (
     BiEncoderModel,
     CrossEncoderModel,
-    configure_encoder_metadata,
     _init_encoder_common,
+    configure_encoder_metadata,
     pool,
 )
-from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
-from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
 )
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 
 
 def test_contrastive_scores_and_labels_shapes_and_labels():
@@ -44,7 +43,7 @@ def test_contrastive_scores_and_labels_shapes_and_labels():
     assert torch.all(labels == 0) and labels.shape == (2,)
 
 
-@pytest.mark.parametrize("pool_type", ["avg", "weighted_avg", "cls", "colbert"])
+@pytest.mark.parametrize("pool_type", ["avg", "weighted_avg", "cls", "colbert", "multi_vector"])
 def test_pool_basic_modes(pool_type):
     last_hidden = torch.tensor(
         [
@@ -62,7 +61,7 @@ def test_pool_basic_modes(pool_type):
         assert torch.allclose(out[0], torch.tensor([1.0 + 3.0, 2.0 + 4.0]))
     elif pool_type == "cls":
         assert torch.allclose(out[:, :], last_hidden[:, 0])
-    elif pool_type == "colbert":
+    elif pool_type in {"colbert", "multi_vector"}:
         assert out.shape == last_hidden.shape
 
 
@@ -111,6 +110,42 @@ def test_llama_bidirectional_model_init_and_mask():
     # Forward without attention mask also works
     out_no_mask = model(input_ids=input_ids)
     assert out_no_mask.last_hidden_state is not None and out_no_mask.last_hidden_state.shape == (1, 3, 32)
+
+
+def test_score_head_init_weights_initializes_in_place():
+    """Covers the LlamaBidirectionalForSequenceClassification._init_weights override.
+
+    transformers 5.8's PreTrainedModel._init_weights for nn.Linear writes into a
+    `module.weight.float()` *copy* and leaves bfloat16 weights uninitialized.
+    Our override calls `init.normal_(module.weight, ...)` directly so the bf16
+    tensor is actually populated; non-score modules defer to super().
+    """
+    cfg = LlamaBidirectionalConfig(
+        vocab_size=64,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        intermediate_size=32,
+        num_labels=1,
+        pad_token_id=0,
+        initializer_range=0.02,
+    )
+    model = LlamaBidirectionalForSequenceClassification(cfg)
+    # Reset score.weight to a sentinel, then re-init via our override and check
+    # the override wrote real (non-zero, non-sentinel) values into the bf16 tensor.
+    model.score.weight = nn.Parameter(model.score.weight.detach().to(torch.bfloat16))
+    with torch.no_grad():
+        model.score.weight.fill_(0.0)
+    # Clear the HF "already initialized" flag so the guarded init.normal_ runs.
+    if hasattr(model.score.weight, "_is_hf_initialized"):
+        delattr(model.score.weight, "_is_hf_initialized")
+    model._init_weights(model.score)
+    assert model.score.weight.abs().sum().item() > 0
+    assert not torch.isnan(model.score.weight).any().item()
+
+    # Non-score module path delegates to super(): exercise it without asserting
+    # specific values (super's _init_weights is upstream-owned).
+    model._init_weights(model.model.embed_tokens)
 
 
 def test_bidirectional_attention_is_symmetric():

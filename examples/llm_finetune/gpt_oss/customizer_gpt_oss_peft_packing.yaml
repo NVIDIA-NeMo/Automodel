@@ -43,7 +43,7 @@ checkpoint:
   enabled: true
   model_save_format: safetensors
   checkpoint_dir: ./checkpoints
-  save_consolidated: true
+  save_consolidated: final
   dequantize_base_checkpoint: true
 packed_sequence:
   packed_sequence_size: 816

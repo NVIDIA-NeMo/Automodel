@@ -2,7 +2,10 @@ model:
   pretrained_model_name_or_path: "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
   mode: "finetune"
   cache_dir: null
-  attention_backend: "flash"
+  # Hunyuan passes attention masks into transformer blocks. flash_varlen plus
+  # the mask optimization is the fastest validated full fine-tuning setup.
+  attention_backend: "flash_varlen"
+  optimize_hunyuan_flash_varlen_mask: true
 
 optim:
   learning_rate: 5e-6
@@ -68,7 +71,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
   diffusers_compatible: true
   restore_from: null
 

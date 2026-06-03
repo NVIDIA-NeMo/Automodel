@@ -16,7 +16,7 @@
 # Benchmarking config for Kimi-K2.5-VL LoRA r2 (text backbone only)
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/peft/kimi25vl_lora.yaml --nproc-per-node 8
+#   automodel examples/vlm_benchmark/kimi/kimi25vl_lora.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction

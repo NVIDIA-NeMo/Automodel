@@ -511,7 +511,7 @@ def main(config_path=None):
     Loads the configuration, sets up the recipe, and runs the benchmark.
     """
     if config_path is None:
-        # Default to moonlight_16b_torch.yaml in examples/benchmark/configs
+        # Default to moonlight_16b_torch.yaml in examples/llm_benchmark/moonlight
         config_path = (
             pathlib.Path(__file__).parent.parent.parent.resolve()
             / "examples"

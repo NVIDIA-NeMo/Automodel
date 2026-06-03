@@ -93,6 +93,10 @@ VLM_INPUT_KEYS: tuple[str, ...] = (
     "image_grid_hws",
     "image_grid_thw",
     "image_sizes",
+    "patch_pixel_values",
+    "num_patches",
+    "patch_newline_mask",
+    "image_embeds",
     # Video
     "pixel_values_videos",
     # Audio / sound
@@ -148,6 +152,30 @@ def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
     if dropped:
         logger.debug("Dropping unsupported forward kwargs for %s: %s", type(model).__name__, dropped)
     return filtered
+
+
+def get_lm_head_module(model: nn.Module) -> nn.Module | None:
+    """Return the model's LM head module, if one can be found."""
+    if hasattr(model, "get_output_embeddings"):
+        lm_head = model.get_output_embeddings()
+        if lm_head is not None:
+            return lm_head
+    for name, module in model.named_modules():
+        if (name == "lm_head" or name.endswith(".lm_head")) and hasattr(module, "weight"):
+            return module
+    return None
+
+
+def get_lm_head_weight(model: nn.Module) -> torch.Tensor:
+    """Return the model's LM-head weight, materializing DTensor weights when needed."""
+    lm_head = get_lm_head_module(model)
+    if lm_head is not None:
+        weight = lm_head.weight
+        return weight.full_tensor() if hasattr(weight, "full_tensor") else weight
+    for name, param in model.named_parameters(remove_duplicate=False):
+        if "lm_head" in name and name.endswith(".weight"):
+            return param.full_tensor() if hasattr(param, "full_tensor") else param
+    raise ValueError("lm_head.weight not found in model")
 
 
 def _get_logical_numel(param) -> int:
@@ -298,6 +326,40 @@ def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_pattern
                 param.requires_grad = False
 
 
+def enable_radio_vit_fused_attn(model):
+    """Route RADIO ViT attention through ``F.scaled_dot_product_attention``.
+
+    RADIO's timm Attention blocks default to ``fused_attn=False``, which
+    materializes the full ``(B, H, seq, seq)`` attention tensor (~5 GiB per
+    block at RADIO-v2-H + dynamic-resolution patch counts). Flipping
+    ``fused_attn=True`` matches the Megatron-Bridge path which sets
+    ``vision_config.use_flash_attn=True`` via
+    ``attn_implementation="flash_attention_2"``.
+
+    No-op when the model has no RADIO vision tower.
+
+    Args:
+        model: The model to patch in place.
+    """
+    vision_model = getattr(model, "vision_model", None) or getattr(getattr(model, "model", None), "vision_model", None)
+    vit_blocks = getattr(
+        getattr(getattr(vision_model, "radio_model", None), "model", None),
+        "blocks",
+        None,
+    )
+    if vit_blocks is None:
+        return
+
+    flipped = 0
+    for block in vit_blocks:
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            attn.fused_attn = True
+            flipped += 1
+    if flipped:
+        logger.info("Enabled fused_attn on %d RADIO ViT blocks", flipped)
+
+
 def apply_parameter_freezing(model, freeze_config):
     """Apply parameter freezing based on configuration.
 
@@ -309,10 +371,12 @@ def apply_parameter_freezing(model, freeze_config):
         - freeze_vision_tower: bool (default True)
         - freeze_audio_tower: bool (default False)
         - freeze_language_model: bool (default False)
+        - freeze_video_embedder: bool (default False)
     """
     freeze_vision_tower = freeze_config.get("freeze_vision_tower", True)
     freeze_audio_tower = freeze_config.get("freeze_audio_tower", False)
     freeze_language_model = freeze_config.get("freeze_language_model", False)
+    freeze_video_embedder = freeze_config.get("freeze_video_embedder", False)
 
     # Freeze vision tower
     if freeze_vision_tower:
@@ -325,6 +389,21 @@ def apply_parameter_freezing(model, freeze_config):
     # Freeze language model backbone
     if freeze_language_model:
         _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])
+
+    # NemotronOmni RADIO: patch_generator.video_embedder is only exercised on
+    # video inputs; on image-only training it sits in the optimizer without
+    # state (no grad → no lazy init), so dcp.load on resume raises
+    # "Missing key in checkpoint state_dict: optim.state.<...>.video_embedder.weight.step".
+    # Independent of freeze_vision_tower so the image encoder can stay trainable
+    # while the video branch is frozen out.
+    if freeze_video_embedder:
+        frozen = 0
+        for name, param in model.named_parameters():
+            if "patch_generator.video_embedder" in name:
+                param.requires_grad_(False)
+                frozen += 1
+        if frozen:
+            logger.info("Froze %d patch_generator.video_embedder params", frozen)
 
     # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
     # and disable KV cache (remote code uses legacy DynamicCache.key_cache
@@ -386,6 +465,22 @@ def freeze_unused_kv_sharing_params(model):
         )
 
 
+def freeze_deepseek_v4_indexer_params(model):
+    """Freeze DeepSeek V4 indexer params that only feed discrete top-k masks."""
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) != "deepseek_v4":
+        return
+
+    frozen_count = 0
+    for name, param in model.named_parameters():
+        if ".self_attn.compressor.indexer." in name:
+            param.requires_grad_(False)
+            frozen_count += 1
+
+    if frozen_count > 0:
+        logger.info("Froze %d DeepSeek V4 indexer parameters.", frozen_count)
+
+
 def cast_mixed_dtype_params_to_bf16(model):
     """Cast fp32 parameters and buffers to bf16 for FSDP2 compatibility."""
     for p in model.parameters():
@@ -411,8 +506,13 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
     3. Converts max_seqlen from tensor to scalar if needed
 
     Args:
-        input_ids (torch.Tensor): Input token IDs with shape [1, total_tokens] or
-            [1, total_tokens, hidden_dim]. The first dimension will be squeezed.
+        input_ids (torch.Tensor or None): Input token IDs with shape [1, total_tokens]
+            or [1, total_tokens, hidden_dim]. The first dimension will be squeezed.
+            ``None`` is permitted when the caller is feeding the model via
+            ``inputs_embeds`` instead — embeddings are squeezed inside the model
+            forward (the ``squeezed_for_thd`` branch in ``NemotronHModel.forward``
+            and analogous code paths), so this helper has nothing to squeeze and
+            simply returns ``None`` for the ``input_ids`` slot.
         position_ids (torch.Tensor): Position IDs with shape [1, total_tokens].
             The first dimension will be squeezed.
         padding_mask (torch.Tensor): Padding mask with shape [1, total_tokens].
@@ -460,7 +560,8 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
         This function modifies attn_kwargs in-place. If you need to preserve the original
         dictionary, pass a copy.
     """
-    input_ids = input_ids.squeeze(0)
+    if input_ids is not None:
+        input_ids = input_ids.squeeze(0)
     position_ids = position_ids.squeeze(0)
     if isinstance(padding_mask, torch.Tensor):
         padding_mask = padding_mask.squeeze(0)
