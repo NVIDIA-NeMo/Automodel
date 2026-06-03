@@ -23,7 +23,7 @@
 #       "_foreach_lerp_ got mixed torch.Tensor and DTensor" optimizer error)
 # Everything else identical for an apples-to-apples comparison.
 #
-# Parallelism: ep_size=64, tp=pp=cp=1, dp=64 (world=64), 16 nodes x 4 GB200.
+# Parallelism: ep_size=32 (==world=32), tp=pp=cp=1, dp=32, 8 nodes x 4 GB200.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 
@@ -35,14 +35,14 @@ benchmark:
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
-  num_nodes: 16
+  num_nodes: 8
 
 distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 64
+  ep_size: 32
 
   sequence_parallel: false
   activation_checkpointing: true
@@ -50,7 +50,7 @@ distributed:
 step_scheduler:
   gc_every_steps: 10
   global_batch_size: 512
-  local_batch_size: 8
+  local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
@@ -110,5 +110,5 @@ optimizer:
 
 ci:
   time: "01:00:00"
-  nodes: 16
-  ep_size: 64
+  nodes: 8
+  ep_size: 32
