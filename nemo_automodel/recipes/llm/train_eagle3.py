@@ -267,7 +267,10 @@ class TrainEagle3Recipe(BaseRecipe):
             # 4. This overrides the draft's ``num_hidden_layers`` (which would
             # otherwise inherit the target's full depth); the EAGLE-3 TTT path
             # ignores it and always builds a single layer.
-            draft_config["num_hidden_layers"] = int(recipe_cfg.get("num_draft_layers", 1))
+            draft_num_hidden_layers = int(recipe_cfg.get("num_draft_layers", 1))
+            draft_config["num_hidden_layers"] = draft_num_hidden_layers
+            if "layer_types" in draft_config:
+                draft_config["layer_types"] = draft_config["layer_types"][:draft_num_hidden_layers]
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
