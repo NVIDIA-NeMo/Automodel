@@ -14,7 +14,6 @@
 
 import json
 import logging
-import os
 import pathlib
 
 import torch
@@ -30,154 +29,6 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 logger = logging.getLogger(__name__)
-
-_MXFP8_GRADCHECK_DONE = {"after_backward": False, "after_step": False}
-
-# Forward-drift probe state: iters we still want to log, and whether hooks are installed.
-_MXFP8_FWDPROBE_ITERS = {0, 1}
-_MXFP8_FWDPROBE_HOOKED = {"done": False}
-_MXFP8_FWDPROBE_STEP = {"i": 0}
-
-
-def _mxfp8_install_fwdprobe(model_parts):
-    """Install forward hooks that log max-abs of the final hidden (post-MoE, post-norm)
-    and the logits (lm_head output) for iters 0 and 1, rank0 only (env DEBUG_MXFP8_FWDPROBE).
-
-    Goal: detect whether the bias x mxfp8 expert forward develops a growing outlier
-    (hidden/logit magnitude) at iter 1 that overflows the tied-embedding grad in the CE
-    backward (the bias-drift hypothesis). If hidden/logits blow up at iter 1, the fix is
-    forward-side (clamp/guard the expert output), not the cross-entropy. No-op unless set.
-
-    Set the current iteration via _MXFP8_FWDPROBE_STEP['i'] from the benchmark loop so the
-    hook can gate on it. Hooks are installed once; they self-skip once all probe iters logged.
-    """
-    if os.environ.get("DEBUG_MXFP8_FWDPROBE") != "True" or _MXFP8_FWDPROBE_HOOKED["done"]:
-        return
-    try:
-        import torch.distributed as dist
-
-        if dist.is_initialized() and dist.get_rank() != 0:
-            _MXFP8_FWDPROBE_HOOKED["done"] = True
-            return
-    except Exception:
-        pass
-
-    def _maxabs(t):
-        try:
-            tt = t.to_local() if hasattr(t, "to_local") else t
-            tt = tt.detach().float()
-            finite = torch.isfinite(tt).all().item()
-            return f"max_abs={tt.abs().max().item():.4g} finite={finite} dtype={t.dtype}"
-        except Exception as e:  # pragma: no cover - diagnostic only
-            return f"<unmeasurable: {e}>"
-
-    def _make_hook(label):
-        def _hook(_module, _inp, out):
-            i = _MXFP8_FWDPROBE_STEP["i"]
-            if i in _MXFP8_FWDPROBE_ITERS:
-                o = out[0] if isinstance(out, (tuple, list)) else out
-                logger.warning(f"[DEBUG_MXFP8_FWDPROBE] iter={i} {label}: {_maxabs(o)}")
-
-        return _hook
-
-    n_hooks = 0
-    for mp in model_parts:
-        # GptOssForCausalLM -> .model (GptOssModel) has .layers (ModuleDict of Block, each
-        # output = post-MoE hidden for that layer), .norm (final hidden), and .lm_head.
-        inner = getattr(mp, "model", None)
-        # Per-layer MoE-block output: sample first / middle / last to bound log volume.
-        layers = getattr(inner, "layers", None) if inner is not None else None
-        if layers is not None:
-            try:
-                keys = list(layers.keys())
-                pick = sorted({keys[0], keys[len(keys) // 2], keys[-1]}, key=lambda k: int(k))
-                for k in pick:
-                    layers[k].register_forward_hook(_make_hook(f"moe_block_out[layer={k}]"))
-                    n_hooks += 1
-            except Exception:
-                pass
-        if inner is not None and getattr(inner, "norm", None) is not None:
-            inner.norm.register_forward_hook(_make_hook("final_hidden(norm)"))
-            n_hooks += 1
-        lm_head = getattr(mp, "lm_head", None)
-        if lm_head is not None:
-            lm_head.register_forward_hook(_make_hook("logits(lm_head)"))
-            n_hooks += 1
-    _MXFP8_FWDPROBE_HOOKED["done"] = True
-    logger.warning(f"[DEBUG_MXFP8_FWDPROBE] installed {n_hooks} forward hooks (iters {sorted(_MXFP8_FWDPROBE_ITERS)})")
-
-
-def _mxfp8_classify_param(name):
-    """Bucket a param name so the localizer can tell expert-weight (the only mxfp8 op,
-    so the suspected wgrad root) from unquantized embed / lm_head / router / attn / norm."""
-    n = name.lower()
-    # Real MoE expert weight params: gate_and_up_projs / down_projs (experts.py). Bias
-    # params (gate_up_proj_bias / down_proj_bias) are NOT mxfp8 operands -> bucket as 'other'.
-    if "bias" not in n and any(
-        k in n for k in ("gate_and_up_projs", "down_projs", ".experts.", "gate_up_linear", "down_linear")
-    ):
-        return "EXPERT_WEIGHT(mxfp8)"
-    if "embed" in n:
-        return "embed(bf16)"
-    if "lm_head" in n:
-        return "lm_head(bf16)"
-    if any(k in n for k in ("gate", "router")):
-        return "router(bf16)"
-    if any(k in n for k in ("q_proj", "k_proj", "v_proj", "o_proj", "attn", "attention")):
-        return "attn(bf16)"
-    if "norm" in n:
-        return "norm(bf16)"
-    return "other"
-
-
-def _mxfp8_gradcheck_global(model_parts, stage):
-    """One-time rank0 global non-finite localizer (env DEBUG_MXFP8_GRADCHECK).
-
-    stage='after_backward' scans every param's .grad; stage='after_step' scans every
-    param's .data. Logs the FULL list of non-finite params (name + bucket + max-abs),
-    NOT just the first, since registration order makes "first" misleading (embeddings
-    register first but are unquantized -> can't be the source). The ONLY mxfp8 op is the
-    MoE expert GEMM, so an EXPERT_WEIGHT(mxfp8) grad going non-finite = the wgrad root;
-    everything downstream (embed/lm_head/router) is propagated symptom. No-op unless set.
-    """
-    if os.environ.get("DEBUG_MXFP8_GRADCHECK") != "True" or _MXFP8_GRADCHECK_DONE.get(stage):
-        return
-    try:
-        import torch.distributed as dist
-
-        if dist.is_initialized() and dist.get_rank() != 0:
-            return
-    except Exception:
-        pass
-    bad = []  # (name, bucket, maxabs_str)
-    for mp in model_parts:
-        for name, p in mp.named_parameters():
-            t = p.grad if stage == "after_backward" else p.data
-            if t is None:
-                continue
-            tt = t.to_local() if hasattr(t, "to_local") else t
-            if not torch.isfinite(tt).all():
-                try:
-                    finite_max = tt[torch.isfinite(tt)].abs().max().item() if torch.isfinite(tt).any() else float("nan")
-                    has_nan = torch.isnan(tt).any().item()
-                    has_inf = torch.isinf(tt).any().item()
-                    kind = "nan" if has_nan else ""
-                    kind += ("+inf" if has_inf else "")
-                    ms = f"finite_max={finite_max:.4g} {kind}"
-                except Exception:
-                    ms = "<unmeasurable>"
-                bad.append((name, _mxfp8_classify_param(name), ms))
-    _MXFP8_GRADCHECK_DONE[stage] = True
-    if not bad:
-        logger.warning(f"[DEBUG_MXFP8_GRADCHECK] {stage}: all params finite")
-        return
-    expert_bad = [b for b in bad if b[1] == "EXPERT_WEIGHT(mxfp8)"]
-    logger.warning(
-        f"[DEBUG_MXFP8_GRADCHECK] {stage}: {len(bad)} non-finite params; "
-        f"EXPERT_WEIGHT(mxfp8)={len(expert_bad)} (the wgrad root if >0)"
-    )
-    for name, bucket, ms in bad:
-        logger.warning(f"[DEBUG_MXFP8_GRADCHECK] {stage}:   {bucket}  {name}  {ms}")
 
 
 def _infer_vocab_size(model_cfg):
@@ -400,13 +251,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Create dataloader iterator
         dataloader_iter = iter(self.dataloader)
 
-        # DEBUG_MXFP8_FWDPROBE: install forward-drift hooks once (no-op unless set).
-        _mxfp8_install_fwdprobe(self.model_parts)
-
         # Main benchmarking loop
         for i in range(steps):
             self.step_scheduler.step = i
-            _MXFP8_FWDPROBE_STEP["i"] = i
             # Start nsys profiling if configured
             if i == nsys_start and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Starting nsys profiling")
@@ -454,20 +301,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     if ga_step_idx == 0:
                         prepare_after_first_microbatch()
 
-                # DEBUG_MXFP8_GRADCHECK: global non-finite localizer (one-time, rank0).
-                # After backward, find the FIRST param with a non-finite GRAD (catches the
-                # weight-grad / wgrad, router, attn, embeddings — not just the expert
-                # dgrad). After opt.step, find the FIRST param whose DATA went non-finite
-                # (optimizer). Pinpoints exactly where the nan is born. No-op unless set.
-                _mxfp8_gradcheck_global(self.model_parts, stage="after_backward")
-
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
                     for opt in self.optimizer:
                         opt.step()
                     logger.debug("Optimizer step")
-
-                _mxfp8_gradcheck_global(self.model_parts, stage="after_step")
 
             # Synchronize num_label_tokens across DP ranks
             num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
