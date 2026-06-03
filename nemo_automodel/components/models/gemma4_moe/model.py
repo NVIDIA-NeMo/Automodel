@@ -247,7 +247,11 @@ class Gemma4MoEDecoderLayer(nn.Module):
         residual = x
         x = self.input_layernorm(x)
         attn_kwargs = kwargs
-        if getattr(self.config, "_attn_implementation", None) == "flex_attention" and "kernel_options" not in kwargs:
+        if (
+            getattr(self.config, "_attn_implementation", None) == "flex_attention"
+            and getattr(self.self_attn, "head_dim", 0) > 256
+            and "kernel_options" not in kwargs
+        ):
             attn_kwargs = {
                 **kwargs,
                 "kernel_options": {
@@ -261,6 +265,8 @@ class Gemma4MoEDecoderLayer(nn.Module):
                     "num_warps": 4,
                 },
             }
+        if padding_mask is not None and getattr(self.self_attn, "_cp_uses_sdpa_hook", False):
+            attn_kwargs = {**attn_kwargs, "padding_mask": padding_mask}
         x, _ = self.self_attn(
             hidden_states=x,
             position_embeddings=position_embeddings,
@@ -339,6 +345,7 @@ def _build_packed_gemma4_causal_mask_mapping(
     sliding_window: int | None,
     as_additive: bool = False,
     as_block_mask: bool = False,
+    flex_block_size: int | tuple[int, int] = 128,
 ) -> dict[str, torch.Tensor]:
     """Build Gemma4 full/sliding masks for packed VLM sequences.
 
@@ -395,6 +402,7 @@ def _build_packed_gemma4_causal_mask_mapping(
                 Q_LEN=seq_len,
                 KV_LEN=seq_len,
                 device=device,
+                BLOCK_SIZE=flex_block_size,
             ),
             "sliding_attention": create_block_mask(
                 _sliding_mask_mod,
@@ -403,6 +411,7 @@ def _build_packed_gemma4_causal_mask_mapping(
                 Q_LEN=seq_len,
                 KV_LEN=seq_len,
                 device=device,
+                BLOCK_SIZE=flex_block_size,
             ),
         }
 
@@ -561,6 +570,7 @@ class Gemma4MoETextModelBackend(nn.Module):
                 dtype=inputs_embeds.dtype,
                 sliding_window=getattr(self.config, "sliding_window", None),
                 as_block_mask=getattr(self.config, "_attn_implementation", None) == "flex_attention",
+                flex_block_size=(32, 32) if getattr(self.config, "head_dim", 0) > 256 else 128,
             )
         elif use_vision_bidirectional_mask:
             from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
@@ -796,6 +806,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     mm_token_type_ids=mm_token_type_ids,
+                    padding_mask=padding_mask,
                     past_key_values=past_key_values,
                     use_cache=use_cache,
                     **kwargs,
@@ -910,6 +921,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if language_model is None or not getattr(language_model, "hidden_size_per_layer_input", None):
             return None
 
+        pad_token_id = self._get_text_pad_token_id()
+        llm_input_ids = input_ids.masked_fill(special_image_mask, pad_token_id)
+        return language_model.get_per_layer_inputs(llm_input_ids, None)
+
+    def _get_text_pad_token_id(self) -> int:
         pad_token_id = getattr(self, "pad_token_id", None)
         if pad_token_id is None or pad_token_id < 0:
             cfg = getattr(self, "config", None)
@@ -925,9 +941,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             pad_token_id = eos_token_id
         if pad_token_id is None or pad_token_id < 0:
             raise ValueError("Gemma4 per-layer inputs require a valid pad_token_id.")
-
-        llm_input_ids = input_ids.masked_fill(special_image_mask, pad_token_id)
-        return language_model.get_per_layer_inputs(llm_input_ids, None)
+        return pad_token_id
 
     def prepare_model_inputs_for_cp(
         self,
@@ -941,7 +955,8 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
 
         special_image_mask = self._get_special_image_mask(input_ids, mm_token_type_ids)
-        inputs_embeds = self.model.get_input_embeddings()(input_ids)
+        llm_input_ids = input_ids.masked_fill(special_image_mask, self._get_text_pad_token_id())
+        inputs_embeds = self.model.get_input_embeddings()(llm_input_ids)
         prepared_inputs: dict[str, Any] = {
             "inputs_embeds": inputs_embeds,
             "mm_token_type_ids": mm_token_type_ids if mm_token_type_ids is not None else special_image_mask.to(torch.long),

@@ -258,12 +258,16 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         mm_token_type_ids_full = _all_gather_seq_metadata(mm_token_type_ids)
         packed_seq_ids = getattr(module, "_cp_packed_seq_ids", None)
         packed_seq_ids_full = _all_gather_seq_metadata(packed_seq_ids)
+        padding_mask = getattr(module, "_cp_padding_mask", None)
+        padding_mask_full = _all_gather_seq_metadata(padding_mask)
         vision_group_ids = _vision_group_ids(mm_token_type_ids_full)
         # HF Gemma4TextAttention marks sliding layers by setting sliding_window;
         # it does not expose an is_sliding flag.
         sliding_window = getattr(module, "sliding_window", None)
         is_sliding = sliding_window is not None
-        use_vision_bidirectional = is_sliding and vision_group_ids is not None
+        config_uses_vision_bidir = getattr(getattr(module, "config", None), "use_bidirectional_attention", None) == "vision"
+        has_vision_tokens = vision_group_ids is not None and bool((vision_group_ids >= 0).any().item())
+        use_vision_bidirectional = is_sliding and config_uses_vision_bidir and has_vision_tokens
 
         q_indices = torch.arange(seq_local, device=query.device) + seq_global_start
 
@@ -280,9 +284,56 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         empty_query_rows = None
         if packed_seq_ids_full is not None:
             empty_query_rows = packed_seq_ids_full[:, q_indices] <= 0
+        if padding_mask_full is not None:
+            padding_query_rows = padding_mask_full[:, q_indices]
+            empty_query_rows = padding_query_rows if empty_query_rows is None else empty_query_rows | padding_query_rows
+
+        if packed_seq_ids_full is None and not use_vision_bidirectional:
+            q_local_indices = torch.arange(seq_local, device=query.device)
+            kv_indices = torch.arange(seq_full, device=query.device)
+            sdpa_mask = _base_mask(q_local_indices[:, None], kv_indices[None, :])
+            if padding_mask_full is not None:
+                sdpa_mask = sdpa_mask.unsqueeze(0) & ~padding_mask_full[:, None, :]
+                sdpa_mask = torch.where(
+                    padding_query_rows[:, :, None],
+                    kv_indices.view(1, 1, seq_full) == 0,
+                    sdpa_mask,
+                )
+                sdpa_mask = sdpa_mask.unsqueeze(1)
+                additive_mask = torch.zeros(sdpa_mask.shape, dtype=query.dtype, device=query.device)
+                sdpa_mask = additive_mask.masked_fill(~sdpa_mask, torch.finfo(query.dtype).min)
+            else:
+                sdpa_mask = sdpa_mask.view(1, 1, seq_local, seq_full)
+            out = _original_sdpa(
+                query,
+                key_full,
+                value_full,
+                attn_mask=sdpa_mask,
+                dropout_p=dropout_p,
+                is_causal=False,
+                scale=scale,
+                enable_gqa=enable_gqa,
+                **kwargs,
+            )
+            if not getattr(_cp_sdpa, "_sdpa_ok_logged", False):
+                _log.info(
+                    "CP using SDPA all-gather. Q=%s K=%s head_dim=%s cp_rank=%s",
+                    tuple(query.shape),
+                    tuple(key_full.shape),
+                    orig_head_dim,
+                    cp_rank,
+                )
+                _cp_sdpa._sdpa_ok_logged = True
+            if empty_query_rows is not None and empty_query_rows.any():
+                out = out.masked_fill(empty_query_rows[:, None, :, None], 0)
+            return out
 
         try:
             from torch.nn.attention.flex_attention import create_block_mask
+
+            padded_head_dim = 1 << (orig_head_dim - 1).bit_length()
+            use_small_flex_blocks = padded_head_dim > 256
+            flex_block_size = (32, 32) if use_small_flex_blocks else 128
 
             if use_vision_bidirectional or packed_seq_ids_full is not None:
 
@@ -302,6 +353,11 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                         # kernels need at least one valid key.  Point them at a dummy
                         # key and zero the output after attention.
                         allowed = torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
+                    if padding_mask_full is not None:
+                        q_is_padding = padding_mask_full[batch_idx, q_global_idx]
+                        kv_is_padding = padding_mask_full[batch_idx, kv_idx]
+                        allowed = allowed & ~kv_is_padding
+                        allowed = torch.where(q_is_padding, kv_idx == 0, allowed)
                     return allowed
 
                 block_mask_batch = query.shape[0]
@@ -319,8 +375,8 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 Q_LEN=seq_local,
                 KV_LEN=seq_full,
                 device=query.device,
+                BLOCK_SIZE=flex_block_size,
             )
-            padded_head_dim = 1 << (orig_head_dim - 1).bit_length()
             query_for_flex = query
             key_for_flex = key_full
             value_for_flex = value_full
@@ -333,7 +389,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 if flex_scale is None:
                     flex_scale = 1.0 / math.sqrt(orig_head_dim)
             flex_kwargs = {"block_mask": block_mask, "scale": flex_scale, "enable_gqa": enable_gqa}
-            if query_for_flex.shape[-1] >= 256:
+            if use_small_flex_blocks:
                 flex_kwargs["kernel_options"] = {
                     "BLOCK_M": 32,
                     "BLOCK_N": 32,
@@ -379,9 +435,13 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
     def _pre_hook(module, args, kwargs):
         mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
         packed_seq_ids = kwargs.pop("_packed_seq_ids", None)
+        padding_mask = kwargs.pop("padding_mask", None)
         module._cp_mm_token_type_ids = mm_token_type_ids
         module._cp_packed_seq_ids = packed_seq_ids
-        module._cp_manual_allgather_active = mm_token_type_ids is not None or packed_seq_ids is not None
+        module._cp_padding_mask = padding_mask
+        module._cp_manual_allgather_active = (
+            mm_token_type_ids is not None or packed_seq_ids is not None or padding_mask is not None
+        )
         _active_module["module"] = module
         F_module.scaled_dot_product_attention = _cp_sdpa
         return args, kwargs
@@ -389,6 +449,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
     def _post_hook(module, inputs, output):
         module._cp_mm_token_type_ids = None
         module._cp_packed_seq_ids = None
+        module._cp_padding_mask = None
         module._cp_manual_allgather_active = False
         _active_module["module"] = None
         F_module.scaled_dot_product_attention = _original_sdpa
