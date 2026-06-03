@@ -59,7 +59,11 @@ from typing import Any, Dict, List, Optional, Union
 from datasets import load_dataset
 
 from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
-from nemo_automodel.components.datasets.llm.formatting_utils import _add_pad_token, format_chat_template
+from nemo_automodel.components.datasets.llm.formatting_utils import (
+    _add_pad_token,
+    _tokenized_chat_length,
+    format_chat_template,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +220,61 @@ def _convert_messages(
     return out
 
 
+def _truncate_messages_to_fit(
+    tokenizer,
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]],
+    seq_length: int,
+) -> List[Dict[str, Any]]:
+    """Drop the oldest conversation exchanges until the dialogue fits ``seq_length``.
+
+    Unlike token-level ``truncation`` (which clips from the tokenizer's
+    ``truncation_side`` and so typically drops the final assistant answer — the
+    supervised target), this drops whole oldest *exchanges* while keeping any
+    leading ``system`` message, the tool definitions, and the final exchange
+    (the user turn that produces the last assistant answer). Tool-call/response
+    pairing among the survivors is preserved because exchanges are cut only at
+    ``user`` boundaries.
+
+    Args:
+        tokenizer: tokenizer with a chat template.
+        messages: OpenAI-format messages from :func:`_convert_messages`.
+        tools: tool definitions rendered alongside the messages.
+        seq_length: the token budget the rendered dialogue must fit.
+
+    Returns:
+        ``messages`` unchanged when it already fits or has no ``user`` boundary
+        to cut at; otherwise the largest suffix of exchanges (leading ``system``
+        messages prepended) that fits. When even ``system`` + the final exchange
+        overflows, that minimal suffix is returned and the caller's token-level
+        ``truncation`` (if enabled) clips the remainder.
+    """
+    if _tokenized_chat_length(tokenizer, messages, tools=tools) <= seq_length:
+        return messages
+
+    n_system = 0
+    while n_system < len(messages) and messages[n_system].get("role") == "system":
+        n_system += 1
+    system = messages[:n_system]
+    history = messages[n_system:]
+
+    # Each ``user`` message starts a new exchange. Re-add exchanges newest-first
+    # (drop oldest) and keep the largest suffix that fits; the rendered length is
+    # monotonic in the number of exchanges kept.
+    boundaries = [i for i, m in enumerate(history) if m.get("role") == "user"]
+    if not boundaries:
+        return messages
+
+    for b in boundaries:
+        candidate = system + history[b:]
+        if _tokenized_chat_length(tokenizer, candidate, tools=tools) <= seq_length:
+            return candidate
+
+    # Even the final exchange alone overflows; return it and let token-level
+    # truncation (if enabled) clip the remainder.
+    return system + history[boundaries[-1] :]
+
+
 def _format_example(
     example: Dict[str, Any],
     tokenizer,
@@ -227,6 +286,7 @@ def _format_example(
     mask_reasoning_content: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
+    truncate_history: bool = False,
 ) -> Dict[str, List[int]]:
     """Render one agent example into tokenized ``input_ids`` / ``labels``.
 
@@ -248,6 +308,7 @@ def _format_example(
             mask_reasoning_content=mask_reasoning_content,
             train_on_last_turn_only=train_on_last_turn_only,
             drop_history_reasoning_content=drop_history_reasoning_content,
+            truncate_history=truncate_history,
         )
     except Exception as e:
         raise ValueError(f"Failed to format agent SFT example (id={example.get('id')!r}): {e}") from e
@@ -264,6 +325,7 @@ def _format_example_impl(
     mask_reasoning_content: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
+    truncate_history: bool = False,
 ) -> Dict[str, List[int]]:
     """Render one agent example into tokenized ``input_ids`` / ``labels``."""
     raw_tools = example.get("tools")
@@ -291,6 +353,9 @@ def _format_example_impl(
         example_id=example.get("id"),
         drop_history_reasoning_content=drop_history_reasoning_content,
     )
+
+    if truncate_history and seq_length is not None:
+        formatted = _truncate_messages_to_fit(tokenizer, formatted, tools, seq_length)
 
     tokenized = format_chat_template(
         tokenizer=tokenizer,
@@ -485,6 +550,7 @@ def make_agent_chat_dataset(
     mask_reasoning_content: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
+    truncate_history: bool = False,
 ) -> LazyMappedDataset:
     """Load a multi-turn function-calling SFT dataset.
 
@@ -518,6 +584,12 @@ def make_agent_chat_dataset(
             this controls whether history thinking appears in the prompt at all,
             the latter controls whether rendered thinking contributes to loss.
             Defaults to False, which keeps every turn's reasoning_content.
+        truncate_history: If True and ``seq_length`` is set, drop the oldest
+            conversation exchanges (keeping any leading system message, the tool
+            definitions, and the final exchange) until the dialogue fits
+            ``seq_length``. Unlike token-level ``truncation``, which clips from
+            the tokenizer side and usually drops the final assistant answer,
+            this preserves the supervised target. Defaults to False.
 
     Returns:
         A ``LazyMappedDataset`` yielding dicts with ``input_ids``, ``labels``
@@ -571,5 +643,6 @@ def make_agent_chat_dataset(
         mask_reasoning_content=mask_reasoning_content,
         train_on_last_turn_only=train_on_last_turn_only,
         drop_history_reasoning_content=drop_history_reasoning_content,
+        truncate_history=truncate_history,
     )
     return LazyMappedDataset(dataset, fmt_fn)

@@ -353,7 +353,7 @@ def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog
     # checkpoint_dir is preserved from the user config
     assert config.checkpoint_dir == "/user/ckpt/"
     # other user-provided torch_save options are discarded (defaults restored)
-    assert config.save_consolidated is True
+    assert config.save_consolidated.value == "final"
     assert config.is_async is False
 
 

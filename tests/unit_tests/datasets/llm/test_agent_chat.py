@@ -649,6 +649,103 @@ def test_format_example_wraps_missing_fields_with_example_id():
         agent_chat._format_example({"id": 7}, Tok(), 0, 0)
 
 
+class _LenTok:
+    """Tokenizer stub whose rendered length equals the total content words.
+
+    ``apply_chat_template`` returns one id per whitespace token across all
+    message contents, so a test controls the rendered length precisely.
+    """
+
+    def apply_chat_template(
+        self,
+        messages,
+        tools=None,
+        tokenize=True,
+        return_dict=True,
+        return_assistant_tokens_mask=False,
+        padding=False,
+        truncation=None,
+        max_length=None,
+    ):
+        n = sum(len(str(m.get("content", "")).split()) for m in messages)
+        return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+
+def test_truncate_messages_to_fit_unchanged_when_already_fits():
+    tok = _LenTok()
+    messages = [
+        {"role": "user", "content": "a b"},
+        {"role": "assistant", "content": "c"},
+    ]
+    assert agent_chat._truncate_messages_to_fit(tok, messages, None, seq_length=100) == messages
+
+
+def test_truncate_messages_to_fit_drops_oldest_exchanges():
+    tok = _LenTok()
+    messages = [
+        {"role": "system", "content": "s"},  # 1
+        {"role": "user", "content": "a a a"},  # 3  exchange 1
+        {"role": "assistant", "content": "b"},  # 1
+        {"role": "user", "content": "c c c"},  # 3  exchange 2
+        {"role": "assistant", "content": "d"},  # 1
+        {"role": "user", "content": "e"},  # 1  exchange 3 (final)
+        {"role": "assistant", "content": "f"},  # 1
+    ]
+    # full = 11; budget 6: system(1) + ex3(2) = 3 fits, + ex2(4) = 7 overflows.
+    out = agent_chat._truncate_messages_to_fit(tok, messages, None, seq_length=6)
+    assert [m["role"] for m in out] == ["system", "user", "assistant"]
+    assert out[1]["content"] == "e"
+
+
+def test_truncate_messages_to_fit_returns_final_exchange_when_nothing_fits():
+    tok = _LenTok()
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c c c c c"},
+        {"role": "assistant", "content": "d d d d d"},
+    ]
+    # final exchange alone = system(1) + 5 + 5 = 11 > budget 4; minimal suffix kept.
+    out = agent_chat._truncate_messages_to_fit(tok, messages, None, seq_length=4)
+    assert [m["role"] for m in out] == ["system", "user", "assistant"]
+    assert out[1]["content"] == "c c c c c"
+
+
+def test_truncate_messages_to_fit_no_user_boundary_unchanged():
+    tok = _LenTok()
+    messages = [
+        {"role": "system", "content": "s s s"},
+        {"role": "assistant", "content": "a a a"},
+    ]
+    assert agent_chat._truncate_messages_to_fit(tok, messages, None, seq_length=1) == messages
+
+
+def test_format_example_truncate_history_runs_before_render(monkeypatch):
+    # _format_example must truncate the converted messages before handing them
+    # to format_chat_template, so only the kept suffix is rendered/supervised.
+    tok = _LenTok()
+    captured = {}
+
+    def fake_format_chat_template(**kwargs):
+        captured.update(kwargs)
+        return {"input_ids": [1], "labels": [-100]}
+
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    example = {
+        "messages": [
+            {"role": "user", "content": "old old old"},
+            {"role": "assistant", "content": "x"},
+            {"role": "user", "content": "new"},
+            {"role": "assistant", "content": "y"},
+        ]
+    }
+    agent_chat._format_example(example, tok, 0, 0, seq_length=3, truncate_history=True)
+    assert [m["role"] for m in captured["formatted_text"]] == ["user", "assistant"]
+    assert captured["formatted_text"][0]["content"] == "new"
+
+
 def _patch_minimal_loader(monkeypatch):
     """Patch load_dataset / pad-token / formatter so dataset build does no real work."""
 
