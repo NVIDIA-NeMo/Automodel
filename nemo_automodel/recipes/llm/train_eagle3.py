@@ -41,6 +41,10 @@ from nemo_automodel.components.datasets.llm.eagle3 import (
     build_eagle3_dataloader,
     load_or_build_eagle3_token_mapping,
 )
+from nemo_automodel.components.datasets.llm.eagle3_cache import (
+    build_cached_eagle3_dataloader,
+    read_manifest,
+)
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.speculative.eagle import (
@@ -115,102 +119,20 @@ class TrainEagle3Recipe(BaseRecipe):
         )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
-        # Optional ``distributed:`` YAML section. Required for targets that
-        # do not fit on a single GPU (e.g. Qwen3-30B-A3B MoE): without it,
-        # ``from_pretrained`` loads the full target on every rank and OOMs.
-        # When absent, the recipe keeps the original single-GPU-per-rank
-        # behavior so existing 8B-class dense recipes are unaffected.
-        # ``force_hf`` is opt-in. Default ``False`` so HF architectures
-        # with an AutoModel custom impl (e.g. ``Qwen3MoeForCausalLM``,
-        # ``LlamaForCausalLM``) take the custom path, which unlocks the
-        # MoE infra (EP, ``GroupedExperts``, DeepEP). Set
-        # ``recipe_args.target_force_hf: true`` in YAML to force the
-        # plain HF implementation.
-        target_kwargs = dict(
-            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
-            torch_dtype=self.compute_dtype,
-            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
-        )
+        # ``cached_target_path`` (optional) selects the SpecForge OFFLINE path:
+        # the target's supervision was precomputed to disk by
+        # ``precompute_eagle3``, so we skip loading and running the target
+        # entirely and stream the cache instead. This is disk-heavy and largely
+        # superseded by the online path -- see precompute_eagle3 for the warning.
+        self.cached_target_path = recipe_cfg.get("cached_target_path", None)
         self.dist_setup = None
         self.distributed_config = None
         self.device_mesh = None
         self.moe_mesh = None
-        if self.cfg.get("distributed", None) is not None:
-            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-            self.distributed_config = self.dist_setup.strategy_config
-            self.device_mesh = self.dist_setup.device_mesh
-            self.moe_mesh = self.dist_setup.moe_mesh
-            target_kwargs.update(
-                distributed_config=self.distributed_config,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                moe_config=self.dist_setup.moe_config,
-                activation_checkpointing=self.dist_setup.activation_checkpointing,
-            )
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
-        # FSDP2 / EP sharding placed the model on the right devices already;
-        # only do the brute-force ``.to(device)`` for the unsharded path.
-        # ``nn.Module.to`` is in-place; reassigning ``self.target_model``
-        # would re-trigger ``BaseRecipe.__setattr__`` state-tracking and
-        # raise ``RuntimeError: State key 'target_model' is already tracked``.
-        if self.dist_setup is None:
-            self.target_model.to(self.device)
-        # The target is frozen: it only supplies aux hidden states / logits as
-        # supervision and is never optimized (the optimizer is built solely
-        # from the draft trainer module). ``generate_batch`` already runs under
-        # ``@torch.no_grad()``, but mark the parameters explicitly so the intent
-        # is unambiguous and no future code path accidentally trains the target
-        # -- matching the EAGLE-1/2 recipe.
-        self.target_model.requires_grad_(False)
-        self.target_wrapper = HFEagle3TargetModel(
-            self.target_model,
-            aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
-        )
-
-        self.train_dataloader = build_eagle3_dataloader(
-            data_path=recipe_cfg.train_data_path,
-            tokenizer=self.tokenizer,
-            seq_length=recipe_cfg.seq_length,
-            batch_size=recipe_cfg.micro_batch_size,
-            shuffle=True,
-            num_workers=recipe_cfg.get("num_workers", 0),
-            split=recipe_cfg.get("train_split", None),
-            distributed=self.dist_env.world_size > 1,
-            shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
-        )
-        self.val_dataloader = None
-        if recipe_cfg.get("val_data_path", None):
-            self.val_dataloader = build_eagle3_dataloader(
-                data_path=recipe_cfg.val_data_path,
-                tokenizer=self.tokenizer,
-                seq_length=recipe_cfg.seq_length,
-                batch_size=recipe_cfg.micro_batch_size,
-                shuffle=False,
-                num_workers=recipe_cfg.get("num_workers", 0),
-                split=recipe_cfg.get("val_split", None),
-                distributed=self.dist_env.world_size > 1,
-                shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
-            )
-
-        special_token_ids = [
-            getattr(self.tokenizer, "bos_token_id", None),
-            getattr(self.tokenizer, "eos_token_id", None),
-            getattr(self.tokenizer, "pad_token_id", None),
-            getattr(self.tokenizer, "unk_token_id", None),
-        ]
-        # ``selected_token_ids_path`` (optional) caches the draft-vocab
-        # selection so reruns skip the full-dataset frequency scan. When the
-        # path is unset, the mapping is rebuilt every setup (original behavior).
-        # On resume this still runs, but ``_load_extra_state`` then overrides the
-        # mapping with the one saved in the checkpoint's ``eagle_meta.pt`` -- so
-        # the cache only matters for cold starts.
-        selected_token_ids, selected_token_mask = load_or_build_eagle3_token_mapping(
-            self.train_dataloader,
-            target_vocab_size=target_config.vocab_size,
-            draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
-            special_token_ids=special_token_ids,
-            cache_path=recipe_cfg.get("selected_token_ids_path", None),
-        )
+        if self.cached_target_path is None:
+            selected_token_ids, selected_token_mask = self._setup_online_target(recipe_cfg, target_path, target_config)
+        else:
+            selected_token_ids, selected_token_mask = self._setup_cached_target(recipe_cfg, target_config)
 
         draft_config = target_config.to_dict()
         draft_config["draft_vocab_size"] = int(selected_token_ids.numel())
@@ -240,7 +162,12 @@ class TrainEagle3Recipe(BaseRecipe):
         # flow into the draft.
         draft_config_obj = type(target_config).from_dict(draft_config)
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
-        self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
+        # Seed draft embeddings from the target: directly from the live target,
+        # or from the embeddings stored alongside the offline cache.
+        embed_source = (
+            self.target_wrapper.get_input_embeddings() if self.target_wrapper is not None else self._cached_embed_source
+        )
+        self.draft_model.copy_embeddings_from_target(embed_source)
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
 
@@ -319,6 +246,170 @@ class TrainEagle3Recipe(BaseRecipe):
         )
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
+
+    def _setup_online_target(self, recipe_cfg, target_path, target_config):
+        """Live path: load the target model and build the live dataloader.
+
+        Sets ``self.target_model`` / ``self.target_wrapper`` /
+        ``self.train_dataloader`` / ``self.val_dataloader`` and returns the
+        ``(selected_token_ids, selected_token_mask)`` draft-vocab mapping built
+        by scanning the training data.
+        """
+        # Optional ``distributed:`` YAML section. Required for targets that do
+        # not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). ``force_hf`` is
+        # opt-in; default ``False`` so HF architectures with an AutoModel custom
+        # impl take the MoE-capable custom path.
+        target_kwargs = dict(
+            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
+            torch_dtype=self.compute_dtype,
+            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+        )
+        if self.cfg.get("distributed", None) is not None:
+            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+            self.distributed_config = self.dist_setup.strategy_config
+            self.device_mesh = self.dist_setup.device_mesh
+            self.moe_mesh = self.dist_setup.moe_mesh
+            target_kwargs.update(
+                distributed_config=self.distributed_config,
+                device_mesh=self.device_mesh,
+                moe_mesh=self.moe_mesh,
+                moe_config=self.dist_setup.moe_config,
+                activation_checkpointing=self.dist_setup.activation_checkpointing,
+            )
+        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        # ``nn.Module.to`` is in-place; reassigning ``self.target_model`` would
+        # re-trigger ``BaseRecipe.__setattr__`` state-tracking and raise.
+        if self.dist_setup is None:
+            self.target_model.to(self.device)
+        # The target is frozen: it only supplies aux hidden states / logits as
+        # supervision and is never optimized (the optimizer is built solely from
+        # the draft trainer module). Mark the parameters explicitly so no future
+        # code path accidentally trains the target -- matching EAGLE-1/2.
+        self.target_model.requires_grad_(False)
+        self.target_wrapper = HFEagle3TargetModel(
+            self.target_model,
+            aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
+        )
+
+        self.train_dataloader = build_eagle3_dataloader(
+            data_path=recipe_cfg.train_data_path,
+            tokenizer=self.tokenizer,
+            seq_length=recipe_cfg.seq_length,
+            batch_size=recipe_cfg.micro_batch_size,
+            shuffle=True,
+            num_workers=recipe_cfg.get("num_workers", 0),
+            split=recipe_cfg.get("train_split", None),
+            distributed=self.dist_env.world_size > 1,
+            shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+        )
+        self.val_dataloader = None
+        if recipe_cfg.get("val_data_path", None):
+            self.val_dataloader = build_eagle3_dataloader(
+                data_path=recipe_cfg.val_data_path,
+                tokenizer=self.tokenizer,
+                seq_length=recipe_cfg.seq_length,
+                batch_size=recipe_cfg.micro_batch_size,
+                shuffle=False,
+                num_workers=recipe_cfg.get("num_workers", 0),
+                split=recipe_cfg.get("val_split", None),
+                distributed=self.dist_env.world_size > 1,
+                shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+            )
+
+        special_token_ids = [
+            getattr(self.tokenizer, "bos_token_id", None),
+            getattr(self.tokenizer, "eos_token_id", None),
+            getattr(self.tokenizer, "pad_token_id", None),
+            getattr(self.tokenizer, "unk_token_id", None),
+        ]
+        # ``selected_token_ids_path`` (optional) caches the draft-vocab selection
+        # so reruns skip the full-dataset frequency scan. When unset, the mapping
+        # is rebuilt every setup (original behavior). On resume this still runs,
+        # but ``_load_extra_state`` then overrides it with the checkpoint's saved
+        # mapping -- so the cache only matters for cold starts.
+        return load_or_build_eagle3_token_mapping(
+            self.train_dataloader,
+            target_vocab_size=target_config.vocab_size,
+            draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
+            special_token_ids=special_token_ids,
+            cache_path=recipe_cfg.get("selected_token_ids_path", None),
+        )
+
+    def _setup_cached_target(self, recipe_cfg, target_config):
+        """Offline path: stream a precomputed cache; no target model is loaded.
+
+        Reads the cache manifest for the draft-vocab mapping and loads the stored
+        target embeddings (the one target tensor the draft still needs). Sets
+        ``self.target_model`` / ``self.target_wrapper`` to ``None`` and builds the
+        cache-backed dataloader.
+        """
+        from nemo_automodel.components.datasets.llm.eagle3_cache import read_target_embeddings
+
+        self.target_model = None
+        self.target_wrapper = None
+        manifest = read_manifest(self.cached_target_path)
+        if int(manifest["target_vocab_size"]) != int(target_config.vocab_size):
+            raise ValueError(
+                f"EAGLE-3 cache at {self.cached_target_path} was built for target_vocab_size="
+                f"{manifest['target_vocab_size']}, but the configured target has {target_config.vocab_size}. "
+                "The cache does not match this target."
+            )
+        # The draft's ``fc`` consumes ``target_hidden_size * 3`` aux features; a
+        # cache from a different-width target would otherwise crash deep inside
+        # ``fc`` with a confusing shape error.
+        expected_aux_dim = int(target_config.hidden_size) * 3
+        if int(manifest["aux_hidden_dim"]) != expected_aux_dim:
+            raise ValueError(
+                f"EAGLE-3 cache at {self.cached_target_path} has aux_hidden_dim={manifest['aux_hidden_dim']}, "
+                f"but the configured target needs {expected_aux_dim} (hidden_size {target_config.hidden_size} x 3 "
+                "aux layers). The cache was built for a different target."
+            )
+        selected_token_ids = torch.tensor(manifest["selected_token_ids"], dtype=torch.long)
+        selected_token_mask = torch.zeros(int(target_config.vocab_size), dtype=torch.bool)
+        selected_token_mask[selected_token_ids] = True
+        self._cached_embed_source = SimpleNamespace(weight=read_target_embeddings(self.cached_target_path))
+
+        self.train_dataloader = build_cached_eagle3_dataloader(
+            cache_dir=self.cached_target_path,
+            batch_size=recipe_cfg.micro_batch_size,
+            shuffle=True,
+            num_workers=recipe_cfg.get("num_workers", 0),
+            distributed=self.dist_env.world_size > 1,
+        )
+        self.val_dataloader = None
+        if self.dist_env.is_main:
+            logger.info(
+                "EAGLE-3 OFFLINE cache: streaming %d precomputed samples from %s (target model not loaded).",
+                len(self.train_dataloader.dataset),
+                self.cached_target_path,
+            )
+        return selected_token_ids, selected_token_mask
+
+    def _forward_batch(self, batch):
+        """Run the trainer module for one batch, from the live target or the cache."""
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        if self.target_wrapper is None:
+            # Offline cache: the supervision is already in the batch.
+            return self.trainer_module(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                loss_mask=batch["loss_mask"],
+                aux_hidden_states=batch["aux_hidden_states"],
+                target_probs=batch["target_probs"],
+                position_mask=batch["position_mask"],
+            )
+        target_batch = self.target_wrapper.generate_batch(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            loss_mask=batch["loss_mask"],
+        )
+        return self.trainer_module(
+            input_ids=target_batch.input_ids,
+            attention_mask=target_batch.attention_mask,
+            loss_mask=target_batch.loss_mask,
+            aux_hidden_states=target_batch.aux_hidden_states,
+            target_logits=target_batch.logits,
+        )
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the standard recipes."""
@@ -555,19 +646,7 @@ class TrainEagle3Recipe(BaseRecipe):
         total_batches = torch.zeros((), device=self.device)
         with torch.no_grad():
             for batch in self.val_dataloader:
-                batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-                target_batch = self.target_wrapper.generate_batch(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    loss_mask=batch["loss_mask"],
-                )
-                metrics = self.trainer_module(
-                    input_ids=target_batch.input_ids,
-                    attention_mask=target_batch.attention_mask,
-                    loss_mask=target_batch.loss_mask,
-                    aux_hidden_states=target_batch.aux_hidden_states,
-                    target_logits=target_batch.logits,
-                )
+                metrics = self._forward_batch(batch)
                 total_loss = total_loss + metrics.loss.detach()
                 total_acc = total_acc + metrics.accuracy.detach()
                 total_batches = total_batches + 1
@@ -616,19 +695,7 @@ class TrainEagle3Recipe(BaseRecipe):
             batches_processed = 0
             pending_micro_batches = 0
             for batch_idx, batch in enumerate(self.train_dataloader):
-                batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-                target_batch = self.target_wrapper.generate_batch(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    loss_mask=batch["loss_mask"],
-                )
-                metrics = self.trainer_module(
-                    input_ids=target_batch.input_ids,
-                    attention_mask=target_batch.attention_mask,
-                    loss_mask=target_batch.loss_mask,
-                    aux_hidden_states=target_batch.aux_hidden_states,
-                    target_logits=target_batch.logits,
-                )
+                metrics = self._forward_batch(batch)
                 loss = metrics.loss / float(self.grad_accumulation_steps)
                 loss.backward()
 
