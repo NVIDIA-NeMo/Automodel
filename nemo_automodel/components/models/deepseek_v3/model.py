@@ -46,7 +46,8 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.self_attn = MLA(config, backend)
-        if layer_idx < config.first_k_dense_replace:
+        self.is_moe_layer = layer_idx >= config.first_k_dense_replace
+        if not self.is_moe_layer:
             self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
         else:
             self.mlp = MoE(moe_config, backend)
@@ -100,11 +101,9 @@ class Block(nn.Module):
         x: torch.Tensor,
         padding_mask: torch.Tensor,
     ) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
+        if not self.is_moe_layer:
             return self.mlp(x)
-        else:
-            assert isinstance(self.mlp, MoE)
-            return self.mlp(x, padding_mask)
+        return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):

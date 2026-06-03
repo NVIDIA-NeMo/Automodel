@@ -18,11 +18,11 @@ import types
 from unittest.mock import patch
 
 # Mock fast_hadamard_transform before importing deepseek_v32 modules
-if 'fast_hadamard_transform' not in sys.modules:
-    mock_hadamard = types.ModuleType('fast_hadamard_transform')
-    mock_hadamard.__spec__ = importlib.util.spec_from_loader('fast_hadamard_transform', loader=None)
+if "fast_hadamard_transform" not in sys.modules:
+    mock_hadamard = types.ModuleType("fast_hadamard_transform")
+    mock_hadamard.__spec__ = importlib.util.spec_from_loader("fast_hadamard_transform", loader=None)
     mock_hadamard.hadamard_transform = lambda x, scale: x
-    sys.modules['fast_hadamard_transform'] = mock_hadamard
+    sys.modules["fast_hadamard_transform"] = mock_hadamard
 
 from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
 from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32ForCausalLM
@@ -56,7 +56,9 @@ class TestDeepseekV32ModelUpdates:
         with patch.object(DeepseekV32Config, "from_pretrained") as mock_from_pretrained:
             mock_from_pretrained.return_value = cfg
 
-            with patch.object(DeepseekV32ForCausalLM, "from_config", wraps=DeepseekV32ForCausalLM.from_config) as mock_from_config:
+            with patch.object(
+                DeepseekV32ForCausalLM, "from_config", wraps=DeepseekV32ForCausalLM.from_config
+            ) as mock_from_config:
                 model = DeepseekV32ForCausalLM.from_pretrained("deepseek/model")
                 assert isinstance(model, DeepseekV32ForCausalLM)
                 mock_from_pretrained.assert_called_once_with("deepseek/model")
@@ -105,11 +107,7 @@ class TestDeepseekV32Config:
 
     def test_config_rope_scaling(self):
         """Test that config handles rope_scaling parameter."""
-        rope_scaling = {
-            "factor": 2.0,
-            "mscale": 1.0,
-            "original_max_position_embeddings": 4096
-        }
+        rope_scaling = {"factor": 2.0, "mscale": 1.0, "original_max_position_embeddings": 4096}
         cfg = DeepseekV32Config(rope_scaling=rope_scaling)
 
         assert cfg.rope_scaling == rope_scaling
@@ -125,6 +123,7 @@ class TestDeepseekV32Block:
     def create_moe_config(self):
         """Create a valid MoEConfig for tests."""
         from nemo_automodel.components.moe.config import MoEConfig
+
         return MoEConfig(
             dim=64,
             inter_dim=128,
@@ -176,13 +175,15 @@ class TestDeepseekV32Block:
         block = DeepseekV32Block(layer_idx=0, config=cfg, moe_config=moe_config, backend=backend)
 
         assert block.layer_idx == 0
-        assert hasattr(block, 'self_attn')
-        assert hasattr(block, 'mlp')
-        assert hasattr(block, 'input_layernorm')
-        assert hasattr(block, 'post_attention_layernorm')
+        assert block.is_moe_layer is False
+        assert hasattr(block, "self_attn")
+        assert hasattr(block, "mlp")
+        assert hasattr(block, "input_layernorm")
+        assert hasattr(block, "post_attention_layernorm")
 
         # Check that MLP is dense (not MoE)
         from nemo_automodel.components.moe.layers import MLP
+
         assert isinstance(block.mlp, MLP)
 
     def test_block_with_moe_layer(self):
@@ -219,9 +220,11 @@ class TestDeepseekV32Block:
         block = DeepseekV32Block(layer_idx=3, config=cfg, moe_config=moe_config, backend=backend)
 
         assert block.layer_idx == 3
+        assert block.is_moe_layer is True
 
         # Check that MLP is MoE (not dense)
         from nemo_automodel.components.moe.layers import MoE
+
         assert isinstance(block.mlp, MoE)
 
 
@@ -256,10 +259,10 @@ class TestDeepseekV32Model:
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
         model = DeepseekV32Model(cfg, backend)
 
-        assert hasattr(model, 'embed_tokens')
-        assert hasattr(model, 'layers')
-        assert hasattr(model, 'norm')
-        assert hasattr(model, 'freqs_cis')
+        assert hasattr(model, "embed_tokens")
+        assert hasattr(model, "layers")
+        assert hasattr(model, "norm")
+        assert hasattr(model, "freqs_cis")
         assert len(model.layers) == 2
 
     def test_model_initialization_with_moe_config(self):
@@ -425,7 +428,7 @@ class TestDeepseekV32ForCausalLM:
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", enable_hf_state_dict_adapter=False)
         model = DeepseekV32ForCausalLM(cfg, backend=backend)
 
-        assert not hasattr(model, 'state_dict_adapter')
+        assert not hasattr(model, "state_dict_adapter")
 
     def test_init_with_state_dict_adapter_enabled(self):
         """Test initialization with state dict adapter enabled."""
@@ -456,8 +459,9 @@ class TestDeepseekV32ForCausalLM:
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", enable_hf_state_dict_adapter=True)
         model = DeepseekV32ForCausalLM(cfg, backend=backend)
 
-        assert hasattr(model, 'state_dict_adapter')
+        assert hasattr(model, "state_dict_adapter")
         from nemo_automodel.components.models.deepseek_v32.state_dict_adapter import DeepSeekV32StateDictAdapter
+
         assert isinstance(model.state_dict_adapter, DeepSeekV32StateDictAdapter)
 
     def test_model_has_lm_head(self):
@@ -489,7 +493,7 @@ class TestDeepseekV32ForCausalLM:
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
         model = DeepseekV32ForCausalLM(cfg, backend=backend)
 
-        assert hasattr(model, 'lm_head')
+        assert hasattr(model, "lm_head")
         # lm_head should project from hidden_size to vocab_size
         assert model.lm_head.in_features == cfg.hidden_size
         assert model.lm_head.out_features == cfg.vocab_size

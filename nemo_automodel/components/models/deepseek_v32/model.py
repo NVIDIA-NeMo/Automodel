@@ -59,7 +59,8 @@ class DeepseekV32Block(Block):
         from nemo_automodel.components.models.common import initialize_rms_norm_module
         from nemo_automodel.components.moe.layers import MLP, MoE
 
-        if layer_idx < config.first_k_dense_replace:
+        self.is_moe_layer = layer_idx >= config.first_k_dense_replace
+        if not self.is_moe_layer:
             self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
         else:
             self.mlp = MoE(moe_config, backend)
