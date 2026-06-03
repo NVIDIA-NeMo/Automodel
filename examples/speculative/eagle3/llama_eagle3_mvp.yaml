@@ -39,6 +39,13 @@ recipe_args:
   # fresh path (or delete the file) if you change the training data.
   # selected_token_ids_path: ./outputs/eagle3_llama_mvp/draft_token_map.pt
   freeze_embeddings: true
+  # SpecForge OFFLINE path (legacy, disk-heavy): point this at a cache produced
+  # by `python -m nemo_automodel.components.speculative.precompute_eagle3` and the
+  # recipe streams the precomputed target supervision instead of loading/running
+  # the target. It costs ~80 MB/sample (tens of TB for a large corpus) and is
+  # largely superseded by the default online path -- leave it unset unless you
+  # are repeatedly re-training a draft on a fixed, bounded dataset.
+  # cached_target_path: /data/eagle3_cache/sharegpt_llama31
   trust_remote_code: false
   shuffle_seed: 42
   log_every_steps: 10
