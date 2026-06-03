@@ -32,8 +32,15 @@ peft:
 optim:
   learning_rate: 5e-6
   optimizer:
+    _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     weight_decay: 0.01
     betas: [0.9, 0.999]
+    master_weights: true
+    store_param_remainders: true
+    exp_avg_dtype: float32
+    exp_avg_sq_dtype: float32
+    adam_w_mode: true
+    bias_correction: true
 
 lr_scheduler:
   lr_decay_style: cosine
@@ -50,6 +57,10 @@ fsdp:
   dp_replicate_size: 1
   dp_size: 8
   activation_checkpointing: false
+  defer_fsdp_grad_sync: true
+  reduce_dtype: bfloat16
+  enable_fsdp2_prefetch: false
+  enable_compile: true
 
 flow_matching:
   adapter_type: "simple"
@@ -68,8 +79,8 @@ flow_matching:
   summary_log_interval: 10
 
 step_scheduler:
-  global_batch_size: 8
-  local_batch_size: 1
+  global_batch_size: 16
+  local_batch_size: 2
   ckpt_every_steps: 1000
   num_epochs: 100
   log_every: 2

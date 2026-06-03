@@ -12,6 +12,8 @@ dist_env:
 model:
   pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-14B-Diffusers
   mode: finetune  # "finetune" loads pretrained weights, "pretrain" initializes random weights
+  torch_dtype: float32
+  compute_dtype: bfloat16
 
 step_scheduler:
   global_batch_size: 8
@@ -74,7 +76,9 @@ fsdp:
   dp_size: 8
   activation_checkpointing: false
   defer_fsdp_grad_sync: true
-  enable_fsdp2_prefetch: true
+  reduce_dtype: bfloat16
+  enable_fsdp2_prefetch: false
+  enable_compile: true
   fsdp2_backward_prefetch_depth: 2
   fsdp2_forward_prefetch_depth: 1
 
