@@ -38,7 +38,7 @@ seed: 1234
 
 benchmark:
   warmup_steps: 10
-  peak_tflops: 2500  # GB200 BF16 dense peak TFLOPs
+  peak_tflops: 5000  # GB200 MXFP8/FP8 dense peak TFLOPs
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []

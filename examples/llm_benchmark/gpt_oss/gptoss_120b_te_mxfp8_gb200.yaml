@@ -31,8 +31,10 @@
 # (fp8_ctx); the BenchmarkingRecipe reuses that step, so the expert GEMMs run under
 # MXFP8BlockScaling. attn/linear/rms_norm stay TE bf16 unless a wider fp8 scope is set.
 #
-# Everything else matches the bf16 baseline for an apples-to-apples comparison:
-#   peak_tflops=2500, 8 nodes/32 GPUs, ep_size=16, local_batch_size=2, GBS=512, seq_len=4096.
+# Parallelism/data match the bf16 baseline for an apples-to-apples iter-time comparison:
+#   8 nodes/32 GPUs, ep_size=16, local_batch_size=2, GBS=512, seq_len=4096.
+# peak_tflops=5000 (GB200 MXFP8/FP8 dense peak) so MFU is reported against the FP8
+# roofline, not the bf16 2500 peak the gmm/bf16 configs use.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 
@@ -40,7 +42,7 @@ seed: 1234
 
 benchmark:
   warmup_steps: 10
-  peak_tflops: 2500  # GB200 BF16 dense peak TFLOPs
+  peak_tflops: 5000  # GB200 MXFP8/FP8 dense peak TFLOPs
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
