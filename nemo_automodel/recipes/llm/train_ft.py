@@ -61,7 +61,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
-from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
@@ -69,7 +69,7 @@ from nemo_automodel.components.distributed.init_utils import (
 from nemo_automodel.components.distributed.megatron_fsdp import fully_shard_optimizer
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
 from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -172,20 +172,6 @@ def _get_num_thd_chunks(pp_enabled, cfg):
     if pp_enabled:
         return cfg.step_scheduler.local_batch_size // cfg.get("distributed.pipeline.pp_microbatch_size", 1)
     return 1
-
-
-def _dp_eval_sample_shard(distributed_config: Any, dp_rank: int, dp_size: int) -> tuple | None:
-    """Return ``(dp_rank, dp_size)`` to shard tool-call eval across DP ranks, else ``None``.
-
-    Only DDP replicates the full model on every rank, so only there can each rank
-    score a disjoint subset independently. Under FSDP2 / MegatronFSDP the model is
-    sharded and ``generate()`` issues per-layer all-gather collectives that must
-    stay in lockstep across the group — different samples per rank would desync
-    them and hang — so every rank scores the same samples (``None``).
-    """
-    if isinstance(distributed_config, DDPConfig) and dp_size > 1:
-        return (dp_rank, dp_size)
-    return None
 
 
 def build_model(
@@ -918,18 +904,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.cfg = cfg
 
-    def _shard_tool_call_eval_across_dp(self):
-        """Shard tool-call eval samples across DP ranks when it is safe to do so.
-
-        Each DP rank then scores a disjoint subset instead of every rank
-        redundantly scoring the full set. Only safe when the model is replicated
-        per rank (DDP); a ``sample_shard`` already set from YAML is left untouched.
-        """
-        if self.tool_call_evaluator.sample_shard is None:
-            self.tool_call_evaluator.sample_shard = _dp_eval_sample_shard(
-                self.distributed_config, self._get_dp_rank(), self._get_dp_group_size()
-            )
-
     # ------------------ build phase ------------------
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
@@ -1152,7 +1126,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         tool_call_eval_cfg = self.cfg.get("tool_call_eval", None)
         if tool_call_eval_cfg is not None:
             self.tool_call_evaluator = tool_call_eval_cfg.instantiate()
-            self._shard_tool_call_eval_across_dp()
+            # Shard eval samples across DP ranks only when safe (DDP); never
+            # override a ``sample_shard`` already set from YAML.
+            if self.tool_call_evaluator.sample_shard is None:
+                self.tool_call_evaluator.sample_shard = dp_eval_sample_shard(
+                    self.distributed_config, self._get_dp_rank(), self._get_dp_group_size()
+                )
         self._warned_tool_call_eval_skipped = False
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler

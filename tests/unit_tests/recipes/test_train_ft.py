@@ -31,10 +31,11 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
+from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
+from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.recipes.llm.train_ft import (
     PipelineCausalLMLoss,
     TrainFinetuneRecipeForNextTokenPrediction,
-    _dp_eval_sample_shard,
     build_dataloader,
     build_model,
     build_optimizer,
@@ -1987,63 +1988,29 @@ class TestResolveSdpaMethod:
 
 
 class TestDpEvalSampleShard:
-    """`_dp_eval_sample_shard` shards tool-call eval only when the model is
+    """`dp_eval_sample_shard` shards eval samples only when the model is
     replicated per DP rank (DDP); sharded strategies must stay in lockstep."""
 
     def test_ddp_multi_rank_shards(self):
         from nemo_automodel.components.distributed.config import DDPConfig
 
-        assert _dp_eval_sample_shard(DDPConfig(), 1, 4) == (1, 4)
+        assert dp_eval_sample_shard(DDPConfig(), 1, 4) == (1, 4)
 
     def test_ddp_single_rank_no_shard(self):
         from nemo_automodel.components.distributed.config import DDPConfig
 
-        assert _dp_eval_sample_shard(DDPConfig(), 0, 1) is None
+        assert dp_eval_sample_shard(DDPConfig(), 0, 1) is None
 
     def test_fsdp2_never_shards(self):
         # Sharding under FSDP2 would desync generate()'s per-layer all-gathers.
         from nemo_automodel.components.distributed.config import FSDP2Config
 
-        assert _dp_eval_sample_shard(FSDP2Config(), 1, 4) is None
+        assert dp_eval_sample_shard(FSDP2Config(), 1, 4) is None
 
     def test_megatron_fsdp_never_shards(self):
         from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 
-        assert _dp_eval_sample_shard(MegatronFSDPConfig(), 1, 4) is None
-
-
-class TestShardToolCallEvalAcrossDp:
-    """`_shard_tool_call_eval_across_dp` wires the DP shard onto the evaluator
-    during setup: injected only for DDP, and never overriding a YAML-set shard."""
-
-    def _recipe(self, distributed_config, evaluator, dp_rank=1, dp_size=4):
-        recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
-        recipe.tool_call_evaluator = evaluator
-        recipe.distributed_config = distributed_config
-        recipe._get_dp_rank = lambda: dp_rank
-        recipe._get_dp_group_size = lambda: dp_size
-        return recipe
-
-    def test_ddp_injects_shard(self):
-        from nemo_automodel.components.distributed.config import DDPConfig
-
-        ev = _FakeToolCallEvaluator(sample_shard=None)
-        self._recipe(DDPConfig(), ev, dp_rank=1, dp_size=4)._shard_tool_call_eval_across_dp()
-        assert ev.sample_shard == (1, 4)
-
-    def test_fsdp2_leaves_shard_none(self):
-        from nemo_automodel.components.distributed.config import FSDP2Config
-
-        ev = _FakeToolCallEvaluator(sample_shard=None)
-        self._recipe(FSDP2Config(), ev)._shard_tool_call_eval_across_dp()
-        assert ev.sample_shard is None
-
-    def test_yaml_set_shard_is_untouched(self):
-        from nemo_automodel.components.distributed.config import DDPConfig
-
-        ev = _FakeToolCallEvaluator(sample_shard=(0, 2))
-        self._recipe(DDPConfig(), ev, dp_rank=1, dp_size=4)._shard_tool_call_eval_across_dp()
-        assert ev.sample_shard == (0, 2)  # explicit YAML shard preserved
+        assert dp_eval_sample_shard(MegatronFSDPConfig(), 1, 4) is None
 
 
 class _FakeToolCallEvaluator:
@@ -2051,14 +2018,8 @@ class _FakeToolCallEvaluator:
     so ``_run_validation_epoch``'s reduction can be tested without generation."""
 
     metric_prefix = "tool_call"
-    METRIC_KEYS = (
-        "has_call",
-        "name_correct",
-        "args_json_valid",
-        "args_field_recall",
-        "args_field_precision",
-        "args_exact_match",
-    )
+    # Reuse the real evaluator's keys so this fake can never silently diverge.
+    METRIC_KEYS = ToolCallAccuracyEvaluator.METRIC_KEYS
 
     def __init__(self, *, sample_shard=None, run_on_fsdp2=False, result=None, raises=False):
         self.sample_shard = sample_shard
