@@ -109,6 +109,10 @@ from nemo_automodel.components.speculative.eagle.peagle_attention import create_
 from nemo_automodel.shared.import_utils import safe_import_from
 
 logger = logging.getLogger(__name__)
+_peagle_flex_attention = torch.compile(
+    flex_attention,
+    mode="max-autotune-no-cudagraphs",
+)
 
 
 def _load_flash_attn_func() -> tuple[bool, object | None]:
@@ -310,7 +314,7 @@ class Eagle3LlamaAttention(nn.Module):
         cos, sin = self.rotary_emb(combined_states, position_ids)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         k, v = self._repeat_kv(k, v)
-        attn_output = flex_attention(q, k, v, block_mask=block_mask, scale=self.scaling)
+        attn_output = _peagle_flex_attention(q, k, v, block_mask=block_mask, scale=self.scaling)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(attn_output)
 
