@@ -260,12 +260,18 @@ class TestActivationCheckpointingRouting:
         assert result["strategy_config"].activation_checkpointing is True
         assert result["activation_checkpointing"] is True
 
-    def test_selective_rejected_for_ep(self):
-        with pytest.raises(ValueError, match="non-EP FSDP2"):
-            parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "selective", "ep_size": 2})
+    def test_selective_allowed_for_ep(self):
+        # Selective AC is now supported with expert parallelism via the MoE
+        # parallelizer. For EP it is kept off the strategy config and carried on
+        # the parsed value (consumed by parallelize_model -> apply_ac).
+        result = parse_distributed_section(
+            {"strategy": "fsdp2", "activation_checkpointing": "selective", "ep_size": 2, "moe": {}}
+        )
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["activation_checkpointing"] == "selective"
 
     def test_selective_rejected_for_non_fsdp2(self):
-        with pytest.raises(ValueError, match="non-EP FSDP2"):
+        with pytest.raises(ValueError, match="FSDP2"):
             parse_distributed_section({"strategy": "ddp", "activation_checkpointing": "selective"})
 
     def test_unknown_activation_checkpointing_mode_rejected(self):

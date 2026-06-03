@@ -34,7 +34,11 @@ distributed:
   activation_checkpointing: selective
 ```
 
-Use `true` or `full` for full activation checkpointing. Use `selective` for PyTorch selective activation checkpointing on non-EP FSDP2 configs (including single-GPU runs). Selective checkpointing saves expensive operations such as attention, collectives, and part of the matrix multiplications while recomputing cheaper operations during backward.
+Use `true` or `full` for full activation checkpointing. Use `selective` for PyTorch selective activation checkpointing on FSDP2 configs. Selective checkpointing saves expensive operations such as attention, collectives, and part of the matrix multiplications while recomputing cheaper operations during backward.
+
+<Note>
+`selective` requires the FSDP2 strategy. Non-FSDP2 strategies (`ddp`, `megatron_fsdp`) raise an error when `selective` is requested. KV-sharing models (e.g. Gemma4) automatically fall back to sub-module checkpointing, because attention cannot be recomputed through the KV cache.
+</Note>
 
 ### Configure Programmatically
 ```python

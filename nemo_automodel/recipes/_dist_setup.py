@@ -171,8 +171,8 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     # strategy config; for EP configs it stays only on MeshContext
     # (the MoE infra reads it from there).
     ep_size: int = parallelism.get("ep_size") or 1
-    if activation_checkpointing == "selective" and (strategy_name != "fsdp2" or ep_size > 1):
-        raise ValueError("selective activation checkpointing is currently supported only for non-EP FSDP2 configs.")
+    if activation_checkpointing == "selective" and strategy_name != "fsdp2":
+        raise ValueError("selective activation checkpointing is supported only for FSDP2 configs.")
 
     # YAML-level sanity: silently discard sub-configs that don't apply to the
     # current parallelism sizes (e.g. pipeline section present but pp_size=1,

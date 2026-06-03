@@ -775,7 +775,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     )
     apply_ep_mock.assert_called_once()
     # AC enabled
-    apply_ac_mock.assert_called_once_with(model, ignore_router=False)
+    apply_ac_mock.assert_called_once_with(model, ignore_router=False, selective=False)
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args
     # handle positional or keyword invocations
@@ -1656,6 +1656,74 @@ def test_parallelize_model_ignore_router_for_ac_defaults_to_false(monkeypatch):
     apply_ac_mock.assert_called_once()
     args, kwargs = apply_ac_mock.call_args
     assert kwargs.get("ignore_router") is False
+    # Full (True) AC is not selective.
+    assert kwargs.get("selective") is False
+
+
+def test_parallelize_model_passes_selective_to_apply_ac(monkeypatch):
+    """parallelize_model translates activation_checkpointing='selective' into selective=True."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_ac_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_ac", apply_ac_mock)
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_fsdp", MagicMock())
+
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+
+    model = Outer()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=None,
+        dp_axis_names=("dp",),
+        activation_checkpointing="selective",
+    )
+
+    apply_ac_mock.assert_called_once()
+    _, kwargs = apply_ac_mock.call_args
+    assert kwargs.get("selective") is True
+    assert kwargs.get("ignore_router") is False
+
+
+def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
+    """selective=True wraps every block with the shared dense selective policy and
+    does not require hidden_size/num_experts (router dims are only needed for the
+    router-save policy)."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    sentinel_ctx = object()
+    dense_stub = types.ModuleType("nemo_automodel.components.distributed.parallelizer")
+    dense_stub._make_selective_checkpoint_context_fn = MagicMock(return_value=sentinel_ctx)
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.parallelizer", dense_stub)
+
+    wrapped = []
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        assert preserve_rng_state is True
+        assert context_fn is sentinel_ctx
+        wrapped.append(block)
+        return ("W", block)
+
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    blocks = [DummyBlock(), DummyBlock(), DummyBlock()]
+    model = DummyModel(blocks)
+
+    # No hidden_size/num_experts provided — selective path must not need them.
+    P.apply_ac(model, selective=True)
+
+    assert len(wrapped) == 3
+    assert len(model.layers.registered) == 3
+    dense_stub._make_selective_checkpoint_context_fn.assert_called_once()
 
 
 # ============================================================================
