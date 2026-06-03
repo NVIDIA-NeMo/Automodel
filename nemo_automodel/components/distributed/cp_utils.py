@@ -142,10 +142,10 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
     only re-wraps local Q/K/V tensors so DTensor SDPA dispatch can run the
     existing all-gather/ring path.
 
-    Gemma4 batches marked by ``prepare_model_inputs_for_cp`` use a manual path
+    Batches marked by ``prepare_model_inputs_for_cp`` can use a manual path
     instead. The batch is sliced contiguously on the sequence dimension; at the
-    attention call site we all-gather K/V and token types, build a local-query /
-    global-key structural multimodal mask, and return the local output shard.
+    attention call site we all-gather K/V and token metadata, build a
+    local-query / global-key structural mask, and return the local output shard.
 
     Seq dim at the SDPA call is 2: tensors are [B, nH, S/cp_size, D] after HF reshape.
     """
@@ -261,8 +261,8 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         padding_mask = getattr(module, "_cp_padding_mask", None)
         padding_mask_full = _all_gather_seq_metadata(padding_mask)
         vision_group_ids = _vision_group_ids(mm_token_type_ids_full)
-        # HF Gemma4TextAttention marks sliding layers by setting sliding_window;
-        # it does not expose an is_sliding flag.
+        # Some HF attention modules mark sliding layers by setting sliding_window
+        # instead of exposing a separate is_sliding flag.
         sliding_window = getattr(module, "sliding_window", None)
         is_sliding = sliding_window is not None
         config_uses_vision_bidir = getattr(getattr(module, "config", None), "use_bidirectional_attention", None) == "vision"
@@ -427,7 +427,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             return out
         except Exception as flex_err:
             raise RuntimeError(
-                "Gemma4 manual CP all-gather requires FlexAttention. "
+                "Manual CP all-gather requires FlexAttention for packed or irregular masks. "
                 f"FlexAttention failed for Q={tuple(query.shape)} K={tuple(key_full.shape)} "
                 f"V={tuple(value_full.shape)} cp_rank={cp_rank} seq_local={seq_local} seq_full={seq_full}."
             ) from flex_err
@@ -561,9 +561,9 @@ def make_cp_batch_and_ctx(
     if _get_mesh_size(cp_mesh) <= 1:
         return nullcontext, batch
 
-    # Gemma4 needs a local-query/global-key attention mask that PyTorch's
-    # ring-template CP path cannot represent. Its pre-embed step marks the
-    # batch so we use explicit contiguous sequence sharding and let
+    # Some model attention masks need a local-query/global-key representation
+    # that PyTorch's ring-template CP path cannot express. Their pre-embed step
+    # marks the batch so we use explicit contiguous sequence sharding and let
     # attach_cp_sdpa_hooks all-gather K/V and token metadata inside attention.
     # Metadata such as mm_token_type_ids or _packed_seq_ids does not select this
     # path by itself because other VLMs can carry those fields.

@@ -158,7 +158,7 @@ def test_make_cp_batch_and_ctx_pads_to_cp_load_balance_multiple(monkeypatch):
 
 
 def test_make_cp_batch_and_ctx_mm_token_type_ids_do_not_select_manual_allgather(monkeypatch):
-    """VLM metadata alone should not opt non-Gemma4 models into manual all-gather CP."""
+    """VLM metadata alone should not opt models into manual all-gather CP."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     calls = {}
 
@@ -189,7 +189,7 @@ def test_make_cp_batch_and_ctx_mm_token_type_ids_do_not_select_manual_allgather(
 
 
 def test_make_cp_batch_and_ctx_supports_inputs_embeds_and_per_layer_inputs(monkeypatch):
-    """Gemma4 CP pre-embedding path should shard inputs_embeds side inputs."""
+    """Manual all-gather CP pre-embedding should shard inputs_embeds side inputs."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     inputs_embeds = torch.randn(1, 4, 8)
     labels = torch.tensor([[1, 2, 3, 4]])
