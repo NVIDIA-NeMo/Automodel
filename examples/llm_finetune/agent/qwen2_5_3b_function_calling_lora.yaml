@@ -82,6 +82,10 @@ dataset:
   # padding: max_length). With the defaults it does NOT truncate, so long
   # dialogues pass through uncapped. Add `truncation: true` to enforce the cap.
   seq_length: 4096
+  # Drop the oldest conversation turns (keeping the system message, tools, and
+  # the final answer) when a dialogue exceeds seq_length, instead of token-level
+  # truncation that would clip away the supervised final turn. Off by default.
+  # truncate_history: true
   tokenizer:
     pretrained_model_name_or_path: Qwen/Qwen2.5-3B
 
