@@ -17,11 +17,15 @@
 # GB200-specific deltas vs the generic gptoss_120b_te_deepep.yaml:
 #   - peak_tflops: 2500  (GB200 BF16 dense peak; the generic recipe uses the
 #     H100 989 value, which inflates the reported MFU on Blackwell)
-#   - local_batch_size: 8, GBS=1280 (GA=5), activation_checkpointing=true —
-#     matches the gptoss_120b_te_mxfp8_gb200 operating point so the bf16 vs mxfp8
-#     comparison is a precision-only delta.
+#   - local_batch_size: 4, GBS=512 (GA=4), activation_checkpointing=false —
+#     the best-MFU bf16 operating point from the gpt-oss sweep: 3.506 s/iter,
+#     22.70% MFU@2500, 154.6 GB. AC-off avoids recompute (higher MFU); lbs=4
+#     is the largest that fits <192GB with AC off (lbs=6 would OOM). NOTE: the
+#     TE-MXFP8 config uses a DIFFERENT operating point (lbs=8/GBS1280/AC-on) —
+#     for mxfp8 the bigger batch wins MFU despite recompute. Each precision is at
+#     its own best config, so the comparison is best-vs-best, not iso-batch.
 #
-# 8 nodes x 4 GB200 = 32 GPUs, ep_size=16, GBS=1280, seq_len=4096.
+# 8 nodes x 4 GB200 = 32 GPUs, ep_size=16, GBS=512, seq_len=4096.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 
@@ -37,8 +41,8 @@ benchmark:
 
 step_scheduler:
   gc_every_steps: 10
-  global_batch_size: 1280
-  local_batch_size: 8
+  global_batch_size: 512
+  local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
@@ -52,7 +56,7 @@ distributed:
   ep_size: 16
 
   sequence_parallel: false
-  activation_checkpointing: true
+  activation_checkpointing: false
 
   pipeline:
     pp_schedule: interleaved1f1b
