@@ -121,7 +121,7 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
     """
 
     def _self_attn_pre_forward_hook(_module, module_args, module_kwargs):
-        if getattr(_module, "_cp_uses_sdpa_hook", False):
+        if getattr(_module, "_cp_uses_attention_hook", False):
             module_kwargs["attention_mask"] = None
             module_kwargs["is_causal"] = True
             return module_args, module_kwargs
@@ -135,7 +135,7 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
             module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
 
 
-def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
+def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
     """Inject CP-aware attention into self-attention modules.
 
     Generic non-TE models keep PyTorch DTensor ``context_parallel``: this hook
@@ -463,7 +463,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             # CheckpointWrapper's recompute bypasses __call__ (and thus pre-hooks
             # on the wrapper itself), so we must hook on the wrapped module directly.
             target = module._checkpoint_wrapped_module if isinstance(module, CheckpointWrapper) else module
-            target._cp_uses_sdpa_hook = True
+            target._cp_uses_attention_hook = True
             target.register_forward_pre_hook(_pre_hook, with_kwargs=True)
             # always_call=True ensures _original_sdpa is restored even if the forward raises.
             target.register_forward_hook(_post_hook, always_call=True)
@@ -564,7 +564,7 @@ def make_cp_batch_and_ctx(
     # Some model attention masks need a local-query/global-key representation
     # that PyTorch's ring-template CP path cannot express. Their pre-embed step
     # marks the batch so we use explicit contiguous sequence sharding and let
-    # attach_cp_sdpa_hooks all-gather K/V and token metadata inside attention.
+    # attach_cp_attention_hooks all-gather K/V and token metadata inside attention.
     # Metadata such as mm_token_type_ids or _packed_seq_ids does not select this
     # path by itself because other VLMs can carry those fields.
     manual_allgather = bool(batch.pop("_cp_manual_allgather", False))
