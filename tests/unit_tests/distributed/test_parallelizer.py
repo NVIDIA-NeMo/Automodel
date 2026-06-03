@@ -1755,11 +1755,21 @@ class TestSingleGpuActivationCheckpointing:
 class TestSelectiveCheckpointSaveOps:
     """Tests for the TorchTitan-style save-op set used by selective AC."""
 
-    def test_matmul_ops_are_mm_and_linear_only(self):
-        """Only mm and linear alternate; addmm/bmm are always saved."""
+    def test_matmul_ops_alternate_mm_linear_and_grouped_mm(self):
+        """mm/linear and the MoE grouped-GEMM variants alternate; addmm/bmm are always saved."""
         from nemo_automodel.components.distributed.parallelizer import _SELECTIVE_AC_MATMUL_OPS
 
-        assert _SELECTIVE_AC_MATMUL_OPS == frozenset({torch.ops.aten.mm.default, torch.ops.aten.linear.default})
+        # mm and linear always exist; grouped-GEMM variants are version-dependent.
+        assert torch.ops.aten.mm.default in _SELECTIVE_AC_MATMUL_OPS
+        assert torch.ops.aten.linear.default in _SELECTIVE_AC_MATMUL_OPS
+        # addmm/bmm must NOT alternate (they are always-saved).
+        assert torch.ops.aten.addmm.default not in _SELECTIVE_AC_MATMUL_OPS
+        assert torch.ops.aten.bmm.default not in _SELECTIVE_AC_MATMUL_OPS
+        # When available, the grouped-GEMM op (expert compute) alternates so it is
+        # not unconditionally recomputed under EP.
+        grouped_mm = getattr(torch.ops.aten, "_grouped_mm", None)
+        if grouped_mm is not None:
+            assert grouped_mm.default in _SELECTIVE_AC_MATMUL_OPS
 
     def test_save_ops_include_compute_and_comm_ops(self):
         """The save-set covers matmuls, attention, and communication collectives."""
@@ -1804,6 +1814,30 @@ class TestSelectiveCheckpointSaveOps:
 
         assert _resolve_op_attr(torch.ops, "definitely_not_a_namespace.foo.default") is None
         assert _resolve_op_attr(torch, "_higher_order_ops.flex_attention") is not None
+
+    def test_trace_logs_each_op_once_with_verdict(self, caplog):
+        """The opt-in policy trace logs each unique op a single time with its verdict."""
+        import logging as _logging
+
+        from torch.utils.checkpoint import CheckpointPolicy
+
+        import nemo_automodel.components.distributed.parallelizer as P
+
+        P._SELECTIVE_AC_TRACE_SEEN.clear()
+        with caplog.at_level(_logging.INFO, logger="nemo_automodel.components.distributed.parallelizer"):
+            P._trace_selective_ac_decision(torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE, True)
+            # Duplicate of the same op must not log a second time.
+            P._trace_selective_ac_decision(torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE, True)
+            P._trace_selective_ac_decision(
+                torch.ops._c10d_functional.all_to_all_single.default, CheckpointPolicy.MUST_SAVE, False
+            )
+            P._trace_selective_ac_decision(torch.ops.aten.add.Tensor, CheckpointPolicy.PREFER_RECOMPUTE, False)
+
+        lines = [r.getMessage() for r in caplog.records if "[selective-ac]" in r.getMessage()]
+        assert len(lines) == 3  # mm logged once (dedup), all_to_all, add
+        assert any("ALTERNATE" in ln and "mm" in ln for ln in lines)
+        assert any("SAVE" in ln and "all_to_all_single" in ln for ln in lines)
+        assert any("RECOMPUTE" in ln and "add" in ln for ln in lines)
 
 
 class TestExtractModelLayers:

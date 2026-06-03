@@ -14,6 +14,7 @@
 
 import importlib
 import logging
+import os
 import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -141,11 +142,17 @@ def _existing_ops(*ops):
 
 
 # Matmul ops whose activations alternate between save and recompute (every other
-# one is saved). Following TorchTitan, only plain ``mm`` and ``linear`` alternate;
-# ``addmm``/``bmm`` stay in the always-save set built below.
+# one is saved). Following TorchTitan, plain ``mm``/``linear`` alternate;
+# ``addmm``/``bmm`` stay in the always-save set built below. The grouped-GEMM
+# variants are the dominant compute in expert-parallel MoE blocks (custom
+# ``torch._grouped_mm`` kernels), so they alternate too -- otherwise selective AC
+# would recompute every expert GEMM, matching full checkpointing and giving no
+# speedup while still paying the policy overhead.
 _SELECTIVE_AC_MATMUL_OPS = _existing_ops(
     _resolve_torch_op("aten", "mm"),
     _resolve_torch_op("aten", "linear"),
+    _resolve_torch_op("aten", "_grouped_mm"),
+    _resolve_torch_op("aten", "_scaled_grouped_mm"),
 )
 
 
@@ -222,6 +229,28 @@ _SELECTIVE_AC_MUST_SAVE_OPS = _build_selective_ac_save_ops()
 
 _SELECTIVE_AC_TO_COPY_OP = _resolve_torch_op("aten", "_to_copy")
 
+# Opt-in diagnostics: set NEMO_SELECTIVE_AC_TRACE=1 to log, once per unique op,
+# whether selective AC saves or recomputes it. Useful for confirming that a
+# model's expensive ops (e.g. expert grouped-GEMMs, comm collectives) are
+# actually saved rather than silently recomputed.
+_SELECTIVE_AC_TRACE = os.environ.get("NEMO_SELECTIVE_AC_TRACE", "0").lower() not in ("0", "", "false", "no")
+_SELECTIVE_AC_TRACE_SEEN: set[str] = set()
+
+
+def _trace_selective_ac_decision(func, decision, is_alternating: bool) -> None:
+    """Log each op's save/recompute decision once (guarded by env var)."""
+    key = str(func)
+    if key in _SELECTIVE_AC_TRACE_SEEN:
+        return
+    _SELECTIVE_AC_TRACE_SEEN.add(key)
+    if is_alternating:
+        verdict = "ALTERNATE (save/recompute every other call)"
+    elif decision == CheckpointPolicy.MUST_SAVE:
+        verdict = "SAVE"
+    else:
+        verdict = "RECOMPUTE"
+    logger.info("[selective-ac] %s -> %s", key, verdict)
+
 
 def _is_selective_activation_checkpointing(activation_checkpointing: object) -> bool:
     return (
@@ -257,14 +286,21 @@ def _make_selective_checkpoint_context_fn():
         mm_counts = {False: 0, True: 0}
 
         def selective_checkpointing_policy(ctx, func, *args, **kwargs):
-            if func in _SELECTIVE_AC_MATMUL_OPS:
+            is_alternating = func in _SELECTIVE_AC_MATMUL_OPS
+            if is_alternating:
                 mm_counts[ctx.is_recompute] += 1
-                if mm_counts[ctx.is_recompute] % 2 == 0:
-                    return CheckpointPolicy.PREFER_RECOMPUTE
-                return CheckpointPolicy.MUST_SAVE
-            if func in _SELECTIVE_AC_MUST_SAVE_OPS or _is_cuda_to_cpu_copy(func, args, kwargs):
-                return CheckpointPolicy.MUST_SAVE
-            return CheckpointPolicy.PREFER_RECOMPUTE
+                decision = (
+                    CheckpointPolicy.PREFER_RECOMPUTE
+                    if mm_counts[ctx.is_recompute] % 2 == 0
+                    else CheckpointPolicy.MUST_SAVE
+                )
+            elif func in _SELECTIVE_AC_MUST_SAVE_OPS or _is_cuda_to_cpu_copy(func, args, kwargs):
+                decision = CheckpointPolicy.MUST_SAVE
+            else:
+                decision = CheckpointPolicy.PREFER_RECOMPUTE
+            if _SELECTIVE_AC_TRACE and not ctx.is_recompute:
+                _trace_selective_ac_decision(func, decision, is_alternating)
+            return decision
 
         return create_selective_checkpoint_contexts(selective_checkpointing_policy)
 

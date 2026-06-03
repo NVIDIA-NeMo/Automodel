@@ -35,6 +35,8 @@ Use `true` or `full` for full activation checkpointing. Use `selective` for PyTo
 
 > **Note:** `selective` requires the FSDP2 strategy. Non-FSDP2 strategies (`ddp`, `megatron_fsdp`) raise an error when `selective` is requested. KV-sharing models (e.g. Gemma4) automatically fall back to sub-module checkpointing, because attention cannot be recomputed through the KV cache.
 
+> **Tip:** Selective AC only speeds things up when the model's expensive operations are the ones being saved. To see the per-op save/recompute decisions for your model, set `NEMO_SELECTIVE_AC_TRACE=1`; each unique operation is logged once as `SAVE`, `RECOMPUTE`, or `ALTERNATE`. If an expensive op (e.g. an expert grouped-GEMM) shows up as `RECOMPUTE`, selective AC will not beat full checkpointing for that model.
+
 ### Configure Programmatically
 ```python
 from nemo_automodel.components.distributed.config import FSDP2Config
