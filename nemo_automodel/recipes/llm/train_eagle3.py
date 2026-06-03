@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import pathlib
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -76,6 +77,35 @@ def _optim_steps_per_epoch(num_batches_per_epoch: int, grad_accumulation_steps: 
     if num_batches_per_epoch <= 0 or grad_accumulation_steps <= 0:
         return 0
     return -(-num_batches_per_epoch // grad_accumulation_steps)
+
+
+def _should_sync_grads(
+    *,
+    pending_micro_batches: int,
+    grad_accumulation_steps: int,
+    batch_idx: int,
+    batches_per_epoch: int | None,
+    is_ddp: bool,
+) -> bool:
+    """Return True when this micro-batch's backward should all-reduce gradients.
+
+    Under DDP with gradient accumulation only the micro-batch immediately
+    followed by an ``optimizer.step()`` needs to synchronize: at that point the
+    locally-accumulated ``.grad`` already holds the whole window's contribution,
+    so a single all-reduce averages the complete window and the intervening
+    micro-batches can run under ``no_sync()`` -- saving ``grad_accumulation_steps - 1``
+    all-reduces per window. That step is either the window closer
+    (``pending_micro_batches + 1 == grad_accumulation_steps``) or the epoch's
+    final batch (which the trailing-flush step consumes). When the dataloader
+    length is unknown we cannot identify the final batch, so we sync every step
+    (correct, just no speedup). With a single process (no DDP) there is nothing
+    to synchronize, so this is always True.
+    """
+    if not is_ddp or batches_per_epoch is None:
+        return True
+    closes_window = pending_micro_batches + 1 == grad_accumulation_steps
+    is_last_batch = batch_idx == batches_per_epoch - 1
+    return closes_window or is_last_batch
 
 
 def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
@@ -663,6 +693,7 @@ class TrainEagle3Recipe(BaseRecipe):
             batches_per_epoch = len(self.train_dataloader)
         except TypeError:
             batches_per_epoch = None
+        is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
         start_epoch = max(0, int(getattr(self, "_resume_epoch", 0)))
         if start_epoch >= self.num_epochs:
             if self.dist_env.is_main:
@@ -695,9 +726,21 @@ class TrainEagle3Recipe(BaseRecipe):
             batches_processed = 0
             pending_micro_batches = 0
             for batch_idx, batch in enumerate(self.train_dataloader):
-                metrics = self._forward_batch(batch)
-                loss = metrics.loss / float(self.grad_accumulation_steps)
-                loss.backward()
+                # Skip DDP's per-micro-batch all-reduce on every micro-batch
+                # except the one an optimizer step immediately follows; that
+                # step's all-reduce covers the whole locally-accumulated window.
+                sync_grads = _should_sync_grads(
+                    pending_micro_batches=pending_micro_batches,
+                    grad_accumulation_steps=self.grad_accumulation_steps,
+                    batch_idx=batch_idx,
+                    batches_per_epoch=batches_per_epoch,
+                    is_ddp=is_ddp,
+                )
+                sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
+                with sync_ctx:
+                    metrics = self._forward_batch(batch)
+                    loss = metrics.loss / float(self.grad_accumulation_steps)
+                    loss.backward()
 
                 running_loss = running_loss + metrics.loss.detach()
                 running_acc = running_acc + metrics.accuracy.detach()
