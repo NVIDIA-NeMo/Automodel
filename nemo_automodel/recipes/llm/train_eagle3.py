@@ -39,7 +39,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import (
     build_eagle3_dataloader,
-    build_eagle3_token_mapping,
+    load_or_build_eagle3_token_mapping,
 )
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -191,11 +191,18 @@ class TrainEagle3Recipe(BaseRecipe):
             getattr(self.tokenizer, "pad_token_id", None),
             getattr(self.tokenizer, "unk_token_id", None),
         ]
-        selected_token_ids, selected_token_mask = build_eagle3_token_mapping(
+        # ``selected_token_ids_path`` (optional) caches the draft-vocab
+        # selection so reruns skip the full-dataset frequency scan. When the
+        # path is unset, the mapping is rebuilt every setup (original behavior).
+        # On resume this still runs, but ``_load_extra_state`` then overrides the
+        # mapping with the one saved in the checkpoint's ``eagle_meta.pt`` -- so
+        # the cache only matters for cold starts.
+        selected_token_ids, selected_token_mask = load_or_build_eagle3_token_mapping(
             self.train_dataloader,
             target_vocab_size=target_config.vocab_size,
             draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
             special_token_ids=special_token_ids,
+            cache_path=recipe_cfg.get("selected_token_ids_path", None),
         )
 
         draft_config = target_config.to_dict()
@@ -411,8 +418,15 @@ class TrainEagle3Recipe(BaseRecipe):
         if is_dist_initialized:
             dist.barrier()
 
+        step_scheduler = getattr(self, "step_scheduler", None)
+        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
         draft_model = self._module().draft_model
-        self.checkpointer.save_model(draft_model, path, tokenizer=self.tokenizer)
+        self.checkpointer.save_model(
+            draft_model,
+            path,
+            tokenizer=self.tokenizer,
+            is_final_checkpoint=is_final_checkpoint,
+        )
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
         self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
