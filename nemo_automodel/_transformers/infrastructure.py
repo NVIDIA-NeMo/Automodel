@@ -611,8 +611,8 @@ def apply_model_infrastructure(
     # so that SDPA handles causal masking internally (compatible with DTensor sharding).
     if mesh.cp_size > 1 and not _uses_te_attention(model):
         from nemo_automodel.components.distributed.cp_utils import (
+            attach_cp_attention_hooks,
             attach_context_parallel_hooks,
-            attach_cp_sdpa_hooks,
             attach_linear_attn_position_hooks,
         )
 
@@ -623,7 +623,7 @@ def apply_model_infrastructure(
             mp._cp_enabled = True
             attach_context_parallel_hooks(mp)
             attach_linear_attn_position_hooks(mp)
-            attach_cp_sdpa_hooks(mp, cp_mesh)
+            attach_cp_attention_hooks(mp, cp_mesh)
 
     model = _apply_runtime_compatibility_fixes(model)
     return model
