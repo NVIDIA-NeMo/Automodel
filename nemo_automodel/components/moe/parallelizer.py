@@ -191,11 +191,20 @@ def apply_ac(
     if selective:
         # Reuse the dense FSDP2 selective policy so the save-op set (attention,
         # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
-        from nemo_automodel.components.distributed.parallelizer import _make_selective_checkpoint_context_fn
+        from nemo_automodel.components.distributed.parallelizer import (
+            _SELECTIVE_AC_WRAPPER_FLAG,
+            _make_selective_checkpoint_context_fn,
+        )
 
         selective_context_fn = _make_selective_checkpoint_context_fn()
         for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, context_fn=selective_context_fn)
+            # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
+            # selective policy visible to the partitioner) instead of unwrapping and
+            # compiling the block inner, which would collapse selective AC into full
+            # recompute. The flag is only read when per-layer torch.compile is
+            # enabled, so it is a no-op for every other mode.
+            setattr(block, _SELECTIVE_AC_WRAPPER_FLAG, True)
             parent_layers.register_module(layer_id, block)
         return
 

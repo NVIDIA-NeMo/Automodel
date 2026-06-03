@@ -37,6 +37,10 @@ Use `true` or `full` for full activation checkpointing. Use `selective` for PyTo
 
 > **Tip:** Selective AC only speeds things up when the model's expensive operations are the ones being saved. To see the per-op save/recompute decisions for your model, set `NEMO_SELECTIVE_AC_TRACE=1`; each unique operation is logged once as `SAVE`, `RECOMPUTE`, or `ALTERNATE`. If an expensive op (e.g. an expert grouped-GEMM) shows up as `RECOMPUTE`, selective AC will not beat full checkpointing for that model.
 
+> **Note (full vs. selective):** `torch.compile` is the dominant speed lever and benefits **both** full and selective checkpointing. With compile enabled on dense models, full and selective run very close to each other (selective is sometimes marginally faster). Selective AC mainly trades *extra activation memory* (it saves more tensors than full) for at best modest recompute savings, so **full AC is the safer default** unless you have measured a benefit for your specific model.
+
+> **Note (MoE / expert parallelism):** For Mixture-of-Experts models with expert parallelism, prefer **full** activation checkpointing (`true`/`full`). Selective AC is designed for dense transformers: in an MoE block the experts (not attention) dominate the cost and are cheap to recompute but expensive to store. In eager mode this makes selective AC use *more* memory **and** run *slower* than full checkpointing for MoE — the same behavior observed upstream (e.g. TorchTitan). Selective AC remains supported for MoE+FSDP2 (opt-in), but is not recommended as the default there.
+
 ### Configure Programmatically
 ```python
 from nemo_automodel.components.distributed.config import FSDP2Config
