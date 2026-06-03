@@ -312,7 +312,11 @@ def test_make_retrieval_dataset_train_and_eval(tmp_path, monkeypatch):
 
     # Train mode: set_transform uses n_passages - 1 negatives
     ds_train = rd.make_retrieval_dataset(
-        data_dir_list=str(train_file), data_type="train", n_passages=3, max_train_samples=1
+        data_dir_list=str(train_file),
+        data_type="train",
+        n_passages=3,
+        max_train_samples=1,
+        cycle_positive_docs=True,
     )
     assert len(ds_train) == 1
     assert hasattr(ds_train, "set_epoch")
@@ -711,7 +715,7 @@ def test_retrieval_transform_set_epoch():
         ]
     )
 
-    transform = rd.RetrievalTransform(num_neg_docs=1, corpus_dict=corpus_dict)
+    transform = rd.RetrievalTransform(num_neg_docs=1, corpus_dict=corpus_dict, cycle_positive_docs=True)
     dataset.set_transform(transform)
     dataset.set_epoch = transform.set_epoch
 

@@ -648,7 +648,7 @@ class RetrievalTransform:
         corpus_dict: dict,
         use_dataset_instruction: bool = False,
         model_type: str = "bi_encoder",
-        cycle_positive_docs: bool = True,
+        cycle_positive_docs: bool = False,
     ):
         self.num_neg_docs = num_neg_docs
         self.corpus_dict = corpus_dict
@@ -691,7 +691,7 @@ def make_retrieval_dataset(
     max_train_samples: int = None,
     train_data_select_offset: int = 0,
     use_dataset_instruction: bool = False,
-    cycle_positive_docs: bool = True,
+    cycle_positive_docs: bool = False,
 ):
     """
     Load and return dataset in retrieval format for encoder training.
@@ -718,6 +718,8 @@ def make_retrieval_dataset(
         train_data_select_offset: Offset for selecting training samples
         use_dataset_instruction: Whether to use instruction from dataset's metadata
         cycle_positive_docs: Whether training should cycle through positive documents across epochs.
+            Defaults to ``False`` (always use the first positive document). Set to ``True`` only
+            when a query has multiple positive documents and you want to rotate through them by epoch.
 
     Returns:
         A HuggingFace Dataset where each example is a dict with keys:
