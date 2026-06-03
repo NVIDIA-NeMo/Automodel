@@ -22,9 +22,9 @@
 #   - dispatcher: deepep -> hybridep  (GB200/oci_hsg: deepep fails EP-buffer init)
 #
 # Parallelism: ep_size=32 (==world=32), tp=pp=cp=1, dp_size=32. With lbs=4 and
-# global_batch_size=32768, GA = 32768 / (32*4) = 256 gradient-accumulation
+# global_batch_size=8192, GA = 8192 / (32*4) = 64 gradient-accumulation
 # micro-batches/step. seq_len=4096. pp=1 -> no pipeline / moe blocks.
-# warmup=2 + max_steps=5: each step is 256 microbatches so MFU is steady within
+# warmup=2 + max_steps=5: each step is 64 microbatches so MFU is steady within
 # the first step; a couple measured steps give a stable number.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
@@ -51,7 +51,7 @@ distributed:
 
 step_scheduler:
   gc_every_steps: 10
-  global_batch_size: 32768  # GA = GBS / (world*lbs) = 32768 / (32*4) = 256
+  global_batch_size: 8192  # GA = GBS / (world*lbs) = 8192 / (32*4) = 64
   local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
