@@ -205,7 +205,13 @@ async def _chat_completion(
                 if isinstance(usage, dict) and isinstance(usage.get("completion_tokens"), int):
                     return usage["completion_tokens"]
                 return 0
-        except Exception as exc:  # noqa: BLE001 -- retry any transport / 5xx error
+        except aiohttp.ClientResponseError:
+            # 5xx and 429 are turned into RuntimeError above, so the only status
+            # that reaches raise_for_status() is a non-429 4xx (400/401/403/404,
+            # ...) -- a client error that will not succeed on retry. Surface it
+            # immediately instead of burning the whole retry budget on it.
+            raise
+        except Exception as exc:  # noqa: BLE001 -- retry transport / 5xx / 429 errors
             last_err = exc
             if attempt == max_retries:
                 raise

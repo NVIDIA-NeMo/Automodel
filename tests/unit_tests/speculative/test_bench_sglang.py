@@ -200,6 +200,14 @@ def test_validate_args_accepts_valid():
 # ---------------------------------------------------------------------------
 
 
+class _FakeClientResponseError(Exception):
+    """Stand-in for ``aiohttp.ClientResponseError`` (carries an HTTP ``status``)."""
+
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f"HTTP {status}")
+
+
 class _FakeResponse:
     def __init__(self, status, payload=None, text=""):
         self.status = status
@@ -220,7 +228,7 @@ class _FakeResponse:
 
     def raise_for_status(self):
         if self.status >= 400:
-            raise RuntimeError(f"HTTP {self.status}")
+            raise _FakeClientResponseError(self.status)
 
 
 class _FakeSession:
@@ -248,7 +256,11 @@ class _FakeSession:
 
 
 def _fake_aiohttp(session):
-    return SimpleNamespace(ClientSession=lambda *a, **k: session, ClientTimeout=lambda total=None: None)
+    return SimpleNamespace(
+        ClientSession=lambda *a, **k: session,
+        ClientTimeout=lambda total=None: None,
+        ClientResponseError=_FakeClientResponseError,
+    )
 
 
 def _patch_aiohttp(monkeypatch, session):
@@ -295,6 +307,17 @@ def test_chat_completion_raises_after_max_retries(monkeypatch):
     _patch_aiohttp(monkeypatch, session)
     with pytest.raises(RuntimeError, match="HTTP 503"):
         asyncio.run(bench_sglang._chat_completion(session, "http://x", {}, timeout_s=1.0, max_retries=1))
+
+
+def test_chat_completion_does_not_retry_non_retryable_4xx(monkeypatch):
+    # A non-429 4xx (here 404) is a client error that will not succeed on retry.
+    # It must surface on the first attempt instead of burning the retry budget;
+    # queue extra 404s so a regression that retried would show >1 post call.
+    session = _FakeSession(post_responses=[_FakeResponse(404, text="not found")] * 4)
+    _patch_aiohttp(monkeypatch, session)
+    with pytest.raises(_FakeClientResponseError):
+        asyncio.run(bench_sglang._chat_completion(session, "http://x", {}, timeout_s=1.0, max_retries=3))
+    assert len(session.post_calls) == 1
 
 
 def test_run_workload_sums_tokens_and_counts_failures(monkeypatch):
