@@ -16,11 +16,13 @@
 import logging
 from contextlib import ContextDecorator, nullcontext
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.distributed
 import torch.distributed as dist
+
+from nemo_automodel.components.distributed.config import DDPConfig
 
 logger = logging.getLogger(__name__)
 
@@ -245,3 +247,17 @@ def get_sync_ctx(model, is_optim_step, defer_fsdp_grad_sync: bool):
     elif isinstance(model, torch.nn.parallel.DistributedDataParallel) and not is_optim_step:
         sync_ctx = model.no_sync()
     return sync_ctx
+
+
+def dp_eval_sample_shard(distributed_config: Any, dp_rank: int, dp_size: int) -> tuple | None:
+    """Return ``(dp_rank, dp_size)`` to shard eval samples across DP ranks, else ``None``.
+
+    Only DDP replicates the full model on every rank, so only there can each rank
+    score a disjoint subset independently. Under FSDP2 / MegatronFSDP the model is
+    sharded and ``generate()`` issues per-layer all-gather collectives that must
+    stay in lockstep across the group — different samples per rank would desync
+    them and hang — so every rank scores the same samples (``None``).
+    """
+    if isinstance(distributed_config, DDPConfig) and dp_size > 1:
+        return (dp_rank, dp_size)
+    return None

@@ -257,42 +257,36 @@ class TestRedoAttentionLoadBalancing:
 
 
 class TestForwardFastPath:
-    def test_no_cp_mesh_delegates_to_super(self, module, device):
-        """When _cp_mesh is None, forward should delegate to the HF parent class."""
+    def test_no_cp_mesh_delegates_to_forward_no_cp(self, module, device):
+        """When _cp_mesh is None, forward should delegate to _forward_no_cp."""
         assert module._cp_mesh is None
         B, S, D = 1, 8, module.hidden_size
         hidden = torch.randn(B, S, D, device=device)
-        with patch.object(
-            type(module).__bases__[0], "forward", return_value=torch.randn(B, S, D, device=device)
-        ) as mock_super_fwd:
+        with patch.object(module, "_forward_no_cp", return_value=torch.randn(B, S, D, device=device)) as mock_no_cp_fwd:
             module.forward(hidden)
-            mock_super_fwd.assert_called_once()
+            mock_no_cp_fwd.assert_called_once()
 
-    def test_cp_mesh_size_1_delegates_to_super(self, module, device):
-        """When _cp_mesh.size() == 1, forward should delegate to the HF parent class."""
+    def test_cp_mesh_size_1_delegates_to_forward_no_cp(self, module, device):
+        """When _cp_mesh.size() == 1, forward should delegate to _forward_no_cp."""
         mesh = MagicMock()
         mesh.size.return_value = 1
         module._cp_mesh = mesh
 
         B, S, D = 1, 8, module.hidden_size
         hidden = torch.randn(B, S, D, device=device)
-        with patch.object(
-            type(module).__bases__[0], "forward", return_value=torch.randn(B, S, D, device=device)
-        ) as mock_super_fwd:
+        with patch.object(module, "_forward_no_cp", return_value=torch.randn(B, S, D, device=device)) as mock_no_cp_fwd:
             module.forward(hidden)
-            mock_super_fwd.assert_called_once()
+            mock_no_cp_fwd.assert_called_once()
 
     def test_no_cp_does_not_forward_cache_position(self, module, device):
-        """cache_position should not be forwarded to super (removed in transformers>=5.5)."""
+        """cache_position should not be forwarded to _forward_no_cp (removed in transformers>=5.5)."""
         assert module._cp_mesh is None
         B, S, D = 1, 8, module.hidden_size
         hidden = torch.randn(B, S, D, device=device)
-        with patch.object(
-            type(module).__bases__[0], "forward", return_value=torch.randn(B, S, D, device=device)
-        ) as mock_super_fwd:
+        with patch.object(module, "_forward_no_cp", return_value=torch.randn(B, S, D, device=device)) as mock_no_cp_fwd:
             module.forward(hidden, cache_position=torch.arange(S, device=device))
-            mock_super_fwd.assert_called_once()
-            _, kwargs = mock_super_fwd.call_args
+            mock_no_cp_fwd.assert_called_once()
+            _, kwargs = mock_no_cp_fwd.call_args
             assert "cache_position" not in kwargs
 
     def test_cp_mesh_gt_1_calls_forward_with_cp(self, module, device):
@@ -306,6 +300,68 @@ class TestForwardFastPath:
         with patch.object(module, "_forward_with_cp", return_value=torch.randn(B, S, D, device=device)) as mock_cp_fwd:
             module.forward(hidden, position_ids=torch.arange(S, device=device).unsqueeze(0))
             mock_cp_fwd.assert_called_once()
+
+
+class TestForwardNoCpV55CacheAPI:
+    """_forward_no_cp must use the transformers v5.5 per-layer cache API.
+
+    v5.5 renamed ``has_previous_state`` to a method taking ``layer_idx``, moved
+    states under ``cache.layers[layer_idx]``, and exposes ``update_conv_state`` /
+    ``update_recurrent_state`` methods instead of direct dict assignment. A plain
+    ``DynamicCache`` (no pre-existing state, as in training) has no top-level
+    ``conv_states`` attribute — the pre-v5.5 pattern raised ``AttributeError``.
+    """
+
+    def test_training_cache_no_previous_state_runs(self, module, text_config, device):
+        """Training-style forward with a fresh DynamicCache (no previous state) must not raise."""
+        from transformers import DynamicCache
+
+        B, S, D = 1, 8, module.hidden_size
+        hidden = torch.randn(B, S, D, device=device)
+        out = module._forward_no_cp(hidden, cache_params=DynamicCache(config=text_config))
+        assert out.shape == (B, S, D)
+
+    def test_no_cache_path_still_works(self, module, device):
+        """When cache_params is None, _forward_no_cp runs the pure compute path."""
+        B, S, D = 1, 8, module.hidden_size
+        hidden = torch.randn(B, S, D, device=device)
+        out = module._forward_no_cp(hidden, cache_params=None)
+        assert out.shape == (B, S, D)
+
+    def test_updates_conv_state_via_method(self, module, text_config, device):
+        """Prefill writes the conv state via ``update_conv_state(state, layer_idx)``."""
+        from transformers import DynamicCache
+
+        B, S, D = 1, 8, module.hidden_size
+        hidden = torch.randn(B, S, D, device=device)
+        cache = DynamicCache(config=text_config)
+        with (
+            patch.object(cache, "update_conv_state", wraps=cache.update_conv_state) as mock_update_conv,
+            patch.object(cache, "update_recurrent_state", wraps=cache.update_recurrent_state) as mock_update_rec,
+        ):
+            module._forward_no_cp(hidden, cache_params=cache)
+        mock_update_conv.assert_called_once()
+        # Written at the layer_idx owned by the module.
+        args, _ = mock_update_conv.call_args
+        assert args[1] == module.layer_idx
+        mock_update_rec.assert_called_once()
+
+    def test_has_previous_state_called_as_method_with_layer_idx(self, module, text_config, device):
+        """v5.5 ``has_previous_state`` is a method that takes ``layer_idx``."""
+        from transformers import DynamicCache
+
+        B, S, D = 1, 8, module.hidden_size
+        hidden = torch.randn(B, S, D, device=device)
+        cache = DynamicCache(config=text_config)
+        with patch.object(cache, "has_previous_state", wraps=cache.has_previous_state) as mock_hps:
+            module._forward_no_cp(hidden, cache_params=cache)
+        mock_hps.assert_called()
+        # At least one call must pass the module's layer_idx.
+        layer_idx_seen = any(
+            (call.args and call.args[0] == module.layer_idx) or call.kwargs.get("layer_idx") == module.layer_idx
+            for call in mock_hps.call_args_list
+        )
+        assert layer_idx_seen
 
 
 # ============================================================================

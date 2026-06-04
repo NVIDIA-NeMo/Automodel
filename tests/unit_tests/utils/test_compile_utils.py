@@ -13,11 +13,8 @@
 # limitations under the License.
 
 import os
-import unittest.mock as mock
 from unittest.mock import MagicMock, patch
 
-import pytest
-import torch
 import torch.nn as nn
 
 # Disable torch.compile for testing to avoid compilation overhead
@@ -25,12 +22,12 @@ os.environ["TORCH_COMPILE_DISABLE"] = "1"
 
 from nemo_automodel.components.utils.compile_utils import (
     CompileConfig,
+    apply_flash_attention_compile_fix,
     build_compile_config,
     compile_model,
     configure_torch_dynamo,
     create_compile_config_from_dict,
     enable_torch_dynamo_scalar_outputs,
-    apply_flash_attention_compile_fix,
     patch_prepare_fa2_from_position_ids,
 )
 

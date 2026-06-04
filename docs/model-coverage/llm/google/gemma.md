@@ -1,18 +1,19 @@
 # Gemma
 
-[Google's Gemma](https://ai.google.dev/gemma) is a family of open-weight language models built on the same research and technology as Gemini. Gemma models are available in multiple sizes and versions, with improvements in each generation including local sliding window attention (Gemma 2) and interleaved global/local attention (Gemma 3).
+[Google's Gemma](https://ai.google.dev/gemma) is a family of open-weight language models built on the same research and technology as Gemini. Gemma models are available in multiple sizes and versions, with improvements in each generation including local sliding window attention (Gemma 2), interleaved global/local attention (Gemma 3), and the unified Gemma 4 architecture.
 
 :::{card}
 | | |
 |---|---|
 | **Task** | Text Generation |
-| **Architecture** | `GemmaForCausalLM` / `Gemma2ForCausalLM` / `Gemma3ForCausalLM` |
+| **Architecture** | `GemmaForCausalLM` / `Gemma2ForCausalLM` / `Gemma3ForCausalLM` / `Gemma4UnifiedForConditionalGeneration` |
 | **Parameters** | 1B – 27B |
 | **HF Org** | [google](https://huggingface.co/google) |
 :::
 
 ## Available Models
 
+- **Gemma 4**: 12B
 - **Gemma 3**: 1B, 4B, 12B, 27B
 - **Gemma 2**: 2B, 9B, 27B
 - **Gemma (v1)**: 2B, 7B
@@ -22,6 +23,7 @@
 - `GemmaForCausalLM` — Gemma v1
 - `Gemma2ForCausalLM` — Gemma 2
 - `Gemma3ForCausalLM` — Gemma 3
+- `Gemma4UnifiedForConditionalGeneration` — Gemma 4 dense
 
 ## Example HF Models
 
@@ -34,6 +36,7 @@
 | Gemma 3 1B IT | [`google/gemma-3-1b-it`](https://huggingface.co/google/gemma-3-1b-it) |
 | Gemma 3 4B IT | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) |
 | Gemma 3 27B IT | [`google/gemma-3-27b-it`](https://huggingface.co/google/gemma-3-27b-it) |
+| Gemma 4 12B | [`google/gemma-4-12B`](https://huggingface.co/google/gemma-4-12B) |
 
 ## Example Recipes
 
@@ -43,6 +46,7 @@
 | {download}`gemma_2_9b_it_squad_peft.yaml <../../../../examples/llm_finetune/gemma/gemma_2_9b_it_squad_peft.yaml>` | LoRA — Gemma 2 9B IT on SQuAD |
 | {download}`gemma_3_270m_squad.yaml <../../../../examples/llm_finetune/gemma/gemma_3_270m_squad.yaml>` | SFT — Gemma 3 270M on SQuAD |
 | {download}`gemma_3_270m_squad_peft.yaml <../../../../examples/llm_finetune/gemma/gemma_3_270m_squad_peft.yaml>` | LoRA — Gemma 3 270M on SQuAD |
+| {download}`gemma_4_12b_hellaswag.yaml <../../../../examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml>` | SFT — Gemma 4 12B on HellaSwag |
 
 
 ## Try with NeMo AutoModel
@@ -100,3 +104,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) for full SFT an
 - [google/gemma-2b](https://huggingface.co/google/gemma-2b)
 - [google/gemma-2-9b-it](https://huggingface.co/google/gemma-2-9b-it)
 - [google/gemma-3-1b-it](https://huggingface.co/google/gemma-3-1b-it)
+- [google/gemma-4-12B](https://huggingface.co/google/gemma-4-12B)

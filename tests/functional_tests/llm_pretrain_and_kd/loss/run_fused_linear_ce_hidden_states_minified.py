@@ -38,9 +38,9 @@ import torch
 import torch.distributed as dist
 
 from nemo_automodel.components.loss.linear_ce import (
-    FusedLinearCrossEntropy,
     HAVE_CUT_CROSS_ENTROPY,
     MISSING_CUT_CROSS_ENTROPY_MSG,
+    FusedLinearCrossEntropy,
 )
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 
@@ -155,4 +155,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

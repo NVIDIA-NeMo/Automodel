@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .agent_chat import make_agent_chat_dataset  # noqa: F401
 from .chat_dataset import ChatDataset  # noqa: F401
 from .column_mapped_text_instruction_dataset import ColumnMappedTextInstructionDataset  # noqa: F401
 from .column_mapped_text_instruction_iterable_dataset import ColumnMappedTextInstructionIterableDataset  # noqa: F401
@@ -31,6 +32,7 @@ __all__ = [
     "make_squad_dataset",
     "make_retrieval_dataset",
     "make_xlam_dataset",
+    "make_agent_chat_dataset",
     "BiEncoderCollator",
     "CrossEncoderCollator",
     "ColumnMappedTextInstructionDataset",

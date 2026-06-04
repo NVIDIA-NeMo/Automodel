@@ -29,6 +29,7 @@ from nemo_automodel.components.models.common.utils import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 class SimpleModel(nn.Module):
     """A small model for dtype testing."""
 
@@ -62,6 +63,18 @@ class ModelWithStrictFp32(nn.Module):
         self.head = nn.Linear(4, 2)
 
 
+class ModelWithStrictFp32Parameter(nn.Module):
+    """Model that declares one strict fp32 parameter by qualified parameter name."""
+
+    _keep_in_fp32_modules_strict = ["mixer.scale"]
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4)
+        self.mixer = nn.Module()
+        self.mixer.scale = nn.Parameter(torch.ones(4))
+
+
 class ModelWithBothFp32Attrs(nn.Module):
     """Model with both _keep_in_fp32_modules and _keep_in_fp32_modules_strict."""
 
@@ -78,6 +91,7 @@ class ModelWithBothFp32Attrs(nn.Module):
 # ---------------------------------------------------------------------------
 # Tests for _get_fp32_module_keywords()
 # ---------------------------------------------------------------------------
+
 
 class TestGetFp32ModuleKeywords:
     def test_no_attributes(self):
@@ -126,6 +140,7 @@ class TestGetFp32ModuleKeywords:
 # Tests for _restore_fp32_modules()
 # ---------------------------------------------------------------------------
 
+
 class TestRestoreFp32Modules:
     def test_matching_modules_restored(self):
         model = SimpleModel()
@@ -156,6 +171,7 @@ class TestRestoreFp32Modules:
 # Tests for cast_model_to_dtype()
 # ---------------------------------------------------------------------------
 
+
 class TestCastModelToDtype:
     def test_simple_model_cast_to_bf16(self):
         model = SimpleModel()
@@ -179,6 +195,13 @@ class TestCastModelToDtype:
         cast_model_to_dtype(model, torch.bfloat16)
 
         assert model.head.weight.dtype == torch.float32
+        assert model.linear.weight.dtype == torch.bfloat16
+
+    def test_strict_fp32_parameters_preserved(self):
+        model = ModelWithStrictFp32Parameter()
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert model.mixer.scale.dtype == torch.float32
         assert model.linear.weight.dtype == torch.bfloat16
 
     def test_both_fp32_attrs_preserved(self):
@@ -207,6 +230,7 @@ class TestCastModelToDtype:
 # ---------------------------------------------------------------------------
 # Tests for DTensor-aware casting
 # ---------------------------------------------------------------------------
+
 
 class TestDTensorAwareCasting:
     def test_has_dtensor_params_false_for_plain_model(self):

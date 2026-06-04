@@ -150,6 +150,34 @@ def _run_apply_model_infrastructure(*, is_meta_device, load_base_model, model_wr
 class TestApplyModelInfrastructurePostShardInit:
     """Tests for initialize_model_weights being called in apply_model_infrastructure."""
 
+    def test_load_only_checkpointer_disables_consolidated_export(self):
+        """Infrastructure checkpointer loads base weights only and should not warn about consolidated saves."""
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+        model = _DummyModel()
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config = MagicMock()
+            mock_ckpt.config.dequantize_base_checkpoint = False
+
+            apply_model_infrastructure(
+                model=model,
+                is_meta_device=True,
+                device=torch.device("cpu"),
+                load_base_model=True,
+                pretrained_model_name_or_path="test/model",
+            )
+
+        checkpoint_config = MockCheckpointer.call_args.args[0]
+        assert checkpoint_config.save_consolidated.value == "false"
+
     def test_from_config_meta_calls_initialize_model_weights(self):
         """from_config path (load_base_model=False) on meta device should call initialize_model_weights."""
         _, mock_ckpt = _run_apply_model_infrastructure(is_meta_device=True, load_base_model=False)
@@ -190,8 +218,8 @@ class TestApplyModelInfrastructurePostShardInit:
 
         mock_ckpt.initialize_model_weights.assert_not_called()
 
-    def test_skips_model_to_device_when_checkpoint_loaded(self):
-        """model.to(device) should be skipped when should_load_checkpoint is True (tied params + FSDP fix)."""
+    def test_calls_model_to_device_when_checkpoint_loaded_without_dtensor(self):
+        """Unsharded post-shard checkpoint loads should still move buffers with model.to(device)."""
         from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
         model = _DummyModel()
@@ -217,9 +245,44 @@ class TestApplyModelInfrastructurePostShardInit:
                 pretrained_model_name_or_path="test/model",
             )
 
-            # model.to(device) should NOT have been called — checkpoint loading
-            # already placed params on device, and calling to() would trigger
-            # FSDP's reset_sharded_param failure on tied parameters.
+            mock_to.assert_called_once_with(torch.device("cpu"), non_blocking=True)
+
+    def test_skips_model_to_device_when_checkpoint_loaded_with_dtensor(self, monkeypatch):
+        """DTensor-sharded post-shard checkpoint loads should skip model.to(device)."""
+        import torch.distributed.tensor as dist_tensor
+
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+        class FakeDTensor:
+            pass
+
+        class ModelWithShardedParameter(_DummyModel):
+            def parameters(self, recurse=True):
+                return iter([FakeDTensor()])
+
+        monkeypatch.setattr(dist_tensor, "DTensor", FakeDTensor)
+        model = ModelWithShardedParameter()
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+            patch.object(model, "to", wraps=model.to) as mock_to,
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config = MagicMock()
+            mock_ckpt.config.dequantize_base_checkpoint = False
+
+            apply_model_infrastructure(
+                model=model,
+                is_meta_device=True,
+                device=torch.device("cpu"),
+                load_base_model=True,
+                pretrained_model_name_or_path="test/model",
+            )
+
             mock_to.assert_not_called()
 
     def test_calls_model_to_device_when_from_config_meta(self):

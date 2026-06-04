@@ -15,6 +15,7 @@ NeMo AutoModel integrates with [Hugging Face Diffusers](https://huggingface.co/d
 | Wan AI | [Wan 2.1 T2V](wan-ai/wan2-1-t2v.md) | Text-to-Video | DiT (Flow Matching) |
 | Black Forest Labs | [FLUX.1-dev](black-forest-labs/flux.md) | Text-to-Image | DiT (Flow Matching) |
 | Hunyuan Community | [HunyuanVideo 1.5](hunyuanvideo-community/hunyuanvideo.md) | Text-to-Video | DiT (Flow Matching) |
+| Qwen / Alibaba Cloud | [Qwen-Image](qwen/qwen-image.md) | Text-to-Image | DiT (Flow Matching) |
 
 ## Supported Workflows
 
@@ -36,4 +37,5 @@ For a complete walkthrough of training configuration, model-specific settings, a
 wan-ai/wan2-1-t2v
 black-forest-labs/flux
 hunyuanvideo-community/hunyuanvideo
+qwen/qwen-image
 ```

@@ -9,7 +9,6 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 import torch
 
 from nemo_automodel.components.models.common.packing import (
@@ -19,7 +18,6 @@ from nemo_automodel.components.models.common.packing import (
     get_seqlens_in_batch,
     get_unpad_data,
 )
-
 
 # ---------------------------------------------------------------------------
 # get_seqlens_in_batch
@@ -102,6 +100,8 @@ class TestPassthroughCreateCausalMask:
             )
         assert result == "delegated"
         mock_cm.assert_called_once()
+        assert "inputs_embeds" in mock_cm.call_args.kwargs
+        assert "input_embeds" not in mock_cm.call_args.kwargs
 
     def test_handles_extra_kwargs(self):
         """Extra kwargs don't break — indexed mask still passes through."""

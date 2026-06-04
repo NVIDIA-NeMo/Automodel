@@ -39,7 +39,7 @@ model:
   pretrained_model_name_or_path: google/gemma-4-26B-A4B-it
   torch_dtype: torch.bfloat16
   trust_remote_code: true
-  attn_implementation: sdpa
+  attn_implementation: eager
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
@@ -53,6 +53,9 @@ model:
   text_config:
   # 26B-A4B does not use kv_shared layers (only used in 2B, 4B), hence use_cache: false.
     use_cache: false
+
+processor:
+  padding_side: right
 
 checkpoint:
   enabled: true
@@ -112,4 +115,5 @@ freeze_config:
 #   name: <your-run-name>
 
 ci:
-  recipe_owner: hemildesai
+  recipe_owner: athitten
+  time: "00:20:00"

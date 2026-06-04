@@ -17,8 +17,8 @@ import warnings
 import pytest
 import torch
 
-from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
 
 
 class TestBackendConfigGatePrecision:
@@ -152,9 +152,6 @@ class TestBackendConfigEnableDeepepDeprecation:
 
     def test_enable_deepep_none_no_warning(self):
         """Test that enable_deepep=None (default) does not trigger warning."""
-        from nemo_automodel.components.models.common.utils import HAVE_DEEP_EP
-
-        expected_dispatcher = "deepep" if HAVE_DEEP_EP and torch.cuda.is_available() else "torch"
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             config = BackendConfig()
@@ -222,6 +219,26 @@ class TestBackendConfigHybridEP:
         """Test that dispatcher_num_sms accepts a custom value."""
         config = BackendConfig(dispatcher="hybridep", dispatcher_num_sms=24)
         assert config.dispatcher_num_sms == 24
+
+    def test_dispatcher_share_token_dispatcher_default(self):
+        """Test that dispatcher_share_token_dispatcher defaults to enabled."""
+        config = BackendConfig(dispatcher="deepep")
+        assert config.dispatcher_share_token_dispatcher is True
+
+    def test_dispatcher_share_token_dispatcher_custom(self):
+        """Test that dispatcher_share_token_dispatcher accepts an explicit value."""
+        config = BackendConfig(dispatcher="deepep", dispatcher_share_token_dispatcher=False)
+        assert config.dispatcher_share_token_dispatcher is False
+
+    def test_dispatcher_async_dispatch_default(self):
+        """Test that dispatcher_async_dispatch defaults to disabled."""
+        config = BackendConfig(dispatcher="deepep")
+        assert config.dispatcher_async_dispatch is False
+
+    def test_dispatcher_async_dispatch_custom(self):
+        """Test that dispatcher_async_dispatch accepts an explicit value."""
+        config = BackendConfig(dispatcher="deepep", dispatcher_async_dispatch=True)
+        assert config.dispatcher_async_dispatch is True
 
     def test_te_experts_falls_back_with_hybridep(self):
         """Test that te experts with hybridep dispatcher is valid (no fallback)."""
@@ -304,3 +321,14 @@ class TestMoEConfig:
 
         config = MoEConfigFromLayers(**base_moe_config_kwargs)
         assert config.n_routed_experts == 8
+
+    def test_swiglu_limit_default_zero(self, base_moe_config_kwargs):
+        """``swiglu_limit`` defaults to 0.0 (preserves the legacy fused swiglu path)."""
+        config = MoEConfig(**base_moe_config_kwargs)
+        assert config.swiglu_limit == 0.0
+
+    @pytest.mark.parametrize("limit", [1.0, 7.0, 100.5])
+    def test_swiglu_limit_custom_positive(self, base_moe_config_kwargs, limit):
+        """``swiglu_limit`` accepts positive floats for the DSV4 clamped variant."""
+        config = MoEConfig(**base_moe_config_kwargs, swiglu_limit=limit)
+        assert config.swiglu_limit == limit

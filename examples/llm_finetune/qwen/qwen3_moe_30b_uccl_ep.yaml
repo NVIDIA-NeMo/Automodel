@@ -56,7 +56,7 @@ checkpoint:
   enabled: false
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
@@ -65,7 +65,7 @@ distributed:
   pp_size: 1
   # Set ep_size to the total number of GPUs across all nodes.
   # UCCL-EP supports ep_size: 2, 4, 8, 16, 32, 64, 128.
-  ep_size: 16
+  ep_size: 8
 
   sequence_parallel: false
   activation_checkpointing: true

@@ -25,6 +25,8 @@ import torch.distributed as dist
 
 @dataclass
 class MetricsSample:
+    """Single timestamped metrics record."""
+
     step: int
     epoch: int
     metrics: Dict[str, Any] = field(default_factory=dict)
@@ -42,6 +44,8 @@ class MetricsSample:
 
 
 def stack_and_move_tensor_metrics_to_cpu(metric_vector: List[MetricsSample]) -> List[MetricsSample]:
+    """Convert tensor metrics in buffered samples to CPU-backed scalar or list values."""
+
     # Find all tensor metrics, stack them per metric name across samples, move to CPU,
     # then place CPU tensors back into the original metrics.
     def extract_tensor_metric_names(metric: MetricsSample) -> tuple[str, ...]:
@@ -75,7 +79,8 @@ def stack_and_move_tensor_metrics_to_cpu(metric_vector: List[MetricsSample]) -> 
         # Write back the CPU tensors to each sample's metrics
         for pos, sample_index in enumerate(indices):
             for name in names_key:
-                metric_vector[sample_index].metrics[name] = stacked_by_name[name][pos].item()
+                t = stacked_by_name[name][pos]
+                metric_vector[sample_index].metrics[name] = t.item() if t.numel() == 1 else t.tolist()
 
     return metric_vector
 
@@ -143,6 +148,8 @@ class MetricLogger:
 
 
 class MetricLoggerDist(MetricLogger):
+    """Rank-zero JSON Lines metric logger for distributed jobs."""
+
     def __init__(self, filepath: str, *, flush: bool = False, append: bool = True) -> None:
         super().__init__(filepath, flush=flush, append=append)
         assert dist.is_initialized(), "torch.distributed must be initialized with MetricLoggerDist"
@@ -169,6 +176,7 @@ class MetricLoggerDist(MetricLogger):
 
 
 def build_metric_logger(filepath: str, *, flush: bool = False, append: bool = True) -> MetricLogger:
+    """Build a local or distributed metric logger depending on distributed state."""
     if dist.is_initialized():
         return MetricLoggerDist(filepath, flush=flush, append=append)
     else:

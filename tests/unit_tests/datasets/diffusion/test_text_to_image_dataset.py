@@ -315,6 +315,47 @@ class TestDatasetGetItem:
         # Prompt embeds should be [256, 4096]
         assert item["prompt_embeds"].dim() == 2
 
+    def test_getitem_prompt_embeds_only(self):
+        """Test __getitem__ with cache containing only prompt_embeds (Qwen-Image case)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+
+            # Create a cache file with only prompt_embeds (no clip_hidden, no pooled_prompt_embeds)
+            cache_file = cache_dir / "sample_0000.pt"
+            data = {
+                "latent": torch.randn(16, 64, 64),
+                "crop_offset": [0, 0],
+                "prompt": "Qwen-Image style prompt",
+                "image_path": "/fake/path/image_0.jpg",
+                "prompt_embeds": torch.randn(1, 256, 4096),
+                "clip_tokens": torch.randint(0, 49408, (1, 77)),
+                "t5_tokens": torch.randint(0, 32128, (1, 256)),
+            }
+            torch.save(data, cache_file)
+
+            metadata = [
+                {
+                    "cache_file": str(cache_file),
+                    "crop_resolution": [512, 512],
+                    "original_resolution": [1024, 768],
+                    "aspect_ratio": 1.0,
+                    "bucket_id": 0,
+                }
+            ]
+            shard_file = cache_dir / "metadata_shard_0000.json"
+            with open(shard_file, "w") as f:
+                json.dump(metadata, f)
+            with open(cache_dir / "metadata.json", "w") as f:
+                json.dump({"shards": ["metadata_shard_0000.json"]}, f)
+
+            dataset = TextToImageDataset(str(cache_dir), train_text_encoder=False)
+            item = dataset[0]
+
+            assert "prompt_embeds" in item
+            assert item["prompt_embeds"].dim() == 2
+            assert "clip_hidden" not in item
+            assert "pooled_prompt_embeds" not in item
+
     def test_getitem_tokens_shapes(self, simple_cache_dir):
         """Test token shapes when train_text_encoder=True."""
         dataset = TextToImageDataset(str(simple_cache_dir), train_text_encoder=True)

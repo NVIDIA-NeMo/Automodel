@@ -60,6 +60,8 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     apply_parameter_freezing,
     count_model_parameters,
+    enable_radio_vit_fused_attn,
+    freeze_deepseek_v4_indexer_params,
     freeze_unused_kv_sharing_params,
     init_empty_weights,
     print_trainable_parameters,
@@ -184,6 +186,7 @@ def _instantiate_pipeline(
     config: Optional[PipelineConfig],
     mesh: MeshContext,
     device: Optional[torch.device] = None,
+    strategy_config: Optional[Union[FSDP2Config, MegatronFSDPConfig, DDPConfig]] = None,
 ) -> Optional[AutoPipeline]:
     """Instantiate AutoPipeline from config.
 
@@ -191,6 +194,8 @@ def _instantiate_pipeline(
         config: Pipeline config. If None or pp_size <= 1, returns None.
         mesh: MeshContext holding device_mesh, moe_mesh, and axis names.
         device: Target device for pipeline computation.
+        strategy_config: Strategy config fallback when ``mesh`` was rebuilt from
+            raw device meshes and no longer carries the recipe-level config.
 
     Returns:
         AutoPipeline instance, or None if pipeline parallelism is not enabled.
@@ -200,6 +205,12 @@ def _instantiate_pipeline(
 
     config_dict = config.to_dict()
     config_dict.pop("loss_fn", None)
+
+    # Route the existing FSDP2Config.defer_fsdp_grad_sync into the pipeline so
+    # the same knob controls grad-sync behavior under PP.
+    strategy_config = getattr(mesh, "strategy_config", None) or strategy_config
+    if strategy_config is not None and hasattr(strategy_config, "defer_fsdp_grad_sync"):
+        config_dict.setdefault("defer_fsdp_grad_sync", strategy_config.defer_fsdp_grad_sync)
 
     return AutoPipeline(
         world_mesh=mesh.device_mesh,
@@ -293,7 +304,7 @@ def instantiate_infrastructure(
     ep_size = mesh.ep_size if mesh.ep_size > 1 else ep_size
 
     model_wrapper = _instantiate_distributed(distributed_config, mesh)
-    autopipeline = _instantiate_pipeline(pipeline_config, mesh, device)
+    autopipeline = _instantiate_pipeline(pipeline_config, mesh, device, distributed_config)
 
     parallelize_fn = None
     if ep_size > 1:
@@ -346,6 +357,8 @@ def apply_model_infrastructure(
     load_base_model=False,
     cache_dir=None,
     pretrained_model_name_or_path="",
+    weights_already_loaded=False,
+    inject_te_attention: bool = False,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -377,6 +390,13 @@ def apply_model_infrastructure(
         pretrained_model_name_or_path: Model name or path for checkpoint loading. Default: ""
         load_base_model: Whether to load base model weights (True for from_pretrained). Default: False
         cache_dir: Cache directory for model weights. Default: None
+        weights_already_loaded: Whether pretrained weights were already loaded during
+            model init (e.g., by HF's from_pretrained on a real device, which also
+            handles BnB quantization atomically). When True, checkpoint loading in
+            this function is skipped. Default: False.
+        inject_te_attention: When True, inject TransformerEngine DotProductAttention
+            into all ``self_attn`` modules of HF models (has no effect on custom
+            models that already use TE via BackendConfig). Default: False.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -385,14 +405,15 @@ def apply_model_infrastructure(
     if mesh is None:
         mesh = MeshContext()
 
-    # Create a dummy checkpointer. We can pass in dummy values here since we are only loading the base weights.
+    # Create a checkpointer for loading base weights only. Keep consolidation disabled
+    # so load-only infrastructure does not emit save/export warnings.
     ckpt_config = CheckpointingConfig(
         enabled=True,
         checkpoint_dir="",
         model_save_format="safetensors",
         model_cache_dir=cache_dir,
         model_repo_id=pretrained_model_name_or_path,
-        save_consolidated=True,
+        save_consolidated=False,
         is_peft=peft_config is not None,
     )
     checkpointer = Checkpointer(
@@ -418,6 +439,14 @@ def apply_model_infrastructure(
         model = _apply_peft_and_lower_precision(
             model, mesh.tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
         )
+
+    # Inject TE attention into HF models when requested.
+    # Done after PEFT (so projection shapes are final) and before sharding
+    # (so TE modules are included in the FSDP unit).
+    if inject_te_attention and not _uses_te_attention(model):
+        from nemo_automodel._transformers.te_attention import inject_te_attention as _inject_te
+
+        _inject_te(model)
 
     # When no PP and no TP, load checkpoint first (unwrapped model) so weights and dtypes come from
     # the checkpoint; then apply FSDP. With TP>1 we must shard first and load after so all ranks
@@ -469,6 +498,10 @@ def apply_model_infrastructure(
     # Freeze dead K/V parameters in KV-shared layers (e.g. Gemma4 E2B/E4B)
     # so the optimizer never tracks them and checkpoint save/resume stay consistent.
     freeze_unused_kv_sharing_params(model)
+    freeze_deepseek_v4_indexer_params(model)
+
+    # NemotronOmni RADIO: opt into the fused SDPA path on ViT attention blocks.
+    enable_radio_vit_fused_attn(model)
 
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
@@ -497,7 +530,7 @@ def apply_model_infrastructure(
     # This is needed for both from_pretrained (before checkpoint loading overwrites)
     # and from_config (where this is the only weight initialization).
     # Skipped when load_before_shard already handled materialization + init.
-    need_post_shard_init = (
+    need_materialize = (
         is_meta_device
         and not load_before_shard
         and any(
@@ -508,14 +541,21 @@ def apply_model_infrastructure(
             ]
         )
     )
-    if need_post_shard_init:
+    # When FSDP2 CPU offload is enabled, params must be materialized on CPU —
+    # FSDP2 manages GPU placement itself during forward/backward.
+    _has_cpu_offload = model_wrapper is not None and getattr(model_wrapper, "offload_policy", None) is not None
+    if need_materialize:
+        init_device = torch.device("cpu") if _has_cpu_offload else device
         model_parts = model.parts if hasattr(model, "parts") else [model]
         lora_a_init = getattr(peft_config, "lora_A_init", None)
         for mp in model_parts:
-            checkpointer.initialize_model_weights(mp, device, peft_init_method=lora_a_init)
+            checkpointer.initialize_model_weights(mp, init_device, peft_init_method=lora_a_init)
 
-    # Load the checkpoint if needed (meta path, or PP/TP path where we did not load before shard)
-    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and need_post_shard_init
+    # Load the checkpoint if pretrained weights are needed and weren't already loaded
+    # (e.g., by HF's from_pretrained on a real device, which also handles BnB
+    # quantization atomically).  Decoupled from the meta-device materialization
+    # decision so that changes to the meta-device policy cannot silently skip loading.
+    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and not weights_already_loaded
     if should_load_checkpoint:
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
@@ -539,11 +579,22 @@ def apply_model_infrastructure(
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
         # Ensure model is on the correct device.
-        # Skip when checkpoint was loaded post-shard (params are already on the
-        # target device) to avoid triggering FSDP's reset_sharded_param which
-        # fails on tied parameters (e.g. lm_head/embed_tokens with TP>1).
+        # Skip only when params are actually sharded (any DTensor in the model)
+        # AND the checkpoint was loaded post-shard. Calling model.to(device) on
+        # sharded params triggers FSDP's reset_sharded_param, which fails on
+        # tied parameters (e.g. lm_head/embed_tokens with TP>1).
         # See: https://github.com/pytorch/pytorch/issues/151085
-        if not should_load_checkpoint:
+        # In unsharded cases (single-GPU, DDP, or any combination of TP/DP/CP/EP
+        # that left params as plain tensors), model.to(device) must still run so
+        # that persistent buffers not present in the checkpoint (e.g. Gemma4's
+        # Gemma4ClippableLinear input_min/max, Gemma4TextDecoderLayer
+        # layer_scalar) reach the GPU.
+        from torch.distributed.tensor import DTensor
+
+        has_sharded_params = any(isinstance(p, DTensor) for p in model.parameters())
+        # Skip model.to(device) when CPU offload is on — FSDP2 expects params on
+        # CPU and moves them to GPU during forward/backward itself.
+        if not _has_cpu_offload and not (should_load_checkpoint and has_sharded_params):
             try:
                 model.to(device, non_blocking=True)
             except NotImplementedError as e:
@@ -562,7 +613,6 @@ def apply_model_infrastructure(
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
             attach_cp_sdpa_hooks,
-            attach_linear_attn_position_hooks,
         )
 
         is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
@@ -571,7 +621,6 @@ def apply_model_infrastructure(
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
             attach_context_parallel_hooks(mp)
-            attach_linear_attn_position_hooks(mp)
             if is_compile_enabled:
                 attach_cp_sdpa_hooks(mp, cp_mesh)
 

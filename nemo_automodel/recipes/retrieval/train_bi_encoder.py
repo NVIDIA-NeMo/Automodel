@@ -32,6 +32,7 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sy
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.recipes._dist_setup import setup_distributed
@@ -46,6 +47,11 @@ from nemo_automodel.recipes.llm.train_ft import (
 from nemo_automodel.shared.te_patches import apply_te_patches
 
 logger = logging.getLogger(__name__)
+
+
+def _uses_multi_vector_scoring(model) -> bool:
+    """Return whether the model emits token-level embeddings for MaxSim scoring."""
+    return getattr(model, "pooling", None) in {"colbert", "multi_vector"}
 
 
 def contrastive_scores_and_labels(
@@ -70,6 +76,59 @@ def contrastive_scores_and_labels(
     qk = torch.sum(repeated_query * key, dim=-1).reshape(query_shape[0], current_train_n_passages)
     labels = torch.zeros(query_shape[0], dtype=torch.long, device=query.device)
     return qk, labels
+
+
+def maxsim_scores_and_labels(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    current_train_n_passages: int,
+    key_attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute local multi-vector MaxSim scores and labels without in-batch negatives."""
+    assert key.shape[0] == query.shape[0] * current_train_n_passages, "{} != {} * {}".format(
+        key.shape[0], query.shape[0], current_train_n_passages
+    )
+    assert key_attention_mask.shape == key.shape[:2], "{} != {}".format(key_attention_mask.shape, key.shape[:2])
+
+    key = key.reshape(query.shape[0], current_train_n_passages, key.shape[1], key.shape[2])
+    key_attention_mask = key_attention_mask.reshape(query.shape[0], current_train_n_passages, key.shape[2])
+
+    token_scores = torch.einsum("bqd,bnpd->bnqp", query, key)
+    token_scores.masked_fill_(~key_attention_mask[:, :, None, :].bool(), torch.finfo(token_scores.dtype).min)
+    maxsim = token_scores.max(dim=3).values
+    scores = maxsim.sum(dim=2)
+    labels = torch.zeros(query.shape[0], dtype=torch.long, device=query.device)
+    return scores, labels
+
+
+def distributed_maxsim_scores_and_labels(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    current_train_n_passages: int,
+    key_attention_mask: torch.Tensor,
+    rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute local-query multi-vector MaxSim scores against globally gathered passages."""
+    assert key.shape[0] % current_train_n_passages == 0, "{} % {} > 0".format(key.shape[0], current_train_n_passages)
+    assert key_attention_mask.shape == key.shape[:2], "{} != {}".format(key_attention_mask.shape, key.shape[:2])
+
+    global_batch_size = key.shape[0] // current_train_n_passages
+    key = key.reshape(global_batch_size, current_train_n_passages, key.shape[1], key.shape[2])
+    key_attention_mask = key_attention_mask.reshape(global_batch_size, current_train_n_passages, key.shape[2])
+
+    scores_by_passage = []
+    for passage_idx in range(current_train_n_passages):
+        token_scores = torch.einsum("bqd,gpd->bgqp", query, key[:, passage_idx])
+        token_scores.masked_fill_(
+            ~key_attention_mask[None, :, passage_idx, None, :].bool(),
+            torch.finfo(token_scores.dtype).min,
+        )
+        scores_by_passage.append(token_scores.max(dim=3).values.sum(dim=2))
+
+    scores = torch.stack(scores_by_passage, dim=2).reshape(query.shape[0], key.shape[0] * current_train_n_passages)
+    labels = torch.arange(query.shape[0], dtype=torch.long, device=query.device) + rank * query.shape[0]
+    labels = labels * current_train_n_passages
+    return scores, labels
 
 
 def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
@@ -229,6 +288,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
         self.optimizer = [self.cfg.optimizer.instantiate(params=param_groups)]
+        warn_if_torch_adam_with_bf16_params(
+            optimizer=self.optimizer,
+            optimizer_cfg=self.cfg.optimizer,
+            is_peft=self.peft_config is not None,
+            context="retrieval",
+            logger=logger,
+        )
 
         self.tokenizer = self.cfg.tokenizer.instantiate()
         if self.tokenizer.pad_token is None:
@@ -288,29 +354,39 @@ class TrainBiEncoderRecipe(BaseRecipe):
             mp.train()
         self.timestamp = time.perf_counter()
 
-        for epoch in self.step_scheduler.epochs:
-            self.step_scheduler.set_epoch(epoch)
-            # The step scheduler yields a list of batches for gradient accumulation
-            for batches in self.step_scheduler:
-                train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                self.log_train_metrics(train_log_data)
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
 
-                val_loss = None
-                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    val_log_data = self._run_validation_epoch(self.val_dataloader)
-                    self.log_val_metrics(val_log_data)
-                    val_loss = {"val_loss": val_log_data.metrics["val_loss"]}
-                    for mp in self.model_parts:
-                        mp.train()
+                if hasattr(self.dataloader.dataset, "set_epoch"):
+                    self.dataloader.dataset.set_epoch(epoch)
 
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(
-                        epoch,
-                        self.step_scheduler.step,
-                        train_loss=train_log_data.metrics["loss"],
-                        val_loss=val_loss,
-                    )
-                self._maybe_collect_garbage()
+                # The step scheduler yields a list of batches for gradient accumulation
+                for batches in self.step_scheduler:
+                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    self.log_train_metrics(train_log_data)
+                    self._update_progress_bar(pbar, train_log_data.metrics)
+
+                    val_loss = None
+                    if self.step_scheduler.is_val_step and self.val_dataloader is not None:
+                        val_log_data = self._run_validation_epoch(self.val_dataloader)
+                        self.log_val_metrics(val_log_data)
+                        val_loss = {"val_loss": val_log_data.metrics["val_loss"]}
+                        for mp in self.model_parts:
+                            mp.train()
+
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            train_loss=train_log_data.metrics["loss"],
+                            val_loss=val_loss,
+                        )
+                    self._maybe_collect_garbage()
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
@@ -341,9 +417,66 @@ class TrainBiEncoderRecipe(BaseRecipe):
             p_reps = model(passage)
 
             n_passages = self.train_n_passages
-            scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
-            if model.l2_normalize:
-                scores = scores / self.temperature
+            use_multi_vector_scoring = _uses_multi_vector_scoring(model)
+            if is_train and getattr(model, "do_distributed_inbatch_negative", False):
+                from nemo_automodel.components.models.common.inbatch_neg_utils import (
+                    dist_gather_tensor,
+                    dist_gather_tensor_with_dim1_padding,
+                    mask_gathered_passages_same_doc_as_positive,
+                )
+
+                local_bs = q_reps.shape[0]
+                dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
+                rank = torch.distributed.get_rank() if dist_initialized else 0
+                world_size = torch.distributed.get_world_size() if dist_initialized else 1
+                preserve_gather_grad = not getattr(model, "detach_distributed_inbatch_negatives", True)
+
+                if use_multi_vector_scoring:
+                    all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
+                    all_p_mask = dist_gather_tensor_with_dim1_padding(passage["attention_mask"], padding_value=False)
+                    expected_p = world_size * local_bs * n_passages
+                    assert all_p.shape[0] == expected_p, (
+                        f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                    )
+                    scores, labels = distributed_maxsim_scores_and_labels(
+                        q_reps,
+                        all_p,
+                        n_passages,
+                        all_p_mask,
+                        rank,
+                    )
+                else:
+                    all_p = dist_gather_tensor(p_reps, preserve_grad=preserve_gather_grad)
+                    expected_p = world_size * local_bs * n_passages
+                    assert all_p.shape[0] == expected_p, (
+                        f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                    )
+                    scores = torch.mm(q_reps, all_p.t())
+                    labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
+                if model.l2_normalize:
+                    scores = scores / self.temperature
+                passage_doc_ids = batch.get("passage_doc_ids")
+                if passage_doc_ids is not None:
+                    all_doc_ids = dist_gather_tensor(passage_doc_ids.contiguous())
+                    mask_gathered_passages_same_doc_as_positive(
+                        scores,
+                        all_doc_ids,
+                        train_n_passages=n_passages,
+                        rank=rank,
+                        local_batch_size=local_bs,
+                    )
+            else:
+                if use_multi_vector_scoring:
+                    scores, labels = maxsim_scores_and_labels(
+                        q_reps,
+                        p_reps,
+                        n_passages,
+                        passage["attention_mask"],
+                    )
+                else:
+                    scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+                if model.l2_normalize:
+                    scores = scores / self.temperature
             loss = F.cross_entropy(scores, labels)
 
             loss_buffer.append(loss.clone().detach())
@@ -429,7 +562,15 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     q_reps = model(query)
                     p_reps = model(passage)
 
-                    scores, labels = contrastive_scores_and_labels(q_reps, p_reps, self.val_n_passages)
+                    if _uses_multi_vector_scoring(model):
+                        scores, labels = maxsim_scores_and_labels(
+                            q_reps,
+                            p_reps,
+                            self.val_n_passages,
+                            passage["attention_mask"],
+                        )
+                    else:
+                        scores, labels = contrastive_scores_and_labels(q_reps, p_reps, self.val_n_passages)
                     if model.l2_normalize:
                         scores = scores / self.temperature
                     loss = F.cross_entropy(scores, labels)

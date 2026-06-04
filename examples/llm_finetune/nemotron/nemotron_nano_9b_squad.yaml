@@ -29,7 +29,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 20
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -105,9 +105,13 @@ ci:
   vllm_deploy: true
   recipe_owner: HuiyingLi
   time: "00:25:00"
+  known_issue_id: AM-156
   checkpoint_robustness:
+    kl_threshold: 5e-3
     hf_kl_threshold: 5e-3
     distributed.tp_size: 2
     tokenizer_name: nvidia/NVIDIA-Nemotron-Nano-9B-v2
+    trust_remote_code: true
+    no_check_resume: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500

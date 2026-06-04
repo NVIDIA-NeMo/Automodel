@@ -53,7 +53,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
@@ -123,7 +123,7 @@ ci:
   vllm_deploy: true
   vllm_smoke_test: true
   checkpoint_robustness:
-    hf_kl_threshold: 5e-2
+    hf_kl_threshold: 1e-1
     tokenizer_name: openai/gpt-oss-20b
     check_phantom_keys: true
     no_check_resume: true

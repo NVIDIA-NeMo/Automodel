@@ -76,7 +76,7 @@ checkpoint:
   enabled: false
   checkpoint_dir: vlm_checkpoints/kimi_k25_2layer/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -104,7 +104,11 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.kimi_k25_vl_collate_fn
+    max_length: 1024
+  drop_last: true
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -128,3 +132,4 @@ ci:
   recipe_owner: hemildesai
   nodes: 32
   time: "00:30:00"
+  known_issue_id: AM-153

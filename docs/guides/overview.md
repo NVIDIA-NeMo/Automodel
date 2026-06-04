@@ -44,7 +44,7 @@ Recipes for distilling knowledge from a large teacher model into a smaller, more
 
 Curated configurations for benchmarking different training stacks and settings (e.g., Torch vs. TransformerEngine + DeepEP, various model sizes, MoE variants).
 
-- Folder: [examples/benchmark/configs](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs)
+- Folder: [examples/llm_benchmark](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark)
 - Representative configurations: DeepSeek-V3, GPT-OSS (20B/120B), Kimi K2, Moonlight 16B, Qwen3 MoE 30B
 
 
@@ -64,6 +64,18 @@ Fine-tuning recipes for VLMs.
 Simple generation script and configurations for VLMs.
 
 - Folder: [examples/vlm_generate](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_generate)
+
+## Audio Models (ASR)
+
+This section provides recipes for fine-tuning omni / audio-capable models on automatic speech recognition (ASR) tasks. The recipes reuse the VLM training stack but operate on `{audio, text}` HuggingFace datasets (AMI, LibriSpeech, GigaSpeech, CommonVoice, etc.).
+
+### Fine-Tuning
+
+End-to-end ASR fine-tuning of `Qwen3-Omni-30B-A3B-Instruct` on any HuggingFace audio dataset, including a thinker-only checkpoint export step for downstream `transformers` / vLLM loading.
+
+- Folder: [examples/audio_finetune/qwen3_omni_asr](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/audio_finetune/qwen3_omni_asr)
+- Representative model: Qwen3-Omni-30B-A3B-Instruct
+- How-to guide: [Fine-tune Qwen3-Omni for ASR](audio/qwen3-omni-asr.md)
 
 ## Diffusion Models (Text-to-Image & Text-to-Video)
 

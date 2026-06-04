@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoConfig
 from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -28,11 +30,30 @@ from nemo_automodel.components.models.common import (
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
+from nemo_automodel.components.models.nemotron_v3.mtp import (
+    _resolve_block_types_per_sublayer,
+    build_mtp_config_from_hf,
+    build_nemotron_v3_mtp,
+)
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+@dataclass
+class NemotronHCausalLMOutputWithPast(CausalLMOutputWithPast):
+    """``CausalLMOutputWithPast`` plus declared MTP fields.
+
+    The MTP per-depth hidden states and scaling factor must be regular
+    dataclass fields (rather than dynamically-set attributes) so they survive
+    output-restructuring layers like FSDP2's mixed-precision output cast,
+    which rebuild ``ModelOutput`` instances from declared fields only.
+    """
+
+    mtp_per_depth_h: Optional[list[torch.Tensor]] = None
+    mtp_loss_scaling_factor: Optional[float] = None
 
 
 class NemotronV3Model(nn.Module):
@@ -120,42 +141,92 @@ class NemotronV3Model(nn.Module):
         cache_position: torch.LongTensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Forward pass through the model.  Supports BSHD ``[B, S, H]`` and THD ``[T, H]``."""
-        # Get embeddings
+        """Forward pass through the model.  Supports BSHD ``[B, S, H]`` and THD ``[T, H]``.
+
+        Pipeline-parallel awareness: when ``self.embed_tokens is None`` (non-first
+        PP stage), ``input_ids`` is interpreted as the upstream hidden-state
+        tensor and routed through the ``inputs_embeds`` branch. When
+        ``self.norm is None`` (non-last PP stage), the final norm is skipped.
+        """
+        # Get embeddings (PP-aware: a trimmed mid-stage has embed_tokens=None
+        # and receives the prior stage's hidden states as input_ids).
         if inputs_embeds is None:
-            if input_ids is None:
-                raise ValueError("input_ids must be provided if inputs_embeds is not provided")
-            hidden_states = self.embed_tokens(input_ids)
+            if getattr(self, "embed_tokens", None) is not None:
+                if input_ids is None:
+                    raise ValueError("input_ids must be provided if inputs_embeds is not provided")
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                if input_ids is None or input_ids.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                    raise ValueError("Non-first PP stage expects an upstream hidden-state tensor")
+                hidden_states = input_ids
         else:
             hidden_states = inputs_embeds
 
-        # When qkv_format="thd" is explicitly requested with batch_size=1,
-        # squeeze to 2D [T, H] so attention layers receive the correct shape
-        # for TE's thd qkv_format.  Note: cu_seqlens alone does NOT trigger
-        # the squeeze because cu_seqlens may be present solely for mamba's
-        # seq_idx construction (e.g. packed sequences with TE p2p CP where
-        # attention must stay in BSHD format).
+        # TE natively supports THD; squeeze to [T, H] so attention layers
+        # pick the THD branch. SDPA/flex only support 4D BSHD.
+        _attn_impl = getattr(getattr(self, "backend", None), "attn", None)
         squeezed_for_thd = False
-        if kwargs.get("qkv_format") == "thd" and hidden_states.dim() == 3 and hidden_states.shape[0] == 1:
+        if (
+            kwargs.get("qkv_format") == "thd"
+            and _attn_impl == "te"
+            and hidden_states.dim() == 3
+            and hidden_states.shape[0] == 1
+        ):
             hidden_states = hidden_states.squeeze(0)
             squeezed_for_thd = True
 
         is_thd = hidden_states.dim() == 2
 
-        # TODO: attention mask currently does not work. A default causal mask is applied.
+        # Non-THD-collater path doesn't emit cu_seqlens — recover it from a
+        # 2D indexed attention_mask so mamba's seq_idx derivation has input.
+        # Gated on B==1: cu_seqlens describes sub-sequence boundaries within a
+        # single flattened token stream. At B>1 the rows are independent
+        # sequences (the batch dim already separates them), so cumsum(0) would
+        # be a wrong cross-row global offset. Leave cu_seqlens unset there and
+        # let each consumer treat every row as one sequence (mamba seq_idx
+        # falls back to per-row, the PP seq_idx tail to its no-mask sentinel).
+        if (
+            "cu_seqlens" not in kwargs
+            and attention_mask is not None
+            and attention_mask.dim() == 2
+            and attention_mask.shape[0] == 1
+            and attention_mask.dtype != torch.bool
+        ):
+            seq_lens = attention_mask.sum(dim=-1).to(torch.int32)
+            kwargs["cu_seqlens"] = F.pad(seq_lens.cumsum(0).to(torch.int32), (1, 0))
 
-        # Get 4D causal mask for attention layers (from precomputed masks).
+        # Per-microbatch arrives as [1, K] (THD collator stacks per-MB and PP
+        # tensor_splits dim 0). Squeeze to 1D, strip the -1000 right-pad
+        # sentinels from pad_and_stack, and clone to a fresh tensor so the
+        # values survive TE backward (PP may free view-backed kwarg storage).
+        _SEQLEN_SENTINEL = -1000
+        for _k in ("cu_seqlens", "cu_seqlens_padded"):
+            _v = kwargs.get(_k)
+            if isinstance(_v, torch.Tensor) and _v.dim() == 2 and _v.shape[0] == 1:
+                _v = _v.squeeze(0)
+            if isinstance(_v, torch.Tensor) and _v.dim() == 1:
+                if (_v == _SEQLEN_SENTINEL).any():
+                    _v = _v[_v != _SEQLEN_SENTINEL]
+                kwargs[_k] = _v.contiguous().clone()
+        _ms = kwargs.get("max_seqlen")
+        if isinstance(_ms, torch.Tensor) and _ms.dim() >= 1 and _ms.numel() == 1:
+            kwargs["max_seqlen"] = _ms.flatten()[0].clone()
+
         causal_mask = causal_mask_mapping.get("full_attention") if causal_mask_mapping is not None else None
 
-        # Apply transformer layers
+        # Neat-packed SDPA path: seq_idx came from _packed_seq_ids upstream
+        # and attention_mask is the 4D block-causal bool mask. Mamba uses
+        # seq_idx (no 2D mask); attention uses the 4D mask directly.
+        _neat_packed = "seq_idx" in kwargs and attention_mask is not None and attention_mask.dim() == 4
+
         for layer in self.layers.values():
-            # Pass appropriate mask based on layer type
             if is_thd:
                 mask = None
+            elif _neat_packed:
+                mask = attention_mask if layer.block_type == "attention" else None
             elif layer.block_type == "attention":
-                # Attention layers use 4D causal mask; fall back to 2D attention_mask
-                # when causal_mask is None (e.g. during TE+CP training where CP split
-                # removes the precomputed 4D mask) so TE can use padding_causal mode.
+                # Fall back to 2D attention_mask when causal_mask is None
+                # (e.g. TE+CP, where the CP split drops the precomputed 4D mask).
                 mask = causal_mask if causal_mask is not None else attention_mask
             elif layer.block_type == "mamba":
                 # Mamba layers use 2D padding mask during prefill, None during decode
@@ -172,10 +243,10 @@ class NemotronV3Model(nn.Module):
                 **kwargs,
             )
 
-        # Final norm
-        hidden_states = self.norm(hidden_states)
+        # Norm is None on non-last PP stages (splitter trims it).
+        if getattr(self, "norm", None) is not None:
+            hidden_states = self.norm(hidden_states)
 
-        # Restore batch dimension if we squeezed for THD
         if squeezed_for_thd:
             hidden_states = hidden_states.unsqueeze(0)
 
@@ -185,15 +256,18 @@ class NemotronV3Model(nn.Module):
     def initialize_weights(self, buffer_device: torch.device | None = None) -> None:
         """Initialize model weights according to NemotronV3 spec.
 
+        After PP splitting, ``embed_tokens`` may be ``None`` on non-first
+        stages and ``norm`` may be ``None`` on non-last stages; guard each.
+
         Args:
             buffer_device: Device to use for buffer initialization
         """
-        # Embedding weights: normal initialization
         with buffer_device:
-            nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=self.config.initializer_range)
-            self.norm.reset_parameters()
+            if getattr(self, "embed_tokens", None) is not None:
+                nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=self.config.initializer_range)
+            if getattr(self, "norm", None) is not None:
+                self.norm.reset_parameters()
 
-        # Initialize all layers via delegation
         for block in self.layers.values():
             block.init_weights(buffer_device=buffer_device)
 
@@ -205,10 +279,12 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     per-step KV caching for attention layers and recurrent state caching for Mamba2 layers.
     """
 
-    # Prevent GenerationMixin from creating a DynamicCache: the hybrid Mamba2/Attention
-    # architecture uses its own NemotronHybridCache.
+    # Hybrid Mamba2/Attention uses NemotronHybridCache, not DynamicCache.
     _is_stateful: bool = True
     main_input_name: str = "input_ids"
+
+    # Skip patch_hf_model_for_pp; our forward already handles PP routing.
+    _pp_keep_self_forward: bool = True
 
     @classmethod
     def from_config(
@@ -253,14 +329,31 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         self,
         config,
         backend: BackendConfig | None = None,
+        *,
+        mtp_loss_scaling_factor: float = 0.1,
+        num_nextn_predict_layers: int | None = None,
+        mtp_use_repeated_layer: bool = False,
         **kwargs,
     ):
         """Initialize NemotronV3ForCausalLM.
 
         Args:
-            config: NemotronH config
-            backend: Backend configuration
-            **kwargs: Additional arguments
+            config: NemotronH config.
+            backend: Backend configuration.
+            mtp_loss_scaling_factor: Auxiliary-loss weight for the MTP head
+                (default ``0.1``). Programmatic override only — not exposed
+                as a YAML knob to keep recipe configs auto-detected.
+            num_nextn_predict_layers: Optional override for the HF config's
+                ``num_nextn_predict_layers`` field (i.e. the MTP forward
+                iteration count). When ``None``, the value from ``config`` is
+                used. Set explicitly when the trained model used weight-tied
+                MTP (``mtp_use_repeated_layer=True``) and the HF export only
+                retains the physical depth count.
+            mtp_use_repeated_layer: When ``True``, build a single physical
+                MTP depth and reuse it across all iterations. Mirrors
+                Megatron's ``--mtp-use-repeated-layer``. Defaults to ``False``.
+            **kwargs: Additional arguments. Recognized keys:
+                ``moe_config``, ``moe_overrides``.
         """
         super().__init__()
         self.config = config
@@ -287,7 +380,25 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             dtype=dtype,
         )
 
-        # Create state_dict_adapter if enabled (needed to convert HF checkpoints)
+        self.mtp_config = build_mtp_config_from_hf(
+            config,
+            loss_scaling_factor=mtp_loss_scaling_factor,
+            num_nextn_predict_layers=num_nextn_predict_layers,
+            use_repeated_layer=mtp_use_repeated_layer,
+        )
+        if self.mtp_config.enabled:
+            block_types = _resolve_block_types_per_sublayer(config)
+            self.mtp = build_nemotron_v3_mtp(
+                config,
+                mtp_config=self.mtp_config,
+                backend=self.backend,
+                moe_config=self.model.moe_config,
+                dtype=dtype,
+                block_types=block_types,
+            )
+        else:
+            self.mtp = None
+
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = NemotronV3StateDictAdapter(
                 config=config,
@@ -296,7 +407,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 dtype=dtype,
             )
 
-        # Required by GenerationMixin.generate()
+        # Required by GenerationMixin.generate().
         self.generation_config = GenerationConfig()
 
     @property
@@ -321,9 +432,131 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def _is_pipeline_parallel_stage(self) -> bool:
+        """True when this module instance has been trimmed to a PP stage subset.
+
+        Detection mirrors ``DeepseekV4ForCausalLM._is_pipeline_parallel_stage``:
+        any of (a) ``lm_head`` is None, (b) inner ``embed_tokens`` is None,
+        (c) ``model.layers`` count diverges from ``config.num_hidden_layers``
+        is sufficient — the PP splitter nulls these attributes when trimming.
+
+        The checks use ``hasattr`` to distinguish "splitter nulled the
+        attribute" (attribute present, value is None) from "caller replaced
+        ``self.model`` with a stub that doesn't declare the attribute"
+        (attribute absent). Tests that swap in stub inner modules should not
+        be misclassified as PP stages.
+        """
+        if self.lm_head is None:
+            return True
+        if hasattr(self.model, "embed_tokens") and self.model.embed_tokens is None:
+            return True
+        if hasattr(self.model, "layers"):
+            try:
+                return len(self.model.layers) != int(self.config.num_hidden_layers)
+            except TypeError:
+                return False
+        return False
+
+    def _build_mtp_embed_inputs_for_pp(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Build the per-depth rolled-token embeddings on the first PP stage.
+
+        The first PP stage owns ``embed_tokens`` and is the only rank that can
+        produce the future-token embeddings consumed by the MTP head on the
+        final stage. The tuple flows alongside ``hidden_states`` through every
+        intermediate stage as additional positional outputs (see ``forward``).
+
+        Args:
+            input_ids: Token ids ``[B, S]`` (int).
+
+        Returns:
+            Tuple of length ``self.mtp_config.num_layers`` containing
+            ``[B, S, hidden]`` embeddings for depths 1..D (i.e. for predicting
+            tokens shifted left by 1..D positions).
+        """
+        if getattr(self.model, "embed_tokens", None) is None:
+            raise ValueError("First PP stage must own embed_tokens to build MTP embeddings")
+        if input_ids.dtype not in (torch.int32, torch.int64, torch.long):
+            raise ValueError("First PP stage must receive token ids to build MTP embeddings")
+
+        from nemo_automodel.components.models.common.mtp import roll_tensor  # noqa: PLC0415
+
+        cur_input_ids = input_ids
+        embeds: list[torch.Tensor] = []
+        for _ in range(self.mtp_config.num_layers):
+            cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
+            embeds.append(self.model.embed_tokens(cur_input_ids))
+        return tuple(embeds)
+
+    def customize_pipeline_stage_modules(
+        self,
+        module_names_per_stage: list[list[str]],
+        *,
+        layers_prefix: str,
+        text_model: nn.Module | None = None,
+    ) -> list[list[str]]:
+        """Pin the MTP head to the last PP stage's FQN list.
+
+        Called by ``split_model_into_stages`` (functional.py:494-502) after the
+        default per-stage FQN auto-generation. The auto-generator includes
+        ``embed_tokens`` on the first stage and ``norm``/``lm_head`` on the
+        last stage but doesn't know about ``model.mtp``; this hook appends it.
+        """
+        del layers_prefix, text_model  # unused — no per-stage rotary to replicate
+        stage_modules = [list(m) for m in module_names_per_stage]
+        if self.mtp is not None and stage_modules:
+            last = stage_modules[-1]
+            if "mtp" not in last:
+                last.append("mtp")
+        return stage_modules
+
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Return analytical (inputs_meta, outputs_meta) for a PP stage.
+
+        Inter-stage tensors are plain ``[B, S, H]`` (no HC stream). With MTP
+        enabled, every transfer carries ``1 + D`` tensors so the variadic
+        forward signature is exercised on every microbatch.
+        """
+        hidden_shape = (microbatch_size, seq_len, self.config.hidden_size)
+        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
+
+        def meta(shape: tuple[int, ...], d: torch.dtype = dtype) -> torch.Tensor:
+            return torch.empty(*shape, device="meta", dtype=d)
+
+        def append_mtp(primary: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            if mtp_depth == 0:
+                return (primary,)
+            return (primary, *(meta(hidden_shape) for _ in range(mtp_depth)))
+
+        if is_first:
+            inputs_meta: tuple[torch.Tensor, ...] = (
+                torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),
+            )
+        else:
+            inputs_meta = append_mtp(meta(hidden_shape))
+
+        if self.lm_head is not None:
+            primary_out = meta((microbatch_size, seq_len, self.config.vocab_size))
+        else:
+            primary_out = meta(hidden_shape)
+        outputs_meta = append_mtp(primary_out)
+        # Last stage appends an int32 [B, S] seq_idx so the loss fn can mask
+        # MTP label rolls across sub-seq boundaries — bonded to its microbatch
+        # via the PP output-tuple contract (schedule-agnostic).
+        if self.lm_head is not None and mtp_depth > 0:
+            outputs_meta = (*outputs_meta, meta((microbatch_size, seq_len), d=torch.int32))
+        return inputs_meta, outputs_meta
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        *mtp_embed_inputs: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         causal_mask_mapping: Optional[dict[str, torch.Tensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -341,48 +574,114 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         """Forward pass with optional loss computation.
 
         Supports both BSHD format (``input_ids`` shape ``[B, S]``) and THD format
-        (``input_ids`` shape ``[T]`` after ``squeeze_input_for_thd``).  When
-        ``kwargs["qkv_format"] == "thd"``, inputs are squeezed to THD before the
-        base-model forward and logits are unsqueezed back to ``[1, T, V]`` on exit.
+        (``input_ids`` shape ``[T]`` after ``squeeze_input_for_thd``). When
+        ``kwargs["qkv_format"] == "thd"`` AND the attention backend is TE,
+        inputs are squeezed to THD before the base-model forward and logits
+        are unsqueezed back to ``[1, T, V]`` on exit. SDPA / flex stay in BSHD.
+
+        Pipeline-parallel awareness: when run as a PP stage, ``input_ids`` is
+        the upstream stage's hidden-state tensor on non-first stages, and
+        ``*mtp_embed_inputs`` carries ``num_nextn_predict_layers`` future-token
+        embeddings produced by the first stage. See the Returns section below
+        for the per-stage tuple contract. The single-rank (no-PP) path returns
+        :class:`NemotronHCausalLMOutputWithPast` unchanged.
 
         Args:
-            input_ids: Input token IDs.  BSHD: ``[B, S]``; THD: ``[1, T]`` (squeezed internally).
+            input_ids: Input token IDs. BSHD: ``[B, S]``; THD: ``[1, T]``
+                (squeezed internally). On non-first PP stages this slot
+                instead carries the upstream stage's hidden-state tensor.
+            *mtp_embed_inputs: Pre-computed future-token embeddings produced
+                by the first PP stage and forwarded between stages as
+                positional args. Empty on the single-rank (no-PP) path.
             attention_mask: 2D padding mask ``[B, S]``.
-            causal_mask_mapping: Dict with precomputed 4D causal masks.
+            causal_mask_mapping: Dict with precomputed 4D causal masks
+                (key ``"full_attention"`` is consumed).
             inputs_embeds: Pre-computed input embeddings (optional).
-            labels: Token IDs for loss computation ``[B, S]`` (optional).
-            past_key_values: Optional NemotronHybridCache for incremental decoding.
-            use_cache: Whether to return past_key_values for subsequent steps.
+            labels: Token IDs for loss computation ``[B, S]`` (optional;
+                under PP, loss is computed by ``PipelineCausalLMLoss``).
+            past_key_values: Optional ``NemotronHybridCache`` for incremental decoding.
+            use_cache: Whether to return ``past_key_values`` for subsequent steps.
             cache_position: Token position indices for cache updates.
-            position_ids: Unused -- accepted for API compatibility with GenerationMixin.
-            padding_mask: Padding mask ``[B, S]`` used by THD squeeze helper.
-            logits_to_keep: If > 0, only compute logits for the last ``logits_to_keep``
-                token positions (avoids materialising the full logit matrix during generation).
+            position_ids: Position IDs (forwarded into MTP sublayer kwargs).
+            padding_mask: Padding mask ``[B, S]`` used by the THD squeeze helper
+                and as the MoE / mamba 2D mask source.
+            logits_to_keep: If > 0, only compute logits for the last
+                ``logits_to_keep`` token positions.
             output_hidden_states: Whether to return hidden states.
-            return_dict: Accepted for API compatibility (always returns CausalLMOutputWithPast).
+            return_dict: Accepted for API compatibility (always returns a
+                ``NemotronHCausalLMOutputWithPast`` off-PP).
             **kwargs: Additional arguments forwarded to the base model
-                (e.g. seq_idx, cu_seqlens, qkv_format, CP kwargs).
+                (e.g. ``qkv_format``, ``cu_seqlens``, ``cu_seqlens_padded``,
+                ``max_seqlen``, ``seq_idx``, ``cp_rank``, ``cp_size``,
+                ``_packed_seq_ids``).
 
         Returns:
-            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with
-            ``logits`` (float32), optional ``loss``, ``past_key_values``, and
-            ``hidden_states``.
+            Off-PP: :class:`NemotronHCausalLMOutputWithPast` with ``logits``,
+            optional ``loss``, ``past_key_values``, ``hidden_states``, and the
+            MTP per-depth hidden states / loss-scaling factor when MTP is on.
+
+            Under PP, returns a positional tuple instead:
+              * mid stages: ``(hidden_states, *mtp_embed_inputs)`` arity ``1 + D``.
+              * last stage: ``(logits, *mtp_per_depth_h, seq_idx)`` arity
+                ``1 + D + 1`` when MTP is enabled, else ``logits`` alone.
         """
+        is_pp_stage = self._is_pipeline_parallel_stage()
+        is_first_stage = getattr(self.model, "embed_tokens", None) is not None
+        has_lm_head = self.lm_head is not None
+        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
+        pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
+
+        # Neat-packed SDPA: convert _packed_seq_ids (1-based [B,S] int, 0=pad)
+        # to mamba's seq_idx and derive a 2D padding_mask. The neat collater
+        # already supplies a 4D attention_mask, but mamba's mixer multiplies
+        # hidden_states by a 2D mask, so we need both.
+        _packed_seq_ids = kwargs.pop("_packed_seq_ids", None)
+        if isinstance(_packed_seq_ids, torch.Tensor) and "seq_idx" not in kwargs:
+            kwargs["seq_idx"] = _packed_seq_ids.to(torch.int32).contiguous()
+            if padding_mask is None:
+                padding_mask = _packed_seq_ids == 0
+
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
             else getattr(self.config, "output_hidden_states", False)
         )
 
+        # Stash pre-squeeze [B, S] input_ids: the MTP embed tuple must be
+        # built AFTER self.model() runs (FSDP2 root lazy-init requires the
+        # root forward first) but with the pre-squeeze shape so emitted
+        # tensors match the [B, S, H] contract from get_pipeline_stage_metas.
+        pre_squeeze_input_ids = (
+            input_ids
+            if (
+                pp_mtp_enabled
+                and is_first_stage
+                and not has_lm_head
+                and not mtp_embed_inputs
+                and input_ids is not None
+                and input_ids.dtype in (torch.int32, torch.int64, torch.long)
+            )
+            else None
+        )
+
+        # Squeezing to [T, H] only helps TE; SDPA/flex need 4D BSHD. Keep
+        # is_thd true regardless so the post-forward unsqueeze still fires.
+        _attn_impl = getattr(getattr(self, "backend", None), "attn", None)
         is_thd = kwargs.get("qkv_format") == "thd"
-        if is_thd:
+        squeeze_for_thd = is_thd and _attn_impl == "te"
+        if squeeze_for_thd and is_first_stage:
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, kwargs
             )
             attention_mask = None
             causal_mask_mapping = None
 
-        # Forward through base model
+        # MoE needs a padding_mask; derive from attention_mask when missing.
+        if padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
+            padding_mask = attention_mask.bool().logical_not()
+
+        # On non-first PP stages, the upstream hidden-state tensor arrives in
+        # the input_ids slot; the inner model routes it via inputs_embeds.
         hidden_states = self.model(
             input_ids,
             attention_mask=attention_mask,
@@ -393,24 +692,31 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             **kwargs,
         )
 
-        # Mark cache as having state after the first forward pass (prefill done)
+        # Root forward has run; FSDP2 lazy-init is satisfied. Build MTP embed
+        # tuple from pre-squeeze [B, S] ids so emitted shapes match
+        # get_pipeline_stage_metas.
+        if pre_squeeze_input_ids is not None:
+            mtp_embed_inputs = self._build_mtp_embed_inputs_for_pp(pre_squeeze_input_ids)
+
         if past_key_values is not None:
             past_key_values.has_previous_state = True
 
-        # Optionally restrict logit computation to the last few positions.
-        # When logits_to_keep == 0 we compute all positions (training default).
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                logits = self.lm_head(hidden_states[slice_indices, :])
+        # lm_head is None on non-last PP stages; return raw hidden_states.
+        if has_lm_head:
+            if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+                logits = self.lm_head(hidden_states)
             else:
-                logits = self.lm_head(hidden_states[:, slice_indices, :])
+                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+                if hidden_states.dim() == 2:
+                    logits = self.lm_head(hidden_states[slice_indices, :])
+                else:
+                    logits = self.lm_head(hidden_states[:, slice_indices, :])
+        else:
+            logits = hidden_states
 
         loss = None
-        if labels is not None:
-            # Shift for next-token prediction
+        # PP path defers loss to PipelineCausalLMLoss; only compute here off-PP.
+        if labels is not None and has_lm_head and not is_pp_stage:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = nn.functional.cross_entropy(
@@ -418,15 +724,140 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 shift_labels.view(-1),
             )
 
-        if is_thd:
+        # MTP head: last PP stage in training only. Other stages / eval emit
+        # placeholder empties below so the tuple arity stays 1 + D.
+        mtp_per_depth_h: list[torch.Tensor] | None = None
+        if self.mtp is not None and self.training:
+            mtp_attention_mask = (
+                causal_mask_mapping.get("full_attention") if causal_mask_mapping is not None else attention_mask
+            )
+            # Forward THD-packing context to the MTP sublayers; without it
+            # they'd auto-detect bshd from the 3D shape and bleed attention
+            # across sub-seq boundaries. cp_rank/cp_size must also be
+            # forwarded — the CP forward pre-hook only attaches to the
+            # backbone attention, not to MTP sublayers that share the class.
+            mtp_kwargs = {
+                "position_ids": position_ids,
+                "attention_mask": mtp_attention_mask,
+            }
+            for _k in (
+                "qkv_format",
+                "cu_seqlens",
+                "cu_seqlens_padded",
+                "max_seqlen",
+                "max_seqlen_q",
+                "max_seqlen_kv",
+                "seq_idx",
+                "cp_rank",
+                "cp_size",
+            ):
+                if _k in kwargs:
+                    _v = kwargs[_k]
+                    # Same per-microbatch [1, K] → 1D normalization as in
+                    # NemotronV3Model.forward; re-applied for the MTP chain.
+                    if _k in ("cu_seqlens", "cu_seqlens_padded", "seq_idx") and isinstance(_v, torch.Tensor):
+                        if _v.dim() == 2 and _v.shape[0] == 1:
+                            _v = _v.squeeze(0)
+                        if _v.dim() == 1:
+                            # Strip pad_and_stack's -1000 sentinels; TE would
+                            # interpret pairs like (1024, -1000) as a negative-
+                            # length sub-seq and OOB-write during backward.
+                            if (_v == -1000).any():
+                                _v = _v[_v != -1000]
+                            _v = _v.contiguous().clone()
+                    mtp_kwargs[_k] = _v
+            # Squeeze to 2D ``[T, H]`` when THD-packed so the attention layer
+            # selects its THD branch.  Also squeeze the propagated MTP embed
+            # tensors for the same reason.
+            mtp_hidden = hidden_states
+            mtp_embeds_for_call = tuple(mtp_embed_inputs) if mtp_embed_inputs else ()
+            if is_thd:
+                if mtp_hidden.dim() == 3 and mtp_hidden.shape[0] == 1:
+                    mtp_hidden = mtp_hidden.squeeze(0)
+                mtp_embeds_for_call = tuple(
+                    e.squeeze(0) if (e.dim() == 3 and e.shape[0] == 1) else e for e in mtp_embeds_for_call
+                )
+
+            if mtp_embeds_for_call:
+                # Final PP stage: embeddings produced upstream.
+                mtp_per_depth_h = self.mtp(
+                    hidden_states=mtp_hidden,
+                    embed_inputs=mtp_embeds_for_call,
+                    **mtp_kwargs,
+                )
+            else:
+                # Non-PP single-rank: roll input_ids locally.
+                mtp_per_depth_h = self.mtp(
+                    hidden_states=mtp_hidden,
+                    input_ids=input_ids,
+                    embed_fn=self.model.embed_tokens,
+                    **mtp_kwargs,
+                )
+            if is_thd and mtp_per_depth_h is not None:
+                mtp_per_depth_h = [h.unsqueeze(0) if h.dim() == 2 else h for h in mtp_per_depth_h]
+        elif pp_mtp_enabled and has_lm_head:
+            # Eval, or no MTP on this rank — emit empties to keep tuple arity.
+            mtp_per_depth_h = [hidden_states.new_empty(hidden_states.shape) for _ in range(mtp_depth)]
+
+        # Restore batch dim only when inner forward returned 2D — inputs_embeds
+        # path already produces [1, T, V] and would become [1, 1, T, V] here.
+        if is_thd and logits.dim() == 2:
             logits = logits.unsqueeze(0)
 
-        return CausalLMOutputWithPast(
+        # PP return contract:
+        #   mid stages: (hidden_states, *mtp_embed_inputs)              arity 1+D
+        #   last stage: (logits,        *mtp_per_depth_h,  seq_idx)     arity 1+D+1
+        # The seq_idx tail binds the per-microbatch sub-seq layout to its loss
+        # call via the PP runtime's forward(mb_i)→loss(mb_i) contract.
+        if is_pp_stage:
+            if pp_mtp_enabled:
+                if not has_lm_head:
+                    return (logits, *mtp_embed_inputs)
+                assert mtp_per_depth_h is not None
+                # seq_idx tail sources, in order of preference:
+                #   1. kwargs["seq_idx"] (neat-path).
+                #   2. derived from kwargs["cu_seqlens"] (THD/TE path).
+                #   3. all-1 sentinel — loss-fn cross-boundary mask is a no-op.
+                if logits.dim() == 3:
+                    _B, _S = logits.shape[:2]
+                elif logits.dim() == 2:
+                    _B, _S = 1, logits.shape[0]
+                else:
+                    _B, _S = 1, hidden_states.shape[-2]
+
+                _seq_idx_tail = kwargs.get("seq_idx", None)
+                if not isinstance(_seq_idx_tail, torch.Tensor):
+                    _cu = kwargs.get("cu_seqlens", None)
+                    if isinstance(_cu, torch.Tensor):
+                        _cu1d = _cu.squeeze(0) if (_cu.dim() == 2 and _cu.shape[0] == 1) else _cu
+                        if _cu1d.dim() == 1:
+                            _positions = torch.arange(_S, device=_cu1d.device)
+                            # ``right=True`` so a position equal to a boundary
+                            # (first token of sub-seq k, position == cu_seqlens[k])
+                            # maps to k, not k-1 — matches mtp.py and layers.py.
+                            _seq_idx_1d = torch.searchsorted(_cu1d[1:].contiguous(), _positions, right=True).to(
+                                torch.int32
+                            )
+                            _seq_idx_tail = _seq_idx_1d.unsqueeze(0).expand(_B, _S).contiguous()
+                if not isinstance(_seq_idx_tail, torch.Tensor):
+                    _seq_idx_tail = torch.ones((_B, _S), dtype=torch.int32, device=logits.device)
+                else:
+                    if _seq_idx_tail.dim() == 1:
+                        _seq_idx_tail = _seq_idx_tail.unsqueeze(0)
+                    if _seq_idx_tail.dtype != torch.int32:
+                        _seq_idx_tail = _seq_idx_tail.to(torch.int32)
+                return (logits, *mtp_per_depth_h, _seq_idx_tail)
+            return logits
+
+        # Non-PP: dataclass return for the recipe's MTP loss reader.
+        return NemotronHCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=(hidden_states,) if output_hidden_states else None,
             attentions=None,
+            mtp_per_depth_h=mtp_per_depth_h,
+            mtp_loss_scaling_factor=(self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None),
         )
 
     @staticmethod
@@ -534,6 +965,10 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     ) -> None:
         """Initialize model weights.
 
+        PP-aware: skips ``lm_head`` and ``mtp`` initialization when those have
+        been trimmed to ``None`` on a non-owning stage. ``self.model`` itself
+        also internally guards ``embed_tokens`` and ``norm``.
+
         Args:
             buffer_device: Device to use for buffer initialization
             dtype: Target dtype for model weights
@@ -541,7 +976,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         with buffer_device:
             self.model.initialize_weights(buffer_device=buffer_device)
-            nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.config.initializer_range)
+            if self.lm_head is not None:
+                nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.config.initializer_range)
+            if self.mtp is not None:
+                for sublayer in self.mtp.layers:
+                    sublayer.init_weights(buffer_device=buffer_device)
 
         cast_model_to_dtype(self, dtype)
 

@@ -131,6 +131,117 @@ class TestNeMoAutoTokenizerFromPretrained:
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
             assert tok.special_tokens_pattern == "cls_sep"
 
+    def test_retry_on_layer_types_mismatch(self):
+        """When AutoTokenizer fails because the underlying config has
+        layer_types longer than num_hidden_layers (e.g. stepfun-ai/Step-3.5-Flash),
+        the wrapper should relax the validator globally and retry."""
+        from huggingface_hub.errors import StrictDataclassClassValidationError
+
+        stub = _StubHFTokenizer()
+        calls = {"n": 0}
+
+        def fake_from_pretrained(pretrained_model_name_or_path, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                cause = ValueError("`num_hidden_layers` (45) must be equal to the number of layer types (48).")
+                raise StrictDataclassClassValidationError(validator="validate_layer_type", cause=cause)
+            return stub
+
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", side_effect=fake_from_pretrained),
+            patch(
+                "nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator",
+                return_value=True,
+            ) as mock_relax,
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("stepfun-ai/Step-3.5-Flash", trust_remote_code=True)
+            assert tok is not None
+            assert calls["n"] == 2
+            mock_relax.assert_called_once()
+
+    def test_unrelated_value_error_is_not_retried(self):
+        """Unrelated ValueErrors should propagate without triggering the fix path."""
+        with (
+            patch(
+                "transformers.AutoTokenizer.from_pretrained",
+                side_effect=ValueError("totally unrelated tokenizer failure"),
+            ),
+            patch("nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator") as mock_relax,
+        ):
+            with pytest.raises(ValueError, match="totally unrelated"):
+                NeMoAutoTokenizer.from_pretrained("dummy/model")
+            mock_relax.assert_not_called()
+
+    def test_retry_on_backend_tokenizer_error_via_auto_map(self):
+        """When AutoTokenizer raises the transformers>=5 'backend tokenizer' error
+        (e.g. Moonlight's slow-only TikTokenTokenizer), the wrapper should resolve
+        auto_map['AutoTokenizer'] from the remote module and retry."""
+        stub = _StubHFTokenizer()
+        backend_err = ValueError(
+            "Couldn't instantiate the backend tokenizer from one of: ... "
+            "You need to have sentencepiece or tiktoken installed to convert "
+            "a slow tokenizer to a fast one."
+        )
+
+        class _FakeDynamicCls:
+            @classmethod
+            def from_pretrained(cls, *args, **kwargs):
+                return stub
+
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", side_effect=backend_err),
+            patch(
+                "nemo_automodel._transformers.tokenization.nemo_auto_tokenizer._read_tokenizer_config",
+                return_value={"auto_map": {"AutoTokenizer": ["tokenization_moonshot.TikTokenTokenizer", None]}},
+            ),
+            patch(
+                "transformers.dynamic_module_utils.get_class_from_dynamic_module",
+                return_value=_FakeDynamicCls,
+            ) as mock_resolve,
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("moonshotai/Moonlight-16B-A3B", trust_remote_code=True)
+            assert tok is not None
+            mock_resolve.assert_called_once()
+            (ref_arg, _), _ = mock_resolve.call_args
+            assert ref_arg == "tokenization_moonshot.TikTokenTokenizer"
+
+    def test_backend_tokenizer_error_propagates_without_trust_remote_code(self):
+        """Without trust_remote_code, the backend-tokenizer fallback must not fire."""
+        backend_err = ValueError(
+            "Couldn't instantiate the backend tokenizer from one of: ... "
+            "You need to have sentencepiece or tiktoken installed."
+        )
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", side_effect=backend_err),
+            patch(
+                "transformers.dynamic_module_utils.get_class_from_dynamic_module",
+            ) as mock_resolve,
+        ):
+            with pytest.raises(ValueError, match="backend tokenizer"):
+                NeMoAutoTokenizer.from_pretrained("dummy/model")
+            mock_resolve.assert_not_called()
+
+    def test_backend_tokenizer_error_propagates_when_auto_map_missing(self):
+        """If auto_map is absent, the retry returns None and the original error re-raises."""
+        backend_err = ValueError(
+            "Couldn't instantiate the backend tokenizer from one of: ... "
+            "You need to have sentencepiece or tiktoken installed."
+        )
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", side_effect=backend_err),
+            patch(
+                "nemo_automodel._transformers.tokenization.nemo_auto_tokenizer._read_tokenizer_config",
+                return_value={},
+            ),
+            patch(
+                "transformers.dynamic_module_utils.get_class_from_dynamic_module",
+            ) as mock_resolve,
+        ):
+            with pytest.raises(ValueError, match="backend tokenizer"):
+                NeMoAutoTokenizer.from_pretrained("dummy/model", trust_remote_code=True)
+            mock_resolve.assert_not_called()
+
     def test_force_hf_passthrough(self):
         stub = _StubHFTokenizer()
         with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub):
@@ -841,9 +952,7 @@ class TestTryConvertTikTokenToNative:
         mock_fast_tokenizer.is_fast = True
 
         with (
-            patch(
-                "transformers.convert_slow_tokenizer.TikTokenConverter"
-            ) as mock_converter_cls,
+            patch("transformers.convert_slow_tokenizer.TikTokenConverter") as mock_converter_cls,
             patch(
                 "transformers.tokenization_utils_tokenizers.TokenizersBackend",
                 return_value=mock_fast_tokenizer,
