@@ -37,7 +37,7 @@ recipe_args:
   # dst=Path('./cache/dataset/perfectblend-qwen3-8b-regen-messages'); dst.mkdir(parents=True, exist_ok=True); \
   # files=sorted(f for f in list_repo_files(repo, repo_type='dataset') if f.startswith('data/train-') and f.endswith('.parquet')); \
   # [pd.read_parquet(hf_hub_download(repo_id=repo, repo_type='dataset', filename=f)).rename(columns={'conversations':'messages'}).to_parquet(dst / Path(f).name, index=False) for f in files]; \
-  # print(f'wrote{len(files)} shards to {dst}')"
+  # print(f'wrote {len(files)} shards to {dst}')"
 
   train_data_path: ./cache/dataset/perfectblend-qwen3-8b-regen-messages
   val_data_path: null

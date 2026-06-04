@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import pathlib
+from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -54,6 +55,7 @@ from nemo_automodel.components.speculative.eagle import (
     PEagleTrainerModule,
 )
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
+from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import (
@@ -78,6 +80,35 @@ def _optim_steps_per_epoch(num_batches_per_epoch: int, grad_accumulation_steps: 
     if num_batches_per_epoch <= 0 or grad_accumulation_steps <= 0:
         return 0
     return -(-num_batches_per_epoch // grad_accumulation_steps)
+
+
+def _should_sync_grads(
+    *,
+    pending_micro_batches: int,
+    grad_accumulation_steps: int,
+    batch_idx: int,
+    batches_per_epoch: int | None,
+    is_ddp: bool,
+) -> bool:
+    """Return True when this micro-batch's backward should all-reduce gradients.
+
+    Under DDP with gradient accumulation only the micro-batch immediately
+    followed by an ``optimizer.step()`` needs to synchronize: at that point the
+    locally-accumulated ``.grad`` already holds the whole window's contribution,
+    so a single all-reduce averages the complete window and the intervening
+    micro-batches can run under ``no_sync()`` -- saving ``grad_accumulation_steps - 1``
+    all-reduces per window. That step is either the window closer
+    (``pending_micro_batches + 1 == grad_accumulation_steps``) or the epoch's
+    final batch (which the trailing-flush step consumes). When the dataloader
+    length is unknown we cannot identify the final batch, so we sync every step
+    (correct, just no speedup). With a single process (no DDP) there is nothing
+    to synchronize, so this is always True.
+    """
+    if not is_ddp or batches_per_epoch is None:
+        return True
+    closes_window = pending_micro_batches + 1 == grad_accumulation_steps
+    is_last_batch = batch_idx == batches_per_epoch - 1
+    return closes_window or is_last_batch
 
 
 def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
@@ -278,6 +309,7 @@ class TrainEagle3Recipe(BaseRecipe):
         )
         self.grad_accumulation_steps = recipe_cfg.get("grad_accumulation_steps", 1)
         self.max_grad_norm = recipe_cfg.get("max_grad_norm", 1.0)
+        self.target_prefetch_depth = self._resolve_prefetch_depth(recipe_cfg)
         self.num_epochs = recipe_cfg.num_epochs
         self.log_every_steps = recipe_cfg.get("log_every_steps", 10)
         self.output_dir = pathlib.Path(recipe_cfg.output_dir)
@@ -336,41 +368,20 @@ class TrainEagle3Recipe(BaseRecipe):
         ``(selected_token_ids, selected_token_mask)`` draft-vocab mapping built
         by scanning the training data.
         """
-        # Optional ``distributed:`` YAML section. Required for targets that do
-        # not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). ``force_hf`` is
-        # opt-in; default ``False`` so HF architectures with an AutoModel custom
-        # impl take the MoE-capable custom path.
-        target_kwargs = dict(
-            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
-            torch_dtype=self.compute_dtype,
-            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
-        )
-        if self.cfg.get("distributed", None) is not None:
-            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-            self.distributed_config = self.dist_setup.strategy_config
-            self.device_mesh = self.dist_setup.device_mesh
-            self.moe_mesh = self.dist_setup.moe_mesh
-            target_kwargs.update(
-                distributed_config=self.distributed_config,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                moe_config=self.dist_setup.moe_config,
-                activation_checkpointing=self.dist_setup.activation_checkpointing,
-            )
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
-        # ``nn.Module.to`` is in-place; reassigning ``self.target_model`` would
-        # re-trigger ``BaseRecipe.__setattr__`` state-tracking and raise.
-        if self.dist_setup is None:
-            self.target_model.to(self.device)
-        # The target is frozen: it only supplies aux hidden states / logits as
-        # supervision and is never optimized (the optimizer is built solely from
-        # the draft trainer module). Mark the parameters explicitly so no future
-        # code path accidentally trains the target -- matching EAGLE-1/2.
-        self.target_model.requires_grad_(False)
-        self.target_wrapper = HFEagle3TargetModel(
-            self.target_model,
-            aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
-        )
+        # ``target_model_backend`` selects where the frozen target runs:
+        #   - ``colocated`` (default): load the target on this GPU and capture
+        #     supervision in-process.
+        #   - ``remote``: the target runs as a standalone server (see
+        #     ``serve_target``); this process only holds the draft and pulls
+        #     precomputed supervision over HTTP + NCCL. No target weights are
+        #     loaded here, which frees the training GPU's memory.
+        backend = recipe_cfg.get("target_model_backend", "colocated")
+        if backend == "remote":
+            self._setup_remote_target(recipe_cfg)
+        elif backend == "colocated":
+            self._setup_colocated_target(recipe_cfg, target_path)
+        else:
+            raise ValueError(f"Unknown target_model_backend={backend!r}; expected 'colocated' or 'remote'.")
 
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
@@ -408,13 +419,92 @@ class TrainEagle3Recipe(BaseRecipe):
         # is rebuilt every setup (original behavior). On resume this still runs,
         # but ``_load_extra_state`` then overrides it with the checkpoint's saved
         # mapping -- so the cache only matters for cold starts.
-        return load_or_build_eagle3_token_mapping(
+        selected_token_ids, selected_token_mask = load_or_build_eagle3_token_mapping(
             self.train_dataloader,
             target_vocab_size=target_config.vocab_size,
             draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
             special_token_ids=special_token_ids,
             cache_path=recipe_cfg.get("selected_token_ids_path", None),
         )
+        # A remote target computes ``target_probs`` server-side, so it needs the
+        # draft-vocab mapping. Co-located backends keep it on the trainer module
+        # (the default ``set_vocab_mapping`` is a no-op).
+        self.target_wrapper.set_vocab_mapping(selected_token_ids, selected_token_mask)
+        return selected_token_ids, selected_token_mask
+
+    def _setup_colocated_target(self, recipe_cfg, target_path):
+        """Load the target on this GPU and capture supervision in-process."""
+        # Optional ``distributed:`` YAML section. Required for targets that do
+        # not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). ``force_hf`` is
+        # opt-in; default ``False`` so HF architectures with an AutoModel custom
+        # impl take the MoE-capable custom path.
+        target_kwargs = dict(
+            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
+            torch_dtype=self.compute_dtype,
+            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+        )
+        if self.cfg.get("distributed", None) is not None:
+            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+            self.distributed_config = self.dist_setup.strategy_config
+            self.device_mesh = self.dist_setup.device_mesh
+            self.moe_mesh = self.dist_setup.moe_mesh
+            target_kwargs.update(
+                distributed_config=self.distributed_config,
+                device_mesh=self.device_mesh,
+                moe_mesh=self.moe_mesh,
+                moe_config=self.dist_setup.moe_config,
+                activation_checkpointing=self.dist_setup.activation_checkpointing,
+            )
+        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        # ``nn.Module.to`` is in-place; reassigning ``self.target_model`` would
+        # re-trigger ``BaseRecipe.__setattr__`` state-tracking and raise.
+        if self.dist_setup is None:
+            self.target_model.to(self.device)
+        # The target is frozen: it only supplies aux hidden states / logits as
+        # supervision and is never optimized (the optimizer is built solely from
+        # the draft trainer module). Mark the parameters explicitly so no future
+        # code path accidentally trains the target -- matching EAGLE-1/2.
+        self.target_model.requires_grad_(False)
+        self.target_wrapper = HFEagle3TargetModel(
+            self.target_model,
+            aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
+        )
+
+    def _setup_remote_target(self, recipe_cfg):
+        """Connect to one or more remote target servers (no target loaded here)."""
+        urls = recipe_cfg.get("remote_urls", None)
+        if not urls and recipe_cfg.get("remote_url", None):
+            urls = [recipe_cfg.remote_url]
+        if not urls:
+            raise ValueError(
+                "target_model_backend='remote' requires recipe_args.remote_urls "
+                "(or remote_url) pointing at a running serve_target instance."
+            )
+        self.target_model = None
+        self.target_wrapper = RemoteEagle3TargetModel.from_urls(
+            list(urls),
+            device=self.device,
+            timeout=recipe_cfg.get("remote_timeout", 120),
+            max_retries=recipe_cfg.get("remote_max_retries", 3),
+        )
+
+    def _resolve_prefetch_depth(self, recipe_cfg) -> int:
+        """Validate and cap the prefetch depth for the configured backend."""
+        depth = int(recipe_cfg.get("target_prefetch_depth", 0))
+        if depth < 0:
+            raise ValueError(f"target_prefetch_depth must be >= 0, got {depth}.")
+        if depth == 0:
+            return 0
+        if self.target_wrapper is None or not self.target_wrapper.supports_async:
+            raise ValueError(
+                "target_prefetch_depth > 0 requires an async-capable backend (target_model_backend='remote')."
+            )
+        # One in-flight request per server keeps NCCL recv ordering unambiguous.
+        num_servers = getattr(self.target_wrapper, "num_remote_servers", 1)
+        capped = min(depth, num_servers)
+        if capped != depth and self.dist_env.is_main:
+            logger.info("Capping target_prefetch_depth %d -> %d (one in-flight request per server).", depth, capped)
+        return capped
 
     def _setup_cached_target(self, recipe_cfg, target_config):
         """Offline path: stream a precomputed cache; no target model is loaded.
@@ -469,8 +559,8 @@ class TrainEagle3Recipe(BaseRecipe):
     def _peagle_supervision(self, batch):
         """Move a batch to device and run the live target to its draft supervision.
 
-        Shared by the single-pass ``_forward_batch`` and the partitioned step.
-        P-EAGLE requires the live target (the offline cache is EAGLE-3 TTT-only).
+        Used by the partitioned step; P-EAGLE requires the live target (the
+        offline cache is EAGLE-3 TTT-only).
         """
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         target_batch = self.target_wrapper.generate_batch(
@@ -478,16 +568,18 @@ class TrainEagle3Recipe(BaseRecipe):
             attention_mask=batch["attention_mask"],
             loss_mask=batch["loss_mask"],
         )
-        return {
-            "input_ids": target_batch.input_ids,
-            "attention_mask": target_batch.attention_mask,
-            "loss_mask": target_batch.loss_mask,
-            "aux_hidden_states": target_batch.aux_hidden_states,
-            "target_logits": target_batch.logits,
-        }
+        return target_batch.to_trainer_inputs()
 
-    def _forward_batch(self, batch):
-        """Run the trainer module for one batch, from the live target or the cache."""
+    def _forward_batch(self, batch, target_batch=None):
+        """Run the trainer module for one batch, from the live target or the cache.
+
+        ``target_batch`` may be supplied when the supervision was prefetched
+        asynchronously (remote backend); it is already on the training device
+        and self-contained, so the raw ``batch`` is not needed.
+        """
+        if target_batch is not None:
+            return self.trainer_module(**target_batch.to_trainer_inputs())
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         if self.target_wrapper is None:
             # Offline cache: the supervision is already in the batch.
             batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -499,7 +591,12 @@ class TrainEagle3Recipe(BaseRecipe):
                 target_probs=batch["target_probs"],
                 position_mask=batch["position_mask"],
             )
-        return self.trainer_module(**self._peagle_supervision(batch))
+        target_batch = self.target_wrapper.generate_batch(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            loss_mask=batch["loss_mask"],
+        )
+        return self.trainer_module(**target_batch.to_trainer_inputs())
 
     def _peagle_partitioned_step(self, batch):
         """Forward+backward one batch via P-EAGLE sequence partitioning.
@@ -538,6 +635,39 @@ class TrainEagle3Recipe(BaseRecipe):
             valid_sum = valid_sum + seg.valid_tokens
             correct_sum = correct_sum + seg.accuracy.detach() * seg.valid_tokens
         return SimpleNamespace(loss=loss_sum, accuracy=correct_sum / valid_sum.clamp_min(1.0), valid_tokens=valid_sum)
+
+    def _prefetched_batches(self, dataloader):
+        """Yield ``(batch, target_batch)`` keeping up to ``target_prefetch_depth``
+        remote target requests in flight, so target inference on the server(s)
+        overlaps draft training on this GPU.
+
+        Requests are dispatched round-robin across servers by the backend; the
+        depth is capped to the server count (see ``setup``) so each server has
+        at most one in-flight request -- required for NCCL recv ordering.
+        """
+        depth = self.target_prefetch_depth
+        it = iter(dataloader)
+        queue: deque = deque()
+        exhausted = False
+
+        def fill():
+            nonlocal exhausted
+            while not exhausted and len(queue) < depth:
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    exhausted = True
+                    return
+                handle = self.target_wrapper.generate_batch_async(
+                    batch["input_ids"], batch["attention_mask"], batch["loss_mask"]
+                )
+                queue.append((batch, handle))
+
+        fill()
+        while queue:
+            batch, handle = queue.popleft()
+            fill()  # refill before blocking on the result to keep the pipe full
+            yield batch, handle.result()
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the standard recipes."""
@@ -791,6 +921,7 @@ class TrainEagle3Recipe(BaseRecipe):
             batches_per_epoch = len(self.train_dataloader)
         except TypeError:
             batches_per_epoch = None
+        is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
         start_epoch = max(0, int(getattr(self, "_resume_epoch", 0)))
         if start_epoch >= self.num_epochs:
             if self.dist_env.is_main:
@@ -822,15 +953,34 @@ class TrainEagle3Recipe(BaseRecipe):
 
             batches_processed = 0
             pending_micro_batches = 0
-            for batch_idx, batch in enumerate(self.train_dataloader):
+            # With prefetch the supervision is fetched asynchronously and paired
+            # with its batch; otherwise the target runs inline (target_batch=None).
+            if self.target_prefetch_depth > 0:
+                batch_source = enumerate(self._prefetched_batches(self.train_dataloader))
+            else:
+                batch_source = ((i, (b, None)) for i, b in enumerate(self.train_dataloader))
+            for batch_idx, (batch, target_batch) in batch_source:
                 if self._peagle_partitioned:
                     # P-EAGLE sequence partitioning owns its per-segment backward
-                    # (driven by the recipe through DDP.forward); metrics are detached.
+                    # and its own no_sync (the all-reduce fires on the last
+                    # segment), so it runs outside the grad-accum sync context.
                     metrics = self._peagle_partitioned_step(batch)
                 else:
-                    metrics = self._forward_batch(batch)
-                    loss = metrics.loss / float(self.grad_accumulation_steps)
-                    loss.backward()
+                    # Skip DDP's per-micro-batch all-reduce on every micro-batch
+                    # except the one an optimizer step immediately follows; that
+                    # step's all-reduce covers the whole locally-accumulated window.
+                    sync_grads = _should_sync_grads(
+                        pending_micro_batches=pending_micro_batches,
+                        grad_accumulation_steps=self.grad_accumulation_steps,
+                        batch_idx=batch_idx,
+                        batches_per_epoch=batches_per_epoch,
+                        is_ddp=is_ddp,
+                    )
+                    sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
+                    with sync_ctx:
+                        metrics = self._forward_batch(batch, target_batch)
+                        loss = metrics.loss / float(self.grad_accumulation_steps)
+                        loss.backward()
 
                 running_loss = running_loss + metrics.loss.detach()
                 running_acc = running_acc + metrics.accuracy.detach()
@@ -942,6 +1092,11 @@ class TrainEagle3Recipe(BaseRecipe):
                     epoch + 1,
                     self.runtime.global_step,
                 )
+
+        if self.target_wrapper is not None:
+            # Release remote connections / shut down the target server's
+            # client-idle watchdog. A no-op for the co-located backend.
+            self.target_wrapper.close()
 
         if self.dist_env.is_main:
             logger.info("Training complete: global_step=%s", self.runtime.global_step)

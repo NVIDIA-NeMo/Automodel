@@ -28,7 +28,11 @@ from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
     roll_tensor,
 )
-from nemo_automodel.components.models.nemotron_v3.mtp import parse_mtp_layer_pattern
+from nemo_automodel.components.models.nemotron_v3.mtp import (
+    _resolve_block_types_per_sublayer,
+    build_mtp_config_from_hf,
+    parse_mtp_layer_pattern,
+)
 
 
 class MockNemotronV3Config:
@@ -113,6 +117,48 @@ class TestPatternParsing:
     def test_empty_pattern_raises(self):
         with pytest.raises(ValueError, match="empty"):
             parse_mtp_layer_pattern("")
+
+    def test_resolve_from_symbol_pattern(self):
+        """Super-V3 path: ``mtp_hybrid_override_pattern`` is honored."""
+        cfg = MockNemotronV3Config(num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*E")
+        cfg.mtp_layers_block_type = None
+        assert _resolve_block_types_per_sublayer(cfg) == ["attention", "moe"]
+
+    def test_resolve_from_layers_block_type(self):
+        """List-form path: ``mtp_layers_block_type`` list-of-strings is honored."""
+        cfg = MockNemotronV3Config(num_nextn_predict_layers=1)
+        cfg.mtp_hybrid_override_pattern = None
+        cfg.mtp_layers_block_type = ["attention", "moe"]
+        assert _resolve_block_types_per_sublayer(cfg) == ["attention", "moe"]
+
+    def test_resolve_returns_none_when_both_absent(self):
+        cfg = MockNemotronV3Config()
+        cfg.mtp_hybrid_override_pattern = None
+        cfg.mtp_layers_block_type = None
+        assert _resolve_block_types_per_sublayer(cfg) is None
+
+    def test_resolve_rejects_unknown_block_type_in_list(self):
+        cfg = MockNemotronV3Config()
+        cfg.mtp_hybrid_override_pattern = None
+        cfg.mtp_layers_block_type = ["attention", "bogus"]
+        with pytest.raises(ValueError, match="Unknown MTP block type"):
+            _resolve_block_types_per_sublayer(cfg)
+
+    def test_build_mtp_config_from_layers_block_type(self):
+        """List-form config (no symbol pattern) yields an enabled MTPConfig.
+
+        Regression for the ``mtp_layers_block_type`` fallback added so that
+        checkpoints lacking ``mtp_hybrid_override_pattern`` can build MTP
+        without raising ``MTP layer pattern is empty``.
+        """
+        cfg = MockNemotronV3Config(num_nextn_predict_layers=1)
+        cfg.mtp_hybrid_override_pattern = None
+        cfg.mtp_layers_block_type = ["attention", "moe"]
+        mtp_config = build_mtp_config_from_hf(cfg)
+        assert mtp_config.enabled
+        assert mtp_config.num_layers == 1
+        assert mtp_config.pattern_length == 2
+        assert mtp_config.total_sublayers == 2
 
 
 class TestRollTensor:
