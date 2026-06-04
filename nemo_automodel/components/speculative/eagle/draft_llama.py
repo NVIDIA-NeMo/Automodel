@@ -66,6 +66,28 @@ behave identically. Enabling them applies the EAGLE-3.1 drafter toggles to
 the Llama-style draft used here; the MLA-backbone Kimi K2.6 draft
 (``Eagle3DeepseekV2ForCausalLM`` in ``lightseekorg/kimi-k2.6-eagle3.1-mla``)
 is a separate architecture and is not covered by this module.
+
+P-EAGLE (parallel-drafting EAGLE-3) adds one further optional toggle:
+
+* ``config.parallel_drafting`` (bool, default False) -- when True, the draft
+  registers a single learnable ``mask_hidden`` placeholder of shape
+  ``[1, 1, num_aux_hidden_states * target_hidden_size]`` (the pre-``fc``
+  concatenated-aux dimension) and exposes :meth:`LlamaEagle3DraftModel.forward_peagle`,
+  a single parallel forward over a flat, COD-subsampled sequence with a
+  ``flex_attention`` cross-depth mask (see ``peagle_attention.py`` /
+  ``peagle_data.py``). The trainer feeds the ``mask_hidden`` placeholder --
+  projected through the same ``project_hidden_states`` path as real aux states --
+  at every masked depth (``>= 1``), together with the masked token
+  ``config.mask_token_id``, so the draft predicts all ``config.num_depths`` tokens
+  in one forward instead of autoregressively. The shape, the on-disk key
+  ``mask_hidden``, and the COD config (``num_depths`` / ``down_sample_ratio`` /
+  ``mask_token_id``) mirror speculators
+  (https://github.com/vllm-project/speculators/pull/480) so the checkpoint loads
+  into vLLM's parallel-drafting runtime unchanged. The masked token slot reuses
+  ``embed_tokens[config.mask_token_id]``. SGLang does not serve a P-EAGLE head
+  today (https://github.com/sgl-project/sglang/issues/23171). The flag only ever
+  adds the ``mask_hidden`` key, so EAGLE-3 / EAGLE-3.1 checkpoints round-trip
+  unchanged.
 """
 
 from __future__ import annotations
@@ -75,6 +97,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers import PretrainedConfig, PreTrainedModel
 
 from nemo_automodel.components.models.common import initialize_rms_norm_module
@@ -82,9 +105,26 @@ from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
 )
+from nemo_automodel.components.speculative.eagle.peagle_attention import create_peagle_mask_mod
 from nemo_automodel.shared.import_utils import safe_import_from
 
 logger = logging.getLogger(__name__)
+
+# flex_attention compiled for the CUDA training path. Inductor's flex backend is
+# not available on CPU (it raises ``InductorError``), so ``_peagle_flex_attention``
+# dispatches to eager ``flex_attention`` there -- correct, just slower -- which
+# keeps the P-EAGLE unit tests and CPU smoke checks runnable. The compiled
+# callable is lazy, so importing this module on CPU costs nothing.
+_peagle_flex_attention_compiled = torch.compile(
+    flex_attention,
+    mode="max-autotune-no-cudagraphs",
+)
+
+
+def _peagle_flex_attention(q, k, v, *, block_mask, scale):
+    """Run the P-EAGLE flex attention, compiling only on CUDA."""
+    flex = _peagle_flex_attention_compiled if q.is_cuda else flex_attention
+    return flex(q, k, v, block_mask=block_mask, scale=scale)
 
 
 def _load_flash_attn_func() -> tuple[bool, object | None]:
@@ -165,9 +205,13 @@ class Eagle3LlamaAttention(nn.Module):
     batch.
     """
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: PretrainedConfig, fuse_input: bool = True):
         super().__init__()
         self.config = config
+        # ``fuse_input`` toggles the q/k/v input width. The EAGLE-3 first layer
+        # consumes the concatenated ``[embed, hidden]`` (2H); P-EAGLE's deeper
+        # layers (layer_id >= 1) are vanilla Llama layers on plain hidden (H).
+        self.fuse_input = fuse_input
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -191,7 +235,7 @@ class Eagle3LlamaAttention(nn.Module):
             )
         self.attn_implementation = attn_impl
 
-        in_features = config.hidden_size * 2
+        in_features = config.hidden_size * 2 if fuse_input else config.hidden_size
         self.q_proj = nn.Linear(
             in_features, self.num_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
         )
@@ -259,6 +303,31 @@ class Eagle3LlamaAttention(nn.Module):
             attn_output = self._eager_attention_forward(
                 q, cache_k, cache_v, attention_mask, step_idx, batch_size, seq_len
             )
+        return self.o_proj(attn_output)
+
+    def forward_peagle(
+        self,
+        combined_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        block_mask,
+    ) -> torch.Tensor:
+        """P-EAGLE single parallel-group attention.
+
+        Unlike the EAGLE-3 ``cache_hidden`` recurrence, P-EAGLE flattens all COD
+        depths into one sequence and attends in a single pass: there is no
+        per-step rotary phase offset (the depth is baked into ``position_ids =
+        anchor_pos + depth``) and no diagonal-extension cache. Cross-depth
+        visibility is enforced entirely by ``block_mask`` (see
+        :func:`create_peagle_mask_mod`), so this is plain scaled-dot-product
+        attention through ``flex_attention``.
+        """
+        batch_size, seq_len, _ = combined_states.shape
+        q, k, v = self._project_qkv(combined_states)
+        cos, sin = self.rotary_emb(combined_states, position_ids)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        k, v = self._repeat_kv(k, v)
+        attn_output = _peagle_flex_attention(q, k, v, block_mask=block_mask, scale=self.scaling)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(attn_output)
 
     def _eager_attention_forward(
@@ -440,6 +509,72 @@ class Eagle3LlamaDecoderLayer(nn.Module):
         hidden_states = residual + self.mlp(hidden_states)
         return hidden_states
 
+    def forward_peagle(
+        self,
+        input_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        block_mask,
+    ) -> torch.Tensor:
+        """Decoder-layer variant for the P-EAGLE single parallel forward.
+
+        Mirrors :meth:`forward` (same norms, residuals, MLP and ``[embeds,
+        hidden]`` concatenation) but routes attention through
+        ``self_attn.forward_peagle`` with a COD ``block_mask`` instead of the
+        ``cache_hidden`` recurrence.
+        """
+        residual = hidden_states
+        norm_input_embeds = self.input_layernorm(input_embeds)
+        norm_hidden_states = self.hidden_norm(hidden_states)
+        combined_states = torch.cat((norm_input_embeds, norm_hidden_states), dim=-1)
+        hidden_states = residual + self.self_attn.forward_peagle(combined_states, position_ids, block_mask)
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + self.mlp(hidden_states)
+        return hidden_states
+
+
+class Eagle3LlamaPeagleLayer(nn.Module):
+    """Vanilla Llama decoder layer for P-EAGLE depths ``>= 1``.
+
+    The EAGLE-3 first layer (:class:`Eagle3LlamaDecoderLayer`) fuses the token
+    embedding and the projected target hidden state (``2H`` attention input).
+    P-EAGLE stacks ``num_hidden_layers`` layers; every layer after the first is
+    a standard Llama block operating on plain hidden states (``H``), matching
+    speculators' ``decoder_layer_class`` (a vanilla ``LlamaDecoderLayer``). Only
+    the P-EAGLE flex-attention path is implemented (these deeper layers do not
+    participate in the EAGLE-3 ``cache_hidden`` TTT recurrence).
+    """
+
+    def __init__(self, config: PretrainedConfig, layer_id: int):
+        super().__init__()
+        self.layer_id = layer_id
+        self.input_layernorm = initialize_rms_norm_module(
+            "torch", config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
+        self.post_attention_layernorm = initialize_rms_norm_module(
+            "torch", config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
+        self.self_attn = Eagle3LlamaAttention(config, fuse_input=False)
+        self.mlp = Eagle3LlamaMLP(config)
+
+    def forward_peagle(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        block_mask,
+    ) -> torch.Tensor:
+        """Standard pre-norm Llama block over ``H`` hidden states with the COD mask."""
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = residual + self.self_attn.forward_peagle(hidden_states, position_ids, block_mask)
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + self.mlp(hidden_states)
+        return hidden_states
+
 
 class Eagle3LlamaModel(nn.Module):
     """Inner backbone matching SGLang's ``LlamaModel`` in ``llama_eagle3.py``.
@@ -480,7 +615,17 @@ class Eagle3LlamaModel(nn.Module):
                     for _ in range(num_aux_hidden_states)
                 ]
             )
-        self.layers = nn.ModuleList([Eagle3LlamaDecoderLayer(config, layer_id=0)])
+        # EAGLE-3 / EAGLE-3.1 TTT uses a single fused first layer. P-EAGLE stacks
+        # ``num_hidden_layers`` layers: the fused first layer (2H) plus
+        # ``num_hidden_layers - 1`` vanilla Llama layers (H), matching speculators'
+        # ``[first_layer] + [decoder_layer for i in range(1, num_layers)]``. The
+        # single-layer construction is preserved for the non-parallel path so the
+        # merged EAGLE checkpoints round-trip unchanged.
+        layers: list[nn.Module] = [Eagle3LlamaDecoderLayer(config, layer_id=0)]
+        if getattr(config, "parallel_drafting", False):
+            num_layers = max(1, int(getattr(config, "num_hidden_layers", 1)))
+            layers.extend(Eagle3LlamaPeagleLayer(config, layer_id=i) for i in range(1, num_layers))
+        self.layers = nn.ModuleList(layers)
         self.norm = initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps, device=None)
 
 
@@ -524,6 +669,25 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         self.model = Eagle3LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
 
+        # P-EAGLE (parallel drafting): a single learnable placeholder that
+        # substitutes for the target auxiliary hidden states at every masked
+        # multi-token-prediction position (COD depths >= 1). It lives at the
+        # *pre-``fc``* concatenated-aux dimension
+        # (``num_aux_hidden_states * target_hidden_size`` == ``model.fc.in_features``)
+        # so it flows through ``project_hidden_states`` -- and ``fc_norm`` when
+        # set -- exactly like a real aux-hidden vector. Shape ``[1, 1, 3 * H]``
+        # and the on-disk key ``mask_hidden`` mirror speculators
+        # (https://github.com/vllm-project/speculators/pull/480) so the checkpoint
+        # loads into vLLM's parallel-drafting runtime unchanged. Registered only
+        # when ``parallel_drafting`` is set so EAGLE-3 / EAGLE-3.1 checkpoints
+        # round-trip with no extra keys.
+        if getattr(config, "parallel_drafting", False):
+            # Initialized with unit-variance noise to match speculators'
+            # ``torch.randn(1, 1, 3 * hidden_size)`` exactly (NOT the 0.02
+            # ``initializer_range`` used for ordinary weights).
+            self.mask_hidden = nn.Parameter(torch.empty(1, 1, self.model.fc.in_features))
+            nn.init.normal_(self.mask_hidden, mean=0.0, std=1.0)
+
         self.post_init()
 
     def copy_embeddings_from_target(self, target_embedding: nn.Embedding) -> None:
@@ -564,6 +728,18 @@ class LlamaEagle3DraftModel(PreTrainedModel):
                 dim=-1,
             )
         return self.model.fc(aux_hidden_states)
+
+    def masked_projected_hidden(self) -> torch.Tensor:
+        """Project the learnable P-EAGLE ``mask_hidden`` placeholder to draft hidden size.
+
+        Returns a ``[1, hidden_size]`` tensor obtained by running the
+        ``[1, 1, num_aux_hidden_states * target_hidden_size]`` placeholder through
+        the same ``project_hidden_states`` path (``fc`` plus optional
+        ``fc_norm``) used for real auxiliary hidden states. The P-EAGLE trainer
+        scatters the result into every masked COD depth. Only valid when the
+        draft was built with ``config.parallel_drafting=True``.
+        """
+        return self.project_hidden_states(self.mask_hidden.view(1, -1))
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embed input ids with the draft embedding table."""
@@ -629,3 +805,53 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         if getattr(self.config, "norm_output", False):
             hidden_states = self.model.norm(hidden_states)
         return hidden_states
+
+    def forward_peagle(
+        self,
+        sampled_input_ids: torch.Tensor,
+        sampled_projected_hidden: torch.Tensor,
+        position_ids: torch.Tensor,
+        block_mask,
+    ) -> torch.Tensor:
+        """Run the P-EAGLE single parallel-group forward.
+
+        All COD depths are already flattened into one ``[1, total_sampled]``
+        sequence by the caller:
+
+        * ``sampled_input_ids`` -- real token ids at depth-0 slots, the masked
+          ``mask_token_id`` at depth >= 1 slots;
+        * ``sampled_projected_hidden`` -- ``fc``-projected target aux states at
+          depth-0 slots, the projected ``mask_hidden`` placeholder elsewhere;
+        * ``position_ids`` -- ``anchor_pos + depth`` (the reference position);
+        * ``block_mask`` -- the COD cross-depth visibility mask.
+
+        Returns the pre-logits hidden states (post-``norm`` when
+        ``config.norm_output`` is set), one row per sampled element.
+        """
+        draft_input_embeds = self.embed_input_ids(sampled_input_ids)
+        # Layer 0 fuses ``[embed, hidden]`` (2H); deeper layers refine plain H.
+        hidden_states = self.model.layers[0].forward_peagle(
+            input_embeds=draft_input_embeds,
+            hidden_states=sampled_projected_hidden,
+            position_ids=position_ids,
+            block_mask=block_mask,
+        )
+        for layer in self.model.layers[1:]:
+            hidden_states = layer.forward_peagle(hidden_states, position_ids, block_mask)
+        if getattr(self.config, "norm_output", False):
+            hidden_states = self.model.norm(hidden_states)
+        return hidden_states
+
+    def build_peagle_block_mask(self, anchor_pos, depth, lengths, total_seq_len):
+        """Construct the COD ``flex_attention`` block mask for one sequence."""
+        mask_mod = create_peagle_mask_mod(
+            anchor_pos=anchor_pos, depth=depth, lengths=lengths, total_seq_len=total_seq_len
+        )
+        return create_block_mask(
+            mask_mod,
+            B=None,
+            H=None,
+            Q_LEN=anchor_pos.shape[0],
+            KV_LEN=anchor_pos.shape[0],
+            device=anchor_pos.device,
+        )
