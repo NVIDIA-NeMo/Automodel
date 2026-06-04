@@ -495,26 +495,42 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     def get_capabilities(cls, config: "Gemma4Config") -> "Gemma4ForConditionalGeneration.ModelCapabilities":
         """Return the capabilities for a specific config (no model instance needed).
 
-        Dispatches on ``config.text_config.enable_moe_block`` so the same class
-        can serve both dense Gemma4 (e.g. ``google/gemma-4-31B-it``) and the
-        MoE variant (e.g. ``google/gemma-4-26B-A4B-it``) honestly.
+        Dispatches in two layers so the same class can serve every Gemma4
+        checkpoint honestly:
+
+        1. If ``config.text_config.enable_moe_block`` is True → MoE variant
+           (e.g. ``google/gemma-4-26B-A4B-it``).
+        2. Else if ``config.audio_config`` is not ``None`` → dense + audio
+           variant (e.g. ``google/gemma-4-E2B-it``, ``google/gemma-4-E4B-it``).
+        3. Else → plain dense variant (e.g. ``google/gemma-4-31B-it``).
 
         Args:
             config: The model's ``Gemma4Config`` (or anything exposing a
-                ``text_config`` with ``enable_moe_block``).
+                ``text_config`` with ``enable_moe_block`` and an
+                ``audio_config`` attribute).
 
         Returns:
             A populated ``ModelCapabilities`` for this specific config.
         """
         text_config = getattr(config, "text_config", config)
         if bool(getattr(text_config, "enable_moe_block", False)):
+            # MoE variant: gemma-4-26B-A4B-it
             return cls.ModelCapabilities(
                 supports_tp=False,
                 supports_cp=True,
                 supports_pp=False,
                 supports_ep=True,
             )
-        return cls.ModelCapabilities()
+        if getattr(config, "audio_config", None) is not None:
+            # Dense + audio variant: gemma-4-E2B-it, gemma-4-E4B-it
+            return cls.ModelCapabilities()
+        # Plain dense variant: gemma-4-31B-it
+        return cls.ModelCapabilities(
+            supports_tp=True,
+            supports_cp=False,
+            supports_pp=True,
+            supports_ep=False,
+        )
 
     @classmethod
     def from_config(
