@@ -28,13 +28,17 @@ from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
 from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
+from nemo_automodel.components.speculative.eagle.draft_llama_peagle import LlamaPEagleDraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
+from nemo_automodel.components.speculative.eagle.peagle_core import PEagleTrainerModule
 from nemo_automodel.components.speculative.eagle.registry import (
     EAGLE1_DRAFT_REGISTRY,
     EAGLE3_DRAFT_REGISTRY,
+    PEAGLE_DRAFT_REGISTRY,
     DraftSpec,
     resolve_eagle1_draft_spec,
     resolve_eagle3_draft_spec,
+    resolve_peagle_draft_spec,
 )
 from nemo_automodel.components.speculative.eagle.target import HFEagle3TargetModel
 from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
@@ -42,14 +46,18 @@ from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTarget
 __all__ = [
     "EagleTrainerModule",
     "Eagle3TrainerModule",
+    "PEagleTrainerModule",
     "HFEagleTargetModel",
     "HFEagle3TargetModel",
     "LlamaEagleDraftModel",
     "LlamaEagle3DraftModel",
+    "LlamaPEagleDraftModel",
     "GptOssEagle3DraftModel",
     "DraftSpec",
     "EAGLE1_DRAFT_REGISTRY",
     "EAGLE3_DRAFT_REGISTRY",
+    "PEAGLE_DRAFT_REGISTRY",
     "resolve_eagle1_draft_spec",
     "resolve_eagle3_draft_spec",
+    "resolve_peagle_draft_spec",
 ]

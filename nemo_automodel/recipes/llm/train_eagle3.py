@@ -294,6 +294,12 @@ class TrainEagle3Recipe(BaseRecipe):
             torch_dtype=self.compute_dtype,
             force_hf=bool(recipe_cfg.get("target_force_hf", False)),
         )
+        # Optional override of the frozen target's attention backend (default:
+        # HF auto-select). Useful to pin ``sdpa``/``eager`` when a target's FA2
+        # path is broken on the local transformers/flash-attn build.
+        target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
+        if target_attn_implementation is not None:
+            target_kwargs["attn_implementation"] = target_attn_implementation
         if self.cfg.get("distributed", None) is not None:
             self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
             self.distributed_config = self.dist_setup.strategy_config

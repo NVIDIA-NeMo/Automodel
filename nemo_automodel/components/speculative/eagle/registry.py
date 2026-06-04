@@ -42,6 +42,7 @@ from transformers import PreTrainedModel
 
 from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
+from nemo_automodel.components.speculative.eagle.draft_llama_peagle import LlamaPEagleDraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
 
 
@@ -83,6 +84,14 @@ EAGLE1_DRAFT_REGISTRY: dict[str, DraftSpec] = {
 }
 
 
+# P-EAGLE (parallel-drafting) shares the same Llama-style dense draft shape; the
+# parallel mechanism lives in the draft layer / trainer module, not in the
+# target-architecture dispatch, so it covers the same architectures.
+PEAGLE_DRAFT_REGISTRY: dict[str, DraftSpec] = {
+    arch: DraftSpec(draft_cls=LlamaPEagleDraftModel) for arch in _DENSE_ARCHITECTURES
+}
+
+
 def _resolve(architectures: list[str], registry: dict[str, DraftSpec], recipe_name: str) -> DraftSpec:
     """Return the first registered draft spec matching any architecture in the list."""
     for arch in architectures:
@@ -98,6 +107,11 @@ def _resolve(architectures: list[str], registry: dict[str, DraftSpec], recipe_na
 def resolve_eagle3_draft_spec(architectures: list[str]) -> DraftSpec:
     """Resolve the EAGLE-3 draft spec for a target's ``config.architectures`` field."""
     return _resolve(architectures, EAGLE3_DRAFT_REGISTRY, "TrainEagle3Recipe")
+
+
+def resolve_peagle_draft_spec(architectures: list[str]) -> DraftSpec:
+    """Resolve the P-EAGLE draft spec for a target's ``config.architectures`` field."""
+    return _resolve(architectures, PEAGLE_DRAFT_REGISTRY, "TrainPEagleRecipe")
 
 
 def resolve_eagle1_draft_spec(architectures: list[str]) -> DraftSpec:
