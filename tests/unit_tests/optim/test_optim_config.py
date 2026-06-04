@@ -14,6 +14,8 @@
 
 """Tests for nemo_automodel.components.optim.optimizer — typed configs + builders."""
 
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 import torch.nn as nn
@@ -246,10 +248,16 @@ class TestBuildOptimizerTuple:
 # ---------------------------------------------------------------------------
 
 
+def _dion_test_model():
+    return nn.Sequential(nn.Embedding(8, 16), nn.Linear(16, 16, bias=False), nn.Linear(16, 8, bias=False))
+
+
 class TestDionFamilyConfigs:
-    """The dion-family configs share a per-part Dion ``build`` and forward their
-    fields to ``build_dion_optimizer``; they resolve from the registry by name.
-    (Construction is not exercised here because ``dion`` may not be installed.)"""
+    """The dion-family configs share a per-part Dion ``build`` (``_DionConfigBase``)
+    that runs ``build_dion_optimizer`` grouping, strips grouping-only kwargs before
+    the dion constructor, and rejects Megatron-FSDP sharding.  They resolve from the
+    registry by name and from a resolved ``dion.*`` class via ``_target_``.
+    Construction tests ``importorskip`` ``dion``."""
 
     def test_registry_resolves_to_config_types(self):
         from nemo_automodel.components.optim.optimizer import (
@@ -276,6 +284,57 @@ class TestDionFamilyConfigs:
 
         assert Dion2Config(fraction=0.5, ef_decay=0.9).fraction == pytest.approx(0.5)
         assert NorMuonConfig(muon_beta2=0.99).muon_beta2 == pytest.approx(0.99)
+
+    def test_target_class_routes_to_typed_config(self):
+        # YAML ``_target_: dion.Muon`` must resolve to the typed MuonConfig (with grouping),
+        # NOT the flat-params OptimizerFromFactoryConfig escape hatch.
+        dion = pytest.importorskip("dion")
+        from nemo_automodel.components.optim.optimizer import (
+            MuonConfig,
+            OptimizerFromFactoryConfig,
+            build_optimizer_config,
+        )
+
+        cfg = build_optimizer_config(dion.Muon, {"lr": 5e-4, "embed_lr": 1e-4, "lm_head_lr": 1e-4})
+        assert isinstance(cfg, MuonConfig)
+        assert not isinstance(cfg, OptimizerFromFactoryConfig)
+        assert cfg.embed_lr == pytest.approx(1e-4)
+        assert cfg.lm_head_lr == pytest.approx(1e-4)
+
+    def test_build_groups_params_and_strips_grouping_kwargs(self):
+        # build() runs Dion grouping and must not splat scalar_*/*_lr into the dion ctor.
+        pytest.importorskip("dion")
+        from nemo_automodel.components.optim.optimizer import MuonConfig
+
+        opt = MuonConfig(lr=5e-4, scalar_opt="adamw", embed_lr=1e-4).build(_dion_test_model())[0]
+        assert type(opt).__name__ == "Muon"
+        assert len(opt.param_groups) >= 2  # matrix group + scalar/embed group(s)
+
+    @pytest.mark.parametrize("cls_name", ["Muon", "NorMuon", "Dion2", "Dion"])
+    def test_all_dion_configs_build(self, cls_name):
+        pytest.importorskip("dion")
+        from nemo_automodel.components.optim import optimizer as opt_mod
+
+        cfg_cls = {
+            "Muon": opt_mod.MuonConfig,
+            "NorMuon": opt_mod.NorMuonConfig,
+            "Dion2": opt_mod.Dion2Config,
+            "Dion": opt_mod.DionConfig,
+        }[cls_name]
+        opt = cfg_cls(lr=5e-4).build(_dion_test_model())[0]
+        assert type(opt).__name__ == cls_name
+
+    def test_megatron_fsdp_sharding_rejected(self, monkeypatch):
+        # Dion is incompatible with Megatron-FSDP optimizer sharding -> build asserts,
+        # rather than silently returning an unsharded optimizer.
+        pytest.importorskip("dion")
+        import nemo_automodel.components.distributed.megatron_fsdp as mfsdp
+        from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPConfig
+        from nemo_automodel.components.optim.optimizer import MuonConfig
+
+        monkeypatch.setattr(mfsdp.dist, "get_world_size", lambda *a, **k: 2)
+        with pytest.raises(AssertionError):
+            MuonConfig(lr=5e-4).build(_dion_test_model(), distributed_config=MegatronFSDPConfig())
 
 
 # ---------------------------------------------------------------------------
@@ -305,3 +364,47 @@ class TestLRSchedulerConfig:
         assert cfg.lr_warmup_steps == 500
         assert cfg.wsd_decay_steps == 2000
         assert cfg.lr_wsd_decay_style == "cosine"
+
+    @staticmethod
+    def _step_scheduler(*, epoch_len, num_epochs, max_steps):
+        """A StepScheduler stand-in whose dataloader has no usable ``len()``.
+
+        ``len(dataloader)`` raising mirrors an IterableDataset / streaming
+        dataloader and proves ``build`` derives ``total_steps`` from
+        ``epoch_len``/``max_steps`` and never calls ``len()``.
+        """
+        ss = MagicMock()
+        ss.epoch_len = epoch_len
+        ss.num_epochs = num_epochs
+        ss.max_steps = max_steps
+        ss.grad_acc_steps = 1
+        dl = MagicMock()
+        dl.__len__ = MagicMock(side_effect=TypeError("object of type 'IterableDataset' has no len()"))
+        ss.dataloader = dl
+        return ss
+
+    def test_build_uses_epoch_len_not_dataloader_len(self):
+        # epoch_len is already in optimizer-step units -> total_steps = num_epochs * epoch_len.
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+        ss = self._step_scheduler(epoch_len=10, num_epochs=4, max_steps=None)
+        scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
+        assert scheds[0].lr_decay_steps == 40  # defaults to total_steps
+
+    def test_build_iterable_falls_back_to_max_steps(self):
+        # epoch_len is None for iterable datasets -> total_steps comes from max_steps, no len().
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+        ss = self._step_scheduler(epoch_len=None, num_epochs=10, max_steps=50)
+        scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
+        assert scheds[0].lr_decay_steps == 50
+
+    def test_build_iterable_without_max_steps_raises(self):
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+        ss = self._step_scheduler(epoch_len=None, num_epochs=10, max_steps=None)
+        with pytest.raises(ValueError, match="iterable/streaming"):
+            LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
+
+    def test_build_caps_total_steps_at_max_steps(self):
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+        ss = self._step_scheduler(epoch_len=100, num_epochs=10, max_steps=20)
+        scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
+        assert scheds[0].lr_decay_steps == 20  # min(num_epochs*epoch_len=1000, max_steps=20)

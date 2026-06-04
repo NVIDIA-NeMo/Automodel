@@ -1229,6 +1229,7 @@ class TestBuildLRScheduler:
         step_scheduler.num_epochs = 10
         step_scheduler.dataloader = mock_dataloader
         step_scheduler.grad_acc_steps = 1
+        step_scheduler.epoch_len = 100  # ceil(len(dataloader)=100 / grad_acc=1)
         step_scheduler.max_steps = None
 
         cfg = MagicMock()
@@ -1258,6 +1259,7 @@ class TestBuildLRScheduler:
         step_scheduler.num_epochs = 5
         step_scheduler.dataloader = mock_dataloader
         step_scheduler.grad_acc_steps = 2
+        step_scheduler.epoch_len = 50  # ceil(len(dataloader)=100 / grad_acc=2)
         step_scheduler.max_steps = None
 
         cfg = MagicMock()
@@ -1283,6 +1285,7 @@ class TestBuildLRScheduler:
         step_scheduler.num_epochs = 100  # Would be 100000 steps
         step_scheduler.dataloader = mock_dataloader
         step_scheduler.grad_acc_steps = 1
+        step_scheduler.epoch_len = 1000  # ceil(len(dataloader)=1000 / grad_acc=1)
         step_scheduler.max_steps = 500  # Limit to 500
 
         cfg = MagicMock()
