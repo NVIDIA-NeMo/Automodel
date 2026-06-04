@@ -233,6 +233,30 @@ wandb:
   entity: nvidia-merlin
   name: ministral3_3b_bidirectional
 
+# FinePDF Qwen-like
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_eng_random5_first20_persona_50k_20260603_qwen3_8B_0_95_perc_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_eng_random5_first20_persona_50k_first5corpus_20260603_qwen3_8B_0_95_perc_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_eng_random5_first20_persona_50k_20260603_qwen3_8B_0_85_perc_unrolled.json
+
+# rm corpus experiment
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_multipos_gemma_broad_1200_20260527_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_multipos_nemotron_confusers_1200_20260527_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_eval_like_gptoss_profile_v2_3200_20260521_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_eval_like_nemotron_super_profile_v2_1200_20260521_qwen3_8B_0_95_perc.json
+
+# FinePDF enterprise pages
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/git/codex/retriever-sdg-v3/output/embed/finepdf_persona_qwen235b_2q_per_doc_20260602_v4/full_corpus_hnm/finepdf_persona_qwen235b_2q_fullcorpus_20260602_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_enterprise_pages_qwen235b_2q_fullcorpus_20260602_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_enterprise_fra_pages_gptoss120b_2q_fullcorpus_20260602_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_enterprise_deu_pages_gptoss120b_2q_fullcorpus_20260602_qwen3_8B_0_95_perc.json
+
+# MLQA
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mlqa_ar_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mlqa_de_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mlqa_es_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mlqa_hi_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mlqa_zh_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
+
 # Baseline
       # - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_ar_unrolled_8B_ragas2_scores_1_2.json
       # - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_bn_unrolled_8B_ragas2_scores_1_2.json
