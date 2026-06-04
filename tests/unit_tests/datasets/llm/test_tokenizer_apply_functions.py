@@ -586,6 +586,95 @@ def test_apply_chat_template_can_mask_reasoning_content_without_generation_kwd()
     assert masked["labels"][masked["input_ids"].index(answer_id)] != -100
 
 
+def test_format_chat_template_train_on_last_turn_only_masks_earlier_turns():
+    # Only the final assistant turn stays supervised; earlier turns are dropped.
+    tok = _StubTokenizerChatNoGenMultiTurn()
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "alpha beta"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "gamma delta"},
+    ]
+    common = dict(eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id, answer_only_loss_mask=True)
+
+    all_turns = format_chat_template(tok, formatted_text=[m.copy() for m in messages], **common)
+    last_only = format_chat_template(
+        tok, formatted_text=[m.copy() for m in messages], train_on_last_turn_only=True, **common
+    )
+
+    all_supervised = {v for v in all_turns["labels"] if v != -100}
+    last_supervised = {v for v in last_only["labels"] if v != -100}
+
+    for word in ("alpha", "beta", "gamma", "delta"):
+        assert tok._id_for_token(word) in all_supervised
+    assert tok._id_for_token("gamma") in last_supervised
+    assert tok._id_for_token("delta") in last_supervised
+    assert tok._id_for_token("alpha") not in last_supervised
+    assert tok._id_for_token("beta") not in last_supervised
+
+
+class _StubTokenizerChatNoGenReasoningSplitsContent(_StubTokenizerChatNoGen):
+    """Assistant content renders both BEFORE and AFTER the reasoning block.
+
+    Mirrors templates that emit text, then a ``<think>`` block, then more text
+    (or a tool call), so a masked reasoning span sits between two supervised
+    content spans within the same turn.
+    """
+
+    chat_template = "<dummy reasoning_content template>"
+
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+        ids: List[int] = [self._start_of_turn_token_id]
+        for msg in messages:
+            ids.append(self._id_for_token(f"<{msg['role']}>"))
+            if msg["role"] == "assistant" and msg.get("reasoning_content"):
+                words = str(msg["content"]).split()
+                head, tail = words[:1], words[1:]
+                ids.extend(self._id_for_token(t) for t in head)
+                ids.append(self._id_for_token("<think>"))
+                ids.extend(self._id_for_token(t) for t in str(msg["reasoning_content"]).split())
+                ids.append(self._id_for_token("</think>"))
+                ids.extend(self._id_for_token(t) for t in tail)
+            else:
+                ids.extend(self._id_for_token(t) for t in str(msg["content"]).split())
+        ids.append(self.eos_token_id)
+        if kwargs.get("return_dict", False):
+            return {"input_ids": ids}
+        return ids
+
+
+def test_format_chat_template_last_turn_only_keeps_content_around_masked_reasoning():
+    # Regression: the final turn renders as [head][<think>why</think>][tail].
+    # The last-turn restriction must run on the hole-free mask, so masking the
+    # reasoning hole does not also drop the supervised "head" before it (the old
+    # order kept only the last contiguous run, i.e. just "tail").
+    tok = _StubTokenizerChatNoGenReasoningSplitsContent()
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "earlierturn"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "head tail", "reasoning_content": "why"},
+    ]
+
+    out = format_chat_template(
+        tok,
+        formatted_text=[m.copy() for m in messages],
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+        mask_reasoning_content=True,
+        train_on_last_turn_only=True,
+    )
+
+    supervised = {v for v in out["labels"] if v != -100}
+    # Both content spans of the last turn stay supervised.
+    assert tok._id_for_token("head") in supervised
+    assert tok._id_for_token("tail") in supervised
+    # The reasoning hole is masked, and the earlier assistant turn is dropped.
+    assert tok._id_for_token("why") not in supervised
+    assert tok._id_for_token("earlierturn") not in supervised
+
+
 # pad_token_id == eos_token_id overlap tests
 
 
@@ -1017,9 +1106,9 @@ class TestFormatChatTemplateNoEosAfterTruncation:
         # All labels must be exactly seq_length
         assert len(out["labels"]) == seq_length
         # The last label must be -100 (padding), NOT eos_token_id
-        assert (
-            out["labels"][-1] == -100
-        ), f"Last label should be -100 (padding) after truncation, got {out['labels'][-1]}"
+        assert out["labels"][-1] == -100, (
+            f"Last label should be -100 (padding) after truncation, got {out['labels'][-1]}"
+        )
 
     def test_eos_still_appended_when_not_truncated(self):
         tok = _StubTokenizerChatTruncating()
