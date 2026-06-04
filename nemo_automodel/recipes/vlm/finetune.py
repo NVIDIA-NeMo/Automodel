@@ -1395,11 +1395,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
                 labels = batch.pop("labels")
-                local_num_label_tokens = (labels != -100).sum().item()
-                num_label_tokens = self._dp_allreduce(
-                    torch.LongTensor([local_num_label_tokens]), include_cp=True
-                ).item()
                 with train_ctx():
+                    local_num_label_tokens = (labels != -100).sum().item()
+                    num_label_tokens = self._dp_allreduce(
+                        torch.LongTensor([local_num_label_tokens]), include_cp=True
+                    ).item()
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                         out = self.model_parts[0](logits_to_keep=1, **batch)
