@@ -38,6 +38,8 @@ from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 def _tiny_config(**overrides) -> DeepseekV4Config:
     """Tiny V4 config: fits in ~1 GB CPU RAM, exercises the lm_head path."""

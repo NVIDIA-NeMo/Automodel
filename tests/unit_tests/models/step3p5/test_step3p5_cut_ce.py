@@ -24,12 +24,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.step3p5.model import Step3p5ForCausalLM
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
 
 
 @dataclass

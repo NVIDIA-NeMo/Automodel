@@ -30,6 +30,8 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.minimax_m2.model import MiniMaxM2ForCausalLM
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 @dataclass
 class MockMiniMaxM2Config:

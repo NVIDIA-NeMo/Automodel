@@ -24,6 +24,7 @@ yields the final (full-sequence) hidden states. Otherwise it silently falls back
 The tiny ``torch``-backend MoE model runs on CPU, so no GPU is required.
 """
 
+import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
@@ -32,6 +33,8 @@ from nemo_automodel.components.models.ling_v2.model import BailingMoeV2ForCausal
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
 
 
 def _tiny_cfg() -> BailingMoeV2Config:

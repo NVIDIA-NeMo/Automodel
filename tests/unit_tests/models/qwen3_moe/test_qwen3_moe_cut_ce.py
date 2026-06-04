@@ -31,6 +31,8 @@ from nemo_automodel.components.models.qwen3_moe.model import Qwen3MoeForCausalLM
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 def _tiny_config() -> Qwen3MoeConfig:
     return Qwen3MoeConfig(

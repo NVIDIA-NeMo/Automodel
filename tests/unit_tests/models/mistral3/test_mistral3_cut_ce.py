@@ -30,6 +30,7 @@ unchanged: full-length logits and no hidden states.
 The tiny dense decoder runs on CPU, so no GPU is required.
 """
 
+import pytest
 import torch
 
 from nemo_automodel.components.models.mistral3.model import (
@@ -38,6 +39,8 @@ from nemo_automodel.components.models.mistral3.model import (
 )
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
 
 
 def _tiny_config(**overrides) -> Ministral3Config:

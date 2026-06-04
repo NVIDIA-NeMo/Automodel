@@ -27,12 +27,15 @@ Default behavior (``logits_to_keep=0``, ``output_hidden_states`` falsy) must be
 unchanged: full-length logits and no hidden states.
 """
 
+import pytest
 import torch
 
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
 from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
 
 
 def _tiny_config(**overrides) -> BaichuanConfig:

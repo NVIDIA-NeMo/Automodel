@@ -42,6 +42,8 @@ VOCAB = 64
 SEQ = 5
 BSZ = 2
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 def _tiny_config() -> HYV3Config:
     return HYV3Config(

@@ -48,10 +48,13 @@ try:
 except Exception as exc:  # pragma: no cover - environment dependent
     IMPORT_ERROR = exc
 
-pytestmark = pytest.mark.skipif(
-    IMPORT_ERROR is not None,
-    reason=f"KimiVL / transformers config unavailable: {IMPORT_ERROR}",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        IMPORT_ERROR is not None,
+        reason=f"KimiVL / transformers config unavailable: {IMPORT_ERROR}",
+    ),
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA"),
+]
 
 VOCAB_SIZE = 128
 HIDDEN_SIZE = 64

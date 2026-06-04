@@ -42,6 +42,8 @@ from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Conf
 from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32ForCausalLM
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 def _tiny_config() -> DeepseekV32Config:
     """A minimal DeepSeek V3.2 config that runs a forward pass on CPU."""

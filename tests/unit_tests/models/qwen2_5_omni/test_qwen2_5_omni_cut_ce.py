@@ -51,6 +51,8 @@ SEQ_LEN = 6
 VOCAB_SIZE = 128
 HIDDEN_SIZE = 64
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 def _build_tiny_model():
     """Build a minimal Qwen2.5-Omni Thinker that runs a text-only forward on CPU.

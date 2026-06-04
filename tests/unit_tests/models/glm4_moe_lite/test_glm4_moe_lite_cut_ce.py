@@ -37,6 +37,8 @@ from nemo_automodel.components.models.glm4_moe_lite.model import Glm4MoeLiteForC
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 @dataclass
 class TinyGlm4MoeLiteConfig:

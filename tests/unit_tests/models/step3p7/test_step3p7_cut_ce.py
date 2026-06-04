@@ -26,6 +26,7 @@ These assert the contract the ``FusedLinearCrossEntropy`` (cut-CE) path in
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
@@ -36,6 +37,8 @@ from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 
 VOCAB_SIZE = 32
 HIDDEN_SIZE = 8
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
 
 
 def small_config(**kwargs):

@@ -38,6 +38,8 @@ N_EXPERTS = 4
 VOCAB = 128
 SEQ_LEN = 6
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 @pytest.fixture
 def config():

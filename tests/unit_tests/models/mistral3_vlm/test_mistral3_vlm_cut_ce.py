@@ -59,6 +59,8 @@ from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 HIDDEN_SIZE = 32
 VOCAB_SIZE = 100
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 def _tiny_config(**overrides) -> Mistral3Config:
     text_config = dict(

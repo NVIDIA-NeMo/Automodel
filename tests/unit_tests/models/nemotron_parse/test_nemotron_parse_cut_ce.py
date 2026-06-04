@@ -28,6 +28,7 @@ stub-encoder tiny-config approach from ``test_nemotron_parse_model.py`` so they
 run on CPU without the heavy RADIO vision dependency.
 """
 
+import pytest
 import torch
 from transformers.models.donut.modeling_donut_swin import DonutSwinModelOutput
 
@@ -37,6 +38,8 @@ from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 
 DECODER_DIM = 32
 VOCAB_SIZE = 50
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
 
 
 def _build_tiny_model(monkeypatch):

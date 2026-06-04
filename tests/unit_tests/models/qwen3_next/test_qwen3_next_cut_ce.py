@@ -27,6 +27,7 @@ Otherwise it silently falls back to ``MaskedCrossEntropy``.
 
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.nn as nn
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
@@ -40,9 +41,12 @@ from nemo_automodel.components.models.qwen3_next.model import Qwen3NextForCausal
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 
-
 # Mock for Qwen3NextGatedDeltaNet to avoid torch.get_current_dtype() / kernel
 # requirements on CPU (mirrors tests/.../test_qwen3_next_model.py).
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
+
 class MockQwen3NextGatedDeltaNet(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()

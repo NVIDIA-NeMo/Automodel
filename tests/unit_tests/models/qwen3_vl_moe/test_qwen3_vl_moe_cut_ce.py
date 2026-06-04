@@ -40,6 +40,8 @@ from nemo_automodel.components.models.qwen3_vl_moe.model import (  # noqa: E402
     Qwen3VLMoeForConditionalGeneration,
 )
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 @pytest.fixture
 def text_config():

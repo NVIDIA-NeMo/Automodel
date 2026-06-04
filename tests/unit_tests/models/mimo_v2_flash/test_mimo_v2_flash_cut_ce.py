@@ -31,6 +31,8 @@ from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2FlashCon
 from nemo_automodel.components.models.mimo_v2_flash.model import MiMoV2FlashForCausalLM
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 @pytest.fixture
 def tiny_config():

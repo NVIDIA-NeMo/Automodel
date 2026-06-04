@@ -50,6 +50,8 @@ from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 HIDDEN_SIZE = 64
 VOCAB_SIZE = 1000
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 def _tiny_config(**overrides) -> Llavaonevision1_5Config:
     vision_config = RiceConfig(

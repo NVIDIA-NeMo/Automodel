@@ -47,6 +47,8 @@ except Exception as exc:  # pragma: no cover - environment-dependent
 SEQ_LEN = 6
 VOCAB_SIZE = 128
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 def _build_tiny_model():
     """Build a minimal KimiK25VL model that runs a text-only forward on CPU."""

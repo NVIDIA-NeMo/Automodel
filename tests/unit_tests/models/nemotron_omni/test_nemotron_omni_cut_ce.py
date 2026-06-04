@@ -49,6 +49,8 @@ IMG_TOKEN_ID = 18
 SOUND_TOKEN_ID = 27
 VIDEO_TOKEN_ID = 131081
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA")
+
 
 class MockNemotronV3Config:
     """Tiny NemotronV3 LLM config (attention+mlp only) runnable on CPU.

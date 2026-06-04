@@ -50,10 +50,13 @@ except Exception as exc:  # pragma: no cover - import guard for incomplete envs
     _GEMMA4_IMPORTABLE = False
     _IMPORT_ERROR = repr(exc)
 
-pytestmark = pytest.mark.skipif(
-    not _GEMMA4_IMPORTABLE,
-    reason=f"gemma4 MoE model/config not importable: {_IMPORT_ERROR}",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not _GEMMA4_IMPORTABLE,
+        reason=f"gemma4 MoE model/config not importable: {_IMPORT_ERROR}",
+    ),
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="cut-CE path requires CUDA"),
+]
 
 VOCAB_SIZE = 256
 HIDDEN_SIZE = 64
