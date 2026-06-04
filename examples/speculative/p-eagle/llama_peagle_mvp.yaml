@@ -1,0 +1,86 @@
+recipe: TrainEagle3Recipe
+
+# P-EAGLE (parallel-drafting EAGLE-3) MVP recipe. Trains the same Llama-style
+# EAGLE-3 draft as ``llama_eagle3_mvp_flash_attn.yaml`` but in *parallel
+# drafting* mode. Following the vLLM P-EAGLE implementation
+# (https://github.com/vllm-project/speculators/pull/480), the draft predicts all
+# ``num_depths`` tokens in a SINGLE forward over a flat, COD-subsampled sequence
+# (depth 0 keeps every position; depth d keeps a geometrically decaying
+# ``down_sample_ratio**d`` fraction). Masked depths condition on a learnable
+# ``mask_hidden`` placeholder and the reserved ``mask_token_id`` token. Cross-depth
+# visibility is enforced by a flex-attention COD mask -- this is NOT EAGLE-3's
+# autoregressive TTT recurrence.
+#
+# IMPORTANT -- inference runtime. P-EAGLE inference is implemented in vLLM via
+# the speculators format. The checkpoint this recipe produces saves the
+# learnable ``mask_hidden`` tensor (shape ``[1, 1, 3*hidden_size]``) and writes
+# ``mask_token_id`` / ``num_depths`` / the COD ratios into the draft
+# ``config.json`` so vLLM loads it unchanged. SGLang does not serve a P-EAGLE
+# head today, so the ``serve_sglang`` entry point cannot serve this draft.
+# Training and the on-disk format are validated by CPU unit tests; acceptance /
+# speedup numbers can only be measured by running the head under vLLM on a GPU.
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: meta-llama/Llama-3.2-1B
+  # Each row must follow the OpenAI chat schema -- a ``messages`` list of
+  # ``{role, content}`` entries (see ``llama_eagle3_mvp_flash_attn.yaml``).
+  train_data_path: /path/to/train.jsonl
+  val_data_path: null
+  train_split: null
+  val_split: null
+  output_dir: ./outputs/llama_peagle_mvp
+  seq_length: 1024
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 0
+  num_epochs: 1
+  draft_vocab_size: 8192
+  freeze_embeddings: false
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+
+  # ----------------------------------------------------------------------
+  # P-EAGLE knobs.
+  #
+  # ``parallel_drafting: true`` switches the recipe from the EAGLE-3 TTT
+  # trainer to the COD parallel-drafting trainer and registers the learnable
+  # ``mask_hidden`` placeholder on the draft.
+  #
+  # ``num_depths`` is K -- the number of parallel COD prediction depths
+  # (P-EAGLE's analogue of ``ttt_steps``). It must match the vLLM
+  # ``num_speculative_tokens`` used at inference.
+  #
+  # ``num_draft_layers`` is the number of stacked draft decoder layers (the
+  # fused first layer + vanilla Llama layers). The speculators reference trains
+  # 4; unlike EAGLE-3 TTT (always single-layer) P-EAGLE benefits from depth.
+  #
+  # ``down_sample_ratio`` / ``down_sample_ratio_min`` control COD geometric
+  # subsampling of deeper depths (retention ``max(r**d, r_min)``); the
+  # speculators defaults are 0.7 / 0.2.
+  #
+  # ``mask_token_id`` is REQUIRED (no default): the reserved token id placed at
+  # every masked multi-token-prediction slot. Its ``embed_tokens`` row serves as
+  # the masked token embedding, so pick a token that does NOT carry meaning in
+  # your data -- a reserved / unused id, not a frequent token like 0. The recipe
+  # range-checks it and writes it into the draft ``config.json``; vLLM reads it
+  # back at inference, so the value here and at serve time MUST match. The value
+  # below (128002) is one of Llama-3's reserved special tokens; choose a reserved
+  # id for your own tokenizer.
+  # ----------------------------------------------------------------------
+  parallel_drafting: true
+  num_depths: 8
+  num_draft_layers: 4
+  down_sample_ratio: 0.7
+  down_sample_ratio_min: 0.2
+  mask_token_id: 128002
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
