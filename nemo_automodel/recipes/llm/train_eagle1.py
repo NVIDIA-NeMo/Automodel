@@ -45,6 +45,7 @@ from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerMod
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle1_draft_spec
 from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
@@ -210,6 +211,9 @@ class TrainEagle1Recipe(BaseRecipe):
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
+        # The target's "Model summary" is logged by apply_model_infrastructure when it
+        # loads; the draft is built directly, so log its (trainable) summary here too.
+        print_trainable_parameters(self.draft_model, name="Draft")
 
         trainer_module = EagleTrainerModule(
             self.draft_model,
