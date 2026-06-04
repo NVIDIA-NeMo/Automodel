@@ -1092,12 +1092,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             if not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False):
                 mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
                 prepared = _model(_pre_embed_only=True, **mm_kwargs)
-                preserved_cp_inputs = {}
-                if "mm_token_type_ids" in batch and "mm_token_type_ids" not in prepared:
-                    preserved_cp_inputs["mm_token_type_ids"] = batch["mm_token_type_ids"]
                 for k in VLM_INPUT_KEYS:
                     batch.pop(k, None)
-                batch.update(preserved_cp_inputs)
                 batch.update(prepared)
             else:
                 for k in VLM_INPUT_KEYS:
@@ -1393,12 +1389,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
                     mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
                     prepared = _model(_pre_embed_only=True, **mm_kwargs)
-                    preserved_cp_inputs = {}
-                    if "mm_token_type_ids" in batch and "mm_token_type_ids" not in prepared:
-                        preserved_cp_inputs["mm_token_type_ids"] = batch["mm_token_type_ids"]
                     for k in VLM_INPUT_KEYS:
                         batch.pop(k, None)
-                    batch.update(preserved_cp_inputs)
                     batch.update(prepared)
 
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
