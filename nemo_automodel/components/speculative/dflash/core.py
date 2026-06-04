@@ -160,6 +160,17 @@ class DFlashTrainerModule(nn.Module):
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
 
+        # Per-block constants depend only on block_size / gamma, so build them
+        # once here (as non-persistent buffers that follow the module's device)
+        # instead of re-allocating them every forward.
+        self.register_buffer("_block_offsets", torch.arange(block_size).view(1, 1, -1), persistent=False)
+        if loss_decay_gamma is not None and loss_decay_gamma > 0:
+            k = torch.arange(block_size).float()
+            decay = torch.exp(-(k - 1).clamp(min=0) / loss_decay_gamma).view(1, 1, -1)
+            self.register_buffer("_decay_weights", decay, persistent=False)
+        else:
+            self._decay_weights = None
+
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -254,8 +265,7 @@ class DFlashTrainerModule(nn.Module):
         logits = self.lm_head(output_hidden)
 
         # Labels: position k of a block predicts token at anchor + k.
-        label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
-        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
+        label_indices = anchor_positions.unsqueeze(-1) + self._block_offsets
         valid_label_mask = label_indices < seq_len
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
 
@@ -266,20 +276,19 @@ class DFlashTrainerModule(nn.Module):
         # Weight mask: valid block * in-bounds label * exclude anchor (pos 0) * loss_mask.
         weight_mask = block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
         weight_mask = weight_mask * valid_label_mask.float()
-        pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        weight_mask = weight_mask * (pos_in_block > 0).float()
+        weight_mask = weight_mask * (self._block_offsets > 0).float()
         original_loss_mask_gathered = torch.gather(
             loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1), 2, safe_label_indices
         )
         weight_mask = weight_mask * original_loss_mask_gathered
 
-        binary_eval_mask = weight_mask.view(-1).clone()
+        # Binary (0/1) mask for accuracy/valid-token counting, captured before the
+        # optional decay reweighting below rebinds ``weight_mask`` to a new tensor.
+        binary_eval_mask = weight_mask.view(-1)
 
         # Loss decay: exp(-(k-1)/gamma) so the first prediction (k=1) keeps weight 1.0.
-        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
-            decay_weights = torch.exp(-(k - 1).clamp(min=0).float() / self.loss_decay_gamma)
-            weight_mask = weight_mask * decay_weights
+        if self._decay_weights is not None:
+            weight_mask = weight_mask * self._decay_weights
 
         flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = target_ids.view(-1)

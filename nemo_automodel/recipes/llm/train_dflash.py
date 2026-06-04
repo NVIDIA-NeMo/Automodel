@@ -172,8 +172,12 @@ class TrainDFlashRecipe(BaseRecipe):
             "mask_token_id": self.mask_token_id,
             "target_layer_ids": target_layer_ids,
         }
+        # A single knob drives both the trainer's mask format and the draft's
+        # attention function -- they must agree (a flex BlockMask only works with
+        # the flex attention fn, a dense bool mask only with sdpa/eager).
+        attention_backend = recipe_cfg.get("attention_backend", "flex_attention")
         draft_config_obj = Qwen3Config.from_dict(draft_config)
-        draft_config_obj._attn_implementation = recipe_cfg.get("draft_attn_implementation", "flex_attention")
+        draft_config_obj._attn_implementation = attention_backend
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
 
         trainer_module = DFlashTrainerModule(
@@ -182,7 +186,7 @@ class TrainDFlashRecipe(BaseRecipe):
             target_embed_tokens=self.target_model.get_input_embeddings(),
             mask_token_id=self.mask_token_id,
             block_size=self.block_size,
-            attention_backend=recipe_cfg.get("attention_backend", "flex_attention"),
+            attention_backend=attention_backend,
             num_anchors=int(recipe_cfg.get("num_anchors", 512)),
             loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
         ).to(self.device)
@@ -250,6 +254,12 @@ class TrainDFlashRecipe(BaseRecipe):
         mask_token_id = recipe_cfg.get("mask_token_id", None)
         if mask_token_id is None:
             mask_token_id = getattr(self.tokenizer, "pad_token_id", None)
+            if mask_token_id is not None:
+                logger.warning(
+                    "recipe_args.mask_token_id not set; falling back to tokenizer.pad_token_id=%d. "
+                    "Set it explicitly (e.g. a dedicated reserved token) if this is not intended.",
+                    mask_token_id,
+                )
         if mask_token_id is None:
             raise ValueError(
                 "DFlash requires a mask_token_id: set recipe_args.mask_token_id (the token used for "
@@ -516,6 +526,8 @@ class TrainDFlashRecipe(BaseRecipe):
             pending_micro_batches = 0
             completed_steps = 0
             last_batch_idx = -1
+            num_batches = len(self.train_dataloader)
+            is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
             for batch_idx, batch in enumerate(self.train_dataloader):
                 last_batch_idx = batch_idx
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -525,9 +537,8 @@ class TrainDFlashRecipe(BaseRecipe):
                     loss_mask=batch["loss_mask"],
                 )
                 is_window_close = (pending_micro_batches + 1 == self.grad_accumulation_steps) or (
-                    batch_idx + 1 == len(self.train_dataloader)
+                    batch_idx + 1 == num_batches
                 )
-                is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
                 sync_ctx = nullcontext() if (not is_ddp or is_window_close) else self.trainer_module.no_sync()
                 try:
                     with sync_ctx:

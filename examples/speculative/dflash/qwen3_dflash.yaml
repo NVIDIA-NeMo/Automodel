@@ -17,9 +17,9 @@ dist_env:
 
 recipe_args:
   target_model_name_or_path: Qwen/Qwen3-8B
-  train_data_path: /llm-align/liuchonghan/datasets/perfectblend_qwen3-8b_regen.jsonl
+  train_data_path: /path/to/perfectblend_qwen3-8b_regen.jsonl   # regenerate responses with the target model first
   val_data_path: null
-  output_dir: /llm-align/liuchonghan/runs/dflash_qwen3_8b
+  output_dir: ./outputs/dflash_qwen3_8b
   seq_length: 3072
   micro_batch_size: 4
   grad_accumulation_steps: 1
@@ -35,8 +35,7 @@ recipe_args:
   #                                   # (defaults to the tokenizer pad token if unset)
   # target_layer_ids: [1, 9, 17, 25, 33]   # target layers captured as draft context
   #                                   # (defaults to an even spread across the target)
-  attention_backend: flex_attention   # "flex_attention" (GPU) or "sdpa"
-  draft_attn_implementation: flex_attention
+  attention_backend: flex_attention   # "flex_attention" (GPU main path) or "sdpa" (portable fallback)
 
   trust_remote_code: false
   shuffle_seed: 42
@@ -56,7 +55,7 @@ optimizer:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /llm-align/liuchonghan/runs/dflash_qwen3_8b/checkpoints
+  checkpoint_dir: ./outputs/dflash_qwen3_8b/checkpoints
   model_save_format: safetensors
   save_consolidated: true
   # restore_from: LATEST  # "LATEST", a subdir like "epoch_1_step_1000", or an absolute path
