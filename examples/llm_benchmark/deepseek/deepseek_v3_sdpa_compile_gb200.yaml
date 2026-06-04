@@ -72,9 +72,9 @@ model:
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
-    linear: te
-    rms_norm: te
-    rope_fusion: true
+    linear: torch     # non-TE: TE Linear is @torch.compiler.disable'd → breaks MLA fullgraph
+    rms_norm: torch   # non-TE: TE RMSNorm is also compiler-disabled → breaks MLA fullgraph
+    rope_fusion: false  # fused RoPE is a TE/compiler-disabled custom op → breaks fullgraph
     compile_mla: true
     experts: gmm
     dispatcher: hybridep  # GB200/oci_hsg: deepep fails EP-buffer init ('invalid resource handle')
