@@ -38,6 +38,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      # `fern check` validates that every path: referenced by docs.yml / the
+      # version YAMLs exists on disk. The frozen v0.4 pages are archived off main,
+      # so restore them before checking or the validation fatals on missing paths.
+      - name: Stitch archived version pages
+        uses: ./.github/actions/stitch-fern-versions
+        with:
+          archived-versions: |
+            v0.4=docs-archive
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:

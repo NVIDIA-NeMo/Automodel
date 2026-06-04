@@ -70,7 +70,8 @@ docs/                            ← nightly MDX lives here (sibling of fern/)
     ├── versions/
     │   ├── nightly.yml          # Nav for nightly — paths point at ../../<path>.mdx (up into docs/)
     │   ├── v0.4.yml             # Nav for the frozen 0.4.0 GA snapshot — paths at ./v0.4/pages/
-    │   ├── v0.4/pages/          # Frozen 0.4.0 content (back-ports only; never edited from nightly)
+    │   ├── v0.4/pages/          # Frozen 0.4.0 content — lives on the `docs-archive` branch, NOT main;
+    │   │                        #   restored here by `make docs-stitch` / CI (gitignored on main)
     │   └── latest.yml           # GA alias — paths at ./v0.4/pages/ today; repointed at next GA cut
     └── product-docs/            # GENERATED Python API reference (gitignored — `make docs` regenerates)
 ```
@@ -83,16 +84,19 @@ docs/fern/versions/v0.4/pages/get-started/installation.mdx docs.nvidia.com/nemo/
                                                            docs.nvidia.com/nemo/automodel/latest/get-started/installation  (latest mounts v0.4 content)
 ```
 
-The **`docs/` top-level tree IS the nightly tree** — every PR lands there. The **`docs/fern/versions/v0.4/pages/` tree is a frozen 0.4.0 release snapshot**, only changed via deliberate back-port. `latest.yml` mounts `./v0.4/pages/` so `/latest/...` URLs serve the current GA — at the next GA cut, `latest.yml` repoints at the new train. Today the two trees are byte-for-byte identical (we just shipped 0.4.0); they'll diverge as nightly accumulates post-release edits.
+The **`docs/` top-level tree IS the nightly tree** — every PR lands there. The **`docs/fern/versions/v0.4/pages/` tree is a frozen 0.4.0 release snapshot**, only changed via deliberate back-port. `latest.yml` mounts `./v0.4/pages/` so `/latest/...` URLs serve the current GA — at the next GA cut, `latest.yml` repoints at the new train. The nightly and v0.4 trees were byte-for-byte identical when 0.4.0 shipped; they diverge as nightly accumulates post-release edits.
+
+**Only the nightly tree is on `main`.** The frozen `v0.4/pages/` snapshot lives on the **`docs-archive` branch** and is restored into the working copy before any Fern build — by `make docs-stitch` locally, or the `.github/actions/stitch-fern-versions` composite action in CI (publish, `fern check`, and preview all run it first). Fern reads one local tree and publishes a full-site snapshot, so the archived pages must be physically present at build time; they can't be sourced from another branch natively. The restore path is gitignored on `main`. To pull a version from an immutable tag instead of the branch: `make docs-check ARCHIVE_REF=docs/v0.4.0`.
 
 ## Local development
 
 From this directory (`cd docs/fern` first, or use `make -C docs/fern <target>` from anywhere):
 
 ```bash
-make docs           # `fern docs md generate` + `fern docs dev` → http://localhost:3002
-make docs-check     # `fern check` (config + MDX validation)
-make docs-preview   # shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)
+make docs           # docs-stitch + `fern docs md generate` + `fern docs dev` → http://localhost:3002
+make docs-stitch    # restore frozen backward-version pages from the docs-archive branch
+make docs-check     # docs-stitch + `fern check` (config + MDX validation)
+make docs-preview   # docs-stitch + shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)
 make docs-publish   # trigger the `Publish Fern Docs` workflow on origin/main
 ```
 

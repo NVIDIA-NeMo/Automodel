@@ -10,15 +10,26 @@ Unified skill for adding, updating, moving, and removing pages on the NeMo AutoM
 
 ## Scope rule
 
-**Nightly MDX content lives at the top level of `docs/`** (e.g. `docs/index.mdx`, `docs/guides/llm/finetune.mdx`). **`docs/fern/` holds only Fern build infrastructure** — config, theme, components, and the frozen v0.4 snapshot. New pages, release notes, migration guides → add as a top-level `.mdx` under `docs/`.
+**Nightly MDX content lives at the top level of `docs/`** (e.g. `docs/index.mdx`, `docs/guides/llm/finetune.mdx`). **`docs/fern/` holds only Fern build infrastructure** — config, theme, and components. New pages, release notes, migration guides → add as a top-level `.mdx` under `docs/`.
+
+**Only the nightly tree is kept on `main`.** Frozen backward-version snapshots live on the `docs-archive` branch and are restored at build time — see *Archived backward versions* below.
 
 **Two real content trees, plus a GA alias YAML.**
 
 - `docs/` — bleeding-edge (nightly) tree. Every PR lands here. Mounted at the `nightly` URL slug via `docs/fern/versions/nightly.yml` (paths reach back up via `../../<rel>.mdx`).
-- `docs/fern/versions/v0.4/pages/` — frozen 0.4.0 GA snapshot. Independent copy of every page. Only changes via deliberate back-port. Mounted at the `v0.4` URL slug via `v0.4.yml`.
+- `docs/fern/versions/v0.4/pages/` — frozen 0.4.0 GA snapshot. **Not on `main`**: it lives on the `docs-archive` branch and is restored under this path by `make docs-stitch` (local) or the `stitch-fern-versions` CI action (build). Mounted at the `v0.4` URL slug via `v0.4.yml`. Only changes via deliberate back-port (on `docs-archive`).
 - `docs/fern/versions/latest.yml` — GA alias. Its `path:` lines mount the current GA's content (today: `./v0.4/pages/...`). Repointed at the next GA's tree when one is cut.
 
-The two trees were byte-for-byte identical at the moment 0.4.0 shipped, but they will diverge as nightly accumulates post-release edits and v0.4 stays frozen. **Default editing target is `docs/` top-level.** Only touch `docs/fern/versions/v0.4/pages/` for explicit back-ports — call out the divergence in the PR description.
+The nightly and v0.4 trees were byte-for-byte identical at the moment 0.4.0 shipped, but they will diverge as nightly accumulates post-release edits and v0.4 stays frozen. **Default editing target is `docs/` top-level.** Back-ports to a frozen version happen on the `docs-archive` branch, not here — call out the divergence in the PR description.
+
+### Archived backward versions
+
+Fern has no native way to source a version train's prose from another git ref: `fern generate --docs` reads the single local working tree, and publish is a full-site snapshot (a train missing from the tree is *unpublished*). So frozen GA pages are kept off `main` on the **`docs-archive` branch** and restored before every Fern build.
+
+- **The registry** lives inline in each `fern-docs-*` workflow as `archived-versions: |` lines of `<version-dir>=<git-ref>` (today: `v0.4=docs-archive`). The `<git-ref>` is opaque: a **branch** (default — all frozen versions in one place, easy back-ports) or a **tag** like `docs/v0.4.0` (immutable snapshot). `latest` is an alias of an existing pages tree and needs **no** entry.
+- **The mechanism** is the `.github/actions/stitch-fern-versions` composite action: `git fetch --depth=1 origin <ref>` then `git restore --source=FETCH_HEAD -- docs/fern/versions/<vdir>/pages`. It runs in `publish-fern-docs.yml`, `fern-docs-ci.yml`, and `fern-docs-preview-build.yml`. `docs.yml` + the nav YAMLs always come from the live checkout, never the archive ref, so frozen prose can't drift into the wrong train.
+- **Locally**, `make docs` / `docs-check` / `docs-preview` depend on `make docs-stitch`, which does the same restore. Override the ref with `make docs-check ARCHIVE_REF=docs/v0.4.0`.
+- The restored path is gitignored on `main`, so a local stitch won't show the pages as untracked.
 
 **Sidebar fidelity rule.** Section captions, page titles, and Model Coverage child ordering must match the **published v0.4.0 sidebar at docs.nvidia.com/nemo/automodel/latest** verbatim. Don't silently shorten a title or reorder siblings — the docs PM and content engineers diff against the published site and any drift is treated as a regression. If you want a shorter sidebar label, change the toctree-derived display name in the source — never just retitle in the MDX.
 
@@ -228,14 +239,18 @@ make docs                # runs `fern docs md generate` then `fern docs dev`
 
 PRs that touch `docs/**` get an automatic Fern preview URL posted as a 🌿 comment by `fern-docs-preview-comment.yml`. No manual step.
 
-```
-                    ┌─ fern-docs-ci.yml                  → fern check (push to pull-request/<n>)
-PR (touches docs/) ─┼─ fern-docs-preview-build.yml       → upload docs/fern/ artifact (no secrets)
-                    └─ fern-docs-preview-comment.yml     → 🌿 preview URL comment
+Every job below first runs the `stitch-fern-versions` action to restore the archived
+backward-version pages (the `docs-archive` branch) into the working copy — the frozen
+trees are not on `main`.
 
-Push to main (touches docs/) → publish-fern-docs.yml → docs.nvidia.com/nemo/automodel
-Tag push (docs/v*)           → publish-fern-docs.yml → docs.nvidia.com/nemo/automodel
-Manual dispatch              → publish-fern-docs.yml → docs.nvidia.com/nemo/automodel
+```
+                    ┌─ fern-docs-ci.yml                  → stitch → fern check (push to pull-request/<n>)
+PR (touches docs/) ─┼─ fern-docs-preview-build.yml       → stitch → upload docs/ artifact (no secrets)
+                    └─ fern-docs-preview-comment.yml     → 🌿 preview URL comment (consumes artifact)
+
+Push to main (touches docs/) → publish-fern-docs.yml → stitch → docs.nvidia.com/nemo/automodel
+Tag push (docs/v*)           → publish-fern-docs.yml → stitch → docs.nvidia.com/nemo/automodel
+Manual dispatch              → publish-fern-docs.yml → stitch → docs.nvidia.com/nemo/automodel
 ```
 
 The preview-comment + publish jobs require the `DOCS_FERN_TOKEN` org secret (already wired for `build-docs.yml`).
@@ -248,9 +263,10 @@ When NeMo AutoModel ships a new GA (e.g. `v0.5`):
 2. `cp docs/fern/versions/nightly.yml docs/fern/versions/v0.5.yml` and rewrite `../../` path prefixes to `./v0.5/pages/`.
 3. Update `docs/fern/versions/latest.yml` to point at the new train: `cp docs/fern/versions/v0.5.yml docs/fern/versions/latest.yml`. (`latest` is the auto-bumping GA alias.)
 4. In `docs/fern/docs.yml` `versions:`, add a new frozen-pin entry (`display-name: "0.5.0 · 26.07"`, `slug: v0.5`, `availability: stable`) and keep the previous pin (`v0.4`) for permalink stability.
-5. `docs/` keeps moving forward as the bleeding-edge tree; the new `docs/fern/versions/v0.5/pages/` is the frozen GA snapshot and only changes via deliberate back-port.
-6. Promote `nightly` to `availability: stable` if and when its content tree gets cut over.
-7. Tag `docs/v0.5.0` and push to publish.
+5. **Archive the frozen tree off `main`** (see *Archived backward versions*): commit `docs/fern/versions/v0.5/pages/` onto the `docs-archive` branch and push it, then `git rm -r docs/fern/versions/v0.5/pages` from `main` and add that path to `.gitignore`. The `v0.5.yml`/`latest.yml`/`docs.yml` config stays on `main`.
+6. Add `v0.5=docs-archive` to the `archived-versions:` registry in `publish-fern-docs.yml`, `fern-docs-ci.yml`, and `fern-docs-preview-build.yml` (and the `.gitignore` line). `docs/` keeps moving forward as the bleeding-edge tree; the new frozen snapshot only changes via deliberate back-port on `docs-archive`.
+7. Promote `nightly` to `availability: stable` if and when its content tree gets cut over.
+8. Tag `docs/v0.5.0` and push to publish.
 
 ## Commits and DCO
 
@@ -276,6 +292,8 @@ If sign-off is missing on a recent commit, amend with `git commit --amend -s`. P
 | Image not rendering | Use relative path (`./image.png`) for page-scoped images, not root-relative (`/image.png`) |
 | Sidebar caption looks shortened vs published site | Compare against `docs.nvidia.com/nemo/automodel/latest` and restore the verbatim title in `docs/fern/versions/nightly.yml` |
 | `path: ../../foo.mdx` doesn't resolve | Confirm the MDX file is at `docs/foo.mdx` (top level), not still under `docs/fern/versions/nightly/pages/` — that legacy tree no longer exists |
+| `fern check` fatals on missing `./v0.4/pages/...` paths | The frozen v0.4 tree isn't checked out. Run `make docs-stitch` (or `make docs-check`, which depends on it) to restore it from the `docs-archive` branch |
+| `archive ref '...' does not contain '...'` in CI | The `stitch-fern-versions` action couldn't find the version's pages on its registry ref. Confirm the `docs-archive` branch (or the configured tag) still holds `docs/fern/versions/<vdir>/pages` |
 
 ## Key references
 
@@ -285,7 +303,9 @@ If sign-off is missing on a recent commit, amend with `git commit --amend -s`. P
 | `docs/fern/versions/nightly.yml` | Canonical nav tree — paths reach up into `docs/` via `../../` |
 | `docs/fern/versions/{latest,v0.4}.yml` | Frozen GA nav (mount `./v0.4/pages/...`) |
 | `docs/` (top-level *.mdx) | Nightly MDX content (~140 pages + page-scoped images) |
-| `docs/fern/versions/v0.4/pages/` | Frozen 0.4.0 snapshot (back-ports only) |
+| `docs/fern/versions/v0.4/pages/` | Frozen 0.4.0 snapshot — **on the `docs-archive` branch, not `main`**; stitched in at build time |
+| `docs-archive` branch | Holds all frozen backward-version `pages/` trees; restored by `stitch-fern-versions` / `make docs-stitch` |
+| `.github/actions/stitch-fern-versions/` | Composite action that restores archived version pages before any Fern build |
 | `docs/fern/components/` | `BadgeLinks.tsx`, `Tag.tsx` (repo-specific; NVIDIA footer ships via `global-theme: nvidia`) |
 | `docs/fern/README.md` | Human-facing orientation |
 | `docs/fern/Makefile` | `make docs / docs-check / docs-preview / docs-publish` (run from `docs/fern/` or via `make -C docs/fern`) |

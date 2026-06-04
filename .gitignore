@@ -188,4 +188,10 @@ skypilot_jobs/
 # during preview / publish — not committed)
 docs/fern/product-docs/
 
+# Fern: frozen backward-version page trees. Kept on the `docs-archive` branch,
+# not on main; restored into the working copy by the stitch-fern-versions action
+# (CI) or `make docs-stitch` (local). Ignored so a local stitch doesn't show them
+# as untracked. Add a line per archived GA train as new versions are cut.
+docs/fern/versions/v0.4/pages/
+
 training_logs/
