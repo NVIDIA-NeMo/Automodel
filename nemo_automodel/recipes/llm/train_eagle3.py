@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import pathlib
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -88,6 +89,10 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
 
 class TrainEagle3Recipe(BaseRecipe):
     """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
+
+    # True only for P-EAGLE with ``sequence_partitions > 1`` (set in ``setup``);
+    # the train loop then drives the per-segment forward/backward step.
+    _peagle_partitioned = False
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -223,6 +228,15 @@ class TrainEagle3Recipe(BaseRecipe):
         if recipe_cfg.get("freeze_embeddings", freeze_embeddings_default):
             self.draft_model.freeze_embeddings()
 
+        # ``sequence_partitions`` (S) is a training-only memory knob: when > 1 the
+        # P-EAGLE trainer splits each sequence into S segments and runs a separate
+        # forward+backward per segment, accumulating gradients, so only one
+        # segment's activations are resident at once (P-EAGLE Algorithm 1,
+        # arXiv:2602.01469). It does not alter the loss or the saved checkpoint, so
+        # it is NOT serialized into the draft config. Default 1 == single flat
+        # forward.
+        sequence_partitions = int(recipe_cfg.get("sequence_partitions", 1))
+        self._peagle_partitioned = parallel_drafting and sequence_partitions > 1
         if parallel_drafting:
             # ``num_depths`` is P-EAGLE's K (number of parallel COD depths),
             # default 8 to match speculators. The COD ratios shape how
@@ -235,6 +249,7 @@ class TrainEagle3Recipe(BaseRecipe):
                 mask_token_id=mask_token_id,
                 down_sample_ratio=float(recipe_cfg.get("down_sample_ratio", 0.7)),
                 down_sample_ratio_min=float(recipe_cfg.get("down_sample_ratio_min", 0.2)),
+                sequence_partitions=sequence_partitions,
             ).to(self.device)
         else:
             trainer_module = Eagle3TrainerModule(
@@ -451,11 +466,31 @@ class TrainEagle3Recipe(BaseRecipe):
             )
         return selected_token_ids, selected_token_mask
 
+    def _peagle_supervision(self, batch):
+        """Move a batch to device and run the live target to its draft supervision.
+
+        Shared by the single-pass ``_forward_batch`` and the partitioned step.
+        P-EAGLE requires the live target (the offline cache is EAGLE-3 TTT-only).
+        """
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        target_batch = self.target_wrapper.generate_batch(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            loss_mask=batch["loss_mask"],
+        )
+        return {
+            "input_ids": target_batch.input_ids,
+            "attention_mask": target_batch.attention_mask,
+            "loss_mask": target_batch.loss_mask,
+            "aux_hidden_states": target_batch.aux_hidden_states,
+            "target_logits": target_batch.logits,
+        }
+
     def _forward_batch(self, batch):
         """Run the trainer module for one batch, from the live target or the cache."""
-        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         if self.target_wrapper is None:
             # Offline cache: the supervision is already in the batch.
+            batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
             return self.trainer_module(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
@@ -464,18 +499,45 @@ class TrainEagle3Recipe(BaseRecipe):
                 target_probs=batch["target_probs"],
                 position_mask=batch["position_mask"],
             )
-        target_batch = self.target_wrapper.generate_batch(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            loss_mask=batch["loss_mask"],
-        )
-        return self.trainer_module(
-            input_ids=target_batch.input_ids,
-            attention_mask=target_batch.attention_mask,
-            loss_mask=target_batch.loss_mask,
-            aux_hidden_states=target_batch.aux_hidden_states,
-            target_logits=target_batch.logits,
-        )
+        return self.trainer_module(**self._peagle_supervision(batch))
+
+    def _peagle_partitioned_step(self, batch):
+        """Forward+backward one batch via P-EAGLE sequence partitioning.
+
+        Builds the segment plan, then runs one ``DDP.forward`` per segment and
+        back-propagates each here (the recipe owns ``backward()`` so DDP's
+        gradient all-reduce fires). ``no_sync`` defers the all-reduce on every
+        segment except the last, so there is exactly one all-reduce per
+        micro-batch -- matching the single-pass path and keeping the per-rank
+        collective count aligned. Gradients are divided by
+        ``grad_accumulation_steps`` exactly like the single-pass backward; the
+        returned (detached) metrics aggregate the whole batch for logging.
+        """
+        sup = self._peagle_supervision(batch)
+        plan = self._module().build_peagle_plan(sup["loss_mask"])
+        accum = float(self.grad_accumulation_steps)
+        is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
+        num_units = len(plan.units)
+
+        loss_sum = torch.zeros((), device=self.device)
+        correct_sum = torch.zeros((), device=self.device)
+        valid_sum = torch.zeros((), device=self.device)
+        if num_units == 0:
+            # Fully-unsupervised batch: still issue one synced backward so the
+            # per-rank all-reduce count stays aligned (avoids a DDP hang).
+            (sum(p.sum() for p in self.trainer_module.parameters()) * 0.0).backward()
+            return SimpleNamespace(loss=loss_sum, accuracy=correct_sum, valid_tokens=valid_sum)
+
+        for i in range(num_units):
+            defer_sync = is_ddp and i < num_units - 1
+            sync_ctx = self.trainer_module.no_sync() if defer_sync else nullcontext()
+            with sync_ctx:
+                seg = self.trainer_module(**sup, peagle_segment=(plan, i))
+                (seg.loss / accum).backward()
+            loss_sum = loss_sum + seg.loss.detach()
+            valid_sum = valid_sum + seg.valid_tokens
+            correct_sum = correct_sum + seg.accuracy.detach() * seg.valid_tokens
+        return SimpleNamespace(loss=loss_sum, accuracy=correct_sum / valid_sum.clamp_min(1.0), valid_tokens=valid_sum)
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the standard recipes."""
@@ -761,9 +823,14 @@ class TrainEagle3Recipe(BaseRecipe):
             batches_processed = 0
             pending_micro_batches = 0
             for batch_idx, batch in enumerate(self.train_dataloader):
-                metrics = self._forward_batch(batch)
-                loss = metrics.loss / float(self.grad_accumulation_steps)
-                loss.backward()
+                if self._peagle_partitioned:
+                    # P-EAGLE sequence partitioning owns its per-segment backward
+                    # (driven by the recipe through DDP.forward); metrics are detached.
+                    metrics = self._peagle_partitioned_step(batch)
+                else:
+                    metrics = self._forward_batch(batch)
+                    loss = metrics.loss / float(self.grad_accumulation_steps)
+                    loss.backward()
 
                 running_loss = running_loss + metrics.loss.detach()
                 running_acc = running_acc + metrics.accuracy.detach()
