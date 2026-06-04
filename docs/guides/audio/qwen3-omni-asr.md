@@ -109,6 +109,33 @@ dataset:
 Audio columns are universally named `audio` across these datasets, so the
 default `audio_column="audio"` rarely needs an override.
 
+### Mixture of Datasets: `multi_en`
+
+For a stronger general-purpose English model, train on a **mixture** of public
+ASR corpora rather than a single dataset.
+`nemo_automodel.components.datasets.audio.multi_en` concatenates several HF
+sources into one training set, normalizing each to `{audio, text, source}` with
+per-source transcript cleanup (e.g. stripping GigaSpeech bracket tags such as
+`<COMMA>` / `<SIL>`). The default English composition is ~500k clips:
+
+| Source | HF repo | config / split | clips |
+|---|---|---|---:|
+| AMI IHM | `edinburghcstr/ami` | `ihm` / `train` | 108,502 |
+| Earnings22 | `sanchit-gandhi/earnings22_split` | `train` | 52,006 |
+| VoxPopuli (en) | `facebook/voxpopuli` | `en` / `train` (capped) | 4,000 |
+| GigaSpeech (s) | `speechcolab/gigaspeech` | `s` / `train` | 230,068 |
+| SPGISpeech (S) | `kensho/spgispeech` | `S` / `train` | 77,073 |
+| LibriSpeech | `openslr/librispeech_asr` | `clean` / `train.100` | 28,539 |
+| **Total** | | | **~500,188** |
+
+GigaSpeech and SPGISpeech are gated on the Hub — accept their terms (and allow
+`trust_remote_code` for GigaSpeech) before launching. The source list is fully
+overridable from YAML via `dataset.sources` (pass a trimmed list to drop gated
+corpora), and `dataset.max_audio_duration_seconds` caps clip length to bound
+activation memory. Ready-to-run recipe:
+`examples/audio_finetune/qwen3_omni_asr/multi_en_sft.yaml` (and
+`examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml` for the 3B).
+
 ---
 
 ## Train
@@ -251,3 +278,33 @@ roughly half:
 |-----------------|-------------------------------------------------------|--------------------|
 | Before training | Base `Qwen/Qwen3-Omni-30B-A3B-Instruct` (zero-shot)   | 15.81%             |
 | After training  | 1 epoch full FT (audio tower trainable)               | **8.31%**          |
+
+## Results: `multi_en` mixture
+
+Training the same model for 3 epochs on the ~500k-clip `multi_en` mixture (see
+[Mixture of Datasets](#mixture-of-datasets-multi_en)) generalizes across all 7
+[open-ASR-leaderboard](https://huggingface.co/datasets/hf-audio/open-asr-leaderboard)
+English test subsets, not just AMI. WER below is Whisper-normalized
+(`EnglishTextNormalizer`), greedy decode, comparing the zero-shot base against
+the `multi_en` fine-tune:
+
+| Subset | N | Base (zero-shot) | `multi_en` FT |
+|---|---:|---:|---:|
+| LibriSpeech test.clean | 2,620 | 1.49 | 1.89 |
+| LibriSpeech test.other | 2,939 | 2.62 | 3.54 |
+| SPGISpeech | 39,341 | 3.12 | **2.11** |
+| VoxPopuli | 1,842 | 7.07 | **6.67** |
+| GigaSpeech | 19,931 | 8.54 | 9.46 |
+| Earnings22 | 2,741 | 9.79 | **8.89** |
+| AMI (IHM) | 12,643 | 11.07 | **8.22** |
+| **Macro avg** | — | 6.24 | **5.83** |
+
+Fine-tuning concentrates its gains on the harder conversational / domain sets
+(AMI −2.85, Earnings22 −0.90, SPGISpeech −1.01, VoxPopuli −0.40), while the
+strong base keeps a small edge on clean read speech (LibriSpeech, GigaSpeech) —
+a hint that the mix can be rebalanced toward those styles. Net macro WER
+improves from 6.24% to **5.83%**.
+
+The same recipe on **Qwen2.5-Omni-3B** (`multi_en_sft_3b.yaml`) shows a much
+larger fine-tuning gain, since the small model's zero-shot baseline is weaker:
+macro WER **8.97% → 6.55%** (−2.42).
