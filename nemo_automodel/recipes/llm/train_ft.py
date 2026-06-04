@@ -790,12 +790,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             activation_checkpointing=self.dist_setup.activation_checkpointing,
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
-        self.optimizer = self.cfg.optimizer.build(
+        optimizer = self.cfg.optimizer.build(
             model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None
         )
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
         self.optimizer = shard_optimizers_for_megatron_fsdp(
-            model, self.optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
+            model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):

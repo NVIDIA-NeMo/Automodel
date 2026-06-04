@@ -109,12 +109,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             distributed_config=self.distributed_config,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
-        self.optimizer = self.cfg.optimizer.build(
+        optimizer = self.cfg.optimizer.build(
             model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None
         )
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
         self.optimizer = shard_optimizers_for_megatron_fsdp(
-            model, self.optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
+            model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )
 
         self.model_parts = [model]
