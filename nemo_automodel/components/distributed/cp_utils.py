@@ -286,7 +286,9 @@ class _ManualAllGatherAttention:
         # instead of exposing a separate is_sliding flag.
         sliding_window = getattr(module, "sliding_window", None)
         is_sliding = sliding_window is not None
-        config_uses_vision_bidir = getattr(getattr(module, "config", None), "use_bidirectional_attention", None) == "vision"
+        config_uses_vision_bidir = (
+            getattr(getattr(module, "config", None), "use_bidirectional_attention", None) == "vision"
+        )
         has_vision_tokens = vision_group_ids is not None and bool((vision_group_ids >= 0).any().item())
         use_vision_bidirectional = is_sliding and config_uses_vision_bidir and has_vision_tokens
 
