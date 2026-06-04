@@ -279,6 +279,9 @@ navigation:
       - page: "Hy3-preview"
         path: ../../guides/llm/hy3.mdx
         slug: hy3-preview
+      - page: "Nemotron-3 Ultra"
+        path: ../../guides/llm/nemotron-3-ultra.mdx
+        slug: nemotron-3-ultra
       - page: "Pretrain Megatron Core Datasets with NeMo AutoModel"
         path: ../../guides/llm/pretraining.mdx
         slug: pretraining

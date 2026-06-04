@@ -171,22 +171,40 @@ class MTPModule(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
-        embed_fn: Callable[[torch.LongTensor], torch.Tensor],
+        *,
+        input_ids: torch.LongTensor | None = None,
+        embed_fn: Callable[[torch.LongTensor], torch.Tensor] | None = None,
+        embed_inputs: tuple[torch.Tensor, ...] | None = None,
         position_ids: torch.LongTensor | None = None,
         **block_kwargs,
     ) -> list[torch.Tensor]:
         """Iterate over MTP depths and return per-depth hidden states.
 
+        Two mutually-exclusive input modes:
+
+        * **Single-rank / first-stage PP** (default): pass ``input_ids`` plus
+          ``embed_fn``. The module rolls ``input_ids`` cumulatively left by 1
+          per depth and applies ``embed_fn`` to produce the future-token
+          embedding for that depth.
+        * **Final-stage PP**: pass ``embed_inputs`` (a tuple of pre-rolled
+          per-depth embeddings, length ``num_depths``). Used when the last PP
+          stage no longer owns ``embed_tokens``; the first PP stage has
+          already produced the rolled embeddings and propagated them through
+          the pipeline.
+
         Args:
-            input_ids: Token ids ``[B, S]`` (or ``[T]`` in THD). Rolled
-                cumulatively left by 1 per depth.
             hidden_states: Output of the main model's final norm (``h_0``);
                 shape matches the model's residual stream.
+            input_ids: Token ids ``[B, S]`` (or ``[T]`` in THD). Rolled
+                cumulatively left by 1 per depth. Mutually exclusive with
+                ``embed_inputs``.
             embed_fn: Callable applied to rolled ``input_ids`` to produce the
                 future-token embedding (typically the model's input embedding
-                layer).
+                layer). Required when ``input_ids`` is supplied.
+            embed_inputs: Optional tuple of ``num_depths`` pre-computed
+                future-token embeddings, one per depth in MTP order.
+                Mutually exclusive with ``input_ids``/``embed_fn``.
             position_ids: Position ids matching ``input_ids``. When supplied,
                 rolled cumulatively per depth in lockstep with ``input_ids``
                 (so slot ``t`` carries the original position of the rolled
@@ -200,6 +218,15 @@ class MTPModule(nn.Module):
             List of length ``num_depths`` containing the hidden state
             produced at each depth.
         """
+        if embed_inputs is not None:
+            if input_ids is not None or embed_fn is not None:
+                raise ValueError("embed_inputs is mutually exclusive with input_ids/embed_fn")
+            if len(embed_inputs) != self.num_depths:
+                raise ValueError(f"embed_inputs length {len(embed_inputs)} does not match num_depths {self.num_depths}")
+        else:
+            if input_ids is None or embed_fn is None:
+                raise ValueError("MTPModule.forward requires either embed_inputs or (input_ids, embed_fn)")
+
         num_iterations = self.num_depths
         num_sublayers_per_depth = self.pattern_length
         use_repeated = self.mtp_config.use_repeated_layer
@@ -207,11 +234,14 @@ class MTPModule(nn.Module):
         cur_input_ids = input_ids
         cur_position_ids = position_ids
         for depth in range(num_iterations):
-            cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
+            if embed_inputs is not None:
+                decoder_input = embed_inputs[depth]
+            else:
+                cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
+                decoder_input = embed_fn(cur_input_ids)
             if cur_position_ids is not None:
                 cur_position_ids = roll_tensor(cur_position_ids, shifts=-1, dim=-1)
 
-            decoder_input = embed_fn(cur_input_ids)
             physical_depth = 0 if use_repeated else depth
             for sublayer_idx in range(num_sublayers_per_depth):
                 sublayer = self.layers[physical_depth * num_sublayers_per_depth + sublayer_idx]

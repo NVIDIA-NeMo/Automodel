@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import pathlib
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -53,6 +54,49 @@ from nemo_automodel.recipes.base_recipe import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _optim_steps_per_epoch(num_batches_per_epoch: int, grad_accumulation_steps: int) -> int:
+    """Return ceil(num_batches / accum), the actual number of optimizer steps per epoch.
+
+    Floor division silently drops the trailing partial accumulation window
+    (up to ``grad_accumulation_steps - 1`` micro-batches) from the LR
+    scheduler's view of training, even though the trainer flushes those
+    gradients with an explicit step. Ceil keeps the scheduler aligned with
+    the actual number of ``optimizer.step()`` calls.
+    """
+    if num_batches_per_epoch <= 0 or grad_accumulation_steps <= 0:
+        return 0
+    return -(-num_batches_per_epoch // grad_accumulation_steps)
+
+
+def _should_sync_grads(
+    *,
+    pending_micro_batches: int,
+    grad_accumulation_steps: int,
+    batch_idx: int,
+    batches_per_epoch: int | None,
+    is_ddp: bool,
+) -> bool:
+    """Return True when this micro-batch's backward should all-reduce gradients.
+
+    Under DDP with gradient accumulation only the micro-batch immediately
+    followed by an ``optimizer.step()`` needs to synchronize: at that point the
+    locally-accumulated ``.grad`` already holds the whole window's contribution,
+    so a single all-reduce averages the complete window and the intervening
+    micro-batches can run under ``no_sync()`` -- saving ``grad_accumulation_steps - 1``
+    all-reduces per window. That step is either the window closer
+    (``pending_micro_batches + 1 == grad_accumulation_steps``) or the epoch's
+    final batch (which the trailing-flush step consumes). When the dataloader
+    length is unknown we cannot identify the final batch, so we sync every step
+    (correct, just no speedup). With a single process (no DDP) there is nothing
+    to synchronize, so this is always True.
+    """
+    if not is_ddp or batches_per_epoch is None:
+        return True
+    closes_window = pending_micro_batches + 1 == grad_accumulation_steps
+    is_last_batch = batch_idx == batches_per_epoch - 1
+    return closes_window or is_last_batch
 
 
 def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
@@ -202,7 +246,16 @@ class TrainEagle1Recipe(BaseRecipe):
             num_batches_per_epoch = len(self.train_dataloader)
         except TypeError:
             num_batches_per_epoch = 0
-        total_optim_steps = max(1, (self.num_epochs * num_batches_per_epoch) // self.grad_accumulation_steps)
+        # Use ceil division so a trailing partial accumulation window (when
+        # ``num_batches_per_epoch`` is not a multiple of ``grad_accumulation_steps``)
+        # is counted as a real optimizer step. The training loop flushes that
+        # leftover window at the end of each epoch, so the LR scheduler must
+        # cover those steps too -- otherwise ``progress`` saturates and the
+        # final epoch trains at ``min_lr_ratio`` instead of the intended decay.
+        total_optim_steps = max(
+            1,
+            self.num_epochs * _optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps),
+        )
         warmup_ratio = float(opt_cfg.get("warmup_ratio", 0.05))
         min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
         warmup_steps = max(1, int(warmup_ratio * total_optim_steps))
@@ -478,6 +531,11 @@ class TrainEagle1Recipe(BaseRecipe):
             if self.dist_env.is_main:
                 logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
             return
+        try:
+            batches_per_epoch = len(self.train_dataloader)
+        except TypeError:
+            batches_per_epoch = None
+        is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
         for epoch_idx in range(start_epoch, self.num_epochs):
             if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
                 self.train_dataloader.sampler.set_epoch(epoch_idx)
@@ -486,6 +544,7 @@ class TrainEagle1Recipe(BaseRecipe):
             running_acc = 0.0
             epoch_loss = 0.0
             micro_step = 0
+            pending_micro_batches = 0
             completed_steps = 0
             last_batch_idx = -1
             for batch_idx, batch in enumerate(self.train_dataloader):
@@ -496,29 +555,43 @@ class TrainEagle1Recipe(BaseRecipe):
                     attention_mask=batch["attention_mask"],
                     loss_mask=batch["loss_mask"],
                 )
-                metrics = self.trainer_module(
-                    input_ids=target_batch.input_ids,
-                    attention_mask=target_batch.attention_mask,
-                    loss_mask=target_batch.loss_mask,
-                    input_hidden_states=target_batch.input_hidden_states,
-                    target_hidden_states=target_batch.target_hidden_states,
-                    target_logits=target_batch.target_logits,
+                # Skip DDP's per-micro-batch all-reduce on every micro-batch
+                # except the one an optimizer step immediately follows; that
+                # step's all-reduce covers the whole locally-accumulated window.
+                sync_grads = _should_sync_grads(
+                    pending_micro_batches=pending_micro_batches,
+                    grad_accumulation_steps=self.grad_accumulation_steps,
+                    batch_idx=batch_idx,
+                    batches_per_epoch=batches_per_epoch,
+                    is_ddp=is_ddp,
                 )
-                loss = metrics.loss / self.grad_accumulation_steps
-                loss.backward()
+                sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
+                with sync_ctx:
+                    metrics = self.trainer_module(
+                        input_ids=target_batch.input_ids,
+                        attention_mask=target_batch.attention_mask,
+                        loss_mask=target_batch.loss_mask,
+                        input_hidden_states=target_batch.input_hidden_states,
+                        target_hidden_states=target_batch.target_hidden_states,
+                        target_logits=target_batch.target_logits,
+                    )
+                    loss = metrics.loss / self.grad_accumulation_steps
+                    loss.backward()
 
                 running_loss += metrics.loss.detach().item()
                 running_acc += metrics.accuracy.detach().item()
                 epoch_loss += metrics.loss.detach().item()
                 micro_step += 1
+                pending_micro_batches += 1
 
-                if micro_step % self.grad_accumulation_steps == 0:
+                if pending_micro_batches == self.grad_accumulation_steps:
                     torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.lr_scheduler.step()
                     self.runtime.global_step += 1
                     completed_steps += 1
+                    pending_micro_batches = 0
 
                     if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
                         avg_loss = running_loss / self.log_every_steps
@@ -534,13 +607,42 @@ class TrainEagle1Recipe(BaseRecipe):
                         running_loss = 0.0
                         running_acc = 0.0
 
-            if micro_step % self.grad_accumulation_steps != 0:
+            # Flush the trailing partial accumulation window. When
+            # ``batches_per_epoch`` is not a multiple of ``grad_accumulation_steps``,
+            # up to ``grad_accumulation_steps - 1`` micro-batches have run
+            # ``backward()`` but never reached an ``optimizer.step()`` -- those
+            # gradients would otherwise be wiped by the next epoch's
+            # ``zero_grad`` and the samples wasted.
+            #
+            # Each micro-batch divided its loss by ``grad_accumulation_steps``
+            # in anticipation of a full window. With only ``pending_micro_batches``
+            # contributors, the accumulated gradient magnitude is
+            # ``pending_micro_batches / grad_accumulation_steps`` of a normal
+            # step; rescale by the inverse so the trailing step's gradient is on
+            # the same scale as every other step.
+            #
+            # Assumption: every data-parallel rank reaches this flush with the
+            # same ``pending_micro_batches``. That holds here because the loader
+            # uses ``DistributedSampler`` with ``drop_last=False`` (and the
+            # DataLoader likewise), which pads every rank to an equal sample
+            # count -> equal batches per epoch -> equal trailing windows. If a
+            # non-padding / variable-length sampler is ever introduced, revisit
+            # this: a divergent per-rank ``scale`` would desync parameters, and
+            # a rank that lands on ``pending_micro_batches == 0`` would skip the
+            # flush (and the ``clip_grad_norm_`` collective inside it) while its
+            # peers step, hanging on the mismatched collective.
+            if pending_micro_batches > 0:
+                scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
+                for p in self.trainer_module.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(scale)
                 torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.lr_scheduler.step()
                 self.runtime.global_step += 1
                 completed_steps += 1
+                pending_micro_batches = 0
 
             eval_metrics = self._run_eval()
             if self.dist_env.is_main:
