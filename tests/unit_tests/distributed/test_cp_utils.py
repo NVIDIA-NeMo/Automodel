@@ -423,8 +423,14 @@ def test_attach_context_parallel_hooks_skips_vision_tower_self_attn():
 def test_cp_attention_module_name_filter_excludes_multimodal_towers():
     assert _cu._is_cp_attention_module_name("model.language_model.layers.0.self_attn")
     assert not _cu._is_cp_attention_module_name("model.vision_tower.encoder.layers.0.self_attn")
+    assert not _cu._is_cp_attention_module_name("model.vision_model.encoder.layers.0.self_attn")
+    assert not _cu._is_cp_attention_module_name("model.image_model.encoder.layers.0.self_attn")
+    assert not _cu._is_cp_attention_module_name("model.image_tower.encoder.layers.0.self_attn")
     assert not _cu._is_cp_attention_module_name("model.audio_tower.encoder.layers.0.self_attn")
+    assert not _cu._is_cp_attention_module_name("model.audio_model.encoder.layers.0.self_attn")
     assert not _cu._is_cp_attention_module_name("model.video_tower.encoder.layers.0.self_attn")
+    assert not _cu._is_cp_attention_module_name("model.video_model.encoder.layers.0.self_attn")
+    assert not _cu._is_cp_attention_module_name("model.visual_model.encoder.layers.0.self_attn")
 
 
 # ============================================================================
