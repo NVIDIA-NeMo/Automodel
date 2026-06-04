@@ -14,6 +14,7 @@
 
 import io
 import logging
+from typing import Iterable
 
 import torch
 from PIL import Image
@@ -230,6 +231,20 @@ def _build_video_metadata(conversation):
                     )
                 )
     return metadata_list
+
+
+def default_stop_tokens(processor) -> Iterable[str]:
+    """Return default generation stop tokens for a processor tokenizer."""
+    tokenizer = getattr(processor, "tokenizer", None)
+    eos_token = getattr(tokenizer, "eos_token", None) if tokenizer is not None else None
+    candidates = [
+        "<end_of_turn>",
+        "<|im_end|>",
+        "<|eot_id|>",
+    ]
+    if eos_token is not None:
+        candidates.append(eos_token)
+    return tuple(candidates)
 
 
 def json2token(obj, sort_json_key: bool = True):

@@ -107,9 +107,9 @@ def test_qwen3_omni_asr_registry_guard(vlm_collate_mod, audio_collate_mod):
     assert vlm_collate_mod.COLLATE_FNS["Qwen3OmniMoeProcessor"] is not audio_collate_mod.qwen3_omni_asr_collate_fn
 
 
-def test_qwen2_5_omni_asr_registry_points_at_audio_collate(vlm_collate_mod, audio_collate_mod):
-    """The registry's Qwen2.5-Omni entry must resolve to the moved ASR collate."""
-    assert vlm_collate_mod.COLLATE_FNS["Qwen2_5OmniProcessor"] is audio_collate_mod.qwen2_5_omni_asr_collate_fn
+def test_qwen2_5_omni_not_in_vlm_registry(vlm_collate_mod):
+    """Qwen2_5OmniProcessor should NOT be in the VLM COLLATE_FNS; ASR recipes use _target_ directly."""
+    assert "Qwen2_5OmniProcessor" not in vlm_collate_mod.COLLATE_FNS
 
 
 def test_qwen3_omni_asr_extract_audios_from_conversation(audio_collate_mod):

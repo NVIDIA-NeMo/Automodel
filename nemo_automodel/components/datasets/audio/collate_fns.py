@@ -18,7 +18,7 @@ as 1-D ``np.ndarray`` items (see
 :func:`nemo_automodel.components.datasets.audio.datasets.make_hf_audio_asr_dataset`),
 so they feed the processor's ``audio=`` kwarg directly without going through
 ``qwen_omni_utils`` / ``torchcodec``. Label masking is delegated to the shared
-marker-based :func:`nemo_automodel.components.datasets.label_utils.build_labels_from_template`.
+marker-based :func:`nemo_automodel.components.datasets.vlm.collate_fns.build_labels_from_template`.
 """
 
 from typing import Any, Dict, List, Sequence
@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Sequence
 import numpy as np
 import torch
 
-from nemo_automodel.components.datasets.label_utils import build_labels_from_template
+from nemo_automodel.components.datasets.vlm.collate_fns import build_labels_from_template
 
 
 def _extract_audios_from_conversation(conversation: Sequence[Dict[str, Any]]) -> List[Any]:

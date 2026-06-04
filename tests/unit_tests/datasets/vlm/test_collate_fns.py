@@ -526,7 +526,7 @@ def test_nemotron_parse_collate_shifts_and_casts(collate_mod, monkeypatch):
 
     # nemotron_parse_collate_fn builds labels via build_labels_from_template;
     # stub that (the function the collate actually calls) rather than the inner
-    # build_labels, which now lives in label_utils.
+    # build_labels.
     monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
 
     examples = [

@@ -21,7 +21,7 @@ import torch
 
 @pytest.fixture()
 def label_mod():
-    import nemo_automodel.components.datasets.label_utils as _m
+    import nemo_automodel.components.datasets.vlm.collate_fns as _m
 
     return importlib.reload(_m)
 
