@@ -279,6 +279,41 @@ def _build_reasoning_mask(
     return reasoning_mask
 
 
+def _mask_labels_to_last_turn(mask: List[int], ignore_index: int = -100) -> List[int]:
+    """Restrict supervision to the final assistant turn (``mask_history``).
+
+    Operates on any per-token sequence where ``ignore_index`` marks
+    unsupervised positions: a label list (``ignore_index=-100``) or a 0/1
+    assistant mask (``ignore_index=0``). Each assistant turn renders as a
+    single contiguous supervised span, so this keeps only the last such run
+    and rewrites every earlier supervised position to ``ignore_index``.
+
+    Apply this to the assistant mask **before** any reasoning_content holes are
+    punched into it; running it on already-holed labels would treat the
+    reasoning gap as a turn boundary and drop in-turn content before the hole.
+
+    Args:
+        mask: per-token labels or 0/1 mask (``ignore_index`` marks unsupervised).
+        ignore_index: the value marking unsupervised positions.
+
+    Returns:
+        The same list, mutated so only the final supervised run is kept.
+    """
+    last = -1
+    for i in range(len(mask) - 1, -1, -1):
+        if mask[i] != ignore_index:
+            last = i
+            break
+    if last < 0:
+        return mask
+    start = last
+    while start - 1 >= 0 and mask[start - 1] != ignore_index:
+        start -= 1
+    for i in range(start):
+        mask[i] = ignore_index
+    return mask
+
+
 @torch.no_grad()
 def _get_right_trailing_pad_mask(
     sequence: torch.Tensor,
@@ -583,6 +618,7 @@ def format_chat_template(
     tools: Optional[List[Dict]] = None,
     answer_only_loss_mask: bool = True,
     mask_reasoning_content: bool = False,
+    train_on_last_turn_only: bool = False,
     unshifted: bool = False,
 ) -> Dict[str, List[int]]:
     """
@@ -597,6 +633,9 @@ def format_chat_template(
         tools: Optional list of tool definitions for function calling.
         answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
         mask_reasoning_content: Whether to exclude rendered reasoning_content tokens from loss.
+        train_on_last_turn_only: Whether to supervise only the final assistant turn,
+            masking every earlier assistant turn (``mask_history``). Applied to the
+            assistant mask before reasoning_content is masked out.
 
     Returns:
         A dictionary with the formatted example.
@@ -666,6 +705,11 @@ def format_chat_template(
         for i in range(min(len(mask), len(tokenizer_attn_mask))):
             if not tokenizer_attn_mask[i]:
                 mask[i] = 0
+
+    # Restrict to the last assistant turn before reasoning is masked, so the
+    # contiguous-run heuristic sees a hole-free mask (one run per turn).
+    if train_on_last_turn_only:
+        _mask_labels_to_last_turn(mask, ignore_index=0)
 
     if mask_reasoning_content and has_reasoning_content:
         reasoning_mask = _build_reasoning_mask(
