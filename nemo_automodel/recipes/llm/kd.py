@@ -773,6 +773,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
             v.close()
+        self._finalize_pending_checkpoint()
         self.checkpointer.close()
 
     @torch.no_grad()
