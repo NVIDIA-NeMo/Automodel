@@ -141,13 +141,14 @@ def _uses_te_dot_product_attention(model_or_cfg):
 
 
 def _uses_thd_collater(cfg_dataloader):
+    """Return True if the dataloader's collate_fn is ``packed_sequence_thd_collater``.
+
+    ``collate_fn`` ends in ``_fn``, so ConfigNode resolves the YAML dotted-path string to
+    the actual callable at load time — the value here is always the function, never a string.
+    """
     from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
-    return (
-        True
-        if hasattr(cfg_dataloader, "collate_fn") and cfg_dataloader.collate_fn == packed_sequence_thd_collater
-        else False
-    )
+    return getattr(cfg_dataloader, "collate_fn", None) is packed_sequence_thd_collater
 
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
@@ -1131,15 +1132,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
+        _thd_collater = _uses_thd_collater(self.cfg.dataloader)
+        # Gate THD/cu_seqlens processing on the dataset being THD-packed, not on TE
+        # attention being present on this rank: both TE attention and mamba need
+        # cu_seqlens, and gating on attention would drop PP stages with no attention
+        # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream.
+        _use_te_value = _thd_collater
+        _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
             batch,
-            use_te=_uses_te_dot_product_attention(
-                self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
-            )
-            and _uses_thd_collater(self.cfg.dataloader),
+            use_te=_use_te_value,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-            num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
+            num_chunks=_num_chunks_value,
         )
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
@@ -1163,7 +1168,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 batch_filtered = {
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
                 }
-
+                # Hand the THD ``cu_seqlens`` to the PP loss to mask cross-sequence boundaries —
+                # the fallback when the model emits no per-microbatch seq_idx tail (which the loss
+                # prefers). One cu_seqlens encodes a single shared layout, so it is only correct at
+                # one pack/microbatch per step; the seq_idx tail handles differing per-microbatch boundaries.
+                cu_seqlens = batch_filtered.get("cu_seqlens")
+                if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
+                    cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
+                pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
+                if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
+                    pp_loss_fn.cu_seqlens = cu_seqlens
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:
@@ -1230,6 +1244,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
                         ignore_index=mtp_cfg.ignore_index,
+                        # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
+                        cu_seqlens=batch.get("cu_seqlens"),
                     )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
