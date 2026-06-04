@@ -36,6 +36,8 @@ SHAPE_KEY = "shape"
 DATA_KEY = "data"
 DTYPE_KEY = "dtype"
 DATA_OFFSETS_KEY = "data_offsets"
+FQN_TO_DTYPE_MAPPING_FILENAME = "fqn_to_dtype_mapping.json"
+FQN_TO_FILE_INDEX_MAPPING_FILENAME = "fqn_to_file_index_mapping.json"
 
 DTYPE_MAP = {
     "F16": torch.float16,
