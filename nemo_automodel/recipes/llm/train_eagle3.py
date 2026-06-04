@@ -48,6 +48,7 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
 )
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
     HFEagle3TargetModel,
@@ -276,6 +277,16 @@ class TrainEagle3Recipe(BaseRecipe):
         )
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
+
+        # Optional Weights & Biases logging (rank 0 only).
+        self.wandb_run = None
+        if self.dist_env.is_main and self.cfg.get("wandb", None) is not None:
+            suppress_wandb_log_messages()
+            self.wandb_run = init_wandb_run(
+                self.cfg.wandb.to_dict(),
+                self.cfg.to_dict(),
+                default_name="eagle3_" + str(target_path).rstrip("/").split("/")[-1],
+            )
 
     def _setup_online_target(self, recipe_cfg, target_path, target_config):
         """Live path: load the target model and build the live dataloader.
@@ -686,6 +697,12 @@ class TrainEagle3Recipe(BaseRecipe):
         self.trainer_module.train()
         return (total_loss / total_batches.clamp_min(1.0), total_acc / total_batches.clamp_min(1.0))
 
+    def _wandb_log(self, data: dict, step: int) -> None:
+        """Log a metrics dict to W&B when a run is active (rank 0)."""
+        run = getattr(self, "wandb_run", None)
+        if run is not None:
+            run.log(data, step=step)
+
     def run_train_validation_loop(self):
         """Run the minimal EAGLE-3 train loop."""
         self.trainer_module.train()
@@ -749,7 +766,7 @@ class TrainEagle3Recipe(BaseRecipe):
                 pending_micro_batches += 1
 
                 if pending_micro_batches == self.grad_accumulation_steps:
-                    torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
@@ -768,6 +785,16 @@ class TrainEagle3Recipe(BaseRecipe):
                                 mean_loss.item(),
                                 mean_acc.item(),
                                 current_lr,
+                            )
+                            self._wandb_log(
+                                {
+                                    "train/loss": mean_loss.item(),
+                                    "train/accuracy": mean_acc.item(),
+                                    "train/lr": current_lr,
+                                    "train/grad_norm": float(grad_norm),
+                                    "train/epoch": epoch,
+                                },
+                                step=self.runtime.global_step,
                             )
                         running_loss.zero_()
                         running_acc.zero_()
@@ -791,7 +818,7 @@ class TrainEagle3Recipe(BaseRecipe):
                 for p in self.trainer_module.parameters():
                     if p.grad is not None:
                         p.grad.mul_(scale)
-                torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -810,6 +837,16 @@ class TrainEagle3Recipe(BaseRecipe):
                             mean_loss.item(),
                             mean_acc.item(),
                             current_lr,
+                        )
+                        self._wandb_log(
+                            {
+                                "train/loss": mean_loss.item(),
+                                "train/accuracy": mean_acc.item(),
+                                "train/lr": current_lr,
+                                "train/grad_norm": float(grad_norm),
+                                "train/epoch": epoch,
+                            },
+                            step=self.runtime.global_step,
                         )
                     running_loss.zero_()
                     running_acc.zero_()
@@ -837,6 +874,10 @@ class TrainEagle3Recipe(BaseRecipe):
                         val_loss_dict["val_loss"],
                         val_loss_dict["val_accuracy"],
                     )
+                    self._wandb_log(
+                        {"val/loss": val_loss_dict["val_loss"], "val/accuracy": val_loss_dict["val_accuracy"]},
+                        step=self.runtime.global_step,
+                    )
             self.save_checkpoint(
                 epoch=epoch + 1,
                 step=self.runtime.global_step,
@@ -852,6 +893,9 @@ class TrainEagle3Recipe(BaseRecipe):
                     epoch + 1,
                     self.runtime.global_step,
                 )
+
+        if getattr(self, "wandb_run", None) is not None:
+            self.wandb_run.finish()
 
         if self.dist_env.is_main:
             logger.info("Training complete: global_step=%s", self.runtime.global_step)
