@@ -43,6 +43,16 @@ except ImportError:  # pragma: no cover - depends on torch build
     create_block_mask = None
 
 
+class NoValidAnchorsError(ValueError):
+    """Raised when a batch has no sample long enough to form a DFlash block.
+
+    A DFlash anchor needs at least ``block_size + 1`` supervised tokens (the
+    anchor plus its block). Datasets always contain some short conversations;
+    the training loop catches this and skips the offending micro-batch rather
+    than aborting the run.
+    """
+
+
 @dataclass
 class DFlashStepMetrics:
     """Per-step training outputs for the DFlash draft."""
@@ -162,9 +172,9 @@ class DFlashTrainerModule(nn.Module):
         valid_counts = valid.sum(dim=1)
         max_n = min(self.num_anchors, int(valid_counts.max().item()) - 1)
         if max_n <= 0:
-            raise ValueError(
-                "No valid anchor positions; ensure each sample has at least "
-                f"block_size+1 ({bs + 1}) supervised tokens before batching."
+            raise NoValidAnchorsError(
+                "No valid anchor positions in this batch; every sample has fewer than "
+                f"block_size+1 ({bs + 1}) supervised tokens."
             )
 
         indices = torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)

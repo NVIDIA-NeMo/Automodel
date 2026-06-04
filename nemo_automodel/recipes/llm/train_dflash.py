@@ -50,7 +50,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule
+from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
 from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel
@@ -239,6 +239,7 @@ class TrainDFlashRecipe(BaseRecipe):
         self.total_optim_steps = total_optim_steps
         self.runtime = SimpleNamespace(global_step=0)
         self._resume_epoch = 0
+        self._skipped_micro_batches = 0
 
         self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)), ranked=self.dist_env.world_size > 1)
         self._build_checkpointer(target_path)
@@ -528,14 +529,23 @@ class TrainDFlashRecipe(BaseRecipe):
                 )
                 is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
                 sync_ctx = nullcontext() if (not is_ddp or is_window_close) else self.trainer_module.no_sync()
-                with sync_ctx:
-                    metrics = self.trainer_module(
-                        input_ids=target_batch.input_ids,
-                        hidden_states=target_batch.hidden_states,
-                        loss_mask=target_batch.loss_mask,
-                    )
-                    loss = metrics.loss / self.grad_accumulation_steps
-                    loss.backward()
+                try:
+                    with sync_ctx:
+                        metrics = self.trainer_module(
+                            input_ids=target_batch.input_ids,
+                            hidden_states=target_batch.hidden_states,
+                            loss_mask=target_batch.loss_mask,
+                        )
+                        loss = metrics.loss / self.grad_accumulation_steps
+                        loss.backward()
+                except NoValidAnchorsError:
+                    # Every sample in this micro-batch is too short to form a block;
+                    # nothing to learn from it. Skip without touching the
+                    # accumulation counters. (No backward ran, so grads are intact.)
+                    # NOTE: under DDP this skip is per-rank and data-dependent; pre-filter
+                    # short samples for multi-rank runs to keep optimizer steps in lockstep.
+                    self._skipped_micro_batches += 1
+                    continue
 
                 running_loss += metrics.loss.detach().item()
                 running_acc += metrics.accuracy.detach().item()
@@ -583,7 +593,10 @@ class TrainDFlashRecipe(BaseRecipe):
 
             eval_metrics = self._run_eval()
             if self.dist_env.is_main:
-                msg = f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps}"
+                msg = (
+                    f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps} "
+                    f"skipped_short_micro_batches={self._skipped_micro_batches}"
+                )
                 if eval_metrics is not None:
                     msg += f" val_loss={eval_metrics['val_loss']:.4f} val_accuracy={eval_metrics['val_accuracy']:.4f}"
                 logger.info(msg)

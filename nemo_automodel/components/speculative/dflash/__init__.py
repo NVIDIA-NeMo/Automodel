@@ -23,6 +23,7 @@ autoregressive single-step drafting. See
 from nemo_automodel.components.speculative.dflash.core import (
     DFlashStepMetrics,
     DFlashTrainerModule,
+    NoValidAnchorsError,
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
@@ -41,6 +42,7 @@ from nemo_automodel.components.speculative.dflash.target import DFlashTargetBatc
 __all__ = [
     "DFlashTrainerModule",
     "DFlashStepMetrics",
+    "NoValidAnchorsError",
     "create_dflash_block_mask",
     "create_dflash_sdpa_mask",
     "Qwen3DFlashDraftModel",
