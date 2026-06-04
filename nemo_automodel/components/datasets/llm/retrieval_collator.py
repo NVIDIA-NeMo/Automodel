@@ -16,14 +16,8 @@ import hashlib
 from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 import torch
-from transformers import AutoConfig, AutoProcessor, DataCollatorWithPadding, PreTrainedTokenizerBase, ProcessorMixin
+from transformers import AutoConfig, AutoProcessor, DataCollatorWithPadding, PreTrainedTokenizerBase
 from transformers.file_utils import PaddingStrategy
-
-from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
-
-MODELS_WITH_PROCESSOR = {
-    "llama_nemotron_vl": LlamaNemotronVLProcessor,
-}
 
 
 def _doc_id_str_to_int64(doc_id: str) -> int:
@@ -310,18 +304,92 @@ class CrossEncoderCollator(DataCollatorWithPadding):
         return batch_dict
 
 
-def make_vision_collator_from_processor_method(tokenizer: ProcessorMixin, collator_fn_name: str):
-    """
-    Turns a method of a processor into a collator function.
+class VisionBiEncoderCollator:
+    """Collate multimodal bi-encoder batches with a processor.
 
     Args:
-        tokenizer: The processor instance.
-        collator_fn_name: The name of the proceessor method to turn into a collator function.
-
-    Returns:
-        A collator for vision/multimodal retrieval datasets.
+        processor: Processor that implements ``process_queries_documents_biencoder``.
+        return_tensors: Tensor format forwarded to the processor.
+        padding: Padding mode forwarded to the processor. ``None`` lets the processor
+            use its configured default.
+        truncation: Whether processor tokenization should truncate.
+        processor_kwargs: Extra keyword arguments forwarded to the processor collator method.
     """
-    return getattr(tokenizer, collator_fn_name)
+
+    def __init__(
+        self,
+        processor: Any,
+        return_tensors: str = "pt",
+        padding: bool | str | None = None,
+        truncation: bool = True,
+        **processor_kwargs,
+    ) -> None:
+        processor_method = getattr(processor, "process_queries_documents_biencoder", None)
+        if not callable(processor_method):
+            raise ValueError("processor must implement callable process_queries_documents_biencoder")
+        self.processor_method = processor_method
+        self.return_tensors = return_tensors
+        self.padding = padding
+        self.truncation = truncation
+        self.processor_kwargs = processor_kwargs
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+        kwargs = {
+            "return_tensors": self.return_tensors,
+            "truncation": self.truncation,
+            **self.processor_kwargs,
+        }
+        if self.padding is not None:
+            kwargs["padding"] = self.padding
+        batch_dict = self.processor_method(features, **kwargs)
+        if features and features[0].get("doc_id") is not None:
+            doc_id_flat: list[str] = []
+            for feature in features:
+                doc_id_flat.extend(feature["doc_id"])
+            batch_dict["passage_doc_ids"] = torch.tensor(
+                [_doc_id_str_to_int64(str(doc_id)) for doc_id in doc_id_flat],
+                dtype=torch.long,
+            )
+        return batch_dict
+
+
+class ProcessorMethodCollator:
+    """Compatibility adapter that turns a named processor method into a collator.
+
+    Prefer ``VisionBiEncoderCollator`` for new configs.
+    """
+
+    def __init__(self, processor: Any, collator_fn_name: str, **processor_kwargs) -> None:
+        if not hasattr(processor, collator_fn_name):
+            raise ValueError(f"processor does not implement {collator_fn_name}")
+        collator_fn = getattr(processor, collator_fn_name)
+        if not callable(collator_fn):
+            raise ValueError(f"processor attribute {collator_fn_name} is not callable")
+        self.collator_fn = collator_fn
+        self.processor_kwargs = processor_kwargs
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+        return self.collator_fn(features, **self.processor_kwargs)
+
+
+def make_vision_collator_from_processor_method(
+    processor: Any = None,
+    tokenizer: Any = None,
+    collator_fn_name: str = "process_queries_documents_biencoder",
+    **processor_kwargs,
+) -> ProcessorMethodCollator:
+    """Return a collator that delegates to a named processor method.
+
+    This keeps older PR configs working where the recipe injected a processor
+    under the keyword ``tokenizer``. New configs should use
+    ``VisionBiEncoderCollator`` with a ``processor:`` recipe section.
+    """
+    if processor is not None and tokenizer is not None and processor is not tokenizer:
+        raise ValueError("Specify either processor or tokenizer, not both")
+    processor = processor if processor is not None else tokenizer
+    if processor is None:
+        raise ValueError("processor is required")
+    return ProcessorMethodCollator(processor, collator_fn_name, **processor_kwargs)
 
 
 # Deprecated: To be replaced by make_vision_collator_from_processor_method()
@@ -339,10 +407,10 @@ def make_vision_retrieval_collator_from_processor_path(model_name_or_path: str, 
     if "tokenizer" in kwargs:
         del kwargs["tokenizer"]
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
-    if config.model_type in MODELS_WITH_PROCESSOR:
-        processor = MODELS_WITH_PROCESSOR[config.model_type].from_pretrained(
-            model_name_or_path, trust_remote_code=True, **kwargs
-        )
+    if config.model_type == "llama_nemotron_vl":
+        from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
+
+        processor = LlamaNemotronVLProcessor.from_pretrained(model_name_or_path, trust_remote_code=True, **kwargs)
     else:
         processor = AutoProcessor.from_pretrained(model_name_or_path, trust_remote_code=True, **kwargs)
     return processor.process_queries_documents_biencoder

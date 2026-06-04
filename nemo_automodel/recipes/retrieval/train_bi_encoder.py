@@ -18,6 +18,7 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -157,7 +158,21 @@ def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
     return query_batch_dict, doc_batch_dict
 
 
-def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_world_size=1):
+def _get_text_tokenizer(tokenizer_or_processor: Any) -> Any:
+    """Return the underlying text tokenizer from a tokenizer or processor."""
+    if isinstance(tokenizer_or_processor, ProcessorMixin):
+        return tokenizer_or_processor.tokenizer
+    return tokenizer_or_processor
+
+
+def _instantiate_collate_fn(cfg_collate_fn, tokenizer_or_processor: Any):
+    """Instantiate a collator with the runtime object it semantically expects."""
+    if isinstance(tokenizer_or_processor, ProcessorMixin):
+        return cfg_collate_fn.instantiate(processor=tokenizer_or_processor)
+    return cfg_collate_fn.instantiate(tokenizer=tokenizer_or_processor)
+
+
+def build_dataloader(cfg_dl, tokenizer_or_processor, seed, batch_size=None, dp_rank=0, dp_world_size=1):
     """Build a DataLoader for encoder training."""
     with ScopedRNG(seed=seed, ranked=True):
         with FirstRankPerNode():
@@ -165,7 +180,7 @@ def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_wor
 
         collate_fn = None
         if hasattr(cfg_dl, "collate_fn") and hasattr(cfg_dl.collate_fn, "_target_"):
-            collate_fn = cfg_dl.collate_fn.instantiate(tokenizer=tokenizer)
+            collate_fn = _instantiate_collate_fn(cfg_dl.collate_fn, tokenizer_or_processor)
 
         if not isinstance(dataset, IterableDataset):
             shuffle = cfg_dl.get("shuffle", True)
@@ -297,16 +312,19 @@ class TrainBiEncoderRecipe(BaseRecipe):
             logger=logger,
         )
 
-        # Might be tokenizer or processor (for VLMs)
-        self.tokenizer = self.cfg.tokenizer.instantiate()
-        tokenizer = self.tokenizer.tokenizer if isinstance(self.tokenizer, ProcessorMixin) else self.tokenizer
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = self.tokenizer.eos_token
-            tokenizer.padding_side = "left"
+        self.processor = self.cfg.processor.instantiate() if self.cfg.get("processor", None) is not None else None
+        # BaseRecipe checkpoints ProcessorMixin objects directly, so keep tokenizer-only configs in self.tokenizer.
+        self.tokenizer = None if self.processor is not None else self.cfg.tokenizer.instantiate()
+        tokenizer_or_processor = self.processor if self.processor is not None else self.tokenizer
+
+        text_tokenizer = _get_text_tokenizer(tokenizer_or_processor)
+        if text_tokenizer.pad_token is None:
+            text_tokenizer.pad_token = text_tokenizer.eos_token
+            text_tokenizer.padding_side = "left"
 
         self.dataloader = build_dataloader(
             self.cfg.dataloader,
-            self.tokenizer,
+            tokenizer_or_processor,
             seed=self.cfg.get("seed", 42),
             batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
             dp_rank=self._get_dp_rank(),
@@ -321,7 +339,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             )
             self.val_dataloader = build_dataloader(
                 self.cfg.validation_dataloader,
-                self.tokenizer,
+                tokenizer_or_processor,
                 seed=self.cfg.get("seed", 42),
                 batch_size=val_batch_size,
                 dp_rank=self._get_dp_rank(),

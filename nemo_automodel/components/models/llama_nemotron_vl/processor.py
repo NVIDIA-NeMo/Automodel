@@ -10,10 +10,26 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import requests
 import torch
-import torchvision.transforms as T
 from PIL import Image
-from torchvision.transforms.functional import InterpolationMode
-from transformers import AutoProcessor, BatchEncoding, PretrainedConfig, ProcessorMixin
+from transformers import BatchEncoding, PretrainedConfig, ProcessorMixin
+
+try:
+    import torchvision.transforms as T
+    from torchvision.transforms.functional import InterpolationMode
+except ImportError as import_error:
+    T = None
+    InterpolationMode = None
+    _TORCHVISION_IMPORT_ERROR = import_error
+else:
+    _TORCHVISION_IMPORT_ERROR = None
+
+
+def _require_torchvision():
+    if T is None or InterpolationMode is None:
+        raise ImportError(
+            "torchvision is required for LlamaNemotronVLProcessor image preprocessing."
+        ) from _TORCHVISION_IMPORT_ERROR
+
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -83,6 +99,7 @@ def load_image(image):
 
 def build_transform(input_size, norm_type="imagenet"):
     """Build a transform for an image."""
+    _require_torchvision()
     if norm_type == "imagenet":
         MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
     elif norm_type == "siglip":
@@ -223,61 +240,88 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
 
     def __call__(
         self,
-        text: Optional[List[str]] = None,
-        images: Optional[List[Any]] = None,
+        images: Optional[Union[Any, List[Any]]] = None,
+        text: Optional[Union[str, List[str]]] = None,
         text_kwargs: Optional[Dict[str, Any]] = None,
         images_kwargs: Optional[Dict[str, Any]] = None,
         common_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """Process text and/or image inputs into model-ready features.
-        This method provides compatibility with the standard HuggingFace processor interface
-        used by Sentence Transformers. For image inputs, it delegates to process_documents.
-        For text-only inputs, it tokenizes directly (assuming any task prefix has already been
-        applied by the caller).
+
+        This method follows the Hugging Face processor call convention. For
+        image inputs, it delegates to ``process_documents``. For text-only
+        inputs, it tokenizes directly, assuming any task prefix has already been
+        applied by the caller.
+
         Args:
-            text: List of text strings. For text-only inputs, these should already include
-                any task prefix (e.g. "query: " or "passage: ").
-            images: List of PIL Images for document encoding.
-            text_kwargs: Keyword arguments for text processing (e.g. padding, truncation).
-            images_kwargs: Keyword arguments for image processing (unused, for API compat).
-            common_kwargs: Common keyword arguments (e.g. return_tensors).
-            **kwargs: Additional keyword arguments (ignored).
+            images: Image input or batch of image inputs for document encoding.
+            text: Text input or batch of text inputs. Text should already include
+                any task prefix (e.g. "query: " or "passage: ") for text-only calls.
+            text_kwargs: Keyword arguments for tokenizer processing.
+            images_kwargs: Keyword arguments for document/image processing.
+            common_kwargs: Common keyword arguments such as ``return_tensors``.
+            **kwargs: Additional tokenizer keyword arguments.
+
         Returns:
-            Dict with "input_ids", "attention_mask", and optionally "pixel_values".
+            Dict with ``input_ids``, ``attention_mask``, and optionally ``pixel_values``.
         """
         text_kwargs = text_kwargs or {}
+        images_kwargs = images_kwargs or {}
         common_kwargs = common_kwargs or {}
-        tokenizer_kwargs = {**common_kwargs, **text_kwargs}
+        tokenizer_kwargs = {**kwargs, **common_kwargs, **text_kwargs}
+
+        document_kwargs = {}
+        if "pixel_values_layout" in tokenizer_kwargs:
+            document_kwargs["pixel_values_layout"] = tokenizer_kwargs.pop("pixel_values_layout")
+        supported_image_kwargs = {"pixel_values_layout"}
+        unsupported_image_kwargs = set(images_kwargs) - supported_image_kwargs
+        if unsupported_image_kwargs:
+            raise ValueError(f"Unsupported images_kwargs: {sorted(unsupported_image_kwargs)}")
+        document_kwargs.update(images_kwargs)
+
         return_tensors = tokenizer_kwargs.pop("return_tensors", "pt")
         padding = tokenizer_kwargs.pop("padding", self.padding)
         truncation = tokenizer_kwargs.pop("truncation", True)
 
         if images is not None:
-            # Image or image+text: delegate to process_documents which handles
-            # image tiling, image token creation, and the passage prefix.
-            if text is not None:
-                documents = [{"image": img, "text": t} for img, t in zip(images, text)]
+            image_list = images if isinstance(images, list) else [images]
+            if text is None:
+                text_list = [""] * len(image_list)
+            elif isinstance(text, str):
+                text_list = [text] * len(image_list)
             else:
-                documents = [{"image": img, "text": ""} for img in images]
+                text_list = text
+
+            if len(text_list) != len(image_list):
+                raise ValueError("text and images must have the same batch size")
+
+            documents = [{"image": img, "text": txt} for img, txt in zip(image_list, text_list)]
             return self.process_documents(
                 documents,
                 return_tensors=return_tensors,
                 padding=padding,
                 truncation=truncation,
+                **document_kwargs,
+                **tokenizer_kwargs,
             )
 
-        # Text-only: just tokenize (the caller has already applied any prompt prefix)
-        max_length = None
-        if truncation:
+        if text is None:
+            raise ValueError("At least one of images or text must be provided")
+
+        text_batch = [text] if isinstance(text, str) else text
+        max_length = tokenizer_kwargs.pop("max_length", None)
+        if truncation and max_length is None:
             max_length = self.p_max_length or self.tokenizer.model_max_length
+        pad_to_multiple_of = tokenizer_kwargs.pop("pad_to_multiple_of", self.pad_to_multiple_of)
         return self.tokenizer(
-            text,
+            text_batch,
             padding=padding,
             truncation=truncation,
             max_length=max_length,
-            pad_to_multiple_of=self.pad_to_multiple_of,
+            pad_to_multiple_of=pad_to_multiple_of,
             return_tensors=return_tensors,
+            **tokenizer_kwargs,
         )
 
     def process_documents(
@@ -286,6 +330,8 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
         return_tensors: Literal["pt", "np"] = "pt",
         padding: bool | str | None = None,
         truncation: bool = True,
+        max_length: Optional[int] = None,
+        pad_to_multiple_of: Optional[int] = None,
         pixel_values_layout: Literal["per_image", "flat_tiles"] = "flat_tiles",
         **kwargs,
     ) -> Dict[str, Any]:
@@ -298,6 +344,8 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
             padding: Padding strategy passed to the tokenizer. Defaults to the value
                 set in the processor constructor.
             truncation: Whether to truncate sequences to p_max_length.
+            max_length: Optional tokenizer max length override.
+            pad_to_multiple_of: Optional tokenizer padding multiple override.
             pixel_values_layout: How to structure the pixel values output:
                 - "flat_tiles": All image tiles concatenated into a single tensor of shape
                   (total_tiles, C, H, W). Different images may contribute different numbers
@@ -394,9 +442,10 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
 
             content_prompts.append(content_prompt)
 
-        max_length = None
-        if truncation:
+        if truncation and max_length is None:
             max_length = self.p_max_length or self.tokenizer.model_max_length
+        if pad_to_multiple_of is None:
+            pad_to_multiple_of = self.pad_to_multiple_of
 
         if padding is None:
             padding = self.padding
@@ -406,8 +455,9 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
             truncation=truncation,
             max_length=max_length,
             padding=padding,
-            pad_to_multiple_of=self.pad_to_multiple_of,
+            pad_to_multiple_of=pad_to_multiple_of,
             return_tensors=return_tensors,
+            **kwargs,
         )
 
         if pixel_values_layout == "flat_tiles":
@@ -449,6 +499,8 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
         return_tensors: Literal["pt", "np"] = "pt",
         padding: bool | str | None = None,
         truncation: bool = True,
+        max_length: Optional[int] = None,
+        pad_to_multiple_of: Optional[int] = None,
         **kwargs,
     ) -> BatchEncoding:
         """Process queries into model inputs with tokenized text.
@@ -458,6 +510,8 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
             padding: Padding strategy passed to the tokenizer. Defaults to the value
                 set in the processor constructor.
             truncation: Whether to truncate sequences to q_max_length.
+            max_length: Optional tokenizer max length override.
+            pad_to_multiple_of: Optional tokenizer padding multiple override.
         Returns:
             Dict with "input_ids" and "attention_mask".
         """
@@ -481,9 +535,10 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
 
             query_prompts.append(query_prompt)
 
-        max_length = None
-        if truncation:
+        if truncation and max_length is None:
             max_length = self.q_max_length or self.tokenizer.model_max_length
+        if pad_to_multiple_of is None:
+            pad_to_multiple_of = self.pad_to_multiple_of
 
         if padding is None:
             padding = self.padding
@@ -493,8 +548,9 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
             truncation=truncation,
             max_length=max_length,
             padding=padding,
-            pad_to_multiple_of=self.pad_to_multiple_of,
+            pad_to_multiple_of=pad_to_multiple_of,
             return_tensors=return_tensors,
+            **kwargs,
         )
 
         return batch_query
@@ -512,7 +568,10 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
             pos_neg_text_batch.extend(feature["doc_text"])
             pos_neg_image_batch.extend(feature["doc_image"])
 
-        query_batch_dict = self.process_queries(queries, **kwargs)
+        query_kwargs = dict(kwargs)
+        query_kwargs.pop("pixel_values_layout", None)
+
+        query_batch_dict = self.process_queries(queries, **query_kwargs)
         doc_batch_dict = self.process_documents({"images": pos_neg_image_batch, "texts": pos_neg_text_batch}, **kwargs)
 
         merged_batch_dict = self.merge_batch_dict(query_batch_dict, doc_batch_dict)
@@ -537,7 +596,9 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
         merged_batch_dict["labels"] = labels
         return merged_batch_dict
 
+
 def _register_with_hf_auto_classes():
     LlamaNemotronVLProcessor.register_for_auto_class("AutoProcessor")
+
 
 _register_with_hf_auto_classes()

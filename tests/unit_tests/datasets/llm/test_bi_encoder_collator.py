@@ -12,12 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+import subprocess
+import sys
 from typing import Any, Dict, List
 
 import pytest
 import torch
 
 import nemo_automodel.components.datasets.llm.retrieval_collator as rc
+
+
+def test_public_export_does_not_import_llama_nemotron_processor():
+    script = """
+import sys
+from nemo_automodel.components.datasets import llm
+
+assert hasattr(llm, "VisionBiEncoderCollator")
+assert "nemo_automodel.components.models.llama_nemotron_vl.processor" not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
 
 
 class FakeTokenizer:
@@ -120,12 +133,22 @@ def test_collator_end_to_end_no_prefix():
 def test_collator_with_prefix_and_pad_multiple():
     tok = FakeTokenizer()
     collator = rc.BiEncoderCollator(
-        tokenizer=tok, q_max_len=32, p_max_len=32, query_prefix="Q:", passage_prefix="D:", padding=True, pad_to_multiple_of=4
+        tokenizer=tok,
+        q_max_len=32,
+        p_max_len=32,
+        query_prefix="Q:",
+        passage_prefix="D:",
+        padding=True,
+        pad_to_multiple_of=4,
     )
     # Make varying lengths so padding is exercised and rounded to multiple-of 4
     batch = [
         {"question": "short", "doc_text": ["tiny", "a bit longer"], "doc_image": ["", ""]},
-        {"question": "this is a somewhat longer question", "doc_text": ["short doc", "this is a longish doc text"], "doc_image": ["", ""]},
+        {
+            "question": "this is a somewhat longer question",
+            "doc_text": ["short doc", "this is a longish doc text"],
+            "doc_image": ["", ""],
+        },
     ]
     out = collator(batch)
     # Verify padding rounded to multiple of 4
@@ -220,3 +243,78 @@ def test_collator_with_dataset_instruction():
     # The instruction adds 12 words, so we should see significantly more tokens
     assert with_instruction_tokens > without_instruction_tokens
     assert with_instruction_tokens - without_instruction_tokens > 10  # At least 10 more tokens from instruction
+
+
+class FakeVisionProcessor:
+    def __init__(self):
+        self.calls = []
+
+    def process_queries_documents_biencoder(self, features, **kwargs):
+        self.calls.append((features, kwargs))
+        return {"labels": torch.zeros(len(features), dtype=torch.long), "sentinel": kwargs.get("sentinel")}
+
+
+def test_vision_biencoder_collator_forwards_to_processor():
+    processor = FakeVisionProcessor()
+    collator = rc.VisionBiEncoderCollator(
+        processor=processor,
+        padding="longest",
+        truncation=False,
+        sentinel="ok",
+    )
+    batch = _make_batch(num_examples=2, docs_per_example=2)
+    batch[0]["doc_id"] = ["doc-0-0", "doc-0-1"]
+    batch[1]["doc_id"] = ["doc-1-0", "doc-1-1"]
+
+    out = collator(batch)
+
+    assert out["labels"].shape == (2,)
+    assert out["sentinel"] == "ok"
+    assert out["passage_doc_ids"].tolist() == [
+        rc._doc_id_str_to_int64("doc-0-0"),
+        rc._doc_id_str_to_int64("doc-0-1"),
+        rc._doc_id_str_to_int64("doc-1-0"),
+        rc._doc_id_str_to_int64("doc-1-1"),
+    ]
+    assert processor.calls == [
+        (
+            batch,
+            {
+                "return_tensors": "pt",
+                "truncation": False,
+                "sentinel": "ok",
+                "padding": "longest",
+            },
+        )
+    ]
+
+
+def test_vision_biencoder_collator_requires_processor_method():
+    with pytest.raises(ValueError, match="process_queries_documents_biencoder"):
+        rc.VisionBiEncoderCollator(processor=object())
+
+
+def test_vision_biencoder_collator_requires_callable_processor_method():
+    processor = type("Processor", (), {"process_queries_documents_biencoder": None})()
+
+    with pytest.raises(ValueError, match="callable process_queries_documents_biencoder"):
+        rc.VisionBiEncoderCollator(processor=processor)
+
+
+def test_legacy_processor_method_factory_accepts_tokenizer_keyword():
+    processor = FakeVisionProcessor()
+    collator = rc.make_vision_collator_from_processor_method(tokenizer=processor, sentinel="legacy")
+    batch = _make_batch(num_examples=1, docs_per_example=1)
+
+    out = collator(batch)
+
+    assert out["sentinel"] == "legacy"
+    assert processor.calls == [(batch, {"sentinel": "legacy"})]
+
+
+def test_legacy_processor_method_factory_rejects_different_processor_and_tokenizer():
+    with pytest.raises(ValueError, match="either processor or tokenizer"):
+        rc.make_vision_collator_from_processor_method(
+            processor=FakeVisionProcessor(),
+            tokenizer=FakeVisionProcessor(),
+        )
