@@ -811,7 +811,7 @@ def make_cp_batch_and_ctx(
     of the context_parallel submesh is 1, this function is effectively a no-op.
 
     Args:
-        cp_mesh (DeviceMesh): The device mesh for context parallel.
+        device_mesh (DeviceMesh): The device mesh for context parallel.
         batch (Dict[str, torch.Tensor]): The input batch containing (string, torch.Tensor)
 
     Returns:

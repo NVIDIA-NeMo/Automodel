@@ -433,6 +433,28 @@ def test_cp_attention_module_name_filter_excludes_multimodal_towers():
     assert not _cu._is_cp_attention_module_name("model.visual_model.encoder.layers.0.self_attn")
 
 
+def test_manual_allgather_attention_vision_group_ids():
+    mm_token_type_ids = torch.tensor(
+        [
+            [0, 1, 1, 0, 2, 2, 0, 1, 0],
+            [1, 0, 1, 2, 0, 0, 2, 0, 2],
+        ]
+    )
+
+    group_ids = _cu._ManualAllGatherAttention._vision_group_ids(mm_token_type_ids)
+
+    assert _cu._ManualAllGatherAttention._vision_group_ids(None) is None
+    assert torch.equal(
+        group_ids,
+        torch.tensor(
+            [
+                [-1, 0, 0, -1, 1, 1, -1, 2, -1],
+                [0, -1, 1, 1, -1, -1, 2, -1, 3],
+            ]
+        ),
+    )
+
+
 # ============================================================================
 # Tests for make_cp_batch_for_te
 # ============================================================================
@@ -513,6 +535,7 @@ def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
             return torch.arange(total_tokens)
 
     import sys
+
     sys.modules["transformer_engine_torch"] = MockTex
 
     monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
