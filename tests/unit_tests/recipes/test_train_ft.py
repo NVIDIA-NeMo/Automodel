@@ -130,6 +130,44 @@ def test_pipeline_causal_lm_loss_adds_mtp_tuple_output():
     torch.testing.assert_close(got, expected)
 
 
+def test_mtp_loss_config_defaults_and_override():
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.components.loss.mtp import MTPLossConfig
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = nn.Linear(3, 5, bias=False)
+            self.mtp_config = SimpleNamespace(loss_scaling_factor=0.2)
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+    # Defaults: scaling_factor None (model-driven), ignore_index -100.
+    assert MTPLossConfig().scaling_factor is None
+    assert MTPLossConfig().ignore_index == -100
+
+    torch.manual_seed(123)
+    model = DummyModel()
+    model.train()
+    loss_fn = MaskedCrossEntropy(fp32_upcast=False, reduction="sum")
+
+    logits = torch.randn(1, 4, 5)
+    mtp_h = torch.randn(1, 4, 3)
+    labels = torch.tensor([[1, 2, 3, 4]])
+    shifted_labels = torch.tensor([[2, 3, 4, -100]])
+    base = loss_fn(logits=logits, labels=labels)
+    aux = loss_fn(logits=model.lm_head(mtp_h), labels=shifted_labels)
+
+    # An explicit scaling_factor overrides the model-provided 0.2.
+    got_override = MTPLossConfig(scaling_factor=0.5).build(loss_fn, model)((logits, mtp_h), labels)
+    torch.testing.assert_close(got_override, base + 0.5 * aux)
+
+    # The default (None) falls back to the model-provided 0.2.
+    got_default = MTPLossConfig().build(loss_fn, model)((logits, mtp_h), labels)
+    torch.testing.assert_close(got_default, base + 0.2 * aux)
+
+
 def test_build_validation_dataloader_pp_enabled(caplog):
     cfg = ConfigNode(
         {
