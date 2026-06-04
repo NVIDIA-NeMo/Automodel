@@ -117,12 +117,14 @@ class CheckpointingConfig:
         if self.model_cache_dir is None:
             self.model_cache_dir = hf_constants.HF_HUB_CACHE
 
-        # PEFT checkpointing is not supported for `torch_save`; fall back to the
-        # safetensors default (keeping ``checkpoint_dir``).
+        # PEFT checkpointing is not supported for `torch_save`; flip only the two
+        # incompatible fields (format -> safetensors, save_consolidated -> FINAL).
+        # All other user-set fields (is_async, staging_dir, v4_compatible,
+        # single_rank_consolidation, ...) are preserved.
         if self.is_peft and self.model_save_format == "torch_save":
             logging.warning(
                 "PEFT checkpointing is not supported for `torch_save` format; "
-                "falling back to `safetensors` (preserving `checkpoint_dir`)."
+                "falling back to `safetensors` (all other checkpoint settings are preserved)."
             )
             self.model_save_format = "safetensors"
             self.save_consolidated = SaveConsolidatedMode.FINAL
