@@ -53,6 +53,26 @@ NeMo Automodel automatically creates symbolic links in the checkpoint directory 
 
 These symbolic links eliminate the need to manually track checkpoint names or search through directories to find the best model. When validation is enabled in your training run, both links are automatically maintained and updated as training progresses.
 
+## Checkpoint Retention
+
+By default, NeMo Automodel retains a bounded recent checkpoint window to reduce accidental disk growth from frequent checkpoint saves:
+
+```yaml
+checkpoint:
+  max_recent_checkpoints: 2
+```
+
+`max_recent_checkpoints` controls how many of the most recent checkpoint directories are retained by step. It is not a hard cap on the total number of checkpoint directories: checkpoint-root pointers such as `LATEST`, `LOWEST_VAL`, and other top-level symlinks or pointer text files protect their targets in addition to the recent window. This keeps resume-from-latest behavior reliable while preserving explicitly referenced checkpoints such as the best validation checkpoint.
+
+For example, if `max_recent_checkpoints: 2` and `LOWEST_VAL` points to an older checkpoint outside the most recent two saves, NeMo Automodel keeps the two most recent checkpoints plus the `LOWEST_VAL` target.
+
+Set the value to `null` to disable pruning and keep all intermediate checkpoints:
+
+```yaml
+checkpoint:
+  max_recent_checkpoints: null
+```
+
 ## Safetensors
 To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel saves checkpoints in the [Safetensors](https://github.com/safetensors/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (PyTorch .bin), natively supported by Hugging Face Transformers, offering both safety and performance advantages over Python pickle-based approaches.
 

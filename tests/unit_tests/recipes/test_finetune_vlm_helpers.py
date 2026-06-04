@@ -1320,12 +1320,14 @@ class TestBuildCheckpointConfig:
         assert config.model_cache_dir == "/tmp/cache"
         assert config.save_consolidated.value == "final"
         assert config.is_peft is False
+        assert config.max_recent_checkpoints == 2
 
     def test_build_checkpoint_config_with_custom_config(self):
         """Test checkpoint config with custom settings."""
         cfg_ckpt = MagicMock()
         cfg_ckpt.to_dict.return_value = {
             "checkpoint_dir": "/custom/ckpt/",
+            "max_recent_checkpoints": 3,
             "save_consolidated": False,
             "restore_from": "/some/path",  # Should be removed
         }
@@ -1338,6 +1340,7 @@ class TestBuildCheckpointConfig:
         )
 
         assert config.checkpoint_dir == "/custom/ckpt/"
+        assert config.max_recent_checkpoints == 3
         assert config.save_consolidated.value == "false"
         assert config.is_peft is True
 
@@ -1349,6 +1352,7 @@ class TestBuildCheckpointConfig:
         cfg_ckpt.to_dict.return_value = {
             "model_save_format": "torch_save",
             "checkpoint_dir": "/user/ckpt/",
+            "max_recent_checkpoints": 2,
             "save_consolidated": False,
         }
 
@@ -1363,9 +1367,10 @@ class TestBuildCheckpointConfig:
         assert any("falling back" in rec.message.lower() for rec in caplog.records)
         assert config.is_peft is True
         assert config.model_save_format == SerializationFormat.SAFETENSORS
-        # checkpoint_dir is preserved from the user config
+        # checkpoint_dir and max_recent_checkpoints are preserved from the user config
         assert config.checkpoint_dir == "/user/ckpt/"
-        # other user-provided torch_save options are discarded; save_consolidated falls back to the default "final"
+        assert config.max_recent_checkpoints == 2
+        # incompatible torch_save options are coerced; save_consolidated falls back to the default "final"
         assert config.save_consolidated.value == "final"
         assert config.is_async is False
 

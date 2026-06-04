@@ -973,6 +973,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             is_peft=self.peft_cfg is not None,
             model_state_dict_keys=model_state_dict_keys,
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
+            max_recent_checkpoints=checkpoint_cfg.get("max_recent_checkpoints", 2),
         )
         self.restore_from = checkpoint_cfg.get("restore_from", None)
         self.checkpointer = self.checkpoint_config.build(
@@ -1257,6 +1258,8 @@ class TrainDiffusionRecipe(BaseRecipe):
             if wandb.run is not None:
                 wandb.finish()
 
+        self._finalize_pending_checkpoint()
+        self.checkpointer.close()
         logging.info("[INFO] Training complete!")
 
     def _get_dp_rank(self, include_cp: bool = False) -> int:
