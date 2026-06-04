@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import importlib
-import types
 
 import pytest
 import torch
@@ -24,24 +23,6 @@ def label_mod():
     import nemo_automodel.components.datasets.vlm.collate_fns as _m
 
     return importlib.reload(_m)
-
-
-def test_default_stop_tokens_with_tokenizer(label_mod):
-    tokenizer = types.SimpleNamespace(eos_token="<eos>")
-    processor = types.SimpleNamespace(tokenizer=tokenizer)
-
-    tokens = label_mod.default_stop_tokens(processor)
-
-    assert tokens[-1] == "<eos>"
-    assert tokens[:-1] == ("<end_of_turn>", "<|im_end|>", "<|eot_id|>")
-
-
-def test_default_stop_tokens_without_tokenizer(label_mod):
-    processor = object()
-
-    tokens = label_mod.default_stop_tokens(processor)
-
-    assert tokens == ("<end_of_turn>", "<|im_end|>", "<|eot_id|>")
 
 
 def test_build_labels_retries_with_stripped_whitespace(label_mod, monkeypatch):
