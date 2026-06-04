@@ -1,0 +1,123 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Benchmarking config for DeepSeek-V3 (671B) attn=sdpa + torch.compile(MLA) + experts=torch_mm, GB200 (BF16), NO PP — expert-kernel MFU experiment.
+#
+# Single-variable delta vs deepseek_v3_sdpa_compile_gb200.yaml: experts gmm -> torch_mm
+# (torch._grouped_mm bf16 path instead of grouped_gemm.ops.gmm). Same hybridep
+# dispatch, same compiled SDPA MLA, same lbs2/GBS128/GA1/16N/ep64/AC. Isolates the
+# expert grouped-GEMM kernel (gmm vs torch_mm) at the compiled-MLA operating point
+# (gmm baseline = 26.48% MFU@2500 / 3.091s).
+#
+# GB200 deltas vs the generic deepseek_v3_te_deepep.yaml:
+#   - peak_tflops: 989 -> 2500  (GB200 BF16 dense peak; generic recipe uses H100 989)
+#   - num_nodes/ci.nodes: 32 -> 16  (16 nodes x 4 GB200 = 64 GPUs)
+#   - pp_size: 4 -> 1  (NO pipeline parallelism) — dropped the pipeline + moe blocks
+#   - ep_size: 64 (shard the 256 routed experts across all 64 GPUs)
+#   - dispatcher: deepep -> hybridep  (GB200/oci_hsg: deepep fails EP-buffer init)
+#   - local_batch_size: 8 -> 2, GBS 128 (GA = 128/(64*2) = 1) — 671B no-PP is
+#     memory-tight: ~72GB fixed + ~27.6GB/lbs (lbs1=99.5GB fit, lbs4 OOM'd at 16N),
+#     so lbs=2 (~127GB) is the chosen matched-pair operating point (lbs3~155GB max-fit,
+#     lbs4+ OOMs).
+#
+# Parallelism: ep_size=64 (==world=64), tp=pp=cp=1. seq_len=4096, AC on.
+# DeepSeek-V3 671B fits no-PP on 16 nodes (64 GB200) — PP not needed (lbs1 peak 99.5GB).
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
+seed: 1234
+
+benchmark:
+  warmup_steps: 10
+  peak_tflops: 2500  # GB200 BF16 dense peak TFLOPs
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+  num_nodes: 16
+
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 128  # GA = 128/(64*2) = 1 (GA=1 is the no-PP memory ceiling; GA>1 OOMs)
+  local_batch_size: 2
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 30
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 64
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
+  trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch     # non-TE: TE Linear is @torch.compiler.disable'd → breaks MLA fullgraph
+    rms_norm: torch   # non-TE: TE RMSNorm is also compiler-disabled → breaks MLA fullgraph
+    rope_fusion: false  # fused RoPE is a TE/compiler-disabled custom op → breaks fullgraph
+    compile_mla: true
+    experts: torch_mm  # torch._grouped_mm bf16 (vs gmm); single-variable swap, hybridep dispatch unchanged
+    dispatcher: hybridep  # GB200/oci_hsg: deepep fails EP-buffer init ('invalid resource handle')
+    fake_balanced_gate: true
+    enable_hf_state_dict_adapter: false
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  seq_len: 4096
+  num_samples: 100000
+
+dataloader:
+  batch_size: null  # Dataset already yields batches
+  _target_: torch.utils.data.DataLoader
+  num_workers: 0
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1e-8
+  lr: 0.0001
+  weight_decay: 0
+
+
+ci:
+  time: "04:00:00"
+  nodes: 16
+  ep_size: 64
+  env_vars:
+    RDZV_TIMEOUT: "900"
