@@ -2230,9 +2230,10 @@ class _DummyCPDeviceMesh(dict):
 
 
 class _CPPreEmbedModel(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, *, return_mm_token_type_ids: bool = True):
         super().__init__()
         self.scale = torch.nn.Parameter(torch.tensor(1.0))
+        self.return_mm_token_type_ids = return_mm_token_type_ids
 
     def prepare_model_inputs_for_cp(self, *args, **kwargs):
         raise AssertionError("prepare_model_inputs_for_cp should be invoked through model.__call__")
@@ -2242,10 +2243,13 @@ class _CPPreEmbedModel(torch.nn.Module):
         batch, seq = input_ids.shape
         inputs_embeds = self.scale * torch.ones(batch, seq, 4)
         per_layer_inputs = self.scale * torch.ones(batch, seq, 2, 3)
-        return {
+        prepared = {
             "inputs_embeds": inputs_embeds,
             "per_layer_inputs": per_layer_inputs,
         }
+        if self.return_mm_token_type_ids and mm_token_type_ids is not None:
+            prepared["mm_token_type_ids"] = mm_token_type_ids
+        return prepared
 
 
 class _CPPreEmbedStop(RuntimeError):
@@ -2255,7 +2259,7 @@ class _CPPreEmbedStop(RuntimeError):
 class TestForwardBackwardStepNonPP:
     """Tests for _forward_backward_step without pipeline parallelism."""
 
-    def test_non_pp_cp_pre_embed_preserves_mm_token_type_ids_and_grad(self, monkeypatch):
+    def test_non_pp_cp_pre_embed_uses_model_returned_mm_token_type_ids_and_grad(self, monkeypatch):
         model = _CPPreEmbedModel()
         non_pp_recipe = _create_non_pp_recipe(model)
         non_pp_recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=2)
@@ -2283,6 +2287,43 @@ class TestForwardBackwardStepNonPP:
             "pixel_values": torch.randn(1, 3, 8, 8),
             "image_position_ids": torch.zeros(1, 1, 2, dtype=torch.long),
             "mm_token_type_ids": mm_token_type_ids,
+        }
+
+        with pytest.raises(_CPPreEmbedStop):
+            non_pp_recipe._forward_backward_step(
+                idx=0,
+                batch=batch,
+                loss_buffer=[],
+                num_label_tokens=4,
+                num_batches=1,
+                is_train=False,
+            )
+
+    def test_non_pp_cp_pre_embed_drops_mm_token_type_ids_when_model_does_not_return_it(self, monkeypatch):
+        model = _CPPreEmbedModel(return_mm_token_type_ids=False)
+        non_pp_recipe = _create_non_pp_recipe(model)
+        non_pp_recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=2)
+
+        def _capture_cp_batch(device_mesh, batch, loss_mask=None):
+            assert "input_ids" not in batch
+            assert "pixel_values" not in batch
+            assert "image_position_ids" not in batch
+            assert "mm_token_type_ids" not in batch
+            assert "per_layer_inputs" in batch
+            assert batch["inputs_embeds"].requires_grad
+            raise _CPPreEmbedStop
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            _capture_cp_batch,
+        )
+
+        batch = {
+            "labels": torch.randint(0, 50, (1, 4)),
+            "input_ids": torch.randint(0, 100, (1, 4)),
+            "pixel_values": torch.randn(1, 3, 8, 8),
+            "image_position_ids": torch.zeros(1, 1, 2, dtype=torch.long),
+            "mm_token_type_ids": torch.tensor([[1, 1, 0, 0]]),
         }
 
         with pytest.raises(_CPPreEmbedStop):

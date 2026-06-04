@@ -59,6 +59,17 @@ def _any_requires_grad(module: nn.Module) -> bool:
     return any(p.requires_grad for p in module.parameters())
 
 
+def test_is_cp_non_text_module_path_matches_only_complete_module_parts():
+    assert model_utils.is_cp_non_text_module_path("model.vision_tower.encoder.layers.0.self_attn")
+    assert model_utils.is_cp_non_text_module_path("model.image_model.encoder.layers.0.self_attn")
+    assert model_utils.is_cp_non_text_module_path("model.visual_model.encoder.layers.0.self_attn")
+    assert model_utils.is_cp_non_text_module_path("model.audio_tower.encoder.layers.0.self_attn")
+    assert model_utils.is_cp_non_text_module_path("model.video_model.encoder.layers.0.self_attn")
+
+    assert not model_utils.is_cp_non_text_module_path("model.language_model.layers.0.self_attn")
+    assert not model_utils.is_cp_non_text_module_path("model.language_visual_adapter.layers.0.self_attn")
+
+
 def test_print_trainable_parameters_counts(dummy_model, caplog, monkeypatch):
     """
     Ensure the helper returns correct (trainable, total) counts
