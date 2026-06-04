@@ -47,7 +47,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: <placeholder>
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16
   # MTP head predicts the next 2 tokens. ``mtp_use_repeated_layer=true``
   # reuses ONE physical MTP layer across both depths (weight-tied iterations,
   # mirrors Megatron's --mtp-use-repeated-layer) so the parameter count
@@ -69,7 +69,7 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: checkpoints/<placeholder>_peft/
+  checkpoint_dir: checkpoints/nemotron_ultra_v3_peft/
   model_save_format: safetensors
   save_consolidated: true
 
