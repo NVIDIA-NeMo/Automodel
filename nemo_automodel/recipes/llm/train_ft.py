@@ -62,7 +62,6 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
-from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import (
@@ -695,8 +694,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 logging.info("MLflow experiment tracking enabled")
 
         self.comet_logger = None
-        if self.dist_env.is_main and hasattr(self.cfg, "comet"):
-            self.comet_logger = build_comet(self.cfg)
+        if self.dist_env.is_main and self.cfg.comet is not None:
+            self.comet_logger = self.cfg.comet.build(model_name=_get_model_name(self.cfg.model))
             self.comet_logger.log_params(self.cfg.to_dict())
             logging.info("Comet experiment tracking enabled")
 

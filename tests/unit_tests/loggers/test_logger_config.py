@@ -14,6 +14,9 @@
 
 """Tests for nemo_automodel.components.loggers.loggers — WandbConfig, MLflowConfig, CometConfig."""
 
+import sys
+import types
+
 from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
 
 
@@ -24,13 +27,39 @@ class TestWandbConfig:
         assert cfg.entity is None
         assert cfg.name == ""
         assert cfg.tags == []
-        assert cfg.save_dir is None
+        assert cfg.extra == {}
 
     def test_custom_values(self):
         cfg = WandbConfig(project="my-project", entity="my-team", name="run-1", tags=["exp", "v2"])
         assert cfg.project == "my-project"
         assert cfg.entity == "my-team"
         assert cfg.tags == ["exp", "v2"]
+
+    def test_from_kwargs_routes_passthrough_keys_to_extra(self):
+        # ``mode``/``dir`` are valid wandb.init kwargs but not named fields; they must not raise
+        # (regression: the closed dataclass used to crash on any non-field key).
+        cfg = WandbConfig.from_kwargs(project="flux", mode="online", dir="/tmp/wandb")
+        assert cfg.project == "flux"
+        assert cfg.extra == {"mode": "online", "dir": "/tmp/wandb"}
+
+    def test_from_kwargs_known_keys_assigned_directly(self):
+        cfg = WandbConfig.from_kwargs(project="p", entity="e", tags=["a"], notes="n")
+        assert (cfg.project, cfg.entity, cfg.tags, cfg.notes) == ("p", "e", ["a"], "n")
+        assert cfg.extra == {}
+
+    def test_build_forwards_extra_to_wandb_init(self, monkeypatch):
+        captured = {}
+        fake_wandb = types.ModuleType("wandb")
+        fake_wandb.init = lambda **kw: captured.update(kw) or "run"
+        fake_wandb.Settings = lambda **kw: None
+        monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+        cfg = WandbConfig.from_kwargs(project="flux", mode="online", dir="/tmp/w")
+        run = cfg.build()
+        assert run == "run"
+        assert captured["project"] == "flux"
+        assert captured["mode"] == "online"
+        assert captured["dir"] == "/tmp/w"
 
 
 class TestMLflowConfig:

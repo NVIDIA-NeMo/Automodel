@@ -23,7 +23,7 @@ there is no free builder function — ``config.build(...)`` is the entry point.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
 
@@ -31,8 +31,10 @@ from typing import Any
 class WandbConfig:
     """User-facing WandB configuration (maps to the YAML ``wandb:`` block).
 
-    Fields are forwarded to ``wandb.init()``; any extra kwargs accepted by
-    ``wandb.init`` can be added here as needed.
+    The named fields are the common ones; any other key under the YAML
+    ``wandb:`` block (e.g. ``mode``, ``dir``, ``resume``) is a valid
+    ``wandb.init()`` kwarg and is preserved verbatim in ``extra`` and
+    forwarded to ``wandb.init()``.
 
     Attributes:
         project: WandB project name.
@@ -42,8 +44,9 @@ class WandbConfig:
             one from the model name.
         group: Group name for related runs.
         tags: List of string tags attached to the run.
-        save_dir: Local directory for wandb files.
         notes: Free-text notes shown in the WandB UI.
+        extra: Any additional ``wandb.init()`` kwargs (``mode``, ``dir``,
+            ...) carried through unfiltered.
     """
 
     project: str = "automodel"
@@ -51,8 +54,24 @@ class WandbConfig:
     name: str = ""
     group: str | None = None
     tags: list[str] = field(default_factory=list)
-    save_dir: str | None = None
     notes: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_kwargs(cls, **kwargs: Any) -> "WandbConfig":
+        """Build from a flat kwargs dict, routing unknown keys to ``extra``.
+
+        Keys matching a named field are assigned directly; everything else
+        (valid ``wandb.init`` params such as ``mode``/``dir`` that are not
+        first-class fields here) is preserved in ``extra``.
+        """
+        known = {f.name for f in fields(cls) if f.name != "extra"}
+        direct = {k: v for k, v in kwargs.items() if k in known}
+        extra = {k: v for k, v in kwargs.items() if k not in known}
+        if "extra" in kwargs:  # caller passed an explicit extra mapping
+            extra = {**extra, **(kwargs["extra"] or {})}
+            extra.pop("extra", None)
+        return cls(**direct, extra=extra)
 
     def build(self, run_config: Mapping[str, Any] | None = None, model_name: str | None = None) -> Any:
         """Initialise WandB and return the run.
@@ -68,7 +87,9 @@ class WandbConfig:
         import wandb
         from wandb import Settings
 
-        kwargs = {k: v for k, v in asdict(self).items() if v is not None}
+        named = {k: v for k, v in asdict(self).items() if k != "extra" and v is not None}
+        # ``extra`` (e.g. mode/dir) is forwarded verbatim; named fields win on collision.
+        kwargs = {**self.extra, **named}
         if kwargs.get("name", "") == "" and model_name:
             kwargs["name"] = "_".join(model_name.split("/")[-2:])
         return wandb.init(
@@ -219,16 +240,33 @@ class CometConfig:
     tags: list[str] = field(default_factory=list)
     auto_metric_logging: bool = False
 
-    def build(self) -> Any:
-        """Initialise Comet ML and return the logger (active on rank 0)."""
+    def build(self, model_name: str | None = None) -> Any:
+        """Initialise Comet ML and return the logger (active on rank 0).
+
+        When ``model_name`` is provided a ``model:<name>`` tag is appended and,
+        if ``experiment_name`` is empty, one is derived from the model name.
+
+        Args:
+            model_name: Optional model name used to tag the run and derive an
+                experiment name when none is set.
+
+        Returns:
+            A ``CometLogger`` instance.
+        """
         from nemo_automodel.components.loggers.comet_utils import CometLogger
 
+        tags = list(self.tags)
+        experiment_name = self.experiment_name or ""
+        if model_name:
+            tags.append(f"model:{model_name}")
+            if not experiment_name:
+                experiment_name = "_".join(model_name.split("/")[-2:])
         return CometLogger(
             project_name=self.project_name,
             workspace=self.workspace,
             api_key=self.api_key,
-            experiment_name=self.experiment_name,
-            tags=self.tags,
+            experiment_name=experiment_name,
+            tags=tags,
             auto_metric_logging=self.auto_metric_logging,
         )
 

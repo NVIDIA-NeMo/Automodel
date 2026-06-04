@@ -43,7 +43,7 @@ from collections.abc import Callable, Mapping
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
-from nemo_automodel.components.loggers.loggers import MLflowConfig, WandbConfig
+from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
@@ -123,12 +123,17 @@ class RecipeConfig:
     @cached_property
     def wandb(self) -> WandbConfig | None:
         node = self._raw.get("wandb", None)
-        return WandbConfig(**_section_kwargs(node)) if node else None
+        return WandbConfig.from_kwargs(**_section_kwargs(node)) if node else None
 
     @cached_property
     def mlflow(self) -> MLflowConfig | None:
         node = self._raw.get("mlflow", None)
         return MLflowConfig(**_section_kwargs(node)) if node else None
+
+    @cached_property
+    def comet(self) -> CometConfig | None:
+        node = self._raw.get("comet", None)
+        return CometConfig(**_section_kwargs(node)) if node else None
 
     @cached_property
     def step_scheduler(self) -> StepSchedulerConfig:
