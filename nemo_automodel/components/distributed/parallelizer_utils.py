@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 from copy import copy
 from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
 
@@ -23,6 +25,9 @@ from torch.distributed.fsdp import (
     OffloadPolicy,
     fully_shard,
 )
+from torch.utils.checkpoint import CheckpointPolicy
+
+logger = logging.getLogger(__name__)
 
 UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
 
@@ -171,3 +176,36 @@ def fully_shard_by_dtype(
                 mp_policy=_mp_policy_with_param_dtype(mp_policy, parent_dtype),
                 offload_policy=offload_policy,
             )
+
+
+# Opt-in selective-AC diagnostics: set NEMO_SELECTIVE_AC_TRACE=1 to log, once per
+# unique op, whether selective AC saves or recomputes it. Useful for confirming
+# that a model's expensive ops (e.g. expert grouped-GEMMs, comm collectives) are
+# actually saved rather than silently recomputed.
+_SELECTIVE_AC_TRACE = os.environ.get("NEMO_SELECTIVE_AC_TRACE", "0").lower() not in ("0", "", "false", "no")
+_SELECTIVE_AC_TRACE_SEEN: Set[str] = set()
+
+
+def maybe_trace_selective_ac_decision(func, decision, is_alternating: bool, *, is_recompute: bool) -> None:
+    """Log a selective-AC decision once per op (no-op unless tracing is enabled).
+
+    Args:
+        func: The op the policy was queried about.
+        decision: The ``CheckpointPolicy`` the policy returned for ``func``.
+        is_alternating: Whether ``func`` is an alternating-save matmul op.
+        is_recompute: Whether the policy was queried during the recompute pass;
+            decisions are only logged on the forward pass to avoid duplicates.
+    """
+    if not _SELECTIVE_AC_TRACE or is_recompute:
+        return
+    key = str(func)
+    if key in _SELECTIVE_AC_TRACE_SEEN:
+        return
+    _SELECTIVE_AC_TRACE_SEEN.add(key)
+    if is_alternating:
+        verdict = "ALTERNATE (save/recompute every other call)"
+    elif decision == CheckpointPolicy.MUST_SAVE:
+        verdict = "SAVE"
+    else:
+        verdict = "RECOMPUTE"
+    logger.info("[selective-ac] %s -> %s", key, verdict)

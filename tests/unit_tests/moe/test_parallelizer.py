@@ -1702,10 +1702,10 @@ def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
 
     sentinel_ctx = object()
     sentinel_flag = "_nemo_selective_ac"
-    dense_stub = types.ModuleType("nemo_automodel.components.distributed.parallelizer")
-    dense_stub._make_selective_checkpoint_context_fn = MagicMock(return_value=sentinel_ctx)
-    dense_stub._SELECTIVE_AC_WRAPPER_FLAG = sentinel_flag
-    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.parallelizer", dense_stub)
+    dense_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+    dense_stub.make_selective_checkpoint_context_fn = MagicMock(return_value=sentinel_ctx)
+    dense_stub.SELECTIVE_AC_WRAPPER_FLAG = sentinel_flag
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.activation_checkpointing", dense_stub)
 
     wrapped = []
 
@@ -1730,7 +1730,7 @@ def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
 
     assert len(wrapped) == 3
     assert len(model.layers.registered) == 3
-    dense_stub._make_selective_checkpoint_context_fn.assert_called_once()
+    dense_stub.make_selective_checkpoint_context_fn.assert_called_once()
     # Each wrapper is tagged so _apply_per_layer_compile compiles it OUTER
     # (preserving the selective policy) rather than collapsing to inner compile.
     for w in wrapped:

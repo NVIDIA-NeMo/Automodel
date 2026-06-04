@@ -278,6 +278,13 @@ def mock_distributed_env(monkeypatch):
         checkpoint_wrapper_mock.checkpoint_wrapper,
         raising=False,
     )
+    # Whole-block/sub-module wrapping now lives in activation_checkpointing.py and
+    # uses that module's checkpoint_wrapper, so patch it there too.
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
+        checkpoint_wrapper_mock.checkpoint_wrapper,
+        raising=False,
+    )
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.parallelizer._mesh_resources", mesh_resources_mock, raising=False
     )
@@ -1275,6 +1282,10 @@ class TestActivationCheckpointingKVSharing:
             _Wrapped,
         )
         monkeypatch.setattr(
+            "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
+            _Wrapped,
+        )
+        monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.fully_shard",
             lambda model, **kw: model,
         )
@@ -1408,11 +1419,11 @@ class TestActivationCheckpointingKVSharing:
             return self._Wrapped(module)
 
         monkeypatch.setattr(
-            "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
+            "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
             fake_checkpoint_wrapper,
         )
 
-        from nemo_automodel.components.distributed.parallelizer import _SELECTIVE_AC_WRAPPER_FLAG
+        from nemo_automodel.components.distributed.activation_checkpointing import SELECTIVE_AC_WRAPPER_FLAG
 
         model = _make_model_for_ac(num_kv_shared_layers=0)
         self._run_parallelize(model, activation_checkpointing="selective")
@@ -1421,7 +1432,7 @@ class TestActivationCheckpointingKVSharing:
         for layer in model.model.layers:
             assert isinstance(layer, self._Wrapped)
             # Wrapper is tagged so the per-layer compile step compiles it OUTER.
-            assert getattr(layer, _SELECTIVE_AC_WRAPPER_FLAG, False) is True
+            assert getattr(layer, SELECTIVE_AC_WRAPPER_FLAG, False) is True
         for _, kwargs in calls:
             assert kwargs["checkpoint_impl"] == CheckpointImpl.NO_REENTRANT
             assert kwargs["preserve_rng_state"] is True
@@ -1567,7 +1578,7 @@ class TestSelectiveCheckpointNumerics:
 
     These tests use the *real* torch checkpoint primitives (no mocked
     ``checkpoint_wrapper``) so they exercise the policy returned by
-    ``_make_selective_checkpoint_context_fn``. The policy saves every other
+    ``make_selective_checkpoint_context_fn``. The policy saves every other
     matmul, so the per-pass matmul counter must be keyed on
     ``ctx.is_recompute``. A single shared counter continues from the forward
     count into recompute and flips the save/recompute parity whenever a region
@@ -1590,8 +1601,8 @@ class TestSelectiveCheckpointNumerics:
             checkpoint_wrapper,
         )
 
-        from nemo_automodel.components.distributed.parallelizer import (
-            _make_selective_checkpoint_context_fn,
+        from nemo_automodel.components.distributed.activation_checkpointing import (
+            make_selective_checkpoint_context_fn,
         )
 
         torch.manual_seed(0)
@@ -1603,7 +1614,7 @@ class TestSelectiveCheckpointNumerics:
         wrapped = checkpoint_wrapper(
             wrapped_inner,
             checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-            context_fn=_make_selective_checkpoint_context_fn(),
+            context_fn=make_selective_checkpoint_context_fn(),
             preserve_rng_state=True,
         )
 
@@ -1651,13 +1662,13 @@ class TestSelectiveCheckpointCompile:
             checkpoint_wrapper,
         )
 
-        from nemo_automodel.components.distributed.parallelizer import _SELECTIVE_AC_WRAPPER_FLAG
+        from nemo_automodel.components.distributed.activation_checkpointing import SELECTIVE_AC_WRAPPER_FLAG
 
         layers = nn.ModuleList()
         for _ in range(2):
             wrapper = checkpoint_wrapper(self._Block(), checkpoint_impl=CheckpointImpl.NO_REENTRANT)
             if tag:
-                setattr(wrapper, _SELECTIVE_AC_WRAPPER_FLAG, True)
+                setattr(wrapper, SELECTIVE_AC_WRAPPER_FLAG, True)
             layers.append(wrapper)
         inner = nn.Module()
         inner.layers = layers
@@ -1697,10 +1708,10 @@ class TestSelectiveCheckpointCompile:
 
     def test_disable_dynamo_lru_cache_is_best_effort(self, monkeypatch):
         """Missing private dynamo API must not raise."""
-        import nemo_automodel.components.distributed.parallelizer as parallelizer
+        import nemo_automodel.components.distributed.activation_checkpointing as ac
 
         monkeypatch.delattr(torch._C._dynamo.eval_frame, "_set_lru_cache", raising=False)
-        parallelizer._disable_dynamo_lru_cache()  # should not raise
+        ac._disable_dynamo_lru_cache()  # should not raise
 
 
 class TestSingleGpuActivationCheckpointing:
@@ -1718,7 +1729,7 @@ class TestSingleGpuActivationCheckpointing:
         """Selective AC is honored on a single GPU (not silently full-checkpointed)."""
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
-        from nemo_automodel.components.distributed.parallelizer import _SELECTIVE_AC_WRAPPER_FLAG
+        from nemo_automodel.components.distributed.activation_checkpointing import SELECTIVE_AC_WRAPPER_FLAG
 
         manager = self._make_manager(monkeypatch, "selective")
         model = _make_model_for_ac(num_kv_shared_layers=0)
@@ -1726,7 +1737,7 @@ class TestSingleGpuActivationCheckpointing:
 
         for layer in model.model.layers:
             assert isinstance(layer, CheckpointWrapper)
-            assert getattr(layer, _SELECTIVE_AC_WRAPPER_FLAG, False) is True
+            assert getattr(layer, SELECTIVE_AC_WRAPPER_FLAG, False) is True
         assert model.config.use_cache is False
 
     def test_selective_kv_sharing_falls_back_on_single_gpu(self, monkeypatch):
@@ -1757,7 +1768,7 @@ class TestSelectiveCheckpointSaveOps:
 
     def test_matmul_ops_alternate_mm_linear_and_grouped_mm(self):
         """mm/linear and the MoE grouped-GEMM variants alternate; addmm/bmm are always saved."""
-        from nemo_automodel.components.distributed.parallelizer import _SELECTIVE_AC_MATMUL_OPS
+        from nemo_automodel.components.distributed.activation_checkpointing import _SELECTIVE_AC_MATMUL_OPS
 
         # mm and linear always exist; grouped-GEMM variants are version-dependent.
         assert torch.ops.aten.mm.default in _SELECTIVE_AC_MATMUL_OPS
@@ -1773,7 +1784,7 @@ class TestSelectiveCheckpointSaveOps:
 
     def test_save_ops_include_compute_and_comm_ops(self):
         """The save-set covers matmuls, attention, and communication collectives."""
-        from nemo_automodel.components.distributed.parallelizer import _SELECTIVE_AC_MUST_SAVE_OPS
+        from nemo_automodel.components.distributed.activation_checkpointing import _SELECTIVE_AC_MUST_SAVE_OPS
 
         expected = [
             torch.ops.aten.mm.default,
@@ -1789,7 +1800,7 @@ class TestSelectiveCheckpointSaveOps:
 
     def test_save_ops_seeded_from_partitioner(self):
         """The set is seeded from PyTorch's compute-intensive op list, not hardcoded."""
-        from nemo_automodel.components.distributed.parallelizer import _default_compute_intensive_ops
+        from nemo_automodel.components.distributed.activation_checkpointing import _default_compute_intensive_ops
 
         seeded = _default_compute_intensive_ops()
         assert isinstance(seeded, tuple)
@@ -1798,10 +1809,10 @@ class TestSelectiveCheckpointSaveOps:
 
     def test_build_save_ops_falls_back_without_partitioner(self, monkeypatch):
         """If the private partitioner API is unavailable, the curated supplement still applies."""
-        import nemo_automodel.components.distributed.parallelizer as parallelizer
+        import nemo_automodel.components.distributed.activation_checkpointing as ac
 
-        monkeypatch.setattr(parallelizer, "_default_compute_intensive_ops", lambda: ())
-        save_ops = parallelizer._build_selective_ac_save_ops()
+        monkeypatch.setattr(ac, "_default_compute_intensive_ops", lambda: ())
+        save_ops = ac._build_selective_ac_save_ops()
         # Curated supplement still provides the core matmul + attention ops.
         assert torch.ops.aten.mm.default in save_ops
         assert torch.ops.aten.addmm.default in save_ops
@@ -1810,7 +1821,7 @@ class TestSelectiveCheckpointSaveOps:
 
     def test_resolve_op_attr_returns_none_for_missing(self):
         """Optional/absent ops resolve to None instead of raising."""
-        from nemo_automodel.components.distributed.parallelizer import _resolve_op_attr
+        from nemo_automodel.components.distributed.activation_checkpointing import _resolve_op_attr
 
         assert _resolve_op_attr(torch.ops, "definitely_not_a_namespace.foo.default") is None
         assert _resolve_op_attr(torch, "_higher_order_ops.flex_attention") is not None
@@ -1821,17 +1832,27 @@ class TestSelectiveCheckpointSaveOps:
 
         from torch.utils.checkpoint import CheckpointPolicy
 
-        import nemo_automodel.components.distributed.parallelizer as P
+        import nemo_automodel.components.distributed.parallelizer_utils as U
 
-        P._SELECTIVE_AC_TRACE_SEEN.clear()
-        with caplog.at_level(_logging.INFO, logger="nemo_automodel.components.distributed.parallelizer"):
-            P._trace_selective_ac_decision(torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE, True)
-            # Duplicate of the same op must not log a second time.
-            P._trace_selective_ac_decision(torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE, True)
-            P._trace_selective_ac_decision(
-                torch.ops._c10d_functional.all_to_all_single.default, CheckpointPolicy.MUST_SAVE, False
-            )
-            P._trace_selective_ac_decision(torch.ops.aten.add.Tensor, CheckpointPolicy.PREFER_RECOMPUTE, False)
+        U._SELECTIVE_AC_TRACE_SEEN.clear()
+        with patch.object(U, "_SELECTIVE_AC_TRACE", True):
+            with caplog.at_level(_logging.INFO, logger=U.__name__):
+                U.maybe_trace_selective_ac_decision(
+                    torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE, True, is_recompute=False
+                )
+                # Duplicate of the same op must not log a second time.
+                U.maybe_trace_selective_ac_decision(
+                    torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE, True, is_recompute=False
+                )
+                U.maybe_trace_selective_ac_decision(
+                    torch.ops._c10d_functional.all_to_all_single.default,
+                    CheckpointPolicy.MUST_SAVE,
+                    False,
+                    is_recompute=False,
+                )
+                U.maybe_trace_selective_ac_decision(
+                    torch.ops.aten.add.Tensor, CheckpointPolicy.PREFER_RECOMPUTE, False, is_recompute=False
+                )
 
         lines = [r.getMessage() for r in caplog.records if "[selective-ac]" in r.getMessage()]
         assert len(lines) == 3  # mm logged once (dedup), all_to_all, add
