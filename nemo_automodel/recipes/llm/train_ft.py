@@ -325,6 +325,7 @@ def build_model(
     return model
 
 
+
 def compute_trust_remote_code_from_model(cfg_model):
     """Compute the value of trust_remote_code based on the model configuration.
 
@@ -947,6 +948,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         for v in self.metric_logger_valid.values():
             v.close()
 
+        self._finalize_pending_checkpoint()
         self.checkpointer.close()
 
         # Mark the MLflow run KILLED if training exited via SIGTERM.

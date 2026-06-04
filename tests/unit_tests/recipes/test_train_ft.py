@@ -533,6 +533,7 @@ def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog
     cfg_ckpt.to_dict.return_value = {
         "model_save_format": "torch_save",
         "checkpoint_dir": "/user/ckpt/",
+        "max_recent_checkpoints": 2,
         "save_consolidated": False,
     }
 
@@ -547,9 +548,10 @@ def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog
     assert any("falling back" in rec.message.lower() for rec in caplog.records)
     assert config.is_peft is True
     assert config.model_save_format == SerializationFormat.SAFETENSORS
-    # checkpoint_dir is preserved from the user config
+    # checkpoint_dir and max_recent_checkpoints are preserved from the user config
     assert config.checkpoint_dir == "/user/ckpt/"
-    # other user-provided torch_save options are discarded; save_consolidated falls back to the default "final"
+    assert config.max_recent_checkpoints == 2
+    # incompatible torch_save options are coerced; save_consolidated falls back to the default "final"
     assert config.save_consolidated.value == "final"
     assert config.is_async is False
 

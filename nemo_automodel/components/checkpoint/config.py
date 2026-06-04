@@ -121,6 +121,9 @@ class CheckpointingConfig:
     # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
     best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
     consolidation_timeout_minutes: int = 30  # Timeout for inline consolidated-export synchronization.
+    # Retain this many recent checkpoint directories. Checkpoints targeted by checkpoint-root pointers
+    # such as LATEST and LOWEST_VAL are preserved in addition. Set None to disable pruning.
+    max_recent_checkpoints: int | None = 2
 
     def __post_init__(self):
         """Resolve the cache dir, enforce PEFT constraints, and coerce the save format/mode."""
@@ -141,6 +144,14 @@ class CheckpointingConfig:
             )
             self.model_save_format = "safetensors"
             self.save_consolidated = SaveConsolidatedMode.FINAL
+
+        if self.max_recent_checkpoints is not None:
+            if (
+                isinstance(self.max_recent_checkpoints, bool)
+                or not isinstance(self.max_recent_checkpoints, int)
+                or self.max_recent_checkpoints < 1
+            ):
+                raise ValueError("checkpoint.max_recent_checkpoints must be unset or a positive integer")
 
         # Convert a raw string such as "safetensors" into the right Enum.
         formats = [v.value for v in SerializationFormat]
