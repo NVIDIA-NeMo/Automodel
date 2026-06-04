@@ -220,6 +220,11 @@ class BackendConfig:
     enable_fsdp_optimizations: bool = False
     te_fp8: TEFp8Config | None = None
     gate_precision: str | torch.dtype | None = None
+    # When True, torch.compile(fullgraph=True) the attention module's forward (e.g. the
+    # DeepSeek-V3 MLA) to fuse its many small ops (lora down/up projections, RoPE, latent
+    # reshapes, SDPA). Requires a compilable attention backend (attn="sdpa"); TE's fused
+    # attention is a custom-autograd black box that fullgraph can't trace. Default False.
+    compile_mla: bool = False
 
     def __post_init__(self):
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
