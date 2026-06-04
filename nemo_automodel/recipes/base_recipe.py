@@ -987,6 +987,19 @@ class BaseRecipe:
             "Validation every steps": step_scheduler.val_every_steps,
             "Max train steps": step_scheduler.max_steps,
         }
+        checkpoint_config = getattr(getattr(self, "checkpointer", None), "config", None)
+        if checkpoint_config is not None and hasattr(checkpoint_config, "max_recent_checkpoints"):
+            max_recent_checkpoints = checkpoint_config.max_recent_checkpoints
+            if max_recent_checkpoints is None:
+                attrs["Checkpoint retention"] = (
+                    "disabled; keeping all checkpoints (checkpoint.max_recent_checkpoints=None)"
+                )
+            else:
+                attrs["Checkpoint retention"] = (
+                    f"keeping the most recent {max_recent_checkpoints} checkpoint(s), "
+                    "plus pointer-protected checkpoints "
+                    f"(checkpoint.max_recent_checkpoints={max_recent_checkpoints})"
+                )
         logging.info("Step scheduler:")
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")

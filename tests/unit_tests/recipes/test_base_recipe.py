@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 from types import SimpleNamespace
 
@@ -722,6 +723,36 @@ def test_checkpoint_retention_can_be_disabled(tmp_path):
         "epoch_0_step_100",
         "epoch_0_step_200",
     ]
+
+
+def test_step_scheduler_log_includes_checkpoint_retention_policy(tmp_path, caplog):
+    """Startup logs should tell users whether checkpoint retention is bounded or disabled."""
+    step_scheduler = SimpleNamespace(
+        grad_acc_steps=1,
+        ckpt_every_steps=5,
+        gc_every_steps=None,
+        epoch=0,
+        num_epochs=1,
+        val_every_steps=10,
+        max_steps=20,
+    )
+
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=2)
+    with caplog.at_level(logging.INFO):
+        recipe_inst._log_step_scheduler_details(step_scheduler)
+
+    assert "Checkpoint retention" in caplog.text
+    assert "keeping the most recent 2 checkpoint(s)" in caplog.text
+    assert "plus pointer-protected checkpoints" in caplog.text
+    assert "checkpoint.max_recent_checkpoints=2" in caplog.text
+
+    caplog.clear()
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=None)
+    with caplog.at_level(logging.INFO):
+        recipe_inst._log_step_scheduler_details(step_scheduler)
+
+    assert "disabled; keeping all checkpoints" in caplog.text
+    assert "checkpoint.max_recent_checkpoints=None" in caplog.text
 
 
 def test_checkpoint_retention_max_recent_one_preserves_latest_resume(tmp_path):
