@@ -1,0 +1,135 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Recipe validated on 4 × H100 nodes (32x 80 GB GPUs) under Slurm.
+#
+# To run on a 4-node Slurm allocation, drive torchrun from inside an
+# ``srun`` step that resolves MASTER_ADDR from the allocation and forwards
+# the per-node rank:
+#
+#   MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+#   srun --ntasks-per-node=1 --nodes=4 bash -c '
+#     torchrun --nnodes=4 --nproc-per-node=8 \
+#       --rdzv-backend=c10d --rdzv-endpoint="$MASTER_ADDR":29500 \
+#       --node-rank=$SLURM_NODEID \
+#       examples/llm_finetune/finetune.py \
+#       -c examples/llm_finetune/nemotron/h100.yaml'
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  num_epochs: 1
+  max_steps: 100
+  global_batch_size: 128
+  local_batch_size: 4
+  ckpt_every_steps: 20
+  val_every_steps: 20
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: <placeholder>
+  # MTP head predicts the next 2 tokens. ``mtp_use_repeated_layer=true``
+  # reuses ONE physical MTP layer across both depths (weight-tied iterations,
+  # mirrors Megatron's --mtp-use-repeated-layer) so the parameter count
+  # stays the same as a 1-depth MTP. Block-type pattern is auto-resolved
+  # from the model's ``mtp_layers_block_type: ["attention", "moe"]`` field.
+  num_nextn_predict_layers: 2
+  mtp_use_repeated_layer: true
+  mtp_loss_scaling_factor: 0.1
+  output_hidden_states: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    experts: gmm
+    dispatcher: deepep
+    fake_balanced_gate: false
+    enable_fsdp_optimizations: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/<placeholder>_peft/
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 32
+  activation_checkpointing: true
+  defer_fsdp_grad_sync: true
+
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  exclude_modules: ["*.out_proj"]  # mamba layers use custom kernels that take in the out_proj.weight directly, thus lora doesn't work here.
+  dim: 32
+  alpha: 32
+  use_triton: True
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 2048
+  packing_strategy: thd
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 1024
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-4
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 10
+  min_lr: 1.0e-5
