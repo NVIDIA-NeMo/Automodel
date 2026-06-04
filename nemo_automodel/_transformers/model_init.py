@@ -620,15 +620,29 @@ def _get_model_tensor(model, name: str):
 
 
 def _restore_loaded_model_dtype(
-    model, pretrained_model_name_or_path, hf_config, quantization_config, load_kwargs
+    model, pretrained_model_name_or_path, hf_config, quantization_config, load_kwargs, requested_dtype=None
 ) -> None:
-    """Restore each loaded tensor to the exact dtype stored in the checkpoint.
+    """Unify each loaded tensor's dtype after HuggingFace's mixed-dtype load.
 
     Some modules allocate parameters in a wider dtype than the checkpoint.
     HuggingFace then copies the checkpoint tensor into that existing tensor,
-    which upcasts the loaded value. We fix that by re-inspecting checkpoint
-    tensor dtypes per key and restoring each loaded parameter/buffer to the
-    dtype that was actually stored in the file.
+    which upcasts the loaded value, leaving the model with a mix of dtypes that
+    trips FSDP2's uniform-original-dtype check. We fix that by re-inspecting the
+    checkpoint tensor dtypes per key and unifying each loaded parameter/buffer.
+
+    The unification target depends on ``requested_dtype``:
+
+      * ``None`` (the user passed ``torch_dtype="auto"``): restore each tensor to
+        the exact dtype stored in the checkpoint -- faithfully mirror the file.
+      * an explicit ``torch.dtype``: restore each floating tensor to the *wider*
+        of (checkpoint dtype, requested dtype). This honors an explicit fp32
+        request (so parameters can serve as fp32 master weights) while preserving
+        intrinsically-fp32 checkpoint params (e.g. ``A_log``) even under a bf16
+        request, and is a no-op for the common bf16/auto case.
+
+    Args:
+        requested_dtype: The resolved ``torch_dtype`` the caller requested, or
+            None when ``"auto"`` was requested.
     """
     if quantization_config is not None or getattr(hf_config, "quantization_config", None) is not None:
         return
@@ -652,26 +666,38 @@ def _restore_loaded_model_dtype(
     restored_count = 0
     for name, checkpoint_dtype in checkpoint_dtypes.items():
         tensor = _get_model_tensor(model, name)
-        if tensor is None or tensor.dtype == checkpoint_dtype:
+        if tensor is None:
+            continue
+
+        # Pick the unification target. For an explicit floating request, take the
+        # wider of (checkpoint, requested) so explicit fp32 is honored as master
+        # weights while intrinsically-fp32 checkpoint params survive a bf16 request.
+        # For "auto" (requested_dtype is None) or non-floating tensors, mirror the
+        # checkpoint dtype exactly (preserves today's behavior).
+        target_dtype = checkpoint_dtype
+        if requested_dtype is not None and checkpoint_dtype.is_floating_point and tensor.dtype.is_floating_point:
+            target_dtype = torch.promote_types(checkpoint_dtype, requested_dtype)
+
+        if tensor.dtype == target_dtype:
             continue
 
         seen_dtype = restored_dtype_by_tensor_id.get(id(tensor))
-        if seen_dtype is not None and seen_dtype != checkpoint_dtype:
+        if seen_dtype is not None and seen_dtype != target_dtype:
             logger.warning(
                 "Skipping conflicting checkpoint dtypes for aliased tensor %s: %s vs %s",
                 name,
                 seen_dtype,
-                checkpoint_dtype,
+                target_dtype,
             )
             continue
 
         try:
-            tensor.data = tensor.data.to(dtype=checkpoint_dtype)
+            tensor.data = tensor.data.to(dtype=target_dtype)
         except (RuntimeError, TypeError) as exc:
-            logger.warning("Failed to restore checkpoint dtype for %s to %s: %s", name, checkpoint_dtype, exc)
+            logger.warning("Failed to restore checkpoint dtype for %s to %s: %s", name, target_dtype, exc)
             continue
 
-        restored_dtype_by_tensor_id[id(tensor)] = checkpoint_dtype
+        restored_dtype_by_tensor_id[id(tensor)] = target_dtype
         restored_count += 1
 
     if restored_count > 0:
@@ -759,7 +785,12 @@ def __init_model(
                 )
             if restore_loaded_dtype:
                 _restore_loaded_model_dtype(
-                    model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs
+                    model,
+                    pretrained_model_name_or_path,
+                    hf_config,
+                    quantization_config,
+                    kwargs,
+                    requested_dtype=(torch_dtype if torch_dtype != "auto" else None),
                 )
         else:
             model = cls._from_config_parent_class(
@@ -842,7 +873,14 @@ def __init_model(
                 **kwargs,
             )
         if restore_loaded_dtype:
-            _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
+            _restore_loaded_model_dtype(
+                model,
+                pretrained_model_name_or_path,
+                hf_config,
+                quantization_config,
+                kwargs,
+                requested_dtype=(torch_dtype if torch_dtype != "auto" else None),
+            )
     else:
         model = cls._from_config_parent_class(
             hf_config,

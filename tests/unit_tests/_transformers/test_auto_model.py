@@ -927,6 +927,96 @@ class TestModelMappingKeyErrorFallback:
         assert fake_model.norm.weight.dtype == torch.float32
         mock_wrap.assert_called_once_with(FakeModel)
 
+    def test_force_hf_pretrained_explicit_fp32_promotes_all_to_fp32(self):
+        """Explicit fp32 request unifies every floating tensor to fp32 (master weights)."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 2, bias=False)
+                self.norm = torch.nn.LayerNorm(2)
+
+        fake_config = FakeConfig()
+        # Simulate HF's mixed-dtype load: most params bf16, a stray param fp32.
+        fake_model = FakeModel()
+        fake_model.linear.to(torch.bfloat16)
+        fake_model.norm.to(torch.float32)
+
+        cls = self._make_cls({})
+        cls._from_pretrained_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch(
+                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                return_value={
+                    "linear.weight": torch.bfloat16,
+                    "norm.weight": torch.float32,
+                },
+            ),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            _init_model(
+                cls,
+                "test-model",
+                attn_implementation="eager",
+                torch_dtype=torch.float32,
+                quantization_config=None,
+                force_hf=True,
+            )
+
+        assert fake_model.linear.weight.dtype == torch.float32
+        assert fake_model.norm.weight.dtype == torch.float32
+
+    def test_force_hf_pretrained_explicit_bf16_preserves_intrinsic_fp32(self):
+        """Explicit bf16 request keeps bf16 params bf16 but preserves intrinsically-fp32 params."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 2, bias=False)
+                self.norm = torch.nn.LayerNorm(2)
+
+        fake_config = FakeConfig()
+        fake_model = FakeModel()
+        fake_model.linear.to(torch.bfloat16)
+        fake_model.norm.to(torch.float32)
+
+        cls = self._make_cls({})
+        cls._from_pretrained_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch(
+                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                return_value={
+                    "linear.weight": torch.bfloat16,
+                    "norm.weight": torch.float32,
+                },
+            ),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            _init_model(
+                cls,
+                "test-model",
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16,
+                quantization_config=None,
+                force_hf=True,
+            )
+
+        assert fake_model.linear.weight.dtype == torch.bfloat16
+        # promote(fp32, bf16) == fp32 -> intrinsically-fp32 checkpoint param survives.
+        assert fake_model.norm.weight.dtype == torch.float32
+
     def test_fallback_path_known_config_type(self):
         """Fallback (non-force_hf, no custom model) path: _model_mapping succeeds."""
 
