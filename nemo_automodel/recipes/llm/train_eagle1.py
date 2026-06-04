@@ -240,6 +240,17 @@ class TrainEagle1Recipe(BaseRecipe):
         self.max_grad_norm = recipe_cfg.get("max_grad_norm", 1.0)
         self.num_epochs = recipe_cfg.num_epochs
         self.log_every_steps = recipe_cfg.get("log_every_steps", 10)
+        # Checkpoint cadence. The two knobs are independent:
+        #   * ``ckpt_every_steps``            -- save every N optimizer steps (None/<=0 = off).
+        #   * ``save_checkpoint_every_epoch`` -- save at each epoch boundary (off by default).
+        # The fully-trained model is always saved once the run completes; these
+        # only add intermediate checkpoints (and stack when both are set). With
+        # both off, the end-of-run checkpoint is the only one written.
+        # NOTE: field names mirror StepScheduler (components/training/step_scheduler.py),
+        # which the SFT recipe uses for the same cadence; EAGLE hand-rolls its own
+        # loop, so a future refactor could adopt StepScheduler here too.
+        self.ckpt_every_steps = recipe_cfg.get("ckpt_every_steps", None)
+        self.save_checkpoint_every_epoch = recipe_cfg.get("save_checkpoint_every_epoch", False)
         self.output_dir = pathlib.Path(recipe_cfg.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -427,6 +438,62 @@ class TrainEagle1Recipe(BaseRecipe):
                     self._update_best_symlink(path, float(best_val_metric))
             if is_dist_initialized:
                 dist.barrier()
+
+    def _log_saved_checkpoint(self, kind: str, epoch: int, step: int) -> None:
+        """Log a saved checkpoint on rank 0 when checkpointing is enabled."""
+        ckpt_cfg = getattr(self, "checkpoint_config", None)
+        if self.dist_env.is_main and ckpt_cfg is not None and ckpt_cfg.enabled:
+            logger.info("Saved %s checkpoint to %s/epoch_%d_step_%d", kind, ckpt_cfg.checkpoint_dir, epoch, step)
+
+    def _maybe_save_step_checkpoint(self, epoch: int) -> bool:
+        """Save a checkpoint mid-epoch when ``ckpt_every_steps`` is configured.
+
+        Called after every optimizer step. Saves whenever ``ckpt_every_steps`` is
+        a positive integer and the current ``global_step`` is a multiple of it.
+        Returns True if a checkpoint was written. The checkpoint directory is
+        named ``epoch_{epoch}_step_{global_step}`` so it never collides with the
+        end-of-epoch checkpoint (which uses ``epoch + 1``).
+        """
+        every = getattr(self, "ckpt_every_steps", None)
+        if every is None or every <= 0 or self.runtime.global_step % every != 0:
+            return False
+        self.save_checkpoint(
+            epoch=epoch,
+            step=self.runtime.global_step,
+            train_loss=None,
+            val_loss=None,
+            best_metric_key="val_loss",
+        )
+        self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
+        return True
+
+    def _maybe_save_final_checkpoint(self, completed_epochs: int) -> bool:
+        """Always save the fully-trained model at the end of a completed run,
+        unless a periodic checkpoint already captured the final step.
+
+        The end-of-run state is otherwise easy to lose: with no cadence nothing is
+        saved at all, and with a pure step cadence the final step is skipped
+        whenever the total step count is not a multiple of ``ckpt_every_steps``.
+        This is a no-op only when a step or epoch checkpoint already landed on the
+        final step, so it never duplicates or collides with one.
+        """
+        gs = self.runtime.global_step
+        if gs <= 0:
+            return False
+        every = getattr(self, "ckpt_every_steps", None)
+        saved_by_step = bool(every and every > 0 and gs % every == 0)
+        saved_by_epoch = bool(getattr(self, "save_checkpoint_every_epoch", False))
+        if saved_by_step or saved_by_epoch:
+            return False
+        self.save_checkpoint(
+            epoch=completed_epochs,
+            step=gs,
+            train_loss=None,
+            val_loss=None,
+            best_metric_key="val_loss",
+        )
+        self._log_saved_checkpoint("final", completed_epochs, gs)
+        return True
 
     def _save_extra_state(self, path: str, epoch: int) -> None:
         """Persist EAGLE-recipe-specific scalars. Subclasses extend this."""
@@ -620,6 +687,7 @@ class TrainEagle1Recipe(BaseRecipe):
                     self.runtime.global_step += 1
                     completed_steps += 1
                     pending_micro_batches = 0
+                    self._maybe_save_step_checkpoint(epoch_idx)
 
                     if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
                         n = self.log_every_steps
@@ -687,6 +755,7 @@ class TrainEagle1Recipe(BaseRecipe):
                 self.runtime.global_step += 1
                 completed_steps += 1
                 pending_micro_batches = 0
+                self._maybe_save_step_checkpoint(epoch_idx)
 
             eval_metrics = self._run_eval()
             if self.dist_env.is_main:
@@ -700,7 +769,7 @@ class TrainEagle1Recipe(BaseRecipe):
                     step=self.runtime.global_step,
                 )
 
-            if last_batch_idx >= 0:
+            if getattr(self, "save_checkpoint_every_epoch", False) and last_batch_idx >= 0:
                 avg_loss = epoch_loss / max(1, micro_step) if micro_step else None
                 self.save_checkpoint(
                     epoch=epoch_idx + 1,
@@ -709,6 +778,8 @@ class TrainEagle1Recipe(BaseRecipe):
                     val_loss=eval_metrics,
                     best_metric_key="val_loss",
                 )
+
+        self._maybe_save_final_checkpoint(self.num_epochs)
 
         if getattr(self, "wandb_run", None) is not None:
             self.wandb_run.finish()

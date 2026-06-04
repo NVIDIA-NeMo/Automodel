@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import pathlib
+from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -54,6 +55,7 @@ from nemo_automodel.components.speculative.eagle import (
     HFEagle3TargetModel,
 )
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
+from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import (
@@ -228,8 +230,20 @@ class TrainEagle3Recipe(BaseRecipe):
         )
         self.grad_accumulation_steps = recipe_cfg.get("grad_accumulation_steps", 1)
         self.max_grad_norm = recipe_cfg.get("max_grad_norm", 1.0)
+        self.target_prefetch_depth = self._resolve_prefetch_depth(recipe_cfg)
         self.num_epochs = recipe_cfg.num_epochs
         self.log_every_steps = recipe_cfg.get("log_every_steps", 10)
+        # Checkpoint cadence. The two knobs are independent:
+        #   * ``ckpt_every_steps``            -- save every N optimizer steps (None/<=0 = off).
+        #   * ``save_checkpoint_every_epoch`` -- save at each epoch boundary (off by default).
+        # The fully-trained model is always saved once the run completes; these
+        # only add intermediate checkpoints (and stack when both are set). With
+        # both off, the end-of-run checkpoint is the only one written.
+        # NOTE: field names mirror StepScheduler (components/training/step_scheduler.py),
+        # which the SFT recipe uses for the same cadence; EAGLE hand-rolls its own
+        # loop, so a future refactor could adopt StepScheduler here too.
+        self.ckpt_every_steps = recipe_cfg.get("ckpt_every_steps", None)
+        self.save_checkpoint_every_epoch = recipe_cfg.get("save_checkpoint_every_epoch", False)
         self.output_dir = pathlib.Path(recipe_cfg.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -296,41 +310,20 @@ class TrainEagle3Recipe(BaseRecipe):
         ``(selected_token_ids, selected_token_mask)`` draft-vocab mapping built
         by scanning the training data.
         """
-        # Optional ``distributed:`` YAML section. Required for targets that do
-        # not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). ``force_hf`` is
-        # opt-in; default ``False`` so HF architectures with an AutoModel custom
-        # impl take the MoE-capable custom path.
-        target_kwargs = dict(
-            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
-            torch_dtype=self.compute_dtype,
-            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
-        )
-        if self.cfg.get("distributed", None) is not None:
-            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-            self.distributed_config = self.dist_setup.strategy_config
-            self.device_mesh = self.dist_setup.device_mesh
-            self.moe_mesh = self.dist_setup.moe_mesh
-            target_kwargs.update(
-                distributed_config=self.distributed_config,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                moe_config=self.dist_setup.moe_config,
-                activation_checkpointing=self.dist_setup.activation_checkpointing,
-            )
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
-        # ``nn.Module.to`` is in-place; reassigning ``self.target_model`` would
-        # re-trigger ``BaseRecipe.__setattr__`` state-tracking and raise.
-        if self.dist_setup is None:
-            self.target_model.to(self.device)
-        # The target is frozen: it only supplies aux hidden states / logits as
-        # supervision and is never optimized (the optimizer is built solely from
-        # the draft trainer module). Mark the parameters explicitly so no future
-        # code path accidentally trains the target -- matching EAGLE-1/2.
-        self.target_model.requires_grad_(False)
-        self.target_wrapper = HFEagle3TargetModel(
-            self.target_model,
-            aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
-        )
+        # ``target_model_backend`` selects where the frozen target runs:
+        #   - ``colocated`` (default): load the target on this GPU and capture
+        #     supervision in-process.
+        #   - ``remote``: the target runs as a standalone server (see
+        #     ``serve_target``); this process only holds the draft and pulls
+        #     precomputed supervision over HTTP + NCCL. No target weights are
+        #     loaded here, which frees the training GPU's memory.
+        backend = recipe_cfg.get("target_model_backend", "colocated")
+        if backend == "remote":
+            self._setup_remote_target(recipe_cfg)
+        elif backend == "colocated":
+            self._setup_colocated_target(recipe_cfg, target_path)
+        else:
+            raise ValueError(f"Unknown target_model_backend={backend!r}; expected 'colocated' or 'remote'.")
 
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
@@ -368,13 +361,92 @@ class TrainEagle3Recipe(BaseRecipe):
         # is rebuilt every setup (original behavior). On resume this still runs,
         # but ``_load_extra_state`` then overrides it with the checkpoint's saved
         # mapping -- so the cache only matters for cold starts.
-        return load_or_build_eagle3_token_mapping(
+        selected_token_ids, selected_token_mask = load_or_build_eagle3_token_mapping(
             self.train_dataloader,
             target_vocab_size=target_config.vocab_size,
             draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
             special_token_ids=special_token_ids,
             cache_path=recipe_cfg.get("selected_token_ids_path", None),
         )
+        # A remote target computes ``target_probs`` server-side, so it needs the
+        # draft-vocab mapping. Co-located backends keep it on the trainer module
+        # (the default ``set_vocab_mapping`` is a no-op).
+        self.target_wrapper.set_vocab_mapping(selected_token_ids, selected_token_mask)
+        return selected_token_ids, selected_token_mask
+
+    def _setup_colocated_target(self, recipe_cfg, target_path):
+        """Load the target on this GPU and capture supervision in-process."""
+        # Optional ``distributed:`` YAML section. Required for targets that do
+        # not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). ``force_hf`` is
+        # opt-in; default ``False`` so HF architectures with an AutoModel custom
+        # impl take the MoE-capable custom path.
+        target_kwargs = dict(
+            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
+            torch_dtype=self.compute_dtype,
+            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+        )
+        if self.cfg.get("distributed", None) is not None:
+            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+            self.distributed_config = self.dist_setup.strategy_config
+            self.device_mesh = self.dist_setup.device_mesh
+            self.moe_mesh = self.dist_setup.moe_mesh
+            target_kwargs.update(
+                distributed_config=self.distributed_config,
+                device_mesh=self.device_mesh,
+                moe_mesh=self.moe_mesh,
+                moe_config=self.dist_setup.moe_config,
+                activation_checkpointing=self.dist_setup.activation_checkpointing,
+            )
+        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        # ``nn.Module.to`` is in-place; reassigning ``self.target_model`` would
+        # re-trigger ``BaseRecipe.__setattr__`` state-tracking and raise.
+        if self.dist_setup is None:
+            self.target_model.to(self.device)
+        # The target is frozen: it only supplies aux hidden states / logits as
+        # supervision and is never optimized (the optimizer is built solely from
+        # the draft trainer module). Mark the parameters explicitly so no future
+        # code path accidentally trains the target -- matching EAGLE-1/2.
+        self.target_model.requires_grad_(False)
+        self.target_wrapper = HFEagle3TargetModel(
+            self.target_model,
+            aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
+        )
+
+    def _setup_remote_target(self, recipe_cfg):
+        """Connect to one or more remote target servers (no target loaded here)."""
+        urls = recipe_cfg.get("remote_urls", None)
+        if not urls and recipe_cfg.get("remote_url", None):
+            urls = [recipe_cfg.remote_url]
+        if not urls:
+            raise ValueError(
+                "target_model_backend='remote' requires recipe_args.remote_urls "
+                "(or remote_url) pointing at a running serve_target instance."
+            )
+        self.target_model = None
+        self.target_wrapper = RemoteEagle3TargetModel.from_urls(
+            list(urls),
+            device=self.device,
+            timeout=recipe_cfg.get("remote_timeout", 120),
+            max_retries=recipe_cfg.get("remote_max_retries", 3),
+        )
+
+    def _resolve_prefetch_depth(self, recipe_cfg) -> int:
+        """Validate and cap the prefetch depth for the configured backend."""
+        depth = int(recipe_cfg.get("target_prefetch_depth", 0))
+        if depth < 0:
+            raise ValueError(f"target_prefetch_depth must be >= 0, got {depth}.")
+        if depth == 0:
+            return 0
+        if self.target_wrapper is None or not self.target_wrapper.supports_async:
+            raise ValueError(
+                "target_prefetch_depth > 0 requires an async-capable backend (target_model_backend='remote')."
+            )
+        # One in-flight request per server keeps NCCL recv ordering unambiguous.
+        num_servers = getattr(self.target_wrapper, "num_remote_servers", 1)
+        capped = min(depth, num_servers)
+        if capped != depth and self.dist_env.is_main:
+            logger.info("Capping target_prefetch_depth %d -> %d (one in-flight request per server).", depth, capped)
+        return capped
 
     def _setup_cached_target(self, recipe_cfg, target_config):
         """Offline path: stream a precomputed cache; no target model is loaded.
@@ -426,8 +498,15 @@ class TrainEagle3Recipe(BaseRecipe):
             )
         return selected_token_ids, selected_token_mask
 
-    def _forward_batch(self, batch):
-        """Run the trainer module for one batch, from the live target or the cache."""
+    def _forward_batch(self, batch, target_batch=None):
+        """Run the trainer module for one batch, from the live target or the cache.
+
+        ``target_batch`` may be supplied when the supervision was prefetched
+        asynchronously (remote backend); it is already on the training device
+        and self-contained, so the raw ``batch`` is not needed.
+        """
+        if target_batch is not None:
+            return self.trainer_module(**target_batch.to_trainer_inputs())
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         if self.target_wrapper is None:
             # Offline cache: the supervision is already in the batch.
@@ -444,13 +523,40 @@ class TrainEagle3Recipe(BaseRecipe):
             attention_mask=batch["attention_mask"],
             loss_mask=batch["loss_mask"],
         )
-        return self.trainer_module(
-            input_ids=target_batch.input_ids,
-            attention_mask=target_batch.attention_mask,
-            loss_mask=target_batch.loss_mask,
-            aux_hidden_states=target_batch.aux_hidden_states,
-            target_logits=target_batch.logits,
-        )
+        return self.trainer_module(**target_batch.to_trainer_inputs())
+
+    def _prefetched_batches(self, dataloader):
+        """Yield ``(batch, target_batch)`` keeping up to ``target_prefetch_depth``
+        remote target requests in flight, so target inference on the server(s)
+        overlaps draft training on this GPU.
+
+        Requests are dispatched round-robin across servers by the backend; the
+        depth is capped to the server count (see ``setup``) so each server has
+        at most one in-flight request -- required for NCCL recv ordering.
+        """
+        depth = self.target_prefetch_depth
+        it = iter(dataloader)
+        queue: deque = deque()
+        exhausted = False
+
+        def fill():
+            nonlocal exhausted
+            while not exhausted and len(queue) < depth:
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    exhausted = True
+                    return
+                handle = self.target_wrapper.generate_batch_async(
+                    batch["input_ids"], batch["attention_mask"], batch["loss_mask"]
+                )
+                queue.append((batch, handle))
+
+        fill()
+        while queue:
+            batch, handle = queue.popleft()
+            fill()  # refill before blocking on the result to keep the pipe full
+            yield batch, handle.result()
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the standard recipes."""
@@ -589,6 +695,62 @@ class TrainEagle3Recipe(BaseRecipe):
                     self._update_best_symlink(path, float(best_val_metric))
             if is_dist_initialized:
                 dist.barrier()
+
+    def _log_saved_checkpoint(self, kind: str, epoch: int, step: int) -> None:
+        """Log a saved checkpoint on rank 0 when checkpointing is enabled."""
+        ckpt_cfg = getattr(self, "checkpoint_config", None)
+        if self.dist_env.is_main and ckpt_cfg is not None and ckpt_cfg.enabled:
+            logger.info("Saved %s checkpoint to %s/epoch_%d_step_%d", kind, ckpt_cfg.checkpoint_dir, epoch, step)
+
+    def _maybe_save_step_checkpoint(self, epoch: int) -> bool:
+        """Save a checkpoint mid-epoch when ``ckpt_every_steps`` is configured.
+
+        Called after every optimizer step. Saves whenever ``ckpt_every_steps`` is
+        a positive integer and the current ``global_step`` is a multiple of it.
+        Returns True if a checkpoint was written. The checkpoint directory is
+        named ``epoch_{epoch}_step_{global_step}`` so it never collides with the
+        end-of-epoch checkpoint (which uses ``epoch + 1``).
+        """
+        every = getattr(self, "ckpt_every_steps", None)
+        if every is None or every <= 0 or self.runtime.global_step % every != 0:
+            return False
+        self.save_checkpoint(
+            epoch=epoch,
+            step=self.runtime.global_step,
+            train_loss=None,
+            val_loss=None,
+            best_metric_key="val_loss",
+        )
+        self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
+        return True
+
+    def _maybe_save_final_checkpoint(self, completed_epochs: int) -> bool:
+        """Always save the fully-trained model at the end of a completed run,
+        unless a periodic checkpoint already captured the final step.
+
+        The end-of-run state is otherwise easy to lose: with no cadence nothing is
+        saved at all, and with a pure step cadence the final step is skipped
+        whenever the total step count is not a multiple of ``ckpt_every_steps``.
+        This is a no-op only when a step or epoch checkpoint already landed on the
+        final step, so it never duplicates or collides with one.
+        """
+        gs = self.runtime.global_step
+        if gs <= 0:
+            return False
+        every = getattr(self, "ckpt_every_steps", None)
+        saved_by_step = bool(every and every > 0 and gs % every == 0)
+        saved_by_epoch = bool(getattr(self, "save_checkpoint_every_epoch", False))
+        if saved_by_step or saved_by_epoch:
+            return False
+        self.save_checkpoint(
+            epoch=completed_epochs,
+            step=gs,
+            train_loss=None,
+            val_loss=None,
+            best_metric_key="val_loss",
+        )
+        self._log_saved_checkpoint("final", completed_epochs, gs)
+        return True
 
     def _save_extra_state(self, path: str, epoch: int) -> None:
         """Persist EAGLE-3 meta: global_step, epoch, and vocab mapping tensors."""
@@ -742,7 +904,13 @@ class TrainEagle3Recipe(BaseRecipe):
 
             batches_processed = 0
             pending_micro_batches = 0
-            for batch_idx, batch in enumerate(self.train_dataloader):
+            # With prefetch the supervision is fetched asynchronously and paired
+            # with its batch; otherwise the target runs inline (target_batch=None).
+            if self.target_prefetch_depth > 0:
+                batch_source = enumerate(self._prefetched_batches(self.train_dataloader))
+            else:
+                batch_source = ((i, (b, None)) for i, b in enumerate(self.train_dataloader))
+            for batch_idx, (batch, target_batch) in batch_source:
                 # Skip DDP's per-micro-batch all-reduce on every micro-batch
                 # except the one an optimizer step immediately follows; that
                 # step's all-reduce covers the whole locally-accumulated window.
@@ -755,7 +923,7 @@ class TrainEagle3Recipe(BaseRecipe):
                 )
                 sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
                 with sync_ctx:
-                    metrics = self._forward_batch(batch)
+                    metrics = self._forward_batch(batch, target_batch)
                     loss = metrics.loss / float(self.grad_accumulation_steps)
                     loss.backward()
 
@@ -772,6 +940,7 @@ class TrainEagle3Recipe(BaseRecipe):
                     self.optimizer.zero_grad(set_to_none=True)
                     self.runtime.global_step += 1
                     pending_micro_batches = 0
+                    self._maybe_save_step_checkpoint(epoch)
 
                     if self.runtime.global_step % self.log_every_steps == 0:
                         mean_loss = _all_reduce_mean(running_loss / max(running_steps, 1))
@@ -824,6 +993,7 @@ class TrainEagle3Recipe(BaseRecipe):
                 self.optimizer.zero_grad(set_to_none=True)
                 self.runtime.global_step += 1
                 pending_micro_batches = 0
+                self._maybe_save_step_checkpoint(epoch)
 
                 if running_steps > 0:
                     mean_loss = _all_reduce_mean(running_loss / max(running_steps, 1))
@@ -878,21 +1048,22 @@ class TrainEagle3Recipe(BaseRecipe):
                         {"val/loss": val_loss_dict["val_loss"], "val/accuracy": val_loss_dict["val_accuracy"]},
                         step=self.runtime.global_step,
                     )
-            self.save_checkpoint(
-                epoch=epoch + 1,
-                step=self.runtime.global_step,
-                train_loss=None,
-                val_loss=val_loss_dict,
-                best_metric_key="val_loss",
-            )
-            ckpt_cfg = getattr(self, "checkpoint_config", None)
-            if self.dist_env.is_main and ckpt_cfg is not None and ckpt_cfg.enabled:
-                logger.info(
-                    "Saved checkpoint to %s/epoch_%d_step_%d",
-                    ckpt_cfg.checkpoint_dir,
-                    epoch + 1,
-                    self.runtime.global_step,
+            if getattr(self, "save_checkpoint_every_epoch", False):
+                self.save_checkpoint(
+                    epoch=epoch + 1,
+                    step=self.runtime.global_step,
+                    train_loss=None,
+                    val_loss=val_loss_dict,
+                    best_metric_key="val_loss",
                 )
+                self._log_saved_checkpoint("epoch", epoch + 1, self.runtime.global_step)
+
+        self._maybe_save_final_checkpoint(self.num_epochs)
+
+        if self.target_wrapper is not None:
+            # Release remote connections / shut down the target server's
+            # client-idle watchdog. A no-op for the co-located backend.
+            self.target_wrapper.close()
 
         if getattr(self, "wandb_run", None) is not None:
             self.wandb_run.finish()
