@@ -253,13 +253,18 @@ def _load_checkpoint_into_attr(pipe, attr_name, checkpoint, torch_dtype):
     if target is None:
         raise AttributeError(f"Pipeline has no attribute {attr_name!r} to load checkpoint into")
 
+    # Load checkpoints to CPU first: load_state_dict copies into the target's
+    # existing (already-on-device) parameters, so a GPU map_location would hold a
+    # second full copy of the weights on-device and roughly double peak GPU memory.
+    # This matters for Wan2.2 two-stage inference, where this runs once per stage
+    # and the first transformer is still resident when the second loads.
     if ema_path.exists():
         logger.info("Loading EMA checkpoint from %s into %s", ema_path, attr_name)
-        ema_state = torch.load(ema_path, map_location="cuda", weights_only=True)
+        ema_state = torch.load(ema_path, map_location="cpu", weights_only=True)
         target.load_state_dict(ema_state, strict=True)
     elif consolidated_path.exists():
         logger.info("Loading consolidated checkpoint from %s into %s", consolidated_path, attr_name)
-        state_dict = torch.load(consolidated_path, map_location="cuda", weights_only=True)
+        state_dict = torch.load(consolidated_path, map_location="cpu", weights_only=True)
         if "model_state_dict" in state_dict:
             state_dict = state_dict["model_state_dict"]
         target.load_state_dict(state_dict, strict=True)
