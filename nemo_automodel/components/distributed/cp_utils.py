@@ -19,13 +19,13 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
-from nemo_automodel.components.utils.model_utils import is_multimodal_module_path
+from nemo_automodel.components.utils.model_utils import is_cp_non_text_module_path
 
 
 def _is_cp_attention_module_name(name: str) -> bool:
     if not name.endswith("self_attn"):
         return False
-    return not is_multimodal_module_path(name)
+    return not is_cp_non_text_module_path(name)
 
 
 def _build_position_ids(batch, device):
