@@ -1,0 +1,115 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# LLaDA2 SFT recipe using the existing DiffusionLMSFTRecipe (mode: mdlm).
+#
+# LLaDA2 training is standard MDLM: tokens are uniformly corrupted at a random
+# rate t ~ U[0,1] and the model is trained to denoise with a 1/t-weighted
+# cross-entropy loss.  Block-wise iterative refinement is an inference-only
+# feature handled by diffusers' LLaDA2Pipeline + BlockRefinementScheduler.
+# The weights produced here are directly compatible with that pipeline.
+#
+# Usage (8-GPU):
+#   python -m torch.distributed.run --nproc-per-node=8 \
+#       nemo_automodel/recipes/dllm/train_ft.py \
+#       -c examples/dllm_sft/llada2_sft.yaml
+
+recipe: DiffusionLMSFTRecipe
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 4
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  max_steps: null
+  num_epochs: 5
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+seed: 42
+
+wandb:
+  project: llada2-sft
+  name: llada2-mini-tulu3-run
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: inclusionAI/LLaDA2.1-mini
+  torch_dtype: bfloat16
+  trust_remote_code: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/llada2-mini
+  model_save_format: safetensors
+
+distributed:
+  strategy: fsdp2
+  dp_size: null
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: false
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: float32
+  autocast_dtype: bfloat16
+  offload_policy: null
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+# LLaDA2.1 mask token ID (<|mask|> in the Qwen-based tokenizer).
+# Set eps > 0 to ensure at least some corruption every step.
+dllm:
+  mode: mdlm
+  mask_token_id: 156895
+  eps: 0.001
+  supervise_padding: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  lr: 2.0e-5
+  weight_decay: 0.0
+
+clip_grad_norm:
+  max_norm: 1.0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  init_lr: 0.0
+  min_lr: 0.0
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  shuffle_seed: 42
+  seq_length: 1024
+  truncation: true
+  unshifted: true
+  tokenizer:
+    pretrained_model_name_or_path: inclusionAI/LLaDA2.1-mini
+    trust_remote_code: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  group_by_length: true
