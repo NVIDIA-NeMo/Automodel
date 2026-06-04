@@ -40,8 +40,21 @@ from nemo_automodel.components.speculative.eagle.peagle_data import (
     generate_cod_sample_indices,
 )
 
+# P-EAGLE's draft forward runs flex_attention, whose autograd is not implemented
+# on CPU in the CI torch build (even the forward errors once the inputs require
+# grad). Tests that drive the draft forward therefore run on CUDA and are skipped
+# when it is unavailable; the pure-tensor / mask-mod / plan / config tests stay on
+# CPU.
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+_gpu_only = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="P-EAGLE forward uses flex_attention, which has no CPU autograd support in the CI torch build.",
+)
 
-def _build_tiny_draft_model(*, parallel_drafting: bool = False, mask_token_id: int = 0) -> LlamaEagle3DraftModel:
+
+def _build_tiny_draft_model(
+    *, parallel_drafting: bool = False, mask_token_id: int = 0, device: str = _DEVICE
+) -> LlamaEagle3DraftModel:
     config = LlamaConfig(
         hidden_size=32,
         intermediate_size=64,
@@ -58,7 +71,7 @@ def _build_tiny_draft_model(*, parallel_drafting: bool = False, mask_token_id: i
     if parallel_drafting:
         config.mask_token_id = mask_token_id
         config.num_depths = 8
-    return LlamaEagle3DraftModel(config).to(torch.float32)
+    return LlamaEagle3DraftModel(config).to(device=device, dtype=torch.float32)
 
 
 def _vocab_mapping(config: LlamaConfig) -> tuple[torch.Tensor, torch.Tensor]:
@@ -71,13 +84,15 @@ def _vocab_mapping(config: LlamaConfig) -> tuple[torch.Tensor, torch.Tensor]:
 
 def _make_trainer(draft: LlamaEagle3DraftModel, *, num_depths: int, mask_token_id: int = 0) -> PEagleTrainerModule:
     selected_token_ids, selected_token_mask = _vocab_mapping(draft.config)
+    # ``.to(device)`` follows the draft so the registered vocab buffers and the
+    # draft share a device when the draft was built on CUDA.
     return PEagleTrainerModule(
         draft,
         selected_token_ids=selected_token_ids,
         selected_token_mask=selected_token_mask,
         num_depths=num_depths,
         mask_token_id=mask_token_id,
-    )
+    ).to(next(draft.parameters()).device)
 
 
 def _random_batch(
@@ -86,17 +101,18 @@ def _random_batch(
     batch_size: int = 2,
     seq_len: int = 12,
     targets_in_draft_vocab: bool = True,
+    device: str = _DEVICE,
 ) -> dict[str, torch.Tensor]:
-    target_logits = torch.randn(batch_size, seq_len, config.vocab_size)
+    target_logits = torch.randn(batch_size, seq_len, config.vocab_size, device=device)
     if targets_in_draft_vocab:
         # Bias the target argmax into the draft vocab so supervised positions
         # survive the realistic (shrunk) selected_token_mask.
         target_logits[..., : config.draft_vocab_size] += 8.0
     return {
-        "input_ids": torch.randint(0, config.draft_vocab_size, (batch_size, seq_len)),
-        "attention_mask": torch.ones(batch_size, seq_len, dtype=torch.long),
-        "loss_mask": torch.ones(batch_size, seq_len, dtype=torch.long),
-        "aux_hidden_states": torch.randn(batch_size, seq_len, config.hidden_size * 3),
+        "input_ids": torch.randint(0, config.draft_vocab_size, (batch_size, seq_len), device=device),
+        "attention_mask": torch.ones(batch_size, seq_len, dtype=torch.long, device=device),
+        "loss_mask": torch.ones(batch_size, seq_len, dtype=torch.long, device=device),
+        "aux_hidden_states": torch.randn(batch_size, seq_len, config.hidden_size * 3, device=device),
         "target_logits": target_logits,
     }
 
@@ -172,9 +188,10 @@ def _drive_partitioned(trainer: PEagleTrainerModule, batch: dict[str, torch.Tens
     one ``forward(peagle_segment=...)`` + ``backward()`` per segment. Returns the
     aggregated (detached) loss, valid count, and correct count."""
     plan = trainer.build_peagle_plan(batch["loss_mask"])
-    loss_sum = torch.zeros(())
-    valid_sum = torch.zeros(())
-    correct_sum = torch.zeros(())
+    device = batch["input_ids"].device
+    loss_sum = torch.zeros((), device=device)
+    valid_sum = torch.zeros((), device=device)
+    correct_sum = torch.zeros((), device=device)
     for i in range(len(plan.units)):
         seg = trainer(
             input_ids=batch["input_ids"],
@@ -191,6 +208,7 @@ def _drive_partitioned(trainer: PEagleTrainerModule, batch: dict[str, torch.Tens
     return loss_sum, valid_sum, correct_sum
 
 
+@_gpu_only
 def test_sequence_partitioning_matches_single_flat_forward():
     """Algorithm 1 partitioning is exact: driving the S>1 plan segment-by-segment
     (forward + backward each) reproduces the single flat S=1 forward's loss,
@@ -210,7 +228,7 @@ def test_sequence_partitioning_matches_single_flat_forward():
             num_depths=6,
             mask_token_id=mask_id,
             sequence_partitions=sequence_partitions,
-        )
+        ).to(next(draft.parameters()).device)
 
     single = _trainer(1)
     partitioned = _trainer(4)
@@ -252,7 +270,9 @@ def test_peagle_plan_charges_every_supervised_token_once():
         num_depths=6,
         mask_token_id=mask_id,
         sequence_partitions=4,
-    )
+    ).to(next(draft.parameters()).device)
+    # build_peagle_plan is flex-free (COD sampling + Algorithm 1 assignment), so
+    # this test runs on CPU too -- no @_gpu_only guard.
     batch = _random_batch(draft.config, batch_size=2, seq_len=16)
     plan = trainer.build_peagle_plan(batch["loss_mask"])
 
@@ -355,6 +375,7 @@ def test_peagle_stacks_num_hidden_layers():
     assert len(eagle3.model.layers) == 1
 
 
+@_gpu_only
 def test_peagle_deeper_layers_receive_gradient():
     """Stacked deeper layers must be in the autograd graph (their params update)."""
     torch.manual_seed(0)
@@ -399,6 +420,7 @@ def test_peagle_trainer_rejects_non_positive_num_depths():
             )
 
 
+@_gpu_only
 def test_peagle_trainer_runs_and_backprops_to_mask_hidden():
     """Parallel forward yields a finite loss and a non-zero gradient on ``mask_hidden``."""
     torch.manual_seed(0)
@@ -420,6 +442,7 @@ def test_peagle_trainer_runs_and_backprops_to_mask_hidden():
     )
 
 
+@_gpu_only
 def test_peagle_single_depth_uses_no_mask_hidden_gradient():
     """With ``num_depths=1`` only depth 0 runs, so ``mask_hidden`` carries no gradient signal."""
     torch.manual_seed(0)
@@ -431,6 +454,7 @@ def test_peagle_single_depth_uses_no_mask_hidden_gradient():
     assert draft.mask_hidden.grad is None or draft.mask_hidden.grad.abs().sum().item() == 0
 
 
+@_gpu_only
 def test_peagle_flat_inputs_mask_depth_ge_1_slots():
     """Depth-0 slots carry real token/hidden; depth >= 1 slots carry mask token/``mask_hidden``."""
     torch.manual_seed(0)
@@ -470,6 +494,7 @@ def test_peagle_flat_inputs_mask_depth_ge_1_slots():
         torch.testing.assert_close(h, mask_proj)
 
 
+@_gpu_only
 def test_peagle_supervision_depends_only_on_loss_mask():
     """Supervised-token count is driven by loss_mask + COD, NOT by target vocab.
 
@@ -490,6 +515,7 @@ def test_peagle_supervision_depends_only_on_loss_mask():
     assert out_vocab == in_vocab, "P-EAGLE supervision must not depend on whether targets are in the draft vocab"
 
 
+@_gpu_only
 def test_peagle_loss_decreases_over_optimizer_steps():
     """A few AdamW steps on a fixed batch reduce the P-EAGLE loss."""
     torch.manual_seed(0)
