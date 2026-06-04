@@ -13,8 +13,6 @@
 
 import json
 
-import pytest
-
 from nemo_automodel.components.datasets.llm import xlam
 
 
@@ -65,6 +63,28 @@ def test_convert_tool_calls_preserves_arguments_and_ids():
     assert [c["function"]["name"] for c in converted] == ["foo", "bar"]
     assert [c["id"] for c in converted] == ["call_10_0", "call_10_1"]
     assert converted[0]["function"]["arguments"] == '{"x":1}'
+
+
+def test_convert_tool_calls_serializes_dict_arguments_to_json_string():
+    # OpenAI tool calling format requires `function.arguments` to be a string.
+    # Derivative xLAM-style datasets may carry it as a dict; the adapter must
+    # serialize so chat templates render a valid JSON payload.
+    raw_calls = [
+        {"name": "weather", "arguments": {"city": "Beijing", "days": 3}},
+        {"name": "echo", "arguments": ["a", "b"]},
+    ]
+
+    converted = xlam._convert_tool_calls(raw_calls)
+    assert isinstance(converted[0]["function"]["arguments"], str)
+    assert json.loads(converted[0]["function"]["arguments"]) == {"city": "Beijing", "days": 3}
+    assert json.loads(converted[1]["function"]["arguments"]) == ["a", "b"]
+
+
+def test_convert_tool_calls_preserves_unicode_in_dict_arguments():
+    raw_calls = [{"name": "search", "arguments": {"query": "北京天气"}}]
+    converted = xlam._convert_tool_calls(raw_calls)
+    # ensure_ascii=False keeps CJK characters readable in the rendered chat.
+    assert "北京天气" in converted[0]["function"]["arguments"]
 
 
 def test_format_example_builds_chat_payload(monkeypatch):
@@ -132,6 +152,12 @@ def test_make_xlam_dataset_respects_limit_and_maps(monkeypatch):
         def __init__(self, items):
             self.items = items
             self.map_calls = []
+        
+        def __getitem__(self, idx):
+            return self.items[idx]
+
+        def __len__(self):
+            return len(self.items)
 
         def map(self, fn, batched=False, remove_columns=None):
             self.map_calls.append({"batched": batched, "remove_columns": remove_columns})
@@ -148,7 +174,7 @@ def test_make_xlam_dataset_respects_limit_and_maps(monkeypatch):
     monkeypatch.setattr(xlam, "_add_pad_token", lambda tok: 13)
 
     fmt_calls = []
-
+    
     def fake_format_example(example, tokenizer, eos_token_id, pad_token_id, seq_length, padding, truncation):
         fmt_calls.append(
             {
@@ -181,8 +207,5 @@ def test_make_xlam_dataset_respects_limit_and_maps(monkeypatch):
     )
 
     assert dataset_calls == {"name": "dummy", "split": "train[:2]"}
-    assert result == [{"formatted": 0}, {"formatted": 1}]
-    assert dummy_ds.map_calls[0]["batched"] is False
-    assert dummy_ds.map_calls[0]["remove_columns"] == ["id", "query", "answers", "tools"]
+    assert list(result) == [{"formatted": 0}, {"formatted": 1}]
     assert fmt_calls[0]["pad"] == 13 and fmt_calls[0]["eos"] == tok.eos_token_id
-

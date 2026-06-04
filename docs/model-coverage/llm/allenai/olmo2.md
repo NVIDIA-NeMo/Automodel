@@ -13,7 +13,7 @@
 
 ## Available Models
 
-- **OLMo2-0425-1B-Instruct**
+- **OLMo-2-0425-1B-Instruct**
 - **OLMo2-7B-1124**
 - **OLMo2-13B-1124**
 
@@ -26,7 +26,7 @@
 | Model | HF ID |
 |---|---|
 | OLMo2 7B | [`allenai/OLMo2-7B-1124`](https://huggingface.co/allenai/OLMo2-7B-1124) |
-| OLMo2 0425 1B Instruct | [`allenai/OLMo2-0425-1B-Instruct`](https://huggingface.co/allenai/OLMo2-0425-1B-Instruct) |
+| OLMo2 0425 1B Instruct | [`allenai/OLMo-2-0425-1B-Instruct`](https://huggingface.co/allenai/OLMo-2-0425-1B-Instruct) |
 
 ## Example Recipes
 

@@ -15,7 +15,7 @@
 # Benchmarking config for Step 3.5 Flash Te Deepep
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/step_3.5_flash_te_deepep.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/step/step_3.5_flash_te_deepep.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
@@ -71,6 +71,7 @@ model:
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: stepfun-ai/Step-3.5-Flash
+    trust_remote_code: true
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig

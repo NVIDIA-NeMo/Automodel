@@ -55,7 +55,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: /path/to/model
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16  # pragma: allowlist secret
     trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
@@ -94,4 +94,4 @@ optimizer:
 
 ci:
   time: "00:15:00"
-  nodes: 1
+  nodes: 8

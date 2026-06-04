@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import types
-from unittest.mock import MagicMock
 
-import pytest
 import torch
 from transformers.models.donut.modeling_donut_swin import DonutSwinModelOutput
 
@@ -195,4 +192,3 @@ def test_nemotron_parse_external_loss(monkeypatch):
     l10 = loss_10x(logits=out_coords.logits, labels=labels_with_coords)
     l20 = loss_20x(logits=out_coords.logits, labels=labels_with_coords)
     assert l10 != l20, "Different coordinate weights should produce different losses"
-

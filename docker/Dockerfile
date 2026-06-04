@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.02-py3
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.04-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
@@ -38,8 +38,9 @@ ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Address CVE-2025-68973
-RUN apt-get update && apt install -y --only-upgrade gnupg && \
+# Address CVE-2025-68973; install ffmpeg dev libs for torchcodec source build
+RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
+    apt-get install -y --no-install-recommends ffmpeg libavdevice-dev pkg-config && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -61,8 +62,8 @@ RUN if [ -f /usr/local/bin/torchrun ]; then \
 FROM update_base_container AS automodel_dep
 
 # Install TE
-ARG INSTALL_TE=False
-ARG TE_COMMIT=release_v2.11
+ARG INSTALL_TE=True
+ARG TE_COMMIT=release_v2.14
 RUN if [ "$INSTALL_TE" = "True" ]; then \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \
@@ -129,7 +130,7 @@ RUN pip install "aiohttp>=3.13.3" \
         "jaraco-context>=6.1.0" \
         "nbconvert>=7.17.0" \
         "onnx>=1.21.0" \
-        "pillow>=12.1.1" \
+        "pillow>=12.2.0" \
         "protobuf>=6.33.5" \
         "setuptools>=80.10.2" \
         "tornado>=6.5.5" \
@@ -154,31 +155,17 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
     fi && \
     uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS --no-cache
 
-# Patch wandb-core: bump vulnerable Go deps (CVE fixes)
-ARG TARGETARCH
-RUN if python3 -c "import wandb" 2>/dev/null; then \
-        GRPC_VERSION=1.79.3 && \
-        OTEL_VERSION=1.35.0 && \
-        GO_VERSION=1.26.1 && \
-        WANDB_VERSION=$(python3 -c "import wandb; print(wandb.__version__)") && \
-        WANDB_CORE_BIN=/opt/venv/lib/python3.12/site-packages/wandb/bin/wandb-core && \
-        curl -fsSL "https://dl.google.com/go/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" | tar -C /tmp -xz && \
-        export PATH="/tmp/go/bin:$PATH" && \
-        export GOPATH=/tmp/gopath && \
-        git clone --depth 1 --branch "v${WANDB_VERSION}" https://github.com/wandb/wandb.git /tmp/wandb-src && \
-        cd /tmp/wandb-src/core && \
-        go get google.golang.org/grpc@v${GRPC_VERSION} && \
-        go get go.opentelemetry.io/otel/sdk@v${OTEL_VERSION} && \
-        go mod tidy && \
-        go mod vendor && \
-        CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" \
-            -o "${WANDB_CORE_BIN}" ./cmd/wandb-core/ && \
-        rm -rf /tmp/wandb-src /tmp/go /tmp/gopath; \
-    else \
-        echo "wandb not installed, skipping CVE patch"; \
-    fi
+# Rebuild torchcodec from source to match the container's PyTorch ABI
+RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
+    pip install --no-build-isolation --force-reinstall --no-deps \
+        git+https://github.com/pytorch/torchcodec.git@v0.8.0
 
 COPY . /opt/Automodel
+
+# Re-apply PyTorch overrides after full COPY (which overwrites the modified pyproject.toml/uv.lock)
+RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
+        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
+    fi
 
 WORKDIR /opt/Automodel
 

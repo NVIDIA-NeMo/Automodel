@@ -1,0 +1,159 @@
+---
+title: "NeMo AutoModel Documentation"
+description: "NeMo AutoModel is a PyTorch DTensor-native SPMD open-source training library for scalable LLM and VLM training and fine-tuning with day-0 Hugging Face model support"
+---
+import { Tag } from "@/components/Tag";
+
+PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training -- no checkpoint conversion, no boilerplate.
+**Quick links:** [🤗 HF Compatible](/get-started/hf-compatibility) | [🚀 Performance](/performance/performance-summary) | [📐 Scalability](/get-started/key-features) | [🎯 SFT & PEFT](/recipes-e2e-examples/sft-peft) | [🎨 Diffusion](/recipes-e2e-examples/diffusion-fine-tuning) | [👁️ VLM](/recipes-e2e-examples/gemma-4)
+
+<Cards>
+<Card title="About" href="/get-started/about">
+Overview of NeMo AutoModel and its capabilities.
+</Card>
+
+<Card title="Key Features" href="/get-started/key-features">
+Supported workflows, parallelism, recipes, and benchmarks.
+</Card>
+
+<Card title="🤗 HF Integration" href="/get-started/hf-compatibility">
+A `transformers`-compatible library with accelerated model implementations.
+</Card>
+
+<Card title="Model Coverage" href="/model-coverage/overview">
+Built on `transformers` for day-0 model support and OOTB compatibility.
+</Card>
+
+</Cards>
+
+## Get Started
+
+```bash
+uv pip install nemo-automodel
+
+automodel --nproc-per-node=2 llama3_2_1b_squad.yaml
+```
+
+See the [installation guide](/get-started/installation) for Docker, source builds, and multi-node setup.
+See the [configuration guide](/get-started/configuration) for YAML recipes and CLI overrides.
+Launch on a [local workstation](/job-launchers/local-workstation) or [SLURM cluster](/job-launchers/slurm-cluster).
+
+## Latest Model Support
+
+New models are added regularly. Pick a model below to start fine-tuning, or see the [full release log](/model-coverage/release-log).
+
+| Date | Modality | Model |
+|------|----------|-------|
+| 2026-04-07 | LLM | [GLM-5.1](https://github.com/NVIDIA-NeMo/Automodel/discussions/1719) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml)) |
+| 2026-04-02 | VLM | Gemma 4 ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml)) |
+| 2026-03-16 | VLM | [Mistral Small 4](https://github.com/NVIDIA-NeMo/Automodel/discussions/1558) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml)) |
+| 2026-03-11 | LLM | [Nemotron Super v3](https://github.com/NVIDIA-NeMo/Automodel/discussions/976) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml)) |
+| 2026-03-03 | Diffusion | FLUX.1-dev ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml)) |
+
+## Recipes & Guides
+
+Find the right guide for your task -- fine-tuning, pretraining, distillation, diffusion, and more.
+
+| I want to...                | Choose this when...                                                                 | Input Data                                        | Model     | Guide                                                     |
+| --------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------- | --------- | --------------------------------------------------------- |
+| **SFT (full fine-tune)**    | You need maximum accuracy and have the GPU budget to update all weights             | Instruction / chat dataset                        | LLM       | [Start fine-tuning](/recipes-e2e-examples/sft-peft)               |
+| **PEFT (LoRA)**             | You want to fine-tune on limited GPU memory; updates &lt;1 % of parameters             | Instruction / chat dataset                        | LLM       | [Start LoRA](/recipes-e2e-examples/sft-peft)        |
+| **Tool / function calling** | Your model needs to call APIs or tools with structured arguments                    | Function-calling dataset (queries + tool schemas) | LLM       | [Add tool calling](/recipes-e2e-examples/function-calling)             |
+| **Fine-tune VLM**           | Your task involves both images and text (e.g., visual QA, captioning)               | Image + text dataset                              | VLM       | [Fine-tune VLM](/recipes-e2e-examples/gemma-3-3n)                 |
+| **Fine-tune Gemma 4**       | You want to fine-tune Gemma 4 for structured extraction from images (e.g., receipts) | Image + text dataset                              | VLM       | [Fine-tune Gemma 4](/recipes-e2e-examples/gemma-4)                 |
+| **Fine-tune dLLM**          | You want to fine-tune a diffusion language model (e.g., LLaDA) using masked denoising | Instruction / chat dataset                        | dLLM      | [Fine-tune dLLM](/recipes-e2e-examples/dllm-fine-tuning)                 |
+| **Fine-tune Diffusion**     | You want to fine-tune a diffusion model for image or video generation               | Video / Image dataset                             | Diffusion | [Fine-tune Diffusion](/recipes-e2e-examples/diffusion-fine-tuning)       |
+| **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](/recipes-e2e-examples/qwen3-5-vl)                |
+| **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | <Tag variant="info">Coming Soon</Tag>                                   |
+| **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](/recipes-e2e-examples/large-moe-fine-tuning)         |
+| **Fine-tune DeepSeek V4 Flash** | You want to fine-tune the DeepSeek V4 Flash hybrid-attention MoE (SWA / CSA / HCA + hash-routing) | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune DeepSeek V4 Flash](/recipes-e2e-examples/deepseek-v4-flash)   |
+| **Fine-tune Hy3-preview**       | You want to fine-tune Tencent's 295B MoE with sigmoid routing and per-head QK RMSNorm              | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune Hy3-preview](/recipes-e2e-examples/hy3-preview)                |
+| **Sequence classification** | You need to classify text into categories (sentiment, topic, NLI)                   | Text + labels (e.g., GLUE MRPC)                   | LLM       | [Train classifier](/recipes-e2e-examples/sequence-classification) |
+| **QAT fine-tune**           | You want a quantized model that keeps accuracy for efficient deployment             | Text dataset                                      | LLM       | [Enable QAT](/recipes-e2e-examples/qat)       |
+| **Knowledge distillation**  | You want a smaller, faster model that retains most of the teacher's quality         | Instruction dataset + teacher model               | LLM       | [Distill a model](/recipes-e2e-examples/knowledge-distillation)   |
+| **Pretrain an LLM**         | You are building a base model from scratch on your own corpus                       | Large unlabeled text corpus (e.g., FineWeb-Edu)   | LLM       | [Start pretraining](/recipes-e2e-examples/pretraining)            |
+| **Pretrain (NanoGPT)**      | You want quick pretraining experiments on a single node                             | FineWeb / text corpus                             | LLM       | [Try NanoGPT](/recipes-e2e-examples/nanogpt-pretraining)          |
+
+## Performance
+
+Training throughput on NVIDIA GPUs with optimized kernels for Hugging Face models.
+
+| Model            | GPUs | TFLOPs/sec/GPU | Tokens/sec/GPU | Optimizations          |
+| ---------------- | ---- | -------------- | -------------- | ---------------------- |
+| DeepSeek V3 671B | 256  | 250            | 1,002          | TE + DeepEP            |
+| GPT-OSS 20B      | 8    | 279            | 13,058         | TE + DeepEP + FlexAttn |
+| Qwen3 MoE 30B    | 8    | 277            | 12,040         | TE + DeepEP            |
+
+See the [full benchmark results](/performance/performance-summary) for configuration details and more models.
+
+## Advanced Topics
+
+Parallelism, precision, checkpointing strategies and experiment tracking.
+
+<Cards>
+<Card title="Pipeline Parallelism" href="/development/pipeline-parallelism">
+Torch-native pipelining composable with FSDP2 and DTensor.
+<Tag variant="secondary"&gt;3d-parallelism</Tag>
+</Card>
+
+<Card title="FP8 Training" href="/development/fp8-training">
+Mixed-precision FP8 training with torchao.
+<Tag variant="secondary">FP8</Tag> <Tag variant="secondary">mixed-precision</Tag>
+</Card>
+
+<Card title="Checkpointing" href="/development/checkpointing">
+Distributed checkpoints with SafeTensors output.
+<Tag variant="secondary">DCP</Tag> <Tag variant="secondary">safetensors</Tag>
+</Card>
+
+<Card title="Gradient Checkpointing" href="/development/gradient-checkpointing">
+Trade compute for memory with activation checkpointing.
+<Tag variant="secondary">memory-efficiency</Tag>
+</Card>
+
+<Card title="Quantization-Aware Training" href="/recipes-e2e-examples/qat">
+Train with quantization for deployment-ready models.
+<Tag variant="secondary">QAT</Tag>
+</Card>
+
+<Card title="Experiment Tracking" href="/development/mlflow-logging">
+Track experiments and metrics with MLflow and Wandb.
+<Tag variant="secondary">MLflow</Tag> <Tag variant="secondary">Wandb</Tag>
+</Card>
+
+</Cards>
+
+## For Developers
+
+<Cards>
+<Card title="Repo Internals" href="/get-started/repo-structure">
+Components, recipes, and CLI architecture.
+</Card>
+
+<Card title="API Reference" href="/development/api-reference/overview">
+Auto-generated Python API documentation.
+</Card>
+
+<Card title="Use as a Library" href="/get-started/about">
+Drop-in accelerated backend for TRL, lm-eval-harness, OpenRLHF, or any code that loads Hugging Face models.
+</Card>
+
+</Cards>
+
+---
+
+::
+
+::
+
+::
+
+::
+
+::
+
+::
+
+::
+
+::

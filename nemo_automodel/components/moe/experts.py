@@ -312,6 +312,11 @@ class GroupedExperts(nn.Module):
             else None
         )
 
+        # Match activation dtype for grouped_mm; covers the case where FSDP2's
+        # MixedPrecisionPolicy does not reach EP DTensors.
+        gate_and_up_projs = gate_and_up_projs.to(x.dtype)
+        down_projs = down_projs.to(x.dtype)
+
         # EP variable-length all-gather
         if ep_size > 1:
             ep_group = ep_mesh.get_group()
@@ -377,7 +382,8 @@ class GroupedExperts(nn.Module):
 
         # Gradient anchor
         if ep_size > 1:
-            y = y + (x * 0.0)
+            # Keep the differentiable all-gather path attached to x without materializing a full-size zero tensor.
+            y.add_(x.sum(dtype=torch.float32) * 0.0)
 
         # Variable-length reduce: all_reduce + narrow to original per-rank token boundaries
         if ep_size > 1:
@@ -520,6 +526,8 @@ def quick_geglu_deepep(
     limit: float = 7.0,
     linear_offset: float = 1.0,
 ):
+    """Apply DeepEP Quick-GEGLU activation and routing probabilities."""
+
     gate_out, up_out = x[..., ::2], x[..., 1::2]
     # Clamp the input values
     gate_out = gate_out.clamp(min=None, max=limit)
@@ -541,8 +549,38 @@ def relu2_deepep(x, permuted_probs):
     return (inter * permuted_probs).to(x.dtype)
 
 
+@torch.compile(fullgraph=True, options={"max_autotune": True})
+def swiglu_clamped_deepep(x, permuted_probs, limit: float):
+    """Clamped SwiGLU (DeepSeek V4 style) for DeepEP.
+
+    Gate is clamped at ``max=limit`` and up at ``(-limit, +limit)`` in FP32
+    before ``silu(gate) * up``; the result is multiplied by the permuted
+    routing probs and cast back.  Matches the official V4 Expert.forward::
+
+        gate = self.w1(x).float()
+        up   = self.w3(x).float()
+        if self.swiglu_limit > 0:
+            up   = torch.clamp(up,   min=-swiglu_limit, max=swiglu_limit)
+            gate = torch.clamp(gate,                     max=swiglu_limit)
+        y = F.silu(gate) * up
+
+    ``x`` has shape ``[..., 2 * inter_dim]`` with gate in the first half
+    and up in the second half (same layout as ``weighted_bias_swiglu_impl``).
+    """
+    gate, up = torch.chunk(x, 2, dim=-1)
+    gate = gate.float().clamp(max=limit)
+    up = up.float().clamp(min=-limit, max=limit)
+    inter = F.silu(gate) * up
+    return (inter * permuted_probs).to(x.dtype)
+
+
 def get_expert_activation_for_deepep(config: MoEConfig):
+    """Return the DeepEP expert activation function selected by the MoE config."""
+
     if config.expert_activation == "swiglu":
+        # DeepSeek V4 uses a clamped FP32 variant when swiglu_limit > 0.
+        if getattr(config, "swiglu_limit", 0.0) > 0.0:
+            return partial(swiglu_clamped_deepep, limit=config.swiglu_limit)
         return weighted_bias_swiglu_impl
     elif config.expert_activation == "quick_geglu":
         return partial(
@@ -582,6 +620,8 @@ class GroupedExpertsDeepEP(nn.Module):
         backend: Optional["BackendConfig"] = None,
         dispatcher_backend: str = "deepep",
         dispatcher_num_sms: int = 20,
+        dispatcher_share_token_dispatcher: bool = True,
+        dispatcher_async_dispatch: bool = False,
     ):
         """
         Initializes the GroupedExperts module.
@@ -592,6 +632,8 @@ class GroupedExpertsDeepEP(nn.Module):
                 uses torch._grouped_mm; otherwise uses grouped_gemm.ops.gmm.
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
+            dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
+            dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
         super().__init__()
 
@@ -601,6 +643,8 @@ class GroupedExpertsDeepEP(nn.Module):
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
+        self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
+        self.dispatcher_async_dispatch = dispatcher_async_dispatch
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -622,6 +666,7 @@ class GroupedExpertsDeepEP(nn.Module):
     def init_token_dispatcher(self, ep_mesh: DeviceMesh):
         self.ep_size = ep_mesh.size()
         self.ep_rank = ep_mesh.get_local_rank()
+        ep_group = ep_mesh.get_group()
 
         config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
@@ -631,6 +676,8 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_flex_dispatcher_backend=self.dispatcher_backend,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
+            moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
+            moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
         )
 
         self.n_routed_experts = self.config.n_routed_experts
@@ -644,8 +691,17 @@ class GroupedExpertsDeepEP(nn.Module):
             num_local_experts=num_local_experts,
             local_expert_indices=local_expert_indices,
             config=config,
-            ep_group=ep_mesh.get_group(),
+            ep_group=ep_group,
         )
+        if self.dispatcher_backend == "deepep":
+            self._init_deepep_buffer(ep_group)
+
+    def _init_deepep_buffer(self, ep_group: dist.ProcessGroup) -> None:
+        """Initialize DeepEP communication buffers before activation checkpointing."""
+        from nemo_automodel.components.moe.megatron.fused_a2a import get_buffer
+
+        dtype_size = max(torch.empty((), dtype=self.config.dtype).element_size(), 2)
+        get_buffer(ep_group, self.config.expert_dim * dtype_size)
 
     def forward(
         self,
@@ -687,6 +743,10 @@ class GroupedExpertsDeepEP(nn.Module):
 
         gate_and_up_projs = self.gate_and_up_projs.to_local()
         down_projs = self.down_projs.to_local()
+
+        # Match activation dtype for grouped_mm; see GroupedExperts.forward.
+        gate_and_up_projs = gate_and_up_projs.to(permuted_local_hidden_states.dtype)
+        down_projs = down_projs.to(permuted_local_hidden_states.dtype)
 
         if torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
@@ -778,6 +838,8 @@ class GroupedExpertsTE(nn.Module):
         backend: Optional["BackendConfig"] = None,
         dispatcher_backend: str = "deepep",
         dispatcher_num_sms: int = 20,
+        dispatcher_share_token_dispatcher: bool = True,
+        dispatcher_async_dispatch: bool = False,
     ):
         """
         Initialize the GroupedExpertsTEGroupedLinear module.
@@ -787,6 +849,8 @@ class GroupedExpertsTE(nn.Module):
             backend: Backend configuration (reserved for future use).
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
+            dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
+            dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
         from transformer_engine.pytorch import GroupedLinear
 
@@ -804,6 +868,8 @@ class GroupedExpertsTE(nn.Module):
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
+        self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
+        self.dispatcher_async_dispatch = dispatcher_async_dispatch
 
         # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
         # Non-gated (ReLU²): out_features = moe_inter_dim
@@ -1112,6 +1178,8 @@ class GroupedExpertsTE(nn.Module):
             moe_flex_dispatcher_backend=self.dispatcher_backend,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
+            moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
+            moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
         )
 
         local_expert_indices_offset = self.ep_rank * self.num_local_experts

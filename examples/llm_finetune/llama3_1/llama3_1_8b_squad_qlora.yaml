@@ -41,11 +41,10 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
   torch_dtype: bfloat16
-  force_hf: true # @akoumpa: remove once checkpointer works with quantization
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: true
+  target_modules: '*_proj'
   dim: 16
   alpha: 32
   dropout: 0.1

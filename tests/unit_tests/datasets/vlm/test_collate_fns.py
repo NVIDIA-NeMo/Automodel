@@ -333,7 +333,7 @@ def test_phi4_mm_collate_fn_handles_audio_and_trimming(collate_mod, monkeypatch)
         captured["processor"] = processor_arg
         return labels_stub
 
-    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
 
     batch = collate_mod.phi4_mm_collate_fn(examples, processor)
 
@@ -381,7 +381,10 @@ def test_phi4_mm_collate_fn_input_mode_from_processor(collate_mod, monkeypatch):
 
     examples = [{"conversation": CONVERSATION, "audio": {"array": [0.1], "sampling_rate": 16000}}]
     monkeypatch.setattr(
-        collate_mod, "build_labels", lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long), raising=True
+        collate_mod,
+        "build_labels_from_template",
+        lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long),
+        raising=True,
     )
     batch = collate_mod.phi4_mm_collate_fn(examples, Phi4ProcessorWithInputMode())
     assert torch.equal(batch["input_mode"], torch.tensor([2]))
@@ -405,7 +408,10 @@ def test_phi4_mm_collate_fn_input_mode_fallback(collate_mod, monkeypatch):
 
     examples = [{"conversation": CONVERSATION, "audio": {"array": [0.1], "sampling_rate": 16000}}]
     monkeypatch.setattr(
-        collate_mod, "build_labels", lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long), raising=True
+        collate_mod,
+        "build_labels_from_template",
+        lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long),
+        raising=True,
     )
     batch = collate_mod.phi4_mm_collate_fn(examples, Phi4ProcessorWithAudioEmbeds())
     assert batch["input_mode"] == 2  # SPEECH
@@ -421,7 +427,10 @@ def test_phi4_mm_collate_fn_raw_audio_passthrough(collate_mod, monkeypatch):
         {"conversation": CONVERSATION, "audio": raw_array},
     ]
     monkeypatch.setattr(
-        collate_mod, "build_labels", lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long), raising=True
+        collate_mod,
+        "build_labels_from_template",
+        lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long),
+        raising=True,
     )
     collate_mod.phi4_mm_collate_fn(examples, processor)
     # The raw array should be wrapped as a single-element tuple by the collate fn
@@ -458,6 +467,127 @@ def fake_qwen_utils(monkeypatch):
 def test_dispatch_table(collate_mod):
     assert collate_mod.COLLATE_FNS["Qwen2_5_VLProcessor"] is collate_mod.qwen2_5_collate_fn
     assert collate_mod.COLLATE_FNS["default"] is collate_mod.default_collate_fn
+
+
+def test_nemotron_omni_dispatch_registered(collate_mod):
+    """The v3 NemotronOmni processor key must dispatch to its collate fn."""
+    assert collate_mod.COLLATE_FNS["NemotronH_Nano_Omni_Reasoning_V3Processor"] is collate_mod.nemotron_omni_collate_fn
+
+
+class DummyNemotronOmniProcessor:
+    """Minimal stub that mirrors what ``nemotron_omni_collate_fn`` consumes.
+
+    Returns deterministic per-sample input_ids of varying length so the collate
+    has something interesting to right-pad.
+    """
+
+    image_token = "<image>"
+    video_token = "<video>"
+
+    def __init__(self):
+        self.tokenizer = self  # collate uses getattr(processor, "tokenizer", processor)
+        self.pad_token_id = 0
+        self.sample_lens = [3, 5]
+        self._call_idx = 0
+
+    def apply_chat_template(self, text_conversation, *, tokenize=False, **kwargs):
+        assert tokenize is False
+        return "chat:" + str(len(text_conversation))
+
+    def __call__(self, *, text, return_tensors, **kwargs):
+        assert return_tensors == "pt"
+        n = self.sample_lens[self._call_idx]
+        self._call_idx += 1
+        ids = torch.arange(1, n + 1, dtype=torch.long).unsqueeze(0)
+        return {
+            "input_ids": ids,
+            "attention_mask": torch.ones_like(ids),
+        }
+
+
+def test_nemotron_omni_collate_text_only_pads_and_shifts(collate_mod, monkeypatch):
+    """Two text-only samples of differing length right-pad to the longer one,
+    then the per-token shift drops the trailing position so labels are aligned."""
+    processor = DummyNemotronOmniProcessor()
+
+    # build_labels is exercised in its own tests; stub it to return a fixed tensor.
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        assert processor_arg is processor
+        return torch.full(input_ids.shape, -100, dtype=torch.long)
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    examples = [
+        {"conversation": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]},
+        {"conversation": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "world"}]},
+    ]
+    batch = collate_mod.nemotron_omni_collate_fn(examples, processor=processor)
+
+    # Sample lens are 3 and 5; max is 5; trailing-shift drops one position -> 4.
+    assert batch["input_ids"].shape == (2, 4)
+    assert batch["attention_mask"].shape == (2, 4)
+    assert batch["labels"].shape == (2, 4)
+    # Right-padding of the shorter sample uses pad_token_id=0 in the tail.
+    assert batch["input_ids"][0, -1].item() == 0
+    assert batch["attention_mask"][0, -1].item() == 0
+    # No multimodal kwargs were produced for an all-text batch.
+    for k in ("pixel_values", "pixel_values_videos", "sound_features", "image_flags"):
+        assert k not in batch
+
+
+class DummyNemotronOmniImageProcessor(DummyNemotronOmniProcessor):
+    """Variant that records call kwargs and emits ``pixel_values`` when images are passed."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen_kwargs: list = []
+
+    def __call__(self, *, text, return_tensors, **kwargs):
+        assert return_tensors == "pt"
+        self.seen_kwargs.append(kwargs)
+        ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        out = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+        if "images" in kwargs:
+            out["pixel_values"] = torch.zeros(len(kwargs["images"]), 3, 4, 4, dtype=torch.float32)
+        return out
+
+
+def test_nemotron_omni_collate_extracts_images(collate_mod, monkeypatch):
+    """List-content with ``type=='image'`` items should be collected into pixel_values
+    and an ``<image>`` token spliced into the text content."""
+    processor = DummyNemotronOmniImageProcessor()
+
+    monkeypatch.setattr(
+        collate_mod,
+        "build_labels",
+        lambda ids, conv, p: torch.zeros_like(ids),
+        raising=True,
+    )
+
+    from PIL import Image as PILImage
+
+    img = PILImage.new("RGB", (4, 4))
+    examples = [
+        {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img},
+                        {"type": "text", "text": "what is this?"},
+                    ],
+                },
+                {"role": "assistant", "content": "an image"},
+            ]
+        }
+    ]
+    batch = collate_mod.nemotron_omni_collate_fn(examples, processor=processor)
+
+    # The image was extracted and forwarded to the processor, then surfaced in the batch.
+    assert processor.seen_kwargs and processor.seen_kwargs[0].get("images") == [img]
+    assert "pixel_values" in batch
+    assert batch["pixel_values"].dtype == torch.bfloat16  # collate casts to bf16
+    assert "image_flags" in batch and batch["image_flags"].shape == (1, 1)
 
 
 def test_qwen25_collate_shapes(collate_mod, monkeypatch):
@@ -559,12 +689,11 @@ def test_default_collate_fn_with_max_length(collate_mod, fake_qwen_utils, monkey
             return {"input_ids": input_ids, "pixel_values": pixel_values}
 
     processor = MaxLengthProcessor()
-    collate_mod.default_collate_fn(
-        [{"conversation": CONVERSATION}], processor, max_length=512
-    )
+    collate_mod.default_collate_fn([{"conversation": CONVERSATION}], processor, max_length=512)
 
     assert captured_kwargs.get("max_length") == 512
     assert captured_kwargs.get("padding") == "max_length"
+    assert captured_kwargs.get("truncation") is True
 
 
 def test_default_collate_fn_without_max_length(collate_mod, fake_qwen_utils, monkeypatch):
@@ -600,7 +729,7 @@ def test_kimi_vl_collate_fn_shapes(collate_mod, monkeypatch):
     """Test kimi_vl_collate_fn produces correct output shapes."""
     processor = DummyKimiVLProcessor()
 
-    # Stub build_labels to return deterministic labels
+    # Stub build_labels_from_template to return deterministic labels
     # The collate fn does labels[:, 1:] so we need 5 elements to get 4 after shift
     labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
 
@@ -608,7 +737,7 @@ def test_kimi_vl_collate_fn_shapes(collate_mod, monkeypatch):
         assert processor_arg is processor
         return labels_stub
 
-    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
 
     examples = [{"conversation": CONVERSATION}]
     batch = collate_mod.kimi_vl_collate_fn(examples, processor)
@@ -624,9 +753,7 @@ def test_kimi_vl_collate_fn_with_max_length(collate_mod, monkeypatch):
     processor = DummyKimiVLProcessor()
 
     labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
-    monkeypatch.setattr(
-        collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
-    )
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", lambda *args, **kwargs: labels_stub, raising=True)
 
     examples = [{"conversation": CONVERSATION}]
     collate_mod.kimi_vl_collate_fn(examples, processor, max_length=2048)
@@ -642,9 +769,7 @@ def test_kimi_vl_collate_fn_extracts_images(collate_mod, monkeypatch):
     processor = DummyKimiVLProcessor()
 
     labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
-    monkeypatch.setattr(
-        collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
-    )
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", lambda *args, **kwargs: labels_stub, raising=True)
 
     conversation_with_image = [
         {
@@ -671,9 +796,7 @@ def test_kimi_vl_collate_fn_passes_add_special_tokens_false(collate_mod, monkeyp
     processor = DummyKimiVLProcessor()
 
     labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
-    monkeypatch.setattr(
-        collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
-    )
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", lambda *args, **kwargs: labels_stub, raising=True)
 
     examples = [{"conversation": CONVERSATION}]
     collate_mod.kimi_vl_collate_fn(examples, processor)
@@ -692,7 +815,7 @@ def test_kimi_vl_collate_fn_multiple_examples(collate_mod, monkeypatch):
         batch_size = input_ids.shape[0]
         return torch.arange(1, 6).unsqueeze(0).repeat(batch_size, 1)
 
-    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
 
     examples = [{"conversation": CONVERSATION} for _ in range(3)]
     batch = collate_mod.kimi_vl_collate_fn(examples, processor)
@@ -874,6 +997,85 @@ class TestExpandImageTokens:
         assert expanded_ids.dtype == torch.int32
         assert expanded_mask.dtype == torch.int64
 
+    def test_expand_image_tokens_multi_image_different_sizes(self, collate_mod):
+        """Multi-image: two placeholders with different grid sizes."""
+        media_token_id = 163605
+        # [BOS, PH1, TEXT, PH2, EOS]
+        input_ids = torch.tensor([1, media_token_id, 99, media_token_id, 2])
+        attention_mask = torch.ones(5, dtype=torch.long)
+
+        # First image: [1,2,2] -> (2//2)*(2//2) = 1 token
+        # Second image: [1,4,4] -> (4//2)*(4//2) = 4 tokens
+        grid_thws = torch.tensor([[1, 2, 2], [1, 4, 4]])
+
+        expanded_ids, expanded_mask = collate_mod._expand_image_tokens(
+            input_ids, attention_mask, grid_thws, media_token_id
+        )
+
+        # 5 - 2 placeholders + 1 + 4 = 8 tokens
+        assert expanded_ids.shape[0] == 8
+        assert expanded_mask.shape[0] == 8
+
+        # [1, media*1, 99, media*4, 2]
+        assert expanded_ids[0] == 1
+        assert expanded_ids[1] == media_token_id
+        assert expanded_ids[2] == 99
+        assert (expanded_ids[3:7] == media_token_id).all()
+        assert expanded_ids[7] == 2
+
+    def test_expand_image_tokens_multi_image_same_size(self, collate_mod):
+        """Multi-image: two placeholders with identical grid sizes."""
+        media_token_id = 163605
+        input_ids = torch.tensor([media_token_id, 50, media_token_id])
+        attention_mask = torch.ones(3, dtype=torch.long)
+
+        # Both images: [1,4,4] -> 4 tokens each
+        grid_thws = torch.tensor([[1, 4, 4], [1, 4, 4]])
+
+        expanded_ids, expanded_mask = collate_mod._expand_image_tokens(
+            input_ids, attention_mask, grid_thws, media_token_id
+        )
+
+        # 3 - 2 + 4 + 4 = 9 tokens
+        assert expanded_ids.shape[0] == 9
+        assert (expanded_ids[0:4] == media_token_id).all()
+        assert expanded_ids[4] == 50
+        assert (expanded_ids[5:9] == media_token_id).all()
+
+    def test_expand_image_tokens_three_images(self, collate_mod):
+        """Multi-image: three placeholders each with 4-token expansion."""
+        media_token_id = 163605
+        input_ids = torch.tensor([1, media_token_id, 2, media_token_id, 3, media_token_id, 4])
+        attention_mask = torch.ones(7, dtype=torch.long)
+
+        # All three: [1,4,4] -> 4 tokens each
+        grid_thws = torch.tensor([[1, 4, 4], [1, 4, 4], [1, 4, 4]])
+
+        expanded_ids, expanded_mask = collate_mod._expand_image_tokens(
+            input_ids, attention_mask, grid_thws, media_token_id
+        )
+
+        # 7 - 3 + 4*3 = 16 tokens
+        assert expanded_ids.shape[0] == 16
+        assert expanded_mask.shape[0] == 16
+
+        # Spot-check non-image tokens
+        assert expanded_ids[0] == 1
+        assert expanded_ids[5] == 2
+        assert expanded_ids[10] == 3
+        assert expanded_ids[15] == 4
+
+    def test_expand_image_tokens_mismatch_raises(self, collate_mod):
+        """ValueError when placeholder count does not match grid_thws rows."""
+        media_token_id = 163605
+        # Two placeholders but only one grid entry
+        input_ids = torch.tensor([media_token_id, 5, media_token_id])
+        attention_mask = torch.ones(3, dtype=torch.long)
+        grid_thws = torch.tensor([[1, 4, 4]])
+
+        with pytest.raises(ValueError, match="placeholder"):
+            collate_mod._expand_image_tokens(input_ids, attention_mask, grid_thws, media_token_id)
+
 
 # =============================================================================
 # Tests for kimi_k25_vl_collate_fn
@@ -897,9 +1099,7 @@ class DummyKimiK25VLProcessor:
 
     def __call__(self, *, text, return_tensors, medias=None, **kwargs):
         assert return_tensors == "pt"
-        self.forward_calls.append(
-            {"text": text, "return_tensors": return_tensors, "medias": medias, **kwargs}
-        )
+        self.forward_calls.append({"text": text, "return_tensors": return_tensors, "medias": medias, **kwargs})
 
         # Simulate processor output with single placeholder
         input_ids = torch.tensor([[1, 2, self.media_placeholder_token_id, 3, 4]])
@@ -1035,7 +1235,8 @@ def test_kimi_k25_vl_collate_fn_with_max_length(collate_mod, monkeypatch):
 
 
 def test_kimi_k25_vl_collate_fn_drops_overlong(collate_mod, monkeypatch):
-    """Test kimi_k25_vl_collate_fn drops samples exceeding max_length instead of truncating."""
+    """Test kimi_k25_vl_collate_fn drops samples when drop_overlong=True."""
+
     # Custom processor that produces longer sequences
     class LongSequenceProcessor:
         def __init__(self):
@@ -1059,9 +1260,327 @@ def test_kimi_k25_vl_collate_fn_drops_overlong(collate_mod, monkeypatch):
     ]
     examples = [{"conversation": conversation}]
 
-    # All samples exceed max_length=20 → ValueError
+    # All samples exceed max_length=20 with drop_overlong=True → ValueError
     with pytest.raises(ValueError, match="All samples in batch exceed max_length"):
-        collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20)
+        collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20, drop_overlong=True)
+
+
+def test_kimi_k25_vl_collate_fn_truncates_by_default(collate_mod, monkeypatch):
+    """Test kimi_k25_vl_collate_fn passes truncation to processor by default (not drop)."""
+
+    captured_kwargs = {}
+
+    class TruncatingProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = 163605
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            max_len = kwargs.get("max_length", 50)
+            # Respect truncation like a real processor would
+            length = min(50, max_len) if kwargs.get("truncation") else 50
+            input_ids = torch.arange(1, length + 1).unsqueeze(0)
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = TruncatingProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}]
+
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20)
+
+    # Processor should receive truncation=True and max_length=20
+    assert captured_kwargs.get("truncation") is True
+    assert captured_kwargs.get("max_length") == 20
+    # After processor truncation to 20 and autoregressive shift (:-1), seq_len = 19
+    assert batch["input_ids"].shape == (1, 19)
+    assert batch["attention_mask"].shape == (1, 19)
+    assert batch["labels"].shape == (1, 19)
+
+
+def test_kimi_k25_vl_collate_fn_no_drop_preserves_batch_size(collate_mod, monkeypatch):
+    """Test that default (no drop) preserves all samples in batch for PP compatibility."""
+    call_count = [0]
+
+    class TruncatingProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = 163605
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            call_count[0] += 1
+            max_len = kwargs.get("max_length", 50)
+            # First sample: 50 tokens, second: 10 tokens
+            base_length = 50 if call_count[0] == 1 else 10
+            length = min(base_length, max_len) if kwargs.get("truncation") else base_length
+            input_ids = torch.arange(1, length + 1).unsqueeze(0)
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = TruncatingProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}, {"conversation": conversation}]
+
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20)
+
+    # Both samples preserved (truncated by processor, not dropped). After shift: 19 tokens.
+    assert batch["input_ids"].shape[0] == 2
+    assert batch["input_ids"].shape[1] == 19
+
+
+def test_kimi_k25_vl_collate_fn_truncation_drops_image_data(collate_mod, monkeypatch):
+    """Test that truncation into image region drops pixel_values/grid_thws and replaces orphaned tokens."""
+    MEDIA_TOKEN_ID = 163605
+    PAD_TOKEN_ID = 0
+
+    class ImageProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=PAD_TOKEN_ID)
+            self.media_placeholder_token_id = MEDIA_TOKEN_ID
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            # 5 text tokens + 1 image placeholder = 6 tokens pre-expansion
+            input_ids = torch.tensor([[1, 2, MEDIA_TOKEN_ID, 3, 4, 5]])
+            attention_mask = torch.ones_like(input_ids)
+            # grid_thws: t=1, h=8, w=8 → (8//2)*(8//2) = 16 expanded image tokens
+            # Post-expansion: 5 text + 16 image = 21 tokens
+            grid_thws = torch.tensor([[1, 8, 8]])
+            pixel_values = torch.randn(1, 3, 64, 64)
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "grid_thws": grid_thws,
+                "pixel_values": pixel_values,
+            }
+
+    processor = ImageProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "image", "image": "test.jpg"}, {"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}]
+
+    # max_length=15 < 21 post-expansion tokens → truncation cuts into image region
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=15)
+
+    # Sample should be kept (not dropped) but image data excluded
+    assert batch["input_ids"].shape[0] == 1
+    # No pixel_values or grid_thws since image was partially truncated
+    assert "pixel_values" not in batch
+    assert "grid_thws" not in batch
+    assert "image_grid_hws" not in batch
+    # Orphaned image tokens should be replaced with pad_token_id
+    assert (batch["input_ids"] == MEDIA_TOKEN_ID).sum().item() == 0
+
+
+def test_kimi_k25_vl_collate_fn_n_images_per_sample_matches_batch_size_text_only_mix(
+    collate_mod, monkeypatch
+):
+    """Mixed batch (text-only + image): n_images_per_sample length must equal batch_size.
+
+    Regression: previously image_counts was derived from all_grid_thws only, so
+    text-only samples were skipped and the resulting tensor was shorter than
+    batch_size. VLM PP media prep indexes cumsum_images by sample index and
+    would IndexError out of bounds.
+    """
+    MEDIA_TOKEN_ID = 163605
+
+    class MixedProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = MEDIA_TOKEN_ID
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, *, text, return_tensors, medias=None, **kwargs):
+            if medias:
+                input_ids = torch.tensor([[1, 2, MEDIA_TOKEN_ID, 3, 4]])
+                attention_mask = torch.ones_like(input_ids)
+                return {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "grid_thws": torch.tensor([[1, 4, 4]]),
+                    "pixel_values": torch.randn(1, 3, 14, 14),
+                }
+            input_ids = torch.tensor([[10, 11, 12, 13, 14]])
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = MixedProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    text_only = [
+        {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+    ]
+    with_image = [
+        {"role": "user", "content": [{"type": "image", "image": "x.jpg"}, {"type": "text", "text": "What?"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Cat."}]},
+    ]
+    examples = [{"conversation": text_only}, {"conversation": with_image}]
+
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+
+    assert "n_images_per_sample" in batch
+    assert batch["n_images_per_sample"].shape == (2,), (
+        f"n_images_per_sample length must equal batch_size=2, "
+        f"got shape {batch['n_images_per_sample'].shape}"
+    )
+    # text-only sample → 0; image sample → 1
+    assert batch["n_images_per_sample"].tolist() == [0, 1]
+
+
+def test_wrap_vlm_collate_for_pp_prepares_media_chunks():
+    from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, wrap_vlm_collate_for_pp
+
+    image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3]])
+    patch_counts = image_grid_thw.prod(dim=1)
+    pixel_values = torch.arange(int(patch_counts.sum()) * 4, dtype=torch.float32).reshape(-1, 4)
+
+    def collate_fn(_examples):
+        return {
+            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "labels": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "pixel_values": pixel_values.clone(),
+            "image_grid_thw": image_grid_thw.clone(),
+            "n_images_per_sample": torch.tensor([1, 1]),
+        }
+
+    batch = wrap_vlm_collate_for_pp(collate_fn, n_microbatches=2)([{}, {}])
+
+    assert VLM_PP_MEDIA_KEY in batch
+    assert "pixel_values" not in batch
+    assert "image_grid_thw" not in batch
+    assert "n_images_per_sample" not in batch
+
+    media = batch[VLM_PP_MEDIA_KEY]
+    split_at = int(patch_counts[0].item())
+    assert torch.equal(media["pixel_values"][0], pixel_values[:split_at])
+    assert torch.equal(media["pixel_values"][1], pixel_values[split_at:])
+    assert torch.equal(media["image_grid_hws"][0], image_grid_thw[:1])
+    assert torch.equal(media["image_grid_hws"][1], image_grid_thw[1:])
+
+
+def test_kimi_k25_vl_collate_fn_n_images_per_sample_matches_batch_size_truncation_orphan(
+    collate_mod, monkeypatch
+):
+    """Mixed batch (truncated image + intact image): n_images_per_sample length must equal batch_size.
+
+    Regression: a sample whose image region got orphaned by truncation was
+    correctly excluded from all_grid_thws but still kept in all_expanded.
+    Without the fix, n_images_per_sample length would be smaller than the
+    final batch and downstream PP indexing would crash.
+    """
+    MEDIA_TOKEN_ID = 163605
+
+    class MaybeOrphanProcessor:
+        """Returns the same large grid for both calls; the second call's tokens
+        will be truncated past the image region by max_length below."""
+
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = MEDIA_TOKEN_ID
+            self._call_idx = 0
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, *, text, return_tensors, medias=None, **kwargs):
+            self._call_idx += 1
+            if self._call_idx == 1:
+                # Small grid that fits within max_length after expansion
+                input_ids = torch.tensor([[1, 2, MEDIA_TOKEN_ID, 3, 4]])
+                attention_mask = torch.ones_like(input_ids)
+                grid_thws = torch.tensor([[1, 4, 4]])  # 4 image tokens
+                return {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "grid_thws": grid_thws,
+                    "pixel_values": torch.randn(1, 3, 14, 14),
+                }
+            # Second sample: 5 text + 16 image tokens = 21 post-expansion;
+            # max_length=15 truncates into the image region → orphan path.
+            input_ids = torch.tensor([[1, 2, MEDIA_TOKEN_ID, 3, 4, 5]])
+            attention_mask = torch.ones_like(input_ids)
+            grid_thws = torch.tensor([[1, 8, 8]])  # 16 image tokens after expansion
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "grid_thws": grid_thws,
+                "pixel_values": torch.randn(1, 3, 64, 64),
+            }
+
+    processor = MaybeOrphanProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    conv_intact = [
+        {"role": "user", "content": [{"type": "image", "image": "a.jpg"}, {"type": "text", "text": "?"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "."}]},
+    ]
+    conv_orphan = [
+        {"role": "user", "content": [{"type": "image", "image": "b.jpg"}, {"type": "text", "text": "?"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "."}]},
+    ]
+    examples = [{"conversation": conv_intact}, {"conversation": conv_orphan}]
+
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=15)
+
+    assert batch["input_ids"].shape[0] == 2
+    assert "n_images_per_sample" in batch
+    assert batch["n_images_per_sample"].shape == (2,), (
+        f"n_images_per_sample length must equal batch_size=2, "
+        f"got shape {batch['n_images_per_sample'].shape}"
+    )
+    # First sample's image survives → 1; second sample is orphaned → 0
+    assert batch["n_images_per_sample"].tolist() == [1, 0]
 
 
 def test_kimi_k25_vl_collate_fn_multiple_examples(collate_mod, monkeypatch):
@@ -1179,6 +1698,95 @@ def test_kimi_k25_vl_collate_fn_labels_shifted(collate_mod, monkeypatch):
     assert batch["labels"].shape[1] == 4  # 5 - 1 = 4
 
 
+def test_kimi_k25_vl_collate_fn_fake_image_mask(collate_mod, monkeypatch):
+    """mask_fake_vision_tokens_batch must be called with the injected sample index."""
+    media_token_id = 163605
+
+    class FakeImageProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = media_token_id
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            input_ids = torch.tensor([[1, media_token_id, media_token_id, 2]])
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = FakeImageProcessor()
+    monkeypatch.setattr(
+        collate_mod,
+        "build_labels_from_template",
+        lambda ids, convs, proc: torch.full_like(ids, -100),
+        raising=True,
+    )
+
+    mask_calls = []
+
+    def fake_mask(batch, proc, sample_indices):
+        mask_calls.append(list(sample_indices))
+
+    monkeypatch.setattr(collate_mod, "mask_fake_vision_tokens_batch", fake_mask, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+    ]
+    examples = [{"conversation": conversation, "_injected_fake": True}]
+
+    collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+
+    assert len(mask_calls) == 1, "mask_fake_vision_tokens_batch should be called once"
+    assert mask_calls[0] == [0], "injected sample is at batch index 0"
+
+
+def test_kimi_k25_vl_collate_fn_non_fake_not_masked(collate_mod, monkeypatch):
+    """mask_fake_vision_tokens_batch must NOT be called for non-injected samples."""
+    media_token_id = 163605
+
+    class RealImageProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = media_token_id
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            input_ids = torch.tensor([[1, media_token_id, 2]])
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = RealImageProcessor()
+    monkeypatch.setattr(
+        collate_mod,
+        "build_labels_from_template",
+        lambda ids, convs, proc: torch.full_like(ids, -100),
+        raising=True,
+    )
+
+    mask_calls = []
+    monkeypatch.setattr(
+        collate_mod,
+        "mask_fake_vision_tokens_batch",
+        lambda batch, proc, indices: mask_calls.append(indices),
+        raising=True,
+    )
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+    ]
+    # _injected_fake is NOT set
+    examples = [{"conversation": conversation}]
+
+    collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+
+    assert len(mask_calls) == 0, "mask_fake_vision_tokens_batch should not be called for non-injected samples"
+
+
 # =============================================================================
 # Tests for _ensure_rgb
 # =============================================================================
@@ -1189,49 +1797,61 @@ class TestEnsureRgb:
 
     def test_rgba_image_converted_to_rgb(self, collate_mod):
         img = PILImage.new("RGBA", (4, 4), (255, 0, 0, 128))
-        conversations = [[
-            {"role": "user", "content": [{"image": img}]},
-        ]]
+        conversations = [
+            [
+                {"role": "user", "content": [{"image": img}]},
+            ]
+        ]
         collate_mod._ensure_rgb(conversations)
         assert conversations[0][0]["content"][0]["image"].mode == "RGB"
 
     def test_grayscale_image_converted_to_rgb(self, collate_mod):
         img = PILImage.new("L", (4, 4), 128)
-        conversations = [[
-            {"role": "user", "content": [{"image": img}]},
-        ]]
+        conversations = [
+            [
+                {"role": "user", "content": [{"image": img}]},
+            ]
+        ]
         collate_mod._ensure_rgb(conversations)
         assert conversations[0][0]["content"][0]["image"].mode == "RGB"
 
     def test_palette_image_converted_to_rgb(self, collate_mod):
         img = PILImage.new("P", (4, 4))
-        conversations = [[
-            {"role": "user", "content": [{"image": img}]},
-        ]]
+        conversations = [
+            [
+                {"role": "user", "content": [{"image": img}]},
+            ]
+        ]
         collate_mod._ensure_rgb(conversations)
         assert conversations[0][0]["content"][0]["image"].mode == "RGB"
 
     def test_rgb_image_unchanged(self, collate_mod):
         img = PILImage.new("RGB", (4, 4), (255, 0, 0))
-        conversations = [[
-            {"role": "user", "content": [{"image": img}]},
-        ]]
+        conversations = [
+            [
+                {"role": "user", "content": [{"image": img}]},
+            ]
+        ]
         collate_mod._ensure_rgb(conversations)
         result = conversations[0][0]["content"][0]["image"]
         assert result.mode == "RGB"
 
     def test_no_images_passthrough(self, collate_mod):
-        conversations = [[
-            {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
-            {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
-        ]]
+        conversations = [
+            [
+                {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+            ]
+        ]
         result = collate_mod._ensure_rgb(conversations)
         assert result == conversations
 
     def test_string_content_skipped(self, collate_mod):
-        conversations = [[
-            {"role": "assistant", "content": "plain string"},
-        ]]
+        conversations = [
+            [
+                {"role": "assistant", "content": "plain string"},
+            ]
+        ]
         result = collate_mod._ensure_rgb(conversations)
         assert result[0][0]["content"] == "plain string"
 
@@ -1242,14 +1862,19 @@ class TestEnsureRgb:
         rgba = PILImage.new("RGBA", (4, 4))
         gray = PILImage.new("L", (4, 4))
         rgb = PILImage.new("RGB", (4, 4))
-        conversations = [[
-            {"role": "user", "content": [
-                {"image": rgba},
-                {"type": "text", "text": "describe these"},
-                {"image": gray},
-                {"image": rgb},
-            ]},
-        ]]
+        conversations = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"image": rgba},
+                        {"type": "text", "text": "describe these"},
+                        {"image": gray},
+                        {"image": rgb},
+                    ],
+                },
+            ]
+        ]
         collate_mod._ensure_rgb(conversations)
         items = conversations[0][0]["content"]
         assert items[0]["image"].mode == "RGB"
@@ -1269,12 +1894,17 @@ class TestEnsureRgb:
         assert conversations[1][0]["content"][0]["image"].mode == "RGB"
 
     def test_non_image_dict_items_untouched(self, collate_mod):
-        conversations = [[
-            {"role": "user", "content": [
-                {"type": "text", "text": "hi"},
-                {"type": "video", "video": "clip.mp4"},
-            ]},
-        ]]
+        conversations = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hi"},
+                        {"type": "video", "video": "clip.mp4"},
+                    ],
+                },
+            ]
+        ]
         result = collate_mod._ensure_rgb(conversations)
         items = result[0][0]["content"]
         assert items[0] == {"type": "text", "text": "hi"}
@@ -1384,6 +2014,7 @@ class TestInjectFakeImage:
 
     def test_injects_into_first_user_list_content(self, collate_mod):
         import copy
+
         conversation = copy.deepcopy(TEXT_ONLY_CONVERSATION)
         result = collate_mod.inject_fake_image_into_conversation(conversation)
 
@@ -1395,6 +2026,7 @@ class TestInjectFakeImage:
 
     def test_does_not_mutate_original(self, collate_mod):
         import copy
+
         original = copy.deepcopy(TEXT_ONLY_CONVERSATION)
         result = collate_mod.inject_fake_image_into_conversation(original)
 
@@ -1430,10 +2062,12 @@ class TestMaskFakeVisionTokensBatch:
             tokenizer = DummyTokenizer()
 
         batch = {
-            "input_ids": torch.tensor([
-                [1, 2, IMAGE_PAD_ID, IMAGE_PAD_ID, 3],
-                [1, 2, 3, 4, 5],
-            ]),
+            "input_ids": torch.tensor(
+                [
+                    [1, 2, IMAGE_PAD_ID, IMAGE_PAD_ID, 3],
+                    [1, 2, 3, 4, 5],
+                ]
+            ),
             "attention_mask": torch.ones(2, 5, dtype=torch.long),
         }
 
@@ -1452,10 +2086,12 @@ class TestMaskFakeVisionTokensBatch:
             tokenizer = DummyTokenizer()
 
         batch = {
-            "input_ids": torch.tensor([
-                [1, 2, IMAGE_PAD_ID, 3, 4],
-                [1, IMAGE_PAD_ID, IMAGE_PAD_ID, 4, 5],
-            ]),
+            "input_ids": torch.tensor(
+                [
+                    [1, 2, IMAGE_PAD_ID, 3, 4],
+                    [1, IMAGE_PAD_ID, IMAGE_PAD_ID, 4, 5],
+                ]
+            ),
             "attention_mask": torch.ones(2, 5, dtype=torch.long),
         }
 
@@ -1535,6 +2171,7 @@ class TestDefaultCollateFnFakeImage:
 
         # Simulate a sample that was injected with a fake image at dataset level.
         import copy
+
         fake_conv = copy.deepcopy(TEXT_ONLY_CONVERSATION)
         fake_conv[0]["content"].insert(0, {"type": "image", "image": PILImage.new("RGB", (56, 56), (255, 255, 255))})
 
@@ -1550,9 +2187,7 @@ class TestDefaultCollateFnFakeImage:
                 return {"input_ids": input_ids, "attention_mask": attention_mask, "pixel_values": pixel_values}
 
         processor = FakeImageProcessor()
-        batch = collate_mod.default_collate_fn(
-            [{"conversation": fake_conv, "_injected_fake": True}], processor
-        )
+        batch = collate_mod.default_collate_fn([{"conversation": fake_conv, "_injected_fake": True}], processor)
 
         # The image_pad token should be masked out (position 1 has IMAGE_PAD_ID).
         assert batch["attention_mask"][0, 1].item() == 0
@@ -1573,9 +2208,7 @@ class TestDefaultCollateFnFakeImage:
                 return {"input_ids": input_ids, "pixel_values": pixel_values}
 
         processor = TrackingProcessor()
-        collate_mod.default_collate_fn(
-            [{"conversation": IMAGE_CONVERSATION}], processor
-        )
+        collate_mod.default_collate_fn([{"conversation": IMAGE_CONVERSATION}], processor)
 
         # No _injected_fake flag — sample has real media.
         first_user_content = captured["conv_list"][0][0]["content"]
@@ -1591,6 +2224,7 @@ class TestQwen25CollateFnFakeImage:
         IMAGE_PAD_ID = 151655
 
         import copy
+
         fake_conv = copy.deepcopy(TEXT_ONLY_CONVERSATION)
         fake_conv[0]["content"].insert(0, {"type": "image", "image": PILImage.new("RGB", (56, 56), (255, 255, 255))})
 
@@ -1617,9 +2251,7 @@ class TestQwen25CollateFnFakeImage:
 
         monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
 
-        batch = collate_mod.qwen2_5_collate_fn(
-            [{"conversation": fake_conv, "_injected_fake": True}], processor
-        )
+        batch = collate_mod.qwen2_5_collate_fn([{"conversation": fake_conv, "_injected_fake": True}], processor)
 
         # The fake image should have been extracted.
         assert captured["images"] is not None
@@ -1707,8 +2339,8 @@ class TestBuildLabelsFromTemplate:
         labels = collate_mod.build_labels_from_template(input_ids, [conv], Qwen3VLProcessor())
 
         expected = torch.full_like(input_ids, -100)
-        expected[0, 11] = 20       # assistant content token 1
-        expected[0, 12] = 21       # assistant content token 2
+        expected[0, 11] = 20  # assistant content token 1
+        expected[0, 12] = 21  # assistant content token 2
         expected[0, 13] = _IM_END  # stop token
         assert torch.equal(labels, expected)
 
@@ -1732,14 +2364,14 @@ class TestBuildLabelsFromTemplate:
         # Layout: [IM_START,USER,NL, 20, IM_END,NL,  IM_START,ASST,NL, 20, IM_END,NL]
         #  pos:      0      1   2   3    4      5      6      7   8   9   10     11
         input_ids = _make_qwen_input_ids(
-            ("user", [20]),       # same content as assistant
+            ("user", [20]),  # same content as assistant
             ("assistant", [20]),  # should be labeled
         )
         labels = collate_mod.build_labels_from_template(input_ids, [[]], Qwen3VLProcessor())
 
         # Only the SECOND occurrence (in assistant) should be labeled.
         assert labels[0, 3].item() == -100  # user content [20]
-        assert labels[0, 9].item() == 20    # assistant content [20]
+        assert labels[0, 9].item() == 20  # assistant content [20]
 
     def test_fallback_for_non_qwen_processor(self, collate_mod):
         """Non-Qwen processor types fall back to old build_labels."""
@@ -1796,8 +2428,173 @@ class TestBuildLabelsFromTemplate:
 
         count0 = (labels[0] != -100).sum().item()
         count1 = (labels[1] != -100).sum().item()
-        assert count0 == 2   # [20, im_end]
-        assert count1 == 3   # [40, 41, im_end]
+        assert count0 == 2  # [20, im_end]
+        assert count1 == 3  # [40, 41, im_end]
+
+
+# ---------------------------------------------------------------------------
+# Tests for _derive_turn_markers (Gemma4-style general path)
+# ---------------------------------------------------------------------------
+
+# Synthetic token IDs for a Gemma4-style tokenizer.
+_SOT = 2  # <start_of_turn>
+_USER_TK = 1645  # "user"
+_MODEL_TK = 2516  # "model"
+_NL = 108  # "\n"
+_EOT = 107  # <end_of_turn>
+_U_CONTENT = 506  # "u"
+# sentinel encoded as two distinct ids
+_SEN_A = 999
+_SEN_B = 888
+
+
+class _Gemma4StyleTokenizer:
+    """Minimal Gemma4-like tokenizer stub for _derive_turn_markers tests.
+
+    Template layout (ids):
+      user turn:      [SOT, USER, NL, <content>, EOT, NL]
+      assistant turn: [SOT, MODEL, NL, <content>, EOT]
+    """
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, **kwargs):
+        ids = []
+        for msg in messages:
+            if msg["role"] == "user":
+                ids += [_SOT, _USER_TK, _NL, _U_CONTENT, _EOT, _NL]
+            else:
+                # assistant
+                content = msg["content"]
+                if content == "XSENTINELMARKERX":
+                    content_ids = [_SEN_A, _SEN_B]
+                else:
+                    content_ids = [42]
+                ids += [_SOT, _MODEL_TK, _NL] + content_ids + [_EOT]
+        return ids
+
+    def encode(self, text, add_special_tokens=False):
+        if text == "XSENTINELMARKERX":
+            return [_SEN_A, _SEN_B]
+        return []
+
+
+class TestDeriveTurnMarkers:
+    """Unit tests for _derive_turn_markers."""
+
+    def test_extracts_correct_marker_and_eot(self, collate_mod):
+        """_derive_turn_markers returns the assistant prefix and EOT id."""
+        tokenizer = _Gemma4StyleTokenizer()
+        marker, eot = collate_mod._derive_turn_markers(tokenizer)
+
+        # assistant marker should be [SOT, MODEL, NL]
+        assert marker == [_SOT, _MODEL_TK, _NL]
+        # end-of-turn token should be EOT (token right after sentinel)
+        assert eot == _EOT
+
+    def test_raises_when_sentinel_absent(self, collate_mod):
+        """ValueError raised when the sentinel does not appear in template output."""
+
+        class _NoSentinelTokenizer:
+            def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, **kwargs):
+                # Never includes sentinel
+                return [1, 2, 3, 4, 5]
+
+            def encode(self, text, add_special_tokens=False):
+                return [999, 888]  # sentinel ids that won't be found above
+
+        with pytest.raises(ValueError, match="not found"):
+            collate_mod._derive_turn_markers(_NoSentinelTokenizer())
+
+    def test_raises_when_marker_is_empty(self, collate_mod):
+        """ValueError raised when user and sentinel positions are adjacent (empty marker)."""
+
+        class _EmptyMarkerTokenizer:
+            def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, **kwargs):
+                # user_ids == all_ids[:6], sentinel starts at position 6 → marker empty
+                user_ids = [1, 2, 3, 4, 5, 6]
+                sentinel_ids = [999, 888]
+                eot = [107]
+                msgs = messages
+                if len(msgs) == 1:
+                    return user_ids
+                return user_ids + sentinel_ids + eot
+
+            def encode(self, text, add_special_tokens=False):
+                return [999, 888]
+
+        with pytest.raises(ValueError, match="empty"):
+            collate_mod._derive_turn_markers(_EmptyMarkerTokenizer())
+
+
+class TestBuildLabelsFromTemplateGeneralPath:
+    """Tests for the general (non-Qwen) path of build_labels_from_template."""
+
+    def _make_gemma4_input_ids(self, *turns):
+        """Build input_ids matching _Gemma4StyleTokenizer layout."""
+        ids = []
+        for role, content_ids in turns:
+            if role == "user":
+                ids += [_SOT, _USER_TK, _NL, _U_CONTENT, _EOT, _NL]
+            else:
+                ids += [_SOT, _MODEL_TK, _NL] + content_ids + [_EOT]
+        return torch.tensor([ids], dtype=torch.long)
+
+    def test_general_path_labels_assistant_tokens(self, collate_mod):
+        """Non-Qwen processor with apply_chat_template uses general path and labels correctly."""
+        input_ids = self._make_gemma4_input_ids(
+            ("user", []),
+            ("assistant", [42, 43]),
+        )
+
+        class _Proc:
+            tokenizer = _Gemma4StyleTokenizer()
+
+        labels = collate_mod.build_labels_from_template(input_ids, [[]], _Proc())
+
+        # Labeled positions: content tokens [42, 43] + EOT
+        labeled = (labels[0] != -100).nonzero(as_tuple=True)[0].tolist()
+        labeled_vals = [input_ids[0, p].item() for p in labeled]
+        assert 42 in labeled_vals
+        assert 43 in labeled_vals
+        assert _EOT in labeled_vals
+        # User tokens must NOT be labeled
+        assert labels[0, 0].item() == -100  # SOT
+        assert labels[0, 1].item() == -100  # USER
+
+    def test_general_path_fallback_on_derive_failure(self, collate_mod):
+        """If _derive_turn_markers raises, falls back to build_labels without error."""
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+        conv = [
+            {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+        ]
+
+        class _BrokenTokenizer:
+            """Has apply_chat_template but sentinel never appears → derive fails."""
+
+            def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, **kwargs):
+                return [1, 2, 3]
+
+            def encode(self, text, add_special_tokens=False):
+                return [999, 888]
+
+            def __call__(self, text, **kwargs):
+                return {"input_ids": torch.tensor([[1, 2, 3, 4, 5]])}
+
+            def convert_tokens_to_ids(self, token):
+                return None
+
+            def decode(self, token):
+                return str(token)
+
+            pad_token_id = 0
+            eos_token = "<eos>"
+
+        class _BrokenProc:
+            tokenizer = _BrokenTokenizer()
+
+        # Must not raise; should return a tensor of correct shape
+        labels = collate_mod.build_labels_from_template(input_ids, [conv], _BrokenProc())
+        assert labels.shape == input_ids.shape
 
 
 # ---------------------------------------------------------------------------
@@ -1844,7 +2641,9 @@ def test_drop_overlong_samples_filters_long(collate_mod):
     long_conv = [{"role": "user", "content": [{"type": "text", "text": "x" * 100}]}]
 
     result, kept = collate_mod._drop_overlong_samples(
-        [short_conv, long_conv], _DropTestProcessor(), max_length=50,
+        [short_conv, long_conv],
+        _DropTestProcessor(),
+        max_length=50,
     )
     assert len(result) == 1
     assert result[0] is short_conv
@@ -1857,7 +2656,9 @@ def test_drop_overlong_samples_keeps_short(collate_mod):
     conv2 = [{"role": "user", "content": [{"type": "text", "text": "x" * 20}]}]
 
     result, kept = collate_mod._drop_overlong_samples(
-        [conv1, conv2], _DropTestProcessor(), max_length=50,
+        [conv1, conv2],
+        _DropTestProcessor(),
+        max_length=50,
     )
     assert len(result) == 2
     assert result[0] is conv1
@@ -1872,7 +2673,9 @@ def test_drop_overlong_samples_all_long_raises(collate_mod):
 
     with pytest.raises(ValueError, match="All 2 samples"):
         collate_mod._drop_overlong_samples(
-            [long1, long2], _DropTestProcessor(), max_length=50,
+            [long1, long2],
+            _DropTestProcessor(),
+            max_length=50,
         )
 
 
@@ -1886,8 +2689,39 @@ def test_drop_overlong_samples_none_max_length_noop(collate_mod):
     assert kept == [0]
 
 
-def test_default_collate_fn_no_truncation(collate_mod, fake_qwen_utils, monkeypatch):
-    """Verify that with max_length set, truncation=False is passed to the processor."""
+def test_default_collate_fn_truncation_by_default(collate_mod, fake_qwen_utils, monkeypatch):
+    """Verify that with max_length set and drop_overlong=False (default), truncation=True."""
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+
+    captured_kwargs = {}
+
+    class CapturingProcessor:
+        tokenizer = DummyTokenizer()
+
+        def apply_chat_template(self, conv_list, **kwargs):
+            if kwargs.get("tokenize", False):
+                captured_kwargs.update(kwargs)
+                batch_size = len(conv_list)
+                input_ids = torch.arange(1, 5).unsqueeze(0).repeat(batch_size, 1)
+                pixel_values = torch.ones(batch_size, 3, 64, 64, dtype=torch.float32)
+                return {"input_ids": input_ids, "pixel_values": pixel_values}
+            else:
+                return ["short"]
+
+    processor = CapturingProcessor()
+    collate_mod.default_collate_fn(
+        [{"conversation": CONVERSATION}],
+        processor,
+        max_length=512,
+    )
+
+    assert captured_kwargs.get("truncation") is True
+    assert captured_kwargs.get("max_length") == 512
+    assert captured_kwargs.get("padding") == "max_length"
+
+
+def test_default_collate_fn_no_truncation_with_drop_overlong(collate_mod, fake_qwen_utils, monkeypatch):
+    """Verify that with max_length set and drop_overlong=True, truncation=False."""
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
 
     captured_kwargs = {}
@@ -1908,7 +2742,10 @@ def test_default_collate_fn_no_truncation(collate_mod, fake_qwen_utils, monkeypa
 
     processor = CapturingProcessor()
     collate_mod.default_collate_fn(
-        [{"conversation": CONVERSATION}], processor, max_length=512,
+        [{"conversation": CONVERSATION}],
+        processor,
+        max_length=512,
+        drop_overlong=True,
     )
 
     assert captured_kwargs.get("truncation") is False
@@ -2024,20 +2861,26 @@ def test_default_collate_fn_has_per_sample_image_counts(collate_mod, fake_qwen_u
     conv_with_images = [
         {
             "conversation": [
-                {"role": "user", "content": [
-                    {"type": "image", "image": PILImage.new("RGB", (10, 10))},
-                    {"type": "image", "image": PILImage.new("RGB", (10, 10))},
-                    {"type": "text", "text": "describe"},
-                ]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": PILImage.new("RGB", (10, 10))},
+                        {"type": "image", "image": PILImage.new("RGB", (10, 10))},
+                        {"type": "text", "text": "describe"},
+                    ],
+                },
                 {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
             ]
         },
         {
             "conversation": [
-                {"role": "user", "content": [
-                    {"type": "image", "image": PILImage.new("RGB", (10, 10))},
-                    {"type": "text", "text": "what"},
-                ]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": PILImage.new("RGB", (10, 10))},
+                        {"type": "text", "text": "what"},
+                    ],
+                },
                 {"role": "assistant", "content": [{"type": "text", "text": "yes"}]},
             ]
         },
@@ -2257,3 +3100,307 @@ class TestNeatPackedVlmCollaterAttnImpl:
         result = neat_packed_vlm_collater([s1, s2], attn_implementation="flash_attention_2")
         assert result["pixel_values"].shape[0] == 3  # 2 + 1
         assert result["image_grid_thw"].shape[0] == 3
+
+
+# ---------------------------------------------------------------------------
+# Tests for public gemma4_inject_thinking_prefix hook
+# ---------------------------------------------------------------------------
+
+
+class _GemmaTokenizerStub:
+    """Encodes the Gemma4 marker/prefix strings to fixed token sequences."""
+
+    pad_token_id = 0
+
+    _MARKER = "<|turn>model\n"
+    _PREFIX = "<|channel>thought\n<channel|>"
+    _MARKER_IDS = [10, 11]
+    _PREFIX_IDS = [20, 21, 22]
+
+    def encode(self, text, add_special_tokens=False):
+        if text == self._MARKER:
+            return list(self._MARKER_IDS)
+        if text == self._PREFIX:
+            return list(self._PREFIX_IDS)
+        return []
+
+
+class _NonGemmaTokenizerStub:
+    """Encodes the Gemma4 marker/prefix to empty (no matching tokens)."""
+
+    pad_token_id = 0
+
+    def encode(self, text, add_special_tokens=False):
+        return []
+
+
+def test_gemma4_inject_thinking_prefix_inserts_after_marker(collate_mod):
+    """Hook injects prefix ids after each <|turn>model\\n marker."""
+    marker = _GemmaTokenizerStub._MARKER_IDS
+    prefix = _GemmaTokenizerStub._PREFIX_IDS
+    # [user...] [marker] [answer]
+    seq = torch.tensor([[1, 2, 3, *marker, 4, 5]])
+    batch = {"input_ids": seq.clone(), "attention_mask": torch.ones_like(seq)}
+
+    out = collate_mod.gemma4_inject_thinking_prefix(batch, _GemmaTokenizerStub())
+    expected = torch.tensor([[1, 2, 3, *marker, *prefix, 4, 5]])
+    assert torch.equal(out["input_ids"], expected)
+    assert out["attention_mask"].shape == expected.shape
+    # injected positions are unmasked (visible)
+    inject_start = 3 + len(marker)
+    inject_end = inject_start + len(prefix)
+    assert (out["attention_mask"][0, inject_start:inject_end] == 1).all()
+
+
+def test_gemma4_inject_thinking_prefix_noop_for_non_gemma_tokenizer(collate_mod):
+    """For tokenizers without the marker/prefix vocab, the batch is returned unchanged."""
+    seq = torch.tensor([[1, 2, 3, 4, 5]])
+    batch = {"input_ids": seq.clone(), "attention_mask": torch.ones_like(seq)}
+
+    out = collate_mod.gemma4_inject_thinking_prefix(batch, _NonGemmaTokenizerStub())
+    assert torch.equal(out["input_ids"], seq)
+
+
+def test_gemma4_inject_thinking_prefix_accepts_processor_or_tokenizer(collate_mod):
+    """Hook unwraps processor.tokenizer and also accepts a raw tokenizer."""
+
+    class _Processor:
+        tokenizer = _GemmaTokenizerStub()
+
+    marker = _GemmaTokenizerStub._MARKER_IDS
+    seq = torch.tensor([[*marker, 9]])
+    batch_a = {"input_ids": seq.clone(), "attention_mask": torch.ones_like(seq)}
+    batch_b = {"input_ids": seq.clone(), "attention_mask": torch.ones_like(seq)}
+
+    out_proc = collate_mod.gemma4_inject_thinking_prefix(batch_a, _Processor())
+    out_tok = collate_mod.gemma4_inject_thinking_prefix(batch_b, _GemmaTokenizerStub())
+    assert torch.equal(out_proc["input_ids"], out_tok["input_ids"])
+
+
+# ---------------------------------------------------------------------------
+# Qwen3-Omni ASR collate (no qwen_omni_utils)
+# ---------------------------------------------------------------------------
+import io as _io
+
+import numpy as _np
+import soundfile as _sf
+
+
+_ASR_USER_TEXT = "<system>"
+_ASR_ASSISTANT_TEXT = "你好"
+
+
+def _asr_conversation(transcript=_ASR_ASSISTANT_TEXT):
+    waveform = _np.zeros(800, dtype=_np.float32)
+    return [
+        {"role": "system", "content": "Transcribe."},
+        {"role": "user", "content": [{"type": "audio", "audio": waveform}]},
+        {"role": "assistant", "content": [{"type": "text", "text": transcript}]},
+    ]
+
+
+class DummyQwen3OmniAsrProcessor:
+    """Mock that mimics Qwen3OmniMoeProcessor.__call__ for ASR usage.
+
+    Returns deterministic ``input_ids`` and audio-feature tensors keyed by the
+    audio kwarg the new collate is required to pass. Tracks every call so tests
+    can assert what was forwarded.
+    """
+
+    def __init__(self):
+        self.tokenizer = DummyTokenizer(pad_token_id=0)
+        self.call_kwargs = []
+
+    def apply_chat_template(self, conversation, *, add_generation_prompt, tokenize, **kwargs):
+        assert add_generation_prompt is False, "ASR collate must call apply_chat_template(add_generation_prompt=False)"
+        assert tokenize is False
+        return "chat"
+
+    def __call__(self, *, text, return_tensors, padding, audio=None, **kwargs):
+        assert return_tensors == "pt"
+        assert padding is True
+        self.call_kwargs.append({"text": list(text), "audio": audio, "padding_side": kwargs.get("padding_side")})
+        batch_size = len(text)
+        input_ids = torch.arange(1, 7).unsqueeze(0).repeat(batch_size, 1)
+        attn_mask = torch.ones_like(input_ids)
+        num_audios = 0 if audio is None else len(audio)
+        if num_audios == 0:
+            num_audios = batch_size
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attn_mask,
+            "input_features": torch.zeros(num_audios, 128, 32, dtype=torch.float32),
+            "feature_attention_mask": torch.ones(num_audios, 32, dtype=torch.long),
+        }
+
+
+def test_qwen3_omni_asr_registry_guard(collate_mod):
+    """The global registry must still point at the original Omni collate."""
+    assert collate_mod.COLLATE_FNS["Qwen3OmniMoeProcessor"] is collate_mod.qwen3_omni_collate_fn
+    assert collate_mod.COLLATE_FNS["Qwen3OmniMoeProcessor"] is not collate_mod.qwen3_omni_asr_collate_fn
+
+
+def test_qwen3_omni_asr_extract_audios_from_conversation(collate_mod):
+    """Audio payloads must be pulled from any user-turn ``{type:audio,audio:...}`` item."""
+    conv = _asr_conversation()
+    audios = collate_mod._extract_audios_from_conversation(conv)
+    assert len(audios) == 1
+    assert isinstance(audios[0], _np.ndarray)
+
+
+def test_qwen3_omni_asr_collate_shapes_and_kwargs(collate_mod, monkeypatch):
+    """The collate must produce shifted labels, slice same-shape tensors, and pass audio=."""
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25]], dtype=torch.long)
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        assert input_ids.shape == (2, 6)
+        assert len(conversations) == 2
+        return labels_stub
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    processor = DummyQwen3OmniAsrProcessor()
+    batch = collate_mod.qwen3_omni_asr_collate_fn(
+        [{"conversation": _asr_conversation()} for _ in range(2)],
+        processor,
+    )
+
+    # The audio kwarg must have been forwarded with one waveform per sample.
+    assert len(processor.call_kwargs) == 1
+    assert processor.call_kwargs[0]["audio"] is not None
+    assert len(processor.call_kwargs[0]["audio"]) == 2
+    # The collate must pin padding_side="right" to align with recipe token accounting.
+    assert processor.call_kwargs[0]["padding_side"] == "right"
+
+    # Pre-shifted labels and same-shape tensors sliced to [:, :-1] (length 5).
+    assert batch["input_ids"].shape == (2, 5)
+    assert batch["attention_mask"].shape == (2, 5)
+    assert batch["labels"].shape == (2, 5)
+    # Same-shape labels[:, 1:] of length-6 labels_stub == values at columns 1..5.
+    assert torch.equal(batch["labels"], labels_stub[:, 1:])
+
+    # Audio feature tensors must NOT be sliced (their shape differs from input_ids).
+    assert batch["input_features"].shape == (2, 128, 32)
+    assert batch["feature_attention_mask"].shape == (2, 32)
+
+
+def test_qwen3_omni_asr_raises_when_no_assistant_turn(collate_mod):
+    """An assistant-less conversation must error rather than yield NaN loss."""
+    processor = DummyQwen3OmniAsrProcessor()
+    bad = [
+        {"role": "system", "content": "Transcribe."},
+        {"role": "user", "content": [{"type": "audio", "audio": _np.zeros(800, dtype=_np.float32)}]},
+    ]
+    with pytest.raises(ValueError, match="assistant"):
+        collate_mod.qwen3_omni_asr_collate_fn([{"conversation": bad}], processor)
+
+
+def test_qwen3_omni_asr_raises_when_assistant_text_empty(collate_mod):
+    """A whitespace-only assistant turn must error."""
+    processor = DummyQwen3OmniAsrProcessor()
+    bad_conv = _asr_conversation(transcript="  ")
+    with pytest.raises(ValueError, match="assistant"):
+        collate_mod.qwen3_omni_asr_collate_fn([{"conversation": bad_conv}], processor)
+
+
+def test_qwen3_omni_asr_works_when_qwen_omni_utils_missing(collate_mod, monkeypatch):
+    """The collate must NOT depend on qwen_omni_utils, even when it is missing/poisoned."""
+    # Poison the qwen_omni_utils slot so any accidental import would fail.
+    monkeypatch.setitem(sys.modules, "qwen_omni_utils", None)
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_OMNI_UTILS", False, raising=True)
+
+    labels_stub = torch.tensor([[100, 101, 102, 103, 104, 105]], dtype=torch.long)
+    monkeypatch.setattr(
+        collate_mod,
+        "build_labels_from_template",
+        lambda input_ids, conversations, processor_arg: labels_stub,
+        raising=True,
+    )
+
+    processor = DummyQwen3OmniAsrProcessor()
+    batch = collate_mod.qwen3_omni_asr_collate_fn([{"conversation": _asr_conversation()}], processor)
+    assert batch["input_ids"].shape == (1, 5)
+    assert torch.equal(batch["labels"], labels_stub[:, 1:])
+
+
+def test_qwen3_omni_asr_function_body_does_not_import_qwen_omni_utils(collate_mod):
+    """Static guard: the ASR collate must not import qwen_omni_utils or call process_mm_info.
+
+    Parses the function body via AST so the explanatory docstring (which intentionally
+    explains *why* this collate avoids qwen_omni_utils) does not trip the check.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    src = textwrap.dedent(inspect.getsource(collate_mod.qwen3_omni_asr_collate_fn))
+    tree = ast.parse(src)
+    func_def = tree.body[0]
+    assert isinstance(func_def, (ast.FunctionDef, ast.AsyncFunctionDef))
+
+    body = list(func_def.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(getattr(body[0], "value", None), ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    body_src = "\n".join(ast.unparse(node) for node in body)
+    assert "qwen_omni_utils" not in body_src
+    assert "process_mm_info" not in body_src
+
+
+def test_qwen3_omni_asr_validate_helper_coerces_float64_to_float32(collate_mod):
+    """A 1-D float64 waveform must be coerced to float32 (no raise)."""
+    waveform = _np.zeros(400, dtype=_np.float64)
+    coerced = collate_mod._validate_and_coerce_audio_payload(waveform, sample_index=0)
+    assert isinstance(coerced, _np.ndarray)
+    assert coerced.dtype == _np.float32
+    assert coerced.ndim == 1
+    assert coerced.shape == (400,)
+
+
+def test_qwen3_omni_asr_validate_helper_rejects_2d_audio(collate_mod):
+    """A non-1-D audio payload must raise ValueError naming sample index and shape/dtype."""
+    waveform_2d = _np.zeros((2, 400), dtype=_np.float32)
+    with pytest.raises(ValueError, match=r"sample\[3\] audio payload must be 1-D"):
+        collate_mod._validate_and_coerce_audio_payload(waveform_2d, sample_index=3)
+
+
+def test_qwen3_omni_asr_collate_coerces_float64_inputs(collate_mod, monkeypatch):
+    """End-to-end: the collate must accept a float64 waveform and forward it as float32."""
+
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14, 15]], dtype=torch.long)
+    monkeypatch.setattr(
+        collate_mod,
+        "build_labels_from_template",
+        lambda input_ids, conversations, processor_arg: labels_stub,
+        raising=True,
+    )
+
+    processor = DummyQwen3OmniAsrProcessor()
+    conv = [
+        {"role": "system", "content": "Transcribe."},
+        {"role": "user", "content": [{"type": "audio", "audio": _np.zeros(400, dtype=_np.float64)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "你好"}]},
+    ]
+    collate_mod.qwen3_omni_asr_collate_fn([{"conversation": conv}], processor)
+
+    # The collate must have coerced the float64 waveform to float32 BEFORE passing to the processor.
+    forwarded_audio = processor.call_kwargs[0]["audio"]
+    assert forwarded_audio is not None and len(forwarded_audio) == 1
+    assert forwarded_audio[0].dtype == _np.float32
+    assert forwarded_audio[0].ndim == 1
+
+
+def test_qwen3_omni_asr_collate_rejects_2d_audio(collate_mod):
+    """End-to-end: a 2-D waveform inside the conversation must raise during collation."""
+    processor = DummyQwen3OmniAsrProcessor()
+    conv = [
+        {"role": "system", "content": "Transcribe."},
+        {"role": "user", "content": [{"type": "audio", "audio": _np.zeros((2, 400), dtype=_np.float32)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "你好"}]},
+    ]
+    with pytest.raises(ValueError, match=r"sample\[0\].*1-D"):
+        collate_mod.qwen3_omni_asr_collate_fn([{"conversation": conv}], processor)

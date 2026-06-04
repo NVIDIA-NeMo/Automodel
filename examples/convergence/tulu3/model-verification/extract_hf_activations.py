@@ -53,6 +53,8 @@ DEFAULT_PROMPTS = [
 
 
 def main():
+    """Extract Hugging Face model activations for comparison."""
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, help="HF model ID or local path")
     parser.add_argument("--output-file", required=True, help="Path to save activations (.pt)")

@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PipelineInfo:
+    """Runtime state produced by pipeline-parallel setup."""
+
     enabled: bool
     schedule: Optional[_PipelineSchedule]
     has_first_stage: bool
@@ -70,6 +72,7 @@ class AutoPipeline:
         patch_inner_model: bool = True,
         patch_causal_lm_model: bool = True,
         patch_stage_backward_maybe_with_nosync: bool = False,
+        defer_fsdp_grad_sync: bool = True,
         # Runtime
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
@@ -104,6 +107,7 @@ class AutoPipeline:
         self.patch_inner_model = patch_inner_model
         self.patch_causal_lm_model = patch_causal_lm_model
         self.patch_stage_backward_maybe_with_nosync = patch_stage_backward_maybe_with_nosync
+        self.defer_fsdp_grad_sync = defer_fsdp_grad_sync
         self._device: torch.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
         self.scale_grads_in_schedule = scale_grads_in_schedule
@@ -160,7 +164,9 @@ class AutoPipeline:
             scale_grads=self.scale_grads_in_schedule,
             round_to_pp_multiple=self.round_virtual_stages_to_pp_multiple,
             patch_stage_backward_maybe_with_nosync=self.patch_stage_backward_maybe_with_nosync,
+            reduce_grad_per_microbatch=not self.defer_fsdp_grad_sync,
             seq_len=self.pp_seq_len,
+            tensor_dtype=self.dtype,
         )
 
         # Update PipelineInfo state
@@ -204,6 +210,7 @@ class AutoPipeline:
             self._model_config,
             self.pp_microbatch_size,
             seq_len,
+            tensor_dtype=self.dtype,
         )
         self._pp_current_seq_len = seq_len
         logger.debug(f"PP stage shapes updated for seq_len={seq_len}")

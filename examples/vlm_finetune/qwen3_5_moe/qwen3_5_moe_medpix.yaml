@@ -38,7 +38,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: your/path/to/qwen3_5_moe_400b_checkpoint
+  pretrained_model_name_or_path: Qwen/Qwen3.5-397B-A17B
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
@@ -51,7 +51,7 @@ model:
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: your/path/to/qwen3_5_moe_400b_checkpoint
+  pretrained_model_name_or_path: Qwen/Qwen3.5-397B-A17B
 
 checkpoint:
   enabled: false
@@ -96,7 +96,7 @@ dataloader:
   num_workers: 1
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
-    max_length: 1024
+    max_length: 2048
   drop_last: true
 
 validation_dataset:
@@ -109,6 +109,8 @@ validation_dataloader:
   num_workers: 1
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 2048
+  drop_last: true
 
 optimizer:
   _target_: torch.optim.Adam
@@ -121,6 +123,7 @@ optimizer:
 ci:
   recipe_owner: HuiyingLi
   nodes: 32
+  time: "00:45:00"
 
 # Uncomment and configure for W&B logging
 # wandb:

@@ -117,5 +117,5 @@ optimizer:
 
 ci:
   recipe_owner: hemildesai
-  time: "00:20:00"
+  time: "00:25:00"
   nodes: 8

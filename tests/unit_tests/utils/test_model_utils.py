@@ -334,6 +334,40 @@ def test_freeze_audio_tower_false_keeps_speech_trainable(audio_model):
     assert _all_requires_grad(audio_model.speech_adapter)
 
 
+@pytest.fixture()
+def sound_model() -> nn.Module:
+    """Model with a NemotronOmni-style ``sound_*`` submodule."""
+
+    class SoundModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.sound_encoder = nn.Linear(4, 4)
+            self.sound_projection = nn.Linear(4, 4)
+            self.language_head = nn.Linear(4, 4)
+
+        def forward(self, x):
+            pass
+
+    return SoundModel()
+
+
+def test_freeze_audio_tower_freezes_sound_pattern(sound_model):
+    """``freeze_audio_tower=True`` must also freeze NemotronOmni's ``sound_*`` modules."""
+    model_utils.apply_parameter_freezing(sound_model, {"freeze_audio_tower": True, "freeze_vision_tower": False})
+
+    assert not _any_requires_grad(sound_model.sound_encoder)
+    assert not _any_requires_grad(sound_model.sound_projection)
+    assert _all_requires_grad(sound_model.language_head)
+
+
+def test_freeze_audio_tower_false_keeps_sound_trainable(sound_model):
+    """Sound modules stay trainable when audio freeze is off."""
+    model_utils.apply_parameter_freezing(sound_model, {"freeze_audio_tower": False, "freeze_vision_tower": False})
+
+    assert _all_requires_grad(sound_model.sound_encoder)
+    assert _all_requires_grad(sound_model.sound_projection)
+
+
 # =============================================================================
 # Tests for cast_mixed_dtype_params_to_bf16
 # =============================================================================
@@ -419,3 +453,221 @@ class TestFilterForwardKwargs:
         filtered = model_utils.filter_forward_kwargs(model, batch)
 
         assert filtered == batch
+
+
+class TestSqueezeInputForThd:
+    """``squeeze_input_for_thd`` strips the placeholder batch dim (``[1, T, ...] -> [T, ...]``)
+    before THD attention/Mamba kernels see the inputs. The contract has to handle
+    ``input_ids=None`` because callers feeding the model via ``inputs_embeds`` only
+    (multimodal LMs, speech-language models) leave ``input_ids`` unset; the embeddings
+    are squeezed inside the model forward instead.
+    """
+
+    def _attn_kwargs(self, *, padded: bool = False, with_max_seqlen: bool = True):
+        """Build the kwargs dict in the canonical [1, num_seqs+1] layout, padded
+        with the ``-1000`` sentinel that ``squeeze_input_for_thd`` filters out."""
+        kwargs: dict = {
+            "cu_seqlens": torch.tensor([[0, 3, 5, -1000]], dtype=torch.int32),
+        }
+        if padded:
+            kwargs["cu_seqlens_padded"] = torch.tensor([[0, 4, 6, -1000]], dtype=torch.int32)
+        if with_max_seqlen:
+            kwargs["max_seqlen"] = torch.tensor([3])
+        return kwargs
+
+    def test_squeezes_input_ids_when_provided(self):
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+        position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+        padding_mask = torch.tensor([[False, False, False, False, False]])
+        kwargs = self._attn_kwargs()
+
+        ids, pos, mask, kw = model_utils.squeeze_input_for_thd(input_ids, position_ids, padding_mask, kwargs)
+
+        assert ids.shape == (5,)
+        assert pos.shape == (5,)
+        assert mask.shape == (5,)
+        # Sentinel filtered out and dtype/shape preserved.
+        assert kw["cu_seqlens"].tolist() == [0, 3, 5]
+        assert kw["cu_seqlens"].dtype == torch.int32
+        # max_seqlen tensor → Python int.
+        assert kw["max_seqlen"] == 3
+        assert isinstance(kw["max_seqlen"], int)
+
+    def test_accepts_input_ids_none_for_inputs_embeds_callers(self):
+        """The bug: prior code did ``input_ids.squeeze(0)`` unconditionally and
+        crashed when the caller used ``inputs_embeds`` only. The fix returns
+        ``None`` for the ``input_ids`` slot and squeezes everything else."""
+        position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+        padding_mask = torch.tensor([[False, False, False, False, False]])
+        kwargs = self._attn_kwargs()
+
+        ids, pos, mask, kw = model_utils.squeeze_input_for_thd(None, position_ids, padding_mask, kwargs)
+
+        assert ids is None
+        assert pos.shape == (5,)
+        assert mask.shape == (5,)
+        assert kw["cu_seqlens"].tolist() == [0, 3, 5]
+        assert kw["max_seqlen"] == 3
+
+    def test_padding_mask_none_is_passed_through(self):
+        """Existing behavior: ``padding_mask`` may be ``None`` (unmasked path).
+        The new ``input_ids=None`` branch must compose with this."""
+        position_ids = torch.tensor([[0, 1, 2, 3, 4]])
+        kwargs = self._attn_kwargs(with_max_seqlen=False)
+
+        ids, pos, mask, kw = model_utils.squeeze_input_for_thd(None, position_ids, None, kwargs)
+
+        assert ids is None
+        assert mask is None
+        assert pos.shape == (5,)
+
+    def test_3d_inputs_embeds_via_input_ids_slot_still_works(self):
+        """Belt-and-braces: the docstring claims ``input_ids`` may carry a 3D
+        ``[1, T, H]`` embedding tensor. Squeezing dim 0 of that yields ``[T, H]``."""
+        embeds = torch.randn(1, 5, 16)
+        position_ids = torch.tensor([[0, 1, 2, 3, 4]])
+        kwargs = self._attn_kwargs(with_max_seqlen=False)
+
+        ids, pos, _mask, _kw = model_utils.squeeze_input_for_thd(embeds, position_ids, None, kwargs)
+
+        assert ids.shape == (5, 16)
+        assert pos.shape == (5,)
+
+    def test_cu_seqlens_padded_filtered_alongside_cu_seqlens(self):
+        """Both ``cu_seqlens`` and ``cu_seqlens_padded`` (CP path) get the
+        sentinel filter — the bug fix must not regress this."""
+        position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+        kwargs = self._attn_kwargs(padded=True, with_max_seqlen=False)
+
+        _ids, _pos, _mask, kw = model_utils.squeeze_input_for_thd(None, position_ids, None, kwargs)
+
+        assert kw["cu_seqlens"].tolist() == [0, 3, 5]
+        assert kw["cu_seqlens_padded"].tolist() == [0, 4, 6]
+
+
+# =============================================================================
+# Tests for enable_radio_vit_fused_attn
+# =============================================================================
+
+
+def _build_radio_model(num_blocks: int = 3, attach_via_nested_model: bool = False, attn_present: bool = True):
+    """Build a stub mirroring ``model.[model.]vision_model.radio_model.model.blocks[*].attn.fused_attn``."""
+
+    class Attn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fused_attn = False
+
+    class Block(nn.Module):
+        def __init__(self, with_attn: bool):
+            super().__init__()
+            if with_attn:
+                self.attn = Attn()
+            # else: no `attn` attribute at all → exercises the `attn is None` skip
+
+    class RadioInner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList([Block(attn_present) for _ in range(num_blocks)])
+
+    class RadioModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = RadioInner()
+
+    class VisionModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.radio_model = RadioModel()
+
+    class Outer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            if attach_via_nested_model:
+
+                class Inner(nn.Module):
+                    def __init__(self):
+                        super().__init__()
+                        self.vision_model = VisionModel()
+
+                self.model = Inner()
+            else:
+                self.vision_model = VisionModel()
+
+    return Outer()
+
+
+def test_enable_radio_vit_fused_attn_flips_blocks_top_level():
+    """All blocks reachable via ``model.vision_model.radio_model.model.blocks`` flip to fused_attn=True."""
+    model = _build_radio_model(num_blocks=3)
+    model_utils.enable_radio_vit_fused_attn(model)
+
+    for block in model.vision_model.radio_model.model.blocks:
+        assert block.attn.fused_attn is True
+
+
+def test_enable_radio_vit_fused_attn_flips_blocks_nested_model():
+    """Resolves vision_model via the ``model.model.vision_model`` path used by HF wrappers."""
+    model = _build_radio_model(num_blocks=2, attach_via_nested_model=True)
+    model_utils.enable_radio_vit_fused_attn(model)
+
+    for block in model.model.vision_model.radio_model.model.blocks:
+        assert block.attn.fused_attn is True
+
+
+def test_enable_radio_vit_fused_attn_noop_without_radio():
+    """No vision tower → silent no-op (does not raise)."""
+    model = nn.Linear(4, 4)
+    model_utils.enable_radio_vit_fused_attn(model)
+
+
+def test_enable_radio_vit_fused_attn_skips_blocks_without_attn():
+    """Blocks without an ``attn`` attribute are skipped, not crashed on."""
+    model = _build_radio_model(num_blocks=2, attn_present=False)
+    model_utils.enable_radio_vit_fused_attn(model)  # must not raise
+
+
+# =============================================================================
+# Tests for freeze_video_embedder branch in apply_parameter_freezing
+# =============================================================================
+
+
+@pytest.fixture()
+def video_embedder_model() -> nn.Module:
+    """Model exposing a ``patch_generator.video_embedder`` parameter."""
+
+    class PatchGenerator(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.video_embedder = nn.Linear(4, 4)
+            self.image_embedder = nn.Linear(4, 4)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.patch_generator = PatchGenerator()
+            self.language_head = nn.Linear(4, 4)
+
+    return Model()
+
+
+def test_freeze_video_embedder_true_freezes_only_video_embedder(video_embedder_model):
+    """``freeze_video_embedder=True`` freezes ``patch_generator.video_embedder.*`` only."""
+    model_utils.apply_parameter_freezing(
+        video_embedder_model,
+        {"freeze_vision_tower": False, "freeze_video_embedder": True},
+    )
+
+    assert not _any_requires_grad(video_embedder_model.patch_generator.video_embedder)
+    assert _all_requires_grad(video_embedder_model.patch_generator.image_embedder)
+    assert _all_requires_grad(video_embedder_model.language_head)
+
+
+def test_freeze_video_embedder_false_keeps_video_embedder_trainable(video_embedder_model):
+    """Default ``freeze_video_embedder=False`` leaves the video embedder trainable."""
+    model_utils.apply_parameter_freezing(
+        video_embedder_model,
+        {"freeze_vision_tower": False, "freeze_video_embedder": False},
+    )
+
+    assert _all_requires_grad(video_embedder_model.patch_generator.video_embedder)

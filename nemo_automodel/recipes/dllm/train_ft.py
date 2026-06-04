@@ -39,6 +39,7 @@ import time
 from contextlib import nullcontext
 from typing import Optional
 
+import mlflow
 import torch
 import wandb
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
@@ -48,6 +49,7 @@ from nemo_automodel.components.datasets.dllm.collate import DLLMCollator
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.loggers.mlflow_utils import to_float_metrics
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import (
     prepare_after_first_microbatch,
@@ -75,6 +77,24 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
     def setup(self):
         """Build all training components, then apply dLLM-specific overrides."""
+        # Diffusion-LM training expects the user-specified ``torch_dtype`` to
+        # be honored as the master-weight dtype. AM's default loading path
+        # restores the on-disk dtype after load, which would silently downcast
+        # an fp32 load back to the checkpoint's bf16 and break the standard
+        # mixed-precision recipe (fp32 master + bf16 compute). Disable that
+        # restoration here only — other recipes are unaffected.
+        # ``self.cfg.model`` is a ``ConfigNode``; use attribute access (no
+        # ``__setitem__``) and check ``__dict__`` for explicit user overrides.
+        # Only set _restore_loaded_dtype for NeMo model loading paths — it is
+        # an internal NeMo flag unknown to vanilla transformers.AutoModel, and
+        # passing it to trust_remote_code models (e.g. DFlashDraftModel) raises
+        # a TypeError.
+        model_cfg = self.cfg.get("model", None)
+        if model_cfg is not None and "_restore_loaded_dtype" not in model_cfg.__dict__:
+            target = str(model_cfg.get("_target_", ""))
+            if "nemo_automodel" in target:
+                model_cfg._restore_loaded_dtype = False
+
         # Let parent build model, optimizer, dataloader, scheduler, etc.
         super().setup()
 
@@ -105,19 +125,17 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         psld = dllm_cfg.get("pad_seq_len_divisible", None)
         self.dllm_pad_seq_len_divisible = int(psld) if psld is not None else None
 
-        # Resolve mask_token_id
+        # Resolve mask_token_id — may stay None if the strategy's setup_extra() will set it.
         self.mask_token_id = dllm_cfg.get("mask_token_id", None)
         if self.mask_token_id is None:
-            # Try to get from tokenizer
             if (
                 self.tokenizer is not None
                 and hasattr(self.tokenizer, "mask_token_id")
                 and self.tokenizer.mask_token_id is not None
             ):
                 self.mask_token_id = self.tokenizer.mask_token_id
-            else:
-                raise ValueError("dllm.mask_token_id must be set in config, or the tokenizer must have a mask_token_id")
-        self.mask_token_id = int(self.mask_token_id)
+        if self.mask_token_id is not None:
+            self.mask_token_id = int(self.mask_token_id)
 
         # --- Build dLLM loss function via strategy ---
         self.dllm_loss_fn = self.dllm_strategy.create_loss_fn(dllm_cfg)
@@ -134,6 +152,19 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
         # Buffers for dLLM-specific metrics
         self._dllm_loss_buffer = []
+        # Per-rank raw (correct, count) sums per block offset for DFlash draft
+        # accuracy — SUM-allreduced across DP/CP, then divided to give global
+        # per-position acceptance-length proxy plus the overall mean.
+        self._dflash_correct_per_pos_buffer = []
+        self._dflash_count_per_pos_buffer = []
+
+        # --- Strategy post-setup hook (e.g. loads frozen target for DFlash) ---
+        self.dllm_strategy.setup_extra(self)
+        if self.mask_token_id is None:
+            raise ValueError(
+                "dllm.mask_token_id must be set in config, resolved by the tokenizer, or set by strategy.setup_extra()."
+            )
+        self.mask_token_id = int(self.mask_token_id)
 
     def _wrap_dataloader_collate(self):
         """Replace dataloader collate functions with the dLLM single-pass collater.
@@ -206,6 +237,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         *,
         loss_buffer,
         num_diffusion_tokens,
+        num_ar_tokens=None,
         num_batches,
         is_train: bool = True,
     ):
@@ -259,16 +291,25 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             batch = filter_forward_kwargs(model, batch)
             out = model(**batch)
             logits = getattr(out, "logits", out)
+            # Hybrid models (e.g. Nemotron-Labs-Diffusion in block_diff mode)
+            # also return causal_logits for the AR branch of the loss.  When
+            # absent (e.g. pure-MDLM models like LLaDA), the AR branch is
+            # silently skipped by HybridDiffusionLLMLoss / MDLMCrossEntropyLoss.
+            causal_logits = getattr(out, "causal_logits", None)
             del out
 
             # Compute dLLM loss (unified interface via DLLMLossOutput)
+            has_causal = causal_logits is not None
             loss_result = self.dllm_loss_fn(
                 logits=logits,
                 target_ids=clean_input_ids,
                 noise_mask=noise_mask,
                 p_mask=p_mask,
                 loss_mask=loss_mask,
+                loss_mask_ar=loss_mask if has_causal else None,
                 num_diffusion_tokens=num_diffusion_tokens,
+                num_ar_tokens=num_ar_tokens if has_causal else None,
+                causal_logits=causal_logits,
             )
             microbatch_loss = loss_result.total_loss
             dllm_loss = loss_result.dllm_loss.detach().clone()
@@ -285,28 +326,20 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         Follows the parent pattern but uses loss_mask from the collate wrapper
         instead of labels != -100 for token counting.
         """
-        # Pre-corrupt all microbatches so we can count noise tokens globally
-        # before any forward pass.
-        num_noise_tokens = 0  # diffusion loss denominator (corrupted positions)
-        num_supervised_tokens = 0  # total supervised tokens (all loss_mask==1 positions)
+        # Pre-process all microbatches (corruption for MDLM, target forwards for DFlash).
+        num_noise_tokens_raw, num_supervised_tokens_raw = self.dllm_strategy.pre_step(self, batches)
+        num_noise_tokens = self._dp_allreduce(torch.tensor(num_noise_tokens_raw, dtype=torch.long)).item()
+        num_supervised_tokens = self._dp_allreduce(torch.tensor(num_supervised_tokens_raw, dtype=torch.long)).item()
 
-        for batch in batches:
-            noisy_input_ids, noise_mask, p_mask = self._apply_corruption(batch["input_ids"], batch["loss_mask"])
-            batch["_noisy_input_ids"] = noisy_input_ids
-            batch["_noise_mask"] = noise_mask
-            batch["_p_mask"] = p_mask
-            batch["_clean_input_ids"] = batch["input_ids"].clone()
-            num_noise_tokens += noise_mask.sum().item()
-            num_supervised_tokens += batch["loss_mask"].sum().item()
-
-        num_noise_tokens = self._dp_allreduce(torch.tensor(num_noise_tokens, dtype=torch.long)).item()
-        num_supervised_tokens = self._dp_allreduce(torch.tensor(num_supervised_tokens, dtype=torch.long)).item()
-
-        # Select denominator based on strategy (MDLM -> supervised, future models may use noise)
+        # Select diffusion-loss denominator based on strategy:
+        # - MDLM (LLaDA) -> supervised
+        # - Hybrid (Nemotron-Labs-Diffusion) -> noise
+        # AR-loss denominator is always supervised (only relevant for Hybrid).
         if self.dllm_strategy.normalization_mode == "noise":
             num_diffusion_tokens = num_noise_tokens
         else:
             num_diffusion_tokens = num_supervised_tokens
+        num_ar_tokens = num_supervised_tokens
 
         loss_buffer = []
 
@@ -321,11 +354,13 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
-            self._forward_backward_step(
+            self.dllm_strategy.forward_backward(
+                self,
                 i,
                 batch,
                 loss_buffer=loss_buffer,
                 num_diffusion_tokens=num_diffusion_tokens,
+                num_ar_tokens=num_ar_tokens,
                 num_batches=num_batches,
             )
 
@@ -342,7 +377,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
-            num_label_tokens=num_diffusion_tokens,
+            num_label_tokens=num_ar_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
         )
 
@@ -400,25 +435,50 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         dllm_loss = self._dp_allreduce(torch.stack(self._dllm_loss_buffer).sum(), include_cp=True).item()
         self._dllm_loss_buffer.clear()
 
+        # DFlash draft top-1 accuracy. Per-rank raw (correct, count) per block
+        # offset are summed over grad-accum microbatches, SUM-allreduced across
+        # DP+CP (same primitive as dllm_loss), then divided post-reduction to
+        # give per-position acceptance-length proxy and the overall mean.
+        # Buffers stay empty for non-DFlash modes, so draft_acc(_k) stays None.
+        draft_acc = None
+        draft_acc_per_pos = None
+        if self._dflash_correct_per_pos_buffer:
+            correct_per_pos = self._dp_allreduce(
+                torch.stack(self._dflash_correct_per_pos_buffer).sum(dim=0), include_cp=True
+            )
+            count_per_pos = self._dp_allreduce(
+                torch.stack(self._dflash_count_per_pos_buffer).sum(dim=0), include_cp=True
+            )
+            total_correct = correct_per_pos.sum().item()
+            total_count = count_per_pos.sum().item()
+            if total_count > 0:
+                draft_acc = total_correct / total_count
+            count_safe = count_per_pos.clamp_min(1.0)
+            draft_acc_per_pos = (correct_per_pos / count_safe).tolist()
+        self._dflash_correct_per_pos_buffer.clear()
+        self._dflash_count_per_pos_buffer.clear()
+
+        metrics = {
+            "loss": total_loss,
+            "dllm_loss": dllm_loss,
+            "grad_norm": grad_norm,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+            "tps": tps,
+            "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+            "mfu": mfu,
+            "tokens_per_step": num_tokens_in_batch,
+            "supervised_tokens": num_supervised_tokens,
+            "draft_acc": draft_acc,
+            "mode": self.dllm_mode,
+        }
+        if draft_acc_per_pos is not None:
+            for k, v in enumerate(draft_acc_per_pos, start=1):
+                metrics[f"draft_acc_k{k}"] = v
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "loss": total_loss,
-                "Loss/Train_Total": total_loss,
-                "Loss/Train_DLLM": dllm_loss,
-                "grad_norm": grad_norm,
-                "Train/grad_norm": grad_norm,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "Train/lr": self.optimizer[0].param_groups[0]["lr"],
-                "Train/mem": torch.cuda.max_memory_allocated() / 1024**3,
-                "Train/tps": tps,
-                "Train/tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
-                "Train/mfu": mfu,
-                "Train/tokens_per_step": num_tokens_in_batch,
-                "Train/supervised_tokens": num_supervised_tokens,
-                "Train/mode": self.dllm_mode,
-            },
+            metrics=metrics,
         )
 
     @torch.no_grad()
@@ -438,26 +498,20 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             use_noise = self.dllm_strategy.normalization_mode == "noise"
 
             for batch in val_dataloader:
-                # Pre-corrupt this val batch (same as training path)
-                input_ids = batch["input_ids"]
-                loss_mask = batch["loss_mask"]
-                noisy_input_ids, noise_mask, p_mask = self._apply_corruption(input_ids, loss_mask)
-                batch["_noisy_input_ids"] = noisy_input_ids
-                batch["_noise_mask"] = noise_mask
-                batch["_p_mask"] = p_mask
-                batch["_clean_input_ids"] = input_ids.clone()
-
-                # Count tokens for this batch (all-reduce across DP for this batch)
-                num_noise = self._dp_allreduce(torch.tensor(noise_mask.sum().item(), dtype=torch.long)).item()
-                num_supervised = self._dp_allreduce(torch.tensor(loss_mask.sum().item(), dtype=torch.long)).item()
+                # Pre-process this val batch via the strategy (mirrors training pre_step).
+                num_noise_raw, num_supervised_raw = self.dllm_strategy.pre_step(self, [batch])
+                num_noise = self._dp_allreduce(torch.tensor(num_noise_raw, dtype=torch.long)).item()
+                num_supervised = self._dp_allreduce(torch.tensor(num_supervised_raw, dtype=torch.long)).item()
                 num_norm = num_noise if use_noise else num_supervised
 
                 loss_buffer = []
-                self._forward_backward_step(
+                self.dllm_strategy.forward_backward(
+                    self,
                     0,
                     batch,
                     loss_buffer=loss_buffer,
                     num_diffusion_tokens=num_norm,
+                    num_ar_tokens=num_supervised,
                     num_batches=1,
                     is_train=False,
                 )
@@ -476,6 +530,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
         # Clear dLLM loss buffer from validation
         self._dllm_loss_buffer.clear()
+        self._dflash_correct_per_pos_buffer.clear()
+        self._dflash_count_per_pos_buffer.clear()
 
         return MetricsSample(
             step=self.step_scheduler.step,
@@ -499,25 +555,28 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             remote_metrics = {k: v for k, v in log_data.to_dict().items() if k not in ("step", "epoch", "timestamp")}
             if wandb.run is not None:
                 wandb.log(remote_metrics, step=self.step_scheduler.step)
-            if self.mlflow_logger is not None:
-                self.mlflow_logger.log_metrics(remote_metrics, step=log_data.step)
+            if mlflow.active_run() is not None:
+                mlflow.log_metrics(to_float_metrics(remote_metrics), step=log_data.step)
             if self.comet_logger is not None:
                 self.comet_logger.log_metrics(remote_metrics, step=log_data.step)
 
         self.metric_logger_train.log(log_data)
+        draft_acc = log_data.metrics.get("draft_acc")
+        acc_str = "" if draft_acc is None else " | draft_acc {:.4f}".format(draft_acc)
         logging.info(
             "step {} | epoch {} | loss {:.4f} | dllm_loss {:.4f} | grad_norm {:.4f} | "
-            "lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | mode {}".format(
+            "lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu){} | mode {}".format(
                 log_data.step,
                 log_data.epoch,
-                log_data.metrics["Loss/Train_Total"],
-                log_data.metrics["Loss/Train_DLLM"],
-                log_data.metrics["Train/grad_norm"],
-                log_data.metrics["Train/lr"],
-                log_data.metrics["Train/mem"],
-                log_data.metrics["Train/tps"],
-                log_data.metrics["Train/tps_per_gpu"],
-                log_data.metrics["Train/mode"],
+                log_data.metrics["loss"],
+                log_data.metrics["dllm_loss"],
+                log_data.metrics["grad_norm"],
+                log_data.metrics["lr"],
+                log_data.metrics["mem"],
+                log_data.metrics["tps"],
+                log_data.metrics["tps_per_gpu"],
+                acc_str,
+                log_data.metrics["mode"],
             )
         )
         torch.cuda.reset_peak_memory_stats()
