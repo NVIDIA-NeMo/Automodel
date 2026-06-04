@@ -218,6 +218,7 @@ file gives step-by-step instructions an AI agent can follow.
 | 7 | build-and-dependency     | `build-and-dependency`     | Container setup, uv package management, environment variables, CLI usage |
 | 8 | cicd                     | `cicd`                     | Commit/PR workflow, CI trigger mechanism, failure investigation |
 | 9 | testing                  | `testing`                  | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
+| 10 | job-log-debugging       | `job-log-debugging`        | Locate and diagnose running or finished AutoModel job logs |
 
 **Always read the relevant `SKILL.md` before starting any task it covers —
 skills are mandatory context, not optional background reading.**

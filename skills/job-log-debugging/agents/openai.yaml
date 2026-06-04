@@ -1,0 +1,4 @@
+interface:
+  display_name: "Job Log Debugging"
+  short_description: "Find and diagnose running or finished AutoModel job logs."
+  default_prompt: "Diagnose why this AutoModel job failed from its run name, job id, or log path."
