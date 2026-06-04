@@ -287,18 +287,22 @@ class _ManualAllGatherAttention:
         if padding_mask_full is not None:
             padding_query_rows = padding_mask_full[:, q_indices]
             empty_query_rows = padding_query_rows if empty_query_rows is None else empty_query_rows | padding_query_rows
-        else:
-            padding_query_rows = None
 
-        if packed_seq_ids_full is None and not use_vision_bidirectional:
+        # SDPA is only used when manual all-gather attention has no mask to
+        # represent. Masked local-query/global-key attention stays on Flex so
+        # we do not materialize dense [B, H, Q, K] masks.
+        use_unmasked_sdpa = (
+            not is_causal
+            and sliding_window is None
+            and packed_seq_ids_full is None
+            and padding_mask_full is None
+            and not use_vision_bidirectional
+        )
+        if use_unmasked_sdpa:
             return self._run_sdpa_allgather_attention(
                 query,
                 key_full,
                 value_full,
-                base_mask=base_mask,
-                padding_mask_full=padding_mask_full,
-                padding_query_rows=padding_query_rows,
-                empty_query_rows=empty_query_rows,
                 seq_local=seq_local,
                 seq_full=seq_full,
                 orig_head_dim=orig_head_dim,
@@ -334,10 +338,6 @@ class _ManualAllGatherAttention:
         key_full,
         value_full,
         *,
-        base_mask,
-        padding_mask_full,
-        padding_query_rows,
-        empty_query_rows,
         seq_local,
         seq_full,
         orig_head_dim,
@@ -347,27 +347,11 @@ class _ManualAllGatherAttention:
         enable_gqa,
         kwargs,
     ):
-        q_local_indices = torch.arange(seq_local, device=query.device)
-        kv_indices = torch.arange(seq_full, device=query.device)
-        sdpa_mask = base_mask(q_local_indices[:, None], kv_indices[None, :])
-        if padding_mask_full is not None:
-            sdpa_mask = sdpa_mask.unsqueeze(0) & ~padding_mask_full[:, None, :]
-            sdpa_mask = torch.where(
-                padding_query_rows[:, :, None],
-                kv_indices.view(1, 1, seq_full) == 0,
-                sdpa_mask,
-            )
-            sdpa_mask = sdpa_mask.unsqueeze(1)
-            additive_mask = torch.zeros(sdpa_mask.shape, dtype=query.dtype, device=query.device)
-            sdpa_mask = additive_mask.masked_fill(~sdpa_mask, torch.finfo(query.dtype).min)
-        else:
-            sdpa_mask = sdpa_mask.view(1, 1, seq_local, seq_full)
-
         out = self.original_sdpa(
             query,
             key_full,
             value_full,
-            attn_mask=sdpa_mask,
+            attn_mask=None,
             dropout_p=dropout_p,
             is_causal=False,
             scale=scale,
@@ -376,15 +360,13 @@ class _ManualAllGatherAttention:
         )
         if not self._sdpa_ok_logged:
             self.log.info(
-                "CP using SDPA all-gather. Q=%s K=%s head_dim=%s cp_rank=%s",
+                "CP using unmasked SDPA all-gather. Q=%s K=%s head_dim=%s cp_rank=%s",
                 tuple(query.shape),
                 tuple(key_full.shape),
                 orig_head_dim,
                 cp_rank,
             )
             self._sdpa_ok_logged = True
-        if empty_query_rows is not None and empty_query_rows.any():
-            out = out.masked_fill(empty_query_rows[:, None, :, None], 0)
         return out
 
     def _run_flex_allgather_attention(
@@ -418,7 +400,7 @@ class _ManualAllGatherAttention:
             use_small_flex_blocks = padded_head_dim > 256
             flex_block_size = (32, 32) if use_small_flex_blocks else 128
 
-            if use_vision_bidirectional or packed_seq_ids_full is not None:
+            if use_vision_bidirectional or packed_seq_ids_full is not None or padding_mask_full is not None:
 
                 def cp_mask(batch_idx, head_idx, q_idx, kv_idx):
                     q_global_idx = q_idx + seq_global_start
@@ -514,7 +496,7 @@ class _ManualAllGatherAttention:
             return out
         except Exception as flex_err:
             raise RuntimeError(
-                "Manual CP all-gather requires FlexAttention for packed or irregular masks. "
+                "Manual CP all-gather requires FlexAttention for masked local-query/global-key attention. "
                 f"FlexAttention failed for Q={tuple(query.shape)} K={tuple(key_full.shape)} "
                 f"V={tuple(value_full.shape)} cp_rank={cp_rank} seq_local={seq_local} seq_full={seq_full}."
             ) from flex_err
