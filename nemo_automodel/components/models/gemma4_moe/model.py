@@ -478,20 +478,43 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
     @dataclass(frozen=True)
     class ModelCapabilities:
-        """Declared parallelism / packing capabilities for this model class.
+        """Declared parallelism capabilities for this model class.
 
-        These flags are the model authors' contract: each flag should be set to
-        ``True`` only when the corresponding feature has a working,
-        verified implementation for this class.  Validation of the contract
-        (e.g. KL-divergence parity tests) lives separately under
-        ``tests/capability_registry/``.
+        Each flag should be set to ``True`` only when the corresponding feature
+        has a working, verified implementation for this class.  Variants of the
+        class with different config-driven structure (e.g. dense vs MoE) are
+        disambiguated by :meth:`get_capabilities` below.
         """
 
         supports_tp: bool = False
         supports_cp: bool = False
         supports_pp: bool = False
         supports_ep: bool = False
-        supports_packing: bool = False
+
+    @classmethod
+    def get_capabilities(cls, config: "Gemma4Config") -> "Gemma4ForConditionalGeneration.ModelCapabilities":
+        """Return the capabilities for a specific config (no model instance needed).
+
+        Dispatches on ``config.text_config.enable_moe_block`` so the same class
+        can serve both dense Gemma4 (e.g. ``google/gemma-4-31B-it``) and the
+        MoE variant (e.g. ``google/gemma-4-26B-A4B-it``) honestly.
+
+        Args:
+            config: The model's ``Gemma4Config`` (or anything exposing a
+                ``text_config`` with ``enable_moe_block``).
+
+        Returns:
+            A populated ``ModelCapabilities`` for this specific config.
+        """
+        text_config = getattr(config, "text_config", config)
+        if bool(getattr(text_config, "enable_moe_block", False)):
+            return cls.ModelCapabilities(
+                supports_tp=False,
+                supports_cp=True,
+                supports_pp=False,
+                supports_ep=True,
+            )
+        return cls.ModelCapabilities()
 
     @classmethod
     def from_config(

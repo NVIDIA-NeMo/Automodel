@@ -14,8 +14,11 @@
 
 """Pure query side of the capability registry.
 
-Each NeMo custom model class declares its parallelism / packing support
-via a nested ``ModelCapabilities`` dataclass, e.g.::
+Each NeMo custom model class declares its parallelism support via a nested
+``ModelCapabilities`` dataclass, and optionally a ``get_capabilities(config)``
+classmethod that returns config-specialised values (e.g. dense vs MoE
+variants of the same class). The query path prefers ``get_capabilities``
+when present and falls back to the dataclass defaults otherwise::
 
     class Gemma4ForConditionalGeneration(...):
         @dataclass(frozen=True)
@@ -24,12 +27,10 @@ via a nested ``ModelCapabilities`` dataclass, e.g.::
             supports_cp: bool = False
             supports_pp: bool = False
             supports_ep: bool = False
-            supports_packing: bool = False
 
-This module looks up the registered NeMo class for a given HF model id and
-returns the declared capability values. Validation that the declared values
-actually hold is intentionally out of scope here -- standardized tests live
-under ``tests/capability_registry/standardized_tests/``.
+        @classmethod
+        def get_capabilities(cls, config) -> "ModelCapabilities":
+            ...
 """
 
 from __future__ import annotations
@@ -52,12 +53,16 @@ CAPABILITIES: tuple[str, ...] = (
     "supports_cp",
     "supports_pp",
     "supports_ep",
-    "supports_packing",
 )
 
 
 def query_capabilities(model_id: str, *, trust_remote_code: bool = False) -> dict[str, bool]:
     """Return the declared ``ModelCapabilities`` for ``model_id``.
+
+    The lookup prefers ``model_cls.get_capabilities(config)`` so that classes
+    serving multiple variants (e.g. dense vs MoE Gemma4) can specialise their
+    flags by config. If the model class doesn't provide one, the bare
+    ``ModelCapabilities`` defaults are used.
 
     Args:
         model_id: HuggingFace model id (e.g. ``"google/gemma-4-..."``).
@@ -65,8 +70,7 @@ def query_capabilities(model_id: str, *, trust_remote_code: bool = False) -> dic
 
     Returns:
         Dict mapping each capability name (``"supports_tp"``, ``"supports_cp"``,
-        ``"supports_pp"``, ``"supports_ep"``, ``"supports_packing"``) to its
-        declared boolean value.
+        ``"supports_pp"``, ``"supports_ep"``) to its declared boolean value.
 
     Raises:
         ValueError: If no NeMo custom class is registered for the model's
@@ -76,7 +80,8 @@ def query_capabilities(model_id: str, *, trust_remote_code: bool = False) -> dic
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
     model_cls = _resolve_nemo_class(config)
     caps_cls = _get_capabilities_class(model_cls)
-    return _capabilities_to_dict(caps_cls)
+    caps_instance = _resolve_capabilities_instance(model_cls, caps_cls, config)
+    return _capabilities_to_dict(caps_instance)
 
 
 def _resolve_nemo_class(config: Any) -> type:
@@ -109,12 +114,31 @@ def _get_capabilities_class(model_cls: type) -> type:
     return caps_cls
 
 
-def _capabilities_to_dict(caps_cls: type) -> dict[str, bool]:
-    """Instantiate the (defaults-only) capabilities dataclass and return its fields as a dict."""
-    instance = caps_cls()  # all fields have defaults -> no args required
+def _resolve_capabilities_instance(model_cls: type, caps_cls: type, config: Any):
+    """Pick the config-specialised capabilities when available, else defaults.
+
+    If ``model_cls.get_capabilities`` is defined, it is called with the model's
+    config — this lets a single class (e.g. ``Gemma4ForConditionalGeneration``)
+    expose different flags for dense vs MoE variants. Otherwise the dataclass's
+    default-constructed instance is returned.
+    """
+    get_caps = getattr(model_cls, "get_capabilities", None)
+    if callable(get_caps):
+        instance = get_caps(config)
+        if not isinstance(instance, caps_cls):
+            raise ValueError(
+                f"{model_cls.__name__}.get_capabilities returned {type(instance).__name__}, "
+                f"expected {caps_cls.__qualname__}."
+            )
+        return instance
+    return caps_cls()
+
+
+def _capabilities_to_dict(instance: Any) -> dict[str, bool]:
+    """Read the canonical fields off a ``ModelCapabilities`` instance into a dict."""
     out: dict[str, bool] = {}
     for name in CAPABILITIES:
         if not hasattr(instance, name):
-            raise ValueError(f"{caps_cls.__qualname__} is missing required capability field '{name}'.")
+            raise ValueError(f"{type(instance).__qualname__} is missing required capability field '{name}'.")
         out[name] = bool(getattr(instance, name))
     return out
