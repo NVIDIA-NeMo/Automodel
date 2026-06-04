@@ -135,7 +135,7 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
             module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
 
 
-def _run_context_parallel_attention(
+def _cp_sdpa(
     query,
     key,
     value,
@@ -149,7 +149,7 @@ def _run_context_parallel_attention(
     enable_gqa,
     kwargs,
 ):
-    """Run the classic PyTorch context_parallel attention path."""
+    """Run the classic PyTorch context_parallel SDPA path."""
     from torch.distributed.tensor import DTensor, Shard
 
     if not isinstance(query, DTensor):
@@ -174,16 +174,14 @@ def _run_context_parallel_attention(
 class _ManualAllGatherAttention:
     """Manual contiguous-shard CP attention for masks PyTorch CP cannot express."""
 
-    def __init__(self, cp_mesh, original_sdpa):
+    def __init__(self, cp_mesh):
         import logging
 
         self.cp_mesh = cp_mesh
         self.group = cp_mesh.get_group()
         self.size = cp_mesh.size()
-        self.original_sdpa = original_sdpa
         self.log = logging.getLogger(__name__)
         self._compiled_flex_attn = None
-        self._sdpa_ok_logged = False
         self._flex_ok_logged = False
 
         try:
@@ -288,31 +286,6 @@ class _ManualAllGatherAttention:
             padding_query_rows = padding_mask_full[:, q_indices]
             empty_query_rows = padding_query_rows if empty_query_rows is None else empty_query_rows | padding_query_rows
 
-        # SDPA is only used when manual all-gather attention has no mask to
-        # represent. Masked local-query/global-key attention stays on Flex so
-        # we do not materialize dense [B, H, Q, K] masks.
-        use_unmasked_sdpa = (
-            not is_causal
-            and sliding_window is None
-            and packed_seq_ids_full is None
-            and padding_mask_full is None
-            and not use_vision_bidirectional
-        )
-        if use_unmasked_sdpa:
-            return self._run_sdpa_allgather_attention(
-                query,
-                key_full,
-                value_full,
-                seq_local=seq_local,
-                seq_full=seq_full,
-                orig_head_dim=orig_head_dim,
-                cp_rank=cp_rank,
-                dropout_p=dropout_p,
-                scale=scale,
-                enable_gqa=enable_gqa,
-                kwargs=kwargs,
-            )
-
         return self._run_flex_allgather_attention(
             query,
             key_full,
@@ -331,43 +304,6 @@ class _ManualAllGatherAttention:
             scale=scale,
             enable_gqa=enable_gqa,
         )
-
-    def _run_sdpa_allgather_attention(
-        self,
-        query,
-        key_full,
-        value_full,
-        *,
-        seq_local,
-        seq_full,
-        orig_head_dim,
-        cp_rank,
-        dropout_p,
-        scale,
-        enable_gqa,
-        kwargs,
-    ):
-        out = self.original_sdpa(
-            query,
-            key_full,
-            value_full,
-            attn_mask=None,
-            dropout_p=dropout_p,
-            is_causal=False,
-            scale=scale,
-            enable_gqa=enable_gqa,
-            **kwargs,
-        )
-        if not self._sdpa_ok_logged:
-            self.log.info(
-                "CP using unmasked SDPA all-gather. Q=%s K=%s head_dim=%s cp_rank=%s",
-                tuple(query.shape),
-                tuple(key_full.shape),
-                orig_head_dim,
-                cp_rank,
-            )
-            self._sdpa_ok_logged = True
-        return out
 
     def _run_flex_allgather_attention(
         self,
@@ -496,7 +432,7 @@ class _ManualAllGatherAttention:
             return out
         except Exception as flex_err:
             raise RuntimeError(
-                "Manual CP all-gather requires FlexAttention for masked local-query/global-key attention. "
+                "Manual CP all-gather requires FlexAttention for local-query/global-key attention. "
                 f"FlexAttention failed for Q={tuple(query.shape)} K={tuple(key_full.shape)} "
                 f"V={tuple(value_full.shape)} cp_rank={cp_rank} seq_local={seq_local} seq_full={seq_full}."
             ) from flex_err
@@ -518,7 +454,7 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
     original_sdpa = F_module.scaled_dot_product_attention
     cp_size = cp_mesh.size()
     active_module = {"module": None}
-    manual_allgather_attention = _ManualAllGatherAttention(cp_mesh, original_sdpa)
+    manual_allgather_attention = _ManualAllGatherAttention(cp_mesh)
 
     @torch._dynamo.disable
     def cp_attention(
@@ -552,7 +488,7 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 kwargs=kwargs,
             )
 
-        return _run_context_parallel_attention(
+        return _cp_sdpa(
             query,
             key,
             value,
