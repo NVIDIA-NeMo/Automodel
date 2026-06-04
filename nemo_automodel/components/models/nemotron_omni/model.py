@@ -25,6 +25,7 @@ Architecture name: "NemotronH_Nano_Omni_Reasoning_V3" (from config.json)
 
 import logging
 import warnings
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -238,6 +239,15 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
     The LLM part reuses the nemotron_v3 implementation (NemotronHForCausalLM) which
     has custom DTensor parallelism for the Mamba+Attention hybrid MoE architecture.
     """
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = True
+        supports_pp: bool = False
+        supports_ep: bool = True
 
     @classmethod
     def from_config(

@@ -509,6 +509,15 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = True
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = False
+
     def __init__(self, config: Ministral3Config):
         super().__init__(config)
         self.model = Ministral3Model(config)

@@ -19,6 +19,8 @@ These classes subclass from DeepSeek V3, with the main difference being
 the use of DeepseekV32MLA (with Indexer) instead of the standard MLA.
 """
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 
@@ -140,6 +142,15 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
 
     Subclasses V3 ForCausalLM, using DeepseekV32Model and DeepSeekV32StateDictAdapter.
     """
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = True
 
     @classmethod
     def from_config(

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -210,6 +211,15 @@ class GptOssModel(nn.Module):
 
 
 class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = True
+
     @classmethod
     def from_config(
         cls,

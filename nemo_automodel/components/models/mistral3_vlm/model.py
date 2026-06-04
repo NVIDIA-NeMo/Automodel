@@ -31,6 +31,7 @@ Custom wrapper around HF's ``Mistral3ForConditionalGeneration`` that:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import torch
 from transformers import PretrainedConfig
@@ -113,6 +114,15 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
     # indefinitely (empirically verified: without this attribute the 4-layer
     # smoke never reaches the adapter load stage within 300s).
     _skip_init_weights_on_load = True
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     def __init__(self, config: PretrainedConfig):
         # HF's Mistral3ForConditionalGeneration.__init__ consults

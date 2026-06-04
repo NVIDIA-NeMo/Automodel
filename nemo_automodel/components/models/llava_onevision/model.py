@@ -26,6 +26,7 @@ In-memory tree:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -282,6 +283,15 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
     """LLaVA-OneVision-1.5 for conditional generation (Rice ViT + Qwen3 text)."""
 
     config_class = Llavaonevision1_5Config
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     @classmethod
     def from_config(cls, config, **kwargs):

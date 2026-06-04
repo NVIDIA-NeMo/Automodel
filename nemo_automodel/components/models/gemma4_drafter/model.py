@@ -20,6 +20,8 @@ in NeMo's distributed checkpointing pipeline and gives us a stable native class
 name for the model registry.
 """
 
+from dataclasses import dataclass
+
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 
@@ -52,6 +54,15 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
             * the architecture can be registered in NeMo's ``MODEL_ARCH_MAPPING``
               under a stable native class name.
         """
+
+        @dataclass(frozen=True)
+        class ModelCapabilities:
+            """Declared parallelism capabilities for this model class."""
+
+            supports_tp: bool = False
+            supports_cp: bool = False
+            supports_pp: bool = False
+            supports_ep: bool = False
 
         @classmethod
         def from_config(cls, config: Gemma4AssistantConfig, **kwargs):

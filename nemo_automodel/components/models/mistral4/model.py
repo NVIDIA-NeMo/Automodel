@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -294,6 +295,15 @@ class Mistral4Model(nn.Module):
 
 
 class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = True
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = True
+
     @classmethod
     def from_config(
         cls,
@@ -633,6 +643,15 @@ if _HF_MISTRAL3_AVAILABLE:
         Follows KimiK25VLForConditionalGeneration pattern: inherits from nn.Module
         (not HF PreTrainedModel) to avoid FSDP conflicts.
         """
+
+        @dataclass(frozen=True)
+        class ModelCapabilities:
+            """Declared parallelism capabilities for this model class."""
+
+            supports_tp: bool = True
+            supports_cp: bool = False
+            supports_pp: bool = True
+            supports_ep: bool = True
 
         @classmethod
         def supports_config(cls, config) -> bool:

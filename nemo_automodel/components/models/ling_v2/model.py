@@ -35,6 +35,7 @@ model:
 ```
 """
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -275,6 +276,15 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     # ``apply_rotary_emb`` with a tensor-shape mismatch at ``torch.cat``.
     # Setting this flag instructs the PP split to leave our forwards intact.
     _pp_keep_self_forward: bool = True
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = True
 
     @classmethod
     def from_config(

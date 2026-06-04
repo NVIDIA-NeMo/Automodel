@@ -229,6 +229,15 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     _is_stateful: bool = True
     main_input_name: str = "input_ids"
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = True
+        supports_pp: bool = False
+        supports_ep: bool = True
+
     @classmethod
     def from_config(
         cls,

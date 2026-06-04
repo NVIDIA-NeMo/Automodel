@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -400,6 +401,15 @@ class Step3p5ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Step3p5 model for causal language modeling."""
 
     _keep_in_fp32_modules = ["rotary_emb"]
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     @classmethod
     def from_config(
