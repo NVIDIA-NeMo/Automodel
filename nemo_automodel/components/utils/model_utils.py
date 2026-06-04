@@ -107,7 +107,7 @@ VLM_INPUT_KEYS: tuple[str, ...] = (
 )
 
 
-MULTIMODAL_MODULE_PATH_PARTS: frozenset[str] = frozenset(
+CP_NON_TEXT_MODULE_PATH_PARTS: frozenset[str] = frozenset(
     {
         "audio_encoder",
         "audio_model",
@@ -127,9 +127,9 @@ MULTIMODAL_MODULE_PATH_PARTS: frozenset[str] = frozenset(
 )
 
 
-def is_multimodal_module_path(name: str) -> bool:
-    """Return true if a dotted module path is inside a multimodal encoder/tower."""
-    return any(part in MULTIMODAL_MODULE_PATH_PARTS for part in name.split("."))
+def is_cp_non_text_module_path(name: str) -> bool:
+    """Return true if a module path should not receive text CP attention hooks."""
+    return any(part in CP_NON_TEXT_MODULE_PATH_PARTS for part in name.split("."))
 
 
 def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
