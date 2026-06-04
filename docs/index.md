@@ -28,7 +28,7 @@ content_type: index
 
 PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training; no checkpoint conversion and no boilerplate.
 
-**Quick links:** [🤗 HF Compatible](guides/huggingface-api-compatibility.md) | [🚀 Performance](performance-summary.md) | [📐 Scalability](about/key-features.md) | [🎯 SFT & PEFT](guides/llm/finetune.md) | [🎨 Diffusion](guides/diffusion/finetune.md) | [👁️ VLM](guides/vlm/gemma4.md) | [🌐 Omni](guides/omni/gemma3-3n.md) | [🌊 dLLM](guides/dllm/finetune.md)
+**Quick links:** [🤗 HF Compatible](guides/huggingface-api-compatibility.md) | [🚀 Performance](performance-summary.md) | [📐 Scalability](about/key-features.md) | [🎯 SFT and PEFT](guides/llm/finetune.md) | [🎨 Diffusion](guides/diffusion/finetune.md) | [👁️ VLM](guides/vlm/gemma4.md) | [🔀 dLLM](guides/dllm/finetune.md) | [🔊 Audio](guides/audio/qwen3-omni-asr.md) | [🧩 Omni](guides/omni/gemma3-3n.md) | [⚡ Speculative](guides/speculative/serve_with_sglang.md)
 
 ::::{grid} 2 2 2 2
 :gutter: 1 1 1 2
@@ -87,7 +87,7 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 | 2026-03-11 | LLM | [Nemotron Super v3](https://github.com/NVIDIA-NeMo/Automodel/discussions/976) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml)) |
 | 2026-03-03 | Diffusion | FLUX.1-dev ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml)) |
 
-## Recipes & Guides
+## Recipes and Guides
 
 Find the right guide for your task: fine-tuning, pretraining, distillation, diffusion, and more.
 

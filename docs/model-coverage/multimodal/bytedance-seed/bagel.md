@@ -31,6 +31,7 @@
 | Recipe | Dataset | Description |
 |---|---|---|
 | {download}`bagel_pretrain.yaml <../../../../examples/multimodal_pretrain/bagel/bagel_pretrain.yaml>` | BAGEL-style packed multimodal data | Joint text-understanding and image-generation pretraining |
+| {download}`bagel_sft.yaml <../../../../examples/multimodal_finetune/bagel/bagel_sft.yaml>` | BAGEL-style packed multimodal data | Joint understanding + generation fine-tuning |
 
 ## Try with NeMo AutoModel
 

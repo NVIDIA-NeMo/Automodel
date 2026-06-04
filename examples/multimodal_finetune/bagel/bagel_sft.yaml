@@ -28,7 +28,9 @@ model:
   torch_dtype: float32
   stage: 2
   # Optional override. If omitted, the recipe uses ae.safetensors from the
-  # local checkpoint directory or downloads it from the same HF repo.
+  # local checkpoint directory or downloads it from the same HF repo. When
+  # checkpointing is enabled, ae.safetensors is copied into each checkpoint
+  # directory as a sidecar.
   # vae_path: /path/to/ae.safetensors
   # max_latent_size: 64
 

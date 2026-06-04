@@ -36,6 +36,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import random
+import shutil
 import time
 import warnings
 from typing import Any, Dict, List, Optional
@@ -312,6 +313,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         self._last_tokens_per_sec = 0.0
         self._last_train_steps_per_sec = 0.0
         self._last_tokens_per_step = 0.0
+        self._vae_path: str | None = None
         self.vae_encode_micro_batch_size = int(cfg.get("model.vae_encode_micro_batch_size", 0) or 0)
         if self.vae_encode_micro_batch_size < 0:
             raise ValueError("model.vae_encode_micro_batch_size must be >= 0")
@@ -470,6 +472,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             vae_path = _resolve_bagel_vae_path(artifact_path, self.cfg.get("model.vae_path", None))
             logger.info("Loading VAE from %s ...", vae_path)
             vae_model, vae_params = _load_bagel_vae(vae_path)
+            self._vae_path = vae_path
             for p in vae_model.parameters():
                 p.requires_grad = False
             self.vae_model = vae_model.to(self.dist_env.device).eval()
@@ -1001,6 +1004,49 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     # Main loop. Full-model checkpointing is controlled by ``ckpt_every_steps``
     # in the YAML.
     # ------------------------------------------------------------------
+    def _copy_vae_sidecar_to_checkpoint(self, checkpoint_path: pathlib.Path) -> None:
+        if int(getattr(self, "stage", 1)) != 2 or self._vae_path is None:
+            return
+
+        is_dist_initialized = dist.is_initialized()
+        is_rank_0 = not is_dist_initialized or dist.get_rank() == 0
+        if not is_rank_0:
+            return
+
+        src = pathlib.Path(self._vae_path)
+        dst = checkpoint_path / "ae.safetensors"
+        try:
+            if not src.is_file():
+                raise FileNotFoundError(src)
+            shutil.copy2(src, dst)
+            logger.info("Copied BAGEL VAE sidecar to %s", dst)
+        except OSError:
+            logger.warning(
+                "Failed to copy BAGEL VAE sidecar from %s to %s; the checkpoint still requires "
+                "the configured VAE source or HF repo to restore Stage 2 generation.",
+                src,
+                dst,
+                exc_info=True,
+            )
+
+    def save_checkpoint(
+        self,
+        epoch: int,
+        step: int,
+        train_loss: float,
+        val_loss: Optional[Dict[str, float]] = None,
+        best_metric_key: str = "default",
+    ) -> None:
+        """Save BAGEL state and include the frozen VAE as a checkpoint sidecar."""
+        if self.checkpointer is None or not self.checkpointer.config.enabled:
+            return
+
+        super().save_checkpoint(epoch, step, train_loss, val_loss, best_metric_key)
+        checkpoint_path = pathlib.Path(self.checkpointer.config.checkpoint_dir) / f"epoch_{epoch}_step_{step}"
+        self._copy_vae_sidecar_to_checkpoint(checkpoint_path)
+        if dist.is_initialized():
+            dist.barrier()
+
     def run_train_validation_loop(self):
         """BAGEL training loop — no validation, optional periodic checkpoint."""
         self.model.train()
