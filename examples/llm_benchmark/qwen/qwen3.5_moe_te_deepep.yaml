@@ -70,7 +70,12 @@ model:
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3.5-35B-A3B
+    text_config:
+      # Keep standard benchmarking MTP-free by default. Set to 1 to enable
+      # Qwen3.5-MoE MTP training with the auxiliary loss below.
+      num_nextn_predict_layers: 0
   trust_remote_code: true
+  mtp_loss_scaling_factor: 0.1
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
