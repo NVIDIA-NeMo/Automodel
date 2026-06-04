@@ -181,7 +181,12 @@ class DFlashTrainerModule(nn.Module):
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
         valid_counts = valid.sum(dim=1)
-        max_n = min(self.num_anchors, int(valid_counts.max().item()) - 1)
+        # ``valid`` already restricts positions to ``[0, seq_len - block_size]``, so
+        # every valid position has room for a full block and is a legitimate anchor.
+        # Draw up to the richest sample's valid count (per-sample padding is handled
+        # by ``keep_mask`` below); no -1, which would spuriously raise when the
+        # richest sample has exactly one valid anchor and always drop one otherwise.
+        max_n = min(self.num_anchors, int(valid_counts.max().item()))
         if max_n <= 0:
             raise NoValidAnchorsError(
                 "No valid anchor positions in this batch; every sample has fewer than "

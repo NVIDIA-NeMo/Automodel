@@ -521,6 +521,7 @@ class TrainDFlashRecipe(BaseRecipe):
 
             running_loss = 0.0
             running_acc = 0.0
+            running_micro = 0
             epoch_loss = 0.0
             micro_step = 0
             pending_micro_batches = 0
@@ -560,6 +561,7 @@ class TrainDFlashRecipe(BaseRecipe):
 
                 running_loss += metrics.loss.detach().item()
                 running_acc += metrics.accuracy.detach().item()
+                running_micro += 1
                 epoch_loss += metrics.loss.detach().item()
                 micro_step += 1
                 pending_micro_batches += 1
@@ -575,16 +577,21 @@ class TrainDFlashRecipe(BaseRecipe):
                     self._maybe_save_step_checkpoint(epoch_idx)
 
                     if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
+                        # Average over the micro-batches accumulated since the last
+                        # log, not over optimizer steps: with grad_accumulation_steps>1
+                        # (or skipped short micro-batches) the two differ, and dividing
+                        # by log_every_steps would inflate the reported loss/acc.
                         logger.info(
                             "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
                             epoch_idx,
                             self.runtime.global_step,
-                            running_loss / self.log_every_steps,
-                            running_acc / self.log_every_steps,
+                            running_loss / max(1, running_micro),
+                            running_acc / max(1, running_micro),
                             self.lr_scheduler.get_last_lr()[0],
                         )
                         running_loss = 0.0
                         running_acc = 0.0
+                        running_micro = 0
 
             # Flush the trailing partial accumulation window (see EAGLE recipes
             # for the rescale rationale).
