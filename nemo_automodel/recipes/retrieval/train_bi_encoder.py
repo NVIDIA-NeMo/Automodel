@@ -32,7 +32,7 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sy
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
+from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.recipes._dist_setup import setup_distributed
@@ -283,7 +283,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.optimizer = [self.cfg.get("optimizer").instantiate(params=param_groups)]
         warn_if_torch_adam_with_bf16_params(
             optimizer=self.optimizer,
-            optimizer_cfg=self.cfg.optimizer,
             is_peft=self.peft_config is not None,
             context="retrieval",
             logger=logger,

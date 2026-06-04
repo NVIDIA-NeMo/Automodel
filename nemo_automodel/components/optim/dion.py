@@ -16,12 +16,20 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional, Protocol
 
 import torch.nn as nn
 
-if TYPE_CHECKING:
-    from nemo_automodel.components.optim.optimizer import OptimizerConfig
+
+class _DionFamilyConfig(Protocol):
+    """Structural type for the dion-family optimizer configs build_dion_optimizer reads."""
+
+    lr: float
+    weight_decay: float
+    scalar_opt: str
+    scalar_betas: tuple[float, float]
+    scalar_eps: float
+
 
 _import_error: Exception | None = None
 try:
@@ -151,7 +159,7 @@ def _get_dion_mesh(device_mesh: Any) -> Any:
 
 
 def build_dion_optimizer(
-    config: "OptimizerConfig",
+    config: "_DionFamilyConfig",
     model: nn.Module,
     *,
     device_mesh: Optional[Any] = None,
@@ -174,7 +182,7 @@ def build_dion_optimizer(
     ``no_compile``.
 
     Args:
-        config: The dion-family :class:`OptimizerConfig` to read settings from.
+        config: The dion-family config (see :class:`_DionFamilyConfig`) to read settings from.
         model: Model whose parameters are to be optimized.
         device_mesh: Optional DeviceMesh for FSDP/TP. When non-empty it is
             resolved to a 1-D Dion submesh.

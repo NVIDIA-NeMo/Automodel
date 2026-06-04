@@ -254,10 +254,9 @@ def _dion_test_model():
 
 class TestDionFamilyConfigs:
     """The dion-family configs share a per-part Dion ``build`` (``_DionConfigBase``)
-    that runs ``build_dion_optimizer`` grouping, strips grouping-only kwargs before
-    the dion constructor, and rejects Megatron-FSDP sharding.  They resolve from the
-    registry by name and from a resolved ``dion.*`` class via ``_target_``.
-    Construction tests ``importorskip`` ``dion``."""
+    that runs ``build_dion_optimizer`` grouping and strips grouping-only kwargs before
+    the dion constructor.  They resolve from the registry by name and from a resolved
+    ``dion.*`` class via ``_target_``.  Construction tests ``importorskip`` ``dion``."""
 
     def test_registry_resolves_to_config_types(self):
         from nemo_automodel.components.optim.optimizer import (
@@ -323,18 +322,6 @@ class TestDionFamilyConfigs:
         }[cls_name]
         opt = cfg_cls(lr=5e-4).build(_dion_test_model())[0]
         assert type(opt).__name__ == cls_name
-
-    def test_megatron_fsdp_sharding_rejected(self, monkeypatch):
-        # Dion is incompatible with Megatron-FSDP optimizer sharding -> build asserts,
-        # rather than silently returning an unsharded optimizer.
-        pytest.importorskip("dion")
-        import nemo_automodel.components.distributed.megatron_fsdp as mfsdp
-        from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPConfig
-        from nemo_automodel.components.optim.optimizer import MuonConfig
-
-        monkeypatch.setattr(mfsdp.dist, "get_world_size", lambda *a, **k: 2)
-        with pytest.raises(AssertionError):
-            MuonConfig(lr=5e-4).build(_dion_test_model(), distributed_config=MegatronFSDPConfig())
 
 
 # ---------------------------------------------------------------------------

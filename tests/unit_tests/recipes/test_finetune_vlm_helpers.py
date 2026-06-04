@@ -45,9 +45,7 @@ from nemo_automodel.recipes.vlm.finetune import (
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
     """Resolve a YAML optimizer block and build it (mirrors ``RecipeConfig.optimizer.build``)."""
-    return build_optimizer_config(*_callable_and_kwargs(cfg_opt)).build(
-        model, distributed_config=distributed_config, device_mesh=device_mesh
-    )
+    return build_optimizer_config(*_callable_and_kwargs(cfg_opt)).build(model, device_mesh=device_mesh)
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):

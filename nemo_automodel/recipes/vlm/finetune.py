@@ -68,7 +68,6 @@ from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
-from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
@@ -79,7 +78,7 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_setup import setup_distributed, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -630,14 +629,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             activation_checkpointing=self.dist_setup.activation_checkpointing,
         )
         self.optimizer = self.cfg.optimizer.build(
-            model, distributed_config=self.distributed_config, device_mesh=self.device_mesh
+            model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None
         )
-        warn_if_torch_adam_with_bf16_params(
-            optimizer=self.optimizer,
-            optimizer_cfg=self.cfg.optimizer,
-            is_peft=self.peft_config is not None,
-            context="vlm",
-            logger=logger,
+        self.optimizer = shard_optimizers_for_megatron_fsdp(
+            model, self.optimizer, self.distributed_config, allow=self.cfg.optimizer.supports_megatron_fsdp_sharding
         )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):

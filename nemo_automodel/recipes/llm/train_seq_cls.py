@@ -28,12 +28,11 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_setup import setup_distributed, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
@@ -111,14 +110,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
         self.optimizer = self.cfg.optimizer.build(
-            model, distributed_config=self.distributed_config, device_mesh=self.device_mesh
+            model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None
         )
-        warn_if_torch_adam_with_bf16_params(
-            optimizer=self.optimizer,
-            optimizer_cfg=self.cfg.optimizer,
-            is_peft=self.peft_config is not None,
-            context="llm",
-            logger=logger,
+        self.optimizer = shard_optimizers_for_megatron_fsdp(
+            model, self.optimizer, self.distributed_config, allow=self.cfg.optimizer.supports_megatron_fsdp_sharding
         )
 
         self.model_parts = [model]
