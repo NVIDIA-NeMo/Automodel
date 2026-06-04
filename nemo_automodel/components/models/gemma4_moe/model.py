@@ -75,6 +75,7 @@ except (ModuleNotFoundError, ImportError, AttributeError):
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -644,6 +645,8 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     ) -> None:
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
+            for p in self.parameters():
+                p.data = p.data.to(dtype)
             return
 
         # Guard: HF's super().__init__() calls post_init() -> init_weights() ->

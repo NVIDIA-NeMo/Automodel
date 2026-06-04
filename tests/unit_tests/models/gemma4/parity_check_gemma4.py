@@ -19,7 +19,7 @@ transformers, runs the same text-only token sequence through both, and checks
 that max |logit diff| is within --atol.
 
 Usage (single GPU, text-only):
-    python examples/vlm_finetune/gemma4/parity_check_gemma4.py \
+    python tests/unit_tests/models/gemma4/parity_check_gemma4.py \
         --hf-dir path/to/gemma-4-E4B-it/model \
         --atol 0.01
 
