@@ -26,6 +26,7 @@ parallelizer file stays small.
 """
 
 import logging
+import os
 from typing import List
 
 import torch
@@ -35,8 +36,6 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
-
-from nemo_automodel.components.distributed.parallelizer_utils import maybe_trace_selective_ac_decision
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +187,39 @@ def _is_cuda_to_cpu_copy(func, args, kwargs) -> bool:
     return getattr(src_device, "type", None) == "cuda" and target_device.type == "cpu"
 
 
+# Opt-in diagnostics: set NEMO_SELECTIVE_AC_TRACE=1 to log, once per unique op,
+# whether selective AC saves or recomputes it. Useful for confirming that a
+# model's expensive ops (e.g. expert grouped-GEMMs, comm collectives) are
+# actually saved rather than silently recomputed.
+_SELECTIVE_AC_TRACE = os.environ.get("NEMO_SELECTIVE_AC_TRACE", "0").lower() not in ("0", "", "false", "no")
+_SELECTIVE_AC_TRACE_SEEN: set[str] = set()
+
+
+def _maybe_trace_selective_ac_decision(func, decision, is_alternating: bool, *, is_recompute: bool) -> None:
+    """Log a selective-AC decision once per op (no-op unless tracing is enabled).
+
+    Args:
+        func: The op the policy was queried about.
+        decision: The ``CheckpointPolicy`` the policy returned for ``func``.
+        is_alternating: Whether ``func`` is an alternating-save matmul op.
+        is_recompute: Whether the policy was queried during the recompute pass;
+            decisions are only logged on the forward pass to avoid duplicates.
+    """
+    if not _SELECTIVE_AC_TRACE or is_recompute:
+        return
+    key = str(func)
+    if key in _SELECTIVE_AC_TRACE_SEEN:
+        return
+    _SELECTIVE_AC_TRACE_SEEN.add(key)
+    if is_alternating:
+        verdict = "ALTERNATE (save/recompute every other call)"
+    elif decision == CheckpointPolicy.MUST_SAVE:
+        verdict = "SAVE"
+    else:
+        verdict = "RECOMPUTE"
+    logger.info("[selective-ac] %s -> %s", key, verdict)
+
+
 def make_selective_checkpoint_context_fn():
     """Build a TorchTitan-style selective activation checkpointing context."""
 
@@ -213,7 +245,7 @@ def make_selective_checkpoint_context_fn():
                 decision = CheckpointPolicy.MUST_SAVE
             else:
                 decision = CheckpointPolicy.PREFER_RECOMPUTE
-            maybe_trace_selective_ac_decision(func, decision, is_alternating, is_recompute=ctx.is_recompute)
+            _maybe_trace_selective_ac_decision(func, decision, is_alternating, is_recompute=ctx.is_recompute)
             return decision
 
         return create_selective_checkpoint_contexts(selective_checkpointing_policy)

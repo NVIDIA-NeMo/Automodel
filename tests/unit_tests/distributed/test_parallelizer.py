@@ -1832,25 +1832,25 @@ class TestSelectiveCheckpointSaveOps:
 
         from torch.utils.checkpoint import CheckpointPolicy
 
-        import nemo_automodel.components.distributed.parallelizer_utils as U
+        import nemo_automodel.components.distributed.activation_checkpointing as ac
 
-        U._SELECTIVE_AC_TRACE_SEEN.clear()
-        with patch.object(U, "_SELECTIVE_AC_TRACE", True):
-            with caplog.at_level(_logging.INFO, logger=U.__name__):
-                U.maybe_trace_selective_ac_decision(
+        ac._SELECTIVE_AC_TRACE_SEEN.clear()
+        with patch.object(ac, "_SELECTIVE_AC_TRACE", True):
+            with caplog.at_level(_logging.INFO, logger=ac.__name__):
+                ac._maybe_trace_selective_ac_decision(
                     torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE, True, is_recompute=False
                 )
                 # Duplicate of the same op must not log a second time.
-                U.maybe_trace_selective_ac_decision(
+                ac._maybe_trace_selective_ac_decision(
                     torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE, True, is_recompute=False
                 )
-                U.maybe_trace_selective_ac_decision(
+                ac._maybe_trace_selective_ac_decision(
                     torch.ops._c10d_functional.all_to_all_single.default,
                     CheckpointPolicy.MUST_SAVE,
                     False,
                     is_recompute=False,
                 )
-                U.maybe_trace_selective_ac_decision(
+                ac._maybe_trace_selective_ac_decision(
                     torch.ops.aten.add.Tensor, CheckpointPolicy.PREFER_RECOMPUTE, False, is_recompute=False
                 )
 
