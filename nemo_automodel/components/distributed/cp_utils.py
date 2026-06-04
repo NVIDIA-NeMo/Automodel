@@ -19,13 +19,35 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
-from nemo_automodel.components.utils.model_utils import is_cp_non_text_module_path
+
+_CP_NON_TEXT_MODULE_PATH_PARTS: frozenset[str] = frozenset(
+    {
+        "audio_encoder",
+        "audio_model",
+        "audio_tower",
+        "image_encoder",
+        "image_model",
+        "image_tower",
+        "video_encoder",
+        "video_model",
+        "video_tower",
+        "vision_encoder",
+        "vision_model",
+        "vision_tower",
+        "visual",
+        "visual_model",
+    }
+)
+
+
+def _is_cp_non_text_module_path(name: str) -> bool:
+    return any(part in _CP_NON_TEXT_MODULE_PATH_PARTS for part in name.split("."))
 
 
 def _is_cp_attention_module_name(name: str) -> bool:
     if not name.endswith("self_attn"):
         return False
-    return not is_cp_non_text_module_path(name)
+    return not _is_cp_non_text_module_path(name)
 
 
 def _build_position_ids(batch, device):
