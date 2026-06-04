@@ -109,10 +109,22 @@ from nemo_automodel.components.speculative.eagle.peagle_attention import create_
 from nemo_automodel.shared.import_utils import safe_import_from
 
 logger = logging.getLogger(__name__)
-_peagle_flex_attention = torch.compile(
+
+# flex_attention compiled for the CUDA training path. Inductor's flex backend is
+# not available on CPU (it raises ``InductorError``), so ``_peagle_flex_attention``
+# dispatches to eager ``flex_attention`` there -- correct, just slower -- which
+# keeps the P-EAGLE unit tests and CPU smoke checks runnable. The compiled
+# callable is lazy, so importing this module on CPU costs nothing.
+_peagle_flex_attention_compiled = torch.compile(
     flex_attention,
     mode="max-autotune-no-cudagraphs",
 )
+
+
+def _peagle_flex_attention(q, k, v, *, block_mask, scale):
+    """Run the P-EAGLE flex attention, compiling only on CUDA."""
+    flex = _peagle_flex_attention_compiled if q.is_cuda else flex_attention
+    return flex(q, k, v, block_mask=block_mask, scale=scale)
 
 
 def _load_flash_attn_func() -> tuple[bool, object | None]:

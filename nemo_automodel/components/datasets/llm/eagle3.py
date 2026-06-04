@@ -147,18 +147,21 @@ def build_eagle3_token_mapping(
 
     counts = torch.zeros(target_vocab_size, dtype=torch.long)
     total_supervised_tokens = 0
+    # Drive the progress bar manually and iterate ``dataloader`` directly: wrapping
+    # the loader in ``tqdm(dataloader)`` triggers a second ``__iter__`` on loaders
+    # without ``__len__``, which would double-scan a single-pass / streaming loader.
     progress = tqdm(
-        dataloader,
         total=total_batches,
         desc=f"Counting supervised tokens for draft vocab ({draft_vocab_size})",
         unit="batch",
         disable=not is_rank0,
         leave=True,
     )
-    for step, batch in enumerate(progress):
+    for step, batch in enumerate(dataloader):
         input_ids = batch["input_ids"]
         loss_mask = batch["loss_mask"].bool()
         supervised_ids = input_ids[loss_mask].to(torch.long).flatten()
+        progress.update(1)
         if supervised_ids.numel() == 0:
             continue
         in_range = (supervised_ids >= 0) & (supervised_ids < target_vocab_size)
@@ -167,6 +170,7 @@ def build_eagle3_token_mapping(
         if is_rank0 and step % 100 == 0:
             progress.set_postfix(tokens=total_supervised_tokens)
         counts.scatter_add_(0, supervised_ids, torch.ones_like(supervised_ids))
+    progress.close()
 
     if distributed:
         # NCCL collectives require CUDA tensors; move counts onto the current
