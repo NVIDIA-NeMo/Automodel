@@ -19,6 +19,9 @@ navigation:
       - page: "Repository Structure"
         path: ./v0.4/pages/repository-structure.mdx
         slug: repo-structure
+      - page: "Release Notes"
+        path: ./v0.4/pages/release-notes.mdx
+        slug: release-notes
   - section: "Announcements"
     contents:
       - page: "Announcements"
@@ -57,6 +60,8 @@ navigation:
             path: ./v0.4/pages/model-coverage/llm/qwen/qwen3-moe.mdx
           - page: "Qwen3-Next"
             path: ./v0.4/pages/model-coverage/llm/qwen/qwen3-next.mdx
+          - page: "ERNIE 4.5"
+            path: ./v0.4/pages/model-coverage/llm/baidu/ernie4-5.mdx
           - page: "DeepSeek"
             path: ./v0.4/pages/model-coverage/llm/deepseek-ai/deepseek.mdx
           - page: "DeepSeek-V3"
@@ -149,6 +154,12 @@ navigation:
             path: ./v0.4/pages/model-coverage/llm/parasail-ai/gritlm.mdx
           - page: "Hy3-preview"
             path: ./v0.4/pages/model-coverage/llm/tencent/hy3.mdx
+          - page: "Hy-MT2"
+            path: ./v0.4/pages/model-coverage/llm/tencent/hy-mt2.mdx
+          - page: "MiMo-V2-Flash"
+            path: ./v0.4/pages/model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
+          - page: "Ling 2.0"
+            path: ./v0.4/pages/model-coverage/llm/inclusionai/ling-2.mdx
       - section: "Vision Language Models (VLMs)"
         slug: vision-language-models
         contents:
@@ -222,12 +233,18 @@ navigation:
       - page: "Function Calling with NeMo AutoModel using FunctionGemma"
         path: ./v0.4/pages/guides/llm/toolcalling.mdx
         slug: function-calling
+      - page: "Multi-Turn Agent (Tool-Calling) SFT with NeMo AutoModel"
+        path: ./v0.4/pages/guides/llm/agent-sft.mdx
+        slug: agent-sft
       - page: "Knowledge Distillation with NeMo AutoModel"
         path: ./v0.4/pages/guides/llm/knowledge-distillation.mdx
         slug: knowledge-distillation
       - page: "Fine-Tune Large MoE LLMs"
         path: ./v0.4/pages/guides/llm/large-moe-finetune.mdx
         slug: large-moe-fine-tuning
+      - page: "Fine-Tune Nemotron-3-Ultra-550B"
+        path: ./v0.4/pages/guides/llm/nemotron-3-ultra.mdx
+        slug: nemotron-3-ultra
       - page: "DeepSeek V4 Flash"
         path: ./v0.4/pages/guides/llm/dsv4-flash.mdx
         slug: deepseek-v4-flash
@@ -261,6 +278,9 @@ navigation:
       - page: "Diffusion Model Fine-Tuning with NeMo AutoModel"
         path: ./v0.4/pages/guides/diffusion/finetune.mdx
         slug: diffusion-fine-tuning
+      - page: "Train an EAGLE Drafter for Speculative Decoding"
+        path: ./v0.4/pages/guides/speculative/eagle.mdx
+        slug: eagle-speculative-decoding
       - page: "dLLM Fine-Tuning"
         path: ./v0.4/pages/guides/dllm/finetune.mdx
         slug: dllm-fine-tuning
@@ -304,7 +324,7 @@ navigation:
       - page: "Run on a Cluster"
         path: ./v0.4/pages/launcher/slurm.mdx
         slug: slurm-cluster
-      - page: "Run with NeMo-Run"
+      - page: "Run with NeMo Run"
         path: ./v0.4/pages/launcher/nemo-run.mdx
         slug: nemo-run
       - page: "Run on Any Cloud with SkyPilot"
@@ -327,6 +347,9 @@ navigation:
       - page: "FP8 Training in NeMo AutoModel"
         path: ./v0.4/pages/guides/fp8-training.mdx
         slug: fp8-training
+      - page: "Mixed-Precision Training"
+        path: ./v0.4/pages/guides/mixed-precision-training.mdx
+        slug: mixed-precision-training
       - page: "MLflow Logging in NeMo AutoModel"
         path: ./v0.4/pages/guides/mlflow-logging.mdx
         slug: mlflow-logging
