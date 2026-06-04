@@ -5,9 +5,9 @@ description: "End-to-end LoRA PEFT fine-tuning of Nemotron-3-Ultra-550B on Hella
 
 ## Introduction
 
-[nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16) is a frontier-scale large language model (LLM) trained by NVIDIA, designed to deliver strong agentic, reasoning, and conversational capabilities. It is optimized for the most demanding workloads, including complex multi-step agents, long-context analysis, and high-accuracy reasoning over code, math, and science. Like other models in the family, it responds to user queries and tasks by first generating a reasoning trace and then concluding with a final response. The model's reasoning capabilities can be configured through a flag in the chat template.
+[nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16) is a large language model (LLM) trained by NVIDIA with agentic, reasoning, and conversational capabilities. It supports multi-step agents, long-context analysis, and reasoning over code, math, and science. Like other models in the family, it responds to user queries and tasks by first generating a reasoning trace and then concluding with a final response. The model's reasoning capabilities can be configured through a flag in the chat template.
 
-The model employs a hybrid Latent Mixture-of-Experts (LatentMoE) architecture, utilizing interleaved Mamba-2 and MoE layers, along with select Attention layers. Like the Super model, the Ultra model incorporates Multi-Token Prediction (MTP) layers for faster text generation and improved quality, and it is trained using an NVFP4 pre-training recipe to maximize compute efficiency. The model has 55B active parameters and 550B parameters in total.
+The model employs a hybrid Latent Mixture-of-Experts (LatentMoE) architecture, using interleaved Mamba-2 and MoE layers, along with select Attention layers. Like the Super model, the Ultra model incorporates Multi-Token Prediction (MTP) layers for faster text generation and improved quality. It is also trained using an NVFP4 pre-training recipe to maximize compute efficiency. The model has 55B active parameters and 550B parameters in total.
 
 This guide walks you through fine-tuning Nemotron-3-Ultra on HellaSwag using NVIDIA NeMo AutoModel. You will learn how to configure the recipe, launch training, and inspect the results.
 
@@ -17,19 +17,19 @@ To set up your environment to run NeMo AutoModel, follow the [installation guide
 
 ### HellaSwag
 
-We use [HellaSwag](https://huggingface.co/datasets/Rowan/hellaswag), a commonsense natural-language-inference dataset consisting of context + four candidate continuations. The version used here is the standard `rowan/hellaswag` HuggingFace split, formatted for next-token-prediction fine-tuning.
+We use [HellaSwag](https://huggingface.co/datasets/Rowan/hellaswag), a commonsense natural-language-inference dataset consisting of context + four candidate continuations. This guide uses the standard `rowan/hellaswag` Hugging Face split, formatted for next-token-prediction fine-tuning.
 
-- **Train / validation splits** taken directly from the HuggingFace dataset.
+- **Train and validation splits**: taken directly from the Hugging Face dataset.
 - **Tokenizer**: shared with the base model (instantiated from the Nemotron-3-Ultra checkpoint's config).
-- **Sequence packing**: THD packing with `packed_sequence_size=2048` (`packing_strategy: thd`) via the packed-sequence THD collater. Validation uses the same THD collater, so the whole run stays on the packed `(1, T)` path used by the Transformer Engine attention backend.
+- **Sequence packing**: THD packing with `packed_sequence_size=2048` (`packing_strategy: thd`) using the packed-sequence THD collater. Validation uses the same THD collater, so the whole run stays on the packed `(1, T)` path used by the Transformer Engine attention backend.
 
-For the full HellaSwag dataset wrapper used in NeMo AutoModel, see [`nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/hellaswag.py).
+For the full HellaSwag dataset wrapper used in NeMo AutoModel, refer to [`nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/hellaswag.py).
 
 ## Launch Training
 
 A ready-to-use PEFT (LoRA) recipe ships at [`examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft_gb200.yaml), validated on 4 × GB200 (16 GPUs). An H100-oriented variant — same recipe, `deepep` dispatcher and `ep_size: 32` for a 4 × 8 H100 allocation — ships at [`examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml).
 
-NeMo AutoModel supports several ways to launch training — via the AutoModel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](/launcher/slurm) guide.
+NeMo AutoModel supports several ways to launch training — through the AutoModel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, and so on), refer to the [Run on a Cluster](/launcher/slurm) guide.
 
 ### Standalone Slurm Script
 
@@ -40,7 +40,7 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel && git checkout main && git pull
 ```
 
-The Slurm script below is the one used to fine-tune Nemotron-3-Ultra on 4 × GB200 (16 GPUs). It drives `torchrun` from inside an `srun` step that rendezvouses on the first allocated node and forwards the per-node rank. Fill in the `<...>` placeholders (account, credentials, paths), point the `/opt/Automodel` mount at the clone above, then `sbatch` it:
+The Slurm script below fine-tunes Nemotron-3-Ultra on 4 × GB200 (16 GPUs). It drives `torchrun` from inside an `srun` step that rendezvouses on the first allocated node and forwards the per-node rank. Fill in the `<...>` placeholders (account, credentials, paths), point the `/opt/Automodel` mount at the clone above, then `sbatch` it:
 
 ```bash
 #!/bin/bash
@@ -102,6 +102,6 @@ srun \
 
 ## Training Results
 
-The recipe was validated with LoRA PEFT on HellaSwag on a 4 × GB200 (16-GPU) allocation, using the hybrid Mamba-2 / MoE Ultra backbone with MTP and Transformer Engine kernels. Training loss decreased steadily over the run (≈2.67 → ≈1.6), confirming healthy convergence end-to-end through model load, THD-packed data, FSDP2 + expert parallelism, and safetensors checkpointing.
+We validated the recipe with LoRA PEFT on HellaSwag on a 4 × GB200 (16-GPU) allocation, using the hybrid Mamba-2 and MoE Ultra backbone with MTP and Transformer Engine kernels. Training loss decreased steadily over the run (≈2.67 → ≈1.6), confirming healthy convergence end-to-end through model load, THD-packed data, FSDP2 + expert parallelism, and safetensors checkpointing.
 
 <img src="./nemotron_ultra_loss.png" alt="Nemotron-3 Ultra Training Loss Curve" />
