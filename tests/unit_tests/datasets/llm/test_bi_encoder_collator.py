@@ -299,22 +299,3 @@ def test_vision_biencoder_collator_requires_callable_processor_method():
 
     with pytest.raises(ValueError, match="callable process_queries_documents_biencoder"):
         rc.VisionBiEncoderCollator(processor=processor)
-
-
-def test_legacy_processor_method_factory_accepts_tokenizer_keyword():
-    processor = FakeVisionProcessor()
-    collator = rc.make_vision_collator_from_processor_method(tokenizer=processor, sentinel="legacy")
-    batch = _make_batch(num_examples=1, docs_per_example=1)
-
-    out = collator(batch)
-
-    assert out["sentinel"] == "legacy"
-    assert processor.calls == [(batch, {"sentinel": "legacy"})]
-
-
-def test_legacy_processor_method_factory_rejects_different_processor_and_tokenizer():
-    with pytest.raises(ValueError, match="either processor or tokenizer"):
-        rc.make_vision_collator_from_processor_method(
-            processor=FakeVisionProcessor(),
-            tokenizer=FakeVisionProcessor(),
-        )

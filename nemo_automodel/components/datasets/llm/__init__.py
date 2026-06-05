@@ -26,7 +26,6 @@ from .retrieval_collator import (  # noqa: F401
     BiEncoderCollator,
     CrossEncoderCollator,
     VisionBiEncoderCollator,
-    make_vision_collator_from_processor_method,
 )
 from .retrieval_dataset import make_retrieval_dataset  # noqa: F401
 from .squad import make_squad_dataset  # noqa: F401
@@ -41,7 +40,6 @@ __all__ = [
     "BiEncoderCollator",
     "CrossEncoderCollator",
     "VisionBiEncoderCollator",
-    "make_vision_collator_from_processor_method",
     "ColumnMappedTextInstructionDataset",
     "ColumnMappedTextInstructionIterableDataset",
     "ChatDataset",

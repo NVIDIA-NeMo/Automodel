@@ -16,7 +16,7 @@ import hashlib
 from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 import torch
-from transformers import AutoConfig, AutoProcessor, DataCollatorWithPadding, PreTrainedTokenizerBase
+from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase
 from transformers.file_utils import PaddingStrategy
 
 
@@ -351,66 +351,3 @@ class VisionBiEncoderCollator:
                 dtype=torch.long,
             )
         return batch_dict
-
-
-class ProcessorMethodCollator:
-    """Compatibility adapter that turns a named processor method into a collator.
-
-    Prefer ``VisionBiEncoderCollator`` for new configs.
-    """
-
-    def __init__(self, processor: Any, collator_fn_name: str, **processor_kwargs) -> None:
-        if not hasattr(processor, collator_fn_name):
-            raise ValueError(f"processor does not implement {collator_fn_name}")
-        collator_fn = getattr(processor, collator_fn_name)
-        if not callable(collator_fn):
-            raise ValueError(f"processor attribute {collator_fn_name} is not callable")
-        self.collator_fn = collator_fn
-        self.processor_kwargs = processor_kwargs
-
-    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
-        return self.collator_fn(features, **self.processor_kwargs)
-
-
-def make_vision_collator_from_processor_method(
-    processor: Any = None,
-    tokenizer: Any = None,
-    collator_fn_name: str = "process_queries_documents_biencoder",
-    **processor_kwargs,
-) -> ProcessorMethodCollator:
-    """Return a collator that delegates to a named processor method.
-
-    This keeps older PR configs working where the recipe injected a processor
-    under the keyword ``tokenizer``. New configs should use
-    ``VisionBiEncoderCollator`` with a ``processor:`` recipe section.
-    """
-    if processor is not None and tokenizer is not None and processor is not tokenizer:
-        raise ValueError("Specify either processor or tokenizer, not both")
-    processor = processor if processor is not None else tokenizer
-    if processor is None:
-        raise ValueError("processor is required")
-    return ProcessorMethodCollator(processor, collator_fn_name, **processor_kwargs)
-
-
-# Deprecated: To be replaced by make_vision_collator_from_processor_method()
-def make_vision_retrieval_collator_from_processor_path(model_name_or_path: str, **kwargs):
-    """ "
-    Make a vision retrieval collator from a processor.
-
-    Args:
-        model_name_or_path: The name or path of the model to use, where the processor is defined.
-        **kwargs: Additional arguments to pass to the processor.
-
-    Returns:
-        A collator for vision/multimodal retrieval datasets.
-    """
-    if "tokenizer" in kwargs:
-        del kwargs["tokenizer"]
-    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
-    if config.model_type == "llama_nemotron_vl":
-        from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
-
-        processor = LlamaNemotronVLProcessor.from_pretrained(model_name_or_path, trust_remote_code=True, **kwargs)
-    else:
-        processor = AutoProcessor.from_pretrained(model_name_or_path, trust_remote_code=True, **kwargs)
-    return processor.process_queries_documents_biencoder
