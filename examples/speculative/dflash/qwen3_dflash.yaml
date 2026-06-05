@@ -38,6 +38,7 @@ recipe_args:
   attention_backend: flex_attention   # "flex_attention" (GPU main path) or "sdpa" (portable fallback)
 
   trust_remote_code: false
+  # target_attn_implementation: sdpa   # frozen target's attention backend (unset = HF auto-select)
   shuffle_seed: 42
   log_every_steps: 10
   max_grad_norm: 1.0
