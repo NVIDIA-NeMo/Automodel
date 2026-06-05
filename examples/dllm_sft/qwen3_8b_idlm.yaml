@@ -15,12 +15,12 @@
 # I-DLM (Introspective Diffusion LM) all-masked finetuning for Qwen3-8B.
 #
 # Converts the AR Qwen3-8B into a diffusion LM (Yu et al., 2026, arXiv:2604.11035)
-# via the all-masked objective under strict causal attention with a next-token
-# logit shift:  L = CE_noisy + clean_loss_weight * CE_clean.
+# via the all-masked objective: a [x_t | x_0] block-diffusion forward with a
+# next-token logit shift, L = CE_noisy + clean_loss_weight * CE_clean.
 #
 # Hyperparameters follow Appendix H.1 of the paper (I-DLM-8B, full fine-tune):
 #   lr 1e-5 cosine, warmup ratio 0.03, per-device batch 1, grad-accum 4
-#   (effective batch 32 on 8 GPUs), 2 epochs, clean-loss weight 0.2.
+#   (effective batch 32 on 8 GPUs), 1 epoch per block stage, clean-loss weight 0.2.
 #
 # Usage (8-GPU single node):
 #   python -m torch.distributed.run --nproc-per-node=8 \
@@ -35,7 +35,7 @@ step_scheduler:
   ckpt_every_steps: 1000
   val_every_steps: 500
   max_steps: null
-  num_epochs: 2            # paper: 2 epochs (stride curriculum N=2 then N=3)
+  num_epochs: 1            # paper: 1 epoch per block stage (b1 here; b2/b3 are follow-on runs)
 
 dist_env:
   backend: nccl
@@ -53,6 +53,9 @@ model:
   pretrained_model_name_or_path: Qwen/Qwen3-8B
   trust_remote_code: true
   dtype: bfloat16
+  # I-DLM feeds a custom [x_t | x_0] block-diffusion mask; sdpa honours it.
+  # Use flex_attention to avoid materialising the dense 2L x 2L mask at scale.
+  attn_implementation: sdpa
 
 checkpoint:
   enabled: true
@@ -80,13 +83,15 @@ distributed:
   fsdp2_forward_prefetch_depth: 1
   fsdp2_backward_prefetch_depth: 2
 
-# mode: idlm selects IDLMStrategy (all-masked corruption + Dream-shift two-CE,
-# strict causal attention). clean_loss_weight is the paper's fixed alpha=0.2;
-# set auto_balance_clean_loss: true for the auto-balanced scaling (Eq. 2) used
-# in the paper's later stride expansions.
+# mode: idlm selects IDLMStrategy (all-masked corruption + Dream-shift two-CE
+# over the [x_t | x_0] block-diffusion forward). clean_loss_weight is the paper's
+# fixed alpha=0.2; set auto_balance_clean_loss: true for the auto-balanced scaling
+# (Eq. 2) used at the b3 stage. block_length is the diffusion block size: the
+# paper trains a b1 -> b2 -> b3 curriculum (one epoch each).
 dllm:
   mode: idlm
   mask_token_id: 151669    # reserved Qwen3 special token used as the I-DLM mask
+  block_length: 1
   clean_loss_weight: 0.2
   auto_balance_clean_loss: false
   eps: 0.001
