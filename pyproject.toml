@@ -204,6 +204,7 @@ dev = [
 ]
 
 [tool.uv]
+managed = true
 default-groups = ["build", "docs", "test"]
 no-build-isolation-package = [
     "bitsandbytes",
