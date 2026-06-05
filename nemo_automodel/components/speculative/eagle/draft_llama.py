@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Llama-style dense LLM draft model for EAGLE-3 training.
+"""Llama-style dense LLM draft model for EAGLE-3 / EAGLE-3.1 training.
 
 The implementation is config-driven and supports any HuggingFace dense
 decoder-only architecture whose layout matches Llama: GQA attention with
@@ -43,6 +43,51 @@ unchanged):
 SGLang merges ``q_proj/k_proj/v_proj`` into a single ``qkv_proj`` and
 ``gate_proj/up_proj`` into ``gate_up_proj`` via its ``stacked_params_mapping``
 at load time, so the un-fused storage above is the canonical on-disk format.
+
+EAGLE-3.1 introduces two optional drafter-side toggles that together address
+the "attention drift" failure mode observed when speculation depth grows:
+
+* ``config.fc_norm`` (bool, default False) -- when True, an
+  ``nn.ModuleList`` of ``num_aux_hidden_states`` independent RMSNorms (each
+  of size ``target_hidden_size``) is applied per chunk before the
+  concatenated auxiliary hidden states enter ``model.fc``. The on-disk keys
+  are ``model.fc_norm.0.weight``, ``model.fc_norm.1.weight``, ...; the
+  module layout matches vLLM's EAGLE-3.1 integration in PR
+  https://github.com/vllm-project/vllm/pull/42764 so checkpoints trained
+  here load directly into vLLM / SGLang.
+* ``config.norm_output`` (bool, default False) -- when True, the existing
+  final RMSNorm (``model.norm``) is applied to the per-step hidden state
+  returned by ``forward`` so that the next TTT step (and the lm_head)
+  consume the post-norm state instead of the raw decoder output. Adds no
+  new parameters.
+
+Both flags default to False so EAGLE-3 checkpoints continue to load and
+behave identically. Enabling them applies the EAGLE-3.1 drafter toggles to
+the Llama-style draft used here; the MLA-backbone Kimi K2.6 draft
+(``Eagle3DeepseekV2ForCausalLM`` in ``lightseekorg/kimi-k2.6-eagle3.1-mla``)
+is a separate architecture and is not covered by this module.
+
+P-EAGLE (parallel-drafting EAGLE-3) adds one further optional toggle:
+
+* ``config.parallel_drafting`` (bool, default False) -- when True, the draft
+  registers a single learnable ``mask_hidden`` placeholder of shape
+  ``[1, 1, num_aux_hidden_states * target_hidden_size]`` (the pre-``fc``
+  concatenated-aux dimension) and exposes :meth:`LlamaEagle3DraftModel.forward_peagle`,
+  a single parallel forward over a flat, COD-subsampled sequence with a
+  ``flex_attention`` cross-depth mask (see ``peagle_attention.py`` /
+  ``peagle_data.py``). The trainer feeds the ``mask_hidden`` placeholder --
+  projected through the same ``project_hidden_states`` path as real aux states --
+  at every masked depth (``>= 1``), together with the masked token
+  ``config.mask_token_id``, so the draft predicts all ``config.num_depths`` tokens
+  in one forward instead of autoregressively. The shape, the on-disk key
+  ``mask_hidden``, and the COD config (``num_depths`` / ``down_sample_ratio`` /
+  ``mask_token_id``) mirror speculators
+  (https://github.com/vllm-project/speculators/pull/480) so the checkpoint loads
+  into vLLM's parallel-drafting runtime unchanged. The masked token slot reuses
+  ``embed_tokens[config.mask_token_id]``. SGLang does not serve a P-EAGLE head
+  today (https://github.com/sgl-project/sglang/issues/23171). The flag only ever
+  adds the ``mask_hidden`` key, so EAGLE-3 / EAGLE-3.1 checkpoints round-trip
+  unchanged.
 """
 
 from __future__ import annotations
@@ -58,6 +103,12 @@ from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
+)
+from nemo_automodel.components.speculative.eagle.peagle_draft import (
+    _PeagleAttentionMixin,
+    _PeagleDecoderLayerMixin,
+    _PeagleDraftMixin,
+    _PeagleVanillaLayerMixin,
 )
 from nemo_automodel.shared.import_utils import safe_import_from
 
@@ -107,7 +158,7 @@ def _is_right_padded_attention_mask(attention_mask: torch.Tensor) -> bool:
     return not bool((mask_bool[:, 1:] & ~mask_bool[:, :-1]).any())
 
 
-class Eagle3LlamaAttention(nn.Module):
+class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
     """EAGLE-3 draft attention over ``[input_emb, hidden]`` 2H features.
 
     Driven through a shared ``cache_hidden = [K_list, V_list]`` pair. At
@@ -142,9 +193,13 @@ class Eagle3LlamaAttention(nn.Module):
     batch.
     """
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: PretrainedConfig, fuse_input: bool = True):
         super().__init__()
         self.config = config
+        # ``fuse_input`` toggles the q/k/v input width. The EAGLE-3 first layer
+        # consumes the concatenated ``[embed, hidden]`` (2H); P-EAGLE's deeper
+        # layers (layer_id >= 1) are vanilla Llama layers on plain hidden (H).
+        self.fuse_input = fuse_input
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -168,7 +223,7 @@ class Eagle3LlamaAttention(nn.Module):
             )
         self.attn_implementation = attn_impl
 
-        in_features = config.hidden_size * 2
+        in_features = config.hidden_size * 2 if fuse_input else config.hidden_size
         self.q_proj = nn.Linear(
             in_features, self.num_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
         )
@@ -368,7 +423,7 @@ class Eagle3LlamaMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
 
 
-class Eagle3LlamaDecoderLayer(nn.Module):
+class Eagle3LlamaDecoderLayer(_PeagleDecoderLayerMixin, nn.Module):
     """Single decoder layer used by the minimal EAGLE-3 draft model.
 
     Attribute names mirror SGLang's ``LlamaDecoderLayer`` in
@@ -418,6 +473,31 @@ class Eagle3LlamaDecoderLayer(nn.Module):
         return hidden_states
 
 
+class Eagle3LlamaPeagleLayer(_PeagleVanillaLayerMixin, nn.Module):
+    """Vanilla Llama decoder layer for P-EAGLE depths ``>= 1``.
+
+    The EAGLE-3 first layer (:class:`Eagle3LlamaDecoderLayer`) fuses the token
+    embedding and the projected target hidden state (``2H`` attention input).
+    P-EAGLE stacks ``num_hidden_layers`` layers; every layer after the first is
+    a standard Llama block operating on plain hidden states (``H``), matching
+    speculators' ``decoder_layer_class`` (a vanilla ``LlamaDecoderLayer``). Only
+    the P-EAGLE flex-attention path is implemented (these deeper layers do not
+    participate in the EAGLE-3 ``cache_hidden`` TTT recurrence).
+    """
+
+    def __init__(self, config: PretrainedConfig, layer_id: int):
+        super().__init__()
+        self.layer_id = layer_id
+        self.input_layernorm = initialize_rms_norm_module(
+            "torch", config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
+        self.post_attention_layernorm = initialize_rms_norm_module(
+            "torch", config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
+        self.self_attn = Eagle3LlamaAttention(config, fuse_input=False)
+        self.mlp = Eagle3LlamaMLP(config)
+
+
 class Eagle3LlamaModel(nn.Module):
     """Inner backbone matching SGLang's ``LlamaModel`` in ``llama_eagle3.py``.
 
@@ -439,11 +519,39 @@ class Eagle3LlamaModel(nn.Module):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
         self.fc = nn.Linear(target_hidden_size * num_aux_hidden_states, config.hidden_size, bias=False)
-        self.layers = nn.ModuleList([Eagle3LlamaDecoderLayer(config, layer_id=0)])
+        # EAGLE-3.1 ``fc_norm``: one RMSNorm of size ``target_hidden_size`` per
+        # auxiliary hidden-state chunk, applied *before* the chunks are
+        # concatenated and fed into ``fc``. The norms are independent
+        # parameters (``nn.ModuleList``, NOT a single shared scale), which
+        # matches the upstream vLLM EAGLE-3.1 implementation
+        # (https://github.com/vllm-project/vllm/pull/42764) and the community
+        # checkpoint at ``lightseekorg/kimi-k2.6-eagle3.1-mla``. The on-disk
+        # keys are therefore ``model.fc_norm.0.weight``,
+        # ``model.fc_norm.1.weight``, ... (one per chunk). The module is only
+        # registered when ``fc_norm`` is set so EAGLE-3 checkpoints continue
+        # to round-trip with no extra keys.
+        if getattr(config, "fc_norm", False):
+            self.fc_norm = nn.ModuleList(
+                [
+                    initialize_rms_norm_module("torch", target_hidden_size, eps=config.rms_norm_eps, device=None)
+                    for _ in range(num_aux_hidden_states)
+                ]
+            )
+        # EAGLE-3 / EAGLE-3.1 TTT uses a single fused first layer. P-EAGLE stacks
+        # ``num_hidden_layers`` layers: the fused first layer (2H) plus
+        # ``num_hidden_layers - 1`` vanilla Llama layers (H), matching speculators'
+        # ``[first_layer] + [decoder_layer for i in range(1, num_layers)]``. The
+        # single-layer construction is preserved for the non-parallel path so the
+        # merged EAGLE checkpoints round-trip unchanged.
+        layers: list[nn.Module] = [Eagle3LlamaDecoderLayer(config, layer_id=0)]
+        if getattr(config, "parallel_drafting", False):
+            num_layers = max(1, int(getattr(config, "num_hidden_layers", 1)))
+            layers.extend(Eagle3LlamaPeagleLayer(config, layer_id=i) for i in range(1, num_layers))
+        self.layers = nn.ModuleList(layers)
         self.norm = initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps, device=None)
 
 
-class LlamaEagle3DraftModel(PreTrainedModel):
+class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
     """Llama-style dense EAGLE-3 draft model (Llama, Phi-3, Qwen3).
 
     State dict keys match SGLang's ``LlamaForCausalLMEagle3`` so the saved
@@ -467,6 +575,12 @@ class LlamaEagle3DraftModel(PreTrainedModel):
 
     config_class = PretrainedConfig
     base_model_prefix = "model"
+    # Declare the attention backends this draft actually implements so
+    # ``PreTrainedModel.__init__`` allows them. ``Eagle3LlamaAttention`` supports
+    # ``eager`` and ``flash_attention_2`` (see ``_SUPPORTED_ATTN_IMPLEMENTATIONS``)
+    # but NOT SDPA; without this flag transformers defaults ``_supports_flash_attn``
+    # to ``False`` and rejects ``attn_implementation="flash_attention_2"``.
+    _supports_flash_attn = True
 
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)
@@ -477,19 +591,51 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         self.model = Eagle3LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
 
+        # P-EAGLE (parallel drafting): register the learnable ``mask_hidden``
+        # placeholder only when enabled so EAGLE-3 / EAGLE-3.1 checkpoints
+        # round-trip with no extra keys (see ``_PeagleDraftMixin``).
+        if getattr(config, "parallel_drafting", False):
+            self._init_peagle_parameters(config)
+
         self.post_init()
 
     def copy_embeddings_from_target(self, target_embedding: nn.Embedding) -> None:
-        """Initialize draft embeddings from the target model embeddings."""
+        """Initialize draft embeddings from the target model embeddings.
+
+        When the target model is wrapped with FSDP2, ``target_embedding.weight``
+        is a ``DTensor`` sharded across ranks.  The draft embedding is a plain
+        ``nn.Parameter`` (the draft is not FSDP-wrapped), so a direct
+        ``copy_`` of a DTensor into a regular tensor raises a mixed-type
+        distributed-operator error.  Gather to a full local tensor first.
+        """
+        target_weight = target_embedding.weight
+        if hasattr(target_weight, "full_tensor"):
+            target_weight = target_weight.full_tensor()
         with torch.no_grad():
-            self.model.embed_tokens.weight.copy_(target_embedding.weight)
+            self.model.embed_tokens.weight.copy_(target_weight)
 
     def freeze_embeddings(self) -> None:
         """Freeze draft input embeddings."""
         self.model.embed_tokens.weight.requires_grad_(False)
 
     def project_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project concatenated target aux states from ``num_aux * H_target`` to draft hidden size."""
+        """Project concatenated target aux states from ``num_aux * H_target`` to draft hidden size.
+
+        When ``config.fc_norm`` is set (EAGLE-3.1), the input is split into
+        ``num_aux_hidden_states`` equal chunks along the last dim and each
+        chunk is passed through its own RMSNorm in ``model.fc_norm`` (the
+        modules are independent, matching vLLM's upstream implementation).
+        The normalized chunks are then re-concatenated and fed to ``fc``,
+        stabilising the per-aux-state scale before the projection mixes them
+        and removing the speculation-depth drift observed with raw inputs.
+        """
+        if getattr(self.config, "fc_norm", False):
+            num_aux = len(self.model.fc_norm)
+            chunks = aux_hidden_states.chunk(num_aux, dim=-1)
+            aux_hidden_states = torch.cat(
+                [norm(chunk) for norm, chunk in zip(self.model.fc_norm, chunks)],
+                dim=-1,
+            )
         return self.model.fc(aux_hidden_states)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -497,7 +643,16 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         return self.model.embed_tokens(input_ids)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Compute draft logits on the configured draft vocabulary."""
+        """Compute draft logits on the configured draft vocabulary.
+
+        With ``config.norm_output`` unset (EAGLE-3 default) the input is the
+        raw decoder-layer output and the final ``model.norm`` is applied
+        here. With ``config.norm_output`` set (EAGLE-3.1) ``forward`` has
+        already returned the post-norm state, so ``lm_head`` is applied
+        directly to avoid a double normalisation.
+        """
+        if getattr(self.config, "norm_output", False):
+            return self.lm_head(hidden_states)
         return self.lm_head(self.model.norm(hidden_states))
 
     def forward(
@@ -532,10 +687,18 @@ class LlamaEagle3DraftModel(PreTrainedModel):
 
         draft_input_embeds = self.embed_input_ids(input_ids)
         causal_mask = _build_causal_mask(attention_mask=attention_mask, dtype=projected_hidden_states.dtype)
-        return self.model.layers[0](
+        hidden_states = self.model.layers[0](
             input_embeds=draft_input_embeds,
             hidden_states=projected_hidden_states,
             attention_mask=causal_mask,
             position_ids=position_ids,
             cache_hidden=cache_hidden,
         )
+        # EAGLE-3.1 ``norm_output``: route the post-norm hidden state to both
+        # the next TTT step (fed back via ``cur_hidden_states`` in the trainer
+        # loop) and to ``compute_logits``. ``compute_logits`` detects the
+        # flag and skips re-norming. With the flag unset this branch is a
+        # no-op and EAGLE-3 behavior is preserved.
+        if getattr(self.config, "norm_output", False):
+            hidden_states = self.model.norm(hidden_states)
+        return hidden_states

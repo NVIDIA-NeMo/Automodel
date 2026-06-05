@@ -25,6 +25,7 @@ try:
 except ImportError:
     pass
 
+import gc
 import inspect
 import logging
 import pathlib
@@ -60,7 +61,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
-from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
@@ -68,7 +69,7 @@ from nemo_automodel.components.distributed.init_utils import (
 from nemo_automodel.components.distributed.megatron_fsdp import fully_shard_optimizer
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
 from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -87,6 +88,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -152,13 +154,14 @@ def _uses_te_dot_product_attention(model_or_cfg):
 
 
 def _uses_thd_collater(cfg_dataloader):
+    """Return True if the dataloader's collate_fn is ``packed_sequence_thd_collater``.
+
+    ``collate_fn`` ends in ``_fn``, so ConfigNode resolves the YAML dotted-path string to
+    the actual callable at load time — the value here is always the function, never a string.
+    """
     from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
-    return (
-        True
-        if hasattr(cfg_dataloader, "collate_fn") and cfg_dataloader.collate_fn == packed_sequence_thd_collater
-        else False
-    )
+    return getattr(cfg_dataloader, "collate_fn", None) is packed_sequence_thd_collater
 
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
@@ -302,7 +305,7 @@ def build_model(
     return model
 
 
-def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh, is_peft: bool = False):
     """Build an optimizer for the model.
 
     Args:
@@ -310,6 +313,7 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         cfg_opt: The configuration for the optimizer.
         distributed_config: The distributed configuration.
         device_mesh: The device mesh.
+        is_peft: Whether the optimizer is for a PEFT run.
     """
     # Resolve dtype strings (e.g. "torch.bfloat16") to torch.dtype objects for
     # optimizers like TE FusedAdam that accept dtype kwargs.
@@ -319,8 +323,16 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             setattr(cfg_opt, attr, dtype_from_str(val))
 
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
-        # TP does not support foreach
-        cfg_opt.foreach = False
+        # TP does not support foreach for torch optimizers. Do not add this kwarg
+        # to optimizer classes that do not declare it, such as TE FusedAdam.
+        target = getattr(cfg_opt, "_target_", None)
+        if isinstance(target, str):
+            target_name = target
+        else:
+            target_module = getattr(target, "__module__", "")
+            target_name = f"{target_module}.{getattr(target, '__qualname__', '')}"
+        if target_name.startswith("torch.optim.") or hasattr(cfg_opt, "foreach"):
+            cfg_opt.foreach = False
 
     optimizer = []
     has_dion_optimizer = is_dion_optimizer(cfg_opt)
@@ -340,6 +352,14 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             assert not has_dion_optimizer, "Dion optimizer does not support fully_shard_optimizer"
             tmp_optimizer = fully_shard_optimizer(part, tmp_optimizer)
         optimizer.append(tmp_optimizer)
+
+    warn_if_torch_adam_with_bf16_params(
+        optimizer=optimizer,
+        optimizer_cfg=cfg_opt,
+        is_peft=is_peft,
+        context="llm",
+        logger=logger,
+    )
 
     return optimizer
 
@@ -364,7 +384,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
         model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
-        save_consolidated=True,
+        save_consolidated="final",
         is_peft=is_peft,
     )
     user_cfg = {}
@@ -733,15 +753,22 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
     if cfg is None:
         return None
 
-    # Calculate total steps for the training run
+    # Calculate total steps for the training run.
+    # `step_scheduler.epoch_len` is already in optimizer-step units
+    # (microbatches // grad_acc_steps) and is None for IterableDataset, in which
+    # case `max_steps` governs the total step count.
     total_epochs = step_scheduler.num_epochs
-    epoch_len = len(step_scheduler.dataloader)
-    grad_acc_steps = step_scheduler.grad_acc_steps
-
-    # Total optimizer steps (accounting for gradient accumulation)
-    total_steps = (total_epochs * epoch_len) // grad_acc_steps
-    if step_scheduler.max_steps is not None:
-        total_steps = min(total_steps, step_scheduler.max_steps)
+    if step_scheduler.epoch_len is not None:
+        total_steps = total_epochs * step_scheduler.epoch_len
+        if step_scheduler.max_steps is not None:
+            total_steps = min(total_steps, step_scheduler.max_steps)
+    else:
+        if step_scheduler.max_steps is None:
+            raise ValueError(
+                "build_lr_scheduler: dataloader has no __len__ (iterable dataset) and "
+                "step_scheduler.max_steps is not set. Set step_scheduler.max_steps in your config."
+            )
+        total_steps = step_scheduler.max_steps
 
     # Set defaults for scheduler parameters
     optimizer_param_schedulers = []
@@ -1002,7 +1029,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        self.optimizer = build_optimizer(
+            model,
+            self.cfg.optimizer,
+            self.distributed_config,
+            self.device_mesh,
+            is_peft=self.peft_config is not None,
+        )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -1071,6 +1104,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.pp_enabled,
             model=self.model_parts[0],
         )
+        # Optional tool-call accuracy evaluator for agent SFT runs.
+        # Presence of the ``tool_call_eval`` block enables it; absence skips it.
+        self.tool_call_evaluator = None
+        tool_call_eval_cfg = self.cfg.get("tool_call_eval", None)
+        if tool_call_eval_cfg is not None:
+            self.tool_call_evaluator = tool_call_eval_cfg.instantiate()
+            # Shard eval samples across DP ranks only when safe (DDP); never
+            # override a ``sample_shard`` already set from YAML.
+            if self.tool_call_evaluator.sample_shard is None:
+                self.tool_call_evaluator.sample_shard = dp_eval_sample_shard(
+                    self.distributed_config, self._get_dp_rank(), self._get_dp_group_size()
+                )
+        self._warned_tool_call_eval_skipped = False
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
         self.step_scheduler = build_step_scheduler(
@@ -1317,15 +1363,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
+        _thd_collater = _uses_thd_collater(self.cfg.dataloader)
+        # Gate THD/cu_seqlens processing on the dataset being THD-packed, not on TE
+        # attention being present on this rank: both TE attention and mamba need
+        # cu_seqlens, and gating on attention would drop PP stages with no attention
+        # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream.
+        _use_te_value = _thd_collater
+        _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
             batch,
-            use_te=_uses_te_dot_product_attention(
-                self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
-            )
-            and _uses_thd_collater(self.cfg.dataloader),
+            use_te=_use_te_value,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-            num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
+            num_chunks=_num_chunks_value,
         )
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
@@ -1349,7 +1399,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 batch_filtered = {
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
                 }
-
+                # Hand the THD ``cu_seqlens`` to the PP loss to mask cross-sequence boundaries —
+                # the fallback when the model emits no per-microbatch seq_idx tail (which the loss
+                # prefers). One cu_seqlens encodes a single shared layout, so it is only correct at
+                # one pack/microbatch per step; the seq_idx tail handles differing per-microbatch boundaries.
+                cu_seqlens = batch_filtered.get("cu_seqlens")
+                if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
+                    cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
+                pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
+                if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
+                    pp_loss_fn.cu_seqlens = cu_seqlens
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:
@@ -1401,14 +1460,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     num_label_tokens=num_label_tokens,
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
-                if mtp_per_depth_h is not None:
+                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
+                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
                     local_loss = local_loss + calculate_mtp_loss(
                         self.loss_fn,
                         mtp_per_depth_h=mtp_per_depth_h,
+                        mtp_per_depth_logits=mtp_per_depth_logits,
                         labels=labels,
                         model=model,
                         scaling_factor=out.mtp_loss_scaling_factor,
                         num_label_tokens=num_label_tokens,
+                        # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
+                        cu_seqlens=batch.get("cu_seqlens"),
                     )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
@@ -1624,15 +1687,86 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
 
+        metrics = {
+            "val_loss": val_loss,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "num_label_tokens": total_num_label_tokens,
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+        }
+
+        # Tool-call accuracy is the only signal that catches "loss going
+        # down because format was learned but the model picks wrong tools".
+        # Generation on an FSDP2 training model is intentionally opt-in:
+        # generate() repeatedly unshards parameters and can leave enough
+        # allocator pressure to OOM the next backward pass.
+        if getattr(self, "tool_call_evaluator", None) is not None:
+            prefix = self.tool_call_evaluator.metric_prefix
+            count_key = f"{prefix}/_count"
+            if isinstance(self.distributed_config, FSDP2Config) and not getattr(
+                self.tool_call_evaluator, "run_on_fsdp2", False
+            ):
+                if not self._warned_tool_call_eval_skipped:
+                    logging.warning(
+                        "Skipping tool_call_evaluator during FSDP2 training. "
+                        "Set tool_call_eval.run_on_fsdp2=true to force in-loop generation, "
+                        "or run the evaluator offline from a checkpoint."
+                    )
+                    self._warned_tool_call_eval_skipped = True
+                metrics[f"{prefix}/_disabled_fsdp2"] = 1.0
+            else:
+                # sample_shard is set (identically) on every rank only for DDP,
+                # where each rank scored a DISJOINT subset → all-reduce. When it
+                # is None (FSDP2 in-loop, or single rank) every rank scored the
+                # SAME set in lockstep and holds identical results → use them
+                # directly with no collective. The branch is taken identically on
+                # all ranks, so the collectives below stay in sync.
+                sharded = self.tool_call_evaluator.sample_shard is not None
+                try:
+                    local_metrics = self.tool_call_evaluator.evaluate(self.model_parts[0], self.tokenizer)
+                except Exception as exc:
+                    logging.warning("tool_call_evaluator.evaluate failed: %s", exc)
+                    local_metrics = {}
+
+                metric_keys = list(self.tool_call_evaluator.METRIC_KEYS)
+                local_count = float(local_metrics.get(count_key, 0.0))
+                if sharded:
+                    # Every DP rank must issue the SAME collective here, whatever
+                    # its local eval produced. A rank whose evaluate() raised (e.g.
+                    # a divergent generate() OOM) or that hit different skip reasons
+                    # must not skip or add an all-reduce, or it desyncs the
+                    # collective and deadlocks the others. So reduce a FIXED vector
+                    # (count, count-weighted means, skipped — never the per-rank
+                    # _skip_<reason> keys) in one packed all-reduce; a local failure
+                    # contributes zeros but still participates.
+                    packed = torch.tensor(
+                        [local_count]
+                        + [float(local_metrics.get(f"{prefix}/{k}", 0.0)) * local_count for k in metric_keys]
+                        + [float(local_metrics.get(f"{prefix}/_skipped", 0.0))],
+                        dtype=torch.float32,
+                        device=self.dist_env.device,
+                    )
+                    reduced = self._dp_allreduce(packed).tolist()
+                    total_count = reduced[0]
+                    for i, k in enumerate(metric_keys, start=1):
+                        metrics[f"{prefix}/{k}"] = reduced[i] / total_count if total_count > 0 else 0.0
+                    metrics[f"{prefix}/_skipped"] = reduced[-1]
+                    metrics[count_key] = total_count
+                else:
+                    # Replicated: identical on every rank, so report the local
+                    # values directly (no collective, _count is the true count).
+                    for k in metric_keys:
+                        metrics[f"{prefix}/{k}"] = float(local_metrics.get(f"{prefix}/{k}", 0.0))
+                    metrics[f"{prefix}/_skipped"] = float(local_metrics.get(f"{prefix}/_skipped", 0.0))
+                    metrics[count_key] = local_count
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "val_loss": val_loss,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "num_label_tokens": total_num_label_tokens,
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-            },
+            metrics=metrics,
         )
 
     def log_val_metrics(self, val_name, log_data, metric_logger=None):
@@ -1664,14 +1798,25 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not metric_logger is None:
             metric_logger.log(log_data)
 
+        tool_call_suffix = ""
+        if "tool_call/_count" in log_data.metrics:
+            tool_call_suffix = (
+                " | tool_name_acc {:.3f} | args_json_valid {:.3f} | args_exact_match {:.3f} (n={})".format(
+                    log_data.metrics.get("tool_call/name_correct", 0.0),
+                    log_data.metrics.get("tool_call/args_json_valid", 0.0),
+                    log_data.metrics.get("tool_call/args_exact_match", 0.0),
+                    int(log_data.metrics.get("tool_call/_count", 0)),
+                )
+            )
         logging.info(
-            '[val] name "{}" | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}'.format(
+            '[val] name "{}" | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}{}'.format(
                 val_name,
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["val_loss"],
                 log_data.metrics["lr"],
                 log_data.metrics["num_label_tokens"],
+                tool_call_suffix,
             )
         )
 

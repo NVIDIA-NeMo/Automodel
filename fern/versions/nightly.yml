@@ -154,6 +154,8 @@ navigation:
             path: ./nightly/pages/model-coverage/llm/parasail-ai/gritlm.mdx
           - page: "Hy3-preview"
             path: ./nightly/pages/model-coverage/llm/tencent/hy3.mdx
+          - page: "Hy-MT2"
+            path: ./nightly/pages/model-coverage/llm/tencent/hy-mt2.mdx
           - page: "MiMo-V2-Flash"
             path: ./nightly/pages/model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
           - page: "Ling 2.0"
@@ -231,12 +233,18 @@ navigation:
       - page: "Function Calling with NeMo AutoModel using FunctionGemma"
         path: ./nightly/pages/guides/llm/toolcalling.mdx
         slug: function-calling
+      - page: "Multi-Turn Agent (Tool-Calling) SFT with NeMo AutoModel"
+        path: ./nightly/pages/guides/llm/agent-sft.mdx
+        slug: agent-sft
       - page: "Knowledge Distillation with NeMo AutoModel"
         path: ./nightly/pages/guides/llm/knowledge-distillation.mdx
         slug: knowledge-distillation
       - page: "Fine-Tune Large MoE LLMs"
         path: ./nightly/pages/guides/llm/large-moe-finetune.mdx
         slug: large-moe-fine-tuning
+      - page: "Fine-Tune Nemotron-3-Ultra-550B"
+        path: ./nightly/pages/guides/llm/nemotron-3-ultra.mdx
+        slug: nemotron-3-ultra
       - page: "DeepSeek V4 Flash"
         path: ./nightly/pages/guides/llm/dsv4-flash.mdx
         slug: deepseek-v4-flash
@@ -339,6 +347,9 @@ navigation:
       - page: "FP8 Training in NeMo AutoModel"
         path: ./nightly/pages/guides/fp8-training.mdx
         slug: fp8-training
+      - page: "Mixed-Precision Training"
+        path: ./nightly/pages/guides/mixed-precision-training.mdx
+        slug: mixed-precision-training
       - page: "MLflow Logging in NeMo AutoModel"
         path: ./nightly/pages/guides/mlflow-logging.mdx
         slug: mlflow-logging

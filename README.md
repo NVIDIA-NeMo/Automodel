@@ -21,6 +21,9 @@
 </div>
 
 ## 📣 News and Discussions
+- [06/04/2026][**Nemotron-3 Ultra**](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16) We now support finetuning NVIDIA's Nemotron 3 Ultra 550B A55B. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml) and [guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/nemotron-3-ultra.md).
+- [06/03/2026][**Gemma 4 12B**](https://huggingface.co/google/gemma-4-12B) We now support finetuning the dense `google/gemma-4-12B` model. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml).
+- [05/27/2026][**Step-3.7-Flash**](https://huggingface.co/stepfun-ai/Step-3.7-Flash) We added model coverage for Stepfun AI's 198B-A13B MoE vision-language model, targeting image/video agentic developer workflows with a 256k context language backbone and 1.8B ViT vision tower. See the [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/vlm/stepfun-ai/step-3-7.md).
 - [05/19/2026][**Ling 2.0**](https://huggingface.co/collections/inclusionAI/ling-20) We now support finetuning the inclusionAI Ling 2.0 MoE family (`inclusionAI/Ling-mini-2.0`, `inclusionAI/Ling-flash-2.0`, and `inclusionAI/Ling-1T`), thanks to [@Hayden727](https://github.com/Hayden727). Check out our [recipes](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/ling).
 - [05/17/2026][**ERNIE 4.5**](https://huggingface.co/baidu) and [**MiMo-V2-Flash**](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash) We now support finetuning `baidu/ERNIE-4.5-0.3B-PT`, `baidu/ERNIE-4.5-21B-A3B-PT`, and `XiaomiMiMo/MiMo-V2-Flash`. Check out our ERNIE [dense recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml), ERNIE [MoE recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml), and MiMo [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml).
 - [04/29/2026][**Mistral Medium 3.5**](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B) We now support finetuning Mistral AI's 128B FP8-native VLM Mistral Medium 3.5. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml) and [guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/vlm/mistral-medium-3-5.md).
@@ -361,7 +364,7 @@ YAML sketch:
 checkpoint:
 enabled: true
 checkpoint_dir: ./checkpoints
-save_consolidated: true
+save_consolidated: final
 model_save_format: safetensors
 ``` -->
 

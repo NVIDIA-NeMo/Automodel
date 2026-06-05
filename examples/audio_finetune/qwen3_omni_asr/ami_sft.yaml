@@ -133,5 +133,5 @@ wandb:
   dir: ${oc.env:WANDB_DIR,result/wandb}
 
 ci:
-  recipe_owner: yuekaiz
+  recipe_owner: yuekaizhang
   time: "00:30:00"

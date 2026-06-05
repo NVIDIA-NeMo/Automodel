@@ -125,7 +125,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             distributed_setup=self.distributed_setup,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        self.optimizer = build_optimizer(
+            model,
+            self.cfg.optimizer,
+            self.distributed_config,
+            self.device_mesh,
+            is_peft=self.peft_config is not None,
+        )
 
         self.model_parts = [model]
         self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])

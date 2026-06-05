@@ -26,7 +26,6 @@ from nemo_automodel.components.speculative.eagle.registry import (
     resolve_eagle3_draft_spec,
 )
 
-
 # ── DraftSpec dataclass ──────────────────────────────────────────────────
 
 
@@ -62,6 +61,16 @@ def test_eagle1_registry_contains_phi3():
     assert "Phi3ForCausalLM" in EAGLE1_DRAFT_REGISTRY
 
 
+def test_eagle3_registry_contains_qwen3_moe():
+    assert "Qwen3MoeForCausalLM" in EAGLE3_DRAFT_REGISTRY
+    assert EAGLE3_DRAFT_REGISTRY["Qwen3MoeForCausalLM"].draft_cls is LlamaEagle3DraftModel
+
+
+def test_eagle1_registry_contains_qwen3_moe():
+    assert "Qwen3MoeForCausalLM" in EAGLE1_DRAFT_REGISTRY
+    assert EAGLE1_DRAFT_REGISTRY["Qwen3MoeForCausalLM"].draft_cls is LlamaEagleDraftModel
+
+
 # ── resolve_eagle3_draft_spec ────────────────────────────────────────────
 
 
@@ -88,8 +97,20 @@ def test_resolve_eagle3_empty_raises():
 # ── resolve_eagle1_draft_spec ────────────────────────────────────────────
 
 
+def test_resolve_eagle3_qwen3_moe():
+    # MoE backbones share the dense Llama-style draft because the draft only
+    # consumes post-block hidden states, not the per-expert routing internals.
+    spec = resolve_eagle3_draft_spec(["Qwen3MoeForCausalLM"])
+    assert spec.draft_cls is LlamaEagle3DraftModel
+
+
 def test_resolve_eagle1_llama():
     spec = resolve_eagle1_draft_spec(["LlamaForCausalLM"])
+    assert spec.draft_cls is LlamaEagleDraftModel
+
+
+def test_resolve_eagle1_qwen3_moe():
+    spec = resolve_eagle1_draft_spec(["Qwen3MoeForCausalLM"])
     assert spec.draft_cls is LlamaEagleDraftModel
 
 

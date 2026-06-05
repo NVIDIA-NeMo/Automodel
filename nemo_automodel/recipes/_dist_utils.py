@@ -145,6 +145,9 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     strategy_config = _resolve_strategy_config(strategy_name, **strategy_kwargs)
 
     if pipeline_dict is not None:
+        pipeline_dict = pipeline_dict.copy()
+        if isinstance(pipeline_dict.get("dtype"), str):
+            pipeline_dict["dtype"] = dtype_from_str(pipeline_dict["dtype"])
         pipeline_config = PipelineConfig(**pipeline_dict)
     elif pp_size > 1:
         pipeline_config = PipelineConfig()

@@ -20,7 +20,13 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.datasets.vlm.pp_media import chunk_vlm_media, prepare_vlm_media_for_pp
+from nemo_automodel.components.datasets.vlm.pp_media import (
+    VLM_PP_MEDIA_KEY,
+    chunk_step3_media,
+    chunk_vlm_media,
+    prepare_vlm_media_for_pp,
+    stage_vlm_media_for_pp,
+)
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
@@ -241,6 +247,77 @@ def test_build_model_no_moe_config_when_cfg_moe_is_none():
     assert "activation_checkpointing" not in captured_kwargs
 
 
+def test_build_model_passes_quantization_config():
+    """cfg_quantization is converted via create_bnb_config and forwarded as quantization_config."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+    cfg_quantization = SimpleNamespace(load_in_4bit=True)
+    sentinel_bnb = object()
+
+    with (
+        patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True),
+        patch(
+            "nemo_automodel.components.quantization.qlora.create_bnb_config",
+            return_value=sentinel_bnb,
+        ) as mock_create,
+    ):
+        build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=123,
+            cfg_quantization=cfg_quantization,
+        )
+
+    # Wiring: cfg_quantization -> create_bnb_config(...) -> kwargs["quantization_config"]
+    mock_create.assert_called_once_with(cfg_quantization)
+    assert captured_kwargs.get("quantization_config") is sentinel_bnb
+
+
+def test_build_model_no_quantization_config_when_none():
+    """No quantization_config kwarg when cfg_quantization is None (the default)."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
+        build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=123,
+        )
+
+    assert "quantization_config" not in captured_kwargs
+
+
 # -----------------------------------------------------------------------------
 # FinetuneRecipeForVLM helpers
 # -----------------------------------------------------------------------------
@@ -279,7 +356,10 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     recipe.model_parts = [model]  # Now uses model_parts instead of model
     recipe.pp_enabled = False  # Pipeline parallelism disabled
     recipe.optimizer = [_DummyOptimizer()]  # Now a list
-    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
+    # ``is_remote_logging_step`` is read by ``_forward_backward_step`` when the
+    # composite (gemma4 joint drafter) attaches drafter logits; default False
+    # so non-drafter test paths skip the log line.
+    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0, is_remote_logging_step=False)
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
     recipe.cfg = _Cfg(fp8=None)
     recipe.lr_scheduler = None
@@ -353,7 +433,7 @@ def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
     recipe.model_parts = [_TensorModel()]
     recipe.pp_enabled = True
     recipe.optimizer = [_DummyOptimizer()]
-    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
+    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0, is_remote_logging_step=False)
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
     recipe.cfg = _Cfg(fp8=None)
     recipe.lr_scheduler = None
@@ -1175,7 +1255,7 @@ class TestBuildCheckpointConfig:
         assert config.model_save_format.value == "safetensors"
         assert config.model_repo_id == "org/model"
         assert config.model_cache_dir == "/tmp/cache"
-        assert config.save_consolidated is True
+        assert config.save_consolidated.value == "final"
         assert config.is_peft is False
 
     def test_build_checkpoint_config_with_custom_config(self):
@@ -1195,7 +1275,7 @@ class TestBuildCheckpointConfig:
         )
 
         assert config.checkpoint_dir == "/custom/ckpt/"
-        assert config.save_consolidated is False
+        assert config.save_consolidated.value == "false"
         assert config.is_peft is True
 
     def test_build_checkpoint_config_warns_on_peft_with_torch_save(self, caplog):
@@ -1225,7 +1305,7 @@ class TestBuildCheckpointConfig:
         # checkpoint_dir is preserved from the user config
         assert config.checkpoint_dir == "/user/ckpt/"
         # other user-provided torch_save options are discarded (defaults restored)
-        assert config.save_consolidated is True
+        assert config.save_consolidated.value == "final"
         assert config.is_async is False
 
     def test_build_checkpoint_config_uses_hf_hub_cache_when_cache_dir_none(self):
@@ -2083,6 +2163,10 @@ def _create_non_pp_recipe(model, device="cpu"):
     recipe.__dict__["distributed_config"] = None
     recipe.__dict__["model_parts"] = [model]
     recipe.__dict__["_get_dp_group_size"] = lambda include_cp=True: 1
+    # ``is_remote_logging_step`` is read by ``_forward_backward_step`` to
+    # gate the joint-drafter loss-log line; default False so non-drafter
+    # test paths don't trip on the new attribute.
+    recipe.__dict__["step_scheduler"] = SimpleNamespace(is_remote_logging_step=False)
     return recipe
 
 
@@ -2768,6 +2852,74 @@ class TestChunkVlmMedia:
         assert [c.shape[0] for c in ig_chunks] == [3, 6, 1]
         assert [c.shape[0] for c in pv_chunks] == [3, 6, 1]
         assert sum(c.shape[0] for c in pv_chunks) == n_images
+
+    def test_step3_media_chunks_full_images_and_flat_patches(self):
+        pixel_values = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
+        patch_pixel_values = torch.arange(6 * 2, dtype=torch.float32).reshape(6, 2)
+        patch_newline_mask = torch.tensor([True, False, False, True, False, True])
+        num_patches = torch.tensor([2, 0, 3, 1])
+
+        chunks = chunk_step3_media(
+            pixel_values,
+            batch_size=4,
+            n_microbatches=2,
+            num_patches=num_patches,
+            patch_pixel_values=patch_pixel_values,
+            patch_newline_mask=patch_newline_mask,
+        )
+
+        assert torch.equal(chunks["pixel_values"][0], pixel_values[:2])
+        assert torch.equal(chunks["pixel_values"][1], pixel_values[2:])
+        assert torch.equal(chunks["num_patches"][0], torch.tensor([2, 0]))
+        assert torch.equal(chunks["num_patches"][1], torch.tensor([3, 1]))
+        assert torch.equal(chunks["patch_pixel_values"][0], patch_pixel_values[:2])
+        assert torch.equal(chunks["patch_pixel_values"][1], patch_pixel_values[2:])
+        assert torch.equal(chunks["patch_newline_mask"][0], patch_newline_mask[:2])
+        assert torch.equal(chunks["patch_newline_mask"][1], patch_newline_mask[2:])
+
+    def test_step3_media_defaults_num_patches_and_validates_shapes(self):
+        pixel_values = torch.randn(3, 2)
+        chunks = chunk_step3_media(pixel_values, batch_size=3, n_microbatches=2)
+        assert [chunk.tolist() for chunk in chunks["num_patches"]] == [[0, 0], [0]]
+        assert "patch_pixel_values" not in chunks
+        assert "patch_newline_mask" not in chunks
+
+        with pytest.raises(ValueError, match="one full image tensor per sample"):
+            chunk_step3_media(pixel_values[:2], batch_size=3, n_microbatches=2)
+        with pytest.raises(ValueError, match="num_patches must have length"):
+            chunk_step3_media(pixel_values, batch_size=3, n_microbatches=2, num_patches=torch.tensor([1, 2]))
+
+    def test_prepare_step3_media_without_image_grid_and_stage_cleanup(self):
+        model = SimpleNamespace()
+        pp = SimpleNamespace(info=SimpleNamespace(has_first_stage=True))
+        batch = {
+            "input_ids": torch.ones(4, 3, dtype=torch.long),
+            "pixel_values": torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3),
+            "patch_pixel_values": torch.arange(4 * 2, dtype=torch.float32).reshape(4, 2),
+            "num_patches": torch.tensor([1, 0, 2, 1]),
+            "patch_newline_mask": torch.tensor([True, False, True, False]),
+        }
+
+        prepared = prepare_vlm_media_for_pp(batch, batch_size=4, n_microbatches=2)
+
+        assert "pixel_values" not in prepared
+        assert "patch_pixel_values" not in prepared
+        assert "num_patches" not in prepared
+        assert "patch_newline_mask" not in prepared
+        assert VLM_PP_MEDIA_KEY in prepared
+
+        with stage_vlm_media_for_pp(pp, [model], prepared):
+            assert len(model._vlm_pixel_values_chunks) == 2
+            assert len(model._vlm_patch_pixel_values_chunks) == 2
+            assert len(model._vlm_num_patches_chunks) == 2
+            assert len(model._vlm_patch_newline_mask_chunks) == 2
+            assert model._vlm_chunk_idx == 0
+
+        assert model._vlm_pixel_values_chunks is None
+        assert model._vlm_patch_pixel_values_chunks is None
+        assert model._vlm_num_patches_chunks is None
+        assert model._vlm_patch_newline_mask_chunks is None
+        assert model._vlm_chunk_idx is None
 
 
 # -----------------------------------------------------------------------------

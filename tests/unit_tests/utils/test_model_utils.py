@@ -76,6 +76,19 @@ def test_print_trainable_parameters_counts(dummy_model, caplog, monkeypatch):
     # Check logging output
     assert "Trainable parameters" in caplog.text
     assert "Total parameters" in caplog.text
+    # Default header label
+    assert "Model summary:" in caplog.text
+
+
+def test_print_trainable_parameters_custom_name(dummy_model, caplog):
+    """The ``name`` label customizes the summary header (e.g. the draft model
+    in speculative-decoding training)."""
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    model_utils.print_trainable_parameters(dummy_model, name="Draft")
+    assert "Draft summary:" in caplog.text
+    assert "Model summary:" not in caplog.text
 
 
 def test_print_trainable_parameters_non_zero_rank(dummy_model, capsys, monkeypatch):
@@ -543,3 +556,131 @@ class TestSqueezeInputForThd:
 
         assert kw["cu_seqlens"].tolist() == [0, 3, 5]
         assert kw["cu_seqlens_padded"].tolist() == [0, 4, 6]
+
+
+# =============================================================================
+# Tests for enable_radio_vit_fused_attn
+# =============================================================================
+
+
+def _build_radio_model(num_blocks: int = 3, attach_via_nested_model: bool = False, attn_present: bool = True):
+    """Build a stub mirroring ``model.[model.]vision_model.radio_model.model.blocks[*].attn.fused_attn``."""
+
+    class Attn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fused_attn = False
+
+    class Block(nn.Module):
+        def __init__(self, with_attn: bool):
+            super().__init__()
+            if with_attn:
+                self.attn = Attn()
+            # else: no `attn` attribute at all → exercises the `attn is None` skip
+
+    class RadioInner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList([Block(attn_present) for _ in range(num_blocks)])
+
+    class RadioModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = RadioInner()
+
+    class VisionModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.radio_model = RadioModel()
+
+    class Outer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            if attach_via_nested_model:
+
+                class Inner(nn.Module):
+                    def __init__(self):
+                        super().__init__()
+                        self.vision_model = VisionModel()
+
+                self.model = Inner()
+            else:
+                self.vision_model = VisionModel()
+
+    return Outer()
+
+
+def test_enable_radio_vit_fused_attn_flips_blocks_top_level():
+    """All blocks reachable via ``model.vision_model.radio_model.model.blocks`` flip to fused_attn=True."""
+    model = _build_radio_model(num_blocks=3)
+    model_utils.enable_radio_vit_fused_attn(model)
+
+    for block in model.vision_model.radio_model.model.blocks:
+        assert block.attn.fused_attn is True
+
+
+def test_enable_radio_vit_fused_attn_flips_blocks_nested_model():
+    """Resolves vision_model via the ``model.model.vision_model`` path used by HF wrappers."""
+    model = _build_radio_model(num_blocks=2, attach_via_nested_model=True)
+    model_utils.enable_radio_vit_fused_attn(model)
+
+    for block in model.model.vision_model.radio_model.model.blocks:
+        assert block.attn.fused_attn is True
+
+
+def test_enable_radio_vit_fused_attn_noop_without_radio():
+    """No vision tower → silent no-op (does not raise)."""
+    model = nn.Linear(4, 4)
+    model_utils.enable_radio_vit_fused_attn(model)
+
+
+def test_enable_radio_vit_fused_attn_skips_blocks_without_attn():
+    """Blocks without an ``attn`` attribute are skipped, not crashed on."""
+    model = _build_radio_model(num_blocks=2, attn_present=False)
+    model_utils.enable_radio_vit_fused_attn(model)  # must not raise
+
+
+# =============================================================================
+# Tests for freeze_video_embedder branch in apply_parameter_freezing
+# =============================================================================
+
+
+@pytest.fixture()
+def video_embedder_model() -> nn.Module:
+    """Model exposing a ``patch_generator.video_embedder`` parameter."""
+
+    class PatchGenerator(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.video_embedder = nn.Linear(4, 4)
+            self.image_embedder = nn.Linear(4, 4)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.patch_generator = PatchGenerator()
+            self.language_head = nn.Linear(4, 4)
+
+    return Model()
+
+
+def test_freeze_video_embedder_true_freezes_only_video_embedder(video_embedder_model):
+    """``freeze_video_embedder=True`` freezes ``patch_generator.video_embedder.*`` only."""
+    model_utils.apply_parameter_freezing(
+        video_embedder_model,
+        {"freeze_vision_tower": False, "freeze_video_embedder": True},
+    )
+
+    assert not _any_requires_grad(video_embedder_model.patch_generator.video_embedder)
+    assert _all_requires_grad(video_embedder_model.patch_generator.image_embedder)
+    assert _all_requires_grad(video_embedder_model.language_head)
+
+
+def test_freeze_video_embedder_false_keeps_video_embedder_trainable(video_embedder_model):
+    """Default ``freeze_video_embedder=False`` leaves the video embedder trainable."""
+    model_utils.apply_parameter_freezing(
+        video_embedder_model,
+        {"freeze_vision_tower": False, "freeze_video_embedder": False},
+    )
+
+    assert _all_requires_grad(video_embedder_model.patch_generator.video_embedder)

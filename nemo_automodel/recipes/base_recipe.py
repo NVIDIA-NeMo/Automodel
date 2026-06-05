@@ -343,6 +343,8 @@ class BaseRecipe:
             torch.distributed.barrier()
 
         model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
+        step_scheduler = getattr(self, "step_scheduler", None)
+        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
 
         for key in sorted(self.__dict__["__state_tracked"]):
             if is_model(getattr(self, key)):
@@ -369,7 +371,13 @@ class BaseRecipe:
         # For multi-stage PP models, use checkpointer directly to handle all parts
         # For single models, use save_pretrained for HF-compatible API
         if isinstance(model, list) and len(model) > 1:
-            self.checkpointer.save_model(model, path, peft_config=self.peft_config, tokenizer=tokenizer)
+            self.checkpointer.save_model(
+                model,
+                path,
+                peft_config=self.peft_config,
+                tokenizer=tokenizer,
+                is_final_checkpoint=is_final_checkpoint,
+            )
         else:
             unwrapped_model = model[0] if isinstance(model, list) else model
             # Unwrap DDP if present
@@ -387,14 +395,23 @@ class BaseRecipe:
                         checkpointer=self.checkpointer,
                         tokenizer=tokenizer,
                         peft_config=self.peft_config,
+                        is_final_checkpoint=is_final_checkpoint,
                     )
                 else:
                     self.checkpointer.save_model(
-                        model=unwrapped_model, weights_path=path, peft_config=self.peft_config, tokenizer=tokenizer
+                        model=unwrapped_model,
+                        weights_path=path,
+                        peft_config=self.peft_config,
+                        tokenizer=tokenizer,
+                        is_final_checkpoint=is_final_checkpoint,
                     )
             else:
                 self.checkpointer.save_model(
-                    model=unwrapped_model, weights_path=path, peft_config=self.peft_config, tokenizer=tokenizer
+                    model=unwrapped_model,
+                    weights_path=path,
+                    peft_config=self.peft_config,
+                    tokenizer=tokenizer,
+                    is_final_checkpoint=is_final_checkpoint,
                 )
 
         # Sync before checkpointing for Dion
@@ -586,7 +603,24 @@ class BaseRecipe:
 
         model, optimizer, scheduler = self._load_checkpoint_tracked_state(ckpt_dir)
 
-        self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
+        # Composite models (e.g. ``Gemma4WithDrafter``) save weights to multiple
+        # HF-format sub-directories instead of a single ``model/`` dir. Dispatch
+        # to the model's own ``load_pretrained`` when it provides one so the
+        # composite knows how to read its custom layout. This mirrors the
+        # save-side dispatch in ``save_checkpoint``.
+        from torch.nn.parallel import DistributedDataParallel
+
+        # ``model`` here may be a single ``nn.Module`` (LLM/diffusion recipes)
+        # or a ``list[nn.Module]`` (VLM recipe stores ``self.model_parts``).
+        # Peek at the first element when given a single-item list so we can
+        # check for the composite hook regardless of recipe shape.
+        candidate = model[0] if isinstance(model, list) and len(model) == 1 else model
+        if isinstance(candidate, DistributedDataParallel):
+            candidate = candidate.module
+        if hasattr(candidate, "load_pretrained") and hasattr(candidate.load_pretrained, "__func__"):
+            candidate.load_pretrained(ckpt_dir, checkpointer=self.checkpointer)
+        else:
+            self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
         self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
 
     def _log_experiment_details(self):

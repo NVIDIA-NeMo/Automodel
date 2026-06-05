@@ -177,6 +177,145 @@ def test_ensure_params_trainable_returns_correct_count():
 
 
 # =============================================================================
+# FP8/linear helper tests
+# =============================================================================
+
+
+def test_is_fp8_training_safe_linear_accepts_multiple_of_16_shapes():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _is_fp8_training_safe_linear
+
+    assert _is_fp8_training_safe_linear("block.attn.to_q", torch.nn.Linear(32, 64))
+
+
+@pytest.mark.parametrize(
+    ("name", "linear"),
+    [
+        ("block.attn.to_q", torch.nn.Linear(30, 64)),
+        ("time_text_embed.proj", torch.nn.Linear(32, 64)),
+        ("norm_out.linear", torch.nn.Linear(32, 64)),
+        ("block.norm.linear", torch.nn.Linear(32, 64)),
+    ],
+)
+def test_is_fp8_training_safe_linear_rejects_known_unsafe_cases(name, linear):
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _is_fp8_training_safe_linear
+
+    assert not _is_fp8_training_safe_linear(name, linear)
+
+
+def test_replace_linear_with_transformer_engine_copies_weights_and_skips_unsafe_modules():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _replace_linear_with_transformer_engine
+
+    class FakeTransformerEngineLinear(torch.nn.Linear):
+        def __init__(self, in_features, out_features, bias=True, device=None, params_dtype=None):
+            super().__init__(in_features, out_features, bias=bias, device=device, dtype=params_dtype)
+
+    class MixedLinearModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.safe = torch.nn.Linear(16, 32)
+            self.unsafe = torch.nn.Linear(15, 32, bias=False)
+            self.nested = torch.nn.Sequential(torch.nn.Linear(16, 16, bias=False))
+
+    module = MixedLinearModule()
+    module.eval()
+    safe_weight = module.safe.weight.detach().clone()
+    nested_weight = module.nested[0].weight.detach().clone()
+    module.safe.weight.requires_grad_(False)
+
+    fake_transformer_engine = SimpleNamespace(pytorch=SimpleNamespace(Linear=FakeTransformerEngineLinear))
+    with patch(f"{MODULE_PATH}.safe_import_te", return_value=(True, fake_transformer_engine)):
+        converted = _replace_linear_with_transformer_engine(module, "transformer", fp8_safe_only=True)
+
+    assert converted == 2
+    assert isinstance(module.safe, FakeTransformerEngineLinear)
+    assert isinstance(module.nested[0], FakeTransformerEngineLinear)
+    assert isinstance(module.unsafe, torch.nn.Linear)
+    assert not isinstance(module.unsafe, FakeTransformerEngineLinear)
+    assert not module.safe.training
+    assert not module.safe.weight.requires_grad
+    assert torch.allclose(module.safe.weight, safe_weight)
+    assert torch.allclose(module.nested[0].weight, nested_weight)
+
+
+def test_replace_linear_with_transformer_engine_requires_optional_dependency():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _replace_linear_with_transformer_engine
+
+    with patch(f"{MODULE_PATH}.safe_import_te", return_value=(False, None)):
+        with pytest.raises(ImportError, match="transformer_engine.pytorch"):
+            _replace_linear_with_transformer_engine(DummyModule(), "transformer")
+
+
+def test_compact_fused_qkv_projection_modules_removes_only_fused_original_projections():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _compact_fused_qkv_projection_modules
+
+    class AttentionModule(torch.nn.Module):
+        def __init__(self, *, fused_projections):
+            super().__init__()
+            self.fused_projections = fused_projections
+            self.to_qkv = torch.nn.Linear(2, 6, bias=False)
+            self.to_q = torch.nn.Linear(2, 2, bias=False)
+            self.to_k = torch.nn.Linear(2, 2, bias=False)
+            self.to_v = torch.nn.Linear(2, 2, bias=False)
+            self.to_added_qkv = torch.nn.Linear(2, 6, bias=False)
+            self.add_q_proj = torch.nn.Linear(2, 2, bias=False)
+            self.add_k_proj = torch.nn.Linear(2, 2, bias=False)
+            self.add_v_proj = torch.nn.Linear(2, 2, bias=False)
+
+    module = torch.nn.Module()
+    module.fused = AttentionModule(fused_projections=True)
+    module.unfused = AttentionModule(fused_projections=False)
+    expected_removed_parameters = sum(
+        parameter.numel()
+        for projection_name in ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj")
+        for parameter in getattr(module.fused, projection_name).parameters()
+    )
+
+    removed_modules, removed_parameters = _compact_fused_qkv_projection_modules(module, "transformer")
+
+    assert removed_modules == 6
+    assert removed_parameters == expected_removed_parameters
+    for projection_name in ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj"):
+        assert not hasattr(module.fused, projection_name)
+        assert hasattr(module.unfused, projection_name)
+    assert hasattr(module.fused, "to_qkv")
+    assert hasattr(module.fused, "to_added_qkv")
+
+
+def test_fuse_transformer_qkv_projections_calls_hook_and_counts_fused_modules():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _fuse_transformer_qkv_projections
+
+    class AttentionModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fused_projections = False
+
+    class TransformerModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn1 = AttentionModule()
+            self.attn2 = AttentionModule()
+
+        def fuse_qkv_projections(self):
+            self.attn1.fused_projections = True
+            self.attn2.fused_projections = True
+
+    transformer = TransformerModule()
+
+    fused = _fuse_transformer_qkv_projections(transformer, "transformer")
+
+    assert fused == 2
+    assert transformer.attn1.fused_projections
+    assert transformer.attn2.fused_projections
+
+
+def test_fuse_transformer_qkv_projections_requires_diffusers_hook():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _fuse_transformer_qkv_projections
+
+    with pytest.raises(AttributeError, match="fuse_qkv_projections"):
+        _fuse_transformer_qkv_projections(DummyModule(), "transformer")
+
+
+# =============================================================================
 # PipelineSpec tests
 # =============================================================================
 
@@ -604,6 +743,51 @@ def test_from_pretrained_components_to_load_filters_modules():
     assert mock_move.call_args[0][0] is unet
 
 
+def test_from_pretrained_applies_transformer_qkv_and_te_options():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    transformer = DummyModule()
+    dummy_pipe = DummyPipeline({"transformer": transformer, "text_encoder": DummyModule()})
+    mock_diffusion_pipeline = MagicMock()
+    mock_diffusion_pipeline.from_pretrained.return_value = dummy_pipe
+
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
+        patch(f"{MODULE_PATH}._fuse_transformer_qkv_projections") as mock_fuse,
+        patch(f"{MODULE_PATH}._replace_linear_with_transformer_engine") as mock_replace_linear,
+    ):
+        NeMoAutoDiffusionPipeline.from_pretrained(
+            "dummy",
+            move_to_device=False,
+            fuse_qkv_projections=True,
+            compact_fused_qkv_projections=True,
+            transformer_engine_linear=True,
+            transformer_engine_fp8_safe_only=True,
+        )
+
+    mock_fuse.assert_called_once_with(transformer, "transformer", compact=True)
+    mock_replace_linear.assert_called_once_with(transformer, "transformer", fp8_safe_only=True)
+
+
+def test_from_pretrained_rejects_compact_qkv_without_fusion():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    mock_diffusion_pipeline = MagicMock()
+    mock_diffusion_pipeline.from_pretrained.return_value = DummyPipeline({"transformer": DummyModule()})
+
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
+    ):
+        with pytest.raises(ValueError, match="compact_fused_qkv_projections=true"):
+            NeMoAutoDiffusionPipeline.from_pretrained(
+                "dummy",
+                move_to_device=False,
+                compact_fused_qkv_projections=True,
+            )
+
+
 # =============================================================================
 # from_config tests
 # =============================================================================
@@ -650,6 +834,26 @@ def test_from_config_raises_without_transformer_cls():
     ):
         with pytest.raises(ValueError, match="transformer_cls is required"):
             NeMoAutoDiffusionPipeline.from_config("dummy", pipeline_spec={})
+
+
+def test_from_config_rejects_compact_qkv_without_fusion():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    mock_transformer_cls = MagicMock()
+    mock_transformer_cls.load_config.return_value = {}
+    mock_transformer_cls.from_config.return_value = DummyModule()
+
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}._import_diffusers_class", return_value=mock_transformer_cls),
+    ):
+        with pytest.raises(ValueError, match="compact_fused_qkv_projections=true"):
+            NeMoAutoDiffusionPipeline.from_config(
+                "model-id",
+                pipeline_spec={"transformer_cls": "FakeTransformer"},
+                move_to_device=False,
+                compact_fused_qkv_projections=True,
+            )
 
 
 def test_from_config_full_pipeline_mode():

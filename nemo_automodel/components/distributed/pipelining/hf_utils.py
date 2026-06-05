@@ -29,6 +29,7 @@ TEXT_MODULE_ATTRS = ("language_model", "text_model", "text_decoder")
 MULTIMODAL_SUFFIXES = (
     "vision_tower",
     "visual",
+    "vision_model",
     "image_encoder",
     "vision_encoder",
     "embed_vision",
@@ -39,6 +40,7 @@ MULTIMODAL_SUFFIXES = (
     "multi_modal_projector",
     "multimodal_projector",
     "vision_projector",
+    "vit_large_projector",
     "audio_projector",
 )
 

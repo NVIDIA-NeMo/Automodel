@@ -45,7 +45,7 @@ docker run --gpus all -it --rm --shm-size=8g -v $(pwd)/checkpoints:/tmp/checkpoi
 ```
 
 :::{important}
-Docker containers are ephemeral — files written inside the container are lost when it stops. The `-v` flag in the `docker run` command above bind-mounts a local `checkpoints/` directory into the container so that saved checkpoints persist across runs. For more details, see [Saving Checkpoints When Using Docker](../checkpointing.md#saving-checkpoints-when-using-docker).
+Docker containers are ephemeral — files written inside the container are lost when it stops. The `-v` flag in the `docker run` command above bind-mounts a local `checkpoints/` directory into the container so that saved checkpoints persist across runs. For more details, see [Save Checkpoints When Using Docker](../checkpointing.md#save-checkpoints-when-using-docker).
 :::
 
 For the full set of installation methods, see the [installation guide](../installation.md).
@@ -146,7 +146,7 @@ model:
 | Key | Role |
 |-----|------|
 | `_target_` | Points to [`NeMoAutoModelForCausalLM.from_pretrained`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/auto_model.py) — a factory method that downloads (or loads from cache) a pretrained Hugging Face model and wraps it with NeMo distributed-training support. |
-| `pretrained_model_name_or_path` | A keyword argument to `from_pretrained`. Any argument that [`from_pretrained`](https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.from_pretrained) accepts can be added here (e.g. `cache_dir`, `torch_dtype`). |
+| `pretrained_model_name_or_path` | A keyword argument to `from_pretrained`. Any argument that [`from_pretrained`](https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.from_pretrained) accepts can be added here (e.g., `cache_dir`, `torch_dtype`). |
 
 This guide uses **Meta Llama 3.2 1B** as a running example. Replace `pretrained_model_name_or_path` with any supported [Hugging Face model ID](../../model-coverage/llm/index.md).
 
@@ -154,7 +154,7 @@ This guide uses **Meta Llama 3.2 1B** as a running example. Replace `pretrained_
 Llama is a family of decoder-only transformer models developed by Meta. The 1B variant is a compact model suitable for research and edge deployment, featuring RoPE positional embeddings, grouped-query attention (GQA), and SwiGLU activations.
 :::
 
-:::{dropdown} Accessing gated models
+:::{dropdown} Accessing Gated Models
 Some Hugging Face models are **gated**. If the model page shows a "Request access" button:
 
 1. Log in with your Hugging Face account and accept the license.
@@ -185,7 +185,7 @@ validation_dataset:
 This guide uses **SQuAD v1.1** as a running example. Swap the dataset by changing `_target_` and the dataset arguments — see [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md).
 
 :::{dropdown} About SQuAD v1.1
-The Stanford Question Answering Dataset (SQuAD) is a reading comprehension dataset where each example consists of a Wikipedia passage, a question, and a span answer. SQuAD v1.1 guarantees all questions are answerable from the context, making it suitable for straightforward fine-tuning.
+The Stanford Question Answering Dataset (SQuAD) is a reading comprehension dataset where each example consists of a Wikipedia passage, a question, and an answer span. SQuAD v1.1 guarantees all questions are answerable from the context, making it suitable for straightforward fine-tuning.
 
 Example:
 ```json
@@ -214,7 +214,7 @@ peft:
 | `dim` | The low-rank dimension *r* — controls adapter capacity. Larger values learn more but use more memory. |
 | `alpha` | Scaling factor applied to the adapter output (`alpha / dim`). Higher values give adapters more influence during training. |
 
-Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run SFT instead — see [Switching Between SFT and PEFT](#switching-between-sft-and-peft).
+Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run SFT instead — see [Switch Between SFT and PEFT](#switch-between-sft-and-peft).
 
 #### QLoRA (Quantized Low-Rank Adaptation)
 
@@ -254,9 +254,13 @@ Unlike the sections above, `step_scheduler` has **no `_target_`** — it is not 
 
 All other settings (distributed strategy, optimizer, checkpointing, logging) use sensible defaults. See the [Full Configuration Reference](#full-configuration-reference) to customize them.
 
+:::{note}
+Most example recipes use bf16 training by default for memory and throughput. If you are running long fine-tuning, especially full-parameter SFT, and need higher-precision optimizer state, configure it explicitly instead of assuming it from the mixed-precision compute policy. See the [mixed-precision training guide](../mixed-precision-training.md) for the recommended TE and torch AdamW patterns.
+:::
+
 ### Full Config YAML
 
-:::{dropdown} finetune_config.yaml (click to expand)
+:::{dropdown} finetune_config.yaml (Click to Expand)
 Save as `finetune_config.yaml`. This config runs PEFT (LoRA). To run SFT instead, remove the `peft:` section. For production-ready examples, see the hosted configs: [Llama 3.2 1B SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) and [Llama 3.2 1B PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad_peft.yaml).
 
 ```yaml
@@ -293,9 +297,9 @@ You can run the recipe using the AutoModel CLI or directly with `torchrun` (adva
 automodel --nproc-per-node=8 finetune_config.yaml
 ```
 
-The `--nproc-per-node=8` flag specifies the number of GPUs per node. Adjust to your case (for a single GPU, omit the `--nproc-per-node` option).
+The `--nproc-per-node=8` flag specifies the number of GPUs per node. Adjust as needed (for a single GPU, omit the `--nproc-per-node` option).
 
-### Invoke the Recipe Script Directly (advanced)
+### Invoke the Recipe Script Directly (Advanced)
 
 Alternatively, you can invoke the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
 
@@ -304,7 +308,7 @@ torchrun --nproc-per-node=8 nemo_automodel/recipes/llm/train_ft.py -c finetune_c
 ```
 
 ### Sample Output
-Running the recipe using either the `automodel` app or by directly invoking the recipe script should produce
+Running the recipe with the `automodel` app or by invoking the recipe script directly produces the following log:
 the following log:
 ```
 $ automodel finetune_config.yaml
@@ -326,9 +330,9 @@ Each log line reports the current loss, gradient norm, peak GPU memory, and toke
 
 ### Checkpoint Contents
 
-Checkpoints are saved in native Hugging Face format, so no conversion is required — they work directly with Transformers, PEFT, vLLM, lm-eval-harness, and other tools in the Hugging Face ecosystem. SFT and PEFT produce different checkpoint layouts. **SFT checkpoints** contain the full model weights at `model/consolidated/` — a single, self-contained Hugging Face model directory created by gathering distributed shards into one location — and can be loaded directly. **PEFT checkpoints** contain only the adapter weights (~MBs instead of GBs) — at inference time you must load the original base model and apply the adapter on top. This distinction affects every downstream step (inference, publishing, deployment).
+Checkpoints are saved as Hugging Face-compatible safetensors. By default, SFT writes sharded model weights plus a generated `model/consolidate.sh` helper; run the helper after training to create `model/consolidated/` for Transformers, vLLM, lm-eval-harness, and other Hugging Face ecosystem tools. You can also set `save_consolidated: final` to export consolidated HF weights only for the final checkpoint. Use `save_consolidated: every` (or legacy `true`) only when you intentionally want inline HF export at every checkpoint save. **PEFT checkpoints** contain only the adapter weights (~MBs instead of GBs) and are saved directly under `model/`. They do not use `model/consolidate.sh` — at inference time you must load the original base model and apply the adapter on top. This distinction affects every downstream step (inference, publishing, deployment).
 
-:::{dropdown} Checkpoint directory structure
+:::{dropdown} Checkpoint Directory Structure
 **SFT checkpoint:**
 ```bash
 $ tree checkpoints/epoch_0_step_10/
@@ -336,14 +340,7 @@ checkpoints/epoch_0_step_10/
 ├── config.yaml
 ├── dataloader.pt
 ├── model
-│   ├── consolidated
-│   │   ├── config.json
-│   │   ├── model-00001-of-00001.safetensors
-│   │   ├── model.safetensors.index.json
-│   │   ├── special_tokens_map.json
-│   │   ├── tokenizer.json
-│   │   ├── tokenizer_config.json
-│   │   └── generation_config.json
+│   ├── consolidate.sh
 │   ├── shard-00001-model-00001-of-00001.safetensors
 │   └── shard-00002-model-00001-of-00001.safetensors
 ├── optim
@@ -352,7 +349,7 @@ checkpoints/epoch_0_step_10/
 ├── rng.pt
 └── step_scheduler.pt
 
-4 directories, 11 files
+3 directories, 9 files
 ```
 
 **PEFT checkpoint:**
@@ -377,11 +374,17 @@ checkpoints/epoch_0_step_10/
 
 ## Run Inference
 
-Inference uses the Hugging Face `generate` API. Because SFT checkpoints are self-contained while PEFT checkpoints store only adapter weights (see [Checkpoint Contents](#checkpoint-contents)), the loading procedure differs between the two modes.
+Inference uses the Hugging Face `generate` API. Because exported SFT checkpoints are self-contained while PEFT checkpoints store only adapter weights (see [Checkpoint Contents](#checkpoint-contents)), the loading procedure differs between the two modes.
 
 ### SFT Inference
 
-The SFT checkpoint at `model/consolidated/` is a complete Hugging Face model and can be loaded directly:
+If `save_consolidated: false`, first run the generated helper for the checkpoint you want to load:
+
+```bash
+bash checkpoints/epoch_0_step_10/model/consolidate.sh
+```
+
+The exported SFT checkpoint at `model/consolidated/` is a complete Hugging Face model and can be loaded directly:
 
 ```python
 import torch
@@ -453,7 +456,7 @@ A decreasing validation loss across checkpoints indicates the model is learning.
 
 ### After Training: lm-eval-harness
 
-For task-specific benchmarks (e.g., MMLU, GSM8k, HellaSwag accuracy), use [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness) with the fine-tuned checkpoint:
+For task-specific benchmarks (e.g., MMLU, GSM8K, HellaSwag accuracy), use [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness) with the fine-tuned checkpoint. For SFT runs with `save_consolidated: false`, run `bash checkpoints/epoch_0_step_20/model/consolidate.sh` before pointing evaluation at `model/consolidated/`:
 
 ```bash
 pip install lm-eval
@@ -481,7 +484,7 @@ Run lm-eval-harness on the base model *before* fine-tuning to establish a baseli
 
 ## Publish to the Hugging Face Hub
 
-Fine-tuned checkpoints and PEFT adapters are stored in Hugging Face-native format and can be uploaded directly to the Hub.
+Fine-tuned checkpoints and PEFT adapters are stored in Hugging Face-native format and can be uploaded directly to the Hub. For SFT runs with `save_consolidated: false`, upload `model/consolidated/` after running the generated consolidation helper.
 
 1. Install the Hugging Face Hub library (if not already installed):
 
@@ -549,6 +552,8 @@ Make sure vLLM is installed (`pip install vllm`, or use an environment that incl
 
 ### SFT Checkpoint with vLLM
 
+If `save_consolidated: false`, run the generated `model/consolidate.sh` helper before serving from `model/consolidated/`.
+
 ```python
 from vllm import LLM, SamplingParams
 
@@ -596,7 +601,7 @@ if __name__ == '__main__':
 
 This section documents all available config fields for the fine-tuning recipe. For the quick-start config, see [Configure Your Training Recipe](#configure-your-training-recipe).
 
-### Switching Between SFT and PEFT
+### Switch Between SFT and PEFT
 
 The `peft:` section controls which mode runs:
 
@@ -696,9 +701,8 @@ checkpoint:
                                 # to persist checkpoints across container restarts.
   model_save_format: safetensors  # "safetensors" (recommended, faster and safer) or
                                   # "torch_save" (legacy pickle-based format)
-  save_consolidated: True  # when true, writes a single HuggingFace-compatible checkpoint
-                           # to model/consolidated/ that can be loaded directly by
-                           # Transformers, vLLM, etc. Requires safetensors format.
+  save_consolidated: final # recommended: export consolidated HF weights only for the final checkpoint.
+                           # Other modes: false (sharded only) or every/true (export every checkpoint).
 
 # Training Dataset
 # _target_ → make_squad_dataset: a factory function that downloads the SQuAD
@@ -784,7 +788,7 @@ optimizer:
 | `step_scheduler` | Yes | `grad_acc_steps` sets how many micro-batches accumulate per gradient step. `ckpt_every_steps` and `val_every_steps` are counted in gradient steps. |
 | `distributed` | Yes | `dp_size: null` means auto-detect from world size. Adjust `tp_size` for tensor parallelism across GPUs. |
 | `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. |
-| `optimizer` | Optional | Defaults are reasonable. Any `torch.optim` class can be substituted via `_target_`. |
+| `optimizer` | Optional | Defaults are reasonable. Any `torch.optim` class can be substituted via `_target_`. For long fine-tuning, especially full-parameter SFT, see the [mixed-precision training guide](../mixed-precision-training.md) before combining torch AdamW with bf16 resident parameters. |
 | `wandb` | Optional | Uncomment and configure to enable Weights & Biases logging. |
 
 For the fine-tuning recipe itself, see [`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py). For more example configs, browse [`examples/llm_finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune).
@@ -815,7 +819,7 @@ dp_size = world_size ÷ (tp_size × cp_size × pp_size)
 
 EP does not appear in this formula — experts are distributed across the DP×CP rank groups, with the constraint that `(dp_size × cp_size)` must be divisible by `ep_size`.
 
-#### Data Parallel (default)
+#### Data Parallel (Default)
 
 Data parallelism is the default. With `strategy: fsdp2`, FSDP2 shards both model parameters and optimizer states across the DP group, so memory usage shrinks as you add GPUs:
 
@@ -888,7 +892,7 @@ distributed:
 When `cp_size > 1`, fused RoPE is automatically disabled. Some models also require the Transformer Engine (TE) attention backend for CP with packed sequences — the framework will raise an error with instructions if this applies.
 :::
 
-#### Expert Parallelism (MoE models)
+#### Expert Parallelism (MoE Models)
 
 EP distributes MoE experts across GPUs. Set `ep_size` to the number of GPUs that share the full set of experts:
 
@@ -902,9 +906,9 @@ distributed:
   activation_checkpointing: true
 ```
 
-EP only applies to Mixture-of-Experts models (e.g. Qwen3-MoE, Mixtral, DeepSeek-V3). For dense models, leave `ep_size` at `1` or omit it.
+EP only applies to Mixture-of-Experts models (e.g., Qwen3-MoE, Mixtral, DeepSeek-V3). For dense models, leave `ep_size` at `1` or omit it.
 
-#### Combining Multiple Dimensions
+#### Combine Multiple Dimensions
 
 You can combine TP, PP, CP, and EP in a single config. For example, a large MoE model on a multi-node cluster might use:
 

@@ -257,6 +257,7 @@ _IMSTART_TEMPLATE_PROCESSORS = frozenset(
     {
         "Qwen2VLProcessor",
         "Qwen2_5_VLProcessor",
+        "Qwen2_5OmniProcessor",
         "Qwen3VLProcessor",
         "Qwen3VLMoeProcessor",
         "Qwen3OmniMoeProcessor",
@@ -866,6 +867,22 @@ def qwen3_omni_asr_collate_fn(
             batch[key] = value[:, :-1]
 
     return batch
+
+
+def qwen2_5_omni_asr_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+) -> Dict[str, torch.Tensor]:
+    """Collate Qwen2.5-Omni ASR conversations.
+
+    Thin alias over :func:`qwen3_omni_asr_collate_fn`: the body is processor-
+    agnostic (it only depends on the processor exposing ``apply_chat_template``
+    and the ``audio=`` kwarg, both of which ``Qwen2_5OmniProcessor`` provides),
+    so the entire Qwen3-Omni-ASR path works unchanged here. We expose a
+    separate symbol so YAML configs can pick the right collate via
+    ``_target_`` without users having to know about the Qwen3-Omni name.
+    """
+    return qwen3_omni_asr_collate_fn(examples, processor)
 
 
 def kimi_vl_collate_fn(
@@ -2161,6 +2178,7 @@ def llava_onevision_collate_fn(
 # Mapping of processor types to their collate functions
 COLLATE_FNS = {
     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
+    "Qwen2_5OmniProcessor": qwen2_5_omni_asr_collate_fn,
     "Qwen3OmniMoeProcessor": qwen3_omni_collate_fn,
     "KimiVLProcessor": kimi_vl_collate_fn,
     "KimiK25Processor": kimi_k25_vl_collate_fn,
