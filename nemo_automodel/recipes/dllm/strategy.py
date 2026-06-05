@@ -38,6 +38,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.datasets.dllm.corruption import (
+    corrupt_all_masked,
     corrupt_blockwise,
     corrupt_uniform,
 )
@@ -45,6 +46,7 @@ from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loss.dllm_loss import (
     HybridDiffusionLLMLoss,
+    IDLMLoss,
     MDLMCrossEntropyLoss,
 )
 
@@ -220,6 +222,91 @@ class HybridStrategy(DLLMStrategy):
         batch["labels"] = clean_input_ids
         batch["skip_loss"] = True
         return batch
+
+
+class IDLMStrategy(DLLMStrategy):
+    """Strategy for Introspective Diffusion LM (I-DLM) all-masked finetuning.
+
+    Converts an AR causal LM into a diffusion LM (Yu et al., 2026):
+
+    - Corruption: deterministic all-masked over the supervised region
+      (:func:`corrupt_all_masked`).
+    - Attention: **strict causal** — unlike MDLM/LLaDA the model keeps its
+      causal mask (the prompt stays a clean introspective verify signal).
+    - Loss: :class:`IDLMLoss` (Dream-shifted ``CE_noisy + alpha*CE_clean``).
+
+    A single causal forward over the masked input yields both losses, so this
+    overrides :meth:`forward_backward` (the loss needs the padding-validity
+    mask, which the shared MDLM loss path does not thread through).
+    """
+
+    def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
+        return IDLMLoss(
+            clean_loss_weight=float(dllm_cfg.get("clean_loss_weight", 0.2)),
+            auto_balance=bool(dllm_cfg.get("auto_balance_clean_loss", False)),
+        )
+
+    def apply_corruption(self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio):
+        return corrupt_all_masked(input_ids, loss_mask, mask_token_id)
+
+    def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
+        # Model sees the masked tokens under its native causal mask (kept, not
+        # popped — I-DLM is strict-causal, not bidirectional like MDLM).
+        batch["input_ids"] = noisy_input_ids
+        return batch
+
+    def forward_backward(
+        self,
+        recipe,
+        idx: int,
+        batch: dict,
+        *,
+        loss_buffer: list,
+        num_diffusion_tokens: int,
+        num_ar_tokens: Optional[int] = None,
+        num_batches: int,
+        is_train: bool = True,
+    ) -> None:
+        """I-DLM microbatch: single causal forward over the masked input + two-CE loss."""
+        device = recipe.dist_env.device
+        batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+        clean_input_ids = batch.pop("_clean_input_ids")
+        noisy_input_ids = batch.pop("_noisy_input_ids")
+        noise_mask = batch.pop("_noise_mask")
+        batch.pop("_p_mask", None)
+        batch.pop("loss_mask", None)
+        attn = batch.get("attention_mask")
+        if attn is None:
+            attn = torch.ones_like(noisy_input_ids)
+
+        model = recipe.model_parts[0]
+        sync_ctx = (
+            get_sync_ctx(
+                model,
+                idx == num_batches - 1,
+                defer_fsdp_grad_sync=getattr(recipe.distributed_config, "defer_fsdp_grad_sync", True),
+            )
+            if is_train
+            else nullcontext()
+        )
+        autocast_dtype = getattr(recipe.distributed_config, "autocast_dtype", None)
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
+        )
+        fp8_ctx = recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
+        train_ctx, _ = make_cp_batch_and_ctx(recipe.device_mesh, {})
+
+        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+            out = model(input_ids=noisy_input_ids, attention_mask=attn, use_cache=False)
+            logits = out.logits if not torch.is_tensor(out) else out
+            loss_result = recipe.dllm_loss_fn(logits, clean_input_ids, noise_mask, attn)
+            microbatch_loss = loss_result.total_loss
+            loss_buffer.append(microbatch_loss.detach().clone())
+            recipe._dllm_loss_buffer.append(loss_result.dllm_loss)
+
+            if is_train:
+                (microbatch_loss * recipe._get_dp_group_size(include_cp=True)).backward()
 
 
 class DFlashStrategy(DLLMStrategy):
@@ -741,6 +828,7 @@ class DFlashStrategy(DLLMStrategy):
 DLLM_STRATEGIES: Dict[str, type] = {
     "mdlm": MDLMStrategy,
     "hybrid": HybridStrategy,
+    "idlm": IDLMStrategy,
     "dflash": DFlashStrategy,
 }
 
