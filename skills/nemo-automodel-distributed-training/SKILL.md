@@ -498,11 +498,10 @@ components/distributed/mesh.py
 
 Mesh context and raw mesh creation:
 
-```
-components/distributed/device_mesh.py
-    create_mesh_context()         -- builds MeshContext from strategy + parallelism
+components/distributed/mesh_utils.py
     _create_device_meshes()       -- routes to FSDP2/MegatronFSDP/DDP raw mesh creation
     _create_fsdp2_device_mesh()   -- shape (pp, dp_replicate, dp_shard, cp, tp) + flattened submeshes
+    _create_megatron_fsdp_device_mesh() -- shape (dp, cp, tp)
 ```
 
 Distributed managers:
