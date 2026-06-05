@@ -10,23 +10,23 @@ Precision settings have distinct effects:
 
 | Setting | Controls | Effect on optimizer state |
 | --- | --- | --- |
-| `model.torch_dtype` | Storage dtype of the sharded parameter that PyTorch holds. | The optimizer reads `param.data`, so the EMA buffers (`exp_avg`, `exp_avg_sq` for AdamW) end up in this dtype. |
+| `model.torch_dtype` | Storage dtype of the sharded parameter that PyTorch holds. | For `torch.optim`, the optimizer reads `param.data`, so the EMA buffers (`exp_avg`, `exp_avg_sq` for AdamW) end up in this dtype. (TE FusedAdam keeps fp32 state regardless.) |
 | `mp_policy.param_dtype` | Compute dtype FSDP2 casts to during forward/backward. | None directly; this only affects matmul / activation precision. |
 | `mp_policy.reduce_dtype` | Dtype used for gradient reduce-scatter / all-reduce across DP ranks. | None directly; only affects how gradients are summed. |
 | `mp_policy.output_dtype` | Dtype FSDP2 casts module outputs to. | None directly; this affects activation tensors, including tensors that cross pipeline-parallel boundaries. |
 
 When `model.torch_dtype: bfloat16` is used with `torch.optim.AdamW`, the AdamW EMA buffers (`exp_avg` and `exp_avg_sq`) are also stored in bf16. This is fragile for long full-parameter training runs: bf16 has only a 7-bit mantissa, so small EMA updates can be rounded away even though the values themselves are still in range. Symptoms range from silent degradation - slower convergence, i.e., higher final loss at the same step count, with no visible instability - to overt failure: unstable `grad_norm`, loss bumps, loss spikes, or divergence.
 
-## Recommended fp32 Optimizer-State Patterns
+## Recommended fp32 Master Weight & Optimizer-State Patterns
 
-Use one of these patterns for long pre-training:
+Use one of these patterns for long full-parameter training (pre-training or extended fine-tuning):
 
-| Pattern | Model storage / checkpoint dtype | Optimizer state | When to use |
+| Pattern | Model storage dtype | Optimizer state | When to use |
 | --- | --- | --- | --- |
-| TE FusedAdam with bf16 model storage | bf16 | fp32 master weights + fp32 Adam EMA buffers | Use when the model has a validated TE memory/runtime path and you want training checkpoints to stay bf16. |
-| torch AdamW with `model.torch_dtype: float32` | fp32 | fp32 Adam EMA buffers | Use when the PyTorch optimizer path is the validated lower-memory or more stable path for that model. |
+| TE FusedAdam with bf16 model storage | bf16 | fp32 master weights + fp32 Adam EMA buffers | When TE has a validated memory/runtime path for the model and you want training checkpoints to stay bf16. |
+| torch AdamW with `model.torch_dtype: float32` | fp32 | fp32 master weight (the resident param) + fp32 Adam EMA buffers | Robust starting point for new or precision-sensitive models — params, gradients, and optimizer state are all fp32. Trade-off: writes fp32 training checkpoints. |
 
-Both patterns keep forward/backward compute in bf16 through FSDP2 mixed precision. They differ in where the fp32 master weight lives, how much memory the optimizer uses for a specific model, and what dtype is written to model checkpoints.
+Both patterns keep forward/backward compute in bf16 through FSDP2 mixed precision. They differ in where the fp32 master weight lives, how much peak memory they use for a specific model, and what dtype is written to the training checkpoint.
 
 ### Pattern A: TE FusedAdam + bf16 Model Storage
 
@@ -57,7 +57,11 @@ distributed:
     cast_forward_inputs: true
 ```
 
-TE FusedAdam is the cleanest way to request fp32 optimizer state without making the resident model parameter fp32. It is not a guaranteed memory reduction: depending on model architecture, sharding, and optimizer implementation details, TE can use either less or more memory than torch AdamW with fp32 resident parameters. Validate memory per model before making it the default.
+TE FusedAdam is the cleanest way to request fp32 optimizer state without making the resident model parameter fp32.
+
+It is a common misconception that TE costs extra memory for a second fp32 master. With `store_param_remainders: true` (as above), TE does **not** keep a full extra fp32 master: it stores the bf16 parameter plus a 16-bit remainder that together reconstruct the fp32 master, costing the same ~4 bytes/param as torch AdamW's fp32 resident parameter. The fp32 Adam EMA buffers (`exp_avg`, `exp_avg_sq`) are the same in both patterns, so the two optimizers' steady-state footprints are essentially equal. The practical difference is then simplicity (torch AdamW: no TE dependency, fewer moving parts) vs. keeping model storage and checkpoints in bf16 (TE).
+
+Where the two *can* differ is the gradient buffer: TE keeps the resident parameter in bf16, so its gradients are bf16, whereas torch AdamW with fp32 storage keeps parameters and gradients in fp32 (~2 bytes/param more on the gradient buffer). In practice what we measure is *peak* memory, which is usually dominated by activations rather than the optimizer step, so depending on the model (fraction of intrinsically-fp32 params, fragmentation, where the peak falls) TE can come out lower, equal, or higher. Validate memory per model before making it the default.
 
 ### Pattern B: torch AdamW + fp32 Model Storage
 
@@ -84,7 +88,13 @@ distributed:
 
 This is the PyTorch AdamW version of the master-weights pattern. Forward/backward run in bf16, the all-reduce / reduce-scatter runs in fp32, and the optimizer applies updates against fp32 resident parameters. With `torch.optim.AdamW`, the resident fp32 sharded parameter is the master weight, so there is no separate fp32 master-weight copy.
 
-The main artifact trade-off is checkpoint dtype: because AutoModel checkpoints the resident model parameters, this pattern writes model checkpoints in fp32. Keep those fp32 training checkpoints if you need exact resume. If you need a bf16 checkpoint for inference or release, export a separate model-only bf16 checkpoint after training.
+The trade-off is the dtype of the *training* checkpoint: AutoModel's training (DCP) checkpoint stores the resident model parameters, so this pattern writes them in fp32, which you keep for exact resume. This concerns only the training checkpoint; a consolidated HF checkpoint for inference or release is exported separately and follows the model's intended dtype (for fine-tuning this matches the original HF checkpoint, typically bf16). See [checkpointing](checkpointing.md) for details.
+
+### Precision and Robustness
+
+Both patterns keep the master weights and Adam EMA in fp32, so for most models they converge equivalently. The remaining difference is the gradient: under TE (Pattern A) the resident parameter is bf16, so the gradient feeding the Adam update carries bf16 rounding, while torch AdamW with fp32 storage (Pattern B) keeps the parameter, gradient, and optimizer state all in fp32.
+
+This is usually negligible. When bringing up a new model, fp32 storage (Pattern B) is a robust starting point because every part of the update path is fp32; move to TE (Pattern A) once it is validated for that model and you want bf16 checkpoints.
 
 ## Risky Pattern: torch AdamW with bf16 Model Storage
 
@@ -105,5 +115,5 @@ This keeps the resident model parameters in bf16 instead of fp32, so it can redu
 
 ## Example Configs
 
-- [`examples/llm_pretrain/llama3_70b_pretrain.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml) — TE FusedAdam example. This keeps model storage and training checkpoints in bf16 while using fp32 optimizer state.
+- [`examples/llm_pretrain/llama3_70b_pretrain.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml) — TE FusedAdam example. This keeps model storage and training checkpoints in bf16 while using fp32 master weights + optimizer state.
 - [`examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml) — torch AdamW example. This uses `model.torch_dtype: float32` so AdamW state stays fp32 while compute remains bf16 through FSDP2 mixed precision.
