@@ -50,6 +50,7 @@ def build_eagle3_dataloader(
     split: str | None = None,
     distributed: bool = False,
     shuffle_seed: int | None = 42,
+    mask_reasoning_content: bool = False,
 ) -> DataLoader:
     """Build a dataloader backed by the repo's chat formatting utilities."""
     dataset = ChatDataset(
@@ -61,6 +62,7 @@ def build_eagle3_dataloader(
         truncation=True,
         shuffle_seed=shuffle_seed,
         unshifted=True,
+        mask_reasoning_content=mask_reasoning_content,
     )
     sampler = DistributedSampler(dataset, shuffle=shuffle) if distributed else None
 
