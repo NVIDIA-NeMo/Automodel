@@ -43,6 +43,15 @@ else
     export TEST_DIR="tests/functional_tests/$TEST_NAME"
 fi
 
+# PR #2397: TorchInductor's async compile-worker pool corrupts the process heap in
+# the GPU unit-test sandbox, surfacing as non-deterministic SIGSEGV/SIGABRT at the
+# next allocation (e.g. glm4_moe cut-CE). Disable TorchDynamo for the GPU unit job to
+# avoid the unstable compile path; unit tests assert eager behavior, so this does not
+# change coverage. Does not affect functional tests (which may rely on compilation).
+if [[ "$UNIT_TEST" == "true" && "$CPU" == "false" ]]; then
+    export TORCHDYNAMO_DISABLE=1
+fi
+
 coverage run \
     -m pytest \
     --durations 32 \
