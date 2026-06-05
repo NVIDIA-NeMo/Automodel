@@ -448,29 +448,30 @@ scaling dimension:
 When not using YAML recipes, configure distributed training via Python:
 
 ```python
-from nemo_automodel.components.distributed import FSDP2Config, create_mesh_context, initialize_distributed
-from nemo_automodel._transformers.infrastructure import instantiate_infrastructure
-
-dist_env = initialize_distributed("nccl")
-config = FSDP2Config(sequence_parallel=True, activation_checkpointing=True)
-
-mesh = create_mesh_context(
-    config, tp_size=2, pp_size=1, cp_size=1, ep_size=1, world_size=dist_env.world_size,
+from nemo_automodel.components.distributed import (
+    DistributedSetup,
+    FSDP2Config,
+    ParallelismSizes,
+    initialize_distributed,
 )
 
-# 3. Instantiate infrastructure
-model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
-    distributed_config=config, mesh=mesh,
+dist_env = initialize_distributed("nccl")
+distributed_setup = DistributedSetup.build(
+    strategy=FSDP2Config(sequence_parallel=True),
+    parallelism_sizes=ParallelismSizes(tp_size=2),
+    activation_checkpointing=True,
+    world_size=dist_env.world_size,
 )
 ```
 
 Or pass directly to `from_pretrained`:
 
 ```python
+from nemo_automodel import NeMoAutoModelForCausalLM
+
 model = NeMoAutoModelForCausalLM.from_pretrained(
     "meta-llama/Llama-3.2-1B",
-    distributed_config=FSDP2Config(activation_checkpointing=True),
-    tp_size=2,
+    distributed_setup=distributed_setup,
 )
 ```
 
@@ -498,6 +499,9 @@ components/distributed/mesh.py
 
 Mesh context and raw mesh creation:
 
+```
+components/distributed/config.py
+    DistributedSetup.build()      -- builds MeshContext from strategy + parallelism
 components/distributed/mesh_utils.py
     _create_device_meshes()       -- routes to FSDP2/MegatronFSDP/DDP raw mesh creation
     _create_fsdp2_device_mesh()   -- shape (pp, dp_replicate, dp_shard, cp, tp) + flattened submeshes
