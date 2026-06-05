@@ -235,6 +235,16 @@ def _apply_bagel_full_layer_activation_checkpointing(model: nn.Module) -> bool:
     logger.info("Applied BAGEL full-layer activation checkpointing to %d layers", wrapped_count)
     return wrapped_count > 0
 
+def _detect_ffpa_impl(model) -> bool:
+    """Return True iff ``model`` (or its ``text_config``) sets ``_attn_implementation="ffpa"``."""
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return False
+    for sub in (cfg, getattr(cfg, "text_config", None)):
+        if sub is not None and getattr(sub, "_attn_implementation", None) == "ffpa":
+            return True
+    return False
+
 
 class ParallelizationStrategy(ABC):
     """Abstract base class for model parallelization strategies."""
@@ -358,6 +368,33 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 apply_selective_checkpointing_to_layers(model, layers, _has_kv_sharing, enable_compile=enable_compile)
             elif _apply_bagel_full_layer_activation_checkpointing(model):
                 logger.info("Using BAGEL full-layer activation checkpointing; skipping submodule checkpoint wrappers.")
+            if not _has_kv_sharing:
+                if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
+                    try:
+                        model.config.use_cache = False
+                    except Exception:
+                        pass
+
+            if _detect_ffpa_impl(model):
+                # Selective AC: mark FFPA fwd ops MUST_SAVE so CuTeDSL kernels aren't replayed in backward.
+                from functools import partial
+
+                from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                    apply_activation_checkpointing,
+                )
+
+                from nemo_automodel._transformers.ffpa_attention import ffpa_selective_checkpoint_policy
+
+                layer_classes = tuple({type(layer) for layer in layers})
+                apply_activation_checkpointing(
+                    model,
+                    checkpoint_wrapper_fn=partial(
+                        checkpoint_wrapper,
+                        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                        context_fn=ffpa_selective_checkpoint_policy(),
+                    ),
+                    check_fn=lambda submodule: isinstance(submodule, layer_classes),
+                )
             elif enable_compile:
                 # NO_REENTRANT is required for compile: REENTRANT's first forward runs under
                 # no_grad, causing AOT autograd to trace a forward-only graph that drops LoRA
