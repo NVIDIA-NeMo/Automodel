@@ -612,17 +612,18 @@ def apply_model_infrastructure(
     if mesh.cp_size > 1 and not _uses_te_attention(model):
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
-            attach_cp_sdpa_hooks,
+            attach_cp_attention_hooks,
+            attach_linear_attn_position_hooks,
         )
 
-        is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
-        cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
+        cp_mesh = mesh.device_mesh["cp"]
 
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
+            mp._cp_enabled = True
             attach_context_parallel_hooks(mp)
-            if is_compile_enabled:
-                attach_cp_sdpa_hooks(mp, cp_mesh)
+            attach_linear_attn_position_hooks(mp)
+            attach_cp_attention_hooks(mp, cp_mesh)
 
     model = _apply_runtime_compatibility_fixes(model)
     return model
