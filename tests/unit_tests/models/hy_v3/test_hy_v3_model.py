@@ -328,6 +328,22 @@ class TestHYV3ForCausalLM:
         # forward now returns a CausalLMOutputWithPast; logits live on `.logits`.
         assert out.logits.shape == (bsz, seq, config.vocab_size)
 
+    def test_forward_thd_hidden_states_match_logits_layout(self, config, backend_config, device):
+        model = HYV3ForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
+        batch, seq = 1, 5
+        input_ids = torch.randint(0, config.vocab_size, (batch, seq), device=device)
+        position_ids = torch.arange(seq, device=device).unsqueeze(0)
+        hidden = torch.randn(seq, config.hidden_size, device=device, dtype=torch.bfloat16)
+        with patch.object(model.model, "forward", return_value=hidden):
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                output_hidden_states=True,
+            )
+        assert out.logits.shape == (batch, seq, config.vocab_size)
+        assert out.hidden_states.shape == (batch, seq, config.hidden_size)
+
     def test_initialize_weights_invokes_inner_init(self, config, backend_config, device):
         model = HYV3ForCausalLM(config, backend=backend_config).to(device)
         with patch.object(model.model, "init_weights") as mock_init:

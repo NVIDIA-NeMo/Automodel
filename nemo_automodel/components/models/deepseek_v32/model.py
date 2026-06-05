@@ -277,8 +277,11 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
                 logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         # Restore the batch dim for THD (the inner forward returned 2D logits).
-        if is_thd and logits.dim() == 2:
-            logits = logits.unsqueeze(0)
+        if is_thd:
+            if logits.dim() == 2:
+                logits = logits.unsqueeze(0)
+            if output_hidden_states and hidden_states.dim() == 2:
+                hidden_states = hidden_states.unsqueeze(0)
 
         return CausalLMOutputWithPast(
             logits=logits,

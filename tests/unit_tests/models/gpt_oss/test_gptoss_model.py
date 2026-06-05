@@ -466,11 +466,13 @@ class TestGptOssForCausalLM:
                 position_ids=position_ids,
                 qkv_format="thd",
                 cu_seqlens=cu_seqlens,
-            ).logits
+                output_hidden_states=True,
+            )
 
             # Logits must be 3D [1, T, V] after unsqueeze
-            assert output.ndim == 3
-            assert output.shape == (1, total_tokens, gpt_config.vocab_size)
+            assert output.logits.ndim == 3
+            assert output.logits.shape == (1, total_tokens, gpt_config.vocab_size)
+            assert output.hidden_states.shape == (1, total_tokens, gpt_config.hidden_size)
 
             # Verify backbone received squeezed 1D input_ids
             call_args = mock_model.call_args

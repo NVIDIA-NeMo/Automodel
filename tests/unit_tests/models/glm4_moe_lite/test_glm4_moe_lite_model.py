@@ -303,10 +303,17 @@ class TestGlm4MoeLiteForCausalLM:
             "forward",
             return_value=torch.randn(seq_len, config.hidden_size, device=device).to(torch.bfloat16),
         ):
-            logits = model(input_ids, position_ids=position_ids, padding_mask=padding_mask, qkv_format="thd").logits
+            output = model(
+                input_ids,
+                position_ids=position_ids,
+                padding_mask=padding_mask,
+                qkv_format="thd",
+                output_hidden_states=True,
+            )
 
         # thd format should add batch dimension back
-        assert logits.shape == (1, seq_len, config.vocab_size)
+        assert output.logits.shape == (1, seq_len, config.vocab_size)
+        assert output.hidden_states.shape == (1, seq_len, config.hidden_size)
 
     def test_initialize_weights_invokes_submodules(self, config, backend_config):
         model = Glm4MoeLiteForCausalLM(config, backend=backend_config)

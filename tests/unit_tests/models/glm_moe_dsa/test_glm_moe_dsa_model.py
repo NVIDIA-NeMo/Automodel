@@ -360,11 +360,12 @@ class TestGlmMoeDsaForCausalLM:
             ),
         ):
             mock_squeeze.return_value = (input_ids.squeeze(0), None, None, {"qkv_format": "thd"})
-            out = model(input_ids, qkv_format="thd")
+            out = model(input_ids, qkv_format="thd", output_hidden_states=True)
 
         mock_squeeze.assert_called_once()
         logits = out.logits
         assert logits.shape == (batch, seq_len, config.vocab_size)
+        assert out.hidden_states.shape == (batch, seq_len, config.hidden_size)
 
     def test_initialize_weights_invokes_submodules(self, config, backend_config):
         model = GlmMoeDsaForCausalLM(config, backend=backend_config)

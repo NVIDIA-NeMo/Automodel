@@ -228,6 +228,22 @@ class TestMiniMaxM2ForCausalLM:
         logits = getattr(out, "logits", out)
         assert logits.shape == (2, 6, config.vocab_size)
 
+    def test_forward_thd_hidden_states_match_logits_layout(self, config, backend):
+        model = MiniMaxM2ForCausalLM(config, backend=backend).to(torch.float32)
+        batch, seq = 1, 5
+        input_ids = torch.randint(0, config.vocab_size, (batch, seq))
+        position_ids = torch.arange(seq).unsqueeze(0)
+        hidden = torch.randn(seq, config.hidden_size)
+        with patch.object(model.model, "forward", return_value=hidden):
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                output_hidden_states=True,
+            )
+        assert out.logits.shape == (batch, seq, config.vocab_size)
+        assert out.hidden_states.shape == (batch, seq, config.hidden_size)
+
 
 class TestMoeOverrides:
     """Tests for the moe_overrides dict pattern."""

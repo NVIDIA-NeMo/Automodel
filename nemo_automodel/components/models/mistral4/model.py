@@ -404,6 +404,8 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         if is_thd:
             logits = logits.unsqueeze(0)
+            if output_hidden_states and hidden_states.dim() == 2:
+                hidden_states = hidden_states.unsqueeze(0)
 
         return CausalLMOutputWithPast(
             logits=logits,

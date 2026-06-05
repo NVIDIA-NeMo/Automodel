@@ -347,6 +347,8 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         if is_thd:
             logits = logits.unsqueeze(0)
+            if output_hidden_states and hidden.dim() == 2:
+                hidden = hidden.unsqueeze(0)
 
         return CausalLMOutputWithPast(
             logits=logits,
