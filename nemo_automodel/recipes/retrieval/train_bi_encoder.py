@@ -233,8 +233,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.padding_side = "left"
 
+        dataloader_cfg = self.cfg.get("dataloader")
         self.dataloader = build_dataloader(
-            self.cfg.dataloader,
+            dataloader_cfg,
             self.tokenizer,
             seed=self.cfg.get("seed", 42),
             batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
@@ -244,12 +245,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.train_n_passages = self.cfg.get("dataloader.dataset.n_passages", 1)
 
         self.val_dataloader = None
-        if "validation_dataloader" in self.cfg:
+        validation_dataloader_cfg = self.cfg.get("validation_dataloader", None)
+        if validation_dataloader_cfg is not None:
             val_batch_size = self.cfg.get(
                 "validation_dataloader.batch_size", self.cfg.get("step_scheduler.local_batch_size", 1)
             )
             self.val_dataloader = build_dataloader(
-                self.cfg.validation_dataloader,
+                validation_dataloader_cfg,
                 self.tokenizer,
                 seed=self.cfg.get("seed", 42),
                 batch_size=val_batch_size,
