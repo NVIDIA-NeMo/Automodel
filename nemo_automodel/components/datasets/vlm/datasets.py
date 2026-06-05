@@ -1268,6 +1268,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         max_retries=10,
         truncate=False,
         post_tokenize_hook=None,
+        inject_fake_images=True,
     ):
         self.dataset = dataset
         self.processor = processor
@@ -1275,6 +1276,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         self.truncate = truncate
         self.max_retries = max_retries
         self.post_tokenize_hook = post_tokenize_hook
+        self.inject_fake_images = inject_fake_images
         # Compatibility attributes expected by build_dataloader
         self.preload_media = False
 
@@ -1305,7 +1307,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                 conversation = example["conversation"]
 
                 # Inject fake image into pure-text samples for FSDP/Zero3.
-                injected_fake = not _conversation_has_media(conversation)
+                injected_fake = self.inject_fake_images and not _conversation_has_media(conversation)
                 if injected_fake:
                     conversation = inject_fake_image_into_conversation(conversation)
 

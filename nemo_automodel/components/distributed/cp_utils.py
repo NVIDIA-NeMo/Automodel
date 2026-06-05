@@ -295,6 +295,17 @@ def make_cp_batch_and_ctx(
     cp_no_restore_buffers = {primary_seq_tensor, labels}
     batch_buffer_keys: dict[int, str] = {0: primary_key, 1: "labels", 2: "position_ids"}
 
+    # Qwen3.5 MoE linear attention needs a dense sequence index under CP.
+    # Keep it opt-in so other CP models do not receive a new forward kwarg.
+    if "seq_index" in batch:
+        seq_index = batch["seq_index"]
+        if seq_index.ndim == 2 and seq_index.shape[0] == 1 and batch_size > 1:
+            seq_index = seq_index.expand(batch_size, -1).contiguous()
+            batch["seq_index"] = seq_index
+        batch_buffer_keys[len(cp_buffers)] = "seq_index"
+        cp_buffers.append(seq_index)
+        cp_seq_dims.append(1)
+
     # Add loss_mask if available (passed as arg, not in batch -> no key)
     if loss_mask is not None:
         cp_buffers.append(loss_mask)
@@ -333,10 +344,18 @@ def make_cp_batch_and_ctx(
         for i, (buf, dim) in enumerate(zip(cp_buffers, cp_seq_dims)):
             pad_shape = list(buf.shape)
             pad_shape[dim] = pad_len
-            if buf.dtype.is_floating_point:
+            key = batch_buffer_keys.get(i)
+            if key == "seq_index":
+                pad_val = (
+                    torch.arange(seq_len, seq_len + pad_len, dtype=buf.dtype, device=buf.device)
+                    .view(1, -1)
+                    .expand(buf.shape[0], -1)
+                    .contiguous()
+                )
+            elif buf.dtype.is_floating_point:
                 pad_val = torch.zeros(pad_shape, dtype=buf.dtype, device=buf.device)
             else:
-                fill_val = PAD_FILL.get(batch_buffer_keys.get(i), 0)
+                fill_val = PAD_FILL.get(key, 0)
                 pad_val = torch.full(pad_shape, fill_val, dtype=buf.dtype, device=buf.device)
             old_buf = buf
             cp_buffers[i] = torch.cat([buf, pad_val], dim=dim)

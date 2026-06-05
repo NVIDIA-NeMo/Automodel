@@ -14,6 +14,7 @@
 
 """Qwen3.5-MoE (VL) NeMo Automodel support."""
 
+import inspect
 from typing import Any
 
 import torch
@@ -100,6 +101,8 @@ class Qwen3_5MoeBlock(Block):
         Derived once per forward from the indexed attention mask.
         """
         if self.layer_type != "linear_attention":
+            attn_kwargs = dict(attn_kwargs)
+            attn_kwargs.pop("seq_index", None)
             return super().forward(
                 x,
                 freqs_cis=freqs_cis,
@@ -138,6 +141,7 @@ class Qwen3_5MoeBlock(Block):
             hidden_states=normed_x,
             attention_mask=linear_attn_mask,
             position_ids=position_ids,
+            seq_index=attn_kwargs.get("seq_index"),
             cu_seqlens=cu_seqlens,
             indices=indices,
         )
@@ -232,24 +236,26 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
         cache_position=None,
         **kwargs,
     ):
-        embed_tokens = self.get_input_embeddings()
-        if inputs_embeds is None:
-            if embed_tokens is not None:
-                inputs_embeds = embed_tokens(input_ids)
-            elif (
-                input_ids is not None
-                and isinstance(input_ids, torch.Tensor)
-                and input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32)
-            ):
-                # Pipeline-parallel: input_ids may already be embeddings
-                inputs_embeds = input_ids
-                input_ids = None
-            else:
-                raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
-
         # If we have visual pixel values and a vision encoder, go through the full HF
         # VL forward (vision encoding + multimodal scatter + text).
         if (pixel_values is not None or pixel_values_videos is not None) and self.visual is not None:
+            embed_tokens = self.get_input_embeddings()
+            if inputs_embeds is None:
+                if embed_tokens is not None:
+                    inputs_embeds = embed_tokens(input_ids)
+                elif (
+                    input_ids is not None
+                    and isinstance(input_ids, torch.Tensor)
+                    and input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                ):
+                    # Pipeline-parallel: input_ids may already be embeddings
+                    inputs_embeds = input_ids
+                    input_ids = None
+                else:
+                    raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
+            media_tensor = pixel_values if pixel_values is not None else pixel_values_videos
+            if isinstance(media_tensor, torch.Tensor) and hasattr(self.visual, "rotary_pos_emb"):
+                self.visual.rotary_pos_emb.to(media_tensor.device)
             return super().forward(
                 input_ids=None,
                 attention_mask=attention_mask,
@@ -265,8 +271,20 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
             )
 
         # Text-only path: call the NeMo backend language model directly.
+        if inputs_embeds is None and (
+            input_ids is not None
+            and isinstance(input_ids, torch.Tensor)
+            and input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            # Pipeline-parallel: input_ids may already be embeddings.
+            inputs_embeds = input_ids
+            input_ids = None
+
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("Either input_ids or inputs_embeds must be provided")
+
         outputs = self.language_model(
-            input_ids=None,
+            input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -548,6 +566,94 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         fp32_safe_rotary.to(rotary.inv_freq.device)
         vision_model.rotary_pos_emb = fp32_safe_rotary
 
+    def prepare_model_inputs_for_cp(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        image_grid_hws: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        seq_index: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Build full-sequence multimodal embeddings and mRoPE positions before CP sharding."""
+        if input_ids is None:
+            raise ValueError("Qwen3.5-MoE CP pre-embedding requires input_ids.")
+
+        if image_grid_thw is None and image_grid_hws is not None and image_grid_hws.numel() > 0:
+            if image_grid_hws.shape[-1] == 2:
+                ones = torch.ones(
+                    image_grid_hws.shape[0],
+                    1,
+                    dtype=image_grid_hws.dtype,
+                    device=image_grid_hws.device,
+                )
+                image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
+            else:
+                image_grid_thw = image_grid_hws
+
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        if pixel_values is not None:
+            if hasattr(self.model.visual, "rotary_pos_emb"):
+                self.model.visual.rotary_pos_emb.to(pixel_values.device)
+            image_outputs = self.model.get_image_features(pixel_values, image_grid_thw, return_dict=True)
+            image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = self.model.get_placeholder_mask(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                image_features=image_embeds,
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if pixel_values_videos is not None:
+            if hasattr(self.model.visual, "rotary_pos_emb"):
+                self.model.visual.rotary_pos_emb.to(pixel_values_videos.device)
+            video_outputs = self.model.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
+            video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            _, video_mask = self.model.get_placeholder_mask(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                video_features=video_embeds,
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+        if position_ids is None:
+            rope_kwargs = {
+                "image_grid_thw": image_grid_thw,
+                "video_grid_thw": video_grid_thw,
+                "attention_mask": attention_mask,
+            }
+            if "mm_token_type_ids" in inspect.signature(self.model.get_rope_index).parameters:
+                if mm_token_type_ids is None:
+                    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.long)
+                    image_token_id = getattr(self.config, "image_token_id", None)
+                    video_token_id = getattr(self.config, "video_token_id", None)
+                    if image_token_id is not None:
+                        mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == image_token_id, 1)
+                    if video_token_id is not None:
+                        mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == video_token_id, 2)
+                rope_kwargs["mm_token_type_ids"] = mm_token_type_ids.to(device=input_ids.device)
+            position_ids, rope_deltas = self.model.get_rope_index(input_ids, **rope_kwargs)
+            self.model.rope_deltas = rope_deltas
+
+        if seq_index is None:
+            seq_index = (
+                torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+                .unsqueeze(0)
+                .expand(inputs_embeds.shape[0], -1)
+                .contiguous()
+            )
+        elif seq_index.ndim == 2 and seq_index.shape[0] == 1 and inputs_embeds.shape[0] > 1:
+            seq_index = seq_index.expand(inputs_embeds.shape[0], -1).contiguous()
+
+        return {"inputs_embeds": inputs_embeds, "position_ids": position_ids, "seq_index": seq_index}
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -559,6 +665,14 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         cache_position: torch.Tensor | None = None,
         **kwargs: Any,
     ):
+        if kwargs.pop("_pre_embed_only", False):
+            return self.prepare_model_inputs_for_cp(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                **kwargs,
+            )
+
         # PP VLM support: retrieve pixel_values from stored chunks if not passed
         pixel_values = kwargs.get("pixel_values", None)
         pixel_values_videos = kwargs.get("pixel_values_videos", None)

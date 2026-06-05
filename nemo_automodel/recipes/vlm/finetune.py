@@ -450,6 +450,7 @@ def build_dataloader(
                 max_length=max_length,
                 truncate=truncate,
                 post_tokenize_hook=post_tokenize_hook,
+                inject_fake_images=cfg_ds.get("inject_fake_images", True),
             )
 
             if packing_cfg:
@@ -1431,7 +1432,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # Aggregate across ranks if distributed is initialized
         total_loss = self._dp_allreduce(torch.FloatTensor([total_loss]), include_cp=True).item()
-        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens]), include_cp=True).item()
+        # `num_label_tokens` is measured before CP sharding, so each CP rank
+        # contributes the full sequence token count while `total_loss` is
+        # reconstructed from CP-sharded loss sums. Do not sum tokens over CP.
+        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens])).item()
         total_num_label_tokens = self._dp_allreduce(torch.LongTensor([total_num_label_tokens])).item()
 
         val_loss = total_loss / max(total_tokens, 1e-8)
