@@ -96,7 +96,7 @@ class Qwen3MoeAttention(nn.Module):
                     "TE fused attention is not fullgraph-compilable.",
                     backend.attn,
                 )
-            else:
+            else:  # pragma: no cover - torch.compile path exercised on GPU benchmark runs only
                 logger.warning(
                     "backend.compile_attn=True: torch.compile(fullgraph=True) the Qwen3-MoE attention (attn=sdpa)."
                 )
@@ -110,7 +110,7 @@ class Qwen3MoeAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        if self._compiled_forward is not None:
+        if self._compiled_forward is not None:  # pragma: no cover - compiled path only on GPU benchmark runs
             return self._compiled_forward(x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
         return self._forward_impl(x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
 

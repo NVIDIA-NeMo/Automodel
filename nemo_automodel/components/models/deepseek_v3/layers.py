@@ -135,7 +135,7 @@ class MLA(nn.Module):
                     "TE fused attention is not fullgraph-compilable.",
                     attn_impl,
                 )
-            else:
+            else:  # pragma: no cover - torch.compile path exercised on GPU benchmark runs only
                 logger.warning("compile MLA forward: torch.compile(fullgraph=True) the MLA forward (attn=sdpa).")
                 self._compiled_forward = torch.compile(self._forward_impl, fullgraph=True, dynamic=False)
 
@@ -146,7 +146,7 @@ class MLA(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ):
-        if self._compiled_forward is not None:
+        if self._compiled_forward is not None:  # pragma: no cover - compiled path only on GPU benchmark runs
             return self._compiled_forward(x, freqs_cis, attention_mask, **attn_kwargs)
         return self._forward_impl(x, freqs_cis, attention_mask, **attn_kwargs)
 
