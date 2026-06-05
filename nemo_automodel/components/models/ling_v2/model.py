@@ -35,12 +35,12 @@ model:
 ```
 """
 
-from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn as nn
 
+from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
@@ -277,14 +277,28 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     # Setting this flag instructs the PP split to leave our forwards intact.
     _pp_keep_self_forward: bool = True
 
-    @dataclass(frozen=True)
-    class ModelCapabilities:
-        """Declared parallelism capabilities for this model class."""
+    @classmethod
+    def get_capabilities(cls, config) -> ModelCapabilities:
+        """Return parallelism capabilities for a specific Ling/Bailing-MoE config.
 
-        supports_tp: bool = False
-        supports_cp: bool = False
-        supports_pp: bool = True
-        supports_ep: bool = True
+        Three checkpoint variants share this class:
+
+        1. ``inclusionAI/Ling-1T`` -- 1T-param MoE, requires PP.
+           Demonstrated by examples/llm_finetune/ling/ling_1t_sft.yaml (pp=4)
+           and ling_1t_lora_pp.yaml (pp=8); both with ep_size>=8.
+        2. ``inclusionAI/Ling-flash-2.0`` -- mid-size MoE, single-rank EP only.
+           Demonstrated by ling_flash_2_0_sft.yaml / ling_flash_2_0_lora.yaml
+           (pp=1, ep=8-32).
+        3. ``inclusionAI/Ling-mini-2.0`` -- small MoE, single-rank EP only.
+           Demonstrated by ling_mini_2_0_{hellaswag,sft,squad}.yaml
+           (pp=1, ep=4-8).
+
+        Dispatch is on num_hidden_layers since Ling-1T (~80 layers) is well
+        separated from Ling-flash-2.0 (~32) and Ling-mini-2.0 (~20).
+        """
+        if getattr(config, "num_hidden_layers", 0) > 64:
+            return ModelCapabilities(supports_pp=True, supports_ep=True)
+        return ModelCapabilities(supports_ep=True)
 
     @classmethod
     def from_config(

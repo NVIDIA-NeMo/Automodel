@@ -249,6 +249,98 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 }
 ```
 
+### 2.6 Declare model capabilities (mandatory)
+
+Every class registered in `MODEL_ARCH_MAPPING` must declare its parallelism
+capabilities. Pick exactly one of the two patterns below — never both, never
+neither. CI enforces this via
+`tests/unit_tests/_transformers/test_model_capabilities.py`, so a new arch
+that omits this declaration will fail the L0 unit-test job.
+
+The canonical `ModelCapabilities` dataclass (four bool fields: `supports_tp`,
+`supports_cp`, `supports_pp`, `supports_ep`) lives at
+`nemo_automodel._transformers.model_capabilities`.
+
+**Convention: declare what is verified by a recipe YAML.** A flag is `True`
+only when at least one `examples/*/*.yaml` for this class sets that
+parallelism axis > 1 (e.g. `pp_size: 4` proves PP). Otherwise leave it
+`False`. The flag is *not* "this code path is plumbed" — it is "this config
+has been validated end-to-end".
+
+#### Pattern A — static `ModelCapabilities` (one class, one capability profile)
+
+Use when the model has no variants or every model that maps to this class shares the same
+parallelism story. Most classes (Llama, Qwen2, GptOss, ...) use this
+pattern. Define a frozen nested dataclass:
+
+```python
+from dataclasses import dataclass
+
+class NewModelForCausalLM(HFCheckpointingMixin, nn.Module):
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
+```
+
+#### Pattern B — `get_capabilities(cls, config)` (one class, multiple variants)
+
+Use when the same registered class serves checkpoints/models with *different*
+capability profiles (typical for "family" classes that handle both dense and
+MoE checkpoints, or different model sizes). Do **not** also define a nested
+`ModelCapabilities` dataclass — that placeholder would lie about variants
+the dispatch covers, and CI rejects classes that declare both patterns.
+
+Return the canonical `ModelCapabilities` and branch on a config field that
+cleanly distinguishes the variants:
+
+```python
+from nemo_automodel._transformers.model_capabilities import ModelCapabilities
+
+
+class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    @classmethod
+    def get_capabilities(cls, config) -> ModelCapabilities:
+        """Return parallelism capabilities for a specific ERNIE-4.5 config.
+
+        Two checkpoint variants share this class:
+          1. baidu/ERNIE-4.5-21B-A3B-PT -- MoE variant (moe_num_experts > 0).
+             Demonstrated by examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml
+             (ep_size=8).
+          2. baidu/ERNIE-4.5-0.3B-PT -- dense variant. No expert config.
+             Demonstrated by examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml
+             (tp/cp/pp/ep all 1).
+        """
+        if getattr(config, "moe_num_experts", 0) > 0:
+            return ModelCapabilities(supports_ep=True)
+        return ModelCapabilities()
+```
+
+The dispatch field must be stable and present on every HF config the class
+sees. Good signals: a model-specific MoE/expert count, a known boolean flag
+(e.g. `enable_moe_block`), or `num_hidden_layers` when variants are far
+apart in depth (Ling-1T ≈80 vs Ling-mini-2.0 ≈20). Avoid heuristics that
+silently miss-classify a new checkpoint.
+
+#### Querying capabilities downstream
+
+The public API auto-dispatches between the two patterns:
+
+```python
+from nemo_automodel import query_capabilities
+
+caps = query_capabilities("baidu/ERNIE-4.5-21B-A3B-PT")
+# -> ModelCapabilities(supports_tp=False, supports_cp=False, supports_pp=False, supports_ep=True)
+```
+
+`query_capabilities` accepts an HF model id, a `PretrainedConfig`, a model
+instance, or the registered class itself. Variant-dispatched classes refuse
+the bare-class form because they need a config to make the decision.
+
 ---
 
 ## Phase 3: Onboarding Example Config
@@ -371,6 +463,7 @@ that only surface in a full parity comparison.
 - [ ] Implemented __init__.py with re-export
 - [ ] Registered in `MODEL_ARCH_MAPPING` in `_transformers/registry.py`
 - [ ] Registered custom config in `_CUSTOM_CONFIG_REGISTRATIONS` (if applicable)
+- [ ] Declared `ModelCapabilities` nested dataclass (static) OR `get_capabilities(cls, config)` classmethod (variant dispatch, e.g. ERNIE-4.5 MoE vs dense) — never both, never neither
 - [ ] Created example YAML config
 - [ ] Verified model loads via `NeMoAutoModelForCausalLM.from_pretrained()`
 - [ ] Created unit tests (forward shape, state_dict round-trip)

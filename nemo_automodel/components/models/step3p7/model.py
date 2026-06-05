@@ -313,7 +313,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
 

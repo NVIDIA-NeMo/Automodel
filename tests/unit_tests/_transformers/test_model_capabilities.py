@@ -42,10 +42,10 @@ def test_every_registered_arch_declares_capabilities():
     """Every architecture in ``MODEL_ARCH_MAPPING`` must declare capabilities
     via exactly one of:
 
-      * a nested ``ModelCapabilities`` dataclass (for classes whose capability
-        profile does not depend on config), or
+      * a nested ``ModelCapabilities`` dataclass (for classes that has no variants or every model that maps to 
+      this class shares the same parallelism story), or
       * a ``get_capabilities(cls, config)`` classmethod (for classes that
-        serve multiple checkpoint variants).
+        serve multiple variants ex: gemma4, ernie4.5).
 
     Declaring both is forbidden (the placeholder defaults of the nested class
     can silently shadow the real, config-dependent answer). Declaring neither

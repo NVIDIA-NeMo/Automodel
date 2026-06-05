@@ -251,6 +251,8 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = False
+        # CP demonstrated on the Moonlight-16B-A3B convergence run
+        # (examples/convergence/tulu3/models/moonlight-16b/moonlight_16b_ep8_cp2_flashoptim.yaml).
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
