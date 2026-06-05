@@ -442,6 +442,7 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
             "enable_fsdp2_prefetch": False,
             "fsdp2_backward_prefetch_depth": 4,
             "fsdp2_forward_prefetch_depth": 3,
+            "reduce_dtype": "bfloat16",
         },
         attention_backend="flash",
         transformer_engine_linear=True,
@@ -468,6 +469,7 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
     assert manager_args["enable_fsdp2_prefetch"] is False
     assert manager_args["fsdp2_backward_prefetch_depth"] == 4
     assert manager_args["fsdp2_forward_prefetch_depth"] == 3
+    assert manager_args["mp_policy"].reduce_dtype is torch.bfloat16
     assert calls["transformer_engine_linear"] is True
     assert calls["transformer_engine_fp8_safe_only"] is True
     assert calls["fuse_qkv_projections"] is True
