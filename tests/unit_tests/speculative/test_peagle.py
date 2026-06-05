@@ -32,13 +32,13 @@ import pytest
 import torch
 from transformers import LlamaConfig
 
-from nemo_automodel.components.speculative.eagle.core import PEagleTrainerModule
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.peagle_attention import create_peagle_mask_mod
 from nemo_automodel.components.speculative.eagle.peagle_data import (
     assign_cod_segments,
     generate_cod_sample_indices,
 )
+from nemo_automodel.components.speculative.eagle.peagle_trainer import PEagleTrainerModule
 
 # P-EAGLE's draft forward runs flex_attention, whose autograd is not implemented
 # on CPU in the CI torch build (even the forward errors once the inputs require
