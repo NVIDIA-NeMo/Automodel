@@ -21,6 +21,7 @@
 </div>
 
 ## 📣 News and Discussions
+- [06/04/2026][**Nemotron-3 Ultra**](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16) We now support finetuning NVIDIA's Nemotron 3 Ultra 550B A55B. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml) and [guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/nemotron-3-ultra.md).
 - [06/03/2026][**Gemma 4 12B**](https://huggingface.co/google/gemma-4-12B) We now support finetuning the dense `google/gemma-4-12B` model. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml).
 - [05/27/2026][**Step-3.7-Flash**](https://huggingface.co/stepfun-ai/Step-3.7-Flash) We added model coverage for Stepfun AI's 198B-A13B MoE vision-language model, targeting image/video agentic developer workflows with a 256k context language backbone and 1.8B ViT vision tower. See the [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/vlm/stepfun-ai/step-3-7.md).
 - [05/19/2026][**Ling 2.0**](https://huggingface.co/collections/inclusionAI/ling-20) We now support finetuning the inclusionAI Ling 2.0 MoE family (`inclusionAI/Ling-mini-2.0`, `inclusionAI/Ling-flash-2.0`, and `inclusionAI/Ling-1T`), thanks to [@Hayden727](https://github.com/Hayden727). Check out our [recipes](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/ling).

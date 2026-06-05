@@ -50,6 +50,14 @@ recipe_args:
   shuffle_seed: 42
   log_every_steps: 10
   max_grad_norm: 1.0
+  # Checkpoint cadence (two independent knobs). The fully-trained model is always
+  # saved when the run completes; these only add intermediate checkpoints. Set
+  # ckpt_every_steps to save every N optimizer steps, and/or
+  # save_checkpoint_every_epoch to save at each epoch boundary; setting both
+  # stacks them. With neither set, only the end-of-run checkpoint is written.
+  # Directories are named epoch_{epoch}_step_{global_step}.
+  # ckpt_every_steps: 500
+  # save_checkpoint_every_epoch: false
 
 optimizer:
   # TTT loss is a weighted mean (``Σ 0.8^i * L_i / Σ 0.8^i``), so LR is
