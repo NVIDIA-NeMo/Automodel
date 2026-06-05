@@ -711,8 +711,9 @@ class TestQwen3_5MoeModelVLPath:
         assert kw["pixel_values"] is pixel_values
         assert kw["input_ids"] is None
         assert kw["inputs_embeds"] is not None
-        # forward now wraps the lm_head output of the delegated VL hidden states.
-        assert result.logits.shape == (batch, seq_len, vl_config.text_config.vocab_size)
+        # model.model (base) delegates the VL path to HF super().forward(), which returns the
+        # multimodal hidden states; lm_head/logits live on the outer ForConditionalGeneration.
+        assert result.last_hidden_state.shape == (batch, seq_len, vl_config.text_config.hidden_size)
 
 
 # ---------------------------------------------------------------------------

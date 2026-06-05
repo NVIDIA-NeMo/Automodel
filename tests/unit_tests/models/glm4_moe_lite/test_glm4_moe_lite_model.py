@@ -158,9 +158,10 @@ class TestBlock:
         # freqs_cis for MLA (needs proper shape for fused rope)
         freqs_cis = torch.randn(seq_len, 1, 1, config.qk_rope_head_dim * 2, device=device)
 
-        with patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn, patch.object(
-            block, "_mlp", return_value=torch.zeros_like(x)
-        ) as mock_mlp:
+        with (
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+        ):
             out = block(x, freqs_cis=freqs_cis)
 
         assert out.shape == x.shape
@@ -175,9 +176,10 @@ class TestBlock:
         freqs_cis = torch.randn(3, 1, 1, config.qk_rope_head_dim * 2, device=device)
         attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.bool, device=device)
 
-        with patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn, patch.object(
-            block, "_mlp", return_value=torch.zeros_like(x)
-        ) as mock_mlp:
+        with (
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+        ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask)
 
         mock_attn.assert_called_once()
@@ -198,11 +200,12 @@ class TestBlock:
     def test_init_weights_resets_sublayers(self, config, moe_config, backend_config):
         block = Block(layer_idx=0, config=config, moe_config=moe_config, backend=backend_config)
 
-        with patch.object(block.input_layernorm, "reset_parameters") as mock_in, patch.object(
-            block.post_attention_layernorm, "reset_parameters"
-        ) as mock_post, patch.object(block.self_attn, "init_weights") as mock_attn, patch.object(
-            block.mlp, "init_weights"
-        ) as mock_mlp:
+        with (
+            patch.object(block.input_layernorm, "reset_parameters") as mock_in,
+            patch.object(block.post_attention_layernorm, "reset_parameters") as mock_post,
+            patch.object(block.self_attn, "init_weights") as mock_attn,
+            patch.object(block.mlp, "init_weights") as mock_mlp,
+        ):
             block.init_weights(torch.device("cpu"))
 
         mock_in.assert_called_once()
@@ -249,9 +252,7 @@ class TestGlm4MoeLiteModel:
         input_ids = torch.randint(0, config.vocab_size, (batch, seq_len))
         position_ids = torch.arange(seq_len).unsqueeze(0)
 
-        with patch.object(
-            Block, "forward", return_value=torch.zeros(batch, seq_len, config.hidden_size)
-        ):
+        with patch.object(Block, "forward", return_value=torch.zeros(batch, seq_len, config.hidden_size)):
             out = model(input_ids, position_ids=position_ids)
 
         assert out.shape == (batch, seq_len, config.hidden_size)
@@ -260,9 +261,10 @@ class TestGlm4MoeLiteModel:
         model = Glm4MoeLiteModel(config, backend=backend_config)
         original = model.embed_tokens.weight.clone()
 
-        with patch.object(model.norm, "reset_parameters") as mock_norm, patch.object(
-            Block, "init_weights"
-        ) as mock_layer_init:
+        with (
+            patch.object(model.norm, "reset_parameters") as mock_norm,
+            patch.object(Block, "init_weights") as mock_layer_init,
+        ):
             model.init_weights(torch.device("cpu"))
 
         mock_norm.assert_called_once()
@@ -283,7 +285,7 @@ class TestGlm4MoeLiteForCausalLM:
             "forward",
             return_value=torch.randn(batch, seq_len, config.hidden_size, device=device).to(torch.bfloat16),
         ):
-            logits = model(input_ids)
+            logits = model(input_ids).logits
 
         assert logits.shape == (batch, seq_len, config.vocab_size)
 
@@ -301,7 +303,7 @@ class TestGlm4MoeLiteForCausalLM:
             "forward",
             return_value=torch.randn(seq_len, config.hidden_size, device=device).to(torch.bfloat16),
         ):
-            logits = model(input_ids, position_ids=position_ids, padding_mask=padding_mask, qkv_format="thd")
+            logits = model(input_ids, position_ids=position_ids, padding_mask=padding_mask, qkv_format="thd").logits
 
         # thd format should add batch dimension back
         assert logits.shape == (1, seq_len, config.vocab_size)
