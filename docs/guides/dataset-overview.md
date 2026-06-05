@@ -2,9 +2,9 @@
 
 This page summarizes the datasets supported in NeMo AutoModel for LLM, VLM, and retrieval training and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
 
-- See also: [LLM datasets](llm/dataset.md), [VLM datasets](vlm/dataset.md), [Retrieval dataset](llm/retrieval-dataset.md), and [Retrieval fine-tuning](llm/retrieval-finetuning.md) for deeper, task-specific guides.
+- Refer to [LLM datasets](llm/dataset.md), [VLM datasets](vlm/dataset.md), [Retrieval dataset](llm/retrieval-dataset.md), and [Retrieval fine-tuning](llm/retrieval-finetuning.md) for deeper, task-specific guidance.
 
-- If a dataset you need is missing, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with a short description and example schema so we can prioritize support.
+- If a dataset you need is missing, open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with a short description and example schema so we can prioritize support.
 ---
 
 ## LLM Datasets
@@ -44,7 +44,7 @@ dataset:
   - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
   - Notes:
     - For tokenizers with chat templates and answer-only loss, you may set `answer_only_loss_mask: true` and provide `start_of_turn_token`.
-    - Supports streaming mode for large datasets (see [Streaming Datasets](#streaming-datasets) section below).
+    - Supports streaming mode for large datasets. Refer to [Streaming Datasets](#streaming-datasets) below for details.
     - Map-style, non-streaming dataset (supports `len(ds)` and `ds[i]`)
     - For streaming (including Delta Lake / Databricks), use `ColumnMappedTextInstructionIterableDataset`
   - Example YAML:
@@ -60,7 +60,7 @@ dataset:
   answer_only_loss_mask: true
   start_of_turn_token: "<|assistant|>"
 ```
-See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.md), for more information.
+Refer to the [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.md) for more information.
 
 ### ChatDataset (Multi-Turn Conversations and Tool Calling)
 - Class: `nemo_automodel.components.datasets.llm.ChatDataset`
@@ -213,8 +213,8 @@ dataset:
   ]
 }
 ```
-See the [Function Calling guide](llm/toolcalling.md) for an end-to-end example with FunctionGemma.
-For a small reasoning-style chat SFT starting point, see [qwen2_5_0p5b_instruct_fineproofs_chat.yaml](../../examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml).
+Refer to the [Function Calling guide](llm/toolcalling.md) for an end-to-end example with FunctionGemma.
+For a small reasoning-style chat SFT starting point, refer to [qwen2_5_0p5b_instruct_fineproofs_chat.yaml](../../examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml).
 
 ### Retrieval Fine-Tuning
 - Factory for corpus ID JSON and `hf://` AutoModel-schema sources:
@@ -247,7 +247,7 @@ dataloader:
   batch_size: 2
   shuffle: true
 ```
-See [Retrieval dataset](llm/retrieval-dataset.md) for schema details and [Retrieval fine-tuning](llm/retrieval-finetuning.md) for the end-to-end workflow.
+Refer to [Retrieval dataset](llm/retrieval-dataset.md) for schema details and [Retrieval fine-tuning](llm/retrieval-finetuning.md) for the end-to-end workflow.
 
 ### NanoGPT Binary Shards (Pretraining)
 - Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
@@ -275,7 +275,7 @@ dataset:
   split: "0.99, 0.01, 0.00"  # train, validation, test
   splits_to_build: "train"
 ```
-See the detailed [pretraining guide](llm/pretraining.md), which uses MegatronPretraining data.
+Refer to the [pretraining guide](llm/pretraining.md), which uses MegatronPretraining data.
 
 ## Streaming Datasets
 
@@ -290,7 +290,7 @@ Streaming datasets load and process data incrementally, one batch at a time, rat
 - **Faster startup**: Begin training immediately without waiting for full dataset download
 - **Efficient for remote datasets**: Stream directly from Hugging Face Hub without local storage
 
-### When to Use Streaming
+### Decide When to Stream
 
 Use streaming mode when:
 
@@ -306,7 +306,7 @@ Avoid streaming when:
 - You need to know the exact dataset length upfront
 - Training requires multiple passes with different orderings
 
-### How to Enable Streaming
+### Enable Streaming
 
 For `ColumnMappedTextInstructionDataset`, use the streaming variant by changing the class to `ColumnMappedTextInstructionIterableDataset`:
 
@@ -389,7 +389,7 @@ dataset.set_epoch(epoch_num)
 - This helps hide network latency and keeps GPUs busy
 - Adjust prefetch settings based on your network speed and batch size
 
-### Example: Streaming a Large Dataset
+### Stream a Large Dataset
 
 Here's a complete example of using streaming for a large instruction-tuning dataset:
 
@@ -435,7 +435,7 @@ dataloader:
 
 ---
 
-## VLM Datasets (Vision/Audio + Language)
+## VLM Datasets (Vision/Audio and Language)
 VLM datasets are represented as conversations (message lists) that combine text with images or audio and are processed with the model's `AutoProcessor.apply_chat_template` and a suitable collate function.
 
 Built-in dataset makers (return lists of `conversation` dicts):
@@ -445,7 +445,7 @@ Built-in dataset makers (return lists of `conversation` dicts):
 - **CommonVoice 17 (CV17) (audio)**: `nemo_automodel.components.datasets.vlm.datasets.make_cv17_dataset`
 
 
-Each example follows the conversation schema expected by `apply_chat_template`, e.g.:
+Each example follows the conversation schema expected by `apply_chat_template`, as shown below:
 ```python
 {
   "conversation": [
@@ -491,7 +491,7 @@ dataloader:
 ```
 If you want answer-only loss masking, provide a model-appropriate `start_of_response_token` to the collate function.
 
-See [Gemma-3n](omni/gemma3-3n.md) and [VLM dataset](vlm/dataset.md) for end-to-end examples.
+Refer to [Gemma-3n](omni/gemma3-3n.md) and [VLM dataset](vlm/dataset.md) for end-to-end examples.
 
 ---
 
@@ -508,7 +508,7 @@ The built-in preprocessing tool ([`tools/diffusion/preprocessing_multiprocess.py
 - **Video (T2V)**: `nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader` — for Wan 2.1 and HunyuanVideo
 - **Image (T2I)**: `nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader` — for FLUX.1-dev
 
-### Example YAML (Video Dataloader)
+### Configure a Video Dataloader
 
 ```yaml
 data:
@@ -523,7 +523,7 @@ data:
     num_workers: 0
 ```
 
-See the [Diffusion Dataset Preparation](diffusion/dataset.md) guide for full preprocessing instructions and configuration details.
+Refer to the [Diffusion Dataset Preparation](diffusion/dataset.md) guide for full preprocessing instructions and configuration details.
 
 ---
 
@@ -561,7 +561,7 @@ dataset:
 ```
 Where `build_my_dataset` returns either a `datasets.Dataset` or a list/iterator of conversation dicts (for VLM).
 
-### Use ColumnMappedTextInstructionDataset for Most Instruction Datasets (LLM)
+### Map Instruction Data with ColumnMappedTextInstructionDataset (LLM)
 - Ideal when your data has columns like `instruction`, `input`, or `output` but with arbitrary names
 - Supports local JSON/JSONL and HF Hub
 ```yaml

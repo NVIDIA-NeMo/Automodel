@@ -3,8 +3,8 @@
 NeMo AutoModel supports **retrieval model fine-tuning** using a retrieval-style dataset: each training example is a
 **query** paired with **one positive** document and **one or more negative** documents.
 
-This dataset is used by the retrieval recipes (see `examples/retrieval/bi_encoder/` and
-`examples/retrieval/cross_encoder/`) together with the retrieval collators. For an end-to-end training workflow, see
+This dataset is used by the retrieval recipes in `examples/retrieval/bi_encoder/` and
+`examples/retrieval/cross_encoder/`, together with the retrieval collators. For an end-to-end training workflow, refer to
 [Retrieval Fine-Tuning](retrieval-finetuning.md).
 
 ## Raw Records and Runtime Schemas
@@ -18,7 +18,7 @@ The dataset factory `nemo_automodel.components.datasets.llm.make_retrieval_datas
 - `doc_id`: list of document IDs aligned with `doc_text` for corpus-backed and `hf://` sources. Pure inline JSONL
   does not provide real document IDs for duplicate-document masking unless you add them in a custom preprocessing path.
 - `query_instruction` / `passage_instruction`: optional, used when `use_dataset_instruction: true` and the corpus
-  provides instructions via metadata
+  provides instructions through metadata
 
 The cross-encoder recipe consumes the same raw retrieval records, but sets `model_type: cross_encoder`. Its dataset
 transform flattens each query with its positive and negative passages, and `CrossEncoderCollator` serializes each
@@ -64,7 +64,7 @@ records before training:
 
 This is the format used by NeMo retriever pipelines where documents live in a separate **corpus** and training examples reference documents by **ID**.
 
-**Training file example (single JSON):**
+Training file example (single JSON):
 
 ```json
 {
@@ -83,7 +83,7 @@ This is the format used by NeMo retriever pipelines where documents live in a se
 }
 ```
 
-**Corpus requirements**
+Corpus requirements:
 
 Each corpus directory must contain a `merlin_metadata.json` file and a Hugging Face-loadable `train` split with at least
 `id` and `text` columns. For `class: TextQADataset`, AutoModel calls `datasets.load_dataset(<corpus path>)["train"]`,
@@ -139,7 +139,7 @@ Datasets with BEIR, DPR, MS MARCO, MIRACL, or other layouts need a preprocessing
 
 This is convenient for custom fine-tuning pipelines where the documents are included **inline**.
 
-**JSONL example (one example per line):**
+JSONL example (one example per line):
 
 ```json
 {"query":"Explain transformers","pos_doc":"Transformers are a type of neural network...","neg_doc":["RNNs are...","CNNs are..."]}
@@ -158,7 +158,7 @@ This is convenient for custom fine-tuning pipelines where the documents are incl
 - `use_dataset_instruction: true` has no effect for pure inline records (instructions come from corpus metadata).
 :::
 
-## YAML Usage (Dataset + Collator)
+## Configure the Dataset and Collator in YAML
 
 Use the corpus/HF dataset factory plus the bi-encoder collator for corpus ID-based JSON or `hf://` sources:
 
