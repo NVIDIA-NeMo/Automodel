@@ -28,7 +28,7 @@ from nemo_automodel._transformers.model_capabilities import (
 from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegistry
 
 # ---------------------------------------------------------------------------
-# 1. Every registered class must declare capabilities via XOR
+# 1. Every registered class must declare capabilities via exactly one pattern
 #
 # Modeled on tests/unit_tests/_transformers/test_doc_coverage.py: walk every
 # entry in MODEL_ARCH_MAPPING, collect violations, and surface them in a
@@ -38,7 +38,7 @@ from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegis
 # ---------------------------------------------------------------------------
 
 
-def test_every_registered_arch_declares_capabilities_xor():
+def test_every_registered_arch_declares_capabilities():
     """Every architecture in ``MODEL_ARCH_MAPPING`` must declare capabilities
     via exactly one of:
 
