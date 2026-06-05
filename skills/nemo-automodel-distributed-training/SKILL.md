@@ -462,7 +462,7 @@ scaling dimension:
    (`interleaved_1f1b`) and smaller microbatches to reduce bubble time.
 
 4. **FSDP2 requires DTensor-aware state dict saving.** Use `safetensors` with
-   `save_consolidated: final` for final Hugging Face export, or `save_consolidated: false`
+   `save_consolidated: final` for final HF export, or `save_consolidated: false`
    plus the generated `model/consolidate.sh` helper for offline export.
 
 5. **CP requires compatible attention.** SDPA (Flash Attention or Efficient
