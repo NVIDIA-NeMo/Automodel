@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import pytest
 
-from nemo_automodel.recipes.llm.train_eagle3 import _optim_steps_per_epoch
+from nemo_automodel.recipes.llm.train_eagle3 import _optim_steps_per_epoch, _should_sync_grads
 
 
 @pytest.mark.parametrize(
@@ -51,3 +51,41 @@ def test_optim_steps_per_epoch_handles_invalid_inputs():
     assert _optim_steps_per_epoch(-1, 4) == 0
     assert _optim_steps_per_epoch(10, 0) == 0
     assert _optim_steps_per_epoch(10, -1) == 0
+
+
+def _sync(pending, batch_idx, *, accum=4, batches_per_epoch=10, is_ddp=True):
+    return _should_sync_grads(
+        pending_micro_batches=pending,
+        grad_accumulation_steps=accum,
+        batch_idx=batch_idx,
+        batches_per_epoch=batches_per_epoch,
+        is_ddp=is_ddp,
+    )
+
+
+def test_should_sync_always_true_without_ddp():
+    for pending in range(4):
+        assert _sync(pending, batch_idx=0, is_ddp=False) is True
+
+
+def test_should_sync_only_on_window_close_under_ddp():
+    assert _sync(0, batch_idx=0) is False
+    assert _sync(1, batch_idx=1) is False
+    assert _sync(2, batch_idx=2) is False
+    assert _sync(3, batch_idx=3) is True  # window closer
+
+
+def test_should_sync_on_epoch_final_batch_even_mid_window():
+    # The trailing-flush step consumes the last batch's grads -> must sync.
+    assert _sync(0, batch_idx=9, batches_per_epoch=10) is True
+    assert _sync(2, batch_idx=9, batches_per_epoch=10) is True
+
+
+def test_should_sync_every_step_when_length_unknown():
+    for pending in range(4):
+        assert _sync(pending, batch_idx=pending, batches_per_epoch=None) is True
+
+
+def test_should_sync_every_step_when_accum_is_one():
+    for batch_idx in range(5):
+        assert _sync(0, batch_idx=batch_idx, accum=1) is True

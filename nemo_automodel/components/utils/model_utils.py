@@ -251,11 +251,13 @@ def count_model_parameters(model: nn.Module) -> tuple[int, int]:
 
 
 @torch.no_grad()
-def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
+def print_trainable_parameters(model: nn.Module, name: str = "Model") -> tuple[int, int]:
     """Print the number of trainable parameters in the model.
 
     Args:
         model: Model to analyze
+        name: Label for the summary header (e.g. ``"Draft"`` to distinguish the
+            draft model from the target in speculative-decoding training).
 
     Returns:
         trainable_params: int
@@ -268,7 +270,7 @@ def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
         local_sq_norm = float(local_sq_norm**0.5)
         trainable_pct = (100.0 * trainable_params / total_params) if total_params > 0 else 0.0
 
-        logging.info("Model summary:")
+        logging.info(f"{name} summary:")
         logging.info("--------------------------------")
         logging.info(f"Trainable parameters: {trainable_params:,}")
         logging.info(f"Total parameters: {total_params:,}")
@@ -276,7 +278,7 @@ def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
         logging.info(f"Param L2 norm: {local_sq_norm:.4f}")
         logging.info("--------------------------------")
     except Exception:
-        logging.info("Model summary: <unavailable>")
+        logging.info(f"{name} summary: <unavailable>")
 
     return trainable_params, total_params
 
