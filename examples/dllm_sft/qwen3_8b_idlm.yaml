@@ -109,7 +109,7 @@ lr_scheduler:
   lr_decay_style: cosine
   init_lr: 0.0
   min_lr: 0.0
-  warmup_ratio: 0.03       # paper Appendix H.1
+  lr_warmup_steps: 1000    # ~3% warmup (paper Appendix H.1 ratio 0.03); tune to total steps
 
 # I-DLM trains on responses generated across reasoning datasets (paper Section 3.1
 # / Appendix H.1). For paper-comparable quality, regenerate the assistant turns
