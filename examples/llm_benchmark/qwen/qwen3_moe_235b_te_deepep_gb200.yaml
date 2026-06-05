@@ -74,7 +74,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: gmm
+    experts: te  # TE GroupedLinear bf16 (no fp8) — te is the fastest bf16 expert backend in the bake-off
     dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
@@ -105,6 +105,7 @@ optimizer:
   eps: 1e-8
   lr: 0.0001
   weight_decay: 0
+  foreach: false  # ep32==world32: TE experts plain-tensor vs DTensor; per-param Adam avoids _foreach_lerp_ mix
 
 
 ci:

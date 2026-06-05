@@ -85,7 +85,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: torch_mm
+    experts: te  # TE GroupedLinear bf16 (no fp8) — te is the fastest bf16 expert backend in the bake-off; ep16<world32 so experts stay DTensor-wrapped (optimizer.foreach default OK)
     dispatcher: hybridep
     dispatcher_num_sms: 64
     fake_balanced_gate: true
