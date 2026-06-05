@@ -79,6 +79,14 @@ recipe_args:
   down_sample_ratio: 0.7
   down_sample_ratio_min: 0.2
   mask_token_id: 128002
+  # ``sequence_partitions`` (S, default 1) is a training-only memory knob. With
+  # S > 1 the trainer splits each sequence into S segments by dependency lineage
+  # and runs a separate forward+backward per segment, accumulating gradients, so
+  # only one segment's activations are resident at a time (P-EAGLE Algorithm 1,
+  # arXiv:2602.01469). The loss and saved checkpoint are unchanged -- it trades
+  # recomputation for lower peak memory so the flat COD forward can train on long
+  # contexts that would otherwise OOM. Leave at 1 until you hit a memory wall.
+  sequence_partitions: 1
 
 optimizer:
   lr: 1.0e-4
