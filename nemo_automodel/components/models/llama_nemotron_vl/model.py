@@ -550,6 +550,15 @@ class LlamaNemotronVLModel(PreTrainedModel):
 
             input_embeds = input_embeds.reshape(B, N, C)
 
+        elif self.training:
+            # If there is no image in the batch, adds a dummy image to the batch 
+            # to ensure multi-GPU synchronization when there are batches with only text samples and others with image samples
+            image_size = self.config.force_image_size or self.config.vision_config.image_size
+            dtype = next(self.vision_model.parameters()).dtype
+            dummy_pixels = torch.zeros(1, 3, image_size, image_size, device=input_embeds.device, dtype=dtype)
+            dummy_output = self.extract_feature(dummy_pixels)
+            input_embeds = input_embeds + dummy_output.sum().to(input_embeds.dtype) * 0.0
+
         # Forward through language model
         outputs = self.language_model(
             inputs_embeds=input_embeds,
