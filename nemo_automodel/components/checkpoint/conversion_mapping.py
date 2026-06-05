@@ -183,6 +183,16 @@ _VLM_KEY_MAPPINGS: dict[str, dict[str, str]] = {
 }
 
 
+# VLM model types whose vision tower is nested under `model.visual.*` in
+# transformers >=5.5, while HF checkpoints store it flat (`visual.*`). The
+# transformers WeightRenaming for these only remaps the language-model keys
+# (`model.*` -> `model.language_model.*`), so an explicit
+# `^visual\.` -> `model.visual.` rule must be added or the entire vision tower
+# silently fails to load (set_model_state_dict strict=False) and is left
+# randomly initialized -> nondeterministic, degraded VLM forward.
+_VISION_TOWER_NESTED_MODEL_TYPES: set[str] = {"qwen2_5_vl", "qwen2_vl"}
+
+
 def get_combined_key_mapping(
     model_type: str,
     model_key_mapping: Optional[dict[str, str]] = None,
@@ -239,6 +249,12 @@ def get_combined_key_mapping(
                         for source, target in zip(sources, targets):
                             if source not in result:
                                 result[source] = target
+
+    # Augment (do not override) the transformers-derived mapping for VLMs whose
+    # vision tower is nested under `model.visual.*`. transformers only provides
+    # the language-model renaming, leaving `visual.*` checkpoint keys unmapped.
+    if model_type in _VISION_TOWER_NESTED_MODEL_TYPES and r"^visual\." not in result:
+        result[r"^visual\."] = "model.visual."
 
     return result if result else None
 
