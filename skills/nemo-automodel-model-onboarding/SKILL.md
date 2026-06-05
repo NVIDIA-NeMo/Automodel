@@ -271,13 +271,27 @@ param's original HF dtype and uses it as a fallback, but that recording is skipp
 quantized, from-scratch, and odd-checkpoint paths — so the explicit pin is the only signal
 that holds across every path.
 
-**Frozen submodules** (e.g. a frozen vision tower in a VLM) are excluded from FSDP wrapping
-and therefore never receive the FSDP compute-dtype cast. To avoid a frozen-fp32 module
-feeding bf16 trainable modules (a dtype-mismatch matmul at the seam), every maximal
-fully-frozen, non-sharded submodule is automatically cast to `mp_policy.param_dtype` (bf16)
-after materialization and checkpoint loading. This is safe because frozen modules are never
-updated. If a *frozen* part is also numerically sensitive and must compute in fp32, list it
-in `_keep_in_fp32_modules_strict` — the cast honors those keywords and leaves them fp32.
+**Frozen submodules** (e.g. a frozen vision tower in a VLM) are a dtype-mismatch hazard under
+the fp32-master pattern: a frozen part that stays fp32 feeds bf16 trainable modules and trips
+a matmul at the seam. There are two distinct fp32 sources, and both are handled automatically
+(after materialization, checkpoint load, and sharding) by casting each maximal fully-frozen
+submodule toward `mp_policy.param_dtype` (bf16):
+
+- **Parameters** — a frozen submodule *excluded* from FSDP keeps fp32 (plain tensors) and is
+  cast; a frozen submodule that *is* sharded holds DTensor params, which are left to FSDP's
+  all-gather cast (re-casting sharded storage in place would desync FSDP bookkeeping).
+- **Buffers** — FSDP never casts buffers, so a frozen module's fp32 buffers (e.g.
+  standardization constants) would promote bf16 activations back to fp32 via type promotion.
+  Buffers are always plain tensors, so they are cast unconditionally — including inside sharded
+  frozen towers whose params FSDP already handles.
+
+This is safe because frozen modules are never updated. If a *frozen* part is also numerically
+sensitive and must compute in fp32, list it in `_keep_in_fp32_modules_strict` — the cast honors
+those keywords and leaves matching params and buffers in fp32.
+
+A model whose vision path forces fp32 *inside* a forward op that isn't a parameter or buffer
+(e.g. HF Gemma4's `get_image_features` feeding an fp32 activation into a bf16 projector) needs
+a per-model activation cast at that seam, since no parameter/buffer cast can reach it.
 
 ---
 

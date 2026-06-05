@@ -669,28 +669,30 @@ def compute_lm_head_logits(
 
 
 def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.dtype | None) -> None:
-    """Cast frozen, FSDP-excluded modules to the FSDP compute dtype.
+    """Cast the floating-point tensors of frozen submodules to ``compute_dtype``.
 
-    FSDP2 mixed precision only casts FSDP-managed (trainable) parameters to the
-    compute ``param_dtype`` at all-gather time. Fully frozen submodules (for example a
-    frozen vision tower) are deliberately excluded from FSDP wrapping, so they keep
-    their storage dtype. Under the fp32-master-weights pattern (fp32 storage + bf16
-    compute) this leaves a frozen fp32 module feeding bf16 trainable modules, which
-    raises a dtype-mismatch error in the first matmul across the seam.
+    When parameters are stored in fp32 (the fp32-master-weights pattern) while compute runs
+    in bf16, a fully frozen submodule -- such as a frozen vision tower -- can still produce
+    fp32 values that flow into bf16 trainable modules and raise a dtype mismatch in the next
+    matmul. This walks each maximal fully-frozen submodule and casts its parameters and
+    buffers to ``compute_dtype``, handling the two tensor kinds differently:
 
-    This casts each maximal fully-frozen, non-sharded submodule to ``compute_dtype`` so
-    every forward-participating module computes in the same dtype, while keeping
-    ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` params and buffers in
-    fp32. It is a no-op when ``compute_dtype`` is None, for sharded (DTensor) params
-    (FSDP casts those itself), and for params already in ``compute_dtype`` (pure-fp32 or
-    pure-bf16 runs, where ``module.to`` is a cheap no-op).
+    * **Parameters** are cast only when they are plain (unsharded) tensors. Sharded (DTensor)
+      params are left as-is: FSDP all-gathers them to the compute dtype during forward, and
+      changing a sharded param's dtype in place would desync FSDP's flat-parameter and
+      ``orig_dtype`` bookkeeping.
+    * **Buffers** are always cast. Buffers are never sharded, so they stay in their stored
+      dtype regardless of the wrapper; an fp32 buffer (for example a standardization
+      constant) used in a forward op promotes the surrounding bf16 activations to fp32.
 
-    Frozen modules are never updated, so the compute-dtype storage costs no
-    training accuracy and removes the only fp32/bf16 boundary in the forward.
+    Tensors whose qualified name matches ``_keep_in_fp32_modules`` or
+    ``_keep_in_fp32_modules_strict`` are left in fp32. The function is a no-op when
+    ``compute_dtype`` is None and for tensors already in ``compute_dtype``. Frozen modules are
+    never updated, so casting them does not affect training accuracy.
 
     Args:
         model: The model, already materialized, checkpoint-loaded, and sharded.
-        compute_dtype: The FSDP compute dtype (``mp_policy.param_dtype``); None disables.
+        compute_dtype: The compute dtype (``mp_policy.param_dtype``); None disables the cast.
     """
     if compute_dtype is None:
         return
@@ -702,17 +704,17 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
 
     fp32_keywords = _get_fp32_module_keywords(model)
 
-    # ``named_modules`` yields parents before children, so the first frozen subtree we
-    # accept is always maximal; descendants are skipped via the ancestor check below.
+    def _is_fp32_pinned(name: str) -> bool:
+        return any(kw in name for kw in fp32_keywords)
+
+    # ``named_modules`` yields parents before children, so the first fully-frozen subtree
+    # we accept is always maximal; descendants are skipped via the ancestor check below.
+    # Sharded subtrees are included so their buffers get cast; their params are skipped per-tensor.
     selected: list[str] = []
     for name, module in model.named_modules():
         params = list(module.parameters(recurse=True))
         if not params:
             continue
-        # Sharded (FSDP-managed) subtrees are cast by FSDP itself; leave them alone.
-        if DTensor and any(isinstance(p, DTensor) for p in params):
-            continue
-        # Only fully-frozen subtrees are excluded from FSDP wrapping.
         if any(p.requires_grad for p in params):
             continue
         if any(name == anc or name.startswith(anc + ".") for anc in selected):
@@ -721,10 +723,25 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
 
     for name in selected:
         module = model.get_submodule(name) if name else model
-        module.to(compute_dtype)
-        if fp32_keywords:
-            # Safe here: ``module`` holds plain tensors (we skipped DTensor subtrees).
-            _restore_fp32_modules(module, fp32_keywords)
+        prefix = f"{name}." if name else ""
+        # Parameters: cast plain (unsharded) floats; leave sharded (DTensor) params to FSDP.
+        for param_name, param in module.named_parameters():
+            full_name = prefix + param_name
+            if _is_fp32_pinned(full_name):
+                continue
+            if DTensor and isinstance(param, DTensor):
+                continue
+            if param.is_floating_point() and param.dtype != compute_dtype:
+                param.data = param.data.to(compute_dtype)
+        # Buffers: never FSDP-managed (always plain tensors), so always safe to cast.
+        for buffer_name, buf in module.named_buffers():
+            full_name = prefix + buffer_name
+            if _is_fp32_pinned(full_name):
+                continue
+            if buf.is_floating_point() and buf.dtype != compute_dtype:
+                owner_name, _, leaf = buffer_name.rpartition(".")
+                owner = module.get_submodule(owner_name) if owner_name else module
+                owner._buffers[leaf] = buf.to(compute_dtype)
 
 
 __all__ = [

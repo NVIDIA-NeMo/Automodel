@@ -342,6 +342,35 @@ class TestCastFrozenModulesToComputeDtype:
         for p in model.parameters():
             assert p.dtype == torch.float32
 
+    def test_sharded_frozen_param_skipped_but_buffer_cast(self, monkeypatch):
+        """A sharded (DTensor) frozen param is left to FSDP, but its fp32 buffers are still cast.
+
+        This mirrors the sharded frozen-tower case (e.g. gemma4 vision tower in the root
+        FSDP unit): FSDP all-gathers the params to the compute dtype itself, but never casts
+        buffers, so an fp32 buffer would promote bf16 activations back to fp32. We simulate a
+        DTensor param with a ``nn.Parameter`` subclass and patch the ``DTensor`` symbol the
+        function imports at call time.
+        """
+        import torch.distributed.tensor as dt_mod
+
+        class _FakeDTensor(nn.Parameter):
+            pass
+
+        monkeypatch.setattr(dt_mod, "DTensor", _FakeDTensor, raising=False)
+
+        model = _VLMLike()
+        # Mark the frozen proj weight as a "sharded" param (DTensor-like instance).
+        model.vision.proj.weight = _FakeDTensor(model.vision.proj.weight.data, requires_grad=False)
+
+        cast_frozen_modules_to_compute_dtype(model, torch.bfloat16)
+
+        # Sharded param is left untouched (FSDP would down-cast it at all-gather).
+        assert model.vision.proj.weight.dtype == torch.float32
+        # Plain frozen param in the same subtree is still cast.
+        assert model.vision.norm.weight.dtype == torch.bfloat16
+        # Frozen buffer is always cast (never FSDP-managed) -- the actual fix.
+        assert model.vision.pos.dtype == torch.bfloat16
+
 
 class TestRestoreFp32Buffers:
     def test_buffers_restored_params_untouched(self):
