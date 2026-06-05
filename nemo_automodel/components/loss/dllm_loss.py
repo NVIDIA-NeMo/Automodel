@@ -456,3 +456,70 @@ class DFlashDecayLoss(nn.Module):
             draft_correct_per_pos=c_per_pos,
             draft_count_per_pos=n_per_pos,
         )
+
+
+class IDLMLoss(nn.Module):
+    """Introspective DLM all-masked loss (Yu et al., 2026; arXiv:2604.11035).
+
+    Converts an AR model into a diffusion LM with strict causal attention and a
+    next-token "logit shift" (the hidden state at position ``i`` predicts token
+    ``i+1``). The objective combines two cross-entropy terms over the shifted
+    positions:
+
+    .. math::
+        L = \\text{CE}_\\text{noisy} + \\alpha \\cdot \\text{CE}_\\text{clean}
+
+    - ``CE_noisy`` — CE at masked positions (the decode distribution ``q``).
+    - ``CE_clean`` — CE at clean, valid positions (the introspective verify
+      distribution ``p``); each term is its own mean.
+
+    With ``auto_balance=True`` the fixed weight is replaced by the detached
+    ratio ``CE_noisy / CE_clean`` each step so the two terms stay comparable in
+    magnitude (paper Eq. 2, used for the later stride expansions). Otherwise the
+    fixed ``clean_loss_weight`` is used (the paper's ``0.2`` for early training).
+
+    Args:
+        clean_loss_weight: Fixed ``alpha`` for the clean-token CE.
+        auto_balance: Replace ``alpha`` with ``(CE_noisy / CE_clean).detach()``.
+    """
+
+    def __init__(self, clean_loss_weight: float = 0.2, auto_balance: bool = False):
+        super().__init__()
+        self.clean_loss_weight = float(clean_loss_weight)
+        self.auto_balance = bool(auto_balance)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        noise_mask: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> DLLMLossOutput:
+        """Compute the I-DLM all-masked loss.
+
+        Args:
+            logits: Model logits over the masked input, shape ``[B, L, V]``.
+            target_ids: Clean token IDs, shape ``[B, L]``.
+            noise_mask: Bool mask of masked positions, shape ``[B, L]``.
+            valid_mask: Bool/long padding-validity mask, shape ``[B, L]``.
+
+        Returns:
+            :class:`DLLMLossOutput` with the combined ``total_loss`` and
+            ``dllm_loss`` set to the masked-prediction term ``CE_noisy``.
+        """
+        # Logit shift: logits[:, i] predicts target[:, i+1]. _compute_per_token_nll
+        # materialises a vocab-sharded DTensor via full_tensor() if needed.
+        per_token_ce = _compute_per_token_nll(logits[:, :-1, :], target_ids[:, 1:])  # [B, L-1]
+        shift_valid = valid_mask[:, 1:].bool()
+        shift_noisy = noise_mask[:, 1:].bool() & shift_valid
+        shift_clean = (~noise_mask[:, 1:].bool()) & shift_valid
+
+        ce_noisy = (per_token_ce * shift_noisy.to(per_token_ce.dtype)).sum() / shift_noisy.sum().clamp_min(1)
+        ce_clean = (per_token_ce * shift_clean.to(per_token_ce.dtype)).sum() / shift_clean.sum().clamp_min(1)
+
+        if self.auto_balance:
+            alpha = (ce_noisy / ce_clean.clamp_min(1e-6)).detach()
+        else:
+            alpha = self.clean_loss_weight
+        loss = ce_noisy + alpha * ce_clean
+        return DLLMLossOutput(total_loss=loss, dllm_loss=ce_noisy.detach().clone())

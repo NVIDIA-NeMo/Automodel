@@ -111,6 +111,33 @@ def corrupt_uniform(
     return noisy_input_ids, noise_mask, p_mask.float()
 
 
+def corrupt_all_masked(
+    input_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+    mask_token_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """All-masked corruption for I-DLM training (Yu et al., 2026).
+
+    Every supervised position (``loss_mask == 1``) is replaced with
+    ``mask_token_id`` deterministically — the all-masked objective that gives
+    dense supervision in a single forward pass. Non-supervised positions (the
+    prompt) are left clean to serve as the introspective verify signal.
+
+    Args:
+        input_ids: Token IDs, shape ``[B, L]``.
+        loss_mask: Binary mask indicating supervised positions, shape ``[B, L]``.
+        mask_token_id: The token ID used for masking.
+
+    Returns:
+        Tuple of ``(noisy_input_ids, noise_mask, p_mask)`` each of shape ``[B, L]``.
+        ``p_mask`` is all-ones (every supervised token is masked with probability 1).
+    """
+    noise_mask = loss_mask.bool()
+    noisy_input_ids = torch.where(noise_mask, mask_token_id, input_ids)
+    p_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    return noisy_input_ids, noise_mask, p_mask
+
+
 def corrupt_blockwise(
     input_ids: torch.Tensor,
     loss_mask: torch.Tensor,
