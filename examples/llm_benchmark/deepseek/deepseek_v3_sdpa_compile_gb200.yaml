@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmarking config for DeepSeek-V3 (671B) attn=sdpa + torch.compile(MLA), GB200 (BF16), NO PP — MLA-MFU experiment.
+# SHIPPING no-PP DeepSeek-V3 (671B) bf16 GB200 config: attn=sdpa + torch.compile(MLA) + experts=te.
+# Best bf16 operating point found: 2.910 s/iter, 28.13% MFU@2500, 107.44 GB (up from the
+# attn:te/gmm baseline 3.437 s / 23.82%). Two wins stacked: (1) fullgraph-compiled SDPA MLA
+# (non-TE linear/norm + non-fused rope) lifted 23.82% -> 26.48%; (2) experts=te TE GroupedLinear
+# (bf16, no fp8) won the expert-backend bake-off (te 28.13% > gmm 26.48% > torch_mm 24.95%),
+# lifting 26.48% -> 28.13%. optimizer.foreach=false handles ep64==world64 (TE experts plain-tensor
+# vs DTensor). NO te_fp8 block => true bf16. See sibling _torchmm_/_te_ variants for the bake-off.
 #
 # GB200 deltas vs the generic deepseek_v3_te_deepep.yaml:
 #   - peak_tflops: 989 -> 2500  (GB200 BF16 dense peak; generic recipe uses H100 989)
@@ -76,7 +82,7 @@ model:
     rms_norm: torch   # non-TE: TE RMSNorm is also compiler-disabled → breaks MLA fullgraph
     rope_fusion: false  # fused RoPE is a TE/compiler-disabled custom op → breaks fullgraph
     compile_mla: true
-    experts: gmm
+    experts: te  # WAVE 11 winner: TE GroupedLinear bf16 (no fp8) = 28.13% MFU vs gmm 26.48% / torch_mm 24.95%
     dispatcher: hybridep  # GB200/oci_hsg: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
@@ -107,6 +113,7 @@ optimizer:
   eps: 1e-8
   lr: 0.0001
   weight_decay: 0
+  foreach: false  # ep64==world64: TE experts plain-tensor vs DTensor; per-param Adam avoids _foreach_lerp_ mix
 
 
 ci:
