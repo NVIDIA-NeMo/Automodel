@@ -570,3 +570,53 @@ class TestIDLMLoss:
         # the clean-region denominator, never produce NaN/inf.
         assert torch.isfinite(out.total_loss)
         assert out.total_loss.item() > 0
+
+
+def _init_single_process_group():
+    """Trivial single-process gloo group for DTensor tests (mirrors test_kd_loss)."""
+    if not torch.distributed.is_available():
+        return None
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend="gloo", init_method="tcp://127.0.0.1:29507", rank=0, world_size=1)
+    return torch.distributed.group.WORLD
+
+
+@pytest.fixture(scope="module")
+def trivial_pg():
+    pg = _init_single_process_group()
+    if pg is None:
+        pytest.skip("torch.distributed not available")
+    return pg
+
+
+class TestIDLMLossDTensor:
+    """IDLMLoss on a vocab-sharded DTensor must match the plain-tensor result.
+
+    Single-process (world_size=1) gloo group: the shard is trivial, but this
+    exercises the DTensor code path (the ``full_tensor()`` materialisation in
+    ``_compute_per_token_nll`` plus the logit-shift slice on a DTensor) that the
+    FSDP2/TP training path hits, deterministically and without a GPU.
+    """
+
+    def test_vocab_sharded_dtensor_matches_plain(self, trivial_pg):
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import Shard, distribute_tensor
+
+        from nemo_automodel.components.loss.dllm_loss import IDLMLoss
+
+        torch.manual_seed(0)
+        B, L, V = 2, 12, 32
+        logits = torch.randn(B, L, V)
+        labels = torch.randint(0, V, (B, L))
+        valid_mask = torch.ones(B, L, dtype=torch.long)
+        noise_mask = torch.zeros(B, L, dtype=torch.bool)
+        noise_mask[:, 4:] = True
+
+        loss_fn = IDLMLoss(clean_loss_weight=0.2)
+        plain = loss_fn(logits, labels, noise_mask, valid_mask).total_loss
+
+        mesh = init_device_mesh("cpu", (1,))
+        dlogits = distribute_tensor(logits, mesh, [Shard(-1)])  # vocab-sharded
+        sharded = loss_fn(dlogits, labels, noise_mask, valid_mask).total_loss
+
+        assert torch.allclose(plain, sharded, atol=1e-5), f"plain {plain.item():.6f} != DTensor {sharded.item():.6f}"
