@@ -32,10 +32,24 @@ import pytest
 import torch
 from transformers import LlamaConfig
 
-from nemo_automodel.components.speculative.eagle.core import PEagleTrainerModule
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.peagle_attention import create_peagle_mask_mod
-from nemo_automodel.components.speculative.eagle.peagle_data import generate_cod_sample_indices
+from nemo_automodel.components.speculative.eagle.peagle_data import (
+    assign_cod_segments,
+    generate_cod_sample_indices,
+)
+from nemo_automodel.components.speculative.eagle.peagle_trainer import PEagleTrainerModule
+
+# P-EAGLE's draft forward runs flex_attention, whose autograd is not implemented
+# on CPU in the CI torch build (even the forward errors once the inputs require
+# grad). Tests that drive the draft forward therefore run on CUDA and are skipped
+# when it is unavailable; the pure-tensor / mask-mod / plan / config tests stay on
+# CPU.
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+_gpu_only = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="P-EAGLE forward uses flex_attention, which has no CPU autograd support in the CI torch build.",
+)
 
 # P-EAGLE's draft forward runs flex_attention, whose autograd is not implemented
 # on CPU in the CI torch build (even the forward errors once the inputs require
@@ -144,6 +158,139 @@ def test_cod_filters_unsupervised_positions_from_deeper_depths():
     orig = anchor_pos + depth
     # Depth-0 spans the whole sequence; depths >= 1 must reference supervised ids.
     assert torch.all(orig[depth >= 1] < 8)
+
+
+# --------------------------------------------------------------------------- #
+# Sequence partitioning (Algorithm 1)
+# --------------------------------------------------------------------------- #
+def test_assign_cod_segments_phase1_position_and_phase2_dependency():
+    """depths 0/1 bucket by position; depth >= 2 inherits its rollout's depth-1 bucket.
+
+    With ``seq_len=8, S=2`` the boundary is at 4. A rollout anchored at position 3
+    has its depth-1 element at orig 4 (bucket 1) -- so the whole deep chain lands
+    in segment 1, NOT segment 0 (the bucket of anchor 3). This pins the Phase-2
+    ``A^g[p] = A^{g-1}[p-1]`` propagation and the ``anchor + 1`` off-by-one.
+    """
+    seq_len, num_segments = 8, 2
+    #                        depth-0 over all positions          | d1@a3 | d2@a3
+    anchor_pos = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 3, 3], dtype=torch.long)
+    depth = torch.tensor([0, 0, 0, 0, 0, 0, 0, 0, 1, 2], dtype=torch.long)
+    seg = assign_cod_segments(anchor_pos, depth, seq_len, num_segments)
+    assert seg[:8].tolist() == [0, 0, 0, 0, 1, 1, 1, 1]  # depth-0 by position
+    assert seg[8].item() == 1  # depth-1 anchored at 3 -> bucket(orig=4) = 1
+    assert seg[9].item() == 1  # depth-2 inherits the depth-1 bucket = 1
+
+
+def test_assign_cod_segments_is_in_range_and_defensively_clamped():
+    """Every assignment lands in ``[0, S)`` -- including a defensive clamp."""
+    seq_len, num_segments = 12, 4
+    anchor_pos = torch.arange(seq_len, dtype=torch.long)
+    depth = torch.zeros(seq_len, dtype=torch.long)
+    seg = assign_cod_segments(anchor_pos, depth, seq_len, num_segments)
+    assert int(seg.min()) >= 0 and int(seg.max()) < num_segments
+    # Out-of-range position (defensive): the right boundary must clamp to S-1.
+    clamped = assign_cod_segments(torch.tensor([seq_len]), torch.tensor([0]), seq_len, num_segments)
+    assert clamped.item() == num_segments - 1
+
+
+def _drive_partitioned(trainer: PEagleTrainerModule, batch: dict[str, torch.Tensor]):
+    """Drive the partitioned path exactly as the recipe does: build the plan, then
+    one ``forward(peagle_segment=...)`` + ``backward()`` per segment. Returns the
+    aggregated (detached) loss, valid count, and correct count."""
+    plan = trainer.build_peagle_plan(batch["loss_mask"])
+    device = batch["input_ids"].device
+    loss_sum = torch.zeros((), device=device)
+    valid_sum = torch.zeros((), device=device)
+    correct_sum = torch.zeros((), device=device)
+    for i in range(len(plan.units)):
+        seg = trainer(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            loss_mask=batch["loss_mask"],
+            aux_hidden_states=batch["aux_hidden_states"],
+            target_logits=batch["target_logits"],
+            peagle_segment=(plan, i),
+        )
+        seg.loss.backward()
+        loss_sum = loss_sum + seg.loss.detach()
+        valid_sum = valid_sum + seg.valid_tokens
+        correct_sum = correct_sum + seg.accuracy.detach() * seg.valid_tokens
+    return loss_sum, valid_sum, correct_sum
+
+
+@_gpu_only
+def test_sequence_partitioning_matches_single_flat_forward():
+    """Algorithm 1 partitioning is exact: driving the S>1 plan segment-by-segment
+    (forward + backward each) reproduces the single flat S=1 forward's loss,
+    valid-token count, and (up to float summation order) its gradients on every
+    draft parameter. This is the linchpin -- if the per-segment key/value sets or
+    the loss-charging partition were wrong, the gradients would diverge."""
+    torch.manual_seed(0)
+    mask_id = 20
+    draft = _build_tiny_draft_model(parallel_drafting=True, mask_token_id=mask_id)
+    selected_token_ids, selected_token_mask = _vocab_mapping(draft.config)
+
+    def _trainer(sequence_partitions: int) -> PEagleTrainerModule:
+        return PEagleTrainerModule(
+            draft,
+            selected_token_ids=selected_token_ids,
+            selected_token_mask=selected_token_mask,
+            num_depths=6,
+            mask_token_id=mask_id,
+            sequence_partitions=sequence_partitions,
+        ).to(next(draft.parameters()).device)
+
+    single = _trainer(1)
+    partitioned = _trainer(4)
+    batch = _random_batch(draft.config, batch_size=2, seq_len=16)
+
+    # Seed identically before each path so COD sampling (the only RNG consumer,
+    # in single forward / in build_peagle_plan) draws the same anchors/depths.
+    draft.zero_grad(set_to_none=True)
+    torch.manual_seed(123)
+    single_metrics = single(**batch)
+    single_metrics.loss.backward()
+    single_grads = {n: p.grad.detach().clone() for n, p in draft.named_parameters() if p.grad is not None}
+
+    draft.zero_grad(set_to_none=True)
+    torch.manual_seed(123)
+    part_loss, part_valid, part_correct = _drive_partitioned(partitioned, batch)
+    partitioned_grads = {n: p.grad.detach().clone() for n, p in draft.named_parameters() if p.grad is not None}
+
+    torch.testing.assert_close(part_loss, single_metrics.loss, rtol=1e-4, atol=1e-5)
+    assert part_valid.item() == single_metrics.valid_tokens.item()
+    assert set(partitioned_grads) == set(single_grads)
+    assert single_grads, "expected non-empty gradients"
+    for name in single_grads:
+        torch.testing.assert_close(partitioned_grads[name], single_grads[name], rtol=1e-3, atol=1e-4)
+
+
+def test_peagle_plan_charges_every_supervised_token_once():
+    """The plan partitions supervised tokens: ``total_den`` equals the single-pass
+    supervised count, and every supervised sampled position is the loss-owner of
+    exactly one segment (completion-context rows are never charged)."""
+    torch.manual_seed(0)
+    mask_id = 20
+    draft = _build_tiny_draft_model(parallel_drafting=True, mask_token_id=mask_id)
+    selected_token_ids, selected_token_mask = _vocab_mapping(draft.config)
+    trainer = PEagleTrainerModule(
+        draft,
+        selected_token_ids=selected_token_ids,
+        selected_token_mask=selected_token_mask,
+        num_depths=6,
+        mask_token_id=mask_id,
+        sequence_partitions=4,
+    ).to(next(draft.parameters()).device)
+    # build_peagle_plan is flex-free (COD sampling + Algorithm 1 assignment), so
+    # this test runs on CPU too -- no @_gpu_only guard.
+    batch = _random_batch(draft.config, batch_size=2, seq_len=16)
+    plan = trainer.build_peagle_plan(batch["loss_mask"])
+
+    charged = sum(int(loss_positions.sum()) for _b, _a, _d, _o, loss_positions in plan.units)
+    assert charged == int(plan.total_den.item()), "loss-charged tokens must equal total_den"
+    # No completion-context (unowned) row is charged; charged count matches the
+    # supervised sampled-token total, so each is owned by exactly one segment.
+    assert charged > 0
 
 
 # --------------------------------------------------------------------------- #

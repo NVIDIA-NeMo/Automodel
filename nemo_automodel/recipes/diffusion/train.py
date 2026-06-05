@@ -459,6 +459,8 @@ def build_model_and_optimizer(
                 )
             dp_size = world_size // denom
 
+        reduce_dtype = dtype_from_str(fsdp_cfg.get("reduce_dtype", None), default=torch.float32)
+
         manager_args: Dict[str, Any] = {
             "_manager_type": "fsdp2",
             "dp_size": dp_size,
@@ -481,7 +483,7 @@ def build_model_and_optimizer(
             "fsdp2_forward_prefetch_depth": fsdp_cfg.get("fsdp2_forward_prefetch_depth", 1),
             "mp_policy": MixedPrecisionPolicy(
                 param_dtype=param_dtype,
-                reduce_dtype=torch.float32,
+                reduce_dtype=reduce_dtype,
                 output_dtype=compute_dtype,
             ),
             # CPU offload: when enabled, sharded params + optimizer state live on
