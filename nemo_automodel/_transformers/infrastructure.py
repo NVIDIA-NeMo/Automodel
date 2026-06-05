@@ -627,12 +627,14 @@ def apply_model_infrastructure(
             if is_compile_enabled:
                 attach_cp_sdpa_hooks(mp, cp_mesh)
 
-    # Frozen submodules (e.g. a frozen vision tower) are excluded from FSDP wrapping
-    # (see apply_fsdp tower skipping) and so never receive the FSDP param_dtype cast.
-    # Under fp32 master weights + bf16 mixed-precision compute that leaves a frozen
-    # fp32 module feeding bf16 trainable modules -> dtype-mismatch matmul at the seam.
-    # Cast those frozen modules to the compute dtype so the whole forward runs uniformly.
-    # No-op for pure-fp32 / pure-bf16 runs and when no mp_policy is available (DDP/PP).
+    # Frozen submodules (e.g. a frozen vision tower) either land in the root FSDP unit
+    # (sharded) or are excluded from wrapping, depending on the model/parallelizer. In
+    # both cases FSDP mixed precision never casts their buffers, and an excluded frozen
+    # module also keeps its storage-dtype params. Under fp32 master weights + bf16 compute
+    # that leaves frozen fp32 tensors feeding bf16 trainable modules -> dtype-mismatch
+    # matmul at the seam. Cast frozen params/buffers to the compute dtype so the whole
+    # forward runs uniformly. No-op for pure-fp32 / pure-bf16 runs and when no mp_policy
+    # is available (DDP/PP).
     compute_dtype = getattr(getattr(model_wrapper, "mp_policy", None), "param_dtype", None)
     if compute_dtype is not None:
         for mp in model.parts if hasattr(model, "parts") else [model]:
