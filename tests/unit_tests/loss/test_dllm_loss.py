@@ -504,70 +504,68 @@ class TestDFlashDraftAccuracy:
 
 
 class TestIDLMLoss:
-    """I-DLM all-masked loss: Dream-shift two-CE, matched against the reference."""
+    """I-DLM block-diffusion loss: two CEs over the ``[x_t | x_0]`` halves.
 
-    def _reference(self, logits, labels, noise_mask, valid_mask, alpha):
-        """Mirror of the reference compute_idlm_loss (train_idlm.py)."""
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        shift_valid = valid_mask[:, 1:].bool()
-        shift_noisy = noise_mask[:, 1:].bool()
-        shift_clean = (~shift_noisy) & shift_valid
-        per_token = F.cross_entropy(
-            shift_logits.reshape(-1, shift_logits.size(-1)).float(),
-            shift_labels.reshape(-1),
-            reduction="none",
-        ).view(shift_labels.shape)
-        noisy = shift_noisy & shift_valid
-        ce_noisy = (per_token * noisy).sum() / noisy.sum().clamp_min(1)
-        ce_clean = (per_token * shift_clean).sum() / shift_clean.sum().clamp_min(1)
-        return ce_noisy + alpha * ce_clean, ce_noisy
+    The reference is the official combined-loss math (``train/sft/trainer.py``):
+    a decode CE on the noisy half and a verify CE on the clean half, both over
+    the Dream-shifted response (answer) positions.
+    """
+
+    def _reference(self, logits, target, answer_mask, valid_mask, alpha, L):
+        noisy, clean = logits[:, :L, :], logits[:, L : 2 * L, :]
+        shift_target = target[:, 1:]
+        supervise = (answer_mask[:, 1:].bool() & valid_mask[:, 1:].bool()).float()
+        denom = supervise.sum().clamp_min(1)
+
+        def ce(lg):
+            pt = F.cross_entropy(
+                lg[:, :-1, :].reshape(-1, lg.size(-1)).float(),
+                shift_target.reshape(-1),
+                reduction="none",
+            ).view(shift_target.shape)
+            return (pt * supervise).sum() / denom
+
+        ce_noisy, ce_clean = ce(noisy), ce(clean)
+        return ce_noisy + alpha * ce_clean, ce_noisy, ce_clean
 
     def _inputs(self):
         torch.manual_seed(0)
         B, L, V = 2, 12, 32
-        logits = torch.randn(B, L, V)
-        labels = torch.randint(0, V, (B, L))
+        logits = torch.randn(B, 2 * L, V)  # [x_t | x_0]
+        target = torch.randint(0, V, (B, L))
         valid_mask = torch.ones(B, L, dtype=torch.long)
         valid_mask[1, 10:] = 0  # pad the tail of sample 1
-        # All-masked: supervised region (after a 4-token prompt) is masked.
-        noise_mask = torch.zeros(B, L, dtype=torch.bool)
-        noise_mask[:, 4:] = True
-        noise_mask = noise_mask & valid_mask.bool()
-        return logits, labels, noise_mask, valid_mask
+        # All-masked: supervised region (after a 4-token prompt) is the response.
+        answer_mask = torch.zeros(B, L, dtype=torch.bool)
+        answer_mask[:, 4:] = True
+        answer_mask = answer_mask & valid_mask.bool()
+        return logits, target, answer_mask, valid_mask, L
 
     def test_matches_reference_fixed_alpha(self):
         from nemo_automodel.components.loss.dllm_loss import IDLMLoss
 
-        logits, labels, noise_mask, valid_mask = self._inputs()
-        out = IDLMLoss(clean_loss_weight=0.2)(logits, labels, noise_mask, valid_mask)
-        ref_total, ref_noisy = self._reference(logits, labels, noise_mask, valid_mask, 0.2)
+        logits, target, answer_mask, valid_mask, L = self._inputs()
+        out = IDLMLoss(clean_loss_weight=0.2)(logits, target, answer_mask, valid_mask, seq_len=L)
+        ref_total, ref_noisy, _ = self._reference(logits, target, answer_mask, valid_mask, 0.2, L)
         assert torch.isclose(out.total_loss, ref_total, atol=1e-5)
         assert torch.isclose(out.dllm_loss, ref_noisy, atol=1e-5)
 
     def test_auto_balance_scales_clean_to_noisy(self):
         from nemo_automodel.components.loss.dllm_loss import IDLMLoss
 
-        logits, labels, noise_mask, valid_mask = self._inputs()
-        out = IDLMLoss(auto_balance=True)(logits, labels, noise_mask, valid_mask)
-        # auto-balance uses alpha = (ce_noisy / ce_clean).detach()
-        ref_noisy_total, ref_noisy = self._reference(logits, labels, noise_mask, valid_mask, 0.0)
-        # recover ce_clean from a second reference call with alpha=1
-        ref_alpha1, _ = self._reference(logits, labels, noise_mask, valid_mask, 1.0)
-        ce_clean = ref_alpha1 - ref_noisy
-        alpha = (ref_noisy / ce_clean.clamp_min(1e-6)).detach()
-        expected = ref_noisy + alpha * ce_clean
+        logits, target, answer_mask, valid_mask, L = self._inputs()
+        out = IDLMLoss(auto_balance=True)(logits, target, answer_mask, valid_mask, seq_len=L)
+        _, ce_noisy, ce_clean = self._reference(logits, target, answer_mask, valid_mask, 0.0, L)
+        alpha = (ce_noisy / ce_clean.clamp_min(1e-6)).detach()
+        expected = ce_noisy + alpha * ce_clean
         assert torch.isclose(out.total_loss, expected, atol=1e-5)
 
-    def test_clean_region_excludes_padding(self):
-        """ce_clean must ignore padded positions (only valid, unmasked count)."""
+    def test_excludes_padding_and_finite(self):
+        """Both CEs ignore padded positions and never produce NaN/inf."""
         from nemo_automodel.components.loss.dllm_loss import IDLMLoss
 
-        logits, labels, noise_mask, valid_mask = self._inputs()
-        loss_fn = IDLMLoss(clean_loss_weight=1.0)
-        out = loss_fn(logits, labels, noise_mask, valid_mask)
-        # Padding everything-valid vs the masked-tail version must differ only by
-        # the clean-region denominator, never produce NaN/inf.
+        logits, target, answer_mask, valid_mask, L = self._inputs()
+        out = IDLMLoss(clean_loss_weight=1.0)(logits, target, answer_mask, valid_mask, seq_len=L)
         assert torch.isfinite(out.total_loss)
         assert out.total_loss.item() > 0
 
@@ -606,17 +604,17 @@ class TestIDLMLossDTensor:
 
         torch.manual_seed(0)
         B, L, V = 2, 12, 32
-        logits = torch.randn(B, L, V)
-        labels = torch.randint(0, V, (B, L))
+        logits = torch.randn(B, 2 * L, V)  # [x_t | x_0]
+        target = torch.randint(0, V, (B, L))
         valid_mask = torch.ones(B, L, dtype=torch.long)
-        noise_mask = torch.zeros(B, L, dtype=torch.bool)
-        noise_mask[:, 4:] = True
+        answer_mask = torch.zeros(B, L, dtype=torch.bool)
+        answer_mask[:, 4:] = True
 
         loss_fn = IDLMLoss(clean_loss_weight=0.2)
-        plain = loss_fn(logits, labels, noise_mask, valid_mask).total_loss
+        plain = loss_fn(logits, target, answer_mask, valid_mask, seq_len=L).total_loss
 
         mesh = init_device_mesh("cpu", (1,))
         dlogits = distribute_tensor(logits, mesh, [Shard(-1)])  # vocab-sharded
-        sharded = loss_fn(dlogits, labels, noise_mask, valid_mask).total_loss
+        sharded = loss_fn(dlogits, target, answer_mask, valid_mask, seq_len=L).total_loss
 
         assert torch.allclose(plain, sharded, atol=1e-5), f"plain {plain.item():.6f} != DTensor {sharded.item():.6f}"

@@ -37,6 +37,10 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.attention.idlm_mask import (
+    create_idlm_block_mask,
+    create_idlm_sdpa_mask,
+)
 from nemo_automodel.components.datasets.dllm.corruption import (
     corrupt_all_masked,
     corrupt_blockwise,
@@ -231,27 +235,45 @@ class IDLMStrategy(DLLMStrategy):
 
     - Corruption: deterministic all-masked over the supervised region
       (:func:`corrupt_all_masked`).
-    - Attention: **strict causal** — unlike MDLM/LLaDA the model keeps its
-      causal mask (the prompt stays a clean introspective verify signal).
-    - Loss: :class:`IDLMLoss` (Dream-shifted ``CE_noisy + alpha*CE_clean``).
+    - Forward: the noisy and clean copies are concatenated into a length-``2L``
+      ``[x_t | x_0]`` sequence and run under the block-diffusion attention mask
+      (:func:`create_idlm_sdpa_mask` / :func:`create_idlm_block_mask`), so decode
+      tokens attend the clean ground-truth prefix and the clean copy stays
+      strict-causal.
+    - Loss: :class:`IDLMLoss` (Dream-shifted ``CE_noisy + alpha*CE_clean``,
+      both supervised on the response).
 
-    A single causal forward over the masked input yields both losses, so this
-    overrides :meth:`forward_backward` (the loss needs the padding-validity
-    mask, which the shared MDLM loss path does not thread through).
+    The mask is built for ``sdpa``/``eager`` (dense additive) or
+    ``flex_attention`` (sparse ``BlockMask``, preferred at scale); FlashAttention-2
+    is unsupported (it ignores arbitrary masks), as is context parallelism.
     """
 
+    def __init__(self):
+        self.block_size = 1
+        self.use_regular_causal = True
+
     def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
+        self.block_size = int(dllm_cfg.get("block_length", 1))
+        self.use_regular_causal = bool(dllm_cfg.get("use_regular_causal", True))
         return IDLMLoss(
             clean_loss_weight=float(dllm_cfg.get("clean_loss_weight", 0.2)),
             auto_balance=bool(dllm_cfg.get("auto_balance_clean_loss", False)),
         )
 
+    def setup_extra(self, recipe) -> None:
+        if getattr(recipe.distributed_config, "cp_size", 1) > 1:
+            raise ValueError("I-DLM does not support context parallelism (cp_size must be 1).")
+        attn_impl = getattr(getattr(recipe.model_parts[0], "config", None), "_attn_implementation", None)
+        if attn_impl == "flash_attention_2":
+            raise ValueError(
+                "I-DLM needs the block-diffusion attention mask; set the model's "
+                "attn_implementation to 'sdpa' (FlashAttention-2 ignores 4D masks)."
+            )
+
     def apply_corruption(self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio):
         return corrupt_all_masked(input_ids, loss_mask, mask_token_id)
 
     def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
-        # Model sees the masked tokens under its native causal mask (kept, not
-        # popped — I-DLM is strict-causal, not bidirectional like MDLM).
         batch["input_ids"] = noisy_input_ids
         return batch
 
@@ -267,7 +289,7 @@ class IDLMStrategy(DLLMStrategy):
         num_batches: int,
         is_train: bool = True,
     ) -> None:
-        """I-DLM microbatch: single causal forward over the masked input + two-CE loss."""
+        """I-DLM microbatch: single ``[x_t | x_0]`` forward + two-CE loss."""
         device = recipe.dist_env.device
         batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
@@ -297,10 +319,29 @@ class IDLMStrategy(DLLMStrategy):
         fp8_ctx = recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
         train_ctx, _ = make_cp_batch_and_ctx(recipe.device_mesh, {})
 
+        L = noisy_input_ids.size(1)
+        concat_input_ids = torch.cat([noisy_input_ids, clean_input_ids], dim=1)
+        pos = torch.arange(L, device=device)
+        concat_position_ids = torch.cat([pos, pos]).unsqueeze(0).expand(concat_input_ids.size(0), -1)
+        if getattr(getattr(model, "config", None), "_attn_implementation", None) == "flex_attention":
+            block_mask = create_idlm_block_mask(
+                L, self.block_size, attn, device=device, use_regular_causal=self.use_regular_causal
+            )
+        else:
+            mask_dtype = autocast_dtype if autocast_dtype is not None else torch.float32
+            block_mask = create_idlm_sdpa_mask(
+                L, self.block_size, attn, device=device, dtype=mask_dtype, use_regular_causal=self.use_regular_causal
+            )
+
         with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
-            out = model(input_ids=noisy_input_ids, attention_mask=attn, use_cache=False)
+            out = model(
+                input_ids=concat_input_ids,
+                attention_mask=block_mask,
+                position_ids=concat_position_ids,
+                use_cache=False,
+            )
             logits = out.logits if not torch.is_tensor(out) else out
-            loss_result = recipe.dllm_loss_fn(logits, clean_input_ids, noise_mask, attn)
+            loss_result = recipe.dllm_loss_fn(logits, clean_input_ids, noise_mask, attn, seq_len=L)
             microbatch_loss = loss_result.total_loss
             loss_buffer.append(microbatch_loss.detach().clone())
             recipe._dllm_loss_buffer.append(loss_result.dllm_loss)

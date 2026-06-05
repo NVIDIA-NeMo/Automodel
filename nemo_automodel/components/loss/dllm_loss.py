@@ -461,17 +461,19 @@ class DFlashDecayLoss(nn.Module):
 class IDLMLoss(nn.Module):
     """Introspective DLM all-masked loss (Yu et al., 2026; arXiv:2604.11035).
 
-    Converts an AR model into a diffusion LM with strict causal attention and a
-    next-token "logit shift" (the hidden state at position ``i`` predicts token
-    ``i+1``). The objective combines two cross-entropy terms over the shifted
-    positions:
+    Operates on the concatenated ``[x_t (L) | x_0 (L)]`` forward output produced
+    under the block-diffusion attention mask, where ``x_t`` is the noisy (masked)
+    copy and ``x_0`` the clean copy. With a next-token "logit shift" (the hidden
+    state at position ``i`` predicts token ``i+1``) the objective combines two
+    cross-entropy terms, both supervised on the response (answer) tokens:
 
     .. math::
         L = \\text{CE}_\\text{noisy} + \\alpha \\cdot \\text{CE}_\\text{clean}
 
-    - ``CE_noisy`` — CE at masked positions (the decode distribution ``q``).
-    - ``CE_clean`` — CE at clean, valid positions (the introspective verify
-      distribution ``p``); each term is its own mean.
+    - ``CE_noisy`` — decode CE on the ``x_t`` half (distribution ``q``): each
+      masked token is conditioned on the clean ground-truth prefix.
+    - ``CE_clean`` — verify CE on the ``x_0`` half (distribution ``p``): the
+      clean copy of the response under strict causal attention.
 
     With ``auto_balance=True`` the fixed weight is replaced by the detached
     ratio ``CE_noisy / CE_clean`` each step so the two terms stay comparable in
@@ -479,7 +481,7 @@ class IDLMLoss(nn.Module):
     fixed ``clean_loss_weight`` is used (the paper's ``0.2`` for early training).
 
     Args:
-        clean_loss_weight: Fixed ``alpha`` for the clean-token CE.
+        clean_loss_weight: Fixed ``alpha`` for the clean-copy CE.
         auto_balance: Replace ``alpha`` with ``(CE_noisy / CE_clean).detach()``.
     """
 
@@ -492,30 +494,38 @@ class IDLMLoss(nn.Module):
         self,
         logits: torch.Tensor,
         target_ids: torch.Tensor,
-        noise_mask: torch.Tensor,
+        answer_mask: torch.Tensor,
         valid_mask: torch.Tensor,
+        *,
+        seq_len: int,
     ) -> DLLMLossOutput:
-        """Compute the I-DLM all-masked loss.
+        """Compute the I-DLM block-diffusion loss.
 
         Args:
-            logits: Model logits over the masked input, shape ``[B, L, V]``.
-            target_ids: Clean token IDs, shape ``[B, L]``.
-            noise_mask: Bool mask of masked positions, shape ``[B, L]``.
+            logits: Concatenated forward logits, shape ``[B, 2L, V]`` ordered
+                ``[x_t | x_0]``.
+            target_ids: Clean token IDs for one copy, shape ``[B, L]``.
+            answer_mask: Bool mask of supervised (response) positions, ``[B, L]``.
             valid_mask: Bool/long padding-validity mask, shape ``[B, L]``.
+            seq_len: Length ``L`` of one copy.
 
         Returns:
             :class:`DLLMLossOutput` with the combined ``total_loss`` and
-            ``dllm_loss`` set to the masked-prediction term ``CE_noisy``.
+            ``dllm_loss`` set to the decode term ``CE_noisy``.
         """
-        # Logit shift: logits[:, i] predicts target[:, i+1]. _compute_per_token_nll
-        # materialises a vocab-sharded DTensor via full_tensor() if needed.
-        per_token_ce = _compute_per_token_nll(logits[:, :-1, :], target_ids[:, 1:])  # [B, L-1]
-        shift_valid = valid_mask[:, 1:].bool()
-        shift_noisy = noise_mask[:, 1:].bool() & shift_valid
-        shift_clean = (~noise_mask[:, 1:].bool()) & shift_valid
+        noisy_logits = logits[:, :seq_len, :]
+        clean_logits = logits[:, seq_len : 2 * seq_len, :]
 
-        ce_noisy = (per_token_ce * shift_noisy.to(per_token_ce.dtype)).sum() / shift_noisy.sum().clamp_min(1)
-        ce_clean = (per_token_ce * shift_clean.to(per_token_ce.dtype)).sum() / shift_clean.sum().clamp_min(1)
+        # Logit shift: logits[:, i] predicts target[:, i+1]. Both copies supervise
+        # the response tokens. _compute_per_token_nll materialises a vocab-sharded
+        # DTensor via full_tensor() if needed.
+        shift_target = target_ids[:, 1:]
+        supervise = answer_mask[:, 1:].bool() & valid_mask[:, 1:].bool()
+        weight = supervise.to(torch.float32)
+        denom = supervise.sum().clamp_min(1)
+
+        ce_noisy = (_compute_per_token_nll(noisy_logits[:, :-1, :], shift_target) * weight).sum() / denom
+        ce_clean = (_compute_per_token_nll(clean_logits[:, :-1, :], shift_target) * weight).sum() / denom
 
         if self.auto_balance:
             alpha = (ce_noisy / ce_clean.clamp_min(1e-6)).detach()

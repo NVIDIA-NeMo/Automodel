@@ -284,6 +284,12 @@ class TestIDLMStrategy:
         assert isinstance(strategy.create_loss_fn({}), IDLMLoss)
         assert strategy.create_loss_fn({"auto_balance_clean_loss": True}).auto_balance is True
 
+    def test_create_loss_fn_captures_block_length(self, strategy):
+        strategy.create_loss_fn({"block_length": 3})
+        assert strategy.block_size == 3
+        strategy.create_loss_fn({})
+        assert strategy.block_size == 1  # b1 default
+
     def test_apply_corruption_masks_all_supervised(self, strategy):
         input_ids = torch.randint(0, 100, (2, 16))
         loss_mask = torch.zeros(2, 16, dtype=torch.long)
@@ -296,15 +302,15 @@ class TestIDLMStrategy:
         assert (noisy[:, 8:] == 999).all()
         assert (noisy[:, :8] == input_ids[:, :8]).all()
 
-    def test_prepare_batch_keeps_causal_attention_mask(self, strategy):
-        """I-DLM is strict-causal — attention_mask must be kept (not popped)."""
+    def test_prepare_batch_keeps_attention_mask(self, strategy):
+        """The padding mask must be kept (it feeds the block-diffusion mask)."""
         batch = {"input_ids": torch.zeros(2, 4, dtype=torch.long), "attention_mask": torch.ones(2, 4)}
         noisy = torch.full((2, 4), 999, dtype=torch.long)
         noise_mask = torch.ones(2, 4, dtype=torch.bool)
         clean = torch.arange(8, dtype=torch.long).reshape(2, 4)
         result = strategy.prepare_batch(batch, noisy, noise_mask, clean)
         assert (result["input_ids"] == noisy).all()
-        assert "attention_mask" in result  # unlike MDLM, kept for causal attention
+        assert "attention_mask" in result  # unlike MDLM, kept for the block-diffusion mask
 
 
 # ---------------------------------------------------------------------------

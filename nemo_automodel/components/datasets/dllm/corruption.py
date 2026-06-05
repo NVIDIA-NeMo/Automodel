@@ -17,6 +17,7 @@
 Provides masking strategies for dLLM SFT:
 - ``corrupt_uniform``: uniform per-sequence corruption
 - ``corrupt_blockwise``: per-block weighted corruption with exponential position bias
+- ``corrupt_all_masked``: deterministic all-masked corruption (I-DLM)
 """
 
 from __future__ import annotations
