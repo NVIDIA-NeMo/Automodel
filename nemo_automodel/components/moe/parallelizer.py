@@ -364,20 +364,20 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
         if layer_type in ("full_attention", "sliding_attention"):
-            attn_module = block.self_attn.attn_module
-            if not isinstance(attn_module, DotProductAttention):
+            attn_module = getattr(block.self_attn, "attn_module", None)
+            if isinstance(attn_module, DotProductAttention):
+                attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
+                attn_module.set_context_parallel_group(
+                    cp_mesh.get_group(),
+                    torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
+                    _get_cp_stream(),
+                    cp_comm_type=attn_cp_comm_type,
+                )
+            else:
                 logger.warning(
-                    "Skipping CP setup for block with non-TE attention module: %s",
+                    "Skipping TE CP setup for block with non-TE attention module: %s",
                     type(attn_module).__name__,
                 )
-                continue
-            attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
-            attn_module.set_context_parallel_group(
-                cp_mesh.get_group(),
-                torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
-                _get_cp_stream(),
-                cp_comm_type=attn_cp_comm_type,
-            )
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
 
