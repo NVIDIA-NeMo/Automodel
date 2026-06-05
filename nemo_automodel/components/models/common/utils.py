@@ -191,6 +191,11 @@ class BackendConfig:
         enable_fsdp_optimizations: Whether to enable FSDP2 optimizations.
         gate_precision: Optional dtype override for the gate computation. Accepts
             torch.dtype or string (e.g., "torch.float32", "float32").
+        compile_mla: torch.compile(fullgraph) the DeepSeek MLA forward (requires attn="sdpa"
+            + all-torch submodules). See the field comment below.
+        compile_attn: generic version of compile_mla for standard GQA attention (e.g.
+            Qwen3-MoE). MLA also honors it. Requires attn="sdpa", linear="torch",
+            rms_norm="torch", rope_fusion=False.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -225,6 +230,11 @@ class BackendConfig:
     # reshapes, SDPA). Requires a compilable attention backend (attn="sdpa"); TE's fused
     # attention is a custom-autograd black box that fullgraph can't trace. Default False.
     compile_mla: bool = False
+    # Generic version of compile_mla for standard (GQA) attention modules (e.g. Qwen3-MoE).
+    # Same constraint: the compiled region must contain no TE custom-autograd submodules, so
+    # it requires attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False. MLA also
+    # honors this flag (compile_mla stays as a backward-compatible alias). Default False.
+    compile_attn: bool = False
 
     def __post_init__(self):
         # Normalize te_fp8: dict -> TEFp8Config, None stays None

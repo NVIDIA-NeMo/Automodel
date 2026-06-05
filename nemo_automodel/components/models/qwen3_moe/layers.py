@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Any
 
 import torch
@@ -29,6 +30,8 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+
+logger = logging.getLogger(__name__)
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -80,7 +83,38 @@ class Qwen3MoeAttention(nn.Module):
             num_gqa_groups=self.num_kv_heads,
         )
 
+        # Optionally fuse the attention forward's many small ops (q/k/v projections, per-head
+        # RMSNorm, RoPE, SDPA) with torch.compile(fullgraph=True). Only valid with a compilable
+        # attention backend — TE's fused attention is a custom-autograd black box that fullgraph
+        # can't trace, and TE Linear/RMSNorm are @torch.compiler.disable'd. seq_len is fixed so
+        # dynamic=False.
+        self._compiled_forward = None
+        if backend.compile_attn:
+            if backend.attn != "sdpa":
+                logger.warning(
+                    "backend.compile_attn=True ignored: requires attn='sdpa' (got attn='%s'); "
+                    "TE fused attention is not fullgraph-compilable.",
+                    backend.attn,
+                )
+            else:
+                logger.warning(
+                    "backend.compile_attn=True: torch.compile(fullgraph=True) the Qwen3-MoE attention (attn=sdpa)."
+                )
+                self._compiled_forward = torch.compile(self._forward_impl, fullgraph=True, dynamic=False)
+
     def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        if self._compiled_forward is not None:
+            return self._compiled_forward(x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
+        return self._forward_impl(x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
+
+    def _forward_impl(
         self,
         x: torch.Tensor,
         *,

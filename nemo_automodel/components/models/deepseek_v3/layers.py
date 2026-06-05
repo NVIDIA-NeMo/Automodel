@@ -126,16 +126,17 @@ class MLA(nn.Module):
         # RoPE, latent reshapes, SDPA) with torch.compile(fullgraph=True). Only valid
         # with a compilable attention backend — TE's fused attention is a custom-autograd
         # black box that fullgraph can't trace. seq_len is fixed here so dynamic=False.
+        # Honors compile_mla (MLA-specific) or compile_attn (generic attention-compile flag).
         self._compiled_forward = None
-        if backend.compile_mla:
+        if backend.compile_mla or backend.compile_attn:
             if attn_impl != "sdpa":
                 logger.warning(
-                    "backend.compile_mla=True ignored: requires attn='sdpa' (got attn='%s'); "
+                    "backend.compile_mla/compile_attn ignored: requires attn='sdpa' (got attn='%s'); "
                     "TE fused attention is not fullgraph-compilable.",
                     attn_impl,
                 )
             else:
-                logger.warning("backend.compile_mla=True: torch.compile(fullgraph=True) the MLA forward (attn=sdpa).")
+                logger.warning("compile MLA forward: torch.compile(fullgraph=True) the MLA forward (attn=sdpa).")
                 self._compiled_forward = torch.compile(self._forward_impl, fullgraph=True, dynamic=False)
 
     def forward(
