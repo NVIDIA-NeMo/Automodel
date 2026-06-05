@@ -29,24 +29,88 @@ from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegis
 
 # ---------------------------------------------------------------------------
 # 1. Every registered class must declare capabilities via XOR
+#
+# Modeled on tests/unit_tests/_transformers/test_doc_coverage.py: walk every
+# entry in MODEL_ARCH_MAPPING, collect violations, and surface them in a
+# single actionable assertion. Any new model onboarded into the registry that
+# forgets to declare capabilities (or declares both patterns by mistake) will
+# fail this test in CI before merge.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("arch", sorted(MODEL_ARCH_MAPPING.keys()))
-def test_registered_class_declares_capabilities_xor(arch):
-    """Each registered class must declare ModelCapabilities OR get_capabilities, not both/neither."""
-    try:
-        cls = ModelRegistry.get_model_cls_from_model_arch(arch)
-    except Exception as e:
-        pytest.skip(f"Arch {arch} could not be imported in this environment: {e}")
+def test_every_registered_arch_declares_capabilities_xor():
+    """Every architecture in ``MODEL_ARCH_MAPPING`` must declare capabilities
+    via exactly one of:
 
-    has_static = "ModelCapabilities" in cls.__dict__
-    has_dynamic = "get_capabilities" in cls.__dict__
-    assert has_static != has_dynamic, (
-        f"{cls.__name__} must declare exactly one of ('ModelCapabilities' nested "
-        f"dataclass, 'get_capabilities' classmethod); got static={has_static}, "
-        f"dynamic={has_dynamic}."
-    )
+      * a nested ``ModelCapabilities`` dataclass (for classes whose capability
+        profile does not depend on config), or
+      * a ``get_capabilities(cls, config)`` classmethod (for classes that
+        serve multiple checkpoint variants).
+
+    Declaring both is forbidden (the placeholder defaults of the nested class
+    can silently shadow the real, config-dependent answer). Declaring neither
+    is forbidden (callers cannot infer parallelism support from the registry).
+
+    This guards against the regression where a new arch lands in
+    ``MODEL_ARCH_MAPPING`` but the contributor forgets to declare its
+    capability flags. The test will surface every offending arch in a single
+    error message so onboarding fixes can be done in one pass.
+    """
+    missing: list[tuple[str, str]] = []  # (arch_name, reason)
+    unimportable: list[tuple[str, str]] = []
+
+    for arch_name in MODEL_ARCH_MAPPING:
+        try:
+            cls = ModelRegistry.get_model_cls_from_model_arch(arch_name)
+        except Exception as e:
+            unimportable.append((arch_name, f"{type(e).__name__}: {e}"))
+            continue
+
+        has_static = "ModelCapabilities" in cls.__dict__
+        has_dynamic = "get_capabilities" in cls.__dict__
+
+        if has_static and has_dynamic:
+            missing.append(
+                (
+                    arch_name,
+                    f"{cls.__name__} declares BOTH 'ModelCapabilities' and 'get_capabilities' (must be exactly one).",
+                )
+            )
+        elif not has_static and not has_dynamic:
+            missing.append(
+                (
+                    arch_name,
+                    f"{cls.__name__} declares NEITHER 'ModelCapabilities' nor 'get_capabilities'.",
+                )
+            )
+
+    if missing:
+        details = "\n".join(f"  - {arch}: {reason}" for arch, reason in missing)
+        raise AssertionError(
+            "The following registered architectures violate the capability "
+            "declaration contract:\n"
+            f"{details}\n\n"
+            "Fix by either:\n"
+            "  1. For classes with a single capability profile, add a nested\n"
+            "     `@dataclass(frozen=True) class ModelCapabilities` with the four\n"
+            "     `supports_tp/cp/pp/ep` flags, matching the pattern in\n"
+            "     `nemo_automodel/components/models/llama/model.py`.\n"
+            "  2. For classes serving multiple checkpoint variants (e.g. dense vs.\n"
+            "     MoE), add a `@classmethod get_capabilities(cls, config)` that\n"
+            "     returns `nemo_automodel._transformers.model_capabilities.ModelCapabilities`,\n"
+            "     matching the pattern in\n"
+            "     `nemo_automodel/components/models/gemma4_moe/model.py`.\n"
+            "  3. If a class declared both by mistake, remove the static nested\n"
+            "     dataclass; the dynamic method is the source of truth."
+        )
+
+    if unimportable:
+        details = "\n".join(f"  - {arch}: {reason}" for arch, reason in unimportable)
+        # Don't fail on unimportable archs (transformers version mismatches in
+        # the test environment are not a capability-declaration bug), but log
+        # them so a missing declaration on an unimportable class is not silently
+        # ignored when the env is upgraded.
+        print(f"\n[capabilities] {len(unimportable)} arch(es) not importable in this env:\n{details}")
 
 
 # ---------------------------------------------------------------------------
