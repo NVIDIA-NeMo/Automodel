@@ -133,3 +133,26 @@ def test_one_hot_target():
     triton_loss = fused_soft_cross_entropy(logits, target_probs, mask)
 
     torch.testing.assert_close(triton_loss, ref_loss, rtol=1e-4, atol=1e-4)
+
+
+def test_unnormalized_target_forward_and_backward():
+    """Targets whose rows do not sum to 1 still match the PyTorch reference.
+
+    Pins the per-row ``sum(p)`` factor in the backward (``sum_p * softmax(x) - p``):
+    with a normalized target ``sum_p == 1`` and the factor is invisible, so this
+    uses raw non-negative weights (``sum_p != 1``) to exercise it.
+    """
+    B, S, V = 1, 256, 4096
+    logits_ref = torch.randn(B, S, V, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    logits_tri = logits_ref.detach().clone().requires_grad_(True)
+    # Raw non-negative weights, deliberately NOT renormalized to sum to 1.
+    target_probs = torch.rand(B, S, V, dtype=torch.bfloat16, device="cuda")
+    mask = torch.ones(B, S, 1, device="cuda")
+
+    ref_loss = _pytorch_reference(logits_ref, target_probs, mask)
+    ref_loss.backward()
+    tri_loss = fused_soft_cross_entropy(logits_tri, target_probs, mask)
+    tri_loss.backward()
+
+    torch.testing.assert_close(tri_loss, ref_loss, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(logits_tri.grad, logits_ref.grad, rtol=1e-3, atol=1e-3)

@@ -47,16 +47,22 @@ def _soft_ce_forward_kernel(
     P_stride,
     Loss_ptr,
     LSE_ptr,
+    Sump_ptr,
     Mask_ptr,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """CE = -dot(p, x) + (max + log(sum_exp)) * sum(p), single-pass online softmax."""
+    """CE = -dot(p, x) + (max + log(sum_exp)) * sum(p), single-pass online softmax.
+
+    ``sum(p)`` is saved per row so the backward can form the exact gradient
+    ``sum(p) * softmax(x) - p`` for arbitrary (not necessarily normalized) targets.
+    """
     row_id = tl.program_id(0).to(tl.int64)
 
     if tl.load(Mask_ptr + row_id) == 0.0:
         tl.store(Loss_ptr + row_id, 0.0)
         tl.store(LSE_ptr + row_id, 0.0)
+        tl.store(Sump_ptr + row_id, 0.0)
         return
 
     X_row_ptr = X_ptr + row_id * X_stride
@@ -87,6 +93,7 @@ def _soft_ce_forward_kernel(
     lse = m + tl.log(d)
     tl.store(Loss_ptr + row_id, -dot_px + lse * sum_p)
     tl.store(LSE_ptr + row_id, lse)
+    tl.store(Sump_ptr + row_id, sum_p)
 
 
 @triton.jit
@@ -96,12 +103,18 @@ def _soft_ce_backward_kernel(
     P_ptr,
     P_stride,
     LSE_ptr,
+    Sump_ptr,
     Mask_ptr,
     InvCount_ptr,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """grad = (softmax(x) - p) / valid_count, single-pass using saved lse."""
+    """grad = (sum_p * softmax(x) - p) / valid_count, single-pass using saved lse / sum_p.
+
+    ``sum_p`` (the per-row target mass, == 1 for a normalized distribution) is the
+    derivative of the forward's ``lse * sum(p)`` term and keeps the gradient exact
+    for arbitrary targets.
+    """
     row_id = tl.program_id(0).to(tl.int64)
 
     if tl.load(Mask_ptr + row_id) == 0.0:
@@ -114,6 +127,7 @@ def _soft_ce_backward_kernel(
     X_row_ptr = X_ptr + row_id * X_stride
     P_row_ptr = P_ptr + row_id * P_stride
     lse = tl.load(LSE_ptr + row_id).to(tl.float32)
+    sum_p = tl.load(Sump_ptr + row_id).to(tl.float32)
     inv_count = tl.load(InvCount_ptr).to(tl.float32)
 
     for i in range(0, n_cols, BLOCK_SIZE):
@@ -124,7 +138,7 @@ def _soft_ce_backward_kernel(
         x_block = x_block.to(tl.float32)
         p_block = tl.load(P_row_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
 
-        grad_block = (tl.exp(x_block - lse) - p_block) * inv_count
+        grad_block = (sum_p * tl.exp(x_block - lse) - p_block) * inv_count
         tl.store(X_row_ptr + offsets, grad_block.to(out_dtype), mask=valid)
 
 
@@ -161,6 +175,7 @@ class SoftCrossEntropyFunction(torch.autograd.Function):
         mask_1d = valid_mask.view(n_rows)
         loss_1d = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
         lse_1d = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+        sump_1d = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
 
         BLOCK_SIZE, num_warps = _launch_config(V)
 
@@ -171,6 +186,7 @@ class SoftCrossEntropyFunction(torch.autograd.Function):
             target_probs_2d.stride(0),
             loss_1d,
             lse_1d,
+            sump_1d,
             mask_1d,
             V,
             BLOCK_SIZE=BLOCK_SIZE,
@@ -180,13 +196,13 @@ class SoftCrossEntropyFunction(torch.autograd.Function):
         scalar_loss = loss_1d.sum() / valid_count
         inv_valid_count = torch.reciprocal(valid_count)
 
-        ctx.save_for_backward(logits_2d.detach(), target_probs_2d, mask_1d, lse_1d, inv_valid_count)
+        ctx.save_for_backward(logits_2d.detach(), target_probs_2d, mask_1d, lse_1d, sump_1d, inv_valid_count)
         ctx.shape = (B, S, V)
         return scalar_loss
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits_2d, target_probs_2d, mask_1d, lse_1d, inv_valid_count = ctx.saved_tensors
+        logits_2d, target_probs_2d, mask_1d, lse_1d, sump_1d, inv_valid_count = ctx.saved_tensors
         B, S, V = ctx.shape
         n_rows = B * S
 
@@ -198,6 +214,7 @@ class SoftCrossEntropyFunction(torch.autograd.Function):
             target_probs_2d,
             target_probs_2d.stride(0),
             lse_1d,
+            sump_1d,
             mask_1d,
             inv_valid_count,
             V,
