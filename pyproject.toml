@@ -160,6 +160,12 @@ s3 = [
 msc = [
     "multi-storage-client>=0.13",
 ]
+# Speculative-decoding (EAGLE-3) SGLang target backend. Kept out of the main
+# training image and pinned in a separate dedicated SD environment so the
+# SGLang version stays isolated from the rest of the stack.
+spec_sglang = [
+    "sglang==0.5.9",
+]
 all = [
     "nemo_automodel[cuda]",
     "nemo_automodel[delta-databricks]",
