@@ -74,6 +74,15 @@ else:
     class Gemma4DrafterForCausalLM:
         """Placeholder raised when ``transformers.models.gemma4_assistant`` is unavailable."""
 
+        @dataclass(frozen=True)
+        class ModelCapabilities:
+            """Declared parallelism capabilities for this model class."""
+
+            supports_tp: bool = False
+            supports_cp: bool = False
+            supports_pp: bool = False
+            supports_ep: bool = False
+
         def __init__(self, *args, **kwargs):
             raise UnavailableError(
                 "transformers.models.gemma4_assistant is not available. "

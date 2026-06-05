@@ -1,0 +1,181 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for the model capability query API."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pytest
+import torch.nn as nn
+
+from nemo_automodel._transformers.model_capabilities import (
+    ModelCapabilities,
+    query_capabilities,
+)
+from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegistry
+
+# ---------------------------------------------------------------------------
+# 1. Every registered class must declare capabilities via XOR
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("arch", sorted(MODEL_ARCH_MAPPING.keys()))
+def test_registered_class_declares_capabilities_xor(arch):
+    """Each registered class must declare ModelCapabilities OR get_capabilities, not both/neither."""
+    try:
+        cls = ModelRegistry.get_model_cls_from_model_arch(arch)
+    except Exception as e:
+        pytest.skip(f"Arch {arch} could not be imported in this environment: {e}")
+
+    has_static = "ModelCapabilities" in cls.__dict__
+    has_dynamic = "get_capabilities" in cls.__dict__
+    assert has_static != has_dynamic, (
+        f"{cls.__name__} must declare exactly one of ('ModelCapabilities' nested "
+        f"dataclass, 'get_capabilities' classmethod); got static={has_static}, "
+        f"dynamic={has_dynamic}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. Dynamic-dispatch classes must NOT expose a static ModelCapabilities
+# ---------------------------------------------------------------------------
+
+
+def test_gemma4_dynamic_class_blocks_static_access():
+    """Gemma4ForConditionalGeneration uses get_capabilities; static attribute access must fail."""
+    try:
+        cls = ModelRegistry.get_model_cls_from_model_arch("Gemma4ForConditionalGeneration")
+    except Exception as e:
+        pytest.skip(f"Gemma4 not importable in this environment: {e}")
+
+    with pytest.raises(AttributeError):
+        cls.ModelCapabilities  # noqa: B018  -- attribute access is the test
+
+
+# ---------------------------------------------------------------------------
+# 3. query_capabilities canonical-type & dispatch behavior
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _StaticCaps:
+    supports_tp: bool = True
+    supports_cp: bool = False
+    supports_pp: bool = True
+    supports_ep: bool = False
+
+
+class _FakeStaticModel(nn.Module):
+    ModelCapabilities = _StaticCaps
+
+    def __init__(self, config=None):
+        super().__init__()
+        self.config = config
+
+
+class _FakeDynamicModel(nn.Module):
+    @classmethod
+    def get_capabilities(cls, config):
+        if getattr(config, "is_variant_a", False):
+            return ModelCapabilities(supports_tp=True, supports_pp=True)
+        return ModelCapabilities(supports_ep=True)
+
+    def __init__(self, config=None):
+        super().__init__()
+        self.config = config
+
+
+class _FakeBothModel(nn.Module):
+    """Invalid: declares both patterns."""
+
+    ModelCapabilities = _StaticCaps
+
+    @classmethod
+    def get_capabilities(cls, config):
+        return ModelCapabilities()
+
+
+class _FakeNeitherModel(nn.Module):
+    """Invalid: declares neither pattern."""
+
+
+class _FakeConfig:
+    def __init__(self, archs, **kwargs):
+        self.architectures = archs
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+def test_query_returns_canonical_type_for_static_class():
+    caps = query_capabilities(_FakeStaticModel)
+    assert type(caps) is ModelCapabilities
+    assert caps.supports_tp is True
+    assert caps.supports_pp is True
+    assert caps.supports_cp is False
+    assert caps.supports_ep is False
+
+
+def test_query_static_class_from_instance():
+    caps = query_capabilities(_FakeStaticModel())
+    assert type(caps) is ModelCapabilities
+    assert caps.supports_tp is True
+
+
+def test_query_dynamic_class_requires_config():
+    with pytest.raises(ValueError, match="dynamic capability dispatch"):
+        query_capabilities(_FakeDynamicModel)
+
+
+def test_query_dynamic_class_via_instance_dispatches_on_config():
+    inst_a = _FakeDynamicModel(config=_FakeConfig(archs=[], is_variant_a=True))
+    inst_b = _FakeDynamicModel(config=_FakeConfig(archs=[]))
+    caps_a = query_capabilities(inst_a)
+    caps_b = query_capabilities(inst_b)
+    assert caps_a == ModelCapabilities(supports_tp=True, supports_pp=True)
+    assert caps_b == ModelCapabilities(supports_ep=True)
+    assert caps_a != caps_b
+
+
+def test_query_dynamic_class_via_config_dispatches():
+    cfg = _FakeConfig(archs=[], is_variant_a=True)
+    # Direct config form requires the arch to resolve via registry; bypass that
+    # by passing the instance pathway since this fake isn't registered.
+    inst = _FakeDynamicModel(config=cfg)
+    caps = query_capabilities(inst)
+    assert caps == ModelCapabilities(supports_tp=True, supports_pp=True)
+
+
+def test_both_patterns_is_rejected():
+    with pytest.raises(TypeError, match="declares both"):
+        query_capabilities(_FakeBothModel)
+
+
+def test_neither_pattern_is_rejected():
+    with pytest.raises(AttributeError, match="declares no capabilities"):
+        query_capabilities(_FakeNeitherModel)
+
+
+def test_unsupported_target_type_raises():
+    with pytest.raises(TypeError):
+        query_capabilities(42)
+
+
+def test_query_class_non_module_raises():
+    class NotAModule:
+        pass
+
+    with pytest.raises(TypeError, match="not a torch.nn.Module"):
+        query_capabilities(NotAModule)

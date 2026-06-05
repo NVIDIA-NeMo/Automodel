@@ -19,7 +19,6 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -74,6 +73,7 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     HFGemma4Model = _make_missing("Gemma4Model")
     BaseModelOutputWithPast = _make_missing("BaseModelOutputWithPast")
 
+from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -476,23 +476,8 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     (NeMo GroupedExperts + Gemma4Gate).  Otherwise falls through to vanilla HF.
     """
 
-    @dataclass(frozen=True)
-    class ModelCapabilities:
-        """Declared parallelism capabilities for this model class.
-
-        Each flag should be set to ``True`` only when the corresponding feature
-        has a working, verified implementation for this class.  Variants of the
-        class with different config-driven structure (e.g. dense vs MoE) are
-        disambiguated by :meth:`get_capabilities` below.
-        """
-
-        supports_tp: bool = False
-        supports_cp: bool = False
-        supports_pp: bool = False
-        supports_ep: bool = False
-
     @classmethod
-    def get_capabilities(cls, config: "Gemma4Config") -> "Gemma4ForConditionalGeneration.ModelCapabilities":
+    def get_capabilities(cls, config: "Gemma4Config") -> ModelCapabilities:
         """Return the capabilities for a specific config (no model instance needed).
 
         Dispatches in two layers so the same class can serve every Gemma4
@@ -510,12 +495,12 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 ``audio_config`` attribute).
 
         Returns:
-            A populated ``ModelCapabilities`` for this specific config.
+            A populated :class:`ModelCapabilities` for this specific config.
         """
         text_config = getattr(config, "text_config", config)
         if bool(getattr(text_config, "enable_moe_block", False)):
             # MoE variant: gemma-4-26B-A4B-it
-            return cls.ModelCapabilities(
+            return ModelCapabilities(
                 supports_tp=False,
                 supports_cp=True,
                 supports_pp=False,
@@ -523,9 +508,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             )
         if getattr(config, "audio_config", None) is not None:
             # Dense + audio variant: gemma-4-E2B-it, gemma-4-E4B-it
-            return cls.ModelCapabilities()
+            return ModelCapabilities()
         # Plain dense variant: gemma-4-31B-it
-        return cls.ModelCapabilities(
+        return ModelCapabilities(
             supports_tp=True,
             supports_cp=False,
             supports_pp=True,

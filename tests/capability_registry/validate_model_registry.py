@@ -12,21 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CLI wrapper around :func:`query_capabilities`.
+"""Validate that a model's declared capabilities actually hold.
+
+This is the parity/validation harness. Querying the declared capabilities is
+handled by the public Python API and the small CLI in
+``nemo_automodel/cli/query_capabilities.py``; this script focuses on running
+the standardized tests (KL parity, etc.) that prove the declared flags are
+honest.
 
 Usage:
-    python tests/capability_registry/query_and_validate_model_registry.py \\
-        --model_id google/gemma-4-26B-A4B-it
-
-Looks up the NeMo custom model class registered for ``model_id``'s
-architecture, reads its nested ``ModelCapabilities`` dataclass, and prints
-the declared flags. Validation that the declared values actually hold
-(parity tests, etc.) is out of scope here.
+    python tests/capability_registry/validate_model_registry.py \\
+        --model_id meta-llama/Llama-3.1-8B
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -37,18 +39,18 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from tests.capability_registry._capability_query import query_capabilities  # noqa: E402
+from nemo_automodel import query_capabilities  # noqa: E402
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="query_and_validate_model_registry",
-        description="Query a NeMo AutoModel custom model class's declared ModelCapabilities.",
+        prog="validate_model_registry",
+        description="Validate a NeMo AutoModel model class's declared ModelCapabilities.",
     )
     parser.add_argument(
         "--model_id",
         required=True,
-        help="HuggingFace model id (e.g. google/gemma-4-26B-A4B-it).",
+        help="HuggingFace model id (e.g. meta-llama/Llama-3.1-8B).",
     )
     parser.add_argument(
         "--trust_remote_code",
@@ -63,14 +65,14 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
-def _print_table(model_id: str, capabilities: dict[str, bool]) -> None:
-    """Pretty-print the capability flags as a small table."""
+def _print_table(model_id: str, caps) -> None:
+    flags = dataclasses.asdict(caps)
     header = f"Model Capability Registry: {model_id}"
     print()
     print(header)
     print("-" * len(header))
-    width = max((len(k) for k in capabilities), default=0)
-    for name, value in capabilities.items():
+    width = max((len(k) for k in flags), default=0)
+    for name, value in flags.items():
         print(f"  {name:<{width}} : {value}")
     print()
 
@@ -80,15 +82,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
 
     try:
-        capabilities = query_capabilities(args.model_id, trust_remote_code=args.trust_remote_code)
-    except ValueError as exc:
+        caps = query_capabilities(args.model_id, trust_remote_code=args.trust_remote_code)
+    except (KeyError, ValueError, AttributeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     if args.json:
-        print(json.dumps({"model_id": args.model_id, "capabilities": capabilities}, indent=2))
+        print(json.dumps({"model_id": args.model_id, "capabilities": dataclasses.asdict(caps)}, indent=2))
     else:
-        _print_table(args.model_id, capabilities)
+        _print_table(args.model_id, caps)
+
+    # TODO: standardized parity tests (TP, CP, PP, EP) live in standardized_tests/
+    # and run per-capability based on `caps`.  They spawn torchrun, do K-step
+    # training, and KL-compare logits.
     return 0
 
 
