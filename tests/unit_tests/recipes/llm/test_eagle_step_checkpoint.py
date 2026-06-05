@@ -146,7 +146,15 @@ class _ConstantGradModule(nn.Module):
         self.w = nn.Parameter(torch.zeros(n))
 
     def forward(self, **kwargs):
-        return SimpleNamespace(loss=self.w.sum(), accuracy=torch.tensor(0.5))
+        # Mirror EagleStepMetrics: the recipe loop reads hidden_loss/token_loss
+        # on every micro-batch (for W&B logging), so the fake must expose them.
+        loss = self.w.sum()
+        return SimpleNamespace(
+            loss=loss,
+            accuracy=torch.tensor(0.5),
+            hidden_loss=loss.detach(),
+            token_loss=torch.zeros((), device=self.w.device),
+        )
 
 
 class _FakeTargetWrapper:
