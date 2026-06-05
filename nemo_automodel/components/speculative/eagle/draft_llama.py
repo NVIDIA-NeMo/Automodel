@@ -66,6 +66,28 @@ behave identically. Enabling them applies the EAGLE-3.1 drafter toggles to
 the Llama-style draft used here; the MLA-backbone Kimi K2.6 draft
 (``Eagle3DeepseekV2ForCausalLM`` in ``lightseekorg/kimi-k2.6-eagle3.1-mla``)
 is a separate architecture and is not covered by this module.
+
+P-EAGLE (parallel-drafting EAGLE-3) adds one further optional toggle:
+
+* ``config.parallel_drafting`` (bool, default False) -- when True, the draft
+  registers a single learnable ``mask_hidden`` placeholder of shape
+  ``[1, 1, num_aux_hidden_states * target_hidden_size]`` (the pre-``fc``
+  concatenated-aux dimension) and exposes :meth:`LlamaEagle3DraftModel.forward_peagle`,
+  a single parallel forward over a flat, COD-subsampled sequence with a
+  ``flex_attention`` cross-depth mask (see ``peagle_attention.py`` /
+  ``peagle_data.py``). The trainer feeds the ``mask_hidden`` placeholder --
+  projected through the same ``project_hidden_states`` path as real aux states --
+  at every masked depth (``>= 1``), together with the masked token
+  ``config.mask_token_id``, so the draft predicts all ``config.num_depths`` tokens
+  in one forward instead of autoregressively. The shape, the on-disk key
+  ``mask_hidden``, and the COD config (``num_depths`` / ``down_sample_ratio`` /
+  ``mask_token_id``) mirror speculators
+  (https://github.com/vllm-project/speculators/pull/480) so the checkpoint loads
+  into vLLM's parallel-drafting runtime unchanged. The masked token slot reuses
+  ``embed_tokens[config.mask_token_id]``. SGLang does not serve a P-EAGLE head
+  today (https://github.com/sgl-project/sglang/issues/23171). The flag only ever
+  adds the ``mask_hidden`` key, so EAGLE-3 / EAGLE-3.1 checkpoints round-trip
+  unchanged.
 """
 
 from __future__ import annotations
@@ -81,6 +103,12 @@ from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
+)
+from nemo_automodel.components.speculative.eagle.peagle_draft import (
+    _PeagleAttentionMixin,
+    _PeagleDecoderLayerMixin,
+    _PeagleDraftMixin,
+    _PeagleVanillaLayerMixin,
 )
 from nemo_automodel.shared.import_utils import safe_import_from
 
@@ -130,7 +158,7 @@ def _is_right_padded_attention_mask(attention_mask: torch.Tensor) -> bool:
     return not bool((mask_bool[:, 1:] & ~mask_bool[:, :-1]).any())
 
 
-class Eagle3LlamaAttention(nn.Module):
+class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
     """EAGLE-3 draft attention over ``[input_emb, hidden]`` 2H features.
 
     Driven through a shared ``cache_hidden = [K_list, V_list]`` pair. At
@@ -165,9 +193,13 @@ class Eagle3LlamaAttention(nn.Module):
     batch.
     """
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: PretrainedConfig, fuse_input: bool = True):
         super().__init__()
         self.config = config
+        # ``fuse_input`` toggles the q/k/v input width. The EAGLE-3 first layer
+        # consumes the concatenated ``[embed, hidden]`` (2H); P-EAGLE's deeper
+        # layers (layer_id >= 1) are vanilla Llama layers on plain hidden (H).
+        self.fuse_input = fuse_input
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -191,7 +223,7 @@ class Eagle3LlamaAttention(nn.Module):
             )
         self.attn_implementation = attn_impl
 
-        in_features = config.hidden_size * 2
+        in_features = config.hidden_size * 2 if fuse_input else config.hidden_size
         self.q_proj = nn.Linear(
             in_features, self.num_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
         )
@@ -391,7 +423,7 @@ class Eagle3LlamaMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
 
 
-class Eagle3LlamaDecoderLayer(nn.Module):
+class Eagle3LlamaDecoderLayer(_PeagleDecoderLayerMixin, nn.Module):
     """Single decoder layer used by the minimal EAGLE-3 draft model.
 
     Attribute names mirror SGLang's ``LlamaDecoderLayer`` in
@@ -441,6 +473,31 @@ class Eagle3LlamaDecoderLayer(nn.Module):
         return hidden_states
 
 
+class Eagle3LlamaPeagleLayer(_PeagleVanillaLayerMixin, nn.Module):
+    """Vanilla Llama decoder layer for P-EAGLE depths ``>= 1``.
+
+    The EAGLE-3 first layer (:class:`Eagle3LlamaDecoderLayer`) fuses the token
+    embedding and the projected target hidden state (``2H`` attention input).
+    P-EAGLE stacks ``num_hidden_layers`` layers; every layer after the first is
+    a standard Llama block operating on plain hidden states (``H``), matching
+    speculators' ``decoder_layer_class`` (a vanilla ``LlamaDecoderLayer``). Only
+    the P-EAGLE flex-attention path is implemented (these deeper layers do not
+    participate in the EAGLE-3 ``cache_hidden`` TTT recurrence).
+    """
+
+    def __init__(self, config: PretrainedConfig, layer_id: int):
+        super().__init__()
+        self.layer_id = layer_id
+        self.input_layernorm = initialize_rms_norm_module(
+            "torch", config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
+        self.post_attention_layernorm = initialize_rms_norm_module(
+            "torch", config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
+        self.self_attn = Eagle3LlamaAttention(config, fuse_input=False)
+        self.mlp = Eagle3LlamaMLP(config)
+
+
 class Eagle3LlamaModel(nn.Module):
     """Inner backbone matching SGLang's ``LlamaModel`` in ``llama_eagle3.py``.
 
@@ -480,11 +537,21 @@ class Eagle3LlamaModel(nn.Module):
                     for _ in range(num_aux_hidden_states)
                 ]
             )
-        self.layers = nn.ModuleList([Eagle3LlamaDecoderLayer(config, layer_id=0)])
+        # EAGLE-3 / EAGLE-3.1 TTT uses a single fused first layer. P-EAGLE stacks
+        # ``num_hidden_layers`` layers: the fused first layer (2H) plus
+        # ``num_hidden_layers - 1`` vanilla Llama layers (H), matching speculators'
+        # ``[first_layer] + [decoder_layer for i in range(1, num_layers)]``. The
+        # single-layer construction is preserved for the non-parallel path so the
+        # merged EAGLE checkpoints round-trip unchanged.
+        layers: list[nn.Module] = [Eagle3LlamaDecoderLayer(config, layer_id=0)]
+        if getattr(config, "parallel_drafting", False):
+            num_layers = max(1, int(getattr(config, "num_hidden_layers", 1)))
+            layers.extend(Eagle3LlamaPeagleLayer(config, layer_id=i) for i in range(1, num_layers))
+        self.layers = nn.ModuleList(layers)
         self.norm = initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps, device=None)
 
 
-class LlamaEagle3DraftModel(PreTrainedModel):
+class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
     """Llama-style dense EAGLE-3 draft model (Llama, Phi-3, Qwen3).
 
     State dict keys match SGLang's ``LlamaForCausalLMEagle3`` so the saved
@@ -508,6 +575,12 @@ class LlamaEagle3DraftModel(PreTrainedModel):
 
     config_class = PretrainedConfig
     base_model_prefix = "model"
+    # Declare the attention backends this draft actually implements so
+    # ``PreTrainedModel.__init__`` allows them. ``Eagle3LlamaAttention`` supports
+    # ``eager`` and ``flash_attention_2`` (see ``_SUPPORTED_ATTN_IMPLEMENTATIONS``)
+    # but NOT SDPA; without this flag transformers defaults ``_supports_flash_attn``
+    # to ``False`` and rejects ``attn_implementation="flash_attention_2"``.
+    _supports_flash_attn = True
 
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)
@@ -517,6 +590,12 @@ class LlamaEagle3DraftModel(PreTrainedModel):
 
         self.model = Eagle3LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
+
+        # P-EAGLE (parallel drafting): register the learnable ``mask_hidden``
+        # placeholder only when enabled so EAGLE-3 / EAGLE-3.1 checkpoints
+        # round-trip with no extra keys (see ``_PeagleDraftMixin``).
+        if getattr(config, "parallel_drafting", False):
+            self._init_peagle_parameters(config)
 
         self.post_init()
 

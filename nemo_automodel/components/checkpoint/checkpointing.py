@@ -447,7 +447,7 @@ class Checkpointer:
         model_state = ModelState(model, self.config.is_peft)
         state_dict = model_state.state_dict()
 
-        # Convert to HF format if using custom model implementations
+        # Convert to HF format if using custom model implementations.
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
@@ -455,6 +455,8 @@ class Checkpointer:
             device_mesh=self.moe_mesh,
             v4_compatible=self.config.v4_compatible,
         )
+        # MoE adapters return non-contiguous views; safetensors.save rejects those.
+        _materialize_to_hf_views_for_save(state_dict)
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
         fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, state_dict)
@@ -671,6 +673,8 @@ class Checkpointer:
         reader_key_mapping = None if has_state_dict_adapter else key_mapping
         storage_reader = self._get_storage_reader(model_path, reader_key_mapping, is_init_step=is_init_step)
 
+        # MoE adapters return views into model storage; DCP writes safetensors
+        # data straight through them and from_hf skips the rebuild.
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
@@ -1872,6 +1876,27 @@ def _maybe_adapt_state_dict_to_hf(
     if adapter:
         return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
+
+
+def _materialize_to_hf_views_for_save(state_dict: dict[str, torch.Tensor]) -> None:
+    """Replace non-contiguous tensor values in ``state_dict`` with contiguous copies in place.
+
+    MoE adapters return non-contiguous strided views into the model's grouped
+    expert storage for the optimized load path; ``safetensors.torch.save``
+    (which the DCP HF storage writer calls) rejects non-contiguous tensors,
+    so we materialize one tensor at a time here with ``empty_cache`` between
+    iterations. Per-tensor transient is bounded to a single expert weight
+    instead of allocating the full grouped set up front.
+    """
+    if not state_dict:
+        return
+    cuda_available = torch.cuda.is_available()
+    for key, value in list(state_dict.items()):
+        if isinstance(value, torch.Tensor) and not value.is_contiguous():
+            state_dict[key] = value.contiguous()
+            del value
+            if cuda_available:
+                torch.cuda.empty_cache()
 
 
 def _equally_divide_layers(num_shards: int, keys: list[str]) -> dict[str, int]:

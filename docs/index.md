@@ -107,6 +107,7 @@ Find the right guide for your task: fine-tuning, pretraining, distillation, diff
 | **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](guides/llm/large-moe-finetune.md)         |
 | **Fine-tune DeepSeek V4 Flash** | You want to fine-tune the DeepSeek V4 Flash hybrid-attention MoE (SWA / CSA / HCA + hash-routing) | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune DeepSeek V4 Flash](guides/llm/dsv4-flash.md)   |
 | **Fine-tune Hy3-preview**       | You want to fine-tune Tencent's 295B MoE with sigmoid routing and per-head QK RMSNorm              | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune Hy3-preview](guides/llm/hy3.md)                |
+| **Fine-tune Nemotron-3 Ultra** | You want to fine-tune NVIDIA's 550B-A55B hybrid Mamba-2 / LatentMoE model with MTP                 | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune Nemotron-3 Ultra](guides/llm/nemotron-3-ultra.md) |
 | **Sequence classification** | You need to classify text into categories (sentiment, topic, NLI)                   | Text + labels (e.g., GLUE MRPC)                   | LLM       | [Train classifier](guides/llm/sequence-classification.md) |
 | **QAT fine-tune**           | You want a quantized model that keeps accuracy for efficient deployment             | Text dataset                                      | LLM       | [Enable QAT](guides/quantization-aware-training.md)       |
 | **Knowledge distillation**  | You want a smaller, faster model that retains most of the teacher's quality         | Instruction dataset + teacher model               | LLM       | [Distill a model](guides/llm/knowledge-distillation.md)   |
@@ -267,6 +268,7 @@ guides/llm/knowledge-distillation.md
 Large MoE Fine-Tuning <guides/llm/large-moe-finetune.md>
 DeepSeek V4 Flash <guides/llm/dsv4-flash.md>
 Hy3-preview <guides/llm/hy3.md>
+Nemotron-3 Ultra <guides/llm/nemotron-3-ultra.md>
 Pretraining <guides/llm/pretraining.md>
 NanoGPT Pretraining <guides/llm/nanogpt-pretraining.md>
 Sequence Classification <guides/llm/sequence-classification.md>

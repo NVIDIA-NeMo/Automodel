@@ -24,6 +24,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from tqdm.auto import tqdm
 
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
 
@@ -62,6 +63,26 @@ def build_eagle3_dataloader(
         unshifted=True,
     )
     sampler = DistributedSampler(dataset, shuffle=shuffle) if distributed else None
+
+    # The EAGLE recipes load the target model onto CUDA before iterating, so the
+    # CUDA context is already initialized by the time these workers spawn. Two
+    # defaults are unsafe in that state and must be overridden when
+    # ``num_workers > 0``:
+    #   * ``fork`` (the Linux default start method) hands each worker a copy of
+    #     the parent's live CUDA context, which is invalid in the child and
+    #     aborts the worker with ``cudaErrorInitializationError`` -> SIGABRT.
+    #     ``forkserver`` starts workers from a clean process with no inherited
+    #     CUDA context.
+    #   * Without ``persistent_workers`` the pool is torn down and re-forked at
+    #     every epoch boundary -- exactly when the abort surfaced (the first
+    #     epoch ran fine). Keeping workers alive across epochs removes that
+    #     re-fork entirely.
+    worker_kwargs: dict[str, Any] = {}
+    if num_workers > 0:
+        worker_kwargs["persistent_workers"] = True
+        if torch.cuda.is_available():
+            worker_kwargs["multiprocessing_context"] = "forkserver"
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -71,6 +92,7 @@ def build_eagle3_dataloader(
         pin_memory=torch.cuda.is_available(),
         collate_fn=_stack_batch,
         drop_last=False,
+        **worker_kwargs,
     )
 
 
@@ -116,18 +138,41 @@ def build_eagle3_token_mapping(
         selected_token_mask = torch.ones(target_vocab_size, dtype=torch.bool)
         return selected_token_ids, selected_token_mask
 
+    distributed = dist.is_available() and dist.is_initialized()
+    is_rank0 = (not distributed) or dist.get_rank() == 0
+    try:
+        total_batches = len(dataloader)
+    except TypeError:
+        total_batches = None
+
     counts = torch.zeros(target_vocab_size, dtype=torch.long)
-    for batch in dataloader:
+    total_supervised_tokens = 0
+    # Drive the progress bar manually and iterate ``dataloader`` directly: wrapping
+    # the loader in ``tqdm(dataloader)`` triggers a second ``__iter__`` on loaders
+    # without ``__len__``, which would double-scan a single-pass / streaming loader.
+    progress = tqdm(
+        total=total_batches,
+        desc=f"Counting supervised tokens for draft vocab ({draft_vocab_size})",
+        unit="batch",
+        disable=not is_rank0,
+        leave=True,
+    )
+    for step, batch in enumerate(dataloader):
         input_ids = batch["input_ids"]
         loss_mask = batch["loss_mask"].bool()
         supervised_ids = input_ids[loss_mask].to(torch.long).flatten()
+        progress.update(1)
         if supervised_ids.numel() == 0:
             continue
         in_range = (supervised_ids >= 0) & (supervised_ids < target_vocab_size)
         supervised_ids = supervised_ids[in_range]
+        total_supervised_tokens += supervised_ids.numel()
+        if is_rank0 and step % 100 == 0:
+            progress.set_postfix(tokens=total_supervised_tokens)
         counts.scatter_add_(0, supervised_ids, torch.ones_like(supervised_ids))
+    progress.close()
 
-    if dist.is_available() and dist.is_initialized():
+    if distributed:
         # NCCL collectives require CUDA tensors; move counts onto the current
         # device for the reduction and bring it back to CPU for the Python-side
         # selection logic below.
@@ -137,6 +182,15 @@ def build_eagle3_token_mapping(
             counts = counts_for_reduce.cpu()
         else:
             dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+
+    total_frequency = int(counts.sum().item())
+    unique_tokens = int((counts > 0).sum().item())
+    if is_rank0:
+        logger.info(
+            "Counted %d supervised tokens across %d unique target tokens",
+            total_frequency,
+            unique_tokens,
+        )
 
     selected: list[int] = []
     seen: set[int] = set()
@@ -165,6 +219,10 @@ def build_eagle3_token_mapping(
     selected_token_ids = torch.tensor(selected[:draft_vocab_size], dtype=torch.long)
     selected_token_mask = torch.zeros(target_vocab_size, dtype=torch.bool)
     selected_token_mask[selected_token_ids] = True
+    if is_rank0:
+        selected_frequency = int(counts[selected_token_ids].sum().item())
+        ratio = selected_frequency / total_frequency if total_frequency > 0 else 0.0
+        logger.info("top %d token frequency ratio: %.2f%%", selected_token_ids.numel(), ratio * 100)
     return selected_token_ids, selected_token_mask
 
 
