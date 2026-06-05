@@ -16,8 +16,8 @@
 """Benchmark: Triton fused soft CE vs PyTorch baseline.
 
 Usage:
-    python nemo_automodel/components/loss/benchmark/ce_loss.py
-    CUDA_VISIBLE_DEVICES=2 python nemo_automodel/components/loss/benchmark/ce_loss.py
+    python nemo_automodel/components/loss/benchmark/soft_ce_loss.py
+    CUDA_VISIBLE_DEVICES=2 python nemo_automodel/components/loss/benchmark/soft_ce_loss.py
 """
 
 import time
