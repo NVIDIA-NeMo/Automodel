@@ -15,11 +15,15 @@
 from __future__ import annotations
 
 import torch
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM as HFQwen3_5ForCausalLM
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM, build_mtp_config_from_hf
+from nemo_automodel.components.models.qwen3_5.model import (
+    Qwen3_5ForCausalLM,
+    Qwen3_5ForConditionalGeneration,
+    build_mtp_config_from_hf,
+)
 
 
 def _tiny_config(**kwargs):
@@ -40,6 +44,29 @@ def _tiny_config(**kwargs):
         **kwargs,
     )
     return cfg
+
+
+def _tiny_vlm_config(**kwargs):
+    text_config = _tiny_config(**kwargs)
+    vision_config = Qwen3_5VisionConfig(
+        depth=1,
+        hidden_size=16,
+        intermediate_size=32,
+        num_heads=2,
+        patch_size=2,
+        spatial_merge_size=1,
+        temporal_patch_size=1,
+        out_hidden_size=16,
+    )
+    return Qwen3_5Config(
+        architectures=["Qwen3_5ForConditionalGeneration"],
+        text_config=text_config.to_dict(),
+        vision_config=vision_config.to_dict(),
+        image_token_id=60,
+        video_token_id=61,
+        vision_start_token_id=62,
+        vision_end_token_id=63,
+    )
 
 
 def _backend():
@@ -119,3 +146,44 @@ class TestQwen3_5MTPModel:
 
         assert out.mtp_per_depth_h is None
         assert out.mtp_loss_scaling_factor is None
+
+
+class TestQwen3_5VLMMTPModel:
+    def test_vlm_forward_emits_mtp_hidden_states_in_training(self):
+        cfg = _tiny_vlm_config(mtp_num_hidden_layers=1)
+        model = Qwen3_5ForConditionalGeneration(cfg, backend=_backend(), mtp_loss_scaling_factor=0.2)
+        model.train()
+
+        input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+        out = model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids))
+
+        assert out.logits.shape == (1, 4, cfg.text_config.vocab_size)
+        assert out.mtp_per_depth_h is not None
+        assert len(out.mtp_per_depth_h) == 1
+        assert out.mtp_per_depth_h[0].shape == (1, 4, cfg.text_config.hidden_size)
+        assert out.mtp_loss_scaling_factor == 0.2
+
+    def test_vlm_image_forward_emits_mtp_hidden_states_in_training(self):
+        cfg = _tiny_vlm_config(mtp_num_hidden_layers=1)
+        model = Qwen3_5ForConditionalGeneration(cfg, backend=_backend(), mtp_loss_scaling_factor=0.2)
+        model.train()
+
+        input_ids = torch.tensor([[1, cfg.vision_start_token_id, cfg.image_token_id, cfg.vision_end_token_id, 2]])
+        attention_mask = torch.ones_like(input_ids)
+        mm_token_type_ids = torch.tensor([[0, 0, 1, 0, 0]], dtype=torch.int)
+        image_grid_thw = torch.tensor([[1, 1, 1]], dtype=torch.long)
+        pixel_values = torch.randn(1, 3 * cfg.vision_config.temporal_patch_size * cfg.vision_config.patch_size**2)
+
+        out = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
+        )
+
+        assert out.logits.shape == (1, 5, cfg.text_config.vocab_size)
+        assert out.mtp_per_depth_h is not None
+        assert len(out.mtp_per_depth_h) == 1
+        assert out.mtp_per_depth_h[0].shape == (1, 5, cfg.text_config.hidden_size)
+        assert out.mtp_loss_scaling_factor == 0.2

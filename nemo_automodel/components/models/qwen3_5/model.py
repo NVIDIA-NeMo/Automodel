@@ -23,18 +23,23 @@ from typing import Any
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5DecoderLayer,
     Qwen3_5RMSNorm,
     Qwen3_5TextModel,
     create_causal_mask,
 )
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5ForConditionalGeneration as HFQwen3_5ForConditionalGeneration,
+)
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule, roll_tensor
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .state_dict_adapter import Qwen3_5DenseStateDictAdapter
 
@@ -43,6 +48,7 @@ from .state_dict_adapter import Qwen3_5DenseStateDictAdapter
 class Qwen3_5CausalLMOutputWithPast(CausalLMOutputWithPast):
     """Qwen3.5 causal-LM output extended with MTP auxiliary hidden states."""
 
+    rope_deltas: torch.Tensor | None = None
     mtp_per_depth_h: list[torch.Tensor] | None = None
     mtp_loss_scaling_factor: float | None = None
 
@@ -375,6 +381,261 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
                         module.weight[module.padding_idx].zero_()
                 elif isinstance(module, Qwen3_5RMSNorm):
                     nn.init.zeros_(module.weight)
+        cast_model_to_dtype(self, dtype)
+
+
+class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditionalGeneration):
+    """Qwen3.5/Qwen3.6 dense VLM with optional Megatron-style MTP head.
+
+    The base VLM stays on the upstream HF implementation so image/video feature
+    insertion, M-RoPE position handling, and generation helpers remain intact.
+    MTP is added as an auxiliary train-time module over the final language
+    hidden states, matching the dense text-only MTP architecture.
+    """
+
+    # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
+    # patch_hf_model_for_pp must not replace it under PP.
+    _pp_keep_self_forward: bool = True
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Qwen3_5Config,
+        backend: BackendConfig | None = None,
+        **kwargs: Any,
+    ):
+        return cls(config, backend=backend, **kwargs)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args: Any,
+        **kwargs: Any,
+    ):
+        config = Qwen3_5Config.from_pretrained(pretrained_model_name_or_path)
+        return cls.from_config(config, *model_args, **kwargs)
+
+    def __init__(
+        self,
+        config: Qwen3_5Config,
+        backend: BackendConfig | None = None,
+        *,
+        mtp_loss_scaling_factor: float = 0.1,
+        num_nextn_predict_layers: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        del kwargs
+        super().__init__(config)
+        self.backend = backend or BackendConfig()
+
+        text_config = config.text_config
+        param_dtype = next(self.model.language_model.parameters()).dtype
+        dtype = get_dtype(getattr(text_config, "torch_dtype", None), param_dtype)
+        self.mtp_config = build_mtp_config_from_hf(
+            text_config,
+            loss_scaling_factor=mtp_loss_scaling_factor,
+            num_nextn_predict_layers=num_nextn_predict_layers,
+        )
+        self.mtp = build_qwen3_5_dense_mtp(text_config, self.mtp_config, dtype=dtype) if self.mtp_config.enabled else None
+        if self.mtp is not None:
+            cast_model_to_dtype(self.mtp, dtype)
+
+    def _pop_staged_vlm_media(
+        self,
+        input_ids: torch.Tensor | None,
+        kwargs: dict[str, Any],
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        pixel_values = kwargs.get("pixel_values", None)
+        pixel_values_videos = kwargs.get("pixel_values_videos", None)
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+
+        image_token_id = self.config.image_token_id
+        video_token_id = self.config.video_token_id
+        vision_start_token_id = self.config.vision_start_token_id
+        has_media_tokens = input_ids is not None and (
+            (input_ids == image_token_id).any()
+            or (input_ids == video_token_id).any()
+            or (input_ids == vision_start_token_id).any()
+        )
+        if not has_media_tokens:
+            return pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
+
+        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+        consumed_vlm_chunk = False
+
+        if pixel_values is None:
+            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
+            if image_chunks is not None and chunk_idx < len(image_chunks):
+                pixel_values = image_chunks[chunk_idx]
+                image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
+                if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
+                    image_grid_hws = image_grid_chunks[chunk_idx]
+                    if image_grid_hws is not None and image_grid_hws.numel() > 0:
+                        if image_grid_hws.shape[-1] == 2:
+                            ones = torch.ones(
+                                image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
+                            )
+                            image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
+                        else:
+                            image_grid_thw = image_grid_hws
+                consumed_vlm_chunk = True
+
+        if pixel_values_videos is None:
+            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
+            if video_chunks is not None and chunk_idx < len(video_chunks):
+                video_chunk = video_chunks[chunk_idx]
+                if video_chunk.numel() > 0:
+                    pixel_values_videos = video_chunk
+                    video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
+                    if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
+                        video_grid_thw = video_grid_chunks[chunk_idx]
+                consumed_vlm_chunk = True
+
+        if consumed_vlm_chunk:
+            self._vlm_chunk_idx = chunk_idx + 1
+
+        return pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Any | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.IntTensor | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        padding_mask: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> Qwen3_5CausalLMOutputWithPast:
+        effective_use_cache = False if use_cache is None and self.training else use_cache
+        kwargs = dict(kwargs)
+        if effective_use_cache is not None:
+            kwargs["use_cache"] = effective_use_cache
+        kwargs["pixel_values"] = pixel_values
+        kwargs["pixel_values_videos"] = pixel_values_videos
+        kwargs["image_grid_thw"] = image_grid_thw
+        kwargs["video_grid_thw"] = video_grid_thw
+        pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw = self._pop_staged_vlm_media(input_ids, kwargs)
+
+        if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
+            input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, kwargs
+            )
+            attention_mask = None
+            if padding_mask is not None:
+                kwargs["padding_mask"] = padding_mask
+
+        model_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"}
+        }
+        outputs = self.model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            mm_token_type_ids=mm_token_type_ids,
+            **model_kwargs,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
+
+        mtp_per_depth_h: list[torch.Tensor] | None = None
+        if self.mtp is not None and self.training:
+            language_model = self.model.language_model
+            source_embeds = inputs_embeds if inputs_embeds is not None else language_model.embed_tokens(input_ids)
+            rotary_position_ids, text_position_ids = _split_qwen3_5_position_ids(
+                position_ids,
+                batch_size=source_embeds.shape[0],
+                seq_len=source_embeds.shape[1],
+                device=source_embeds.device,
+                past_key_values=past_key_values,
+            )
+            causal_mask = create_causal_mask(
+                config=language_model.config,
+                inputs_embeds=source_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=text_position_ids,
+            )
+            mtp_kwargs = {
+                key: value
+                for key, value in model_kwargs.items()
+                if key
+                not in {
+                    "cache_position",
+                    "cu_seqlens",
+                    "cu_seqlens_padded",
+                    "max_seqlen",
+                    "mm_token_type_ids",
+                    "padding_mask",
+                    "qkv_format",
+                }
+            }
+            if input_ids is None:
+                mtp_per_depth_h = self.mtp(
+                    hidden_states,
+                    embed_inputs=_rolled_embed_inputs(source_embeds, self.mtp.num_depths),
+                    position_ids=rotary_position_ids,
+                    attention_mask=causal_mask,
+                    rotary_emb=language_model.rotary_emb,
+                    **mtp_kwargs,
+                )
+            else:
+                mtp_per_depth_h = self.mtp(
+                    hidden_states,
+                    input_ids=input_ids,
+                    embed_fn=language_model.embed_tokens,
+                    position_ids=rotary_position_ids,
+                    attention_mask=causal_mask,
+                    rotary_emb=language_model.rotary_emb,
+                    **mtp_kwargs,
+                )
+
+        return Qwen3_5CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=getattr(outputs, "hidden_states", None) or (hidden_states,),
+            attentions=getattr(outputs, "attentions", None),
+            rope_deltas=getattr(outputs, "rope_deltas", None),
+            mtp_per_depth_h=mtp_per_depth_h,
+            mtp_loss_scaling_factor=(self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None),
+        )
+
+    @torch.no_grad()
+    def initialize_weights(
+        self,
+        buffer_device: torch.device | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        mtp = getattr(self, "mtp", None)
+        if mtp is not None:
+            buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+            with buffer_device:
+                for sublayer in mtp.layers:
+                    sublayer.init_weights(buffer_device=buffer_device)
         cast_model_to_dtype(self, dtype)
 
 
