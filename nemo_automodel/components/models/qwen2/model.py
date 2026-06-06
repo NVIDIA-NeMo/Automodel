@@ -461,7 +461,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
 
         hidden_states = outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None:

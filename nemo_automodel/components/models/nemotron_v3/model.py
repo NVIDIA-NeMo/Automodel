@@ -701,7 +701,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         if past_key_values is not None:
             past_key_values.has_previous_state = True
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         # PP path defers loss to PipelineCausalLMLoss; only compute here off-PP.

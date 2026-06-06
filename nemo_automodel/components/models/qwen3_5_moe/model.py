@@ -18,7 +18,6 @@ from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
-from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 
@@ -638,11 +637,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         hidden_states = outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
-
-        return CausalLMOutputWithPast(
-            logits=logits,
-            hidden_states=(hidden_states if output_hidden_states else None),
+        return compute_lm_head_logits(
+            self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states
         )
 
     @torch.no_grad()

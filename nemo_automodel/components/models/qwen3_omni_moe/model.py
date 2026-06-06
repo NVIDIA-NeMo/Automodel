@@ -466,7 +466,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         )
 
         is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
-        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd)
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
 
         if is_thd and output_hidden_states and hidden.dim() == 2:
             hidden = hidden.unsqueeze(0)

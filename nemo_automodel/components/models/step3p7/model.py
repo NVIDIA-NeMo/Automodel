@@ -613,7 +613,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             **kwargs,
         )
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         if pp_mtp_enabled and self.lm_head is None:
             return (logits, *mtp_embed_inputs)

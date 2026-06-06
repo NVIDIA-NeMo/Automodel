@@ -406,14 +406,13 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             and self.lm_head.weight.dtype == torch.float32
             and hidden.dtype != torch.float32
         )
-        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd, fp32_lm_head=fp32_lm_head)
-
-        if is_thd and output_hidden_states and hidden.dim() == 2:
-            hidden = hidden.unsqueeze(0)
-
-        return CausalLMOutputWithPast(
-            logits=logits,
-            hidden_states=hidden if output_hidden_states else None,
+        return compute_lm_head_logits(
+            self.lm_head,
+            hidden,
+            logits_to_keep,
+            is_thd=is_thd,
+            fp32_lm_head=fp32_lm_head,
+            output_hidden_states=output_hidden_states,
         )
 
     def update_moe_gate_bias(self) -> None:

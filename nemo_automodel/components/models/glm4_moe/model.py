@@ -308,18 +308,8 @@ class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        # Final hidden states feeding the lm_head; in THD they are 2D [T, H], in BSHD 3D [B, S, H].
-        final_hidden_states = hidden
-
-        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd)
-
-        if is_thd:
-            # Keep the (full-sequence) hidden states aligned with the unsqueezed logits' batch dim.
-            final_hidden_states = final_hidden_states.unsqueeze(0)
-
-        return CausalLMOutputWithPast(
-            logits=logits,
-            hidden_states=final_hidden_states if output_hidden_states else None,
+        return compute_lm_head_logits(
+            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
         )
 
     @torch.no_grad()

@@ -389,14 +389,8 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd)
-
-        if is_thd and output_hidden_states and hidden_states.dim() == 2:
-            hidden_states = hidden_states.unsqueeze(0)
-
-        return CausalLMOutputWithPast(
-            logits=logits,
-            hidden_states=hidden_states if output_hidden_states else None,
+        return compute_lm_head_logits(
+            self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
         )
 
     def update_moe_gate_bias(self) -> None:

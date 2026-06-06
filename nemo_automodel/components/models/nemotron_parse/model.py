@@ -544,7 +544,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         # Final decoder hidden states feeding the lm_head.
         final_hidden_states = decoder_outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(self.lm_head, final_hidden_states, logits_to_keep)
+        logits = compute_lm_head_logits(self.lm_head, final_hidden_states, logits_to_keep).logits
 
         if not return_dict:
             return decoder_outputs + encoder_outputs

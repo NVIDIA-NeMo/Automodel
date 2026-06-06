@@ -236,7 +236,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         # Final hidden states fed to lm_head (single [B, S, H] tensor).
         hidden_states = outputs[0]
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None:

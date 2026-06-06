@@ -16,7 +16,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration as HFQwen3VLMoeForConditionalGeneration,
@@ -619,11 +618,8 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         if self.lm_head is None:
             return hidden_states
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
-
-        return CausalLMOutputWithPast(
-            logits=logits,
-            hidden_states=hidden_states if output_hidden_states else None,
+        return compute_lm_head_logits(
+            self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states
         )
 
     @torch.no_grad()

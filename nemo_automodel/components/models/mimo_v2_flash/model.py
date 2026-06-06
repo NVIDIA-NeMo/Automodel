@@ -702,12 +702,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 hidden_states=hidden if output_hidden_states else None,
             )
 
-        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep)
-
-        return CausalLMOutputWithPast(
-            logits=logits,
-            hidden_states=hidden if output_hidden_states else None,
-        )
+        return compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
     def customize_pipeline_stage_modules(
         self,

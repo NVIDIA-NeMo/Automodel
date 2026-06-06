@@ -331,14 +331,8 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd)
-
-        if is_thd and output_hidden_states and hidden.dim() == 2:
-            hidden = hidden.unsqueeze(0)
-
-        return CausalLMOutputWithPast(
-            logits=logits,
-            hidden_states=(hidden if output_hidden_states else None),
+        return compute_lm_head_logits(
+            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
         )
 
     @torch.no_grad()

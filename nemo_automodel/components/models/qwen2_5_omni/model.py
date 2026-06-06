@@ -250,7 +250,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
 
         hidden_states = outputs[0]
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None:

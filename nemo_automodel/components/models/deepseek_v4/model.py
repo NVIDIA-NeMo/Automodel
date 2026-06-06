@@ -788,7 +788,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         # deepseek runs the lm_head in fp32: project in fp32 and cast the logits
         # back to the hidden dtype via the shared helper.
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep, is_thd=thd_mode, fp32_lm_head=True)
+        logits = compute_lm_head_logits(
+            self.lm_head, hidden_states, logits_to_keep, is_thd=thd_mode, fp32_lm_head=True
+        ).logits
 
         if pp_mtp_enabled and self.lm_head is None:
             if not mtp_embed_inputs:
