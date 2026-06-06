@@ -61,7 +61,7 @@ def _bare_recipe_for_checkpointer(cls, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@patch("nemo_automodel.recipes.llm.train_eagle1.Checkpointer")
+@patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
 def test_eagle1_build_checkpointer_sets_model_state_dict_keys(mock_checkpointer, tmp_path):
     """_build_checkpointer must populate model_state_dict_keys from the draft model."""
     recipe = _bare_recipe_for_checkpointer(TrainEagle1Recipe, tmp_path)
@@ -73,7 +73,7 @@ def test_eagle1_build_checkpointer_sets_model_state_dict_keys(mock_checkpointer,
     assert recipe.checkpoint_config.model_state_dict_keys == expected_keys
 
 
-@patch("nemo_automodel.recipes.llm.train_eagle1.Checkpointer")
+@patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
 def test_eagle1_build_checkpointer_user_none_override_falls_back(mock_checkpointer, tmp_path):
     """If user config explicitly sets model_state_dict_keys=None, the fallback restores draft keys."""
     user_ckpt_cfg = SimpleNamespace(
@@ -93,7 +93,7 @@ def test_eagle1_build_checkpointer_user_none_override_falls_back(mock_checkpoint
 # ---------------------------------------------------------------------------
 
 
-@patch("nemo_automodel.recipes.llm.train_eagle3.Checkpointer")
+@patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
 def test_eagle3_build_checkpointer_sets_model_state_dict_keys(mock_checkpointer, tmp_path):
     """EAGLE-3 _build_checkpointer must also populate model_state_dict_keys."""
     recipe = _bare_recipe_for_checkpointer(TrainEagle3Recipe, tmp_path)
@@ -105,7 +105,7 @@ def test_eagle3_build_checkpointer_sets_model_state_dict_keys(mock_checkpointer,
     assert recipe.checkpoint_config.model_state_dict_keys == expected_keys
 
 
-@patch("nemo_automodel.recipes.llm.train_eagle3.Checkpointer")
+@patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
 def test_eagle3_build_checkpointer_user_none_override_falls_back(mock_checkpointer, tmp_path):
     """EAGLE-3: user config model_state_dict_keys=None triggers fallback to draft keys."""
     user_ckpt_cfg = SimpleNamespace(

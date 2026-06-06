@@ -33,7 +33,6 @@ from transformers import AutoConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import (
-    Checkpointer,
     CheckpointingConfig,
     save_config,
 )
@@ -41,10 +40,12 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle1_draft_spec
 from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
@@ -210,6 +211,9 @@ class TrainEagle1Recipe(BaseRecipe):
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
+        # The target's "Model summary" is logged by apply_model_infrastructure when it
+        # loads; the draft is built directly, so log its (trainable) summary here too.
+        print_trainable_parameters(self.draft_model, name="Draft")
 
         trainer_module = EagleTrainerModule(
             self.draft_model,
@@ -239,6 +243,17 @@ class TrainEagle1Recipe(BaseRecipe):
         self.max_grad_norm = recipe_cfg.get("max_grad_norm", 1.0)
         self.num_epochs = recipe_cfg.num_epochs
         self.log_every_steps = recipe_cfg.get("log_every_steps", 10)
+        # Checkpoint cadence. The two knobs are independent:
+        #   * ``ckpt_every_steps``            -- save every N optimizer steps (None/<=0 = off).
+        #   * ``save_checkpoint_every_epoch`` -- save at each epoch boundary (off by default).
+        # The fully-trained model is always saved once the run completes; these
+        # only add intermediate checkpoints (and stack when both are set). With
+        # both off, the end-of-run checkpoint is the only one written.
+        # NOTE: field names mirror StepScheduler (components/training/step_scheduler.py),
+        # which the SFT recipe uses for the same cadence; EAGLE hand-rolls its own
+        # loop, so a future refactor could adopt StepScheduler here too.
+        self.ckpt_every_steps = recipe_cfg.get("ckpt_every_steps", None)
+        self.save_checkpoint_every_epoch = recipe_cfg.get("save_checkpoint_every_epoch", False)
         self.output_dir = pathlib.Path(recipe_cfg.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -280,6 +295,16 @@ class TrainEagle1Recipe(BaseRecipe):
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
+        # Optional Weights & Biases logging (rank 0 only).
+        self.wandb_run = None
+        if self.dist_env.is_main and self.cfg.get("wandb", None) is not None:
+            suppress_wandb_log_messages()
+            self.wandb_run = init_wandb_run(
+                self.cfg.wandb.to_dict(),
+                self.cfg.to_dict(),
+                default_name="eagle1_" + str(target_path).rstrip("/").split("/")[-1],
+            )
+
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the standard recipes."""
         ckpt_cfg = self.cfg.get("checkpoint", None)
@@ -309,8 +334,7 @@ class TrainEagle1Recipe(BaseRecipe):
 
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
         dp_rank = dist.get_rank() if dist.is_initialized() else 0
-        self.checkpointer = Checkpointer(
-            config=self.checkpoint_config,
+        self.checkpointer = self.checkpoint_config.build(
             dp_rank=dp_rank,
             tp_rank=0,
             pp_rank=0,
@@ -416,6 +440,62 @@ class TrainEagle1Recipe(BaseRecipe):
                     self._update_best_symlink(path, float(best_val_metric))
             if is_dist_initialized:
                 dist.barrier()
+
+    def _log_saved_checkpoint(self, kind: str, epoch: int, step: int) -> None:
+        """Log a saved checkpoint on rank 0 when checkpointing is enabled."""
+        ckpt_cfg = getattr(self, "checkpoint_config", None)
+        if self.dist_env.is_main and ckpt_cfg is not None and ckpt_cfg.enabled:
+            logger.info("Saved %s checkpoint to %s/epoch_%d_step_%d", kind, ckpt_cfg.checkpoint_dir, epoch, step)
+
+    def _maybe_save_step_checkpoint(self, epoch: int) -> bool:
+        """Save a checkpoint mid-epoch when ``ckpt_every_steps`` is configured.
+
+        Called after every optimizer step. Saves whenever ``ckpt_every_steps`` is
+        a positive integer and the current ``global_step`` is a multiple of it.
+        Returns True if a checkpoint was written. The checkpoint directory is
+        named ``epoch_{epoch}_step_{global_step}`` so it never collides with the
+        end-of-epoch checkpoint (which uses ``epoch + 1``).
+        """
+        every = getattr(self, "ckpt_every_steps", None)
+        if every is None or every <= 0 or self.runtime.global_step % every != 0:
+            return False
+        self.save_checkpoint(
+            epoch=epoch,
+            step=self.runtime.global_step,
+            train_loss=None,
+            val_loss=None,
+            best_metric_key="val_loss",
+        )
+        self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
+        return True
+
+    def _maybe_save_final_checkpoint(self, completed_epochs: int) -> bool:
+        """Always save the fully-trained model at the end of a completed run,
+        unless a periodic checkpoint already captured the final step.
+
+        The end-of-run state is otherwise easy to lose: with no cadence nothing is
+        saved at all, and with a pure step cadence the final step is skipped
+        whenever the total step count is not a multiple of ``ckpt_every_steps``.
+        This is a no-op only when a step or epoch checkpoint already landed on the
+        final step, so it never duplicates or collides with one.
+        """
+        gs = self.runtime.global_step
+        if gs <= 0:
+            return False
+        every = getattr(self, "ckpt_every_steps", None)
+        saved_by_step = bool(every and every > 0 and gs % every == 0)
+        saved_by_epoch = bool(getattr(self, "save_checkpoint_every_epoch", False))
+        if saved_by_step or saved_by_epoch:
+            return False
+        self.save_checkpoint(
+            epoch=completed_epochs,
+            step=gs,
+            train_loss=None,
+            val_loss=None,
+            best_metric_key="val_loss",
+        )
+        self._log_saved_checkpoint("final", completed_epochs, gs)
+        return True
 
     def _save_extra_state(self, path: str, epoch: int) -> None:
         """Persist EAGLE-recipe-specific scalars. Subclasses extend this."""
@@ -530,6 +610,12 @@ class TrainEagle1Recipe(BaseRecipe):
             "val_accuracy": (total_acc / total_batches.clamp_min(1)).item(),
         }
 
+    def _wandb_log(self, data: dict, step: int) -> None:
+        """Log a metrics dict to W&B when a run is active (rank 0)."""
+        run = getattr(self, "wandb_run", None)
+        if run is not None:
+            run.log(data, step=step)
+
     def run_train_validation_loop(self):
         """Run the training loop."""
         self.trainer_module.train()
@@ -549,6 +635,8 @@ class TrainEagle1Recipe(BaseRecipe):
 
             running_loss = 0.0
             running_acc = 0.0
+            running_hidden_loss = 0.0
+            running_token_loss = 0.0
             epoch_loss = 0.0
             micro_step = 0
             pending_micro_batches = 0
@@ -587,32 +675,51 @@ class TrainEagle1Recipe(BaseRecipe):
 
                 running_loss += metrics.loss.detach().item()
                 running_acc += metrics.accuracy.detach().item()
+                running_hidden_loss += metrics.hidden_loss.detach().item()
+                running_token_loss += metrics.token_loss.detach().item()
                 epoch_loss += metrics.loss.detach().item()
                 micro_step += 1
                 pending_micro_batches += 1
 
                 if pending_micro_batches == self.grad_accumulation_steps:
-                    torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.lr_scheduler.step()
                     self.runtime.global_step += 1
                     completed_steps += 1
                     pending_micro_batches = 0
+                    self._maybe_save_step_checkpoint(epoch_idx)
 
                     if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
-                        avg_loss = running_loss / self.log_every_steps
-                        avg_acc = running_acc / self.log_every_steps
+                        n = self.log_every_steps
+                        avg_loss = running_loss / n
+                        avg_acc = running_acc / n
+                        current_lr = self.lr_scheduler.get_last_lr()[0]
                         logger.info(
                             "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
                             epoch_idx,
                             self.runtime.global_step,
                             avg_loss,
                             avg_acc,
-                            self.lr_scheduler.get_last_lr()[0],
+                            current_lr,
+                        )
+                        self._wandb_log(
+                            {
+                                "train/loss": avg_loss,
+                                "train/accuracy": avg_acc,
+                                "train/hidden_loss": running_hidden_loss / n,
+                                "train/token_loss": running_token_loss / n,
+                                "train/lr": current_lr,
+                                "train/grad_norm": float(grad_norm),
+                                "train/epoch": epoch_idx,
+                            },
+                            step=self.runtime.global_step,
                         )
                         running_loss = 0.0
                         running_acc = 0.0
+                        running_hidden_loss = 0.0
+                        running_token_loss = 0.0
 
             # Flush the trailing partial accumulation window. When
             # ``batches_per_epoch`` is not a multiple of ``grad_accumulation_steps``,
@@ -650,6 +757,7 @@ class TrainEagle1Recipe(BaseRecipe):
                 self.runtime.global_step += 1
                 completed_steps += 1
                 pending_micro_batches = 0
+                self._maybe_save_step_checkpoint(epoch_idx)
 
             eval_metrics = self._run_eval()
             if self.dist_env.is_main:
@@ -657,8 +765,13 @@ class TrainEagle1Recipe(BaseRecipe):
                 if eval_metrics is not None:
                     msg += f" val_loss={eval_metrics['val_loss']:.4f} val_accuracy={eval_metrics['val_accuracy']:.4f}"
                 logger.info(msg)
+            if eval_metrics is not None:
+                self._wandb_log(
+                    {"val/loss": eval_metrics["val_loss"], "val/accuracy": eval_metrics["val_accuracy"]},
+                    step=self.runtime.global_step,
+                )
 
-            if last_batch_idx >= 0:
+            if getattr(self, "save_checkpoint_every_epoch", False) and last_batch_idx >= 0:
                 avg_loss = epoch_loss / max(1, micro_step) if micro_step else None
                 self.save_checkpoint(
                     epoch=epoch_idx + 1,
@@ -667,6 +780,11 @@ class TrainEagle1Recipe(BaseRecipe):
                     val_loss=eval_metrics,
                     best_metric_key="val_loss",
                 )
+
+        self._maybe_save_final_checkpoint(self.num_epochs)
+
+        if getattr(self, "wandb_run", None) is not None:
+            self.wandb_run.finish()
 
 
 def main(config_path: str | None = None):

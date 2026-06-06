@@ -11,3 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
+
+__all__ = ["CometConfig", "MLflowConfig", "WandbConfig"]
