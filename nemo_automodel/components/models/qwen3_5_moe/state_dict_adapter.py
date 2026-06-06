@@ -31,8 +31,10 @@ Additionally, the shared expert uses singular in HF and plural in NeMo:
     HF:   .mlp.shared_expert.{gate,up,down}_proj.weight
     NeMo: .mlp.shared_experts.{gate,up,down}_proj.weight
 
-All other keys (attention, linear_attn/GatedDeltaNet, norms, embeddings, lm_head,
-vision encoder) pass through unchanged.
+All other keys (attention, linear_attn/GatedDeltaNet, norms, embeddings, vision
+encoder) pass through unchanged. The HF VLM checkpoint stores the language
+model head as ``model.lm_head`` while Automodel registers it on the outer model
+as ``lm_head``.
 """
 
 import re
@@ -213,6 +215,8 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
 
             if mapped_key.startswith("mtp."):
                 state_dict[mapped_key] = value
+            elif mapped_key.startswith("model.lm_head."):
+                state_dict[mapped_key.removeprefix("model.")] = value
             elif key.startswith("model."):
                 state_dict[mapped_key] = value
             else:
@@ -311,6 +315,8 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 break
 
         new_fqn = map_qwen3_5_mtp_to_hf_key(new_fqn)
+        if self._uses_model_prefix and new_fqn.startswith("lm_head."):
+            new_fqn = f"model.{new_fqn}"
 
         if exclude_key_regex and re.match(exclude_key_regex, new_fqn):
             return []

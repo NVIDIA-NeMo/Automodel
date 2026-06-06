@@ -464,6 +464,29 @@ class TestFromHF:
 
         assert "model.language_model.layers.0.self_attn.q_proj.weight" in out
 
+    def test_maps_vlm_lm_head_to_outer_model(self, adapter):
+        lm_head = torch.randn(128, 64)
+        hf_state = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 64, 128),
+            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(4, 128, 64),
+            "model.lm_head.weight": lm_head,
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        assert "lm_head.weight" in out
+        assert "model.lm_head.weight" not in out
+        assert out["lm_head.weight"] is lm_head
+
+    def test_maps_outer_lm_head_back_to_vlm_hf_key(self, adapter):
+        lm_head = torch.randn(128, 64)
+
+        out = adapter.to_hf({"lm_head.weight": lm_head})
+
+        assert "model.lm_head.weight" in out
+        assert "lm_head.weight" not in out
+        assert out["model.lm_head.weight"] is lm_head
+
     def test_maps_mtp_fusion_keys_without_model_prefix(self, adapter):
         tensor = torch.randn(64, 128)
         hf_state = {
