@@ -20,8 +20,9 @@ import torch
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
-from nemo_automodel.recipes.llm.train_ft import build_dataloader, build_distributed
+from nemo_automodel.recipes.llm.train_ft import build_dataloader
 
 """
 This test is to make sure that JSONL dataset can be checkpointed and loaded correctly.
@@ -31,7 +32,10 @@ This test is to make sure that JSONL dataset can be checkpointed and loaded corr
 def test_megatron_dataset_checkpointing():
     cfg_path = Path(__file__).parents[4] / "examples" / "llm_pretrain" / "megatron_pretrain_gpt2.yaml"
     cfg = parse_args_and_load_config(cfg_path)
-    dist_env = build_distributed(cfg.get("dist_env", {}))
+    dist_env = initialize_distributed(
+        backend=cfg.get("dist_env", {}).get("backend", "nccl"),
+        timeout_minutes=cfg.get("dist_env", {}).get("timeout_minutes", 1),
+    )
     mesh_context = create_distributed_setup_from_config(cfg, world_size=dist_env.world_size).mesh_context
     device_mesh = mesh_context.device_mesh
     dp_rank = device_mesh["dp"].get_local_rank()

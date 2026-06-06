@@ -59,6 +59,7 @@ from nemo_automodel.components.distributed.pipelining.config import PipelineConf
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
@@ -75,7 +76,6 @@ from nemo_automodel.recipes.llm.train_ft import (
     _uses_te_dot_product_attention,
     _uses_thd_collater,
     build_model,
-    calculate_loss,
 )
 
 logger = logging.getLogger(__name__)

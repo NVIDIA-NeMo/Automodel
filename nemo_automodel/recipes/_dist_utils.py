@@ -268,3 +268,18 @@ def create_distributed_setup_from_config(
         activation_checkpointing=parsed["activation_checkpointing"],
         world_size=world_size,
     )
+
+
+def shard_optimizers_for_megatron_fsdp(model, optimizers, distributed_config, *, allow=True):
+    """Apply Megatron-FSDP optimizer sharding per model part at the recipe layer.
+
+    Kept here (not in components/optim) so the optim component does not import the
+    distributed component. ``allow`` comes from the optimizer config's
+    ``supports_megatron_fsdp_sharding`` flag: ``allow=False`` (e.g. Dion) makes
+    ``maybe_shard_optimizer`` assert rather than silently skip under Megatron-FSDP.
+    No-op unless ``distributed_config`` is a MegatronFSDPConfig running distributed.
+    """
+    from nemo_automodel.components.distributed.megatron_fsdp import maybe_shard_optimizer
+
+    parts = list(getattr(model, "parts", [model]))
+    return [maybe_shard_optimizer(part, opt, distributed_config, allow=allow) for part, opt in zip(parts, optimizers)]

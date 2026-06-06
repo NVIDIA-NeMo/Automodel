@@ -29,13 +29,14 @@ from huggingface_hub.constants import HF_HUB_CACHE
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
-from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -45,8 +46,8 @@ from nemo_automodel.components.training.utils import (
     prepare_for_grad_accumulation,
 )
 from nemo_automodel.recipes._dist_utils import parse_distributed_section
+from nemo_automodel.recipes._typed_config import RecipeConfig, _model_name_from_cfg
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import build_distributed, build_wandb
 from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -141,7 +142,6 @@ def _build_optimizer(
         logging.info("[INFO] Optimizer config: %s", optimizer_kwargs)
         warn_if_torch_adam_with_bf16_params(
             optimizer=optimizer,
-            optimizer_cfg=optimizer_cfg,
             parameters=trainable_params,
             is_peft=is_peft,
             context="diffusion",
@@ -170,7 +170,6 @@ def _build_optimizer(
     logging.info("[INFO] Optimizer config: %s", adamw_kwargs)
     warn_if_torch_adam_with_bf16_params(
         optimizer=optimizer,
-        optimizer_cfg=optimizer_cfg,
         parameters=trainable_params,
         is_peft=is_peft,
         context="diffusion",
@@ -682,15 +681,19 @@ class TrainDiffusionRecipe(BaseRecipe):
     """Training recipe for diffusion models."""
 
     def __init__(self, cfg):
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     def setup(self):
-        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        self.dist_env = initialize_distributed(
+            backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
+            timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
+        )
         setup_logging()
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = build_wandb(self.cfg)
+            model_name = _model_name_from_cfg(self.cfg.model) if "model" in self.cfg else None
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=model_name)
             if run is not None:
                 logging.info("🚀 View run at {}".format(run.url))
 
@@ -887,7 +890,7 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         checkpoint_cfg = self.cfg.get("checkpoint", None)
 
-        self.num_epochs = self.cfg.step_scheduler.num_epochs
+        self.num_epochs = self.cfg.get("step_scheduler.num_epochs")
         self.log_every = self.cfg.get("step_scheduler.log_every", 5)
 
         # Strictly require checkpoint config from YAML (no fallback)
@@ -911,8 +914,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
         )
         self.restore_from = checkpoint_cfg.get("restore_from", None)
-        self.checkpointer = Checkpointer(
-            config=self.checkpoint_config,
+        self.checkpointer = self.checkpoint_config.build(
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
@@ -926,7 +928,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.dataloader, self.sampler = dataloader_cfg.instantiate(
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
-            batch_size=self.cfg.step_scheduler.local_batch_size,
+            batch_size=self.cfg.get("step_scheduler.local_batch_size"),
         )
 
         self.raw_steps_per_epoch = len(self.dataloader)
@@ -949,9 +951,9 @@ class TrainDiffusionRecipe(BaseRecipe):
                 self.dp_size = max(1, self.world_size // denom)
 
         # Infer local micro-batch size from dataloader if available
-        self.local_batch_size = self.cfg.step_scheduler.local_batch_size
+        self.local_batch_size = self.cfg.get("step_scheduler.local_batch_size")
         # Desired global effective batch size across all DP ranks and nodes
-        self.global_batch_size = self.cfg.step_scheduler.global_batch_size
+        self.global_batch_size = self.cfg.get("step_scheduler.global_batch_size")
         # Steps per epoch after gradient accumulation
         grad_acc_steps = max(1, self.global_batch_size // max(1, self.local_batch_size * self.dp_size))
         self.steps_per_epoch = ceil(self.raw_steps_per_epoch / grad_acc_steps)
@@ -975,10 +977,10 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.start_epoch = 0
         # Initialize StepScheduler for gradient accumulation and step/epoch bookkeeping
         self.step_scheduler = StepScheduler(
-            global_batch_size=self.cfg.step_scheduler.global_batch_size,
-            local_batch_size=self.cfg.step_scheduler.local_batch_size,
+            global_batch_size=self.cfg.get("step_scheduler.global_batch_size"),
+            local_batch_size=self.cfg.get("step_scheduler.local_batch_size"),
             dp_size=int(self.dp_size),
-            ckpt_every_steps=self.cfg.step_scheduler.ckpt_every_steps,
+            ckpt_every_steps=self.cfg.get("step_scheduler.ckpt_every_steps"),
             save_checkpoint_every_epoch=self.cfg.get("step_scheduler.save_checkpoint_every_epoch", False),
             dataloader=self.dataloader,
             val_every_steps=None,

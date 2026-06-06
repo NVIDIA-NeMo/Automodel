@@ -48,6 +48,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.recipes._typed_config import RecipeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +250,7 @@ class BaseRecipe:
             or is_tokenizer(value)
             or is_lr_scheduler(value)
             or is_optimizer(value)
-            or isinstance(value, ConfigNode)
+            or isinstance(value, (ConfigNode, RecipeConfig))
             or is_dataloader(value)
         )
 
@@ -353,7 +354,7 @@ class BaseRecipe:
                 model = getattr(self, key)
             elif is_optimizer(getattr(self, key)):
                 optimizer = getattr(self, key)
-            elif isinstance(getattr(self, key), ConfigNode):
+            elif isinstance(getattr(self, key), (ConfigNode, RecipeConfig)):
                 config = getattr(self, key)
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
@@ -518,7 +519,7 @@ class BaseRecipe:
                 scheduler = obj
             elif is_dataloader(obj) or isinstance(obj, StatefulRNG):
                 self.checkpointer.load_on_dp_ranks(obj, key, ckpt_dir)
-            elif is_tokenizer(obj) or isinstance(obj, ConfigNode):
+            elif is_tokenizer(obj) or isinstance(obj, (ConfigNode, RecipeConfig)):
                 # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
                 continue
