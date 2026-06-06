@@ -441,6 +441,10 @@ ignore_imports = [
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.llama.model",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.gemma4_moe.model",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.mistral3_vlm.model",
+    # DataloaderConfig.build (the config-driven replacement for the recipe's build_dataloader) deliberately
+    # orchestrates rank-0-first dataset materialization and RNG seeding, which live in distributed/training.
+    "nemo_automodel.components.datasets.loader -> nemo_automodel.components.distributed.utils",
+    "nemo_automodel.components.datasets.loader -> nemo_automodel.components.training.rng",
 ]
 
 # ty: type checking (https://github.com/astral-sh/ty)

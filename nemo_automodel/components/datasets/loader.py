@@ -63,6 +63,25 @@ def _filter_runtime(fn: Callable, runtime: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in runtime.items() if k in params}
 
 
+def _model_supports_seq_lens(model: Any) -> bool:
+    """True when ``model.forward()`` accepts a ``seq_lens`` kwarg (or ``**kwargs``).
+
+    Inlined from ``_transformers.capabilities`` so the ``datasets`` component does not import another
+    component (the import linter forbids cross-component dependencies, and importing ``capabilities``
+    transitively pulls in ``components.distributed``).
+    """
+    fwd = getattr(model, "forward", None)
+    if not callable(fwd):
+        return False
+    try:
+        params = inspect.signature(fwd).parameters
+        if "seq_lens" in params:
+            return True
+        return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (ValueError, TypeError):
+        return False
+
+
 def _shard_iterable_dataset(dataset: Any, *, dp_rank: int, dp_world_size: int) -> Any:
     """Shard an ``IterableDataset`` across data-parallel ranks for unique samples.
 
@@ -403,7 +422,6 @@ class DataloaderConfig:
         ``runtime`` carries the dataset's runtime build args (``tokenizer=`` for LLM, ``processor=`` for VLM,
         ...); only the keys ``dataset_config.build`` accepts are forwarded.
         """
-        from nemo_automodel._transformers.capabilities import _supports_seq_lens
         from nemo_automodel.components.distributed.utils import FirstRankPerNode
         from nemo_automodel.components.training.rng import ScopedRNG
 
@@ -417,7 +435,7 @@ class DataloaderConfig:
                     dataset,
                     split=getattr(self.dataset_config, "split", None),
                     seed=self.seed,
-                    supports_seq_lens=(model is None or _supports_seq_lens(model)),
+                    supports_seq_lens=(model is None or _model_supports_seq_lens(model)),
                     pad_token_id=getattr(runtime.get("tokenizer"), "pad_token_id", 0),
                     cp_size=cp_size,
                     attn_implementation=attn_implementation,
