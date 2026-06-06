@@ -9,6 +9,7 @@ import torch
 
 from nemo_automodel.components.models.qwen3_5.state_dict_adapter import (
     Qwen3_5DenseStateDictAdapter,
+    _route_to_fp32_holder_if_expected,
     _route_to_fp32_holder,
     _strip_fp32_prefix,
     map_qwen3_5_mtp_from_hf_key,
@@ -61,6 +62,28 @@ class TestRouteToFp32Holder:
         assert _route_to_fp32_holder(key) == key
 
 
+class TestRouteToFp32HolderIfExpected:
+    def test_routes_when_no_target_keys_are_provided(self):
+        assert (
+            _route_to_fp32_holder_if_expected("model.layers.0.linear_attn.A_log")
+            == "model.layers.0.linear_attn._fp32_params.A_log"
+        )
+
+    def test_routes_when_model_expects_fp32_holder(self):
+        target_keys = {"model.layers.0.linear_attn._fp32_params.A_log"}
+        assert (
+            _route_to_fp32_holder_if_expected("model.layers.0.linear_attn.A_log", target_keys)
+            == "model.layers.0.linear_attn._fp32_params.A_log"
+        )
+
+    def test_keeps_bare_key_when_model_expects_bare_parameter(self):
+        target_keys = {"model.layers.0.linear_attn.A_log"}
+        assert (
+            _route_to_fp32_holder_if_expected("model.layers.0.linear_attn.A_log", target_keys)
+            == "model.layers.0.linear_attn.A_log"
+        )
+
+
 class TestAdapter:
     def setup_method(self):
         self.adapter = Qwen3_5DenseStateDictAdapter()
@@ -111,6 +134,33 @@ class TestAdapter:
             and "model.language_model.layers.0.linear_attn.A_log" not in out
         )
         assert "model.language_model.layers.0.self_attn.q_proj.weight" in out
+
+    def test_from_hf_keeps_bare_a_log_for_unpatched_model_target(self):
+        hf_sd = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2),
+        }
+        target_keys = set(hf_sd)
+
+        out = self.adapter.from_hf(hf_sd, target_keys=target_keys)
+
+        assert "model.language_model.layers.0.linear_attn.A_log" in out
+        assert "model.language_model.layers.0.linear_attn._fp32_params.A_log" not in out
+
+    def test_from_hf_routes_a_log_for_patched_model_target(self):
+        hf_sd = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2),
+        }
+        target_keys = {
+            "model.language_model.layers.0.linear_attn._fp32_params.A_log",
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+        }
+
+        out = self.adapter.from_hf(hf_sd, target_keys=target_keys)
+
+        assert "model.language_model.layers.0.linear_attn._fp32_params.A_log" in out
+        assert "model.language_model.layers.0.linear_attn.A_log" not in out
 
     def test_round_trip_is_identity(self):
         sd = self._sample_state_dict()

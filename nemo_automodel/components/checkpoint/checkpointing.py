@@ -524,7 +524,10 @@ class Checkpointer:
             t_disk = time.monotonic()
             if state_dict_from_disk is not None:
                 state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
-                    model_state.model[0], state_dict_from_disk, moe_mesh=self.moe_mesh
+                    model_state.model[0],
+                    state_dict_from_disk,
+                    moe_mesh=self.moe_mesh,
+                    target_keys=set(model_state.model[0].state_dict().keys()),
                 )
             else:
                 state_dict_from_disk = {}
@@ -626,7 +629,9 @@ class Checkpointer:
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
-        state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
+        state_dict = _maybe_adapt_state_dict_from_hf(
+            model_state.model[0], state_dict, moe_mesh=self.moe_mesh, target_keys=expected_keys
+        )
         key_diff = _summarize_state_dict_key_diff(expected_keys, set(state_dict.keys()))
         if key_diff["missing_count"] or key_diff["unexpected_count"]:
             logging.warning(
@@ -1969,7 +1974,10 @@ def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optio
 
 
 def _maybe_adapt_state_dict_from_hf(
-    model_part: nn.Module, state_dict: dict[str, torch.Tensor], moe_mesh: Optional[DeviceMesh] = None
+    model_part: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    moe_mesh: Optional[DeviceMesh] = None,
+    target_keys: Optional[set[str]] = None,
 ) -> dict[str, torch.Tensor]:
     """
     Custom models use state dict adapters to convert the state dict from the Hugging Face format to the native format.
@@ -1978,5 +1986,5 @@ def _maybe_adapt_state_dict_from_hf(
     if adapter:
         ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
         ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh
-        return adapter.from_hf(state_dict, device_mesh=ep_mesh)
+        return adapter.from_hf(state_dict, device_mesh=ep_mesh, target_keys=target_keys)
     return state_dict

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import torch
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM as HFQwen3_5ForCausalLM
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM, build_mtp_config_from_hf
@@ -69,6 +70,20 @@ class TestQwen3_5MTPConfig:
 
 
 class TestQwen3_5MTPModel:
+    def test_mtp_disabled_matches_hf_forward(self):
+        cfg = _tiny_config(mtp_num_hidden_layers=0, use_cache=False)
+        torch.manual_seed(1234)
+        hf_model = HFQwen3_5ForCausalLM(cfg).eval()
+        model = Qwen3_5ForCausalLM(cfg, backend=_backend()).eval()
+        model.load_state_dict(hf_model.state_dict(), strict=True)
+
+        input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+        with torch.no_grad():
+            hf_logits = hf_model(input_ids=input_ids, use_cache=False).logits
+            custom_logits = model(input_ids=input_ids, use_cache=False).logits
+
+        torch.testing.assert_close(custom_logits, hf_logits)
+
     def test_dense_mtp_builds_full_attention_block(self):
         cfg = _tiny_config(mtp_num_hidden_layers=1, layer_types=["linear_attention"])
         model = Qwen3_5ForCausalLM(cfg, backend=_backend())

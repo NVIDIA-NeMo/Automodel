@@ -60,6 +60,15 @@ def _route_to_fp32_holder(key: str) -> str:
     return f"{head}.linear_attn._fp32_params.{tail}"
 
 
+def _route_to_fp32_holder_if_expected(key: str, target_keys: set[str] | None = None) -> str:
+    routed_key = _route_to_fp32_holder(key)
+    if target_keys is None or routed_key == key:
+        return routed_key
+    if routed_key in target_keys:
+        return routed_key
+    return key
+
+
 def map_qwen3_5_mtp_from_hf_key(key: str) -> str:
     """Map HF Qwen3.5 MTP keys to Automodel's Megatron-style MTP module."""
     return _MTP_HF_TO_NATIVE.get(key, key)
@@ -82,7 +91,11 @@ class Qwen3_5DenseStateDictAdapter(StateDictAdapter):
         device_mesh: Optional[Any] = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        return {_route_to_fp32_holder(map_qwen3_5_mtp_from_hf_key(k)): v for k, v in hf_state_dict.items()}
+        target_keys = kwargs.get("target_keys")
+        return {
+            _route_to_fp32_holder_if_expected(map_qwen3_5_mtp_from_hf_key(k), target_keys): v
+            for k, v in hf_state_dict.items()
+        }
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
         return [(map_qwen3_5_mtp_to_hf_key(_strip_fp32_prefix(fqn)), tensor)]
