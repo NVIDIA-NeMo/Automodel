@@ -465,12 +465,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             **attn_kwargs,
         )
 
-        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep)
+        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd)
 
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
-            logits = logits.unsqueeze(0)
-            if output_hidden_states and hidden.dim() == 2:
-                hidden = hidden.unsqueeze(0)
+        if is_thd and output_hidden_states and hidden.dim() == 2:
+            hidden = hidden.unsqueeze(0)
 
         # 5. Optionally compute loss/aux outputs
         if labels is not None or output_router_logits:

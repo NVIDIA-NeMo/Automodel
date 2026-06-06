@@ -304,10 +304,9 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # Final hidden states feeding the lm_head; in THD they are 2D [T, H], in BSHD 3D [B, S, H].
         final_hidden_states = hidden
 
-        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep)
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd)
 
         if is_thd:
-            logits = logits.unsqueeze(0)
             # Keep the (full-sequence) hidden states aligned with the unsqueezed logits' batch dim.
             final_hidden_states = final_hidden_states.unsqueeze(0)
 

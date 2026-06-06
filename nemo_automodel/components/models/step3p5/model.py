@@ -519,11 +519,10 @@ class Step3p5ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep)
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd)
 
         final_hidden_states = hidden
         if is_thd:
-            logits = logits.unsqueeze(0)
             final_hidden_states = final_hidden_states.unsqueeze(0)
 
         return CausalLMOutputWithPast(

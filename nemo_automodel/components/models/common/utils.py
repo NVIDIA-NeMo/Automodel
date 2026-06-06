@@ -537,6 +537,7 @@ def compute_lm_head_logits(
     lm_head: nn.Module | None,
     hidden_states: torch.Tensor,
     logits_to_keep: int | torch.Tensor = 0,
+    is_thd: bool = False,
 ) -> torch.Tensor:
     """Project hidden states through ``lm_head``, honoring ``logits_to_keep``.
 
@@ -553,6 +554,11 @@ def compute_lm_head_logits(
     - ``logits_to_keep`` as a positive int or a tensor of indices: only the
       requested positions are projected. Both 2D ``[T, H]`` (THD/packed) and 3D
       ``[B, S, H]`` (BSHD) hidden states are handled.
+    - ``is_thd``: THD/packed inputs yield 2D ``[T, V]`` logits; the leading batch
+      dim is restored (``unsqueeze(0)`` -> ``[1, T, V]``) so downstream code sees
+      a uniform ``[B, S, V]`` layout. Only applied when the logits are still 2D,
+      so an ``inputs_embeds`` path that already produced ``[1, T, V]`` is left
+      untouched.
 
     Args:
         lm_head: The language-model head module, or ``None`` on a pipeline stage
@@ -560,19 +566,26 @@ def compute_lm_head_logits(
         hidden_states: Final hidden states, shaped ``[T, H]`` or ``[B, S, H]``.
         logits_to_keep: ``0`` to project every position; a positive int to keep
             the last ``N`` positions; or a tensor of position indices.
+        is_thd: Whether the inputs were THD/packed; if so, a 2D logits result is
+            unsqueezed back to a leading batch dim of 1.
 
     Returns:
         The projected logits, or ``hidden_states`` unchanged when ``lm_head`` is
         ``None``.
     """
     if lm_head is None:
-        return hidden_states
-    if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-        return lm_head(hidden_states)
-    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-    if hidden_states.dim() == 2:
-        return lm_head(hidden_states[slice_indices, :])
-    return lm_head(hidden_states[:, slice_indices, :])
+        logits = hidden_states
+    elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
+        logits = lm_head(hidden_states)
+    else:
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        if hidden_states.dim() == 2:
+            logits = lm_head(hidden_states[slice_indices, :])
+        else:
+            logits = lm_head(hidden_states[:, slice_indices, :])
+    if is_thd and logits.dim() == 2:
+        logits = logits.unsqueeze(0)
+    return logits
 
 
 __all__ = [

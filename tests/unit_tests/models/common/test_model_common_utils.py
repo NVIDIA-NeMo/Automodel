@@ -249,3 +249,33 @@ class TestComputeLmHeadLogits:
         out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=idx)
         assert out.shape == (3, self.VOCAB)
         torch.testing.assert_close(out, lm_head(hidden[idx, :]))
+
+    def test_is_thd_restores_batch_dim_on_2d_logits(self):
+        """THD/packed input -> 2D [T, V] logits get a leading batch dim restored."""
+        lm_head = self._lm_head()
+        hidden = torch.randn(7, self.HIDDEN)
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0, is_thd=True)
+        assert out.shape == (1, 7, self.VOCAB)
+        torch.testing.assert_close(out, lm_head(hidden).unsqueeze(0))
+
+    def test_is_thd_with_logits_to_keep(self):
+        """is_thd composes with slicing: last-N 2D logits become [1, N, V]."""
+        lm_head = self._lm_head()
+        hidden = torch.randn(7, self.HIDDEN)
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2, is_thd=True)
+        assert out.shape == (1, 2, self.VOCAB)
+        torch.testing.assert_close(out, lm_head(hidden[-2:, :]).unsqueeze(0))
+
+    def test_is_thd_noop_when_logits_already_3d(self):
+        """A 3D logits result (BSHD path) is left untouched, never made 4D."""
+        lm_head = self._lm_head()
+        hidden = torch.randn(2, 5, self.HIDDEN)
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0, is_thd=True)
+        assert out.shape == (2, 5, self.VOCAB)
+
+    def test_is_thd_none_lm_head_unsqueezes_passthrough(self):
+        """With lm_head=None, the 2D passthrough hidden states also get the batch dim."""
+        hidden = torch.randn(7, self.HIDDEN)
+        out = compute_lm_head_logits(None, hidden, logits_to_keep=0, is_thd=True)
+        assert out.shape == (1, 7, self.HIDDEN)
+        torch.testing.assert_close(out, hidden.unsqueeze(0))

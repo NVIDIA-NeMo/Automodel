@@ -320,12 +320,10 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep)
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd)
 
-        if is_thd:
-            logits = logits.unsqueeze(0)
-            if output_hidden_states:
-                hidden = hidden.unsqueeze(0)
+        if is_thd and output_hidden_states:
+            hidden = hidden.unsqueeze(0)
 
         return CausalLMOutputWithPast(
             logits=logits,
