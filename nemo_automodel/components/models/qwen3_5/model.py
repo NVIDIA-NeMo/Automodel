@@ -62,6 +62,12 @@ def _resolve_mtp_num_layers(config: Any, override: int | None = None) -> int:
     return int(value or 0)
 
 
+def _default_init_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{torch.cuda.current_device()}")
+    return torch.device("cpu")
+
+
 def build_mtp_config_from_hf(
     config: Any,
     *,
@@ -367,7 +373,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         buffer_device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
-        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        buffer_device = buffer_device or _default_init_device()
         init_std = float(getattr(self.config, "initializer_range", 0.02))
         with buffer_device:
             for module in self.modules():
@@ -636,7 +642,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     ) -> None:
         mtp = getattr(self, "mtp", None)
         if mtp is not None:
-            buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+            buffer_device = buffer_device or _default_init_device()
             with buffer_device:
                 for sublayer in mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)

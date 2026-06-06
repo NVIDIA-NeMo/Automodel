@@ -192,6 +192,12 @@ def _resolve_mtp_num_layers(config: Any, override: int | None = None) -> int:
     return int(value or 0)
 
 
+def _default_init_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{torch.cuda.current_device()}")
+    return torch.device("cpu")
+
+
 def build_mtp_config_from_hf(
     config: Any,
     *,
@@ -622,7 +628,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        buffer_device = buffer_device or _default_init_device()
 
         with buffer_device:
             if self.embed_tokens is not None:
@@ -899,7 +905,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         buffer_device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
-        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        buffer_device = buffer_device or _default_init_device()
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
 
         with buffer_device:

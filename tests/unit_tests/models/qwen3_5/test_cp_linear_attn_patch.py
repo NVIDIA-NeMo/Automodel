@@ -168,11 +168,10 @@ class TestFp32ParamHolder:
             "transformers.models.qwen3_5",
             "transformers.models.qwen3_5.modeling_qwen3_5",
         ):
-            if path not in sys.modules:
-                stub = types.ModuleType(path)
-                stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
-                stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
-                monkeypatch.setitem(sys.modules, path, stub)
+            stub = types.ModuleType(path)
+            stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+            stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+            monkeypatch.setitem(sys.modules, path, stub)
         cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
         if cp_mod_key in sys.modules:
             monkeypatch.delitem(sys.modules, cp_mod_key)
@@ -214,11 +213,10 @@ class TestComputeGate:
             "transformers.models.qwen3_5",
             "transformers.models.qwen3_5.modeling_qwen3_5",
         ):
-            if path not in sys.modules:
-                stub = types.ModuleType(path)
-                stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
-                stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
-                monkeypatch.setitem(sys.modules, path, stub)
+            stub = types.ModuleType(path)
+            stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+            stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+            monkeypatch.setitem(sys.modules, path, stub)
         cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
         if cp_mod_key in sys.modules:
             monkeypatch.delitem(sys.modules, cp_mod_key)
@@ -265,11 +263,10 @@ class TestPatchHfModelSentinel:
             "transformers.models.qwen3_5",
             "transformers.models.qwen3_5.modeling_qwen3_5",
         ):
-            if path not in sys.modules:
-                stub = types.ModuleType(path)
-                stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
-                stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
-                monkeypatch.setitem(sys.modules, path, stub)
+            stub = types.ModuleType(path)
+            stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+            stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+            monkeypatch.setitem(sys.modules, path, stub)
         cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
         if cp_mod_key in sys.modules:
             monkeypatch.delitem(sys.modules, cp_mod_key)
@@ -310,11 +307,10 @@ class TestPatchHfModelStateDictAdapter:
             "transformers.models.qwen3_5",
             "transformers.models.qwen3_5.modeling_qwen3_5",
         ):
-            if path not in sys.modules:
-                stub = types.ModuleType(path)
-                stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
-                stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
-                monkeypatch.setitem(sys.modules, path, stub)
+            stub = types.ModuleType(path)
+            stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+            stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+            monkeypatch.setitem(sys.modules, path, stub)
         cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
         if cp_mod_key in sys.modules:
             monkeypatch.delitem(sys.modules, cp_mod_key)
@@ -719,18 +715,12 @@ def _build_forward_module(monkeypatch):
         "transformers.models.qwen3_5",
         "transformers.models.qwen3_5.modeling_qwen3_5",
     ):
-        if path not in sys.modules:
-            stub = types.ModuleType(path)
-            stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
-            stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
-            # apply_mask_to_padding_states is imported at runtime inside _forward_no_cp
-            stub.apply_mask_to_padding_states = lambda hidden_states, mask: hidden_states
-            monkeypatch.setitem(sys.modules, path, stub)
-        else:
-            # Ensure existing stub has the function
-            existing = sys.modules[path]
-            if not hasattr(existing, "apply_mask_to_padding_states"):
-                existing.apply_mask_to_padding_states = lambda hidden_states, mask: hidden_states
+        stub = types.ModuleType(path)
+        stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+        stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+        # apply_mask_to_padding_states is imported at runtime inside _forward_no_cp
+        stub.apply_mask_to_padding_states = lambda hidden_states, mask: hidden_states
+        monkeypatch.setitem(sys.modules, path, stub)
 
     cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
     if cp_mod_key in sys.modules:
@@ -972,11 +962,10 @@ class TestMakeFp32GetattrFallback:
             "transformers.models.qwen3_5",
             "transformers.models.qwen3_5.modeling_qwen3_5",
         ):
-            if path not in sys.modules:
-                stub = types.ModuleType(path)
-                stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
-                stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
-                monkeypatch.setitem(sys.modules, path, stub)
+            stub = types.ModuleType(path)
+            stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+            stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+            monkeypatch.setitem(sys.modules, path, stub)
         cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
         if cp_mod_key in sys.modules:
             monkeypatch.delitem(sys.modules, cp_mod_key)
@@ -1108,8 +1097,9 @@ class TestForwardNoCpPacking:
         mod, _ = _build_forward_module(monkeypatch)
         seen = {}
 
-        def _fake_chunk_gdn(query, key, value, *, g, beta, initial_state, output_final_state,
-                            use_qk_l2norm_in_kernel, cu_seqlens=None):
+        def _fake_chunk_gdn(
+            query, key, value, *, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel, cu_seqlens=None
+        ):
             seen["cu_seqlens"] = cu_seqlens
             seen["q_shape"] = tuple(query.shape)
             return value.clone(), None
@@ -1144,8 +1134,9 @@ class TestForwardNoCpPacking:
         mod, _ = _build_forward_module(monkeypatch)
         seen = {}
 
-        def _fake_chunk_gdn(query, key, value, *, g, beta, initial_state, output_final_state,
-                            use_qk_l2norm_in_kernel, cu_seqlens=None):
+        def _fake_chunk_gdn(
+            query, key, value, *, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel, cu_seqlens=None
+        ):
             seen["q_shape"] = tuple(query.shape)
             return value.clone(), None
 
@@ -1187,8 +1178,9 @@ class TestForwardNoCpPacking:
         mod, _ = _build_forward_module(monkeypatch)
         seen = {}
 
-        def _fake_chunk_gdn(query, key, value, *, g, beta, initial_state, output_final_state,
-                            use_qk_l2norm_in_kernel, cu_seqlens=None):
+        def _fake_chunk_gdn(
+            query, key, value, *, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel, cu_seqlens=None
+        ):
             seen["cu_seqlens"] = None if cu_seqlens is None else cu_seqlens.tolist()
             return value.clone(), None
 
