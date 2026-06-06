@@ -244,9 +244,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                         )
                 gate_chunk = gate_up_tensor.shape[1] // ep_shard_size
                 down_chunk = down_tensor.shape[1] // ep_shard_size
-                gate_up_tensor = gate_up_tensor[
-                    :, ep_shard_rank * gate_chunk : (ep_shard_rank + 1) * gate_chunk, :
-                ]
+                gate_up_tensor = gate_up_tensor[:, ep_shard_rank * gate_chunk : (ep_shard_rank + 1) * gate_chunk, :]
                 down_tensor = down_tensor[:, ep_shard_rank * down_chunk : (ep_shard_rank + 1) * down_chunk, :]
 
             state_dict[f"mtp.layers.{layer_num}.mlp.experts.gate_and_up_projs"] = (

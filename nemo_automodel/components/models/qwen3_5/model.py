@@ -437,7 +437,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             loss_scaling_factor=mtp_loss_scaling_factor,
             num_nextn_predict_layers=num_nextn_predict_layers,
         )
-        self.mtp = build_qwen3_5_dense_mtp(text_config, self.mtp_config, dtype=dtype) if self.mtp_config.enabled else None
+        self.mtp = (
+            build_qwen3_5_dense_mtp(text_config, self.mtp_config, dtype=dtype) if self.mtp_config.enabled else None
+        )
         if self.mtp is not None:
             cast_model_to_dtype(self.mtp, dtype)
 
@@ -524,7 +526,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         kwargs["pixel_values_videos"] = pixel_values_videos
         kwargs["image_grid_thw"] = image_grid_thw
         kwargs["video_grid_thw"] = video_grid_thw
-        pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw = self._pop_staged_vlm_media(input_ids, kwargs)
+        pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw = self._pop_staged_vlm_media(
+            input_ids, kwargs
+        )
 
         if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
