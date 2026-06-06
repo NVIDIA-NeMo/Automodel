@@ -77,6 +77,11 @@ distributed:
     output_dtype: float32
   autocast_dtype: bfloat16
   offload_policy: null
+  # Per-layer FSDP2 prefetch: overlaps all-gather / reduce-scatter with compute.
+  # Off by default in FSDP2Config; turn it on here for the throughput win.
+  enable_fsdp2_prefetch: true
+  fsdp2_forward_prefetch_depth: 1
+  fsdp2_backward_prefetch_depth: 2   # 2 hides all-gather behind compute; 1 lowers peak mem
 
 dllm:
   mode: dflash

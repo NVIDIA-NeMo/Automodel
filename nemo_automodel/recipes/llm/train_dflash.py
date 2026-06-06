@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EAGLE-1 / EAGLE-2 training recipe for Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
+"""DFlash draft-model training recipe (Qwen3-style targets).
+
+DFlash drafts a whole block of tokens in parallel via MASK-token denoising
+conditioned on the frozen target's hidden states (see
+``nemo_automodel.components.speculative.dflash``). This recipe mirrors the EAGLE
+recipes' scaffolding -- online target hidden-state capture, gradient
+accumulation with a trailing-window flush, and the same checkpointer plumbing --
+but trains the DFlash draft with its block-wise cross-entropy objective.
+"""
 
 from __future__ import annotations
 
@@ -29,6 +37,7 @@ import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoConfig
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -41,13 +50,11 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
-from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
-from nemo_automodel.components.speculative.eagle.registry import resolve_eagle1_draft_spec
-from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
+from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
+from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
+from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
+from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
-from nemo_automodel.components.utils.model_utils import print_trainable_parameters
-from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
@@ -59,46 +66,10 @@ logger = logging.getLogger(__name__)
 
 
 def _optim_steps_per_epoch(num_batches_per_epoch: int, grad_accumulation_steps: int) -> int:
-    """Return ceil(num_batches / accum), the actual number of optimizer steps per epoch.
-
-    Floor division silently drops the trailing partial accumulation window
-    (up to ``grad_accumulation_steps - 1`` micro-batches) from the LR
-    scheduler's view of training, even though the trainer flushes those
-    gradients with an explicit step. Ceil keeps the scheduler aligned with
-    the actual number of ``optimizer.step()`` calls.
-    """
+    """Return ceil(num_batches / accum), the actual number of optimizer steps per epoch."""
     if num_batches_per_epoch <= 0 or grad_accumulation_steps <= 0:
         return 0
     return -(-num_batches_per_epoch // grad_accumulation_steps)
-
-
-def _should_sync_grads(
-    *,
-    pending_micro_batches: int,
-    grad_accumulation_steps: int,
-    batch_idx: int,
-    batches_per_epoch: int | None,
-    is_ddp: bool,
-) -> bool:
-    """Return True when this micro-batch's backward should all-reduce gradients.
-
-    Under DDP with gradient accumulation only the micro-batch immediately
-    followed by an ``optimizer.step()`` needs to synchronize: at that point the
-    locally-accumulated ``.grad`` already holds the whole window's contribution,
-    so a single all-reduce averages the complete window and the intervening
-    micro-batches can run under ``no_sync()`` -- saving ``grad_accumulation_steps - 1``
-    all-reduces per window. That step is either the window closer
-    (``pending_micro_batches + 1 == grad_accumulation_steps``) or the epoch's
-    final batch (which the trailing-flush step consumes). When the dataloader
-    length is unknown we cannot identify the final batch, so we sync every step
-    (correct, just no speedup). With a single process (no DDP) there is nothing
-    to synchronize, so this is always True.
-    """
-    if not is_ddp or batches_per_epoch is None:
-        return True
-    closes_window = pending_micro_batches + 1 == grad_accumulation_steps
-    is_last_batch = batch_idx == batches_per_epoch - 1
-    return closes_window or is_last_batch
 
 
 def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
@@ -108,14 +79,14 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
-class TrainEagle1Recipe(BaseRecipe):
-    """Recipe for EAGLE-1 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
+class TrainDFlashRecipe(BaseRecipe):
+    """Recipe for DFlash draft-model training on Qwen3-style dense / MoE targets."""
 
     def __init__(self, cfg):
         self.cfg = cfg
 
     def setup(self):
-        """Build target model, draft model, data, optimizer, and trainer module."""
+        """Build the target model, DFlash draft, data, optimizer, and trainer module."""
         self.dist_env = initialize_distributed(
             backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
             timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 30),
@@ -130,51 +101,35 @@ class TrainEagle1Recipe(BaseRecipe):
             target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
         )
         architectures = getattr(target_config, "architectures", []) or []
-        # Dispatch via the eagle registry. New architectures are added by
-        # appending to ``_DENSE_ARCHITECTURES`` (or registering a custom
-        # ``DraftSpec``) in ``components/speculative/eagle/registry.py``;
-        # no recipe change required.
-        draft_spec = resolve_eagle1_draft_spec(architectures)
+        draft_spec = resolve_dflash_draft_spec(architectures)
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(
-            target_path,
-            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
+            target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
         )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
-        # Optional ``distributed:`` YAML section. Required for targets that
-        # do not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). Absent =>
-        # original single-GPU-per-rank behavior, preserved for 8B-class dense.
-        # ``force_hf`` opt-in; see the train_eagle3 recipe for rationale.
-        target_kwargs = dict(
+        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
+            target_path,
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
             force_hf=bool(recipe_cfg.get("target_force_hf", False)),
         )
-        self.dist_setup = None
-        self.distributed_config = None
-        self.device_mesh = None
-        self.moe_mesh = None
-        if self.cfg.get("distributed", None) is not None:
-            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-            self.distributed_config = self.dist_setup.strategy_config
-            self.device_mesh = self.dist_setup.device_mesh
-            self.moe_mesh = self.dist_setup.moe_mesh
-            target_kwargs.update(
-                distributed_config=self.distributed_config,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                moe_config=self.dist_setup.moe_config,
-                activation_checkpointing=self.dist_setup.activation_checkpointing,
-            )
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
-        if self.dist_setup is None:
-            # ``nn.Module.to`` is in-place; reassigning ``self.target_model``
-            # would re-trigger ``BaseRecipe.__setattr__`` state-tracking and
-            # raise ``RuntimeError: State key 'target_model' is already tracked``.
-            self.target_model.to(self.device)
+        self.target_model.to(self.device)
         self.target_model.requires_grad_(False)
-        self.target_wrapper = HFEagleTargetModel(self.target_model)
+
+        # Resolve the captured target layers once and share them between the
+        # target wrapper (what to capture) and the draft config (the ``fc`` input
+        # width) so the two never disagree.
+        num_target_layers = int(target_config.num_hidden_layers)
+        draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 5))
+        target_layer_ids = list(
+            recipe_cfg.get("target_layer_ids", None)
+            or build_target_layer_ids(num_target_layers, draft_num_hidden_layers)
+        )
+        self.target_wrapper = HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids)
+
+        self.block_size = int(recipe_cfg.get("block_size", 16))
+        self.mask_token_id = self._resolve_mask_token_id(recipe_cfg)
 
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
@@ -201,26 +156,39 @@ class TrainEagle1Recipe(BaseRecipe):
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             )
 
+        # DFlash draft config: a small non-causal Qwen3 stack that reuses the
+        # target's architecture defaults (head_dim, rope_theta, rms_norm_eps, ...).
         draft_config = target_config.to_dict()
-        draft_config["architectures"] = ["LlamaEagleDraftModel"]
-        draft_config["draft_num_hidden_layers"] = int(recipe_cfg.get("draft_num_hidden_layers", 1))
-        # Reuse the target's concrete config class (LlamaConfig / Phi3Config / ...)
-        # so architecture-specific defaults like attention_bias and head_dim
-        # flow into the draft.
-        draft_config_obj = type(target_config).from_dict(draft_config)
+        draft_config["architectures"] = ["Qwen3DFlashDraftModel"]
+        draft_config["num_hidden_layers"] = draft_num_hidden_layers
+        # ``layer_types``/``max_window_layers`` are sized to the target's depth;
+        # rebuild them for the (shallower) draft. The DFlash attention never uses
+        # sliding windows, so every draft layer is full attention.
+        draft_config["layer_types"] = ["full_attention"] * draft_num_hidden_layers
+        draft_config["max_window_layers"] = draft_num_hidden_layers
+        draft_config["num_target_layers"] = num_target_layers
+        draft_config["block_size"] = self.block_size
+        draft_config["dflash_config"] = {
+            "mask_token_id": self.mask_token_id,
+            "target_layer_ids": target_layer_ids,
+        }
+        # A single knob drives both the trainer's mask format and the draft's
+        # attention function -- they must agree (a flex BlockMask only works with
+        # the flex attention fn, a dense bool mask only with sdpa/eager).
+        attention_backend = recipe_cfg.get("attention_backend", "flex_attention")
+        draft_config_obj = Qwen3Config.from_dict(draft_config)
+        draft_config_obj._attn_implementation = attention_backend
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
-        self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
-        if recipe_cfg.get("freeze_embeddings", True):
-            self.draft_model.freeze_embeddings()
-        # The target's "Model summary" is logged by apply_model_infrastructure when it
-        # loads; the draft is built directly, so log its (trainable) summary here too.
-        print_trainable_parameters(self.draft_model, name="Draft")
 
-        trainer_module = EagleTrainerModule(
-            self.draft_model,
-            target_lm_head=self.target_wrapper.get_lm_head(),
-            hidden_loss_weight=float(recipe_cfg.get("hidden_loss_weight", 1.0)),
-            token_loss_weight=float(recipe_cfg.get("token_loss_weight", 0.1)),
+        trainer_module = DFlashTrainerModule(
+            draft_model=self.draft_model,
+            target_lm_head=self.target_model.get_output_embeddings(),
+            target_embed_tokens=self.target_model.get_input_embeddings(),
+            mask_token_id=self.mask_token_id,
+            block_size=self.block_size,
+            attention_backend=attention_backend,
+            num_anchors=int(recipe_cfg.get("num_anchors", 512)),
+            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
         ).to(self.device)
         if self.dist_env.world_size > 1:
             trainer_module = DistributedDataParallel(
@@ -244,15 +212,9 @@ class TrainEagle1Recipe(BaseRecipe):
         self.max_grad_norm = recipe_cfg.get("max_grad_norm", 1.0)
         self.num_epochs = recipe_cfg.num_epochs
         self.log_every_steps = recipe_cfg.get("log_every_steps", 10)
-        # Checkpoint cadence. The two knobs are independent:
-        #   * ``ckpt_every_steps``            -- save every N optimizer steps (None/<=0 = off).
-        #   * ``save_checkpoint_every_epoch`` -- save at each epoch boundary (off by default).
-        # The fully-trained model is always saved once the run completes; these
-        # only add intermediate checkpoints (and stack when both are set). With
-        # both off, the end-of-run checkpoint is the only one written.
-        # NOTE: field names mirror StepScheduler (components/training/step_scheduler.py),
-        # which the SFT recipe uses for the same cadence; EAGLE hand-rolls its own
-        # loop, so a future refactor could adopt StepScheduler here too.
+        # Checkpoint cadence (independent knobs; the fully-trained model is always
+        # saved at the end). ``ckpt_every_steps`` saves every N optimizer steps;
+        # ``save_checkpoint_every_epoch`` saves at each epoch boundary (off by default).
         self.ckpt_every_steps = recipe_cfg.get("ckpt_every_steps", None)
         self.save_checkpoint_every_epoch = recipe_cfg.get("save_checkpoint_every_epoch", False)
         self.output_dir = pathlib.Path(recipe_cfg.output_dir)
@@ -262,15 +224,8 @@ class TrainEagle1Recipe(BaseRecipe):
             num_batches_per_epoch = len(self.train_dataloader)
         except TypeError:
             num_batches_per_epoch = 0
-        # Use ceil division so a trailing partial accumulation window (when
-        # ``num_batches_per_epoch`` is not a multiple of ``grad_accumulation_steps``)
-        # is counted as a real optimizer step. The training loop flushes that
-        # leftover window at the end of each epoch, so the LR scheduler must
-        # cover those steps too -- otherwise ``progress`` saturates and the
-        # final epoch trains at ``min_lr_ratio`` instead of the intended decay.
         total_optim_steps = max(
-            1,
-            self.num_epochs * _optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps),
+            1, self.num_epochs * _optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps)
         )
         warmup_ratio = float(opt_cfg.get("warmup_ratio", 0.05))
         min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
@@ -288,33 +243,34 @@ class TrainEagle1Recipe(BaseRecipe):
         self.total_optim_steps = total_optim_steps
         self.runtime = SimpleNamespace(global_step=0)
         self._resume_epoch = 0
+        self._skipped_micro_batches = 0
 
-        self.rng = StatefulRNG(
-            seed=int(recipe_cfg.get("shuffle_seed", 42)),
-            ranked=self.dist_env.world_size > 1,
-        )
+        self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)), ranked=self.dist_env.world_size > 1)
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
-        # Optional Weights & Biases logging (rank 0 only).
-        self.wandb_run = None
-        if self.dist_env.is_main and self.cfg.get("wandb", None) is not None:
-            suppress_wandb_log_messages()
-            self.wandb_run = init_wandb_run(
-                self.cfg.wandb.to_dict(),
-                self.cfg.to_dict(),
-                default_name="eagle1_" + str(target_path).rstrip("/").split("/")[-1],
+    def _resolve_mask_token_id(self, recipe_cfg) -> int:
+        """Resolve the MASK token id used to fill non-anchor block positions."""
+        mask_token_id = recipe_cfg.get("mask_token_id", None)
+        if mask_token_id is None:
+            mask_token_id = getattr(self.tokenizer, "pad_token_id", None)
+            if mask_token_id is not None:
+                logger.warning(
+                    "recipe_args.mask_token_id not set; falling back to tokenizer.pad_token_id=%d. "
+                    "Set it explicitly (e.g. a dedicated reserved token) if this is not intended.",
+                    mask_token_id,
+                )
+        if mask_token_id is None:
+            raise ValueError(
+                "DFlash requires a mask_token_id: set recipe_args.mask_token_id (the token used for "
+                "non-anchor block positions), or ensure the tokenizer defines a pad_token_id."
             )
+        return int(mask_token_id)
 
     def _build_checkpointer(self, target_path: str) -> None:
-        """Build the checkpointer using the same plumbing as the standard recipes."""
+        """Build the checkpointer using the same plumbing as the EAGLE recipes."""
         ckpt_cfg = self.cfg.get("checkpoint", None)
         default_dir = str(self.output_dir / "checkpoints")
-        # EAGLE recipes construct the draft model directly and bypass
-        # `apply_model_infrastructure`, which is where `_pre_shard_hf_state_dict_keys`
-        # would normally be attached. Capture the pre-shard keys here so the
-        # consolidated-safetensors path in `_maybe_build_consolidated_index`
-        # has something to diff against instead of `None`.
         draft_state_dict_keys = list(self.draft_model.state_dict().keys())
         ckpt_kwargs = dict(
             enabled=True,
@@ -336,11 +292,7 @@ class TrainEagle1Recipe(BaseRecipe):
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
         dp_rank = dist.get_rank() if dist.is_initialized() else 0
         self.checkpointer = Checkpointer(
-            config=self.checkpoint_config,
-            dp_rank=dp_rank,
-            tp_rank=0,
-            pp_rank=0,
-            moe_mesh=None,
+            config=self.checkpoint_config, dp_rank=dp_rank, tp_rank=0, pp_rank=0, moe_mesh=None
         )
 
     def _module(self):
@@ -358,12 +310,7 @@ class TrainEagle1Recipe(BaseRecipe):
         val_loss: dict[str, float] | None = None,
         best_metric_key: str = "default",
     ) -> None:
-        """Persist draft model, optimizer, scheduler, RNG, and EAGLE meta.
-
-        Overrides ``BaseRecipe.save_checkpoint`` because EAGLE recipes hold multiple
-        ``nn.Module`` attributes (frozen target, target wrapper, trainer module wrapping
-        the draft) — only ``draft_model`` should be persisted as the main model.
-        """
+        """Persist the DFlash draft model, optimizer, scheduler, RNG, and meta."""
         checkpointer = getattr(self, "checkpointer", None)
         if checkpointer is None or not checkpointer.config.enabled:
             return
@@ -386,7 +333,6 @@ class TrainEagle1Recipe(BaseRecipe):
             setattr(self, "_last_pending_checkpoint_dir", None)
             if is_dist_initialized:
                 dist.barrier()
-
         if prev_best_pending is not None:
             if is_rank_0 and prev_best_pending.get("val") is not None:
                 self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
@@ -410,15 +356,8 @@ class TrainEagle1Recipe(BaseRecipe):
         if is_dist_initialized:
             dist.barrier()
 
-        step_scheduler = getattr(self, "step_scheduler", None)
-        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
         draft_model = self._module().draft_model
-        self.checkpointer.save_model(
-            draft_model,
-            path,
-            tokenizer=self.tokenizer,
-            is_final_checkpoint=is_final_checkpoint,
-        )
+        self.checkpointer.save_model(draft_model, path, tokenizer=self.tokenizer, is_final_checkpoint=False)
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
         self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
@@ -443,76 +382,21 @@ class TrainEagle1Recipe(BaseRecipe):
             if is_dist_initialized:
                 dist.barrier()
 
-    def _log_saved_checkpoint(self, kind: str, epoch: int, step: int) -> None:
-        """Log a saved checkpoint on rank 0 when checkpointing is enabled."""
-        ckpt_cfg = getattr(self, "checkpoint_config", None)
-        if self.dist_env.is_main and ckpt_cfg is not None and ckpt_cfg.enabled:
-            logger.info("Saved %s checkpoint to %s/epoch_%d_step_%d", kind, ckpt_cfg.checkpoint_dir, epoch, step)
-
-    def _maybe_save_step_checkpoint(self, epoch: int) -> bool:
-        """Save a checkpoint mid-epoch when ``ckpt_every_steps`` is configured.
-
-        Called after every optimizer step. Saves whenever ``ckpt_every_steps`` is
-        a positive integer and the current ``global_step`` is a multiple of it.
-        Returns True if a checkpoint was written. The checkpoint directory is
-        named ``epoch_{epoch}_step_{global_step}`` so it never collides with the
-        end-of-epoch checkpoint (which uses ``epoch + 1``).
-        """
-        every = getattr(self, "ckpt_every_steps", None)
-        if every is None or every <= 0 or self.runtime.global_step % every != 0:
-            return False
-        self.save_checkpoint(
-            epoch=epoch,
-            step=self.runtime.global_step,
-            train_loss=None,
-            val_loss=None,
-            best_metric_key="val_loss",
-        )
-        self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
-        return True
-
-    def _maybe_save_final_checkpoint(self, completed_epochs: int) -> bool:
-        """Always save the fully-trained model at the end of a completed run,
-        unless a periodic checkpoint already captured the final step.
-
-        The end-of-run state is otherwise easy to lose: with no cadence nothing is
-        saved at all, and with a pure step cadence the final step is skipped
-        whenever the total step count is not a multiple of ``ckpt_every_steps``.
-        This is a no-op only when a step or epoch checkpoint already landed on the
-        final step, so it never duplicates or collides with one.
-        """
-        gs = self.runtime.global_step
-        if gs <= 0:
-            return False
-        every = getattr(self, "ckpt_every_steps", None)
-        saved_by_step = bool(every and every > 0 and gs % every == 0)
-        saved_by_epoch = bool(getattr(self, "save_checkpoint_every_epoch", False))
-        if saved_by_step or saved_by_epoch:
-            return False
-        self.save_checkpoint(
-            epoch=completed_epochs,
-            step=gs,
-            train_loss=None,
-            val_loss=None,
-            best_metric_key="val_loss",
-        )
-        self._log_saved_checkpoint("final", completed_epochs, gs)
-        return True
-
     def _save_extra_state(self, path: str, epoch: int) -> None:
-        """Persist EAGLE-recipe-specific scalars. Subclasses extend this."""
+        """Persist DFlash meta: global_step, epoch, block_size, and target layers."""
         torch.save(
-            {"global_step": self.runtime.global_step, "epoch": int(epoch)},
-            os.path.join(path, "eagle_meta.pt"),
+            {
+                "global_step": self.runtime.global_step,
+                "epoch": int(epoch),
+                "block_size": self.block_size,
+                "mask_token_id": self.mask_token_id,
+                "target_layer_ids": list(self.target_wrapper.target_layer_ids),
+            },
+            os.path.join(path, "dflash_meta.pt"),
         )
 
     def load_checkpoint(self, restore_from: str | None = None) -> None:
-        """Resolve and restore a checkpoint produced by ``save_checkpoint``.
-
-        Restores the draft model, optimizer, LR scheduler, RNG, and ``global_step``.
-        Target model weights are NOT restored — they are re-loaded from the HF hub on
-        each run because the target is frozen.
-        """
+        """Restore the DFlash draft model, optimizer, scheduler, RNG, and global_step."""
         checkpointer = getattr(self, "checkpointer", None)
         if checkpointer is None or not checkpointer.config.enabled:
             return
@@ -534,23 +418,12 @@ class TrainEagle1Recipe(BaseRecipe):
             ckpt_dir = str(auto)
 
         ok, reason = _is_checkpoint_model_config_compatible(self.cfg, ckpt_dir)
-        if not ok:
-            if not restore_from:
-                if is_rank_0:
-                    logger.warning(
-                        "Auto-detected checkpoint at %s is incompatible with current model configuration: %s. "
-                        "Skipping restore.",
-                        ckpt_dir,
-                        reason,
-                    )
-                return
+        if not ok and not restore_from:
             if is_rank_0:
                 logger.warning(
-                    "Checkpoint at %s may be incompatible with current model configuration: %s. "
-                    "Proceeding with restore anyway.",
-                    ckpt_dir,
-                    reason,
+                    "Auto-detected checkpoint at %s is incompatible: %s. Skipping restore.", ckpt_dir, reason
                 )
+            return
 
         if is_rank_0:
             logger.info("Resuming from checkpoint: %s", ckpt_dir)
@@ -562,19 +435,44 @@ class TrainEagle1Recipe(BaseRecipe):
             self.checkpointer.load_on_dp_ranks(self.rng, "rng", ckpt_dir)
         except FileNotFoundError:
             logger.warning("RNG state not found in %s; continuing without restoring RNG.", ckpt_dir)
-
         self._load_extra_state(ckpt_dir)
 
     def _load_extra_state(self, ckpt_dir: str) -> None:
-        """Restore EAGLE-recipe-specific scalars. Subclasses extend this."""
-        meta_path = os.path.join(ckpt_dir, "eagle_meta.pt")
-        if not os.path.exists(meta_path):
-            legacy = os.path.join(ckpt_dir, "eagle1_meta.pt")
-            meta_path = legacy if os.path.exists(legacy) else meta_path
+        """Restore DFlash meta: global_step and epoch."""
+        meta_path = os.path.join(ckpt_dir, "dflash_meta.pt")
         if os.path.exists(meta_path):
             meta = torch.load(meta_path, weights_only=False, map_location="cpu")
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
+
+    def _log_saved_checkpoint(self, kind: str, epoch: int, step: int) -> None:
+        """Log a saved checkpoint on rank 0 when checkpointing is enabled."""
+        ckpt_cfg = getattr(self, "checkpoint_config", None)
+        if self.dist_env.is_main and ckpt_cfg is not None and ckpt_cfg.enabled:
+            logger.info("Saved %s checkpoint to %s/epoch_%d_step_%d", kind, ckpt_cfg.checkpoint_dir, epoch, step)
+
+    def _maybe_save_step_checkpoint(self, epoch: int) -> bool:
+        """Save a checkpoint mid-epoch when ``ckpt_every_steps`` is configured."""
+        every = getattr(self, "ckpt_every_steps", None)
+        if every is None or every <= 0 or self.runtime.global_step % every != 0:
+            return False
+        self.save_checkpoint(epoch=epoch, step=self.runtime.global_step, best_metric_key="val_loss")
+        self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
+        return True
+
+    def _maybe_save_final_checkpoint(self, completed_epochs: int) -> bool:
+        """Always save the fully-trained model at the end, unless a cadence already saved the final step."""
+        gs = self.runtime.global_step
+        if gs <= 0:
+            return False
+        every = getattr(self, "ckpt_every_steps", None)
+        saved_by_step = bool(every and every > 0 and gs % every == 0)
+        saved_by_epoch = bool(getattr(self, "save_checkpoint_every_epoch", False))
+        if saved_by_step or saved_by_epoch:
+            return False
+        self.save_checkpoint(epoch=completed_epochs, step=gs, best_metric_key="val_loss")
+        self._log_saved_checkpoint("final", completed_epochs, gs)
+        return True
 
     def _run_eval(self):
         if self.val_dataloader is None:
@@ -593,16 +491,12 @@ class TrainEagle1Recipe(BaseRecipe):
                 )
                 metrics = self.trainer_module(
                     input_ids=target_batch.input_ids,
-                    attention_mask=target_batch.attention_mask,
+                    hidden_states=target_batch.hidden_states,
                     loss_mask=target_batch.loss_mask,
-                    input_hidden_states=target_batch.input_hidden_states,
-                    target_hidden_states=target_batch.target_hidden_states,
-                    target_logits=target_batch.target_logits,
                 )
                 total_loss += metrics.loss.detach()
                 total_acc += metrics.accuracy.detach()
                 total_batches += 1
-
         total_loss = _all_reduce_mean(total_loss)
         total_acc = _all_reduce_mean(total_acc)
         total_batches = _all_reduce_mean(total_batches)
@@ -612,38 +506,29 @@ class TrainEagle1Recipe(BaseRecipe):
             "val_accuracy": (total_acc / total_batches.clamp_min(1)).item(),
         }
 
-    def _wandb_log(self, data: dict, step: int) -> None:
-        """Log a metrics dict to W&B when a run is active (rank 0)."""
-        run = getattr(self, "wandb_run", None)
-        if run is not None:
-            run.log(data, step=step)
-
     def run_train_validation_loop(self):
-        """Run the training loop."""
+        """Run the DFlash training loop."""
         self.trainer_module.train()
         start_epoch = max(0, int(getattr(self, "_resume_epoch", 0)))
         if start_epoch >= self.num_epochs:
             if self.dist_env.is_main:
                 logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
             return
-        try:
-            batches_per_epoch = len(self.train_dataloader)
-        except TypeError:
-            batches_per_epoch = None
-        is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
+
         for epoch_idx in range(start_epoch, self.num_epochs):
             if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
                 self.train_dataloader.sampler.set_epoch(epoch_idx)
 
             running_loss = 0.0
             running_acc = 0.0
-            running_hidden_loss = 0.0
-            running_token_loss = 0.0
+            running_micro = 0
             epoch_loss = 0.0
             micro_step = 0
             pending_micro_batches = 0
             completed_steps = 0
             last_batch_idx = -1
+            num_batches = len(self.train_dataloader)
+            is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
             for batch_idx, batch in enumerate(self.train_dataloader):
                 last_batch_idx = batch_idx
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -652,39 +537,37 @@ class TrainEagle1Recipe(BaseRecipe):
                     attention_mask=batch["attention_mask"],
                     loss_mask=batch["loss_mask"],
                 )
-                # Skip DDP's per-micro-batch all-reduce on every micro-batch
-                # except the one an optimizer step immediately follows; that
-                # step's all-reduce covers the whole locally-accumulated window.
-                sync_grads = _should_sync_grads(
-                    pending_micro_batches=pending_micro_batches,
-                    grad_accumulation_steps=self.grad_accumulation_steps,
-                    batch_idx=batch_idx,
-                    batches_per_epoch=batches_per_epoch,
-                    is_ddp=is_ddp,
+                is_window_close = (pending_micro_batches + 1 == self.grad_accumulation_steps) or (
+                    batch_idx + 1 == num_batches
                 )
-                sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
-                with sync_ctx:
-                    metrics = self.trainer_module(
-                        input_ids=target_batch.input_ids,
-                        attention_mask=target_batch.attention_mask,
-                        loss_mask=target_batch.loss_mask,
-                        input_hidden_states=target_batch.input_hidden_states,
-                        target_hidden_states=target_batch.target_hidden_states,
-                        target_logits=target_batch.target_logits,
-                    )
-                    loss = metrics.loss / self.grad_accumulation_steps
-                    loss.backward()
+                sync_ctx = nullcontext() if (not is_ddp or is_window_close) else self.trainer_module.no_sync()
+                try:
+                    with sync_ctx:
+                        metrics = self.trainer_module(
+                            input_ids=target_batch.input_ids,
+                            hidden_states=target_batch.hidden_states,
+                            loss_mask=target_batch.loss_mask,
+                        )
+                        loss = metrics.loss / self.grad_accumulation_steps
+                        loss.backward()
+                except NoValidAnchorsError:
+                    # Every sample in this micro-batch is too short to form a block;
+                    # nothing to learn from it. Skip without touching the
+                    # accumulation counters. (No backward ran, so grads are intact.)
+                    # NOTE: under DDP this skip is per-rank and data-dependent; pre-filter
+                    # short samples for multi-rank runs to keep optimizer steps in lockstep.
+                    self._skipped_micro_batches += 1
+                    continue
 
                 running_loss += metrics.loss.detach().item()
                 running_acc += metrics.accuracy.detach().item()
-                running_hidden_loss += metrics.hidden_loss.detach().item()
-                running_token_loss += metrics.token_loss.detach().item()
+                running_micro += 1
                 epoch_loss += metrics.loss.detach().item()
                 micro_step += 1
                 pending_micro_batches += 1
 
                 if pending_micro_batches == self.grad_accumulation_steps:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.lr_scheduler.step()
@@ -694,59 +577,24 @@ class TrainEagle1Recipe(BaseRecipe):
                     self._maybe_save_step_checkpoint(epoch_idx)
 
                     if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
-                        n = self.log_every_steps
-                        avg_loss = running_loss / n
-                        avg_acc = running_acc / n
-                        current_lr = self.lr_scheduler.get_last_lr()[0]
+                        # Average over the micro-batches accumulated since the last
+                        # log, not over optimizer steps: with grad_accumulation_steps>1
+                        # (or skipped short micro-batches) the two differ, and dividing
+                        # by log_every_steps would inflate the reported loss/acc.
                         logger.info(
                             "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
                             epoch_idx,
                             self.runtime.global_step,
-                            avg_loss,
-                            avg_acc,
-                            current_lr,
-                        )
-                        self._wandb_log(
-                            {
-                                "train/loss": avg_loss,
-                                "train/accuracy": avg_acc,
-                                "train/hidden_loss": running_hidden_loss / n,
-                                "train/token_loss": running_token_loss / n,
-                                "train/lr": current_lr,
-                                "train/grad_norm": float(grad_norm),
-                                "train/epoch": epoch_idx,
-                            },
-                            step=self.runtime.global_step,
+                            running_loss / max(1, running_micro),
+                            running_acc / max(1, running_micro),
+                            self.lr_scheduler.get_last_lr()[0],
                         )
                         running_loss = 0.0
                         running_acc = 0.0
-                        running_hidden_loss = 0.0
-                        running_token_loss = 0.0
+                        running_micro = 0
 
-            # Flush the trailing partial accumulation window. When
-            # ``batches_per_epoch`` is not a multiple of ``grad_accumulation_steps``,
-            # up to ``grad_accumulation_steps - 1`` micro-batches have run
-            # ``backward()`` but never reached an ``optimizer.step()`` -- those
-            # gradients would otherwise be wiped by the next epoch's
-            # ``zero_grad`` and the samples wasted.
-            #
-            # Each micro-batch divided its loss by ``grad_accumulation_steps``
-            # in anticipation of a full window. With only ``pending_micro_batches``
-            # contributors, the accumulated gradient magnitude is
-            # ``pending_micro_batches / grad_accumulation_steps`` of a normal
-            # step; rescale by the inverse so the trailing step's gradient is on
-            # the same scale as every other step.
-            #
-            # Assumption: every data-parallel rank reaches this flush with the
-            # same ``pending_micro_batches``. That holds here because the loader
-            # uses ``DistributedSampler`` with ``drop_last=False`` (and the
-            # DataLoader likewise), which pads every rank to an equal sample
-            # count -> equal batches per epoch -> equal trailing windows. If a
-            # non-padding / variable-length sampler is ever introduced, revisit
-            # this: a divergent per-rank ``scale`` would desync parameters, and
-            # a rank that lands on ``pending_micro_batches == 0`` would skip the
-            # flush (and the ``clip_grad_norm_`` collective inside it) while its
-            # peers step, hanging on the mismatched collective.
+            # Flush the trailing partial accumulation window (see EAGLE recipes
+            # for the rescale rationale).
             if pending_micro_batches > 0:
                 scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                 for p in self.trainer_module.parameters():
@@ -763,15 +611,13 @@ class TrainEagle1Recipe(BaseRecipe):
 
             eval_metrics = self._run_eval()
             if self.dist_env.is_main:
-                msg = f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps}"
+                msg = (
+                    f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps} "
+                    f"skipped_short_micro_batches={self._skipped_micro_batches}"
+                )
                 if eval_metrics is not None:
                     msg += f" val_loss={eval_metrics['val_loss']:.4f} val_accuracy={eval_metrics['val_accuracy']:.4f}"
                 logger.info(msg)
-            if eval_metrics is not None:
-                self._wandb_log(
-                    {"val/loss": eval_metrics["val_loss"], "val/accuracy": eval_metrics["val_accuracy"]},
-                    step=self.runtime.global_step,
-                )
 
             if getattr(self, "save_checkpoint_every_epoch", False) and last_batch_idx >= 0:
                 avg_loss = epoch_loss / max(1, micro_step) if micro_step else None
@@ -782,17 +628,15 @@ class TrainEagle1Recipe(BaseRecipe):
                     val_loss=eval_metrics,
                     best_metric_key="val_loss",
                 )
+                self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
 
         self._maybe_save_final_checkpoint(self.num_epochs)
 
-        if getattr(self, "wandb_run", None) is not None:
-            self.wandb_run.finish()
-
 
 def main(config_path: str | None = None):
-    """Entrypoint for ``TrainEagle1Recipe``."""
+    """Entrypoint for ``TrainDFlashRecipe``."""
     cfg = parse_args_and_load_config(config_path)
-    trainer = TrainEagle1Recipe(cfg)
+    trainer = TrainDFlashRecipe(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
 
