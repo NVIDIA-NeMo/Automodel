@@ -31,7 +31,7 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import mlflow
 import torch
@@ -52,11 +52,10 @@ from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
-from nemo_automodel.components.distributed.init_utils import build_distributed
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import get_sync_ctx
-from nemo_automodel.components.loggers.comet_utils import build_comet
+from nemo_automodel.components.distributed.utils import dp_eval_sample_shard, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import (
@@ -66,12 +65,11 @@ from nemo_automodel.components.loggers.mlflow_utils import (
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
+from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
-from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
@@ -89,7 +87,7 @@ from nemo_automodel.components.utils.model_utils import (
     filter_forward_kwargs,
     resolve_trust_remote_code,
 )
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_setup import setup_distributed, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
@@ -134,13 +132,14 @@ def _uses_te_dot_product_attention(model_or_cfg):
 
 
 def _uses_thd_collater(cfg_dataloader):
+    """Return True if the dataloader's collate_fn is ``packed_sequence_thd_collater``.
+
+    ``collate_fn`` ends in ``_fn``, so ConfigNode resolves the YAML dotted-path string to
+    the actual callable at load time — the value here is always the function, never a string.
+    """
     from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
-    return (
-        True
-        if hasattr(cfg_dataloader, "collate_fn") and cfg_dataloader.collate_fn == packed_sequence_thd_collater
-        else False
-    )
+    return getattr(cfg_dataloader, "collate_fn", None) is packed_sequence_thd_collater
 
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
@@ -349,12 +348,7 @@ def _build_tokenizer(cfg_model, cfg_ds):
 
 
 def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
-    """Return a collate-fn wrapper that precomputes pipeline-parallel causal masks, or ``None``.
-
-    ``None`` when PP is disabled, the model config can't be loaded, or the model
-    computes masks internally (e.g. ``deepseek_v4``).  Passed to
-    :meth:`DataloaderConfig.build` as ``collate_wrapper``.
-    """
+    """Return a collate-fn wrapper that precomputes pipeline-parallel causal masks, or ``None``."""
     if not pp_enabled:
         return None
     try:
@@ -416,7 +410,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
         torch.cuda.reset_peak_memory_stats()
-        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        self.dist_env = initialize_distributed(
+            backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
+            timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
+        )
         # setups logging and adds the rankfilter to logging
         setup_logging()
 
@@ -446,8 +443,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 logging.info("MLflow experiment tracking enabled")
 
         self.comet_logger = None
-        if self.dist_env.is_main and hasattr(self.cfg, "comet"):
-            self.comet_logger = build_comet(self.cfg)
+        if self.dist_env.is_main and self.cfg.comet is not None:
+            self.comet_logger = self.cfg.comet.build(model_name=_get_model_name(self.cfg.model))
             self.comet_logger.log_params(self.cfg.to_dict())
             logging.info("Comet experiment tracking enabled")
 
@@ -543,15 +540,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             activation_checkpointing=self.dist_setup.activation_checkpointing,
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
-        self.optimizer = self.cfg.optimizer.build(
-            model, distributed_config=self.distributed_config, device_mesh=self.device_mesh
-        )
-        warn_if_torch_adam_with_bf16_params(
-            optimizer=self.optimizer,
-            optimizer_cfg=self.cfg.optimizer,
-            is_peft=self.peft_config is not None,
-            context="llm",
-            logger=logger,
+        optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
+        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        self.optimizer = shard_optimizers_for_megatron_fsdp(
+            model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
@@ -629,6 +621,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         tool_call_eval_cfg = self.cfg.get("tool_call_eval", None)
         if tool_call_eval_cfg is not None:
             self.tool_call_evaluator = tool_call_eval_cfg.instantiate()
+            # Shard eval samples across DP ranks only when safe (DDP); never
+            # override a ``sample_shard`` already set from YAML.
+            if self.tool_call_evaluator.sample_shard is None:
+                self.tool_call_evaluator.sample_shard = dp_eval_sample_shard(
+                    self.distributed_config, self._get_dp_rank(), self._get_dp_group_size()
+                )
         self._warned_tool_call_eval_skipped = False
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler — typed configs from RecipeConfig, built with runtime args here.
@@ -753,7 +751,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
-        self.pp.info.schedule._loss_fn = PipelineCausalLMLoss(self.loss_fn, last_stage_model)
+        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(self.loss_fn, last_stage_model)
 
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
@@ -879,15 +877,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
+        _thd_collater = _uses_thd_collater(self.cfg.dataloader)
+        # Gate THD/cu_seqlens processing on the dataset being THD-packed, not on TE
+        # attention being present on this rank: both TE attention and mamba need
+        # cu_seqlens, and gating on attention would drop PP stages with no attention
+        # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream.
+        _use_te_value = _thd_collater
+        _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
             batch,
-            use_te=_uses_te_dot_product_attention(
-                self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
-            )
-            and _uses_thd_collater(self.cfg.dataloader),
+            use_te=_use_te_value,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-            num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
+            num_chunks=_num_chunks_value,
         )
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
@@ -911,7 +913,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 batch_filtered = {
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
                 }
-
+                # Hand the THD ``cu_seqlens`` to the PP loss to mask cross-sequence boundaries —
+                # the fallback when the model emits no per-microbatch seq_idx tail (which the loss
+                # prefers). One cu_seqlens encodes a single shared layout, so it is only correct at
+                # one pack/microbatch per step; the seq_idx tail handles differing per-microbatch boundaries.
+                cu_seqlens = batch_filtered.get("cu_seqlens")
+                if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
+                    cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
+                pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
+                if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
+                    pp_loss_fn.cu_seqlens = cu_seqlens
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:
@@ -965,14 +976,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    mtp_cfg = self.cfg.mtp
+                    scaling_factor = (
+                        mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
+                    )
                     local_loss = local_loss + calculate_mtp_loss(
                         self.loss_fn,
                         mtp_per_depth_h=mtp_per_depth_h,
                         mtp_per_depth_logits=mtp_per_depth_logits,
                         labels=labels,
                         model=model,
-                        scaling_factor=out.mtp_loss_scaling_factor,
+                        scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
+                        ignore_index=mtp_cfg.ignore_index,
+                        # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
+                        cu_seqlens=batch.get("cu_seqlens"),
                     )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
@@ -985,7 +1003,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
         return tensor
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step.
 
         Args:
@@ -1201,7 +1219,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # generate() repeatedly unshards parameters and can leave enough
         # allocator pressure to OOM the next backward pass.
         if getattr(self, "tool_call_evaluator", None) is not None:
-            count_key = f"{self.tool_call_evaluator.metric_prefix}/_count"
+            prefix = self.tool_call_evaluator.metric_prefix
+            count_key = f"{prefix}/_count"
             if isinstance(self.distributed_config, FSDP2Config) and not getattr(
                 self.tool_call_evaluator, "run_on_fsdp2", False
             ):
@@ -1212,44 +1231,56 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         "or run the evaluator offline from a checkpoint."
                     )
                     self._warned_tool_call_eval_skipped = True
-                metrics[f"{self.tool_call_evaluator.metric_prefix}/_disabled_fsdp2"] = 1.0
+                metrics[f"{prefix}/_disabled_fsdp2"] = 1.0
             else:
+                # sample_shard is set (identically) on every rank only for DDP,
+                # where each rank scored a DISJOINT subset → all-reduce. When it
+                # is None (FSDP2 in-loop, or single rank) every rank scored the
+                # SAME set in lockstep and holds identical results → use them
+                # directly with no collective. The branch is taken identically on
+                # all ranks, so the collectives below stay in sync.
+                sharded = self.tool_call_evaluator.sample_shard is not None
                 try:
-                    tool_metrics = self.tool_call_evaluator.evaluate(self.model_parts[0], self.tokenizer)
-                    # The evaluator returns per-rank means and count-like
-                    # diagnostics. Weighted all-reduce the means by scored
-                    # sample count, and sum diagnostics directly.
-                    local_count = float(tool_metrics.pop(count_key, 0.0))
-                    device = self.dist_env.device
-                    count_t = torch.tensor(local_count, dtype=torch.float32, device=device)
-                    total_count = self._dp_allreduce(count_t).item()
-
-                    count_like_metrics = {
-                        k: v
-                        for k, v in list(tool_metrics.items())
-                        if k.startswith(f"{self.tool_call_evaluator.metric_prefix}/_")
-                    }
-                    for k in count_like_metrics:
-                        tool_metrics.pop(k, None)
-
-                    if total_count > 0:
-                        for k, v in list(tool_metrics.items()):
-                            local_sum = torch.tensor(float(v) * local_count, dtype=torch.float32, device=device)
-                            total_sum = self._dp_allreduce(local_sum).item()
-                            tool_metrics[k] = total_sum / total_count
-
-                    for k, v in count_like_metrics.items():
-                        local_total = torch.tensor(float(v), dtype=torch.float32, device=device)
-                        tool_metrics[k] = self._dp_allreduce(local_total).item()
-
-                    tool_metrics[count_key] = total_count
-                    metrics.update(tool_metrics)
+                    local_metrics = self.tool_call_evaluator.evaluate(self.model_parts[0], self.tokenizer)
                 except Exception as exc:
                     logging.warning("tool_call_evaluator.evaluate failed: %s", exc)
-                finally:
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    local_metrics = {}
+
+                metric_keys = list(self.tool_call_evaluator.METRIC_KEYS)
+                local_count = float(local_metrics.get(count_key, 0.0))
+                if sharded:
+                    # Every DP rank must issue the SAME collective here, whatever
+                    # its local eval produced. A rank whose evaluate() raised (e.g.
+                    # a divergent generate() OOM) or that hit different skip reasons
+                    # must not skip or add an all-reduce, or it desyncs the
+                    # collective and deadlocks the others. So reduce a FIXED vector
+                    # (count, count-weighted means, skipped — never the per-rank
+                    # _skip_<reason> keys) in one packed all-reduce; a local failure
+                    # contributes zeros but still participates.
+                    packed = torch.tensor(
+                        [local_count]
+                        + [float(local_metrics.get(f"{prefix}/{k}", 0.0)) * local_count for k in metric_keys]
+                        + [float(local_metrics.get(f"{prefix}/_skipped", 0.0))],
+                        dtype=torch.float32,
+                        device=self.dist_env.device,
+                    )
+                    reduced = self._dp_allreduce(packed).tolist()
+                    total_count = reduced[0]
+                    for i, k in enumerate(metric_keys, start=1):
+                        metrics[f"{prefix}/{k}"] = reduced[i] / total_count if total_count > 0 else 0.0
+                    metrics[f"{prefix}/_skipped"] = reduced[-1]
+                    metrics[count_key] = total_count
+                else:
+                    # Replicated: identical on every rank, so report the local
+                    # values directly (no collective, _count is the true count).
+                    for k in metric_keys:
+                        metrics[f"{prefix}/{k}"] = float(local_metrics.get(f"{prefix}/{k}", 0.0))
+                    metrics[f"{prefix}/_skipped"] = float(local_metrics.get(f"{prefix}/_skipped", 0.0))
+                    metrics[count_key] = local_count
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         return MetricsSample(
             step=self.step_scheduler.step,

@@ -274,37 +274,67 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return norm
 
 
+# ShareGPT ``from`` role -> OpenAI ``role``. Covers the plain-chat roles that
+# datasets such as PerfectBlend ship under a ``conversations`` column. Tool-call
+# agent traces (``function_call`` / ``observation`` / ``tool_call``) are out of
+# scope here -- use the agent SFT dataset (``make_agent_chat_dataset``) for those.
+_SHAREGPT_ROLE_MAP = {
+    "system": "system",
+    "human": "user",
+    "user": "user",
+    "gpt": "assistant",
+    "assistant": "assistant",
+    "chatgpt": "assistant",
+    "model": "assistant",
+    "bot": "assistant",
+}
+
+
+def _conversations_to_messages(conversations: Any) -> List[Dict[str, Any]]:
+    """Convert a ShareGPT ``conversations`` list to OpenAI ``messages``.
+
+    ShareGPT-style rows store turns as ``{"from": <role>, "value": <text>}`` under
+    a ``conversations`` column instead of OpenAI ``{"role", "content"}`` under
+    ``messages``. Map the common plain-chat roles so such datasets load without a
+    manual rename. Raises on an unsupported role rather than guessing.
+    """
+    if not isinstance(conversations, list):
+        raise ValueError(f"`conversations` must be a list of turns, got {type(conversations).__name__}")
+    messages: List[Dict[str, Any]] = []
+    for turn in conversations:
+        if not isinstance(turn, dict):
+            raise ValueError(f"Each `conversations` turn must be a dict, got {type(turn).__name__}")
+        src_role = turn.get("from", turn.get("role"))
+        role = _SHAREGPT_ROLE_MAP.get(src_role)
+        if role is None:
+            raise ValueError(
+                f"Unsupported ShareGPT role {src_role!r} in `conversations`. Supported plain-chat "
+                f"roles: {sorted(_SHAREGPT_ROLE_MAP)}. For tool-calling traces use the agent SFT "
+                "dataset (make_agent_chat_dataset)."
+            )
+        messages.append({"role": role, "content": turn.get("value", turn.get("content", ""))})
+    return messages
+
+
 @dataclass
 class ChatDatasetConfig:
-    """Construction-time configuration for :class:`ChatDataset` (tokenizer is a build arg)."""
+    """Construction-time configuration for :class:`ChatDataset`."""
 
     path_or_dataset_id: Union[str, Sequence[str]]
-    """HF dataset id, local JSON/JSONL path(s), Parquet file, or Parquet directory."""
     split: Optional[str] = None
-    """Dataset split or slice (e.g. ``train``, ``train[1024:]``)."""
     name: Optional[str] = None
-    """Optional Hub subset / config name."""
     seq_length: Optional[int] = None
-    """Maximum sequence length for padding and truncation in formatting."""
     padding: Union[str, bool] = "do_not_pad"
-    """Padding mode for ``format_chat_template``."""
     truncation: Union[str, bool] = "do_not_truncate"
-    """Truncation mode for ``format_chat_template``."""
     start_of_turn_token: Optional[str] = None
-    """Optional token marking assistant turns for answer-only loss."""
     chat_template: Optional[str] = None
-    """Optional Jinja template string overriding ``tokenizer.chat_template``."""
     shuffle_seed: Optional[int] = None
-    """If set, shuffles Hub/Parquet data before applying a split slice."""
     mask_reasoning_content: bool = False
-    """If ``True``, exclude rendered reasoning traces from the loss mask."""
     unshifted: bool = False
-    """Passed through to ``format_chat_template``."""
     skip_invalid_samples: bool = False
-    """If ``True``, skip malformed JSONL lines when reading local files."""
 
     def build(self, *, tokenizer) -> "ChatDataset":
-        """Build a :class:`ChatDataset` from this :class:`ChatDatasetConfig` and a runtime tokenizer."""
+        """Build a :class:`ChatDataset` from this config and a runtime tokenizer."""
         return ChatDataset(
             path_or_dataset_id=self.path_or_dataset_id,
             tokenizer=tokenizer,
@@ -325,10 +355,12 @@ class ChatDatasetConfig:
 class ChatDataset(Dataset):
     """Dataset for OpenAI-format tool-calling chat transcripts.
 
-    This class expects each row to contain a `messages` list in OpenAI chat format,
-    potentially including tool calls and tool responses. The datasetformats the
-    conversation via the tokenizer's chat template to produce `input_ids`, `labels`,
-    and `attention_mask` suitable for SFT.
+    Each row should contain a `messages` list in OpenAI chat format (`role` /
+    `content`), potentially including tool calls and tool responses. Rows that
+    instead carry a ShareGPT `conversations` list (`from` / `value`, as used by
+    PerfectBlend and similar) are auto-converted, so no manual column rename is
+    needed. The conversation is formatted via the tokenizer's chat template to
+    produce `input_ids`, `labels`, and `attention_mask` suitable for SFT.
     """
 
     def __init__(
@@ -404,8 +436,14 @@ class ChatDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
         row = self.dataset[idx]
         messages = row.get("messages")
+        if messages is None and row.get("conversations") is not None:
+            # ShareGPT layout (PerfectBlend etc.): convert {from, value} turns to
+            # OpenAI {role, content} so no manual column rename is needed.
+            messages = _conversations_to_messages(row["conversations"])
         if not isinstance(messages, list):
-            raise ValueError("Each sample must contain a `messages` list in OpenAI format")
+            raise ValueError(
+                "Each sample must contain a `messages` list (OpenAI format) or a `conversations` list (ShareGPT format)"
+            )
 
         normalized = _normalize_messages(messages)
         tools = row.get("tools")

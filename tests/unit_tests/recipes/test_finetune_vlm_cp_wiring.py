@@ -386,8 +386,8 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     monkeypatch.setattr(vlm_finetune, "AutoPipeline", _FakePPModel)
     monkeypatch.setattr(
         vlm_finetune,
-        "build_distributed",
-        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+        "initialize_distributed",
+        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
     monkeypatch.setattr(vlm_finetune, "setup_logging", lambda: None)
     monkeypatch.setattr(vlm_finetune, "apply_cache_compatibility_patches", lambda: None)

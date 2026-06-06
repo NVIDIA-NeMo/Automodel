@@ -24,16 +24,15 @@ import wandb
 from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.init_utils import build_distributed
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_setup import setup_distributed, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
@@ -53,7 +52,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
     def setup(self):
         torch.cuda.reset_peak_memory_stats()
-        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        self.dist_env = initialize_distributed(
+            backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
+            timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
+        )
         setup_logging()
         apply_cache_compatibility_patches()
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
@@ -107,15 +109,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             distributed_config=self.distributed_config,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
-        self.optimizer = self.cfg.optimizer.build(
-            model, distributed_config=self.distributed_config, device_mesh=self.device_mesh
-        )
-        warn_if_torch_adam_with_bf16_params(
-            optimizer=self.optimizer,
-            optimizer_cfg=self.cfg.optimizer,
-            is_peft=self.peft_config is not None,
-            context="llm",
-            logger=logger,
+        optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
+        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        self.optimizer = shard_optimizers_for_megatron_fsdp(
+            model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )
 
         self.model_parts = [model]

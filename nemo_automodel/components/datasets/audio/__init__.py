@@ -11,19 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: Sync skills → agent dirs
 
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - "skills/**"
-      - "AGENTS.md"
+from nemo_automodel.components.datasets.audio.collate_fns import (
+    qwen2_5_omni_asr_collate_fn,
+    qwen3_omni_asr_collate_fn,
+)
+from nemo_automodel.components.datasets.audio.datasets import (
+    make_cv17_dataset,
+    make_hf_audio_asr_dataset,
+)
+from nemo_automodel.components.datasets.audio.multi_en import make_multi_en_asr_dataset
 
-jobs:
-  sync:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_sync_skills.yml@v0.91.0
-    secrets:
-      PAT: ${{ secrets.PAT }}
+__all__ = [
+    "make_hf_audio_asr_dataset",
+    "make_cv17_dataset",
+    "make_multi_en_asr_dataset",
+    "qwen2_5_omni_asr_collate_fn",
+    "qwen3_omni_asr_collate_fn",
+]

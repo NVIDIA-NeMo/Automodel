@@ -15,7 +15,7 @@
 import logging
 import sys
 import types
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -30,16 +30,32 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
-from nemo_automodel.components.datasets.loader import DataloaderConfig, build_dataloader_config
+from nemo_automodel.components.datasets.loader import (
+    DataloaderConfig,
+    build_dataloader_config,
+    make_collate_fn,
+    make_dataset_config,
+    make_packing_config,
+)
+from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
+from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
-    PipelineCausalLMLoss,
     TrainFinetuneRecipeForNextTokenPrediction,
     _build_pp_collate_wrapper,
     build_model,
     compute_trust_remote_code_from_model,
 )
+
+
+def _target_kwargs(node):
+    if node is None:
+        return None, {}
+    if isinstance(node, str):
+        return node, {}
+    return _callable_and_kwargs(node)
 
 
 def _build_loader(
@@ -59,40 +75,41 @@ def _build_loader(
     cp_size=1,
     model=None,
 ):
-    """Resolve the loader YAML like ``RecipeConfig.dataloader`` and build it (no ``build_dataloader``)."""
-    factory, ds_kwargs = _callable_and_kwargs(cfg_ds)
+    """Resolve loader YAML like ``RecipeConfig.dataloader`` and build it."""
+    del global_batch_size, max_steps, val_check_interval
+    target, ds_kwargs = _callable_and_kwargs(cfg_ds)
     ds_kwargs.pop("tokenizer", None)
+    dataset_config = make_dataset_config(target, ds_kwargs)
     dl = _as_dict(cfg_dl)
     dl.pop("_target_", None)
-    collate = dl.pop("collate_fn", None)
+    collate = make_collate_fn(*_target_kwargs(dl.pop("collate_fn", None)))
+    ps = _as_dict(cfg_ps)
+    packing = None
+    if ps.get("packed_sequence_size", 0) > 0:
+        packing = make_packing_config(ps.pop("packing_strategy", "thd"), ps)
     config = build_dataloader_config(
-        factory,
-        ds_kwargs,
+        dataset_config,
         dataloader=dl,
-        packed_sequence=_as_dict(cfg_ps) if cfg_ps else None,
+        packing=packing,
         collate_fn=collate,
         seed=seed,
         local_batch_size=local_batch_size,
-        global_batch_size=global_batch_size,
-        max_steps=max_steps,
-        val_check_interval=val_check_interval,
     )
-    loader = config.build(
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        pp_enabled=pp_enabled,
-        model=model,
-        cp_size=cp_size,
-        collate_wrapper=_build_pp_collate_wrapper(cfg_model, pp_enabled),
-    )
+    with patch("nemo_automodel.components.training.rng.ScopedRNG", lambda *a, **k: nullcontext()):
+        loader = config.build(
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            pp_enabled=pp_enabled,
+            model=model,
+            cp_size=cp_size,
+            collate_wrapper=_build_pp_collate_wrapper(cfg_model, pp_enabled),
+        )
     return loader, None
 
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
     """Resolve a YAML optimizer block and build it (mirrors ``RecipeConfig.optimizer.build``)."""
-    return build_optimizer_config(*_callable_and_kwargs(cfg_opt)).build(
-        model, distributed_config=distributed_config, device_mesh=device_mesh
-    )
+    return build_optimizer_config(*_callable_and_kwargs(cfg_opt)).build(model, device_mesh=device_mesh)
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
@@ -106,7 +123,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
 
 
 class DummyIterableDataset(IterableDataset):  # noqa: D401
-    """Minimal iterable dataset with shard/shuffle hooks for testing the dataloader build."""
+    """Minimal iterable dataset with shard/shuffle hooks for testing build_dataloader."""
 
     def __init__(self, items=None, num_shards=1, tokenizer=None, **kwargs):
         super().__init__()
@@ -170,6 +187,44 @@ def test_pipeline_causal_lm_loss_adds_mtp_tuple_output():
     torch.testing.assert_close(got, expected)
 
 
+def test_mtp_loss_config_defaults_and_override():
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.components.loss.mtp import MTPLossConfig
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = nn.Linear(3, 5, bias=False)
+            self.mtp_config = SimpleNamespace(loss_scaling_factor=0.2)
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+    # Defaults: scaling_factor None (model-driven), ignore_index -100.
+    assert MTPLossConfig().scaling_factor is None
+    assert MTPLossConfig().ignore_index == -100
+
+    torch.manual_seed(123)
+    model = DummyModel()
+    model.train()
+    loss_fn = MaskedCrossEntropy(fp32_upcast=False, reduction="sum")
+
+    logits = torch.randn(1, 4, 5)
+    mtp_h = torch.randn(1, 4, 3)
+    labels = torch.tensor([[1, 2, 3, 4]])
+    shifted_labels = torch.tensor([[2, 3, 4, -100]])
+    base = loss_fn(logits=logits, labels=labels)
+    aux = loss_fn(logits=model.lm_head(mtp_h), labels=shifted_labels)
+
+    # An explicit scaling_factor overrides the model-provided 0.2.
+    got_override = MTPLossConfig(scaling_factor=0.5).build(loss_fn, model)((logits, mtp_h), labels)
+    torch.testing.assert_close(got_override, base + 0.5 * aux)
+
+    # The default (None) falls back to the model-provided 0.2.
+    got_default = MTPLossConfig().build(loss_fn, model)((logits, mtp_h), labels)
+    torch.testing.assert_close(got_default, base + 0.2 * aux)
+
+
 def test_validation_dataloaders_pp_enabled(caplog):
     cfg = ConfigNode(
         {
@@ -205,12 +260,13 @@ def test_validation_dataloaders_collects_and_names_properly():
         }
     )
 
+    expected_names = {"default", "val", "test"}
+
     result = RecipeConfig(cfg).validation_dataloaders
 
-    assert set(result.keys()) == {"default", "val", "test"}
+    assert set(result.keys()) == expected_names
     assert all(isinstance(v, DataloaderConfig) for v in result.values())
-    # The resolved schedule is carried on each config.
-    assert all(v.global_batch_size == 16 and v.batch_size == 8 for v in result.values())
+    assert all(v.batch_size == 8 for v in result.values())
 
 
 def test_validation_dataloaders_no_validation_keys():
@@ -395,8 +451,9 @@ def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog
     assert config.model_save_format == SerializationFormat.SAFETENSORS
     # checkpoint_dir is preserved from the user config
     assert config.checkpoint_dir == "/user/ckpt/"
-    # save_consolidated is forced back to the safetensors default
-    assert config.save_consolidated is True
+    # other user-provided torch_save options are discarded; save_consolidated falls back to the default "final"
+    assert config.save_consolidated.value == "final"
+    assert config.is_async is False
 
 
 def test_build_loader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatch):
@@ -408,7 +465,6 @@ def test_build_loader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatch):
             "num_shards": 4,
         }
     )
-    # shuffle / shuffle_buffer_size are consumed by the loader build, not forwarded to the DataLoader.
     cfg_dl = ConfigNode({"shuffle": True, "shuffle_buffer_size": 8, "num_workers": 0})
     cfg_model = ConfigNode({})
     cfg_ps = ConfigNode({})
@@ -430,7 +486,7 @@ def test_build_loader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatch):
     )
 
     assert tok is None
-    ds = loader.dataset  # the (sharded + shuffled) dataset wrapped by ParallelAwareDataloader
+    ds = loader.dataset
     assert ds.__class__.__name__ == "DummyIterableDataset"
     # Shard path used when num_shards >= dp_world_size
     assert ds._shard == (2, 1)
@@ -506,8 +562,8 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     """Patch heavy dependencies so TrainFinetuneRecipeForNextTokenPrediction.setup runs lightly."""
     # Lightweight distributed/env/logging
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_distributed",
-        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+        "nemo_automodel.recipes.llm.train_ft.initialize_distributed",
+        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.apply_cache_compatibility_patches", lambda: None)
@@ -558,10 +614,16 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         property(lambda self: SimpleNamespace(build=lambda *a, **k: [dummy_opt])),
     )
 
-    # Data-related stubs: short-circuit the RecipeConfig dataloader resolution + build.
-    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: SimpleNamespace(build=lambda **k: "dl")))
-    monkeypatch.setattr(RecipeConfig, "validation_dataloaders", property(lambda self: {}))
+    # Data-related stubs
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._build_tokenizer", lambda cfg_model, cfg_ds: ({}, None))
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.dataloader",
+        property(lambda self: SimpleNamespace(build=lambda **k: "dl")),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.validation_dataloaders",
+        property(lambda self: {}),
+    )
     monkeypatch.setattr(
         "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
         lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
@@ -849,14 +911,18 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
 
     # Minimal stubs so we can create the recipe
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_distributed",
-        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+        "nemo_automodel.recipes.llm.train_ft.initialize_distributed",
+        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
 
     # Mock helper functions to avoid needing full config
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: False)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.dataloader",
+        property(lambda self: SimpleNamespace(collate_fn=None)),
+    )
 
     # Create the recipe without calling setup
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
@@ -1343,10 +1409,11 @@ def _pp_loader(cfg_model, cfg_dl, **patches):
 
 
 def test_pp_autoconfig_failure_skips_masks(caplog):
-    """When AutoConfig.from_pretrained raises, the collate is left unwrapped (warning logged)."""
+    """When AutoConfig.from_pretrained raises, the collate is left unwrapped and a warning is logged."""
     calls = []
     cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
     cfg_model = ConfigNode({"pretrained_model_name_or_path": "bad/model"})
+
     with (
         patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", side_effect=OSError("not found")),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
@@ -1382,7 +1449,7 @@ def test_pp_deepseek_v4_skips_masks(caplog):
 
 
 def test_pp_autoconfig_success_chains_masks():
-    """When AutoConfig succeeds, the resolved collate is wrapped with mask precomputation (base -> masks)."""
+    """When AutoConfig succeeds, the resolved collate is wrapped with mask precomputation."""
     call_order = []
     cfg_dl = ConfigNode({"collate_fn": lambda b: call_order.append("base") or b, "num_workers": 0})
     cfg_model = ConfigNode({"pretrained_model_name_or_path": "good/model"})
@@ -1580,8 +1647,8 @@ class TestRunTrainOptimStepSetsMoEScale:
             }
         )
         monkeypatch.setattr(
-            "nemo_automodel.recipes.llm.train_ft.build_distributed",
-            lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+            "nemo_automodel.recipes.llm.train_ft.initialize_distributed",
+            lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
         )
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
@@ -1803,3 +1870,144 @@ class TestResolveSdpaMethod:
 
         result = resolve_sdpa_method([SDPBackend.FLASH_ATTENTION, "efficient_attention"])
         assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+
+
+class TestDpEvalSampleShard:
+    """`dp_eval_sample_shard` shards eval samples only when the model is
+    replicated per DP rank (DDP); sharded strategies must stay in lockstep."""
+
+    def test_ddp_multi_rank_shards(self):
+        from nemo_automodel.components.distributed.config import DDPConfig
+
+        assert dp_eval_sample_shard(DDPConfig(), 1, 4) == (1, 4)
+
+    def test_ddp_single_rank_no_shard(self):
+        from nemo_automodel.components.distributed.config import DDPConfig
+
+        assert dp_eval_sample_shard(DDPConfig(), 0, 1) is None
+
+    def test_fsdp2_never_shards(self):
+        # Sharding under FSDP2 would desync generate()'s per-layer all-gathers.
+        from nemo_automodel.components.distributed.config import FSDP2Config
+
+        assert dp_eval_sample_shard(FSDP2Config(), 1, 4) is None
+
+    def test_megatron_fsdp_never_shards(self):
+        from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+
+        assert dp_eval_sample_shard(MegatronFSDPConfig(), 1, 4) is None
+
+
+class _FakeToolCallEvaluator:
+    """Stand-in for ToolCallAccuracyEvaluator: returns canned metrics (or raises)
+    so ``_run_validation_epoch``'s reduction can be tested without generation."""
+
+    metric_prefix = "tool_call"
+    # Reuse the real evaluator's keys so this fake can never silently diverge.
+    METRIC_KEYS = ToolCallAccuracyEvaluator.METRIC_KEYS
+
+    def __init__(self, *, sample_shard=None, run_on_fsdp2=False, result=None, raises=False):
+        self.sample_shard = sample_shard
+        self.run_on_fsdp2 = run_on_fsdp2
+        self._result = result if result is not None else {}
+        self._raises = raises
+        self.eval_calls = 0
+
+    def evaluate(self, model, tokenizer):
+        self.eval_calls += 1
+        if self._raises:
+            raise RuntimeError("boom")
+        return dict(self._result)
+
+
+def _make_eval_recipe(distributed_config, evaluator):
+    """Minimal recipe wired for ``_run_validation_epoch`` with an empty val loader.
+
+    Single-rank: ``_dp_allreduce`` is the identity, so the packed all-reduce
+    recovers the per-rank means directly.
+    """
+    recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.model_parts = [SimpleNamespace(eval=lambda: None)]
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), is_main=True)
+    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.01}])]
+    recipe.pp_enabled = False
+    recipe.distributed_config = distributed_config
+    recipe.tool_call_evaluator = evaluator
+    recipe.tokenizer = object()
+    recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
+    recipe._warned_tool_call_eval_skipped = False
+    recipe._dp_allreduce = lambda tensor, *args, **kwargs: tensor
+    return recipe
+
+
+class TestRunValidationToolCallEval:
+    """Cover the tool-call eval reduction branches in ``_run_validation_epoch``
+    (FSDP2 skip / DDP packed all-reduce / replicated / evaluate failure) without a
+    real model or process group."""
+
+    def _run(self, recipe, monkeypatch):
+        # max_memory_allocated() is CUDA-only; stub it so the CPU metrics build works.
+        monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: 0)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", lambda **kwargs: nullcontext())
+        return recipe._run_validation_epoch([])  # empty loader -> straight to the eval block
+
+    def test_fsdp2_skips_in_loop_eval(self, monkeypatch):
+        from nemo_automodel.components.distributed.config import FSDP2Config
+
+        ev = _FakeToolCallEvaluator(run_on_fsdp2=False)
+        recipe = _make_eval_recipe(FSDP2Config(), ev)
+        out = self._run(recipe, monkeypatch)
+        assert out.metrics["tool_call/_disabled_fsdp2"] == 1.0
+        assert ev.eval_calls == 0  # generation never ran
+        assert recipe._warned_tool_call_eval_skipped is True
+
+    def test_ddp_sharded_packed_allreduce(self, monkeypatch):
+        from nemo_automodel.components.distributed.config import DDPConfig
+
+        result = {
+            "tool_call/has_call": 1.0,
+            "tool_call/name_correct": 0.5,
+            "tool_call/args_json_valid": 1.0,
+            "tool_call/args_field_recall": 0.0,
+            "tool_call/args_field_precision": 0.0,
+            "tool_call/args_exact_match": 0.0,
+            "tool_call/_count": 2.0,
+            "tool_call/_skipped": 1.0,
+        }
+        ev = _FakeToolCallEvaluator(sample_shard=(0, 1), result=result)
+        out = self._run(_make_eval_recipe(DDPConfig(), ev), monkeypatch)
+        # Identity all-reduce on one rank: count-weighted sum / count recovers the mean.
+        assert out.metrics["tool_call/has_call"] == 1.0
+        assert out.metrics["tool_call/name_correct"] == 0.5
+        assert out.metrics["tool_call/_count"] == 2.0
+        assert out.metrics["tool_call/_skipped"] == 1.0
+        assert ev.eval_calls == 1
+
+    def test_replicated_reports_local_without_collective(self, monkeypatch):
+        from nemo_automodel.components.distributed.config import FSDP2Config
+
+        result = {
+            "tool_call/has_call": 0.75,
+            "tool_call/name_correct": 0.25,
+            "tool_call/args_json_valid": 0.5,
+            "tool_call/args_field_recall": 0.1,
+            "tool_call/args_field_precision": 0.2,
+            "tool_call/args_exact_match": 0.0,
+            "tool_call/_count": 4.0,
+            "tool_call/_skipped": 0.0,
+        }
+        # FSDP2 + run_on_fsdp2 -> not skipped; sample_shard None -> replicated branch.
+        ev = _FakeToolCallEvaluator(sample_shard=None, run_on_fsdp2=True, result=result)
+        out = self._run(_make_eval_recipe(FSDP2Config(), ev), monkeypatch)
+        assert out.metrics["tool_call/has_call"] == 0.75
+        assert out.metrics["tool_call/_count"] == 4.0
+        assert out.metrics["tool_call/_skipped"] == 0.0
+
+    def test_evaluate_failure_is_tolerated(self, monkeypatch):
+        from nemo_automodel.components.distributed.config import DDPConfig
+
+        ev = _FakeToolCallEvaluator(sample_shard=(0, 1), raises=True)
+        out = self._run(_make_eval_recipe(DDPConfig(), ev), monkeypatch)
+        # An evaluate() that raised contributes an empty result -> zeros, count 0.
+        assert out.metrics["tool_call/_count"] == 0.0
+        assert out.metrics["tool_call/has_call"] == 0.0

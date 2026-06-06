@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -46,6 +47,35 @@ def _is_geq_torch_2_9() -> bool:
     return parse(torch.__version__).base_version >= "2.9.0"
 
 
+class SaveConsolidatedMode(str, Enum):
+    """Controls when consolidated HF safetensors are exported."""
+
+    FALSE = "false"
+    FINAL = "final"
+    EVERY = "every"
+
+
+def _normalize_save_consolidated(value: bool | str | SaveConsolidatedMode) -> SaveConsolidatedMode:
+    """Normalize legacy bools and string aliases to a consolidated export mode."""
+    if isinstance(value, SaveConsolidatedMode):
+        return value
+    if isinstance(value, bool):
+        return SaveConsolidatedMode.EVERY if value else SaveConsolidatedMode.FALSE
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "every"}:
+            return SaveConsolidatedMode.EVERY
+        if normalized == "final":
+            return SaveConsolidatedMode.FINAL
+        if normalized == "false":
+            return SaveConsolidatedMode.FALSE
+    raise ValueError(
+        "Unsupported save_consolidated value: {}. Supported values are false, final, every, and legacy booleans.".format(
+            value
+        )
+    )
+
+
 @dataclass
 class CheckpointingConfig:
     """Configuration for checkpointing.
@@ -61,7 +91,7 @@ class CheckpointingConfig:
     model_save_format: str = "safetensors"
     model_cache_dir: str | Path | None = None
     model_repo_id: str | None = None
-    save_consolidated: bool = True
+    save_consolidated: bool | str | SaveConsolidatedMode = "final"
     is_peft: bool = False
     model_state_dict_keys: list[str] | None = (
         None  # copy of the model state dict keys before any parallelization. Kept for BW compatibility.
@@ -83,19 +113,21 @@ class CheckpointingConfig:
     best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
 
     def __post_init__(self):
-        """Resolve the cache dir, enforce PEFT constraints, and coerce the save format."""
+        """Resolve the cache dir, enforce PEFT constraints, and coerce the save format/mode."""
         if self.model_cache_dir is None:
             self.model_cache_dir = hf_constants.HF_HUB_CACHE
 
-        # PEFT checkpointing is not supported for `torch_save`; fall back to the
-        # safetensors default (keeping ``checkpoint_dir``).
+        # PEFT checkpointing is not supported for `torch_save`; flip only the two
+        # incompatible fields (format -> safetensors, save_consolidated -> FINAL).
+        # All other user-set fields (is_async, staging_dir, v4_compatible,
+        # single_rank_consolidation, ...) are preserved.
         if self.is_peft and self.model_save_format == "torch_save":
             logging.warning(
                 "PEFT checkpointing is not supported for `torch_save` format; "
-                "falling back to `safetensors` (preserving `checkpoint_dir`)."
+                "falling back to `safetensors` (all other checkpoint settings are preserved)."
             )
             self.model_save_format = "safetensors"
-            self.save_consolidated = True
+            self.save_consolidated = SaveConsolidatedMode.FINAL
 
         # Convert a raw string such as "safetensors" into the right Enum.
         formats = [v.value for v in SerializationFormat]
@@ -103,12 +135,16 @@ class CheckpointingConfig:
             f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}"
         )
         self.model_save_format = SerializationFormat[self.model_save_format.upper()]
-        if self.save_consolidated or False:
+
+        # Normalize legacy bools and string aliases to a consolidated export mode.
+        self.save_consolidated = _normalize_save_consolidated(self.save_consolidated)
+        if self.save_consolidated != SaveConsolidatedMode.FALSE and not self.is_peft:
             if not self.v4_compatible:
                 logging.warning(
-                    "save_consolidated=True but v4_compatible=False; "
+                    "save_consolidated=%s but v4_compatible=False; "
                     "checkpoint assets may be not compatible with transformers v4; "
-                    "[experimental] set --checkpoint.v4_compatible=True to enable"
+                    "[experimental] set --checkpoint.v4_compatible=True to enable",
+                    self.save_consolidated.value,
                 )
             else:
                 logging.warning("[experimental] v4_compatible=True enables transformers v4 compatibility")
@@ -145,4 +181,4 @@ class CheckpointingConfig:
         return Checkpointer(config=self, dp_rank=dp_rank, tp_rank=tp_rank, pp_rank=pp_rank, moe_mesh=moe_mesh)
 
 
-__all__ = ["CheckpointingConfig"]
+__all__ = ["CheckpointingConfig", "SaveConsolidatedMode"]

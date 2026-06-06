@@ -43,7 +43,7 @@ from collections.abc import Callable, Mapping
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
-from nemo_automodel.components.loggers.loggers import MLflowConfig, WandbConfig
+from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.datasets.loader import DataloaderConfig
     from nemo_automodel.components.loss.loss import LossConfig
+    from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
 
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
@@ -94,11 +95,7 @@ def _callable_and_kwargs(cfg: Any) -> tuple[Callable[..., Any], dict[str, Any]]:
 
 
 def _target_kwargs(node: Any) -> tuple[Any, dict[str, Any]]:
-    """``(target, kwargs)`` for a loader ``make_*`` resolver from a config node.
-
-    ``None`` → ``(None, {})``; a bare string (a ``make_*`` registry key or dotted path) → ``(node, {})``;
-    otherwise a ``_target_`` section resolved via :func:`_callable_and_kwargs`.
-    """
+    """``(target, kwargs)`` for a loader ``make_*`` resolver from a config node."""
     if node is None:
         return None, {}
     if isinstance(node, str):
@@ -136,12 +133,17 @@ class RecipeConfig:
     @cached_property
     def wandb(self) -> WandbConfig | None:
         node = self._raw.get("wandb", None)
-        return WandbConfig(**_section_kwargs(node)) if node else None
+        return WandbConfig.from_kwargs(**_section_kwargs(node)) if node else None
 
     @cached_property
     def mlflow(self) -> MLflowConfig | None:
         node = self._raw.get("mlflow", None)
         return MLflowConfig(**_section_kwargs(node)) if node else None
+
+    @cached_property
+    def comet(self) -> CometConfig | None:
+        node = self._raw.get("comet", None)
+        return CometConfig(**_section_kwargs(node)) if node else None
 
     @cached_property
     def step_scheduler(self) -> StepSchedulerConfig:
@@ -179,13 +181,9 @@ class RecipeConfig:
         if node is None:
             return None
         target, ds_kwargs = _callable_and_kwargs(node)
-        ds_kwargs.pop("tokenizer", None)  # tokenizer is a runtime build() arg, not a construct kwarg
-        # Resolve dataset._target_ to a typed <Name>Config (or a back-compat shim for a pre-Config target).
+        ds_kwargs.pop("tokenizer", None)
         dataset_config = make_dataset_config(target, ds_kwargs)
         dl = _as_dict(self._raw.get("dataloader", None))
-        # collate_fn resolves to a callable via a loader-side ``make_*`` registry resolver (registry key /
-        # dotted path / callable). Sampling is not configurable here — every dataset (Megatron included) uses
-        # the dataloader's default distributed / length-grouped sampler.
         collate = make_collate_fn(*_target_kwargs(dl.pop("collate_fn", None)))
         ps = _as_dict(self._raw.get("packed_sequence", None))
         packing = None
@@ -202,7 +200,7 @@ class RecipeConfig:
 
     @cached_property
     def validation_dataloaders(self) -> dict[str, "DataloaderConfig"]:
-        """One :class:`DataloaderConfig` per ``validation_dataset*`` block (mirrors :meth:`dataloader`)."""
+        """One :class:`DataloaderConfig` per ``validation_dataset*`` block."""
         from nemo_automodel.components.datasets.loader import (
             build_dataloader_config,
             make_collate_fn,
@@ -221,7 +219,7 @@ class RecipeConfig:
         packing = None
         if ps.get("packed_sequence_size", 0) > 0:
             packing = make_packing_config(ps.pop("packing_strategy", "thd"), ps)
-        out: dict[str, Any] = {}
+        out: dict[str, DataloaderConfig] = {}
         for key in filter(lambda k: k.startswith("validation_dataset"), self._raw.to_dict().keys()):
             node = self._raw.get(key, None)
             if node is None:
@@ -250,6 +248,16 @@ class RecipeConfig:
             return None
         factory, kwargs = _callable_and_kwargs(node)
         return build_loss_config(factory, **kwargs)
+
+    @cached_property
+    def mtp(self) -> "MTPLossConfig":
+        # MTP loss params are model-driven (scaling_factor comes from the model
+        # output / get_mtp_loss_scaling_factor; ignore_index is fixed) and are not
+        # exposed via YAML.  This typed accessor just lets recipes build MTP through
+        # the typed-config boundary like the other sections.
+        from nemo_automodel.components.loss.mtp import MTPLossConfig
+
+        return MTPLossConfig()
 
     @cached_property
     def checkpoint(self) -> "CheckpointingConfig":

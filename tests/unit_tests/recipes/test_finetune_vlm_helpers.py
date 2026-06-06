@@ -45,9 +45,7 @@ from nemo_automodel.recipes.vlm.finetune import (
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
     """Resolve a YAML optimizer block and build it (mirrors ``RecipeConfig.optimizer.build``)."""
-    return build_optimizer_config(*_callable_and_kwargs(cfg_opt)).build(
-        model, distributed_config=distributed_config, device_mesh=device_mesh
-    )
+    return build_optimizer_config(*_callable_and_kwargs(cfg_opt)).build(model, device_mesh=device_mesh)
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
@@ -325,6 +323,77 @@ def test_build_model_no_moe_config_when_cfg_moe_is_none():
 
     assert "moe_config" not in captured_kwargs
     assert "activation_checkpointing" not in captured_kwargs
+
+
+def test_build_model_passes_quantization_config():
+    """cfg_quantization is converted via create_bnb_config and forwarded as quantization_config."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+    cfg_quantization = SimpleNamespace(load_in_4bit=True)
+    sentinel_bnb = object()
+
+    with (
+        patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True),
+        patch(
+            "nemo_automodel.components.quantization.qlora.create_bnb_config",
+            return_value=sentinel_bnb,
+        ) as mock_create,
+    ):
+        build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=123,
+            cfg_quantization=cfg_quantization,
+        )
+
+    # Wiring: cfg_quantization -> create_bnb_config(...) -> kwargs["quantization_config"]
+    mock_create.assert_called_once_with(cfg_quantization)
+    assert captured_kwargs.get("quantization_config") is sentinel_bnb
+
+
+def test_build_model_no_quantization_config_when_none():
+    """No quantization_config kwarg when cfg_quantization is None (the default)."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
+        build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=123,
+        )
+
+    assert "quantization_config" not in captured_kwargs
 
 
 # -----------------------------------------------------------------------------
@@ -1158,6 +1227,7 @@ class TestBuildLRScheduler:
         step_scheduler.num_epochs = 10
         step_scheduler.dataloader = mock_dataloader
         step_scheduler.grad_acc_steps = 1
+        step_scheduler.epoch_len = 100  # ceil(len(dataloader)=100 / grad_acc=1)
         step_scheduler.max_steps = None
 
         cfg = MagicMock()
@@ -1187,6 +1257,7 @@ class TestBuildLRScheduler:
         step_scheduler.num_epochs = 5
         step_scheduler.dataloader = mock_dataloader
         step_scheduler.grad_acc_steps = 2
+        step_scheduler.epoch_len = 50  # ceil(len(dataloader)=100 / grad_acc=2)
         step_scheduler.max_steps = None
 
         cfg = MagicMock()
@@ -1212,6 +1283,7 @@ class TestBuildLRScheduler:
         step_scheduler.num_epochs = 100  # Would be 100000 steps
         step_scheduler.dataloader = mock_dataloader
         step_scheduler.grad_acc_steps = 1
+        step_scheduler.epoch_len = 1000  # ceil(len(dataloader)=1000 / grad_acc=1)
         step_scheduler.max_steps = 500  # Limit to 500
 
         cfg = MagicMock()
@@ -1246,7 +1318,7 @@ class TestBuildCheckpointConfig:
         assert config.model_save_format.value == "safetensors"
         assert config.model_repo_id == "org/model"
         assert config.model_cache_dir == "/tmp/cache"
-        assert config.save_consolidated is True
+        assert config.save_consolidated.value == "final"
         assert config.is_peft is False
 
     def test_build_checkpoint_config_with_custom_config(self):
@@ -1266,7 +1338,7 @@ class TestBuildCheckpointConfig:
         )
 
         assert config.checkpoint_dir == "/custom/ckpt/"
-        assert config.save_consolidated is False
+        assert config.save_consolidated.value == "false"
         assert config.is_peft is True
 
     def test_build_checkpoint_config_warns_on_peft_with_torch_save(self, caplog):
@@ -1293,8 +1365,9 @@ class TestBuildCheckpointConfig:
         assert config.model_save_format == SerializationFormat.SAFETENSORS
         # checkpoint_dir is preserved from the user config
         assert config.checkpoint_dir == "/user/ckpt/"
-        # save_consolidated is forced back to the safetensors default
-        assert config.save_consolidated is True
+        # other user-provided torch_save options are discarded; save_consolidated falls back to the default "final"
+        assert config.save_consolidated.value == "final"
+        assert config.is_async is False
 
     def test_build_checkpoint_config_uses_hf_hub_cache_when_cache_dir_none(self):
         """Test that HF_HUB_CACHE is used when cache_dir is None."""
@@ -2032,29 +2105,6 @@ class TestForwardBackwardStepPP:
 class TestFinetuneRecipeSetup:
     """Tests for FinetuneRecipeForVLM.setup() method components."""
 
-    def test_setup_initializes_dist_env(self, monkeypatch):
-        """Test that setup initializes distributed environment."""
-        from nemo_automodel.recipes.vlm.finetune import build_distributed
-
-        mock_dist_info = SimpleNamespace(
-            rank=0,
-            world_size=1,
-            local_rank=0,
-            is_main=True,
-            device=torch.device("cpu"),
-        )
-
-        monkeypatch.setattr(
-            "nemo_automodel.components.distributed.init_utils.initialize_distributed",
-            lambda backend, timeout_minutes: mock_dist_info,
-        )
-
-        dist_env = build_distributed({"backend": "gloo", "timeout_minutes": 5})
-
-        assert dist_env.rank == 0
-        assert dist_env.world_size == 1
-        assert dist_env.is_main is True
-
     def test_setup_pp_config_validation(self):
         """Test PP configuration validation in setup."""
         # Create minimal config that would fail PP validation
@@ -2499,8 +2549,8 @@ def test_vlm_build_model_accepts_multimodal_lm_entry_points(entry_point):
 def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     """Patch heavy dependencies so FinetuneRecipeForVLM.setup() runs lightly."""
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.build_distributed",
-        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+        "nemo_automodel.recipes.vlm.finetune.initialize_distributed",
+        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.setup_logging", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.apply_cache_compatibility_patches", lambda: None)

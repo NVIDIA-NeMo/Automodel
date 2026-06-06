@@ -16,28 +16,17 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
 from torch.optim import Optimizer
 
-if TYPE_CHECKING:
-    from nemo_automodel.components.optim.optimizer import OptimizerConfig
-
 _WARNED_CONTEXTS: set[str] = set()
-_TORCH_ADAM_TARGETS = {
-    "torch.optim.Adam",
-    "torch.optim.AdamW",
-    "torch.optim.adam.Adam",
-    "torch.optim.adamw.AdamW",
-}
 
 
 def warn_if_torch_adam_with_bf16_params(
     *,
     optimizer: Optimizer | Iterable[Optimizer] | None = None,
-    optimizer_cfg: OptimizerConfig | None = None,
     parameters: Iterable[torch.nn.Parameter] | None = None,
     is_peft: bool = False,
     context: str = "recipe",
@@ -47,7 +36,7 @@ def warn_if_torch_adam_with_bf16_params(
     if is_peft or not _is_rank_zero() or context in _WARNED_CONTEXTS:
         return
 
-    if not (_is_torch_adam_optimizer(optimizer) or _is_torch_adam_config(optimizer_cfg)):
+    if not _is_torch_adam_optimizer(optimizer):
         return
 
     params = parameters if parameters is not None else _iter_optimizer_params(optimizer)
@@ -74,31 +63,6 @@ def _is_torch_adam_optimizer(optimizer: Optimizer | Iterable[Optimizer] | None) 
         return False
     optimizers = optimizer if isinstance(optimizer, Iterable) else [optimizer]
     return any(isinstance(opt, (torch.optim.Adam, torch.optim.AdamW)) for opt in optimizers)
-
-
-def _is_torch_adam_config(optimizer_cfg: OptimizerConfig | None) -> bool:
-    if optimizer_cfg is None:
-        return False
-
-    # ``OptimizerFromFactoryConfig`` wraps the optimizer class on ``.factory``;
-    # the typed ``AdamConfig``/``AdamWConfig`` build ``torch.optim.Adam``/``AdamW``.
-    factory = getattr(optimizer_cfg, "factory", None)
-    if factory is not None and _is_torch_adam_target(factory):
-        return True
-
-    from nemo_automodel.components.optim.optimizer import AdamConfig, AdamWConfig
-
-    return isinstance(optimizer_cfg, (AdamConfig, AdamWConfig))
-
-
-def _is_torch_adam_target(target: Any) -> bool:
-    if isinstance(target, str):
-        return target in _TORCH_ADAM_TARGETS
-    if target in (torch.optim.Adam, torch.optim.AdamW):
-        return True
-    module = getattr(target, "__module__", "")
-    qualname = getattr(target, "__qualname__", "")
-    return f"{module}.{qualname}" in _TORCH_ADAM_TARGETS
 
 
 def _iter_optimizer_params(optimizer: Optimizer | Iterable[Optimizer] | None) -> Iterable[torch.nn.Parameter]:

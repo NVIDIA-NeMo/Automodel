@@ -39,21 +39,22 @@ Megatron-FSDP sharding).  Subclasses only implement the small
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 
-from nemo_automodel.components.optim.dion import build_dion_optimizer
+from nemo_automodel.components.optim.dion import build_dion_optimizer, is_dion_optimizer
+from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
-    from nemo_automodel.components.distributed.config import DistributedConfig
     from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 logger = logging.getLogger(__name__)
@@ -73,44 +74,46 @@ class OptimizerConfig:
     Subclasses expose their full field surface and implement
     :meth:`_build_optimizer`, the per-part hook that constructs a single
     optimizer from a list of parameters.  :meth:`build` owns the shared
-    orchestration (per-part loop, TP ``foreach``, Megatron-FSDP sharding) and is
-    rarely overridden — only by configs whose construction does not fit the
-    ``parameters -> optimizer`` shape (e.g. :class:`MuonConfig`).
+    orchestration (per-part loop, TP ``foreach``) and is rarely overridden —
+    only by configs whose construction does not fit the
+    ``parameters -> optimizer`` shape (e.g. :class:`MuonConfig`).  Megatron-FSDP
+    optimizer sharding is no longer applied here; the recipe layer re-applies it
+    via ``shard_optimizers_for_megatron_fsdp(...)``.
     """
+
+    # Whether this optimizer can be sharded for Megatron-FSDP. The recipe layer
+    # reads this to decide whether to shard the built optimizers.
+    supports_megatron_fsdp_sharding: ClassVar[bool] = True
 
     def build(
         self,
         model: torch.nn.Module,
         *,
-        distributed_config: DistributedConfig | None = None,
         device_mesh: DeviceMesh | None = None,
+        is_peft: bool = False,
     ) -> list[torch.optim.Optimizer]:
         """Build one optimizer per ``model.parts`` (or ``[model]``).
 
-        Applies the shared per-part concerns (TP ``foreach`` disabling,
-        Megatron-FSDP optimizer sharding) and delegates the actual optimizer
-        instantiation to :meth:`_build_optimizer`.
+        Applies the shared per-part concern (TP ``foreach`` disabling) and
+        delegates the actual optimizer instantiation to :meth:`_build_optimizer`.
+        Megatron-FSDP optimizer sharding is applied by the recipe layer, not here.
 
         Args:
             model: Model (or model with ``.parts``) to optimize.
-            distributed_config: Distributed strategy config; triggers
-                Megatron-FSDP optimizer sharding when it is a
-                :class:`MegatronFSDPConfig`.
             device_mesh: Device mesh used for tensor/data parallelism.
+            is_peft: Whether the model is being trained with PEFT (suppresses the
+                bf16 torch-Adam precision warning).
 
         Returns:
             One optimizer per model part.
         """
-        from nemo_automodel.components.distributed.megatron_fsdp import maybe_shard_optimizer
-
         foreach = _foreach_for_mesh(device_mesh)
         optimizers: list[torch.optim.Optimizer] = []
         for part in getattr(model, "parts", [model]):
             trainable_params = [p for p in part.parameters() if p.requires_grad]
             assert len(trainable_params) > 0, "trainable_params cannot be empty"
-            opt = self._build_optimizer(trainable_params, foreach=foreach)
-            opt = maybe_shard_optimizer(part, opt, distributed_config)
-            optimizers.append(opt)
+            optimizers.append(self._build_optimizer(trainable_params, foreach=foreach))
+        warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
 
     def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
@@ -195,142 +198,120 @@ class FlashAdamWConfig(OptimizerConfig):
         return FlashAdamW(params, **asdict(self))
 
 
-@dataclass
-class MuonConfig(OptimizerConfig):
-    """``dion.Muon`` — matrix-aware update for 2D+ params, scalar fallback for 1D.
+# Fields consumed by build_dion_optimizer for parameter grouping; these are NOT dion
+# constructor kwargs, so they are stripped from asdict(self) before instantiating the optimizer.
+_DION_GROUPING_FIELDS = frozenset({"scalar_opt", "scalar_betas", "scalar_eps", "scalar_lr", "embed_lr", "lm_head_lr"})
 
-    Dion needs the model (for parameter grouping) and the device mesh rather than
-    a flat parameter list, so :meth:`build` is overridden to run Dion's parameter
-    grouping per part.  Dion is incompatible with Megatron-FSDP optimizer
-    sharding, which :meth:`build` enforces.
+
+@dataclass
+class _DionConfigBase(OptimizerConfig):
+    """Shared base for the dion-family typed configs (Muon / NorMuon / Dion2 / Dion).
+
+    Dion optimizers need Dion's parameter grouping (built from the model) and the
+    device mesh rather than a flat parameter list, so :meth:`build` runs grouping
+    per model part.  The grouping-only fields below (``scalar_*`` / ``*_lr``) are
+    consumed by :func:`build_dion_optimizer` and stripped from the constructor
+    kwargs.  Dion is incompatible with Megatron-FSDP optimizer sharding; this is
+    enforced at the recipe layer (``supports_megatron_fsdp_sharding = False``
+    drives an ``allow=False`` sharding call that asserts rather than silently
+    returning an unsharded optimizer).
     """
+
+    # Dion optimizers are incompatible with Megatron-FSDP optimizer sharding.
+    supports_megatron_fsdp_sharding: ClassVar[bool] = False
 
     lr: float = 5e-4
     weight_decay: float = 0.0
-    mu: float = 0.95
-    betas: tuple[float, float] = (0.9, 0.95)
-    epsilon: float = 1e-8
-    adjust_lr: str = "spectral_norm"
     scalar_opt: str = "adamw"
     scalar_betas: tuple[float, float] = (0.9, 0.999)
     scalar_eps: float = 1e-8
+    scalar_lr: float | None = None
+    embed_lr: float | None = None
+    lm_head_lr: float | None = None
+
+    # Name of the dion constructor argument that receives the resolved device mesh.
+    _mesh_kwarg: ClassVar[str] = "distributed_mesh"
+
+    def _make_optimizer(self, param_groups: Any, ctor_kwargs: dict[str, Any]) -> torch.optim.Optimizer:
+        """Instantiate the concrete dion optimizer from grouped params + filtered kwargs."""
+        raise NotImplementedError
 
     def build(
         self,
         model: torch.nn.Module,
         *,
-        distributed_config: DistributedConfig | None = None,
         device_mesh: DeviceMesh | None = None,
+        is_peft: bool = False,
     ) -> list[torch.optim.Optimizer]:
-        from dion import Muon
-
         optimizers: list[torch.optim.Optimizer] = []
         for part in getattr(model, "parts", [model]):
-            param_groups, mesh_kwargs = build_dion_optimizer(self, part, device_mesh=device_mesh)
-            optimizers.append(
-                Muon(
-                    param_groups,
-                    **asdict(self),
-                    **mesh_kwargs,
-                )
+            param_groups, mesh_kwargs = build_dion_optimizer(
+                self, part, device_mesh=device_mesh, mesh_kwarg=self._mesh_kwarg
             )
+            ctor_kwargs = {k: v for k, v in asdict(self).items() if k not in _DION_GROUPING_FIELDS}
+            opt = self._make_optimizer(param_groups, {**ctor_kwargs, **mesh_kwargs})
+            optimizers.append(opt)
         return optimizers
 
 
 @dataclass
-class NorMuonConfig(OptimizerConfig):
-    """``dion.NorMuon`` — Muon variant with neuron-wise normalization.
+class MuonConfig(_DionConfigBase):
+    """``dion.Muon`` — matrix-aware update for 2D+ params, scalar fallback for 1D."""
 
-    Like :class:`MuonConfig`, it needs the model (for parameter grouping) and the
-    device mesh, so :meth:`build` runs Dion's parameter grouping per part.
-    """
+    mu: float = 0.95
+    betas: tuple[float, float] = (0.9, 0.95)
+    epsilon: float = 1e-8
+    adjust_lr: str = "spectral_norm"
+    nesterov: bool = False
+    flatten: bool = False
+    use_triton: bool = False
 
-    lr: float = 5e-4
-    weight_decay: float = 0.0
+    def _make_optimizer(self, param_groups, ctor_kwargs):
+        from dion import Muon
+
+        return Muon(param_groups, **ctor_kwargs)
+
+
+@dataclass
+class NorMuonConfig(_DionConfigBase):
+    """``dion.NorMuon`` — Muon variant with neuron-wise normalization."""
+
     mu: float = 0.95
     muon_beta2: float = 0.95
     betas: tuple[float, float] = (0.9, 0.95)
     epsilon: float = 1e-8
     adjust_lr: str = "spectral_norm"
-    scalar_opt: str = "adamw"
-    scalar_betas: tuple[float, float] = (0.9, 0.999)
-    scalar_eps: float = 1e-8
 
-    def build(
-        self,
-        model: torch.nn.Module,
-        *,
-        distributed_config: DistributedConfig | None = None,
-        device_mesh: DeviceMesh | None = None,
-    ) -> list[torch.optim.Optimizer]:
+    def _make_optimizer(self, param_groups, ctor_kwargs):
         from dion import NorMuon
 
-        optimizers: list[torch.optim.Optimizer] = []
-        for part in getattr(model, "parts", [model]):
-            param_groups, mesh_kwargs = build_dion_optimizer(self, part, device_mesh=device_mesh)
-            optimizers.append(
-                NorMuon(
-                    param_groups,
-                    **asdict(self),
-                    **mesh_kwargs,
-                )
-            )
-        return optimizers
+        return NorMuon(param_groups, **ctor_kwargs)
 
 
 @dataclass
-class Dion2Config(OptimizerConfig):
-    """``dion.Dion2`` — recommended successor to the legacy Dion optimizer.
+class Dion2Config(_DionConfigBase):
+    """``dion.Dion2`` — recommended successor to the legacy Dion optimizer."""
 
-    Like :class:`MuonConfig`, it needs the model (for parameter grouping) and the
-    device mesh, so :meth:`build` runs Dion's parameter grouping per part.
-    """
-
-    lr: float = 5e-4
-    weight_decay: float = 0.0
     fraction: float = 0.25
     ef_decay: float = 0.95
     betas: tuple[float, float] = (0.9, 0.95)
     epsilon: float = 1e-8
     adjust_lr: str = "spectral_norm"
-    scalar_opt: str = "adamw"
-    scalar_betas: tuple[float, float] = (0.9, 0.999)
-    scalar_eps: float = 1e-8
 
-    def build(
-        self,
-        model: torch.nn.Module,
-        *,
-        distributed_config: DistributedConfig | None = None,
-        device_mesh: DeviceMesh | None = None,
-    ) -> list[torch.optim.Optimizer]:
+    def _make_optimizer(self, param_groups, ctor_kwargs):
         from dion import Dion2
 
-        optimizers: list[torch.optim.Optimizer] = []
-        for part in getattr(model, "parts", [model]):
-            param_groups, mesh_kwargs = build_dion_optimizer(self, part, device_mesh=device_mesh)
-            optimizers.append(
-                Dion2(
-                    param_groups,
-                    **asdict(self),
-                    **mesh_kwargs,
-                )
-            )
-        return optimizers
+        return Dion2(param_groups, **ctor_kwargs)
 
 
 @dataclass
-class DionConfig(OptimizerConfig):
+class DionConfig(_DionConfigBase):
     """``dion.Dion`` — legacy low-rank optimizer (prefer :class:`Dion2Config`).
 
-    Like :class:`MuonConfig`, it needs the model (for parameter grouping) and the
-    device mesh, so :meth:`build` runs Dion's parameter grouping per part.  Legacy
-    Dion takes separate replicate/outer/inner shard meshes; for FSDP2 the resolved
-    1-D shard submesh maps to ``outer_shard_mesh``.
+    Legacy Dion takes separate replicate/outer/inner shard meshes; for FSDP2 the
+    resolved 1-D shard submesh maps to ``outer_shard_mesh``.
     """
 
-    lr: float = 5e-4
-    weight_decay: float = 0.0
     mu: float = 0.95
     betas: tuple[float, float] = (0.9, 0.95)
     epsilon: float = 1e-8
@@ -338,34 +319,13 @@ class DionConfig(OptimizerConfig):
     rank_multiple_of: int = 1
     power_iters: int = 1
     qr_method: str = "rcqr"
-    scalar_opt: str = "adamw"
-    scalar_betas: tuple[float, float] = (0.9, 0.999)
-    scalar_eps: float = 1e-8
 
-    def build(
-        self,
-        model: torch.nn.Module,
-        *,
-        distributed_config: DistributedConfig | None = None,
-        device_mesh: DeviceMesh | None = None,
-    ) -> list[torch.optim.Optimizer]:
+    _mesh_kwarg: ClassVar[str] = "outer_shard_mesh"
+
+    def _make_optimizer(self, param_groups, ctor_kwargs):
         from dion import Dion
 
-        optimizers: list[torch.optim.Optimizer] = []
-        for part in getattr(model, "parts", [model]):
-            # Legacy Dion takes separate replicate/outer/inner shard meshes; for
-            # FSDP2 the resolved 1-D shard submesh maps to ``outer_shard_mesh``.
-            param_groups, mesh_kwargs = build_dion_optimizer(
-                self, part, device_mesh=device_mesh, mesh_kwarg="outer_shard_mesh"
-            )
-            optimizers.append(
-                Dion(
-                    param_groups,
-                    **asdict(self),
-                    **mesh_kwargs,
-                )
-            )
-        return optimizers
+        return Dion(param_groups, **ctor_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -395,11 +355,9 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         self,
         model: torch.nn.Module,
         *,
-        distributed_config: DistributedConfig | None = None,
         device_mesh: DeviceMesh | None = None,
+        is_peft: bool = False,
     ) -> list[torch.optim.Optimizer]:
-        from nemo_automodel.components.distributed.megatron_fsdp import maybe_shard_optimizer
-
         assert callable(self.factory), "OptimizerFromFactoryConfig.factory must be a callable"
         foreach = _foreach_for_mesh(device_mesh)
 
@@ -408,16 +366,18 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             val = kwargs.get(attr, None)
             if isinstance(val, str):
                 kwargs[attr] = dtype_from_str(val)
-        if foreach is not None:
-            kwargs.setdefault("foreach", foreach)
+        # Only inject ``foreach`` for factories that actually accept it. The TP>1 path sets
+        # ``foreach=False`` via ``_foreach_for_mesh``; passing it to a factory that does not take
+        # ``foreach`` (e.g. TE ``FusedAdam``) would raise.  Honour an explicit user-provided value.
+        if foreach is not None and "foreach" not in kwargs and _factory_accepts_foreach(self.factory):
+            kwargs["foreach"] = foreach
 
         optimizers: list[torch.optim.Optimizer] = []
         for part in getattr(model, "parts", [model]):
             trainable_params = [p for p in part.parameters() if p.requires_grad]
             assert len(trainable_params) > 0, "trainable_params cannot be empty"
-            opt = self.factory(params=trainable_params, **kwargs)
-            opt = maybe_shard_optimizer(part, opt, distributed_config, allow=True)
-            optimizers.append(opt)
+            optimizers.append(self.factory(params=trainable_params, **kwargs))
+        warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
 
 
@@ -463,12 +423,25 @@ class LRSchedulerConfig:
         Returns:
             One :class:`OptimizerParamScheduler` per optimizer.
         """
-        total_steps = (step_scheduler.num_epochs * len(step_scheduler.dataloader)) // step_scheduler.grad_acc_steps
-        if step_scheduler.max_steps is not None:
-            total_steps = min(total_steps, step_scheduler.max_steps)
+        # ``epoch_len`` is already expressed in optimizer steps (StepScheduler computes it as
+        # ``ceil(len(dataloader) / grad_acc_steps)``) and is ``None`` for iterable/streaming
+        # dataloaders, where ``len()`` is undefined.  Never call ``len(dataloader)`` here.
+        if step_scheduler.epoch_len is not None:
+            total_steps = step_scheduler.num_epochs * step_scheduler.epoch_len
+            if step_scheduler.max_steps is not None:
+                total_steps = min(total_steps, step_scheduler.max_steps)
+        elif step_scheduler.max_steps is not None:
+            total_steps = step_scheduler.max_steps
+        else:
+            raise ValueError(
+                "Cannot infer total steps for an iterable/streaming dataset; set step_scheduler.max_steps."
+            )
         lr_decay_steps = self.lr_decay_steps if self.lr_decay_steps is not None else total_steps
         wd_incr_steps = self.wd_incr_steps if self.wd_incr_steps is not None else total_steps
-        optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
+        if isinstance(optimizer, torch.optim.Optimizer):
+            optimizers = [optimizer]
+        else:
+            optimizers = list(optimizer)
         schedulers = []
         for opt in optimizers:
             base_lr = opt.param_groups[0]["lr"]
@@ -510,9 +483,30 @@ class LRSchedulerConfig:
 
 def _foreach_for_mesh(device_mesh: DeviceMesh | None) -> bool | None:
     """Return ``False`` when TP > 1 (foreach is unsupported), else ``None``."""
-    if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
+    if (
+        device_mesh is not None
+        and device_mesh.mesh_dim_names is not None
+        and "tp" in device_mesh.mesh_dim_names
+        and device_mesh["tp"].size() > 1
+    ):
         return False
     return None
+
+
+def _factory_accepts_foreach(factory: Callable[..., Any]) -> bool:
+    """Return ``True`` if ``factory`` accepts a ``foreach`` kwarg.
+
+    ``torch.optim`` optimizers take ``foreach``; external factories such as TE
+    ``FusedAdam`` do not, so passing it would raise ``TypeError``.
+    """
+    try:
+        sig = inspect.signature(factory)
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters
+    if "foreach" in params:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +523,15 @@ OPTIMIZER_CONFIG_REGISTRY: dict[str, type[OptimizerConfig]] = {
     "normuon": NorMuonConfig,
     "dion": DionConfig,
     "dion2": Dion2Config,
+}
+
+# Maps a resolved dion optimizer class name (e.g. from YAML ``_target_: dion.Muon``) to the
+# typed config that performs Dion's parameter grouping.  Keyed by ``cls.__name__``.
+_DION_CONFIG_FOR: dict[str, type[OptimizerConfig]] = {
+    "Muon": MuonConfig,
+    "NorMuon": NorMuonConfig,
+    "Dion2": Dion2Config,
+    "Dion": DionConfig,
 }
 
 
@@ -590,6 +593,17 @@ def build_optimizer_config(
     kwargs = dict(kwargs or {})
     if isinstance(target, type) and issubclass(target, OptimizerConfig):
         return target(**kwargs)
+    # Dion-family optimizers need parameter grouping; route a resolved dion class
+    # (e.g. YAML ``_target_: dion.Muon``) to its typed config rather than the flat-params
+    # factory escape hatch, which would lose grouping and leak grouping-only kwargs.
+    if is_dion_optimizer(target):
+        dion_config = _DION_CONFIG_FOR.get(getattr(target, "__name__", ""))
+        if dion_config is None:
+            raise TypeError(
+                f"Unsupported dion optimizer {getattr(target, '__name__', target)!r}; "
+                f"supported: {sorted(_DION_CONFIG_FOR)}."
+            )
+        return dion_config(**kwargs)
     if callable(target):
         return OptimizerFromFactoryConfig(factory=target, kwargs=kwargs)
     raise TypeError(
@@ -601,14 +615,14 @@ def build_optimizer(
     model: torch.nn.Module,
     config: OptimizerConfig | tuple[str, dict[str, Any]],
     *,
-    distributed_config: DistributedConfig | None = None,
     device_mesh: DeviceMesh | None = None,
 ) -> list[torch.optim.Optimizer]:
     """Build one optimizer per ``model.parts`` (or ``[model]``).
 
     Thin dispatcher: it normalizes ``config`` to an :class:`OptimizerConfig` and
-    returns ``config.build(model, ...)``.  All per-part concerns (TP ``foreach``,
-    Dion param grouping, Megatron-FSDP sharding) live on the config.
+    returns ``config.build(model, ...)``.  Per-part concerns (TP ``foreach``,
+    Dion param grouping) live on the config.  Megatron-FSDP optimizer sharding is
+    re-applied separately by the recipe layer.
 
     ``config`` is one of:
 
@@ -625,8 +639,6 @@ def build_optimizer(
         model: Model (or model with ``.parts``) to optimize.
         config: An :class:`OptimizerConfig` instance or a ``(name_or_path,
             kwargs)`` tuple.
-        distributed_config: Distributed strategy config; triggers Megatron-FSDP
-            optimizer sharding when it is a :class:`MegatronFSDPConfig`.
         device_mesh: Device mesh used for tensor/data parallelism.
 
     Returns:
@@ -650,7 +662,7 @@ def build_optimizer(
             "build_optimizer expects an OptimizerConfig instance or a (name_or_path, kwargs) tuple, "
             f"got {type(config).__name__}."
         )
-    return optimizer_config.build(model, distributed_config=distributed_config, device_mesh=device_mesh)
+    return optimizer_config.build(model, device_mesh=device_mesh)
 
 
 __all__ = [

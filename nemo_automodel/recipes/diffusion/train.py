@@ -31,12 +31,12 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.distributed.init_utils import build_distributed
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
-from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -453,6 +453,8 @@ def build_model_and_optimizer(
                 )
             dp_size = world_size // denom
 
+        reduce_dtype = dtype_from_str(fsdp_cfg.get("reduce_dtype", None), default=torch.float32)
+
         manager_args: Dict[str, Any] = {
             "_manager_type": "fsdp2",
             "dp_size": dp_size,
@@ -475,7 +477,7 @@ def build_model_and_optimizer(
             "fsdp2_forward_prefetch_depth": fsdp_cfg.get("fsdp2_forward_prefetch_depth", 1),
             "mp_policy": MixedPrecisionPolicy(
                 param_dtype=param_dtype,
-                reduce_dtype=torch.float32,
+                reduce_dtype=reduce_dtype,
                 output_dtype=compute_dtype,
             ),
         }
@@ -671,7 +673,10 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     def setup(self):
-        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        self.dist_env = initialize_distributed(
+            backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
+            timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
+        )
         setup_logging()
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
@@ -697,6 +702,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         self.fuse_qkv_projections = bool(self.cfg.get("model.fuse_qkv_projections", False))
         self.compact_fused_qkv_projections = bool(self.cfg.get("model.compact_fused_qkv_projections", False))
+        self.optimize_hunyuan_flash_varlen_mask = bool(self.cfg.get("model.optimize_hunyuan_flash_varlen_mask", False))
         if self.transformer_engine_fp8:
             self.transformer_engine_linear = True
         if self.compact_fused_qkv_projections and not self.fuse_qkv_projections:
@@ -747,6 +753,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info("[INFO] Fuse QKV projections: %s", self.fuse_qkv_projections)
         logging.info("[INFO] Compact fused QKV projections: %s", self.compact_fused_qkv_projections)
+        logging.info("[INFO] Optimize Hunyuan flash-varlen mask: %s", self.optimize_hunyuan_flash_varlen_mask)
         logging.info("[INFO] Precision: model_dtype=%s, compute_dtype=%s", self.model_dtype, self.compute_dtype)
         logging.info(
             "[INFO] Performance config: check_loss=%s, grad_clip_foreach=%s",
@@ -791,6 +798,15 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.adapter_kwargs = (
             adapter_kwargs.to_dict() if hasattr(adapter_kwargs, "to_dict") else dict(adapter_kwargs or {})
         )
+        if self.optimize_hunyuan_flash_varlen_mask:
+            if self.adapter_type != "hunyuan":
+                raise ValueError(
+                    "model.optimize_hunyuan_flash_varlen_mask=true requires flow_matching.adapter_type=hunyuan"
+                )
+            if self.attention_backend != "flash_varlen":
+                raise ValueError(
+                    "model.optimize_hunyuan_flash_varlen_mask=true requires model.attention_backend=flash_varlen"
+                )
 
         logging.info("[INFO] Flow Matching V2 Pipeline")
         logging.info(f"[INFO]   - Adapter type: {self.adapter_type}")
@@ -850,6 +866,15 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
 
         self.model = self.pipe.transformer
+        if self.optimize_hunyuan_flash_varlen_mask:
+            from nemo_automodel.components.flow_matching.adapters.hunyuan import (
+                enable_hunyuan_flash_varlen_mask_optimization,
+            )
+
+            if not enable_hunyuan_flash_varlen_mask_optimization():
+                raise RuntimeError("Failed to enable Hunyuan flash-varlen mask optimization")
+            logging.info("[INFO] Enabled Hunyuan flash-varlen 2D mask optimization")
+
         self.peft_config = getattr(self.pipe, "_peft_config", None)
 
         checkpoint_cfg = self.cfg.get("checkpoint", None)
@@ -872,7 +897,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             model_save_format=checkpoint_cfg.get("model_save_format"),
             model_cache_dir=model_cache_dir if model_cache_dir is not None else HF_HUB_CACHE,
             model_repo_id=self.model_id,
-            save_consolidated=checkpoint_cfg.get("save_consolidated"),
+            save_consolidated=checkpoint_cfg.get("save_consolidated", False),
             is_peft=self.peft_cfg is not None,
             model_state_dict_keys=model_state_dict_keys,
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),

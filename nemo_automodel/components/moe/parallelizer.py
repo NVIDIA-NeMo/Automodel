@@ -360,7 +360,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     # "Padding mask not supported with context parallelism!".
     _model._cp_enabled = True
 
-    for _, block in _model.layers.named_children():
+    for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
         if layer_type in ("full_attention", "sliding_attention"):

@@ -20,7 +20,7 @@ import torch
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.init_utils import build_distributed
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
@@ -32,7 +32,10 @@ This test is to make sure that JSONL dataset can be checkpointed and loaded corr
 def test_megatron_dataset_checkpointing():
     cfg_path = Path(__file__).parents[4] / "examples" / "llm_pretrain" / "megatron_pretrain_gpt2.yaml"
     cfg = parse_args_and_load_config(cfg_path)
-    dist_env = build_distributed(cfg.get("dist_env", {}))
+    dist_env = initialize_distributed(
+        backend=cfg.get("dist_env", {}).get("backend", "nccl"),
+        timeout_minutes=cfg.get("dist_env", {}).get("timeout_minutes", 1),
+    )
     dist_setup = setup_distributed(cfg, world_size=dist_env.world_size)
     device_mesh = dist_setup.device_mesh
     dp_rank = device_mesh["dp"].get_local_rank()
@@ -58,7 +61,6 @@ def test_megatron_dataset_checkpointing():
         pp_rank=pp_rank,
     )
 
-    # Override the example config's batch sizes / schedule with the small values this test needs.
     cfg.step_scheduler.local_batch_size = 2
     cfg.step_scheduler.global_batch_size = 4
     cfg.step_scheduler.max_steps = None

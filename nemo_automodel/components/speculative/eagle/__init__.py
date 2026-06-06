@@ -24,10 +24,13 @@ helpers were moved to the project's canonical locations:
 Import them directly from those modules.
 """
 
+from nemo_automodel.components.speculative.eagle.backend import Eagle3TargetBackend
 from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
+from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
+from nemo_automodel.components.speculative.eagle.peagle_trainer import PEagleTrainerModule
 from nemo_automodel.components.speculative.eagle.registry import (
     EAGLE1_DRAFT_REGISTRY,
     EAGLE3_DRAFT_REGISTRY,
@@ -41,10 +44,13 @@ from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTarget
 __all__ = [
     "EagleTrainerModule",
     "Eagle3TrainerModule",
+    "PEagleTrainerModule",
+    "Eagle3TargetBackend",
     "HFEagleTargetModel",
     "HFEagle3TargetModel",
     "LlamaEagleDraftModel",
     "LlamaEagle3DraftModel",
+    "GptOssEagle3DraftModel",
     "DraftSpec",
     "EAGLE1_DRAFT_REGISTRY",
     "EAGLE3_DRAFT_REGISTRY",

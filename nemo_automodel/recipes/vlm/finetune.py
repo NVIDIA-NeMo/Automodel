@@ -52,7 +52,7 @@ from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp, wrap_vlm_collate_for_pp
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
-from nemo_automodel.components.distributed.init_utils import build_distributed
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -64,11 +64,10 @@ from nemo_automodel.components.loggers.mlflow_utils import (
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
+from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
-from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
@@ -79,7 +78,7 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_setup import setup_distributed, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -88,6 +87,13 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+try:
+    from megatron_fsdp import MegatronFSDP
+    from megatron_fsdp.fully_shard import fully_shard_optimizer
+except (ImportError, FileNotFoundError, OSError):
+    MegatronFSDP = None
+    fully_shard_optimizer = None
 
 # ---------------------------
 #  Stateless helper functions
@@ -118,6 +124,7 @@ def build_model(
     pipeline_config=None,
     cfg_moe=None,
     activation_checkpointing=False,
+    cfg_quantization=None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
 
@@ -153,6 +160,11 @@ def build_model(
             kwargs["fp8_config"] = fp8_config
         if cfg_compile is not None:
             kwargs["compile_config"] = build_compile_config(cfg_compile)
+        if cfg_quantization is not None:
+            logger.info("Model weight quantization enabled with BitsAndBytes")
+            from nemo_automodel.components.quantization.qlora import create_bnb_config
+
+            kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
 
         # Check if using NeMoAutoModel
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
@@ -517,7 +529,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
         torch.cuda.reset_peak_memory_stats()
-        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        self.dist_env = initialize_distributed(
+            backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
+            timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
+        )
         setup_logging()
 
         apply_cache_compatibility_patches()
@@ -605,6 +620,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             seed=self.cfg.get("seed", 42),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
+            cfg_quantization=self.cfg.get("quantization", None),
             device_mesh=self.device_mesh,
             moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
@@ -612,15 +628,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_moe=self.dist_setup.moe_config,
             activation_checkpointing=self.dist_setup.activation_checkpointing,
         )
-        self.optimizer = self.cfg.optimizer.build(
-            model, distributed_config=self.distributed_config, device_mesh=self.device_mesh
-        )
-        warn_if_torch_adam_with_bf16_params(
-            optimizer=self.optimizer,
-            optimizer_cfg=self.cfg.optimizer,
-            is_peft=self.peft_config is not None,
-            context="vlm",
-            logger=logger,
+        optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
+        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        self.optimizer = shard_optimizers_for_megatron_fsdp(
+            model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
@@ -941,14 +952,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    mtp_cfg = self.cfg.mtp
+                    scaling_factor = (
+                        mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
+                    )
                     local_loss = local_loss + calculate_mtp_loss(
                         self.loss_fn,
                         mtp_per_depth_h=mtp_per_depth_h,
                         mtp_per_depth_logits=mtp_per_depth_logits,
                         labels=labels,
                         model=model,
-                        scaling_factor=out.mtp_loss_scaling_factor,
+                        scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
+                        ignore_index=mtp_cfg.ignore_index,
                     )
 
                 # Joint base + drafter co-training (Gemma4WithDrafter and
@@ -985,7 +1001,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
-        self.pp.info.schedule._loss_fn = PipelineCausalLMLoss(self.loss_fn, last_stage_model)
+        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(self.loss_fn, last_stage_model)
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
