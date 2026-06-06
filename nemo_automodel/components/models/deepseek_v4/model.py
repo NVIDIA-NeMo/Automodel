@@ -56,7 +56,11 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import (
+    _has_dtensor_params,
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+)
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
@@ -782,26 +786,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # path can recompute logits over every position.
         final_hidden_states = hidden_states
 
-        if self.lm_head:
-            hidden_dtype = hidden_states.dtype
-            # Restrict logit computation to the last ``logits_to_keep`` positions
-            # when requested (avoids materializing the full logit matrix, e.g.
-            # for FusedLinearCrossEntropy / generation). When logits_to_keep == 0
-            # compute all positions; do NOT slice a full range since DTensor
-            # cannot slice ``slice(0, None)``.
-            if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-                logits = self.lm_head(hidden_states.float()).to(hidden_dtype)
-            else:
-                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-                if hidden_states.dim() == 2:
-                    sliced = hidden_states[slice_indices, :]
-                else:
-                    sliced = hidden_states[:, slice_indices, :]
-                logits = self.lm_head(sliced.float()).to(hidden_dtype)
-        else:
-            logits = hidden_states
-        if thd_mode and logits.dim() == 2:
-            logits = logits.unsqueeze(0)
+        # deepseek runs the lm_head in fp32: project in fp32 and cast the logits
+        # back to the hidden dtype via the shared helper.
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep, is_thd=thd_mode, fp32_lm_head=True)
 
         if pp_mtp_enabled and self.lm_head is None:
             if not mtp_embed_inputs:

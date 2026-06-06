@@ -538,6 +538,7 @@ def compute_lm_head_logits(
     hidden_states: torch.Tensor,
     logits_to_keep: int | torch.Tensor = 0,
     is_thd: bool = False,
+    fp32_lm_head: bool = False,
 ) -> torch.Tensor:
     """Project hidden states through ``lm_head``, honoring ``logits_to_keep``.
 
@@ -559,6 +560,11 @@ def compute_lm_head_logits(
       a uniform ``[B, S, V]`` layout. Only applied when the logits are still 2D,
       so an ``inputs_embeds`` path that already produced ``[1, T, V]`` is left
       untouched.
+    - ``fp32_lm_head``: run the projection in fp32 and cast the logits back to
+      the input dtype. Used by models whose ``lm_head.weight`` has been promoted
+      to fp32 (e.g. via the MoE ``lm_head_precision`` setting). The matmul goes
+      through ``lm_head`` (``nn.Linear``, DTensor-aware under FSDP2) rather than
+      ``F.linear`` so DTensor redistribution is preserved.
 
     Args:
         lm_head: The language-model head module, or ``None`` on a pipeline stage
@@ -568,6 +574,8 @@ def compute_lm_head_logits(
             the last ``N`` positions; or a tensor of position indices.
         is_thd: Whether the inputs were THD/packed; if so, a 2D logits result is
             unsqueezed back to a leading batch dim of 1.
+        fp32_lm_head: Project in fp32 and cast the result back to the input
+            dtype. Ignored when ``lm_head`` is ``None``.
 
     Returns:
         The projected logits, or ``hidden_states`` unchanged when ``lm_head`` is
@@ -575,14 +583,19 @@ def compute_lm_head_logits(
     """
     if lm_head is None:
         logits = hidden_states
-    elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
-        logits = lm_head(hidden_states)
     else:
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        if hidden_states.dim() == 2:
-            logits = lm_head(hidden_states[slice_indices, :])
+        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            sliced = hidden_states
         else:
-            logits = lm_head(hidden_states[:, slice_indices, :])
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            if hidden_states.dim() == 2:
+                sliced = hidden_states[slice_indices, :]
+            else:
+                sliced = hidden_states[:, slice_indices, :]
+        if fp32_lm_head:
+            logits = lm_head(sliced.float()).to(hidden_states.dtype)
+        else:
+            logits = lm_head(sliced)
     if is_thd and logits.dim() == 2:
         logits = logits.unsqueeze(0)
     return logits

@@ -279,3 +279,26 @@ class TestComputeLmHeadLogits:
         out = compute_lm_head_logits(None, hidden, logits_to_keep=0, is_thd=True)
         assert out.shape == (1, 7, self.HIDDEN)
         torch.testing.assert_close(out, hidden.unsqueeze(0))
+
+    def test_fp32_lm_head_projects_in_fp32_and_restores_dtype(self):
+        """fp32_lm_head upcasts to fp32 for the matmul, then casts logits back to input dtype."""
+        lm_head = self._lm_head()  # nn.Linear with an fp32 weight
+        hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.bfloat16)
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0, fp32_lm_head=True)
+        assert out.dtype == torch.bfloat16
+        torch.testing.assert_close(out, lm_head(hidden.float()).to(torch.bfloat16))
+
+    def test_fp32_lm_head_with_slicing(self):
+        """fp32_lm_head composes with logits_to_keep slicing (2D THD input)."""
+        lm_head = self._lm_head()
+        hidden = torch.randn(7, self.HIDDEN, dtype=torch.bfloat16)
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=3, fp32_lm_head=True)
+        assert out.shape == (3, self.VOCAB)
+        assert out.dtype == torch.bfloat16
+        torch.testing.assert_close(out, lm_head(hidden[-3:, :].float()).to(torch.bfloat16))
+
+    def test_fp32_lm_head_ignored_when_lm_head_none(self):
+        """fp32_lm_head is a no-op on the lm_head=None passthrough."""
+        hidden = torch.randn(7, self.HIDDEN, dtype=torch.bfloat16)
+        out = compute_lm_head_logits(None, hidden, fp32_lm_head=True)
+        assert out is hidden

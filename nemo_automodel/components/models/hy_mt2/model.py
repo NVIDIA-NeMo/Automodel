@@ -49,7 +49,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.hy_mt2.layers import HyMT2Attention
 from nemo_automodel.components.models.hy_mt2.state_dict_adapter import HyMT2StateDictAdapter
@@ -396,43 +396,20 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        # Optionally restrict logit computation to the last few positions.
-        # When logits_to_keep == 0 we compute all positions (training default);
-        # avoid slicing in that case because DTensor cannot slice a full range.
-        # Handle both 2D [T, H] (THD/packed) and 3D [B, S, H] hidden states.
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            lm_head_input = hidden
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden.dim() == 2:
-                lm_head_input = hidden[slice_indices, :]
-            else:
-                lm_head_input = hidden[:, slice_indices, :]
-
-        if self.lm_head is None:
-            logits = lm_head_input
-        elif (
+        # When the MoE parallelizer promotes ``lm_head.weight`` to fp32
+        # (``distributed.moe.lm_head_precision: float32``), run the projection in
+        # fp32 and cast the logits back. Routing through ``nn.Linear`` (not
+        # ``F.linear``) keeps the DTensor redistribution intact under FSDP2.
+        fp32_lm_head = (
             self._enable_lm_head_fp32
+            and self.lm_head is not None
             and self.lm_head.weight.dtype == torch.float32
-            and lm_head_input.dtype != torch.float32
-        ):
-            # The MoE parallelizer (``distributed.moe.lm_head_precision:
-            # float32`` in the YAML) has already promoted ``lm_head.weight`` to
-            # fp32. Feed it fp32 input via ``nn.Linear`` -- which is
-            # DTensor-aware under FSDP2 -- and cast logits back to the input
-            # dtype. We must NOT use ``F.linear`` directly with a manually
-            # ``.float()``-ed weight here, because that bypasses nn.Linear's
-            # DTensor redistribution and crashes with
-            # "got mixed torch.Tensor and DTensor".
-            original_dtype = lm_head_input.dtype
-            logits = self.lm_head(lm_head_input.float()).to(original_dtype)
-        else:
-            logits = self.lm_head(lm_head_input)
+            and hidden.dtype != torch.float32
+        )
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd, fp32_lm_head=fp32_lm_head)
 
-        if is_thd:
-            logits = logits.unsqueeze(0)
-            if output_hidden_states and hidden.dim() == 2:
-                hidden = hidden.unsqueeze(0)
+        if is_thd and output_hidden_states and hidden.dim() == 2:
+            hidden = hidden.unsqueeze(0)
 
         return CausalLMOutputWithPast(
             logits=logits,
