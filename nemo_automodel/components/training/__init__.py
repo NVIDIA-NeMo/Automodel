@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,3 +13,7 @@
 # limitations under the License.
 
 """Training utilities shared across recipes."""
+
+from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
+
+__all__ = ["StepSchedulerConfig"]
