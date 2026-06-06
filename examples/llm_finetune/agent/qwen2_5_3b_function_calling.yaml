@@ -82,7 +82,14 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.agent_chat.make_agent_chat_dataset
   dataset_name: llamafactory/glaive_toolcall_en
   split: train
+  # NOTE: seq_length only caps length when truncation is enabled (or pads when
+  # padding: max_length). With the defaults it does NOT truncate, so long
+  # dialogues pass through uncapped. Add `truncation: true` to enforce the cap.
   seq_length: 4096
+  # Drop the oldest conversation turns (keeping the system message, tools, and
+  # the final answer) when a dialogue exceeds seq_length, instead of token-level
+  # truncation that would clip away the supervised final turn. Off by default.
+  # truncate_history: true
   tokenizer:
     pretrained_model_name_or_path: Qwen/Qwen2.5-3B
 
@@ -106,6 +113,24 @@ validation_dataset:
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+# Generation-based tool-call accuracy eval. Catches the case where loss is
+# decreasing but the model emits wrong tool names or malformed argument JSON —
+# something loss alone cannot detect. Remove or comment out this block to disable.
+#
+# NOTE: this recipe uses `distributed.strategy: fsdp2`, which SKIPS in-loop
+# generation eval by default — running generate() on the sharded training model
+# repeatedly unshards params and can OOM the next step. It runs every val step
+# under DDP. To force it under FSDP2, set `run_on_fsdp2: true` below (slower,
+# higher memory); or run the evaluator offline against a saved checkpoint.
+tool_call_eval:
+  _target_: nemo_automodel.components.eval.tool_call_evaluator.ToolCallAccuracyEvaluator
+  dataset_name: llamafactory/glaive_toolcall_en
+  split: train[:128]
+  max_eval_samples: 128
+  max_new_tokens: 256
+  max_prompt_tokens: 3584
+  # run_on_fsdp2: true   # opt in to in-loop eval under FSDP2 (otherwise skipped)
 
 optimizer:
   _target_: torch.optim.AdamW

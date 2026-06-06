@@ -137,30 +137,50 @@ def _build_multiturn_assistant_mask(
     tools: Optional[List[Dict]] = None,
     truncation: Union[str, bool] = "do_not_truncate",
     seq_length: Optional[int] = None,
+    full_length: Optional[int] = None,
 ) -> List[int]:
-    """Build a fallback loss mask that supervises every assistant turn."""
+    """Build a fallback loss mask that supervises every assistant turn.
+
+    Each assistant span is located by tokenizing the conversation prefixes
+    before and after the turn, which is O(turns) ``apply_chat_template`` calls.
+    Two reductions keep that from re-doing work:
+
+    - ``full_length`` is the caller's already-known unpadded token count for the
+      whole conversation (``sum(attention_mask)``). When the dialogue ends on an
+      assistant turn its closing boundary is the full conversation, so passing
+      ``full_length`` skips re-tokenizing the entire prefix — the single most
+      expensive call in the loop.
+    - Prefix lengths are memoized so a boundary shared by adjacent turns (a
+      turn's end and the next turn's start) is tokenized at most once.
+
+    Both are exact: ``full_length`` and the memoized values equal what
+    :func:`_tokenized_chat_length` would return, so the mask is unchanged.
+    """
     assistant_mask = [0] * len(input_ids)
     found_assistant = False
+
+    length_cache: Dict[int, int] = {}
+    if full_length is not None:
+        length_cache[len(formatted_text)] = full_length
+
+    def prefix_length(k: int) -> int:
+        if k not in length_cache:
+            length_cache[k] = _tokenized_chat_length(
+                tokenizer,
+                formatted_text[:k],
+                tools=tools,
+                truncation=truncation,
+                seq_length=seq_length,
+            )
+        return length_cache[k]
 
     for idx, message in enumerate(formatted_text):
         if message["role"] != "assistant":
             continue
 
         found_assistant = True
-        start = _tokenized_chat_length(
-            tokenizer,
-            formatted_text[:idx],
-            tools=tools,
-            truncation=truncation,
-            seq_length=seq_length,
-        )
-        end = _tokenized_chat_length(
-            tokenizer,
-            formatted_text[: idx + 1],
-            tools=tools,
-            truncation=truncation,
-            seq_length=seq_length,
-        )
+        start = prefix_length(idx)
+        end = prefix_length(idx + 1)
         for pos in range(min(start, len(assistant_mask)), min(end, len(assistant_mask))):
             assistant_mask[pos] = 1
 
@@ -257,6 +277,41 @@ def _build_reasoning_mask(
             reasoning_mask[pos] = 1
 
     return reasoning_mask
+
+
+def _mask_labels_to_last_turn(mask: List[int], ignore_index: int = -100) -> List[int]:
+    """Restrict supervision to the final assistant turn (``mask_history``).
+
+    Operates on any per-token sequence where ``ignore_index`` marks
+    unsupervised positions: a label list (``ignore_index=-100``) or a 0/1
+    assistant mask (``ignore_index=0``). Each assistant turn renders as a
+    single contiguous supervised span, so this keeps only the last such run
+    and rewrites every earlier supervised position to ``ignore_index``.
+
+    Apply this to the assistant mask **before** any reasoning_content holes are
+    punched into it; running it on already-holed labels would treat the
+    reasoning gap as a turn boundary and drop in-turn content before the hole.
+
+    Args:
+        mask: per-token labels or 0/1 mask (``ignore_index`` marks unsupervised).
+        ignore_index: the value marking unsupervised positions.
+
+    Returns:
+        The same list, mutated so only the final supervised run is kept.
+    """
+    last = -1
+    for i in range(len(mask) - 1, -1, -1):
+        if mask[i] != ignore_index:
+            last = i
+            break
+    if last < 0:
+        return mask
+    start = last
+    while start - 1 >= 0 and mask[start - 1] != ignore_index:
+        start -= 1
+    for i in range(start):
+        mask[i] = ignore_index
+    return mask
 
 
 @torch.no_grad()
@@ -563,6 +618,7 @@ def format_chat_template(
     tools: Optional[List[Dict]] = None,
     answer_only_loss_mask: bool = True,
     mask_reasoning_content: bool = False,
+    train_on_last_turn_only: bool = False,
     unshifted: bool = False,
 ) -> Dict[str, List[int]]:
     """
@@ -577,6 +633,9 @@ def format_chat_template(
         tools: Optional list of tool definitions for function calling.
         answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
         mask_reasoning_content: Whether to exclude rendered reasoning_content tokens from loss.
+        train_on_last_turn_only: Whether to supervise only the final assistant turn,
+            masking every earlier assistant turn (``mask_history``). Applied to the
+            assistant mask before reasoning_content is masked out.
 
     Returns:
         A dictionary with the formatted example.
@@ -618,6 +677,12 @@ def format_chat_template(
     if template_has_generation_kwd:
         mask = tokenized_chat["assistant_masks"]
     elif not template_has_generation_kwd and answer_only_loss_mask:
+        # The unpadded token count of the whole conversation is already known
+        # from this tokenization; pass it so the mask builder need not
+        # re-tokenize the full prefix. Fall back to None (recompute) when no
+        # attention_mask is available.
+        attn_for_len = tokenized_chat.get("attention_mask")
+        full_length = sum(attn_for_len) if attn_for_len is not None else None
         mask = _build_multiturn_assistant_mask(
             tokenizer,
             formatted_text,
@@ -625,6 +690,7 @@ def format_chat_template(
             tools=tools,
             truncation=truncation,
             seq_length=seq_length,
+            full_length=full_length,
         )
         # _build_multiturn_assistant_mask computes indices from unpadded
         # lengths — shift for left-padding tokenizers.
@@ -639,6 +705,11 @@ def format_chat_template(
         for i in range(min(len(mask), len(tokenizer_attn_mask))):
             if not tokenizer_attn_mask[i]:
                 mask[i] = 0
+
+    # Restrict to the last assistant turn before reasoning is masked, so the
+    # contiguous-run heuristic sees a hole-free mask (one run per turn).
+    if train_on_last_turn_only:
+        _mask_labels_to_last_turn(mask, ignore_index=0)
 
     if mask_reasoning_content and has_reasoning_content:
         reasoning_mask = _build_reasoning_mask(

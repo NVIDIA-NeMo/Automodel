@@ -14,9 +14,11 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import time
+from contextlib import nullcontext
 from math import ceil
 from typing import Any, Dict, Optional
 
@@ -27,13 +29,14 @@ from huggingface_hub.constants import HF_HUB_CACHE
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
-from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -42,9 +45,20 @@ from nemo_automodel.components.training.utils import (
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
+from nemo_automodel.recipes._typed_config import RecipeConfig, _model_name_from_cfg
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import build_distributed, build_wandb
+from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str
+
+_OPTIMIZER_DEFAULT_TARGET = "torch.optim.AdamW"
+_TORCH_DTYPE_ALIASES = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+}
 
 
 def _resolve_optimizer_dtype_strings(optimizer_cfg: Any) -> None:
@@ -96,18 +110,37 @@ def _build_optimizer(
     learning_rate: float,
     is_peft: bool = False,
 ) -> torch.optim.Optimizer:
-    """Build optimizer from config, falling back to AdamW for legacy dict configs."""
+    """Build optimizer from config, falling back to AdamW for legacy configs."""
     optimizer_cfg = optimizer_cfg or {}
     if isinstance(optimizer_cfg, dict) and "_target_" in optimizer_cfg:
         optimizer_cfg = ConfigNode(optimizer_cfg)
 
-    if hasattr(optimizer_cfg, "instantiate") and hasattr(optimizer_cfg, "_target_"):
+    if hasattr(optimizer_cfg, "_target_"):
         _resolve_optimizer_dtype_strings(optimizer_cfg)
-        optimizer = optimizer_cfg.instantiate(params=trainable_params, lr=learning_rate)
-        logging.info("[INFO] Optimizer: %s, lr=%s", optimizer.__class__.__name__, learning_rate)
+        optimizer_target = optimizer_cfg._target_
+        optimizer_target_name = _get_optimizer_target_name(optimizer_target)
+        optimizer_cls = _resolve_optimizer_class(optimizer_target)
+        optimizer_dict = optimizer_cfg.to_dict() if hasattr(optimizer_cfg, "to_dict") else dict(optimizer_cfg)
+
+        optimizer_kwargs = {"lr": learning_rate}
+        for key, value in optimizer_dict.items():
+            if key in {"_target_", "lr", "learning_rate"}:
+                continue
+            if value is not None:
+                optimizer_kwargs[key] = _normalize_optimizer_value(value)
+
+        if (
+            optimizer_cls is torch.optim.AdamW
+            and optimizer_kwargs.get("foreach", False)
+            and optimizer_kwargs.get("fused", False)
+        ):
+            raise ValueError("torch.optim.AdamW does not support foreach=True and fused=True at the same time")
+        optimizer_kwargs = _filter_optimizer_kwargs(optimizer_target_name, optimizer_cls, optimizer_kwargs)
+        optimizer = optimizer_cls(trainable_params, **optimizer_kwargs)
+        logging.info("[INFO] Optimizer target: %s", optimizer_target_name)
+        logging.info("[INFO] Optimizer config: %s", optimizer_kwargs)
         warn_if_torch_adam_with_bf16_params(
             optimizer=optimizer,
-            optimizer_cfg=optimizer_cfg,
             parameters=trainable_params,
             is_peft=is_peft,
             context="diffusion",
@@ -136,7 +169,6 @@ def _build_optimizer(
     logging.info("[INFO] Optimizer config: %s", adamw_kwargs)
     warn_if_torch_adam_with_bf16_params(
         optimizer=optimizer,
-        optimizer_cfg=optimizer_cfg,
         parameters=trainable_params,
         is_peft=is_peft,
         context="diffusion",
@@ -186,6 +218,133 @@ def _calculate_throughput_metrics(
     }
 
 
+def _normalize_optimizer_value(value: Any) -> Any:
+    """Convert CLI-friendly optimizer scalar values into Python objects."""
+    if isinstance(value, str):
+        normalized = value.removeprefix("torch.").lower()
+        return _TORCH_DTYPE_ALIASES.get(normalized, value)
+    return value
+
+
+def _get_optimizer_target_name(target: Any) -> str:
+    """Return a stable display name for an optimizer target."""
+    if isinstance(target, str):
+        return target
+    module_name = getattr(target, "__module__", None)
+    qualname = getattr(target, "__qualname__", None)
+    if module_name and qualname:
+        return f"{module_name}.{qualname}"
+    return repr(target)
+
+
+def _resolve_optimizer_class(target: Any) -> Any:
+    """Resolve an optimizer class from a fully qualified `_target_` string."""
+    if not isinstance(target, str):
+        if callable(target):
+            return target
+        raise ValueError(f"Optimizer target must be a fully qualified import path or callable, got {target!r}.")
+
+    if target == _OPTIMIZER_DEFAULT_TARGET:
+        return torch.optim.AdamW
+
+    module_name, _, symbol_name = target.rpartition(".")
+    if not module_name or not symbol_name:
+        raise ValueError(
+            f"Optimizer target must be a fully qualified import path, got {target!r}. "
+            f"Example: {_OPTIMIZER_DEFAULT_TARGET!r}."
+        )
+
+    available, optimizer_cls = safe_import_from(
+        module_name,
+        symbol_name,
+        msg=f"Optimizer target {target!r} could not be imported",
+    )
+    if not available:
+        raise ImportError(f"Optimizer target {target!r} could not be imported")
+    return optimizer_cls
+
+
+def _filter_optimizer_kwargs(target: str, optimizer_cls: Any, optimizer_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop kwargs unsupported by an opt-in optimizer target."""
+    try:
+        signature = inspect.signature(optimizer_cls)
+    except (TypeError, ValueError):
+        logging.info("[INFO] Could not inspect optimizer target %s; passing all optimizer kwargs", target)
+        return optimizer_kwargs
+
+    parameters = signature.parameters
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return optimizer_kwargs
+
+    accepted = {
+        name
+        for name, parameter in parameters.items()
+        if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    accepted.discard("params")
+
+    filtered_kwargs = {key: value for key, value in optimizer_kwargs.items() if key in accepted}
+    ignored_kwargs = sorted(set(optimizer_kwargs) - set(filtered_kwargs))
+    if ignored_kwargs:
+        logging.info("[INFO] Optimizer target %s does not accept kwargs %s; ignoring them", target, ignored_kwargs)
+    return filtered_kwargs
+
+
+def _build_transformer_engine_fp8_recipe(
+    recipe_name: str,
+    *,
+    amax_history_len: int,
+    amax_compute_algo: str,
+) -> Any:
+    """Build a Transformer Engine FP8 recipe from CLI-friendly config values."""
+    normalized_recipe_name = recipe_name.replace("-", "_").lower()
+    if normalized_recipe_name in {"delayed", "delayed_scaling"}:
+        available, delayed_scaling = safe_import_from(
+            "transformer_engine.common.recipe",
+            "DelayedScaling",
+            msg="model.transformer_engine_fp8=true requires Transformer Engine DelayedScaling",
+        )
+        if not available:
+            raise ImportError("model.transformer_engine_fp8=true requires Transformer Engine DelayedScaling")
+        return delayed_scaling(amax_history_len=amax_history_len, amax_compute_algo=amax_compute_algo)
+
+    if normalized_recipe_name in {"current", "current_scaling"}:
+        available, current_scaling = safe_import_from(
+            "transformer_engine.common.recipe",
+            "Float8CurrentScaling",
+            msg="model.transformer_engine_fp8_recipe=current requires Transformer Engine Float8CurrentScaling",
+        )
+        if not available:
+            raise ImportError("model.transformer_engine_fp8_recipe=current requires Float8CurrentScaling")
+        return current_scaling()
+
+    if normalized_recipe_name in {"mxfp8", "mx", "mx_fp8"}:
+        available, mxfp8_block_scaling = safe_import_from(
+            "transformer_engine.common.recipe",
+            "MXFP8BlockScaling",
+            msg="model.transformer_engine_fp8_recipe=mxfp8 requires Transformer Engine MXFP8BlockScaling",
+        )
+        if not available:
+            raise ImportError("model.transformer_engine_fp8_recipe=mxfp8 requires MXFP8BlockScaling")
+        return mxfp8_block_scaling()
+
+    raise ValueError(
+        f"model.transformer_engine_fp8_recipe must be one of 'delayed', 'current', or 'mxfp8', got {recipe_name!r}"
+    )
+
+
+def _resolve_transformer_engine_autocast() -> Any:
+    """Resolve Transformer Engine's quantization autocast context manager."""
+    available, te_autocast = safe_import_from(
+        "transformer_engine.pytorch.quantization",
+        "autocast",
+        msg="model.transformer_engine_fp8=true requires transformer_engine.pytorch.quantization.autocast",
+    )
+    if not available:
+        raise ImportError("model.transformer_engine_fp8=true requires transformer_engine.pytorch.quantization.autocast")
+    return te_autocast
+
+
 def build_model_and_optimizer(
     *,
     model_id: str,
@@ -199,6 +358,10 @@ def build_model_and_optimizer(
     ddp_cfg: Optional[Dict[str, Any]] = None,
     attention_backend: Optional[str] = None,
     optimizer_cfg: Optional[Dict[str, Any]] = None,
+    transformer_engine_linear: bool = False,
+    transformer_engine_fp8_safe_only: bool = False,
+    fuse_qkv_projections: bool = False,
+    compact_fused_qkv_projections: bool = False,
     pipeline_spec: Optional[Dict[str, Any]] = None,
     peft_cfg=None,
     model_type=None,
@@ -217,6 +380,10 @@ def build_model_and_optimizer(
         ddp_cfg: DDP configuration dict. Mutually exclusive with fsdp_cfg.
         attention_backend: Optional attention backend override.
         optimizer_cfg: Optional optimizer configuration.
+        transformer_engine_linear: Whether to replace transformer torch.nn.Linear modules with Transformer Engine Linear.
+        transformer_engine_fp8_safe_only: Whether to skip TE conversion for known FP8-incompatible modules.
+        fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer before FSDP.
+        compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
         pipeline_spec: Pipeline specification for pretraining (from_config).
             Required when finetune_mode is False. Should contain:
             - transformer_cls: str (e.g., "WanTransformer3DModel", "FluxTransformer2DModel")
@@ -286,6 +453,8 @@ def build_model_and_optimizer(
                 )
             dp_size = world_size // denom
 
+        reduce_dtype = dtype_from_str(fsdp_cfg.get("reduce_dtype", None), default=torch.float32)
+
         manager_args: Dict[str, Any] = {
             "_manager_type": "fsdp2",
             "dp_size": dp_size,
@@ -308,7 +477,7 @@ def build_model_and_optimizer(
             "fsdp2_forward_prefetch_depth": fsdp_cfg.get("fsdp2_forward_prefetch_depth", 1),
             "mp_policy": MixedPrecisionPolicy(
                 param_dtype=param_dtype,
-                reduce_dtype=torch.float32,
+                reduce_dtype=reduce_dtype,
                 output_dtype=compute_dtype,
             ),
         }
@@ -328,6 +497,10 @@ def build_model_and_optimizer(
             low_cpu_mem_usage=True,
             peft_cfg=peft_cfg,
             model_type=model_type,
+            transformer_engine_linear=transformer_engine_linear,
+            transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
+            fuse_qkv_projections=fuse_qkv_projections,
+            compact_fused_qkv_projections=compact_fused_qkv_projections,
         )
     else:
         # Pretraining: initialize with random weights using pipeline_spec
@@ -347,12 +520,17 @@ def build_model_and_optimizer(
             device=device,
             parallel_scheme=parallel_scheme,
             components_to_load=["transformer"],
+            transformer_engine_linear=transformer_engine_linear,
+            transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
+            fuse_qkv_projections=fuse_qkv_projections,
+            compact_fused_qkv_projections=compact_fused_qkv_projections,
         )
     fsdp2_manager = created_managers["transformer"]
     transformer_module = pipe.transformer
+    transformer_module_for_attrs = getattr(transformer_module, "module", transformer_module)
     if attention_backend is not None:
         logging.info(f"[INFO] Setting attention backend to {attention_backend}")
-        transformer_module.set_attention_backend(attention_backend)
+        transformer_module_for_attrs.set_attention_backend(attention_backend)
 
     if lora_enabled:
         # Collect lora_params AFTER FSDP2 wrapping from the live wrapped module.
@@ -492,15 +670,19 @@ class TrainDiffusionRecipe(BaseRecipe):
     """Training recipe for diffusion models."""
 
     def __init__(self, cfg):
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     def setup(self):
-        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        self.dist_env = initialize_distributed(
+            backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
+            timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
+        )
         setup_logging()
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = build_wandb(self.cfg)
+            model_name = _model_name_from_cfg(self.cfg.model) if "model" in self.cfg else None
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=model_name)
             if run is not None:
                 logging.info("🚀 View run at {}".format(run.url))
 
@@ -509,6 +691,22 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         self.model_id = self.cfg.get("model.pretrained_model_name_or_path")
         self.attention_backend = self.cfg.get("model.attention_backend")
+        self.transformer_engine_linear = bool(self.cfg.get("model.transformer_engine_linear", False))
+        self.transformer_engine_fp8 = bool(self.cfg.get("model.transformer_engine_fp8", False))
+        self.transformer_engine_fp8_recipe_name = str(self.cfg.get("model.transformer_engine_fp8_recipe", "delayed"))
+        self.transformer_engine_fp8_amax_history_len = int(
+            self.cfg.get("model.transformer_engine_fp8_amax_history_len", 1024)
+        )
+        self.transformer_engine_fp8_amax_compute_algo = str(
+            self.cfg.get("model.transformer_engine_fp8_amax_compute_algo", "max")
+        )
+        self.fuse_qkv_projections = bool(self.cfg.get("model.fuse_qkv_projections", False))
+        self.compact_fused_qkv_projections = bool(self.cfg.get("model.compact_fused_qkv_projections", False))
+        self.optimize_hunyuan_flash_varlen_mask = bool(self.cfg.get("model.optimize_hunyuan_flash_varlen_mask", False))
+        if self.transformer_engine_fp8:
+            self.transformer_engine_linear = True
+        if self.compact_fused_qkv_projections and not self.fuse_qkv_projections:
+            raise ValueError("model.compact_fused_qkv_projections=true requires model.fuse_qkv_projections=true")
         self.learning_rate = self.cfg.get("optim.learning_rate", 5e-6)
         self.clip_grad_max_norm = float(self.cfg.get("optim.clip_grad", 1.0))
         self.model_dtype, self.compute_dtype = _resolve_model_dtypes(self.cfg)
@@ -527,6 +725,17 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.local_world_size = max(self.local_world_size, 1)
         self.num_nodes = max(1, self.world_size // self.local_world_size)
         self.node_rank = dist.get_rank() // self.local_world_size if dist.is_initialized() else 0
+        self._te_fp8_autocast = None
+        self._te_fp8_recipe = None
+        self._te_fp8_group = None
+        if self.transformer_engine_fp8:
+            self._te_fp8_autocast = _resolve_transformer_engine_autocast()
+            self._te_fp8_recipe = _build_transformer_engine_fp8_recipe(
+                self.transformer_engine_fp8_recipe_name,
+                amax_history_len=self.transformer_engine_fp8_amax_history_len,
+                amax_compute_algo=self.transformer_engine_fp8_amax_compute_algo,
+            )
+            self._te_fp8_group = dist.group.WORLD if dist.is_initialized() else None
 
         logging.info("[INFO] Diffusion Trainer with Flow Matching")
         logging.info(
@@ -534,6 +743,17 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info(f"[INFO] Node rank: {self.node_rank}, Local rank: {self.local_rank}")
         logging.info(f"[INFO] Learning rate: {self.learning_rate}")
+        logging.info("[INFO] Transformer Engine Linear: %s", self.transformer_engine_linear)
+        logging.info(
+            "[INFO] Transformer Engine FP8: %s (recipe=%s, amax_history_len=%s, amax_compute_algo=%s)",
+            self.transformer_engine_fp8,
+            self.transformer_engine_fp8_recipe_name,
+            self.transformer_engine_fp8_amax_history_len,
+            self.transformer_engine_fp8_amax_compute_algo,
+        )
+        logging.info("[INFO] Fuse QKV projections: %s", self.fuse_qkv_projections)
+        logging.info("[INFO] Compact fused QKV projections: %s", self.compact_fused_qkv_projections)
+        logging.info("[INFO] Optimize Hunyuan flash-varlen mask: %s", self.optimize_hunyuan_flash_varlen_mask)
         logging.info("[INFO] Precision: model_dtype=%s, compute_dtype=%s", self.model_dtype, self.compute_dtype)
         logging.info(
             "[INFO] Performance config: check_loss=%s, grad_clip_foreach=%s",
@@ -578,6 +798,15 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.adapter_kwargs = (
             adapter_kwargs.to_dict() if hasattr(adapter_kwargs, "to_dict") else dict(adapter_kwargs or {})
         )
+        if self.optimize_hunyuan_flash_varlen_mask:
+            if self.adapter_type != "hunyuan":
+                raise ValueError(
+                    "model.optimize_hunyuan_flash_varlen_mask=true requires flow_matching.adapter_type=hunyuan"
+                )
+            if self.attention_backend != "flash_varlen":
+                raise ValueError(
+                    "model.optimize_hunyuan_flash_varlen_mask=true requires model.attention_backend=flash_varlen"
+                )
 
         logging.info("[INFO] Flow Matching V2 Pipeline")
         logging.info(f"[INFO]   - Adapter type: {self.adapter_type}")
@@ -626,6 +855,10 @@ class TrainDiffusionRecipe(BaseRecipe):
             fsdp_cfg=fsdp_cfg,
             ddp_cfg=ddp_cfg,
             optimizer_cfg=self.cfg.get("optim.optimizer", {}),
+            transformer_engine_linear=self.transformer_engine_linear,
+            transformer_engine_fp8_safe_only=self.transformer_engine_fp8,
+            fuse_qkv_projections=self.fuse_qkv_projections,
+            compact_fused_qkv_projections=self.compact_fused_qkv_projections,
             attention_backend=self.attention_backend,
             pipeline_spec=pipeline_spec,
             peft_cfg=self.peft_cfg,
@@ -633,11 +866,20 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
 
         self.model = self.pipe.transformer
+        if self.optimize_hunyuan_flash_varlen_mask:
+            from nemo_automodel.components.flow_matching.adapters.hunyuan import (
+                enable_hunyuan_flash_varlen_mask_optimization,
+            )
+
+            if not enable_hunyuan_flash_varlen_mask_optimization():
+                raise RuntimeError("Failed to enable Hunyuan flash-varlen mask optimization")
+            logging.info("[INFO] Enabled Hunyuan flash-varlen 2D mask optimization")
+
         self.peft_config = getattr(self.pipe, "_peft_config", None)
 
         checkpoint_cfg = self.cfg.get("checkpoint", None)
 
-        self.num_epochs = self.cfg.step_scheduler.num_epochs
+        self.num_epochs = self.cfg.get("step_scheduler.num_epochs")
         self.log_every = self.cfg.get("step_scheduler.log_every", 5)
 
         # Strictly require checkpoint config from YAML (no fallback)
@@ -655,14 +897,13 @@ class TrainDiffusionRecipe(BaseRecipe):
             model_save_format=checkpoint_cfg.get("model_save_format"),
             model_cache_dir=model_cache_dir if model_cache_dir is not None else HF_HUB_CACHE,
             model_repo_id=self.model_id,
-            save_consolidated=checkpoint_cfg.get("save_consolidated"),
+            save_consolidated=checkpoint_cfg.get("save_consolidated", False),
             is_peft=self.peft_cfg is not None,
             model_state_dict_keys=model_state_dict_keys,
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
         )
         self.restore_from = checkpoint_cfg.get("restore_from", None)
-        self.checkpointer = Checkpointer(
-            config=self.checkpoint_config,
+        self.checkpointer = self.checkpoint_config.build(
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
@@ -676,7 +917,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.dataloader, self.sampler = dataloader_cfg.instantiate(
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
-            batch_size=self.cfg.step_scheduler.local_batch_size,
+            batch_size=self.cfg.get("step_scheduler.local_batch_size"),
         )
 
         self.raw_steps_per_epoch = len(self.dataloader)
@@ -699,9 +940,9 @@ class TrainDiffusionRecipe(BaseRecipe):
                 self.dp_size = max(1, self.world_size // denom)
 
         # Infer local micro-batch size from dataloader if available
-        self.local_batch_size = self.cfg.step_scheduler.local_batch_size
+        self.local_batch_size = self.cfg.get("step_scheduler.local_batch_size")
         # Desired global effective batch size across all DP ranks and nodes
-        self.global_batch_size = self.cfg.step_scheduler.global_batch_size
+        self.global_batch_size = self.cfg.get("step_scheduler.global_batch_size")
         # Steps per epoch after gradient accumulation
         grad_acc_steps = max(1, self.global_batch_size // max(1, self.local_batch_size * self.dp_size))
         self.steps_per_epoch = ceil(self.raw_steps_per_epoch / grad_acc_steps)
@@ -725,10 +966,10 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.start_epoch = 0
         # Initialize StepScheduler for gradient accumulation and step/epoch bookkeeping
         self.step_scheduler = StepScheduler(
-            global_batch_size=self.cfg.step_scheduler.global_batch_size,
-            local_batch_size=self.cfg.step_scheduler.local_batch_size,
+            global_batch_size=self.cfg.get("step_scheduler.global_batch_size"),
+            local_batch_size=self.cfg.get("step_scheduler.local_batch_size"),
             dp_size=int(self.dp_size),
-            ckpt_every_steps=self.cfg.step_scheduler.ckpt_every_steps,
+            ckpt_every_steps=self.cfg.get("step_scheduler.ckpt_every_steps"),
             save_checkpoint_every_epoch=self.cfg.get("step_scheduler.save_checkpoint_every_epoch", False),
             dataloader=self.dataloader,
             val_every_steps=None,
@@ -768,6 +1009,16 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         if dist.is_initialized():
             dist.barrier()
+
+    def _transformer_engine_fp8_context(self) -> Any:
+        """Return the per-forward Transformer Engine FP8 context."""
+        if not self.transformer_engine_fp8:
+            return nullcontext()
+        return self._te_fp8_autocast(
+            enabled=True,
+            recipe=self._te_fp8_recipe,
+            amax_reduction_group=self._te_fp8_group,
+        )
 
     def run_train_validation_loop(self):
         logging.info("[INFO] Starting T2V training with Flow Matching")
@@ -809,15 +1060,16 @@ class TrainDiffusionRecipe(BaseRecipe):
                         prepare_for_final_backward([self.model], pp_enabled=False)
 
                     try:
-                        _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
-                            model=self.model,
-                            batch=micro_batch,
-                            device=self.device,
-                            dtype=self.compute_dtype,
-                            global_step=global_step,
-                            collect_metrics=False,
-                            check_loss=self.check_loss,
-                        )
+                        with self._transformer_engine_fp8_context():
+                            _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
+                                model=self.model,
+                                batch=micro_batch,
+                                device=self.device,
+                                dtype=self.compute_dtype,
+                                global_step=global_step,
+                                collect_metrics=False,
+                                check_loss=self.check_loss,
+                            )
                     except Exception as exc:
                         logging.info(f"[ERROR] Training step failed at epoch {epoch}, step {num_steps}: {exc}")
                         video_shape = micro_batch.get("video_latents", torch.tensor([])).shape
