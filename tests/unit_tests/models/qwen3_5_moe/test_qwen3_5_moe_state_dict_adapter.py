@@ -478,6 +478,22 @@ class TestFromHF:
         assert "model.lm_head.weight" not in out
         assert out["lm_head.weight"] is lm_head
 
+    def test_keeps_native_lm_head_outer_when_model_prefix_is_detected(self, adapter):
+        native_lm_head = torch.zeros(128, 64)
+        checkpoint_lm_head = torch.ones(128, 64)
+        hf_state = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 64, 128),
+            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(4, 128, 64),
+            "lm_head.weight": native_lm_head,
+            "model.lm_head.weight": checkpoint_lm_head,
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        assert "lm_head.weight" in out
+        assert "model.lm_head.weight" not in out
+        assert out["lm_head.weight"] is checkpoint_lm_head
+
     def test_maps_mtp_fusion_keys_without_model_prefix(self, adapter):
         tensor = torch.randn(64, 128)
         hf_state = {

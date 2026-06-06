@@ -217,6 +217,8 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 state_dict[mapped_key] = value
             elif mapped_key.startswith("model.lm_head."):
                 state_dict[mapped_key.removeprefix("model.")] = value
+            elif mapped_key.startswith("lm_head."):
+                state_dict[mapped_key] = value
             elif key.startswith("model."):
                 state_dict[mapped_key] = value
             else:
