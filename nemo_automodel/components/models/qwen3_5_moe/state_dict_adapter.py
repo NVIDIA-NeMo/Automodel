@@ -315,8 +315,6 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 break
 
         new_fqn = map_qwen3_5_mtp_to_hf_key(new_fqn)
-        if self._uses_model_prefix and new_fqn.startswith("lm_head."):
-            new_fqn = f"model.{new_fqn}"
 
         if exclude_key_regex and re.match(exclude_key_regex, new_fqn):
             return []

@@ -478,15 +478,6 @@ class TestFromHF:
         assert "model.lm_head.weight" not in out
         assert out["lm_head.weight"] is lm_head
 
-    def test_maps_outer_lm_head_back_to_vlm_hf_key(self, adapter):
-        lm_head = torch.randn(128, 64)
-
-        out = adapter.to_hf({"lm_head.weight": lm_head})
-
-        assert "model.lm_head.weight" in out
-        assert "lm_head.weight" not in out
-        assert out["model.lm_head.weight"] is lm_head
-
     def test_maps_mtp_fusion_keys_without_model_prefix(self, adapter):
         tensor = torch.randn(64, 128)
         hf_state = {
