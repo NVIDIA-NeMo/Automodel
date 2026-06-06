@@ -97,6 +97,12 @@ class TestQwen3_5MTPConfig:
 
 
 class TestQwen3_5MTPModel:
+    def test_dense_adapter_keeps_unpatched_linear_attn_keys(self):
+        cfg = _tiny_config(mtp_num_hidden_layers=1)
+        model = Qwen3_5ForCausalLM(cfg, backend=_backend())
+
+        assert not model.state_dict_adapter.route_linear_attn_fp32_params
+
     def test_mtp_disabled_matches_hf_forward(self):
         cfg = _tiny_config(mtp_num_hidden_layers=0, use_cache=False)
         torch.manual_seed(1234)
@@ -149,6 +155,12 @@ class TestQwen3_5MTPModel:
 
 
 class TestQwen3_5VLMMTPModel:
+    def test_vlm_adapter_keeps_unpatched_linear_attn_keys(self):
+        cfg = _tiny_vlm_config(mtp_num_hidden_layers=1)
+        model = Qwen3_5ForConditionalGeneration(cfg, backend=_backend())
+
+        assert not model.state_dict_adapter.route_linear_attn_fp32_params
+
     def test_vlm_forward_emits_mtp_hidden_states_in_training(self):
         cfg = _tiny_vlm_config(mtp_num_hidden_layers=1)
         model = Qwen3_5ForConditionalGeneration(cfg, backend=_backend(), mtp_loss_scaling_factor=0.2)

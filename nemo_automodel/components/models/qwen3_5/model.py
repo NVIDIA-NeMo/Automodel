@@ -276,7 +276,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         self.mtp = build_qwen3_5_dense_mtp(config, self.mtp_config, dtype=dtype) if self.mtp_config.enabled else None
 
         if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = Qwen3_5DenseStateDictAdapter()
+            self.state_dict_adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=False)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens
@@ -448,6 +448,8 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         )
         if self.mtp is not None:
             cast_model_to_dtype(self.mtp, dtype)
+        if self.backend.enable_hf_state_dict_adapter:
+            self.state_dict_adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=False)
 
     def _pop_staged_vlm_media(
         self,

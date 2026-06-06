@@ -331,12 +331,28 @@ class TestPatchHfModelStateDictAdapter:
 
         adapter = getattr(fake_model, "state_dict_adapter", None)
         assert isinstance(adapter, Qwen3_5DenseStateDictAdapter)
+        assert adapter.route_linear_attn_fp32_params
         # Smoke-check round-trip behaviour on a sample state dict.
         out = adapter.to_hf({"layers.0.linear_attn._fp32_params.A_log": torch.zeros(4)})
         assert list(out.keys()) == ["layers.0.linear_attn.A_log"]
 
-    def test_does_not_overwrite_existing_adapter(self, fake_model, monkeypatch):
-        """If a model already has a state_dict_adapter, it is preserved."""
+    def test_updates_existing_qwen3_5_adapter(self, fake_model, monkeypatch):
+        """If a Qwen3.5 adapter already exists, CP patching switches it to fp32-holder mode."""
+        from nemo_automodel.components.models.qwen3_5.state_dict_adapter import (
+            Qwen3_5DenseStateDictAdapter,
+        )
+
+        patch_hf_model = self._stub_and_import(monkeypatch)
+        adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=False)
+        fake_model.state_dict_adapter = adapter
+
+        patch_hf_model(fake_model, cp_enabled=False)
+
+        assert fake_model.state_dict_adapter is adapter
+        assert adapter.route_linear_attn_fp32_params
+
+    def test_does_not_overwrite_unrelated_existing_adapter(self, fake_model, monkeypatch):
+        """If a non-Qwen3.5 model already has a state_dict_adapter, it is preserved."""
         patch_hf_model = self._stub_and_import(monkeypatch)
         sentinel = object()
         fake_model.state_dict_adapter = sentinel
