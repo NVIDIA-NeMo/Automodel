@@ -38,6 +38,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple, logging
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 
 logger = logging.get_logger(__name__)
 
@@ -561,16 +562,7 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         )
 
         hidden_states = outputs.last_hidden_state
-        # DTensor compatibility: when logits_to_keep=0, slice(0, None) would select all
-        # elements but DTensor cannot handle the resulting aten.alias op. Skip slicing.
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                logits = self.lm_head(hidden_states[slice_indices, :])
-            else:
-                logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
 
         loss = None
         if labels is not None:

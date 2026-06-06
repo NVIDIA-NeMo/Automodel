@@ -74,7 +74,7 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     BaseModelOutputWithPast = _make_missing("BaseModelOutputWithPast")
     CausalLMOutputWithPast = _make_missing("CausalLMOutputWithPast")
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
@@ -641,24 +641,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         hidden_states = outputs.last_hidden_state
 
-        # Optionally restrict logit computation to the last few positions (cut-CE /
-        # generation). When logits_to_keep == 0 we project all positions (training
-        # default); slicing a full range is skipped so DTensor weights stay intact.
-        # The returned hidden_states below always span the FULL sequence so a fused
-        # linear cross-entropy loss can re-project them.
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            lm_head_input = hidden_states
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                lm_head_input = hidden_states[slice_indices, :]
-            else:
-                lm_head_input = hidden_states[:, slice_indices, :]
-
-        if self.lm_head is not None:
-            logits = self.lm_head(lm_head_input)
-        else:
-            logits = lm_head_input
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
 
         if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
             logits = logits / final_logit_softcapping

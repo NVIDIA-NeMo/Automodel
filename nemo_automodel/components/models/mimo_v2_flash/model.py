@@ -27,7 +27,11 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import (
+    _has_dtensor_params,
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+)
 from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2FlashConfig
 from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import MiMoV2FlashStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -698,18 +702,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 hidden_states=hidden if output_hidden_states else None,
             )
 
-        # Only compute necessary logits (optimization for training/generation).
-        # DTensor compatibility: when logits_to_keep == 0, slicing slice(0, None)
-        # would select every element but DTensor cannot slice a full range, so
-        # skip the slice entirely and project all positions.
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden.dim() == 2:
-                logits = self.lm_head(hidden[slice_indices, :])
-            else:
-                logits = self.lm_head(hidden[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep)
 
         return CausalLMOutputWithPast(
             logits=logits,

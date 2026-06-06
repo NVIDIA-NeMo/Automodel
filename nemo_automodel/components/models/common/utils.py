@@ -533,11 +533,54 @@ def _restore_fp32_buffers(model: nn.Module, fp32_keywords: list[str]) -> None:
             module._buffers[buffer_name] = buf.to(torch.float32)
 
 
+def compute_lm_head_logits(
+    lm_head: nn.Module | None,
+    hidden_states: torch.Tensor,
+    logits_to_keep: int | torch.Tensor = 0,
+) -> torch.Tensor:
+    """Project hidden states through ``lm_head``, honoring ``logits_to_keep``.
+
+    Centralizes the lm_head projection shared by every custom ``*ForCausalLM`` /
+    ``*ForConditionalGeneration`` ``forward()``:
+
+    - ``lm_head is None`` (e.g. a non-final pipeline-parallel stage that does not
+      own the head): ``hidden_states`` is returned unprojected so the next stage
+      receives it.
+    - ``logits_to_keep == 0`` (training default): every position is projected.
+      The full range is deliberately *not* sliced, because ``slice(0, None)`` on
+      a DTensor is unsupported (it raises on the ``aten.alias`` op under tensor
+      parallel with sequence parallelism).
+    - ``logits_to_keep`` as a positive int or a tensor of indices: only the
+      requested positions are projected. Both 2D ``[T, H]`` (THD/packed) and 3D
+      ``[B, S, H]`` (BSHD) hidden states are handled.
+
+    Args:
+        lm_head: The language-model head module, or ``None`` on a pipeline stage
+            that does not own it.
+        hidden_states: Final hidden states, shaped ``[T, H]`` or ``[B, S, H]``.
+        logits_to_keep: ``0`` to project every position; a positive int to keep
+            the last ``N`` positions; or a tensor of position indices.
+
+    Returns:
+        The projected logits, or ``hidden_states`` unchanged when ``lm_head`` is
+        ``None``.
+    """
+    if lm_head is None:
+        return hidden_states
+    if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+        return lm_head(hidden_states)
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    if hidden_states.dim() == 2:
+        return lm_head(hidden_states[slice_indices, :])
+    return lm_head(hidden_states[:, slice_indices, :])
+
+
 __all__ = [
     "BackendConfig",
     "Float32RMSNorm",
     "TEFp8Config",
     "cast_model_to_dtype",
+    "compute_lm_head_logits",
     "get_is_first_microbatch",
     "get_is_optim_step",
     "get_rope_config",

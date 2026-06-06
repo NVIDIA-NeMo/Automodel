@@ -34,6 +34,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.llava_onevision.rice_vit import RiceTransformer
 
 LOGGER = logging.getLogger(__name__)
@@ -378,17 +379,7 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
 
         hidden_states = outputs.last_hidden_state
 
-        # Only compute necessary logits (optimization for training and generation).
-        # DTensor compatibility: when logits_to_keep == 0, slice(0, None) would select
-        # all positions but DTensor cannot slice a full range — skip slicing entirely.
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                logits = self.lm_head(hidden_states[slice_indices, :])
-            else:
-                logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
 
         loss = None
         if labels is not None:

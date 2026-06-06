@@ -29,6 +29,7 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.models.common import (
     BackendConfig,
+    compute_lm_head_logits,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
@@ -505,16 +506,7 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             **attn_kwargs,
         )
 
-        # Only compute necessary logits. When logits_to_keep == 0, project all
-        # positions without slicing (DTensor cannot slice a full range).
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden.dim() == 2:
-                logits = self.lm_head(hidden[slice_indices, :])
-            else:
-                logits = self.lm_head(hidden[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep)
         if is_thd:
             logits = logits.unsqueeze(0)
             if output_hidden_states and hidden.dim() == 2:
@@ -637,16 +629,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             **attn_kwargs,
         )
 
-        # Only compute necessary logits. When logits_to_keep == 0, project all
-        # positions without slicing (DTensor cannot slice a full range).
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden.dim() == 2:
-                logits = self.lm_head(hidden[slice_indices, :])
-            else:
-                logits = self.lm_head(hidden[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep)
         if is_thd:
             logits = logits.unsqueeze(0)
             if output_hidden_states and hidden.dim() == 2:

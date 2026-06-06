@@ -20,6 +20,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
+    compute_lm_head_logits,
     get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,
@@ -388,19 +389,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        # Only compute necessary logits (optimization for training and generation).
-        # When logits_to_keep == 0 we project all positions; DTensor cannot slice a
-        # full range, so the slicing branch is only taken when slicing is requested.
-        if not self.lm_head:
-            logits = hidden_states
-        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                logits = self.lm_head(hidden_states[slice_indices, :])
-            else:
-                logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
 
         if is_thd:
             logits = logits.unsqueeze(0)

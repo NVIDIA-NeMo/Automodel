@@ -27,7 +27,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
@@ -320,21 +320,7 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        # Optionally restrict logit computation to the last few positions.
-        # When logits_to_keep == 0 we compute all positions (training default).
-        # DTensor cannot slice a full range (slice(0, None)), so skip slicing entirely
-        # when logits_to_keep == 0.
-        if self.lm_head is None:
-            logits = hidden
-        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            # THD/packed hidden is 2D [T, H]; BSHD hidden is 3D [B, S, H].
-            if hidden.dim() == 2:
-                logits = self.lm_head(hidden[slice_indices, :])
-            else:
-                logits = self.lm_head(hidden[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep)
 
         if is_thd:
             logits = logits.unsqueeze(0)

@@ -43,7 +43,7 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniThinkerForConditionalGeneration as HFQwen2_5OmniThinkerForConditionalGeneration,
 )
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.qwen2_5_omni.state_dict_adapter import Qwen2_5OmniStateDictAdapter
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -250,18 +250,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
 
         hidden_states = outputs[0]
 
-        # Only compute necessary logits. When logits_to_keep == 0 we project
-        # all positions (training default); avoid slicing a full range so a
-        # sharded (DTensor) lm_head input stays intact. Handle both 2D [T, H]
-        # (THD/packed) and 3D [B, S, H] hidden states.
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                logits = self.lm_head(hidden_states[slice_indices, :])
-            else:
-                logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
 
         loss = None
         if labels is not None:

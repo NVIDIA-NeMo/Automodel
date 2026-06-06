@@ -36,7 +36,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.hy_v3.layers import HYV3Attention
 from nemo_automodel.components.models.hy_v3.state_dict_adapter import HYV3StateDictAdapter
@@ -324,19 +324,7 @@ class HYV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        # Only compute necessary logits (optimization for training and generation).
-        # When logits_to_keep == 0 we compute all positions (training default); slicing
-        # with slice(0, None) is avoided because a full-range DTensor slice is unsupported.
-        if self.lm_head is None:
-            logits = hidden
-        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden.dim() == 2:
-                logits = self.lm_head(hidden[slice_indices, :])
-            else:
-                logits = self.lm_head(hidden[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep)
 
         if is_thd:
             logits = logits.unsqueeze(0)

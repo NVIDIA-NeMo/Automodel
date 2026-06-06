@@ -22,6 +22,7 @@ from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFChe
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     cast_model_to_dtype,
+    compute_lm_head_logits,
     get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,
@@ -309,18 +310,7 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        # Only compute necessary logits. When logits_to_keep == 0 we compute all
-        # positions (training default); slicing a full range would break DTensor.
-        if self.lm_head is None:
-            logits = hidden
-        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden.dim() == 2:
-                logits = self.lm_head(hidden[slice_indices, :])
-            else:
-                logits = self.lm_head(hidden[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep)
 
         if is_thd:
             logits = logits.unsqueeze(0)

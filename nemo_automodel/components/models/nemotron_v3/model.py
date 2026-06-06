@@ -28,7 +28,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.mtp import (
     _resolve_block_types_per_sublayer,
@@ -701,18 +701,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         if past_key_values is not None:
             past_key_values.has_previous_state = True
 
-        # lm_head is None on non-last PP stages; return raw hidden_states.
-        if has_lm_head:
-            if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-                logits = self.lm_head(hidden_states)
-            else:
-                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-                if hidden_states.dim() == 2:
-                    logits = self.lm_head(hidden_states[slice_indices, :])
-                else:
-                    logits = self.lm_head(hidden_states[:, slice_indices, :])
-        else:
-            logits = hidden_states
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
 
         loss = None
         # PP path defers loss to PipelineCausalLMLoss; only compute here off-PP.

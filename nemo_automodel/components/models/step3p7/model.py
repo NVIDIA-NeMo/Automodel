@@ -26,7 +26,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import roll_tensor
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 from nemo_automodel.components.models.step3p5.model import Step3p5Model
 from nemo_automodel.components.models.step3p7.configuration_step3p7 import Step3p7Config
@@ -613,20 +613,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             **kwargs,
         )
 
-        # Optionally restrict logit computation to the last few positions.
-        # When logits_to_keep == 0 we compute all positions (training default).
-        # DTensor (pytorch 2.9) cannot slice a full range, so skip slicing then.
-        if self.lm_head is None:
-            # PP intermediate stage: pass hidden states through untouched.
-            logits = hidden_states
-        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                logits = self.lm_head(hidden_states[slice_indices, :])
-            else:
-                logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
 
         if pp_mtp_enabled and self.lm_head is None:
             return (logits, *mtp_embed_inputs)

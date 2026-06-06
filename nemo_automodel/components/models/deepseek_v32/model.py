@@ -25,7 +25,12 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.models.common import BackendConfig, get_rope_config, initialize_rms_norm_module
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    compute_lm_head_logits,
+    get_rope_config,
+    initialize_rms_norm_module,
+)
 from nemo_automodel.components.models.deepseek_v3.model import (
     Block,
     DeepseekV3ForCausalLM,
@@ -262,19 +267,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
             **attn_kwargs,
         )
 
-        # Only compute necessary logits (optimization for training and generation).
-        # When logits_to_keep == 0 we project all positions and avoid slicing
-        # (a full-range slice on a DTensor is unsupported).
-        if self.lm_head is None:
-            logits = hidden_states
-        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                logits = self.lm_head(hidden_states[slice_indices, :])
-            else:
-                logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
 
         # Restore the batch dim for THD (the inner forward returned 2D logits).
         if is_thd:

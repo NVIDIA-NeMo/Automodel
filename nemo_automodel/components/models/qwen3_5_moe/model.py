@@ -59,7 +59,7 @@ except ModuleNotFoundError:
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -638,24 +638,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         hidden_states = outputs.last_hidden_state
 
-        # Optionally restrict logit computation to the last few positions.
-        # When logits_to_keep == 0 we compute all positions (training default).
-        # DTensor cannot slice a full range (slice(0, None)), so skip slicing then.
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            lm_head_input = hidden_states
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                # THD / packed: [T, H]
-                lm_head_input = hidden_states[slice_indices, :]
-            else:
-                # BSHD: [B, S, H]
-                lm_head_input = hidden_states[:, slice_indices, :]
-
-        if self.lm_head is not None:
-            logits = self.lm_head(lm_head_input)
-        else:
-            logits = lm_head_input
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep)
 
         return CausalLMOutputWithPast(
             logits=logits,

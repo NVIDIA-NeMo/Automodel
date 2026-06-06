@@ -17,10 +17,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
+from torch import nn
 
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
+    compute_lm_head_logits,
     get_is_first_microbatch,
     get_is_optim_step,
     get_rope_config,
@@ -179,3 +182,70 @@ class TestGetRopeConfig:
         assert rope_parameters["beta_slow"] == 1.0
         assert rope_parameters["beta_fast"] == 32.0
         assert rope_parameters["original_max_position_embeddings"] == 8192
+
+
+class TestComputeLmHeadLogits:
+    """Cover every branch of the shared lm_head projection helper."""
+
+    HIDDEN = 8
+    VOCAB = 16
+
+    def _lm_head(self):
+        torch.manual_seed(0)
+        return nn.Linear(self.HIDDEN, self.VOCAB, bias=False)
+
+    def test_none_lm_head_returns_hidden_states(self):
+        """A non-final PP stage (lm_head is None) passes hidden states through."""
+        hidden = torch.randn(2, 5, self.HIDDEN)
+        out = compute_lm_head_logits(None, hidden, logits_to_keep=0)
+        assert out is hidden
+
+    def test_keep_zero_projects_all_positions_3d(self):
+        """logits_to_keep == 0 projects every position without slicing (BSHD)."""
+        lm_head = self._lm_head()
+        hidden = torch.randn(2, 5, self.HIDDEN)
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0)
+        assert out.shape == (2, 5, self.VOCAB)
+        torch.testing.assert_close(out, lm_head(hidden))
+
+    def test_keep_zero_projects_all_positions_2d(self):
+        """logits_to_keep == 0 with a 2D [T, H] (THD/packed) hidden state."""
+        lm_head = self._lm_head()
+        hidden = torch.randn(7, self.HIDDEN)
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0)
+        assert out.shape == (7, self.VOCAB)
+        torch.testing.assert_close(out, lm_head(hidden))
+
+    def test_keep_int_slices_last_n_3d(self):
+        """A positive int keeps only the last N positions (BSHD)."""
+        lm_head = self._lm_head()
+        hidden = torch.randn(2, 5, self.HIDDEN)
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2)
+        assert out.shape == (2, 2, self.VOCAB)
+        torch.testing.assert_close(out, lm_head(hidden[:, -2:, :]))
+
+    def test_keep_int_slices_last_n_2d(self):
+        """A positive int keeps only the last N positions (THD/packed)."""
+        lm_head = self._lm_head()
+        hidden = torch.randn(7, self.HIDDEN)
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=3)
+        assert out.shape == (3, self.VOCAB)
+        torch.testing.assert_close(out, lm_head(hidden[-3:, :]))
+
+    def test_keep_tensor_indices_3d(self):
+        """A tensor of indices selects those positions (BSHD)."""
+        lm_head = self._lm_head()
+        hidden = torch.randn(2, 5, self.HIDDEN)
+        idx = torch.tensor([0, 2, 4])
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=idx)
+        assert out.shape == (2, 3, self.VOCAB)
+        torch.testing.assert_close(out, lm_head(hidden[:, idx, :]))
+
+    def test_keep_tensor_indices_2d(self):
+        """A tensor of indices selects those positions (THD/packed)."""
+        lm_head = self._lm_head()
+        hidden = torch.randn(7, self.HIDDEN)
+        idx = torch.tensor([1, 3, 5])
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=idx)
+        assert out.shape == (3, self.VOCAB)
+        torch.testing.assert_close(out, lm_head(hidden[idx, :]))

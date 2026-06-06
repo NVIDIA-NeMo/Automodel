@@ -38,6 +38,7 @@ from transformers.models.mbart.modeling_mbart import (
 )
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 
 # -----------------------------------------------------------------------------
 # NemotronParse configuration
@@ -543,17 +544,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         # Final decoder hidden states feeding the lm_head.
         final_hidden_states = decoder_outputs.last_hidden_state
 
-        # Only compute necessary logits (optimization for training/generation).
-        # When logits_to_keep == 0 we project all positions; DTensor cannot slice a
-        # full range, so the slicing branch is skipped entirely in that case.
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(final_hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if final_hidden_states.dim() == 2:
-                logits = self.lm_head(final_hidden_states[slice_indices, :])
-            else:
-                logits = self.lm_head(final_hidden_states[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, final_hidden_states, logits_to_keep)
 
         if not return_dict:
             return decoder_outputs + encoder_outputs
