@@ -398,7 +398,6 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
             world_size = torch.distributed.get_world_size()
 
         distributed_setup = DistributedSetup.build(
-        distributed_setup = DistributedSetup.build(
             strategy=FSDP2Config(
                 mp_policy=args["mp_policy"] if "mp_policy" in args else None,
                 sequence_parallel=args.get("sequence_parallel", False),
@@ -412,7 +411,6 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
                 fsdp2_backward_prefetch_depth=args.get("fsdp2_backward_prefetch_depth", 2),
                 fsdp2_forward_prefetch_depth=args.get("fsdp2_forward_prefetch_depth", 1),
                 activation_checkpointing=args.get("activation_checkpointing", False),
-            ),
             ),
             parallelism_sizes=parallelism,
             activation_checkpointing=args.get("activation_checkpointing", False),
