@@ -18,15 +18,18 @@ See https://github.com/NVIDIA-NeMo/Automodel/issues/2114 for background on why
 this check exists.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
+from nemo_automodel._transformers import model_init
 from nemo_automodel._transformers.model_init import (
     _FP8_PREFLIGHT_DISABLE_ENV,
     _FP8_PREFLIGHT_FOOTPRINT_THRESHOLD,
     _check_fp8_dequantize_will_fit,
     _get_hf_param_count_estimate,
+    _param_count_from_local_safetensors,
     _quant_config_is_fp8_full_materialize,
 )
 
@@ -85,9 +88,12 @@ class TestQuantConfigIsFp8FullMaterialize:
     def test_none(self):
         assert _quant_config_is_fp8_full_materialize(None) is False
 
-    def test_accepts_dequant_aliases(self):
-        assert _quant_config_is_fp8_full_materialize({"quant_method": "fp8", "is_dequantize": True}) is True
-        assert _quant_config_is_fp8_full_materialize({"quant_method": "fp8", "dequant": True}) is True
+    def test_rejects_non_canonical_dequant_aliases(self):
+        # Only the canonical ``dequantize`` flag triggers; speculative aliases
+        # that no transformers/Automodel code path sets must not be treated as a
+        # full-materialize request.
+        assert _quant_config_is_fp8_full_materialize({"quant_method": "fp8", "is_dequantize": True}) is False
+        assert _quant_config_is_fp8_full_materialize({"quant_method": "fp8", "dequant": True}) is False
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +141,32 @@ class TestGetHfParamCountEstimate:
     def test_returns_none_when_unestimable(self):
         assert _get_hf_param_count_estimate(SimpleNamespace()) is None
 
+    def test_gqa_estimates_fewer_params_than_mha(self):
+        # Same dims; grouped-query attention (8 KV heads) must estimate fewer
+        # parameters than full multi-head attention (64 KV heads), proving the
+        # attention term is GQA-aware rather than a flat 4*H*H.
+        base = dict(num_hidden_layers=32, hidden_size=8192, vocab_size=128000, intermediate_size=28672, head_dim=128)
+        mha = _get_hf_param_count_estimate(SimpleNamespace(num_attention_heads=64, num_key_value_heads=64, **base))
+        gqa = _get_hf_param_count_estimate(SimpleNamespace(num_attention_heads=64, num_key_value_heads=8, **base))
+        assert mha is not None and gqa is not None
+        assert gqa < mha
+
+    def test_mha_matches_legacy_4hh_formula(self):
+        # When head_dim == H / n_heads and n_kv == n_heads, the GQA-aware term
+        # collapses to the original 4*H*H attention estimate.
+        H, L, V, I, n = 4096, 32, 32000, 11008, 32
+        cfg = SimpleNamespace(
+            num_hidden_layers=L,
+            hidden_size=H,
+            vocab_size=V,
+            intermediate_size=I,
+            num_attention_heads=n,
+            num_key_value_heads=n,
+            head_dim=H // n,
+        )
+        legacy = L * (4 * H * H + 3 * H * I) + V * H
+        assert _get_hf_param_count_estimate(cfg) == legacy
+
 
 # ---------------------------------------------------------------------------
 # _check_fp8_dequantize_will_fit
@@ -142,6 +174,13 @@ class TestGetHfParamCountEstimate:
 
 
 class TestCheckFp8DequantizeWillFit:
+    @pytest.fixture(autouse=True)
+    def _force_formula_estimate(self, monkeypatch):
+        # Keep these budget tests hermetic and off the HF cache: route the
+        # param-count estimate through the config formula / num_parameters by
+        # disabling the local-safetensors lookup.
+        monkeypatch.setattr(model_init, "_param_count_from_local_safetensors", lambda *a, **k: None)
+
     def test_raises_when_footprint_exceeds_budget(self, monkeypatch):
         monkeypatch.setattr("torch.cuda.is_available", lambda: True)
         monkeypatch.setattr("torch.cuda.mem_get_info", lambda *a, **k: (_MEM_8GB, _MEM_8GB))
@@ -154,7 +193,7 @@ class TestCheckFp8DequantizeWillFit:
         msg = str(excinfo.value)
         assert "Mistral-Medium" in msg
         assert "BF16 footprint" in msg
-        assert "Free CUDA memory" in msg
+        assert "Total CUDA memory" in msg
         assert "issues/2114" in msg
         assert "mistral3_vlm" in msg
         assert _FP8_PREFLIGHT_DISABLE_ENV in msg
@@ -165,6 +204,19 @@ class TestCheckFp8DequantizeWillFit:
 
         cfg = _make_hf_config(layers=32, hidden=4096, vocab=32000, inter=11008)  # ~7B
         assert _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "tinyllama/TinyLlama-FP8") is None
+
+    def test_budgets_against_total_not_free_memory(self, monkeypatch):
+        """A transiently low FREE value must not false-trip a model that fits.
+
+        The verdict budgets against TOTAL memory, so another process holding
+        most of the card's free memory does not change the decision.
+        """
+        monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+        cfg = SimpleNamespace(num_parameters=1_000_000_000)  # 2 GB BF16
+        total = 80 * 1024**3
+        almost_nothing_free = 1 * 1024**3
+        monkeypatch.setattr("torch.cuda.mem_get_info", lambda *a, **k: (almost_nothing_free, total))
+        assert _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "x") is None
 
     def test_noop_when_quant_config_none(self, monkeypatch):
         monkeypatch.setattr("torch.cuda.is_available", lambda: True)
@@ -225,15 +277,18 @@ class TestCheckFp8DequantizeWillFit:
         assert _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "x") is None
 
     def test_threshold_boundary(self, monkeypatch):
-        """At exactly the budget, the check passes; one GB over and it trips."""
+        """At exactly the budget the check passes; shrink TOTAL and it trips."""
         monkeypatch.setattr("torch.cuda.is_available", lambda: True)
         cfg = SimpleNamespace(num_parameters=1_000_000_000)  # 2 GB BF16
 
-        exact_free = int((2 * 1024**3) / _FP8_PREFLIGHT_FOOTPRINT_THRESHOLD)
-        monkeypatch.setattr("torch.cuda.mem_get_info", lambda *a, **k: (exact_free, exact_free))
+        # Budget == THRESHOLD * total, so this total makes the budget exactly 2 GB.
+        total = int((2 * 1024**3) / _FP8_PREFLIGHT_FOOTPRINT_THRESHOLD)
+        monkeypatch.setattr("torch.cuda.mem_get_info", lambda *a, **k: (total, total))
         assert _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "x") is None
 
-        monkeypatch.setattr("torch.cuda.mem_get_info", lambda *a, **k: (exact_free - 1024**3, exact_free))
+        # Drop TOTAL by 1 GB: the budget falls below the 2 GB footprint -> trips.
+        smaller = total - 1024**3
+        monkeypatch.setattr("torch.cuda.mem_get_info", lambda *a, **k: (smaller, smaller))
         with pytest.raises(RuntimeError):
             _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "x")
 
@@ -292,3 +347,86 @@ class TestForceHfBranchWiring:
                 None,  # quantization_config
                 True,  # force_hf
             )
+
+    def test_non_force_hf_fallback_invokes_preflight(self, monkeypatch):
+        """The non-force_hf HF fallback (no custom class) must also pre-flight.
+
+        An fp8+dequantize checkpoint with no custom streaming class reaches the
+        same full-materialize HF loader, so the guard runs there too (#2114).
+        """
+
+        class _Sentinel(Exception):
+            pass
+
+        def _raise_sentinel(*a, **k):
+            raise _Sentinel()
+
+        monkeypatch.setattr(model_init, "_check_fp8_dequantize_will_fit", _raise_sentinel)
+        monkeypatch.setattr(
+            model_init,
+            "get_hf_config",
+            lambda path, attn, **_: SimpleNamespace(
+                architectures=["Dummy"], quantization_config={"quant_method": "fp8", "dequantize": True}
+            ),
+        )
+        monkeypatch.setattr(model_init, "_propagate_torch_dtype_to_subconfigs", lambda *a, **k: None)
+        monkeypatch.setattr(model_init, "_streaming_bnb_supported", lambda *a, **k: False)
+        monkeypatch.setattr(model_init, "_resolve_custom_model_cls_for_config", lambda *a, **k: None)
+
+        class _DummyCls:
+            __name__ = "NeMoDummy"
+            _model_mapping = {}
+
+            @classmethod
+            def _from_pretrained_parent_class(cls, *a, **k):
+                raise AssertionError("HF loader must not run when preflight raises")
+
+        with pytest.raises(_Sentinel):
+            model_init._init_model(
+                _DummyCls,
+                "fake/repo",
+                "sdpa",
+                "bfloat16",
+                None,  # quantization_config
+                False,  # force_hf -> exercise the fallback branch
+            )
+
+
+class TestParamCountFromLocalSafetensors:
+    """Exact element-count source used as preference #1 by the estimate."""
+
+    def test_counts_elements_from_single_file(self, tmp_path):
+        import torch
+        from safetensors.torch import save_file
+
+        save_file(
+            {"a.weight": torch.zeros(10, 20), "b.weight": torch.zeros(5)},
+            str(tmp_path / "model.safetensors"),
+        )
+        assert _param_count_from_local_safetensors(str(tmp_path)) == 205
+
+    def test_counts_elements_from_sharded_index(self, tmp_path):
+        import torch
+        from safetensors.torch import save_file
+
+        save_file({"a.weight": torch.zeros(10, 20)}, str(tmp_path / "model-00001-of-00002.safetensors"))
+        save_file({"b.weight": torch.zeros(30)}, str(tmp_path / "model-00002-of-00002.safetensors"))
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {"total_size": 0},
+                    "weight_map": {
+                        "a.weight": "model-00001-of-00002.safetensors",
+                        "b.weight": "model-00002-of-00002.safetensors",
+                    },
+                }
+            )
+        )
+        assert _param_count_from_local_safetensors(str(tmp_path)) == 230
+
+    def test_none_when_no_safetensors(self, tmp_path):
+        assert _param_count_from_local_safetensors(str(tmp_path)) is None
+
+    def test_none_when_path_falsy(self):
+        assert _param_count_from_local_safetensors(None) is None
+        assert _param_count_from_local_safetensors("") is None
