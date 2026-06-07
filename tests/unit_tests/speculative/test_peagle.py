@@ -51,16 +51,6 @@ _gpu_only = pytest.mark.skipif(
     reason="P-EAGLE forward uses flex_attention, which has no CPU autograd support in the CI torch build.",
 )
 
-# P-EAGLE's draft forward runs flex_attention, whose autograd is not implemented
-# on CPU in the CI torch build (even the forward errors once the inputs require
-# grad). Tests that drive the draft forward therefore run on CUDA and are skipped
-# when it is unavailable; the pure-tensor / mask-mod / config tests stay on CPU.
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-_gpu_only = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="P-EAGLE forward uses flex_attention, which has no CPU autograd support in the CI torch build.",
-)
-
 
 def _build_tiny_draft_model(
     *, parallel_drafting: bool = False, mask_token_id: int = 0, device: str = _DEVICE
