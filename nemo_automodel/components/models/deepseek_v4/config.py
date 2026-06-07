@@ -138,6 +138,16 @@ class DeepseekV4Config(PretrainedConfig):
         index_topk: int = 512,
         # Multi-token prediction layers appended after the main layers
         num_nextn_predict_layers: int = 1,
+        # Training-only numerical alignment with vLLM's DeepSeek V4 fp8 paths.
+        # KV/O-proj use the hardcoded ue8m0 fp8_ds_mla format; the attention
+        # input/output linear projections use the generic block FP8 path, which
+        # under DeepGEMM (VLLM_USE_DEEP_GEMM_E8M0 on; DSV4 scale_fmt=ue8m0
+        # auto-enables it) also uses UE8M0 power-of-two scales. All default
+        # off so the flags are opt-in via the model config.
+        fp8_ds_mla_fake_quant_kv: bool = False,
+        fp8_ds_mla_fake_quant_o_proj: bool = False,
+        fp8_ds_mla_fake_quant_moe: bool = False,
+        fp8_ds_mla_fake_quant_attn_proj: bool = False,
         # Standard options
         rms_norm_eps: float = 1e-6,
         attention_bias: bool = False,
@@ -190,6 +200,10 @@ class DeepseekV4Config(PretrainedConfig):
         self.index_n_heads = index_n_heads
         self.index_topk = index_topk
         self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.fp8_ds_mla_fake_quant_kv = fp8_ds_mla_fake_quant_kv
+        self.fp8_ds_mla_fake_quant_o_proj = fp8_ds_mla_fake_quant_o_proj
+        self.fp8_ds_mla_fake_quant_moe = fp8_ds_mla_fake_quant_moe
+        self.fp8_ds_mla_fake_quant_attn_proj = fp8_ds_mla_fake_quant_attn_proj
         self.rms_norm_eps = rms_norm_eps
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
