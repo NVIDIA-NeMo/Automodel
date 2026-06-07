@@ -28,12 +28,16 @@ plus the helpers in this module, so the dependency stays one-way
 (``draft_llama`` -> ``peagle_draft``) with no circular import.
 """
 
+import logging
+
 import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from nemo_automodel.components.models.llama.rope_utils import apply_rotary_pos_emb
 from nemo_automodel.components.speculative.eagle.peagle_attention import create_peagle_mask_mod
+
+logger = logging.getLogger(__name__)
 
 # flex_attention compiled for the CUDA training path. Inductor's flex backend is
 # not available on CPU (it raises ``InductorError``), so ``_peagle_flex_attention``
@@ -44,12 +48,23 @@ _peagle_flex_attention_compiled = torch.compile(
     flex_attention,
     mode="max-autotune-no-cudagraphs",
 )
+_peagle_flex_attention_compile_failed = False
 
 
 def _peagle_flex_attention(q, k, v, *, block_mask, scale):
-    """Run the P-EAGLE flex attention, compiling only on CUDA."""
-    flex = _peagle_flex_attention_compiled if q.is_cuda else flex_attention
-    return flex(q, k, v, block_mask=block_mask, scale=scale)
+    """Run P-EAGLE flex attention, falling back if Inductor cannot lower it."""
+    global _peagle_flex_attention_compile_failed
+    if q.is_cuda and not _peagle_flex_attention_compile_failed:
+        try:
+            return _peagle_flex_attention_compiled(q, k, v, block_mask=block_mask, scale=scale)
+        except Exception as exc:
+            exc_module = exc.__class__.__module__
+            is_compile_error = exc_module.startswith("torch._inductor") or exc_module.startswith("torch._dynamo")
+            if not is_compile_error:
+                raise
+            _peagle_flex_attention_compile_failed = True
+            logger.warning("Falling back to eager P-EAGLE flex attention after compile failure.", exc_info=True)
+    return flex_attention(q, k, v, block_mask=block_mask, scale=scale)
 
 
 class _PeagleAttentionMixin:
