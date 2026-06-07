@@ -14,12 +14,22 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import math
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 import torch.nn as nn
+
+
+class _DionFamilyConfig(Protocol):
+    """Structural type for the dion-family optimizer configs build_dion_optimizer reads."""
+
+    lr: float
+    weight_decay: float
+    scalar_opt: str
+    scalar_betas: tuple[float, float]
+    scalar_eps: float
+
 
 _import_error: Exception | None = None
 try:
@@ -31,11 +41,10 @@ except Exception as e:  # pragma: no cover - handled at runtime
 logger = logging.getLogger(__name__)
 
 
-def is_dion_optimizer(cfg_opt: Any) -> bool:
-    """Return whether an optimizer config targets a Dion-family optimizer."""
-    target = getattr(cfg_opt, "_target_", None)
-    name = getattr(target, "__name__", "")
-    module = getattr(target, "__module__", "")
+def is_dion_optimizer(optimizer_factory: Any) -> bool:
+    """Return whether an optimizer factory targets a Dion-family optimizer."""
+    name = getattr(optimizer_factory, "__name__", "")
+    module = getattr(optimizer_factory, "__module__", "")
     return module.startswith("dion") or name in {"Dion", "Dion2", "Muon", "NorMuon"}
 
 
@@ -132,91 +141,99 @@ def _separate_param_groups(
     return param_groups
 
 
-def _get_dion_mesh(distributed_mesh: Any) -> Any:
-    if distributed_mesh is None:
+def _get_dion_mesh(device_mesh: Any) -> Any:
+    if device_mesh is None:
         return None
-    if not hasattr(distributed_mesh, "ndim") or distributed_mesh.ndim == 1:
-        return distributed_mesh
+    if not hasattr(device_mesh, "ndim") or device_mesh.ndim == 1:
+        return device_mesh
     try:
-        logger.info(f"[Dion] Extracting dp_shard_cp 1D submesh from distributed_mesh: {distributed_mesh}")
-        dp_mesh_2d = distributed_mesh[("dp_replicate", "dp_shard_cp")]
+        logger.info(f"[Dion] Extracting dp_shard_cp 1D submesh from device_mesh: {device_mesh}")
+        dp_mesh_2d = device_mesh[("dp_replicate", "dp_shard_cp")]
         submesh = dp_mesh_2d["dp_shard_cp"]
         if hasattr(submesh, "ndim") and submesh.ndim == 1:
             logger.info(f"[Dion] Extracted dp_shard_cp 1D submesh via 2D mesh: {submesh}")
             return submesh
     except (KeyError, RuntimeError, TypeError) as e:
         logger.debug(f"[Dion] Could not access via (dp_replicate, dp_shard_cp): {e}")
-    return distributed_mesh
+    return device_mesh
 
 
 def build_dion_optimizer(
-    cfg_opt: Any,
+    config: "_DionFamilyConfig",
     model: nn.Module,
-    distributed_mesh: Optional[Any] = None,
-) -> Any:
+    *,
+    device_mesh: Optional[Any] = None,
+    mesh_kwarg: str | None = "distributed_mesh",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
-    Build a Dion-family optimizer with parameter grouping.
+    Build the parameter groups and resolve the device mesh for a Dion-family
+    optimizer.
+
+    This does not instantiate the optimizer; it returns ``(param_groups,
+    mesh_kwargs)`` so the caller (a typed config in
+    :mod:`nemo_automodel.components.optim.optimizer`) can assemble its own
+    constructor kwargs and instantiate the optimizer itself.  ``mesh_kwargs`` is a
+    dict that maps ``mesh_kwarg`` to the resolved mesh (or is empty when there is
+    no mesh), ready to splat into the optimizer constructor.
+
+    The parameter-grouping settings are read off ``config``: ``lr``,
+    ``weight_decay``, ``scalar_opt``, ``scalar_betas``, ``scalar_eps``
+    (required), and the optional ``scalar_lr``, ``embed_lr``, ``lm_head_lr`` and
+    ``no_compile``.
 
     Args:
-        cfg_opt: ConfigNode for the optimizer.
+        config: The dion-family config (see :class:`_DionFamilyConfig`) to read settings from.
         model: Model whose parameters are to be optimized.
-        distributed_mesh: Optional DeviceMesh for FSDP/TP.
-        process_group: Optional ProcessGroup for DDP.
+        device_mesh: Optional DeviceMesh for FSDP/TP. When non-empty it is
+            resolved to a 1-D Dion submesh.
+        mesh_kwarg: Name of the constructor argument that receives the resolved
+            mesh (``"distributed_mesh"`` for Muon/Dion2/NorMuon,
+            ``"outer_shard_mesh"`` for legacy Dion).  Set to ``None`` to never
+            include the mesh.
+
+    Returns:
+        A ``(param_groups, mesh_kwargs)`` tuple: the per-group parameter dicts and
+        the mesh constructor kwargs (``{mesh_kwarg: mesh}`` or ``{}``).
     """
     if _import_error:
         raise RuntimeError("Failed to import Dion. Please install Dion.") from _import_error
 
-    target = cfg_opt._target_
-
-    cfg_dict = cfg_opt.to_dict()
-
-    no_compile = cfg_dict.pop("no_compile", False)
-    if no_compile:
+    if getattr(config, "no_compile", False):
         import torch._dynamo
 
         torch._dynamo.config.disable = True
         logger.info("[Dion] no_compile=True: torch._dynamo fully disabled (optimizer runs in eager mode)")
 
-    scalar_opt = cfg_dict.pop("scalar_opt", "adamw")
-    scalar_betas = tuple(cfg_dict.pop("scalar_betas", [])) or None
-    scalar_eps = cfg_dict.pop("scalar_eps", None)
-    scalar_lr = cfg_dict.pop("scalar_lr", None)
-    embed_lr = cfg_dict.pop("embed_lr", None)
-    lm_head_lr = cfg_dict.pop("lm_head_lr", None)
+    scalar_betas = config.scalar_betas
+    if scalar_betas is not None:
+        scalar_betas = tuple(scalar_betas) or None
 
-    base_lr = float(cfg_dict.get("lr", 1e-4))
-    weight_decay = float(cfg_dict.get("weight_decay", 0.0))
-
-    signature = inspect.signature(target)
-    valid_keys = set(signature.parameters.keys())
-    cleaned_kwargs = {k: v for k, v in cfg_dict.items() if k in valid_keys}
+    base_lr = float(config.lr)
+    weight_decay = float(config.weight_decay)
 
     param_groups = _separate_param_groups(
         model,
         base_lr,
-        scalar_opt,
+        config.scalar_opt,
         weight_decay,
         scalar_betas=scalar_betas,
-        scalar_eps=scalar_eps,
-        scalar_lr=scalar_lr,
-        embed_lr=embed_lr,
-        lm_head_lr=lm_head_lr,
+        scalar_eps=config.scalar_eps,
+        scalar_lr=getattr(config, "scalar_lr", None),
+        embed_lr=getattr(config, "embed_lr", None),
+        lm_head_lr=getattr(config, "lm_head_lr", None),
     )
 
-    dion_mesh = _get_dion_mesh(distributed_mesh)
+    dion_mesh = _get_dion_mesh(device_mesh)
+    mesh_kwargs: dict[str, Any] = {}
+    if mesh_kwarg is not None and dion_mesh is not None:
+        mesh_kwargs[mesh_kwarg] = dion_mesh
 
-    if "distributed_mesh" in valid_keys:
-        cleaned_kwargs["distributed_mesh"] = dion_mesh
-    if "adjust_lr" in cfg_dict:
-        cleaned_kwargs["adjust_lr"] = cfg_dict["adjust_lr"]
-
-    logger.info(f"[Dion] Building optimizer with {len(param_groups)} param groups:")
+    logger.info(f"[Dion] Built {len(param_groups)} param groups:")
     for i, pg in enumerate(param_groups):
         algo = pg.get("algorithm", "dion2 (default)")
         n_params = len(pg["params"])
         n_elements = sum(p.numel() for p in pg["params"])
         lr_override = pg.get("lr", "default")
         logger.info(f"  Group {i}: algo={algo}, params={n_params}, elements={n_elements:,}, lr={lr_override}")
-    logger.info(f"[Dion] Optimizer kwargs: {cleaned_kwargs}")
 
-    return target(param_groups, **cleaned_kwargs)
+    return param_groups, mesh_kwargs

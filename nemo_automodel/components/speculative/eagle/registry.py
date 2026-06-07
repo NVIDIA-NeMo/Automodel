@@ -20,14 +20,18 @@ hard import dependency on every individual HF ``*Config`` class (which can
 differ between transformers versions) and matches NeMo AutoModel's existing
 ``_transformers/registry.MODEL_ARCH_MAPPING`` style.
 
-Today the dense draft (``LlamaEagle3DraftModel`` / ``LlamaEagleDraftModel``)
-covers all registered architectures: the implementation is config-driven and
-reads ``attention_bias``, ``mlp_bias``, ``head_dim``, ``rope_theta`` /
+The dense draft (``LlamaEagle3DraftModel`` / ``LlamaEagleDraftModel``) covers
+most registered architectures: the implementation is config-driven and reads
+``attention_bias``, ``mlp_bias``, ``head_dim``, ``rope_theta`` /
 ``rope_scaling``, and ``rms_norm_eps`` directly from the target config.
 Adding an architecture that fits this shape is a one-line registry
-append. Architectures that need a different draft (e.g. gpt-oss with its
-alternating sliding-window attention and non-standard RoPE) get a new
-``draft_cls`` entry pointing at a dedicated draft module.
+append. Architectures that need a different draft get a new ``draft_cls``
+entry pointing at a dedicated draft module -- e.g. gpt-oss
+(``GptOssForCausalLM``), whose YaRN RoPE (``rope_type="yarn"``) is not
+implemented by ``LlamaRotaryEmbedding``, uses :class:`GptOssEagle3DraftModel`
+(a thin subclass that swaps in gpt-oss's YaRN rotary so the draft stays
+positionally consistent with the target). See ``draft_gpt_oss.py`` for the
+rationale.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from dataclasses import dataclass
 
 from transformers import PreTrainedModel
 
+from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
 
@@ -65,6 +70,12 @@ _DENSE_ARCHITECTURES: tuple[str, ...] = (
 EAGLE3_DRAFT_REGISTRY: dict[str, DraftSpec] = {
     arch: DraftSpec(draft_cls=LlamaEagle3DraftModel) for arch in _DENSE_ARCHITECTURES
 }
+
+# gpt-oss MoE target. The draft is still Llama-style dense (it only consumes
+# post-block hidden states, like any MoE target), but it needs a dedicated
+# draft class to reproduce gpt-oss's YaRN RoPE -- see ``draft_gpt_oss.py``.
+# Only EAGLE-3 is wired up; EAGLE-1/2 for gpt-oss is not validated yet.
+EAGLE3_DRAFT_REGISTRY["GptOssForCausalLM"] = DraftSpec(draft_cls=GptOssEagle3DraftModel)
 
 
 EAGLE1_DRAFT_REGISTRY: dict[str, DraftSpec] = {
