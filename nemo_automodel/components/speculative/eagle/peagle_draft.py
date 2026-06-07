@@ -36,11 +36,10 @@ from nemo_automodel.components.models.llama.rope_utils import apply_rotary_pos_e
 from nemo_automodel.components.speculative.eagle.peagle_attention import create_peagle_mask_mod
 
 # flex_attention compiled for the CUDA training path. Inductor's flex backend is
-# not available on CPU, and its CUDA lowering requires head dimensions >= 16, so
-# ``_peagle_flex_attention`` dispatches unsupported cases to eager
-# ``flex_attention`` -- correct, just slower -- while keeping the optimized path
-# for real model dimensions. The compiled callable is lazy, so importing this
-# module on CPU costs nothing.
+# not available on CPU (it raises ``InductorError``), so ``_peagle_flex_attention``
+# dispatches to eager ``flex_attention`` there -- correct, just slower -- which
+# keeps the P-EAGLE unit tests and CPU smoke checks runnable. The compiled
+# callable is lazy, so importing this module on CPU costs nothing.
 _peagle_flex_attention_compiled = torch.compile(
     flex_attention,
     mode="max-autotune-no-cudagraphs",
@@ -48,8 +47,8 @@ _peagle_flex_attention_compiled = torch.compile(
 
 
 def _peagle_flex_attention(q, k, v, *, block_mask, scale):
-    """Run the P-EAGLE flex attention, compiling only supported CUDA shapes."""
-    flex = _peagle_flex_attention_compiled if q.is_cuda and q.shape[-1] >= 16 else flex_attention
+    """Run the P-EAGLE flex attention, compiling only on CUDA."""
+    flex = _peagle_flex_attention_compiled if q.is_cuda else flex_attention
     return flex(q, k, v, block_mask=block_mask, scale=scale)
 
 
