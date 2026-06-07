@@ -674,9 +674,14 @@ def _make_manual_allgather_cp_batch(
     pos_seq_dim,
     loss_mask,
     padding_token_id,
+    pad_multiple: int | None = None,
 ):
     cp_size = cp_mesh.size()
-    pad_len = (-seq_len) % (2 * cp_size)
+    divisor = int(pad_multiple or (2 * cp_size))
+    divisor = max(divisor, 2 * cp_size)
+    if divisor % cp_size != 0:
+        raise ValueError(f"Manual CP pad multiple must be divisible by cp_size, got {divisor=} {cp_size=}")
+    pad_len = (-seq_len) % divisor
     if pad_len:
         if "input_ids" in batch:
             batch["input_ids"] = _pad_tensor_seq_dim_(batch["input_ids"], 1, pad_len, padding_token_id)
@@ -843,6 +848,7 @@ def make_cp_batch_and_ctx(
     # Metadata such as mm_token_type_ids or _packed_seq_ids does not select this
     # path by itself because other VLMs can carry those fields.
     manual_allgather = bool(batch.pop("_cp_manual_allgather", False))
+    manual_pad_multiple = batch.pop("_cp_manual_pad_multiple", None)
 
     primary_key, primary_seq_tensor, seq_len, labels, position_ids, pos_seq_dim, loss_mask = _prepare_cp_batch_common(
         cp_mesh,
@@ -862,6 +868,7 @@ def make_cp_batch_and_ctx(
             pos_seq_dim=pos_seq_dim,
             loss_mask=loss_mask,
             padding_token_id=padding_token_id,
+            pad_multiple=manual_pad_multiple,
         )
 
     return _make_context_parallel_cp_batch_and_ctx(

@@ -157,6 +157,24 @@ def test_make_cp_batch_and_ctx_pads_to_cp_load_balance_multiple(monkeypatch):
     assert batch["mm_token_type_ids"][0, -1].item() == 0
 
 
+def test_make_cp_batch_and_ctx_respects_manual_pad_multiple(monkeypatch):
+    """Manual all-gather callers can request a stricter global padding multiple."""
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1, cp_rank=1)
+    batch = {
+        "input_ids": torch.arange(1, 13).view(1, -1),
+        "labels": torch.arange(1, 13).view(1, -1),
+        "_cp_manual_allgather": True,
+        "_cp_manual_pad_multiple": 16,
+    }
+
+    _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
+
+    assert batch["input_ids"].shape[1] == 8
+    assert torch.equal(batch["input_ids"], torch.tensor([[9, 10, 11, 12, 99, 99, 99, 99]]))
+    assert torch.equal(batch["labels"], torch.tensor([[9, 10, 11, 12, -100, -100, -100, -100]]))
+    assert torch.equal(batch["position_ids"], torch.arange(8, 16).view(1, -1))
+
+
 def test_make_cp_batch_and_ctx_mm_token_type_ids_do_not_select_manual_allgather(monkeypatch):
     """VLM metadata alone should not opt models into manual all-gather CP."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)

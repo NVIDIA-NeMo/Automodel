@@ -211,30 +211,39 @@ def build_dsv4_sparse_topk_indices(
     compress_ratio: int = 0,
     compressed_topk: torch.Tensor | None = None,
     n_pooled: int = 0,
+    vanilla_key_len: int | None = None,
+    q_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build Miles-style top-k key indices for DSV4 local-window + compressed KV attention."""
-    window = min(seq_len, window_size)
-    q_pos = torch.arange(seq_len, device=device)
-    k_pos = (q_pos.unsqueeze(1) - window_size + 1).clamp(min=0) + torch.arange(window, device=device)
-    window_topk = torch.where(k_pos > q_pos.unsqueeze(1), torch.full_like(k_pos, -1), k_pos)
-    topk = window_topk.unsqueeze(0).expand(batch_size, -1, -1)
+    vanilla_key_len = seq_len if vanilla_key_len is None else vanilla_key_len
+    window = min(vanilla_key_len, window_size)
+    if q_positions is None:
+        q_pos = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    else:
+        if q_positions.dim() == 1:
+            q_positions = q_positions.unsqueeze(0)
+        q_pos = q_positions.to(device=device, dtype=torch.long)
+        if q_pos.shape[0] == 1 and batch_size > 1:
+            q_pos = q_pos.expand(batch_size, -1)
+    offsets = torch.arange(window, device=device, dtype=torch.long)
+    k_pos = (q_pos.unsqueeze(-1) - window_size + 1).clamp(min=0) + offsets.view(1, 1, window)
+    topk = torch.where(k_pos > q_pos.unsqueeze(-1), torch.full_like(k_pos, -1), k_pos)
 
     if n_pooled > 0:
         if compressed_topk is not None:
             compressed = torch.where(
                 compressed_topk >= 0,
-                compressed_topk + seq_len,
+                compressed_topk + vanilla_key_len,
                 torch.full_like(compressed_topk, -1),
             )
         else:
-            pooled_pos = torch.arange(n_pooled, device=device).unsqueeze(0).expand(seq_len, -1)
-            threshold = ((q_pos + 1) // compress_ratio).unsqueeze(1)
+            pooled_pos = torch.arange(n_pooled, device=device, dtype=torch.long).view(1, 1, n_pooled)
+            threshold = ((q_pos + 1) // compress_ratio).unsqueeze(-1)
             compressed = torch.where(
                 pooled_pos < threshold,
-                pooled_pos + seq_len,
+                pooled_pos + vanilla_key_len,
                 torch.full_like(pooled_pos, -1),
-            ).unsqueeze(0)
-            compressed = compressed.expand(batch_size, -1, -1)
+            )
         topk = torch.cat([topk, compressed], dim=-1)
 
     topk = torch.where((topk >= 0) & (topk < key_len), topk, torch.full_like(topk, -1))
@@ -383,6 +392,8 @@ def dsv4_indexer_scores(
     compress_ratio: int,
     softmax_scale: float,
     backend: Dsv4IndexerBackend,
+    query_start: int = 0,
+    query_total_len: int | None = None,
 ) -> torch.Tensor:
     """Run DSV4 C4 indexer scores through Miles TileLang kernels or torch fallback."""
     if _should_use_tilelang(
@@ -394,7 +405,11 @@ def dsv4_indexer_scores(
     ):
         seq_len = q.shape[1]
         seq_len_kv = pooled_kv.shape[1]
-        cu_ks, cu_ke = _miles_make_causal_cu_seqlens(seq_len, seq_len_kv, compress_ratio, q.device)
+        query_total_len = seq_len if query_total_len is None else query_total_len
+        cu_ks, cu_ke = _miles_make_causal_cu_seqlens(query_total_len, seq_len_kv, compress_ratio, q.device)
+        if query_start or query_total_len != seq_len:
+            cu_ks = cu_ks[query_start : query_start + seq_len]
+            cu_ke = cu_ke[query_start : query_start + seq_len]
         return _miles_batched_indexer_fwd(
             q.transpose(0, 1).contiguous(),
             pooled_kv.transpose(0, 1).contiguous(),
