@@ -1241,7 +1241,7 @@ def test_uncompressed_draft_has_no_remap_buffers():
 def test_set_vocab_mapping_builds_offset_and_mask():
     """d2t is the draft->target offset; t2d marks selected target ids."""
     model = LlamaEagle3DraftModel(_make_draft_config(vocab_size=128, draft_vocab_size=4))
-    selected = torch.tensor([5, 9, 50, 100], dtype=torch.long)  # draft id -> target id (all unique, like a real pruned map)
+    selected = torch.tensor([5, 9, 50, 100], dtype=torch.long)  # draft id -> target id (all unique)
 
     model.set_vocab_mapping(selected)
 
