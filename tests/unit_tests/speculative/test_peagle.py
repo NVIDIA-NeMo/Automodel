@@ -61,6 +61,12 @@ def _build_tiny_draft_model(
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
+        # P-EAGLE compiles flex_attention on CUDA; Inductor's flex Triton kernel
+        # refuses to lower head_dim < 16. hidden_size // num_attention_heads = 8
+        # here, so set a decoupled head_dim >= 16 (the draft reads it via
+        # getattr(config, "head_dim", ...)). Keeps hidden_size/target_hidden_size
+        # at 32 so the rest of the tiny-config assertions are unchanged.
+        head_dim=16,
         vocab_size=128,
         max_position_embeddings=64,
     )
