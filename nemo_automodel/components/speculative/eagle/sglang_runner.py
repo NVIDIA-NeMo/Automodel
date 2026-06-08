@@ -220,6 +220,11 @@ class SGLangTargetRunner:
             gpu_id=gpu_id,
             tp_rank=0,
             tp_size=tp_size,
+            # No expert parallelism for the target runner: a dense target has no
+            # experts, and a MoE target is run with plain TP here. sglang>=0.5.9
+            # made these required positional args on ModelRunner.
+            moe_ep_rank=0,
+            moe_ep_size=1,
             pp_rank=0,
             pp_size=1,
             nccl_port=None,
