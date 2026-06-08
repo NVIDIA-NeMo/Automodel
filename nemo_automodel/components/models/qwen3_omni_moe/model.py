@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTextConfig,
     Qwen3OmniMoeThinkerConfig,
@@ -29,7 +30,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -60,6 +61,12 @@ class Qwen3OmniMoeThinkerTextModel(
         # Map HF Qwen3OmniMoe config -> our MoE wrapper
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
+
+        # Resolve model dtype once; thread it explicitly to every sub-module
+        # so fp32 master weights work even when construction is not wrapped in
+        # local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
@@ -79,16 +86,19 @@ class Qwen3OmniMoeThinkerTextModel(
             router_bias=False,
             expert_activation="swiglu",
             softmax_before_topk=True,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, dtype=model_dtype)
         self.layers = nn.ModuleList(
             [Block(layer_id, config, self.moe_config, backend) for layer_id in range(config.num_hidden_layers)]
         )
-        self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        )
         self.rotary_emb = Qwen3OmniMoeThinkerTextRotaryEmbedding(config)
 
     def forward(
@@ -222,6 +232,22 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         base_config = config.thinker_config if hasattr(config, "thinker_config") else config
         backend = backend or BackendConfig()
 
+        # _init_model() only overrides the top-level hf_config.torch_dtype; for
+        # Omni configs the real params live under thinker_config.text_config /
+        # thinker_config.vision_config, whose torch_dtype still holds the
+        # checkpoint's original value. Propagate the user-requested dtype to
+        # every nested sub-config that exposes a torch_dtype attribute (both
+        # the top-level and the thinker sub-config) so the HF parent, our
+        # text backend, and any HF vision / multimodal code agree.
+        top_dtype = getattr(config, "torch_dtype", None)
+        if top_dtype is not None:
+            for parent in (config, base_config):
+                for sub_cfg in vars(parent).values():
+                    if sub_cfg is not parent and hasattr(sub_cfg, "torch_dtype"):
+                        sub_cfg.torch_dtype = top_dtype
+            if base_config is not config and getattr(base_config, "torch_dtype", None) != top_dtype:
+                base_config.torch_dtype = top_dtype
+
         super().__init__(base_config)
 
         self.backend = backend
@@ -231,8 +257,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.model = Qwen3OmniMoeThinkerTextModel(
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )
+        model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
-            self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
+            self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype
         )
 
         self.vocab_size = text_config.vocab_size
@@ -250,7 +277,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 text_config,
                 self.model.moe_config,
                 self.backend,
-                dtype=get_dtype(text_config.torch_dtype, torch.bfloat16),
+                dtype=model_dtype,
             )
 
     def get_input_embeddings(self):
@@ -283,8 +310,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         output_router_logits: bool | None = None,
         use_audio_in_video: bool | None = None,
         video_second_per_grid: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor | dict:
+    ) -> torch.Tensor | dict | CausalLMOutputWithPast:
         """Forward pass with multimodal fusion.
 
         Args:
@@ -304,11 +333,26 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             output_router_logits: Whether to output router logits
             use_audio_in_video: Whether audio is in video
             video_second_per_grid: Seconds per grid for videos
+            logits_to_keep: If > 0, only compute logits for the last
+                ``logits_to_keep`` token positions (0 = all positions). Enables
+                memory-efficient fused cross-entropy by letting the recipe request
+                a single-position lm_head projection alongside the final hidden
+                states.
+            output_hidden_states: When set, the returned output carries the final
+                hidden states (the input to ``lm_head``) so the recipe can run
+                fused linear cross-entropy.
             **attn_kwargs: Additional attention arguments
 
         Returns:
-            Logits tensor or dict with loss/aux_loss if labels provided
+            Logits tensor, a dict with loss/aux_loss if labels provided, or a
+            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`
+            carrying the final hidden states when ``output_hidden_states`` is set.
         """
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
         if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
@@ -447,10 +491,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             **attn_kwargs,
         )
 
-        logits = self.lm_head(hidden) if self.lm_head else hidden
+        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
 
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
-            logits = logits.unsqueeze(0)
+        if is_thd and output_hidden_states and hidden.dim() == 2:
+            hidden = hidden.unsqueeze(0)
 
         # 5. Optionally compute loss/aux outputs
         if labels is not None or output_router_logits:
@@ -473,7 +518,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 aux_loss = torch.tensor(0.0, device=logits.device)
                 output["aux_loss"] = aux_loss
 
+            if output_hidden_states:
+                output["hidden_states"] = hidden
+
             return output
+
+        if output_hidden_states:
+            return CausalLMOutputWithPast(logits=logits, hidden_states=hidden)
 
         return logits
 

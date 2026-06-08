@@ -211,6 +211,9 @@ class TestMoELatentProjectionForward:
                 patch("torch.cuda.Stream") as mock_stream_class,
                 patch("torch.cuda.current_stream") as mock_current_stream,
                 patch("torch.cuda.stream") as mock_stream_context,
+                # The shared-expert fork/join calls Tensor.record_stream with the
+                # mocked stream; no-op the helper so the mock isn't passed to it.
+                patch("nemo_automodel.components.moe.layers._record_stream_safe"),
             ):
                 mock_stream = Mock()
                 mock_stream.wait_stream = Mock()

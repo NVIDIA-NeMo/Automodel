@@ -1142,6 +1142,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         pretrained_model_name_or_path: str,
         pooling: str = "avg",
         l2_normalize: bool = True,
+        do_distributed_inbatch_negative: bool = False,
+        detach_distributed_inbatch_negatives: bool = True,
         **kwargs,
     ) -> PreTrainedModel:
         """Load a bi-encoder model with infrastructure.
@@ -1153,6 +1155,10 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
             pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.).
             l2_normalize: Whether to L2-normalize embeddings.
+            do_distributed_inbatch_negative: Whether to gather passages across ranks for distributed in-batch
+                negatives during training.
+            detach_distributed_inbatch_negatives: Whether to detach remote passage embeddings in distributed
+                in-batch-negative losses. Set to false for full cross-rank gradient flow.
             **kwargs: Forwarded to ``_NeMoAutoModelForRetrievalBase.from_pretrained``.
 
         Returns:
@@ -1162,6 +1168,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             pretrained_model_name_or_path,
             pooling=pooling,
             l2_normalize=l2_normalize,
+            do_distributed_inbatch_negative=do_distributed_inbatch_negative,
+            detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
             **kwargs,
         )
 

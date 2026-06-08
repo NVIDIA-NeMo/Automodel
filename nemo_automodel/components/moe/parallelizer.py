@@ -294,13 +294,18 @@ def apply_fsdp(
     for block in _iter_moe_blocks(model, _model):
         moe_module = _get_moe_module(block)
         if isinstance(moe_module, MoE) and ep_shard_enabled:
-            # ndim-aware: >=2D expert weights shard on dim 1, 1D bias on dim 0
-            # (see _moe_shard_placement).
+            # Apply FSDP on dim=1 for grouped experts since we may have more
+            # shards than experts (dim=0).
+            # Forward the same mp_policy used elsewhere so that when params are
+            # kept in fp32 (e.g. for fp32 master weights under FSDP2) the
+            # all-gathered expert weights are still cast to param_dtype for
+            # forward compute (required by GMM / TE kernels that expect bf16).
             fully_shard(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=_moe_shard_placement,
                 reshard_after_forward=reshard_after_forward,
+                mp_policy=mp_policy,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters
@@ -372,7 +377,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     # "Padding mask not supported with context parallelism!".
     _model._cp_enabled = True
 
-    for _, block in _model.layers.named_children():
+    for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
         if layer_type in ("full_attention", "sliding_attention"):

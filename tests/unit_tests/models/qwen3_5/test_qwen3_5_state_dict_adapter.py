@@ -11,15 +11,15 @@ from nemo_automodel.components.models.qwen3_5.state_dict_adapter import (
     Qwen3_5DenseStateDictAdapter,
     _route_to_fp32_holder,
     _strip_fp32_prefix,
+    map_qwen3_5_mtp_from_hf_key,
+    map_qwen3_5_mtp_to_hf_key,
 )
 
 
 class TestStripFp32Prefix:
     def test_strips_linear_attn_fp32_prefix(self):
         assert (
-            _strip_fp32_prefix(
-                "model.language_model.layers.0.linear_attn._fp32_params.A_log"
-            )
+            _strip_fp32_prefix("model.language_model.layers.0.linear_attn._fp32_params.A_log")
             == "model.language_model.layers.0.linear_attn.A_log"
         )
 
@@ -81,13 +81,12 @@ class TestAdapter:
             and "model.language_model.layers.0.linear_attn._fp32_params.A_log" not in out
         )
         # Tensors are passed through by reference (no copy).
-        assert out["model.language_model.layers.0.linear_attn.A_log"] is sd[
-            "model.language_model.layers.0.linear_attn._fp32_params.A_log"
-        ]
+        assert (
+            out["model.language_model.layers.0.linear_attn.A_log"]
+            is sd["model.language_model.layers.0.linear_attn._fp32_params.A_log"]
+        )
         # Non-fp32 keys are unchanged.
-        assert out["model.language_model.embed_tokens.weight"] is sd[
-            "model.language_model.embed_tokens.weight"
-        ]
+        assert out["model.language_model.embed_tokens.weight"] is sd["model.language_model.embed_tokens.weight"]
         # Number of keys preserved.
         assert len(out) == len(sd)
 
@@ -113,6 +112,30 @@ class TestAdapter:
         )
         assert "model.language_model.layers.0.self_attn.q_proj.weight" in out
 
+    def test_from_hf_keeps_bare_a_log_when_configured_for_unpatched_model(self):
+        hf_sd = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2),
+        }
+        adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=False)
+
+        out = adapter.from_hf(hf_sd)
+
+        assert "model.language_model.layers.0.linear_attn.A_log" in out
+        assert "model.language_model.layers.0.linear_attn._fp32_params.A_log" not in out
+
+    def test_from_hf_routes_a_log_when_configured_for_patched_model(self):
+        hf_sd = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2),
+        }
+        adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=True)
+
+        out = adapter.from_hf(hf_sd)
+
+        assert "model.language_model.layers.0.linear_attn._fp32_params.A_log" in out
+        assert "model.language_model.layers.0.linear_attn.A_log" not in out
+
     def test_round_trip_is_identity(self):
         sd = self._sample_state_dict()
         round_tripped = self.adapter.from_hf(self.adapter.to_hf(sd))
@@ -129,7 +152,35 @@ class TestAdapter:
 
     def test_convert_single_tensor_passthrough(self):
         t = torch.zeros(2, 2)
-        out = self.adapter.convert_single_tensor_to_hf(
-            "model.language_model.embed_tokens.weight", t
-        )
+        out = self.adapter.convert_single_tensor_to_hf("model.language_model.embed_tokens.weight", t)
         assert out == [("model.language_model.embed_tokens.weight", t)]
+
+
+class TestMTPKeyMapping:
+    def test_maps_hf_mtp_fusion_keys_to_native(self):
+        assert map_qwen3_5_mtp_from_hf_key("mtp.fc.weight") == "mtp.layers.0.eh_proj.weight"
+        assert map_qwen3_5_mtp_from_hf_key("mtp.pre_fc_norm_embedding.weight") == "mtp.layers.0.enorm.weight"
+        assert map_qwen3_5_mtp_from_hf_key("mtp.pre_fc_norm_hidden.weight") == "mtp.layers.0.hnorm.weight"
+        assert map_qwen3_5_mtp_from_hf_key("mtp.norm.weight") == "mtp.layers.0.final_layernorm.weight"
+
+    def test_maps_native_mtp_fusion_keys_to_hf(self):
+        assert map_qwen3_5_mtp_to_hf_key("mtp.layers.0.eh_proj.weight") == "mtp.fc.weight"
+        assert map_qwen3_5_mtp_to_hf_key("mtp.layers.0.enorm.weight") == "mtp.pre_fc_norm_embedding.weight"
+        assert map_qwen3_5_mtp_to_hf_key("mtp.layers.0.hnorm.weight") == "mtp.pre_fc_norm_hidden.weight"
+        assert map_qwen3_5_mtp_to_hf_key("mtp.layers.0.final_layernorm.weight") == "mtp.norm.weight"
+
+    def test_adapter_round_trips_mtp_keys(self):
+        adapter = Qwen3_5DenseStateDictAdapter()
+        native = {
+            "mtp.layers.0.eh_proj.weight": torch.randn(8, 16),
+            "mtp.layers.0.self_attn.q_proj.weight": torch.randn(16, 8),
+        }
+
+        hf = adapter.to_hf(native)
+        assert "mtp.fc.weight" in hf
+        assert "mtp.layers.0.self_attn.q_proj.weight" in hf
+
+        roundtrip = adapter.from_hf(hf)
+        assert set(roundtrip) == set(native)
+        for key, tensor in native.items():
+            assert roundtrip[key] is tensor

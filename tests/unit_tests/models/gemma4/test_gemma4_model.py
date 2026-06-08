@@ -154,7 +154,8 @@ class TestGemma4Gate:
 
     def test_scale_initialized_to_ones(self, text_config):
         gate = Gemma4Gate(text_config)
-        torch.testing.assert_close(gate.scale, torch.ones(text_config.hidden_size))
+        # scale storage dtype follows config.torch_dtype; assert the value, not dtype.
+        torch.testing.assert_close(gate.scale, torch.ones(text_config.hidden_size, dtype=gate.scale.dtype))
 
     def test_forward_output_shapes(self, text_config):
         gate = Gemma4Gate(text_config)
@@ -192,6 +193,40 @@ class TestGemma4Gate:
 
         assert (indices >= 0).all()
         assert (indices < text_config.num_experts).all()
+
+    def test_routing_computed_in_fp32_under_bf16_storage(self, text_config, monkeypatch):
+        # Contract: the routing linear + softmax must run in fp32 regardless of
+        # bf16 parameter storage and bf16 activations, so bf16 rounding cannot
+        # flip top-k expert selection. text_config defaults to bf16 storage.
+        import torch.nn.functional as F
+
+        gate = Gemma4Gate(text_config)
+        assert gate.proj.weight.dtype == torch.bfloat16
+        assert gate.scale.dtype == torch.bfloat16
+
+        seen = {}
+        real_linear, real_softmax = F.linear, F.softmax
+
+        def linear_spy(inp, weight, *args, **kwargs):
+            seen["linear_in"] = inp.dtype
+            seen["linear_w"] = weight.dtype
+            return real_linear(inp, weight, *args, **kwargs)
+
+        def softmax_spy(inp, *args, **kwargs):
+            seen["softmax_in"] = inp.dtype
+            return real_softmax(inp, *args, **kwargs)
+
+        monkeypatch.setattr(F, "linear", linear_spy)
+        monkeypatch.setattr(F, "softmax", softmax_spy)
+
+        x = torch.randn(2, 4, text_config.hidden_size, dtype=torch.bfloat16)
+        weights, _, _ = gate(x)
+
+        assert seen["linear_in"] == torch.float32
+        assert seen["linear_w"] == torch.float32
+        assert seen["softmax_in"] == torch.float32
+        # weights are cast back to the input dtype for the downstream experts
+        assert weights.dtype == torch.bfloat16
 
     def test_init_weights_is_noop(self, text_config):
         gate = Gemma4Gate(text_config)
@@ -520,9 +555,10 @@ class TestGemma4ForConditionalGeneration:
                 last_hidden_state=torch.randn(batch, seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
             ),
         ):
-            logits = model(input_ids)
+            out = model(input_ids)
 
-        assert logits.shape == (batch, seq, text_config.vocab_size)
+        # MoE forward now returns a CausalLMOutputWithPast (cut-CE support); read .logits.
+        assert out.logits.shape == (batch, seq, text_config.vocab_size)
 
     def test_forward_applies_logit_softcapping(self, backend_config, device):
         cfg = _make_gemma4_config(final_logit_softcapping=30.0)
@@ -540,9 +576,9 @@ class TestGemma4ForConditionalGeneration:
             "forward",
             return_value=MagicMock(last_hidden_state=large_hidden),
         ):
-            logits = model(input_ids)
+            out = model(input_ids)
 
-        assert logits.abs().max() <= 30.0 + 1e-2
+        assert out.logits.abs().max() <= 30.0 + 1e-2
 
     def test_forward_generates_cache_position(self, gemma4_config, backend_config, device):
         model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend_config)
@@ -568,6 +604,52 @@ class TestGemma4ForConditionalGeneration:
             captured["cache_position"],
             torch.arange(seq, device=device),
         )
+
+    def test_forward_casts_pooled_image_features_to_projector_dtype(self, gemma4_config, backend_config, device):
+        class DtypeCheckingVisionEmbedder(torch.nn.Module):
+            def __init__(self, hidden_size):
+                super().__init__()
+                self.proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+                self.seen_dtype = None
+
+            def forward(self, *, inputs_embeds):
+                self.seen_dtype = inputs_embeds.dtype
+                return self.proj(inputs_embeds)
+
+        model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend_config)
+        model = model.to(device).to(torch.float32)
+
+        hidden_size = gemma4_config.text_config.hidden_size
+        embedder = DtypeCheckingVisionEmbedder(hidden_size).to(device).to(torch.bfloat16)
+        model.model.embed_vision = embedder
+
+        batch, seq = 1, 3
+        inputs_embeds = torch.randn(batch, seq, hidden_size, device=device, dtype=torch.float32)
+        pixel_values = torch.randn(batch, 1, device=device, dtype=torch.bfloat16)
+        mm_token_type_ids = torch.tensor([[1, 0, 0]], device=device)
+
+        def fake_get_image_features(pixel_values, image_position_ids=None, return_dict=True):
+            pooled = torch.randn(batch, 1, hidden_size, device=device, dtype=torch.float32)
+            return MagicMock(pooler_output=model.model.embed_vision(inputs_embeds=pooled))
+
+        captured = {}
+
+        def fake_language_model_forward(**kwargs):
+            captured["inputs_embeds"] = kwargs["inputs_embeds"]
+            return MagicMock(last_hidden_state=kwargs["inputs_embeds"])
+
+        with (
+            patch.object(model.model, "get_image_features", side_effect=fake_get_image_features),
+            patch.object(model.model.language_model, "forward", side_effect=fake_language_model_forward),
+        ):
+            model(
+                inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+
+        assert embedder.seen_dtype == torch.bfloat16
+        assert captured["inputs_embeds"].dtype == torch.float32
 
     def test_initialize_weights_dense_only_casts_dtype(self, dense_config, backend_config):
         model = Gemma4ForConditionalGeneration(dense_config, backend=backend_config)

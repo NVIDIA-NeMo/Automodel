@@ -233,12 +233,18 @@ navigation:
       - page: "Function Calling with NeMo AutoModel using FunctionGemma"
         path: ./nightly/pages/guides/llm/toolcalling.mdx
         slug: function-calling
+      - page: "Multi-Turn Agent (Tool-Calling) SFT with NeMo AutoModel"
+        path: ./nightly/pages/guides/llm/agent-sft.mdx
+        slug: agent-sft
       - page: "Knowledge Distillation with NeMo AutoModel"
         path: ./nightly/pages/guides/llm/knowledge-distillation.mdx
         slug: knowledge-distillation
       - page: "Fine-Tune Large MoE LLMs"
         path: ./nightly/pages/guides/llm/large-moe-finetune.mdx
         slug: large-moe-fine-tuning
+      - page: "Fine-Tune Nemotron-3-Ultra-550B"
+        path: ./nightly/pages/guides/llm/nemotron-3-ultra.mdx
+        slug: nemotron-3-ultra
       - page: "DeepSeek V4 Flash"
         path: ./nightly/pages/guides/llm/dsv4-flash.mdx
         slug: deepseek-v4-flash

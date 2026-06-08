@@ -310,9 +310,11 @@ def instantiate_infrastructure(
     if ep_size > 1:
         from nemo_automodel.components.moe.parallelizer import parallelize_model
 
-        parallelize_fn = partial(
-            parallelize_model, activation_checkpointing=activation_checkpointing, **moe_config.to_dict()
-        )
+        moe_kwargs = moe_config.to_dict()
+        # Forward mp_policy from distributed config if not explicitly set in MoE config
+        if moe_kwargs.get("mp_policy") is None and model_wrapper is not None:
+            moe_kwargs["mp_policy"] = getattr(model_wrapper, "mp_policy", None)
+        parallelize_fn = partial(parallelize_model, activation_checkpointing=activation_checkpointing, **moe_kwargs)
     elif autopipeline is not None and model_wrapper is not None:
         parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
 
@@ -405,14 +407,15 @@ def apply_model_infrastructure(
     if mesh is None:
         mesh = MeshContext()
 
-    # Create a dummy checkpointer. We can pass in dummy values here since we are only loading the base weights.
+    # Create a checkpointer for loading base weights only. Keep consolidation disabled
+    # so load-only infrastructure does not emit save/export warnings.
     ckpt_config = CheckpointingConfig(
         enabled=True,
         checkpoint_dir="",
         model_save_format="safetensors",
         model_cache_dir=cache_dir,
         model_repo_id=pretrained_model_name_or_path,
-        save_consolidated=True,
+        save_consolidated=False,
         is_peft=peft_config is not None,
     )
     checkpointer = Checkpointer(

@@ -19,10 +19,18 @@ These classes subclass from DeepSeek V3, with the main difference being
 the use of DeepseekV32MLA (with Indexer) instead of the standard MLA.
 """
 
+from typing import Any, Optional, Union
+
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.models.common import BackendConfig, get_rope_config, initialize_rms_norm_module
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    compute_lm_head_logits,
+    get_rope_config,
+    initialize_rms_norm_module,
+)
 from nemo_automodel.components.models.deepseek_v3.model import (
     Block,
     DeepseekV3ForCausalLM,
@@ -33,6 +41,7 @@ from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Conf
 from nemo_automodel.components.models.deepseek_v32.layers import DeepseekV32MLA
 from nemo_automodel.components.models.deepseek_v32.state_dict_adapter import DeepSeekV32StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -59,14 +68,20 @@ class DeepseekV32Block(Block):
         from nemo_automodel.components.models.common import initialize_rms_norm_module
         from nemo_automodel.components.moe.layers import MLP, MoE
 
+        # Thread dtype from config.torch_dtype so the block's own params stay
+        # aligned with the rest of the model (fp32 under fp32 master weights).
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         if layer_idx < config.first_k_dense_replace:
-            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
+            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
         else:
             self.mlp = MoE(moe_config, backend)
 
-        self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
+        )
         self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
         self.layer_idx = layer_idx
 
@@ -92,6 +107,12 @@ class DeepseekV32Model(DeepseekV3Model):
         self.config = config
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
+
+        # Resolve model dtype once; thread it explicitly to every sub-module
+        # so fp32 master weights work even when construction is not wrapped in
+        # local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
@@ -107,19 +128,20 @@ class DeepseekV32Model(DeepseekV3Model):
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             # Use V3.2 Block instead of V3 Block
             self.layers[str(layer_id)] = DeepseekV32Block(layer_id, config, self.moe_config, backend)
-        self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        )
 
         self.max_seq_len = config.max_position_embeddings
         rope_theta, rope_scaling, _ = get_rope_config(config)
@@ -183,11 +205,14 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
+        )
         if self.backend.enable_hf_state_dict_adapter:
             # Use V3.2 adapter instead of V3 adapter
             self.state_dict_adapter = DeepSeekV32StateDictAdapter(
-                self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
+                self.config, self.model.moe_config, self.backend, dtype=model_dtype
             )
 
     def get_input_embeddings(self):
@@ -201,6 +226,66 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
+        **attn_kwargs: Any,
+    ) -> CausalLMOutputWithPast:
+        """Forward pass returning :class:`CausalLMOutputWithPast`.
+
+        Supports both BSHD (``input_ids`` shape ``[B, S]`` -> hidden states
+        ``[B, S, H]``) and THD (``qkv_format == "thd"``; hidden states ``[T, H]``
+        after the batch dim is squeezed, with logits unsqueezed back to
+        ``[1, T, V]`` on exit).
+
+        Args:
+            input_ids: Input token IDs.
+            position_ids: Optional position indices.
+            attention_mask: Optional attention mask.
+            padding_mask: Optional padding mask.
+            logits_to_keep: If ``0`` (default) project all positions; if ``> 0``
+                (or a tensor of indices) only the last ``logits_to_keep`` positions
+                are projected through ``lm_head`` (memory-efficient generation /
+                fused-CE training).
+            output_hidden_states: When truthy, the returned output carries the
+                final (pre-``lm_head``) hidden states spanning the full sequence.
+            **attn_kwargs: Additional attention kwargs forwarded to the base model.
+
+        Returns:
+            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with
+            ``logits`` and, when ``output_hidden_states`` is set, ``hidden_states``.
+        """
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = attn_kwargs.get("qkv_format") == "thd"
+        if is_thd:
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
+        hidden_states = self.model(
+            input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            **attn_kwargs,
+        )
+
+        return compute_lm_head_logits(
+            self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
+        )
 
 
 ModelClass = DeepseekV32ForCausalLM
