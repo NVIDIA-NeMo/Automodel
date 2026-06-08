@@ -14,7 +14,13 @@
 
 import torch
 
-from nemo_automodel.recipes.retrieval.train_bi_encoder import _unwrap_model_for_attrs, _uses_multi_vector_scoring
+from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
+from nemo_automodel.recipes.retrieval import train_bi_encoder
+from nemo_automodel.recipes.retrieval.train_bi_encoder import (
+    TrainBiEncoderRecipe,
+    _unwrap_model_for_attrs,
+    _uses_multi_vector_scoring,
+)
 
 
 class _RetrieverAttrs(torch.nn.Module):
@@ -48,3 +54,74 @@ def test_retrieval_attrs_accept_unwrapped_model():
 
     assert _unwrap_model_for_attrs(inner) is inner
     assert _uses_multi_vector_scoring(inner) is True
+
+
+class _FakeCheckpointer:
+    def maybe_wait_for_staging(self):
+        pass
+
+
+class _FakeOptimizer:
+    param_groups = [{"lr": 1e-5}]
+
+    def step(self):
+        pass
+
+    def zero_grad(self):
+        pass
+
+
+class _FakeStepScheduler:
+    step = 1
+    epoch = 0
+
+
+def _make_recipe_for_optim_step(distributed_config):
+    recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
+    recipe.distributed_config = distributed_config
+    recipe.model_parts = [torch.nn.Linear(1, 1)]
+    recipe.pp_enabled = False
+    recipe.device_mesh = None
+    recipe.moe_mesh = None
+    recipe.checkpointer = _FakeCheckpointer()
+    recipe.optimizer = [_FakeOptimizer()]
+    recipe.lr_scheduler = None
+    recipe.step_scheduler = _FakeStepScheduler()
+    recipe.timestamp = 0.0
+    recipe._get_dp_group_size = lambda include_cp=True: 1
+
+    def _fake_forward_backward_step(*args, **kwargs):
+        kwargs["loss_buffer"].append(torch.tensor(1.0))
+
+    recipe._forward_backward_step = _fake_forward_backward_step
+    return recipe
+
+
+def test_retrieval_optim_step_uses_torch_clip_fast_path_for_ddp(monkeypatch):
+    captured = {}
+
+    def _fake_scale_grads_and_clip_grad_norm(*args, **kwargs):
+        captured.update(kwargs)
+        return 0.0
+
+    monkeypatch.setattr(train_bi_encoder, "scale_grads_and_clip_grad_norm", _fake_scale_grads_and_clip_grad_norm)
+
+    recipe = _make_recipe_for_optim_step(DDPConfig())
+    recipe._run_train_optim_step([{}], max_grad_norm=1.0)
+
+    assert captured["use_torch_clip_grad_norm"] is True
+
+
+def test_retrieval_optim_step_keeps_sharded_clip_path_for_fsdp2(monkeypatch):
+    captured = {}
+
+    def _fake_scale_grads_and_clip_grad_norm(*args, **kwargs):
+        captured.update(kwargs)
+        return 0.0
+
+    monkeypatch.setattr(train_bi_encoder, "scale_grads_and_clip_grad_norm", _fake_scale_grads_and_clip_grad_norm)
+
+    recipe = _make_recipe_for_optim_step(FSDP2Config())
+    recipe._run_train_optim_step([{}], max_grad_norm=1.0)
+
+    assert captured["use_torch_clip_grad_norm"] is False

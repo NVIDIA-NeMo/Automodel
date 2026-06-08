@@ -27,6 +27,7 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -521,6 +522,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             foreach=True,
             num_label_tokens=None,  # Not applicable for encoder
             dp_group_size=self._get_dp_group_size(include_cp=True),
+            use_torch_clip_grad_norm=isinstance(self.distributed_config, DDPConfig),
         )
 
         self.checkpointer.maybe_wait_for_staging()
