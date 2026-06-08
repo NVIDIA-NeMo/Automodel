@@ -21,13 +21,13 @@ import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.recipes.base_recipe import BaseRecipe, _find_latest_checkpoint
+from nemo_automodel.recipes.base_recipe import BaseRecipe, _find_latest_checkpoint, is_distributed_stateful
 
 try:
     import expecttest
 
     HAS_ET = True
-except:
+except Exception:
     HAS_ET = False
 
 
@@ -58,17 +58,28 @@ def _patch_checkpoint_ops(monkeypatch):
             self.tp_rank = tp_rank
             self.pp_rank = pp_rank
             self.moe_mesh = moe_mesh
+            self.distributed_saves = []
+            self.distributed_loads = []
 
-        def save_model(self, model=None, weights_path=None, peft_config=None, tokenizer=None):
+        def save_model(
+            self,
+            model=None,
+            weights_path=None,
+            peft_config=None,
+            tokenizer=None,
+            is_final_checkpoint=False,
+        ):
             """Save model state dict."""
+            del peft_config, tokenizer, is_final_checkpoint
             if model is None:
                 return
             model_dir = os.path.join(weights_path, "model")
             os.makedirs(model_dir, exist_ok=True)
             torch.save(model.state_dict(), os.path.join(model_dir, "model.pt"))
 
-        def load_model(self, model, model_path, is_init_step=False, use_checkpoint_id=True,
-                      key_mapping=None, quantization=False):
+        def load_model(
+            self, model, model_path, is_init_step=False, use_checkpoint_id=True, key_mapping=None, quantization=False
+        ):
             """Load model state dict."""
             if model is None:
                 return
@@ -105,6 +116,19 @@ def _patch_checkpoint_ops(monkeypatch):
             state_dir = os.path.join(path, state_name)
             state.load_state_dict(torch.load(os.path.join(state_dir, f"{state_name}.pt"), weights_only=False))
 
+        def save_distributed_state(self, state, state_name, path):
+            """Save stateful object through distributed-checkpoint route."""
+            self.distributed_saves.append((state_name, path))
+            state_dir = os.path.join(path, state_name)
+            os.makedirs(state_dir, exist_ok=True)
+            torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}.pt"))
+
+        def load_distributed_state(self, state, state_name, path):
+            """Load stateful object through distributed-checkpoint route."""
+            self.distributed_loads.append((state_name, path))
+            state_dir = os.path.join(path, state_name)
+            state.load_state_dict(torch.load(os.path.join(state_dir, f"{state_name}.pt"), weights_only=False))
+
     monkeypatch.setattr(checkpointing, "Checkpointer", MockCheckpointer)
     yield
 
@@ -131,6 +155,12 @@ class _DummyStateful:
         restore state
         """
         self.foo = state["foo"].clone()
+
+
+class _DummyDistributedStateful(_DummyStateful):
+    """Stateful test object that opts into distributed checkpointing."""
+
+    use_distributed_checkpointing = True
 
 
 class _ToyModel(HFCheckpointingMixin, nn.Linear):
@@ -230,8 +260,10 @@ def test_save_and_load_roundtrip(tmp_path, symlink_supported, monkeypatch):
 
     # Patch os.symlink to raise OSError if symlink_supported is False
     if not symlink_supported:
+
         def raise_os_error(*args, **kwargs):
             raise OSError("Symlink not supported")
+
         monkeypatch.setattr(os, "symlink", raise_os_error)
 
     # Save checkpoint.
@@ -262,6 +294,43 @@ def test_save_and_load_roundtrip(tmp_path, symlink_supported, monkeypatch):
     # Expect exact values from the moment of save().
     assert torch.allclose(recipe_inst.model.weight, weight_after_step)
     assert torch.allclose(recipe_inst.custom_state.foo, foo_after_step)
+
+
+def test_distributed_stateful_routes_through_distributed_checkpointing(tmp_path):
+    """Objects that opt in use checkpointer distributed save/load hooks."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    recipe_inst.distributed_state = _DummyDistributedStateful()
+    recipe_inst.distributed_state.foo += 7
+    saved_foo = recipe_inst.distributed_state.foo.clone()
+
+    recipe_inst.save_checkpoint(epoch=0, step=10, train_loss=1.0)
+
+    recipe_inst.distributed_state.foo += 13
+    recipe_inst.load_checkpoint(restore_from="LATEST")
+
+    ckpt_dir = str(tmp_path / "epoch_0_step_10")
+    assert torch.allclose(recipe_inst.distributed_state.foo, saved_foo)
+    assert recipe_inst.checkpointer.distributed_saves == [("distributed_state", ckpt_dir)]
+    assert recipe_inst.checkpointer.distributed_loads == [("distributed_state", ckpt_dir)]
+
+
+def test_untrack_state_removes_state_from_checkpoint_tracking(tmp_path):
+    """untrack_state lets recipes opt out of automatic checkpoint tracking."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    recipe_inst.distributed_state = _DummyDistributedStateful()
+
+    recipe_inst.untrack_state("distributed_state")
+    recipe_inst.save_checkpoint(epoch=0, step=11, train_loss=1.0)
+
+    assert recipe_inst.checkpointer.distributed_saves == []
+    assert not (tmp_path / "epoch_0_step_11" / "distributed_state").exists()
+
+
+def test_is_distributed_stateful_requires_opt_in_and_state_api():
+    """The distributed checkpoint route is only for explicit stateful objects."""
+    assert is_distributed_stateful(_DummyDistributedStateful()) is True
+    assert is_distributed_stateful(_DummyStateful()) is False
+    assert is_distributed_stateful(SimpleNamespace(use_distributed_checkpointing=True)) is False
 
 
 def test_load_checkpoint_fresh_start_empty_dir(tmp_path):
@@ -440,10 +509,13 @@ def test_load_checkpoint_autodetect_skips_peft_mismatch(tmp_path):
     full model). Auto-detect should skip such checkpoints.
     """
     # Save a checkpoint WITH a peft section in config
-    recipe_peft = _ToyRecipe(tmp_path, cfg_dict={
-        "model": {"pretrained_model_name_or_path": "toy/model-a"},
-        "peft": {"dim": 8, "alpha": 32},
-    })
+    recipe_peft = _ToyRecipe(
+        tmp_path,
+        cfg_dict={
+            "model": {"pretrained_model_name_or_path": "toy/model-a"},
+            "peft": {"dim": 8, "alpha": 32},
+        },
+    )
     x = torch.randn(4, 2)
     loss = recipe_peft.model(x).sum()
     loss.backward()
@@ -451,9 +523,12 @@ def test_load_checkpoint_autodetect_skips_peft_mismatch(tmp_path):
     recipe_peft.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
 
     # Create a new recipe WITHOUT peft (same model architecture)
-    recipe_no_peft = _ToyRecipe(tmp_path, cfg_dict={
-        "model": {"pretrained_model_name_or_path": "toy/model-a"},
-    })
+    recipe_no_peft = _ToyRecipe(
+        tmp_path,
+        cfg_dict={
+            "model": {"pretrained_model_name_or_path": "toy/model-a"},
+        },
+    )
     weight_before_load = recipe_no_peft.model.weight.clone()
 
     # Auto-detect should skip because PEFT mismatch

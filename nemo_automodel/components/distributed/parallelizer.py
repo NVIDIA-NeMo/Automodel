@@ -46,9 +46,18 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
-from transformers.models.gemma4.modeling_gemma4 import (
-    Gemma4ForConditionalGeneration,
-)
+
+try:
+    from transformers.models.gemma4.modeling_gemma4 import (
+        Gemma4ForConditionalGeneration,
+    )
+except (ImportError, ModuleNotFoundError):
+
+    class Gemma4ForConditionalGeneration:  # type: ignore[no-redef]
+        """Placeholder when the installed transformers build has no Gemma4."""
+
+        pass
+
 
 from nemo_automodel.components.distributed.activation_checkpointing import (
     SELECTIVE_AC_WRAPPER_FLAG,
@@ -109,7 +118,7 @@ try:
     from megatron_fsdp import fully_shard_model as megatron_fsdp_fully_shard_model
 
     HAVE_MEGATRON_FSDP = True
-except ImportError:
+except (ImportError, FileNotFoundError, OSError):
     pass
 
 # Import as module so tests can patch nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype
@@ -136,6 +145,55 @@ def apply_selective_activation_checkpointing(model: nn.Module, *, enable_compile
         return
     has_kv_sharing = detect_kv_sharing_and_maybe_disable_cache(model)
     apply_selective_checkpointing_to_layers(model, layers, has_kv_sharing, enable_compile=enable_compile)
+
+
+_BAGEL_FULL_LAYER_CHECKPOINT_MODULE_LISTS = (
+    "model.language_model.model.layers",
+    "model.vit_model.vision_model.encoder.layers",
+)
+
+
+def _get_module_by_fqn(module: nn.Module, fqn: str) -> Optional[nn.Module]:
+    obj = module
+    for part in fqn.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def _is_checkpoint_wrapped(module: nn.Module) -> bool:
+    return hasattr(module, "_checkpoint_wrapped_module")
+
+
+def _apply_bagel_full_layer_activation_checkpointing(model: nn.Module) -> bool:
+    """Apply native BAGEL-style activation checkpointing to whole logical layers."""
+    if type(model).__name__ != "BagelForUnifiedMultimodal":
+        return False
+
+    wrapped_count = 0
+    for fqn in _BAGEL_FULL_LAYER_CHECKPOINT_MODULE_LISTS:
+        container = _get_module_by_fqn(model, fqn)
+        if container is None:
+            logger.warning("BAGEL activation checkpointing skipped missing module list %s", fqn)
+            continue
+        if not isinstance(container, (nn.ModuleList, nn.ModuleDict)):
+            logger.warning(
+                "BAGEL activation checkpointing expected %s to be a module list, got %s",
+                fqn,
+                type(container),
+            )
+            continue
+
+        items = container.items() if isinstance(container, nn.ModuleDict) else enumerate(container)
+        for key, layer in list(items):
+            if _is_checkpoint_wrapped(layer):
+                continue
+            container[key] = checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+            wrapped_count += 1
+
+    logger.info("Applied BAGEL full-layer activation checkpointing to %d layers", wrapped_count)
+    return wrapped_count > 0
 
 
 class ParallelizationStrategy(ABC):
@@ -250,6 +308,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
 
             if is_selective_activation_checkpointing(activation_checkpointing):
                 apply_selective_checkpointing_to_layers(model, layers, _has_kv_sharing, enable_compile=enable_compile)
+            elif _apply_bagel_full_layer_activation_checkpointing(model):
+                logger.info("Using BAGEL full-layer activation checkpointing; skipping submodule checkpoint wrappers.")
             elif enable_compile:
                 # NO_REENTRANT is required for compile: REENTRANT's first forward runs under
                 # no_grad, causing AOT autograd to trace a forward-only graph that drops LoRA
@@ -1399,6 +1459,18 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         Gemma4ForConditionalGeneration: ["model.language_model.layers"],
         # String fallback in case of class identity mismatch across imports
         "Gemma4ForConditionalGeneration": ["model.language_model.layers"],
+        # BAGEL (text-to-image + understanding). String-keyed to avoid an
+        # import cycle: parallelizer is core distributed code, the BAGEL
+        # model lives under components/models/bagel/. Lists both the Qwen2
+        # decoder ModuleList and the SigLIP encoder ModuleList so each
+        # member becomes its own FSDP unit (matching upstream BAGEL's
+        # transformer_auto_wrap_policy class set; without the SigLIP
+        # entry, Stage 2 OOMs on 8x80GB because the SigLIP layers sit in
+        # the root FSDP unit's all-gather peak).
+        "BagelForUnifiedMultimodal": [
+            "model.language_model.model.layers",
+            "model.vit_model.vision_model.encoder.layers",
+        ],
     }
     LLM_MODEL_CLS_TO_LAYERS = {
         "NemotronHForCausalLM": ["backbone.layers"],

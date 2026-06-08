@@ -17,6 +17,12 @@ configs:
   - baichuan/baichuan_2_7b_squad_peft.yaml
   - cohere/cohere_command_r_7b_hellaswag_fp8.yaml
   - deepseek_v32/deepseek_v32_hellaswag_pp.yaml
+  - falcon/falcon_h1_0p5b_instruct_squad.yaml
+  - falcon/falcon_h1_1p5b_instruct_squad.yaml
+  - falcon/falcon_h1_7b_instruct_squad.yaml
+  - falcon/falcon_h1_7b_instruct_squad_peft.yaml
+  - falcon/falcon_h1_7b_instruct_hellaswag_peft.yaml
+  - falcon/falcon_h1_34b_instruct_squad_peft.yaml
   - gemma/gemma_3_270m_squad.yaml
   - gemma/gemma_3_270m_squad_peft.yaml
   - glm/glm_4_9b_chat_hf_hellaswag_fp8.yaml
@@ -30,6 +36,9 @@ configs:
   - mistral/ministral3_3b_squad_peft.yaml
   - mistral/mixtral-8x7b-v0-1_squad.yaml
   - mistral/mixtral-8x7b-v0-1_squad_peft.yaml
+  - minicpm/minicpm5_1b_hellaswag_peft.yaml
+  - minicpm/minicpm5_1b_squad.yaml
+  - minicpm/minicpm5_1b_squad_peft.yaml
   - moonlight/moonlight_16b_te.yaml
   - moonlight/moonlight_16b_te_packed_sequence.yaml
   - nemotron/llama3_3_nemotron_super_49B_squad.yaml

@@ -301,6 +301,17 @@ def apply_submodule_checkpointing(layers: List[nn.Module], has_kv_sharing: bool)
         if hasattr(layer, "post_attention_layernorm"):
             layer.post_attention_layernorm = checkpoint_wrapper(layer.post_attention_layernorm)  # type: ignore
 
+        # MoT (mixture-of-transformers) sibling submodules -- present in BAGEL's
+        # Qwen2MoTDecoderLayer for the generation expert. mlp_moe_gen is a full
+        # Qwen2MLP duplicate (same size as mlp), so omitting it from AC roughly
+        # doubles per-layer activation memory in Stage-2 BAGEL training.
+        if hasattr(layer, "mlp_moe_gen"):
+            layer.mlp_moe_gen = checkpoint_wrapper(layer.mlp_moe_gen)  # type: ignore
+        if hasattr(layer, "input_layernorm_moe_gen"):
+            layer.input_layernorm_moe_gen = checkpoint_wrapper(layer.input_layernorm_moe_gen)  # type: ignore
+        if hasattr(layer, "post_attention_layernorm_moe_gen"):
+            layer.post_attention_layernorm_moe_gen = checkpoint_wrapper(layer.post_attention_layernorm_moe_gen)  # type: ignore
+
 
 def _replace_child_module(root: nn.Module, target: nn.Module, replacement: nn.Module) -> bool:
     """Replace ``target`` with ``replacement`` in ``root``'s module tree."""

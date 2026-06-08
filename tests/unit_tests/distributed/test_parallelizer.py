@@ -28,9 +28,8 @@ from torch.distributed.tensor.parallel import (
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
+import nemo_automodel.components.distributed.parallelizer as parallelizer
 from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
-
-# Import the function under test
 from nemo_automodel.components.distributed.parallelizer import (
     _attention_is_head_sharded,
     _extract_model_layers,
@@ -147,6 +146,40 @@ def create_gemma3_mock():
     # Create an instance of the hybrid class
     mock = MockGemma3ModelWithTypeCheck()
     return mock
+
+
+class _CheckpointWrapped(nn.Module):
+    """Minimal checkpoint wrapper used by BAGEL activation-checkpointing tests."""
+
+    def __init__(self, inner, **kwargs):
+        super().__init__()
+        self._checkpoint_wrapped_module = inner
+        self.kwargs = kwargs
+
+    def forward(self, x):
+        return self._checkpoint_wrapped_module(x)
+
+
+def _make_bagel_model(num_language_layers: int = 2, num_vision_layers: int = 3):
+    """Build the nested layer containers used by BAGEL without importing BAGEL."""
+
+    class BagelForUnifiedMultimodal(nn.Module):
+        """Stand-in with the exact class name used by the production mapper."""
+
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.language_model = nn.Module()
+            self.model.language_model.model = nn.Module()
+            self.model.language_model.model.layers = nn.ModuleList([_FakeLayer() for _ in range(num_language_layers)])
+            self.model.vit_model = nn.Module()
+            self.model.vit_model.vision_model = nn.Module()
+            self.model.vit_model.vision_model.encoder = nn.Module()
+            self.model.vit_model.vision_model.encoder.layers = nn.ModuleList(
+                [_FakeLayer() for _ in range(num_vision_layers)]
+            )
+
+    return BagelForUnifiedMultimodal()
 
 
 @pytest.fixture
@@ -1272,6 +1305,10 @@ class TestActivationCheckpointingKVSharing:
                 super().__init__()
                 self._inner = inner
 
+            @property
+            def _checkpoint_wrapped_module(self):
+                return self._inner
+
             def forward(self, x):
                 return self._inner(x)
 
@@ -1279,7 +1316,7 @@ class TestActivationCheckpointingKVSharing:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
-            _Wrapped,
+            lambda module, **kwargs: _Wrapped(module),
         )
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
@@ -1449,6 +1486,17 @@ class TestActivationCheckpointingKVSharing:
             assert not isinstance(layer.self_attn, self._Wrapped)
             assert isinstance(layer.input_layernorm, self._Wrapped)
             assert isinstance(layer.post_attention_layernorm, self._Wrapped)
+
+    def test_bagel_parallelize_uses_full_layer_checkpointing(self):
+        """BAGEL wraps whole Qwen/SigLIP layers through the special AC path."""
+        model = _make_bagel_model(num_language_layers=2, num_vision_layers=2)
+
+        self._run_parallelize(model, activation_checkpointing=True)
+
+        language_layers = model.model.language_model.model.layers
+        vision_layers = model.model.vit_model.vision_model.encoder.layers
+        assert all(isinstance(layer, self._Wrapped) for layer in language_layers)
+        assert all(isinstance(layer, self._Wrapped) for layer in vision_layers)
 
     # ------------------------------------------------------------------ #
     # HF native gradient-checkpointing path
@@ -2059,3 +2107,55 @@ class TestExtractModelLayers:
         # 3 text-decoder + 2 vision tower layers, all flattened.
         assert len(result) == 5
         assert not any(isinstance(r, nn.ModuleList) for r in result)
+
+    def test_string_keyed_bagel_extracts_language_and_vision_layers(self):
+        """BAGEL exposes Qwen decoder layers and SigLIP encoder layers."""
+        model = _make_bagel_model(num_language_layers=2, num_vision_layers=3)
+
+        result = _extract_model_layers(model)
+
+        language_layers = model.model.language_model.model.layers
+        vision_layers = model.model.vit_model.vision_model.encoder.layers
+        assert len(result) == 5
+        assert [id(r) for r in result[:2]] == [id(layer) for layer in language_layers]
+        assert [id(r) for r in result[2:]] == [id(layer) for layer in vision_layers]
+
+
+class TestBagelFullLayerActivationCheckpointing:
+    """Tests for native BAGEL-style whole-layer activation checkpointing."""
+
+    def test_get_module_by_fqn_resolves_nested_module_and_missing_path(self):
+        """Nested FQN lookup returns the module or None for missing paths."""
+        model = _make_bagel_model()
+
+        result = parallelizer._get_module_by_fqn(model, "model.vit_model.vision_model.encoder.layers")
+
+        assert result is model.model.vit_model.vision_model.encoder.layers
+        assert parallelizer._get_module_by_fqn(model, "model.missing.layers") is None
+
+    def test_apply_bagel_full_layer_activation_checkpointing_wraps_each_layer(self, monkeypatch):
+        """BAGEL wraps Qwen and SigLIP layers once and skips already wrapped layers."""
+        model = _make_bagel_model(num_language_layers=2, num_vision_layers=3)
+        wrap_calls = []
+
+        def _fake_checkpoint_wrapper(module, **kwargs):
+            wrap_calls.append((module, kwargs))
+            return _CheckpointWrapped(module, **kwargs)
+
+        monkeypatch.setattr(parallelizer, "checkpoint_wrapper", _fake_checkpoint_wrapper)
+
+        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(model) is True
+
+        language_layers = model.model.language_model.model.layers
+        vision_layers = model.model.vit_model.vision_model.encoder.layers
+        wrapped_layers = list(language_layers) + list(vision_layers)
+        assert len(wrap_calls) == 5
+        assert all(isinstance(layer, _CheckpointWrapped) for layer in wrapped_layers)
+        assert all(call_kwargs["checkpoint_impl"].name == "NO_REENTRANT" for _, call_kwargs in wrap_calls)
+
+        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(model) is False
+        assert len(wrap_calls) == 5
+
+    def test_apply_bagel_full_layer_activation_checkpointing_ignores_other_models(self):
+        """Non-BAGEL models continue through the generic checkpointing path."""
+        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(nn.Module()) is False

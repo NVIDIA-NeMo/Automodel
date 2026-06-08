@@ -121,14 +121,22 @@ class CometLogger:
 
 
 def build_comet(cfg) -> CometLogger:
-    """Build Comet logger from configuration.
+    """Build a Comet logger from a raw config object.
+
+    Back-compat shim. The logger-construction logic lives in
+    :meth:`nemo_automodel.components.loggers.loggers.CometConfig.build` (the
+    single implementation); recipes construct ``CometConfig`` via
+    ``RecipeConfig.comet`` and call ``build`` directly. This wrapper maps a raw
+    cfg's ``comet:`` block onto the typed config so existing callers keep working.
 
     Args:
-        cfg: Configuration object containing Comet settings
+        cfg: Configuration object containing Comet settings.
 
     Returns:
-        CometLogger instance
+        CometLogger instance.
     """
+    from nemo_automodel.components.loggers.loggers import CometConfig
+
     comet_config = cfg.get("comet", {})
     if not comet_config:
         raise ValueError("Comet configuration not found in config")
@@ -137,23 +145,16 @@ def build_comet(cfg) -> CometLogger:
     if not project_name:
         raise ValueError("comet.project_name is required")
 
-    workspace = comet_config.get("workspace", None)
-    api_key = comet_config.get("api_key", None)
-    experiment_name = comet_config.get("experiment_name", "")
-    tags = list(comet_config.get("tags", []))
-    auto_metric_logging = comet_config.get("auto_metric_logging", False)
-
+    model_name = None
     if hasattr(cfg, "model") and hasattr(cfg.model, "pretrained_model_name_or_path"):
-        tags.append(f"model:{cfg.model.pretrained_model_name_or_path}")
+        model_name = cfg.model.pretrained_model_name_or_path
 
-    if not experiment_name and hasattr(cfg, "model") and hasattr(cfg.model, "pretrained_model_name_or_path"):
-        experiment_name = "_".join(cfg.model.pretrained_model_name_or_path.split("/")[-2:])
-
-    return CometLogger(
+    config = CometConfig(
         project_name=project_name,
-        workspace=workspace,
-        api_key=api_key,
-        experiment_name=experiment_name,
-        tags=tags,
-        auto_metric_logging=auto_metric_logging,
+        workspace=comet_config.get("workspace", None),
+        api_key=comet_config.get("api_key", None),
+        experiment_name=comet_config.get("experiment_name", None),
+        tags=list(comet_config.get("tags", [])),
+        auto_metric_logging=comet_config.get("auto_metric_logging", False),
     )
+    return config.build(model_name=model_name)

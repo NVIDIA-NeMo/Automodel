@@ -17,6 +17,8 @@ import sys
 import types
 from unittest.mock import patch
 
+import torch
+
 # Mock fast_hadamard_transform before importing deepseek_v32 modules
 if "fast_hadamard_transform" not in sys.modules:
     mock_hadamard = types.ModuleType("fast_hadamard_transform")
@@ -497,3 +499,45 @@ class TestDeepseekV32ForCausalLM:
         # lm_head should project from hidden_size to vocab_size
         assert model.lm_head.in_features == cfg.hidden_size
         assert model.lm_head.out_features == cfg.vocab_size
+
+    def test_forward_thd_hidden_states_match_logits_layout(self):
+        """THD hidden states should keep the same restored batch layout as logits."""
+        from nemo_automodel.components.models.common import BackendConfig
+
+        cfg = DeepseekV32Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+            qk_head_dim=32,
+            kv_lora_rank=32,
+            q_lora_rank=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=16,
+        )
+
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
+        model = DeepseekV32ForCausalLM(cfg, backend=backend).to(torch.float32)
+        batch, seq = 1, 5
+        input_ids = torch.randint(0, cfg.vocab_size, (batch, seq))
+        position_ids = torch.arange(seq).unsqueeze(0)
+        hidden_states = torch.randn(seq, cfg.hidden_size)
+        with patch.object(model.model, "forward", return_value=hidden_states):
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                output_hidden_states=True,
+            )
+        assert out.logits.shape == (batch, seq, cfg.vocab_size)
+        assert out.hidden_states.shape == (batch, seq, cfg.hidden_size)
