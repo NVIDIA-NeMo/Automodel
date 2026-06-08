@@ -391,3 +391,18 @@ class TestTEFp8ConfigRecipe:
             pytest.skip("transformer_engine not importable")
         sentinel = object()
         assert TEFp8Config(recipe=sentinel).build_recipe() is sentinel
+
+
+class TestBackendConfigCompileAttn:
+    """BackendConfig.compile_attn fullgraph-compile flag (drives both MLA and GQA attention)."""
+
+    def test_compile_attn_default_false(self):
+        assert BackendConfig().compile_attn is False
+
+    def test_compile_attn_explicit_true(self):
+        assert BackendConfig(compile_attn=True).compile_attn is True
+
+    def test_compile_mla_removed(self):
+        # compile_mla was consolidated into the generic compile_attn flag.
+        with pytest.raises(TypeError):
+            BackendConfig(compile_mla=True)
