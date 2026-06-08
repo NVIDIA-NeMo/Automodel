@@ -36,15 +36,7 @@ from typing import Optional, Sequence
 
 import torch
 
-from nemo_automodel.components.speculative.eagle.target_runner import (
-    RunnerEagle3TargetModel,
-    TargetRunner,
-)
-
-#: Backwards-compatible alias. The runner surface is now engine-agnostic and
-#: lives in ``target_runner`` as :class:`TargetRunner`; kept here so existing
-#: imports of ``SGLangRunnerProtocol`` keep resolving.
-SGLangRunnerProtocol = TargetRunner
+from nemo_automodel.components.speculative.eagle.target_runner import RunnerEagle3TargetModel
 
 
 class SGLangEagle3TargetModel(RunnerEagle3TargetModel):

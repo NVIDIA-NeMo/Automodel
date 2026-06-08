@@ -155,6 +155,7 @@ class SGLangTargetRunner:
 
     def __init__(self, model_runner):
         self._model_runner = model_runner
+        self._sampling_params = None  # constant teacher-forcing params, built once on first extend
 
     @property
     def model(self):
@@ -268,7 +269,9 @@ class SGLangTargetRunner:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         runner = self._model_runner
-        sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
+        if self._sampling_params is None:
+            self._sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
+        sampling_params = self._sampling_params
         rows = torch.split(input_ids, 1, dim=0)
         reqs, input_lens = [], []
         for idx, row in enumerate(rows):
