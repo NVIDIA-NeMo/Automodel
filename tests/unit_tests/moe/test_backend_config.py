@@ -404,7 +404,7 @@ class TestTEFp8ConfigRecipe:
 
 
 class TestBackendConfigCompileAttn:
-    """BackendConfig.compile_attn / compile_mla fullgraph-compile flags."""
+    """BackendConfig.compile_attn fullgraph-compile flag (drives both MLA and GQA attention)."""
 
     def test_compile_attn_default_false(self):
         assert BackendConfig().compile_attn is False
@@ -412,8 +412,7 @@ class TestBackendConfigCompileAttn:
     def test_compile_attn_explicit_true(self):
         assert BackendConfig(compile_attn=True).compile_attn is True
 
-    def test_compile_mla_default_false(self):
-        assert BackendConfig().compile_mla is False
-
-    def test_compile_mla_explicit_true(self):
-        assert BackendConfig(compile_mla=True).compile_mla is True
+    def test_compile_mla_removed(self):
+        # compile_mla was consolidated into the generic compile_attn flag.
+        with pytest.raises(TypeError):
+            BackendConfig(compile_mla=True)

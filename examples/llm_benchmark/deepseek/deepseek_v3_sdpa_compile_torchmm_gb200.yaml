@@ -81,7 +81,7 @@ model:
     linear: torch     # non-TE: TE Linear is @torch.compiler.disable'd → breaks MLA fullgraph
     rms_norm: torch   # non-TE: TE RMSNorm is also compiler-disabled → breaks MLA fullgraph
     rope_fusion: false  # fused RoPE is a TE/compiler-disabled custom op → breaks fullgraph
-    compile_mla: true
+    compile_attn: true
     experts: torch_mm  # torch._grouped_mm bf16 (vs gmm); single-variable swap, hybridep dispatch unchanged
     dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: true
