@@ -29,13 +29,14 @@ from huggingface_hub.constants import HF_HUB_CACHE
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
-from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -44,8 +45,8 @@ from nemo_automodel.components.training.utils import (
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
+from nemo_automodel.recipes._typed_config import RecipeConfig, _model_name_from_cfg
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import build_distributed, build_wandb
 from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -140,7 +141,6 @@ def _build_optimizer(
         logging.info("[INFO] Optimizer config: %s", optimizer_kwargs)
         warn_if_torch_adam_with_bf16_params(
             optimizer=optimizer,
-            optimizer_cfg=optimizer_cfg,
             parameters=trainable_params,
             is_peft=is_peft,
             context="diffusion",
@@ -169,7 +169,6 @@ def _build_optimizer(
     logging.info("[INFO] Optimizer config: %s", adamw_kwargs)
     warn_if_torch_adam_with_bf16_params(
         optimizer=optimizer,
-        optimizer_cfg=optimizer_cfg,
         parameters=trainable_params,
         is_peft=is_peft,
         context="diffusion",
@@ -455,6 +454,8 @@ def build_model_and_optimizer(
                 )
             dp_size = world_size // denom
 
+        reduce_dtype = dtype_from_str(fsdp_cfg.get("reduce_dtype", None), default=torch.float32)
+
         manager_args: Dict[str, Any] = {
             "_manager_type": "fsdp2",
             "dp_size": dp_size,
@@ -477,7 +478,7 @@ def build_model_and_optimizer(
             "fsdp2_forward_prefetch_depth": fsdp_cfg.get("fsdp2_forward_prefetch_depth", 1),
             "mp_policy": MixedPrecisionPolicy(
                 param_dtype=param_dtype,
-                reduce_dtype=torch.float32,
+                reduce_dtype=reduce_dtype,
                 output_dtype=compute_dtype,
             ),
         }
@@ -670,15 +671,19 @@ class TrainDiffusionRecipe(BaseRecipe):
     """Training recipe for diffusion models."""
 
     def __init__(self, cfg):
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     def setup(self):
-        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        self.dist_env = initialize_distributed(
+            backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
+            timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
+        )
         setup_logging()
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = build_wandb(self.cfg)
+            model_name = _model_name_from_cfg(self.cfg.model) if "model" in self.cfg else None
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=model_name)
             if run is not None:
                 logging.info("🚀 View run at {}".format(run.url))
 
@@ -698,6 +703,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         self.fuse_qkv_projections = bool(self.cfg.get("model.fuse_qkv_projections", False))
         self.compact_fused_qkv_projections = bool(self.cfg.get("model.compact_fused_qkv_projections", False))
+        self.optimize_hunyuan_flash_varlen_mask = bool(self.cfg.get("model.optimize_hunyuan_flash_varlen_mask", False))
         if self.transformer_engine_fp8:
             self.transformer_engine_linear = True
         if self.compact_fused_qkv_projections and not self.fuse_qkv_projections:
@@ -748,6 +754,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info("[INFO] Fuse QKV projections: %s", self.fuse_qkv_projections)
         logging.info("[INFO] Compact fused QKV projections: %s", self.compact_fused_qkv_projections)
+        logging.info("[INFO] Optimize Hunyuan flash-varlen mask: %s", self.optimize_hunyuan_flash_varlen_mask)
         logging.info("[INFO] Precision: model_dtype=%s, compute_dtype=%s", self.model_dtype, self.compute_dtype)
         logging.info(
             "[INFO] Performance config: check_loss=%s, grad_clip_foreach=%s",
@@ -792,6 +799,15 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.adapter_kwargs = (
             adapter_kwargs.to_dict() if hasattr(adapter_kwargs, "to_dict") else dict(adapter_kwargs or {})
         )
+        if self.optimize_hunyuan_flash_varlen_mask:
+            if self.adapter_type != "hunyuan":
+                raise ValueError(
+                    "model.optimize_hunyuan_flash_varlen_mask=true requires flow_matching.adapter_type=hunyuan"
+                )
+            if self.attention_backend != "flash_varlen":
+                raise ValueError(
+                    "model.optimize_hunyuan_flash_varlen_mask=true requires model.attention_backend=flash_varlen"
+                )
 
         logging.info("[INFO] Flow Matching V2 Pipeline")
         logging.info(f"[INFO]   - Adapter type: {self.adapter_type}")
@@ -851,11 +867,20 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
 
         self.model = self.pipe.transformer
+        if self.optimize_hunyuan_flash_varlen_mask:
+            from nemo_automodel.components.flow_matching.adapters.hunyuan import (
+                enable_hunyuan_flash_varlen_mask_optimization,
+            )
+
+            if not enable_hunyuan_flash_varlen_mask_optimization():
+                raise RuntimeError("Failed to enable Hunyuan flash-varlen mask optimization")
+            logging.info("[INFO] Enabled Hunyuan flash-varlen 2D mask optimization")
+
         self.peft_config = getattr(self.pipe, "_peft_config", None)
 
         checkpoint_cfg = self.cfg.get("checkpoint", None)
 
-        self.num_epochs = self.cfg.step_scheduler.num_epochs
+        self.num_epochs = self.cfg.get("step_scheduler.num_epochs")
         self.log_every = self.cfg.get("step_scheduler.log_every", 5)
 
         # Strictly require checkpoint config from YAML (no fallback)
@@ -873,14 +898,13 @@ class TrainDiffusionRecipe(BaseRecipe):
             model_save_format=checkpoint_cfg.get("model_save_format"),
             model_cache_dir=model_cache_dir if model_cache_dir is not None else HF_HUB_CACHE,
             model_repo_id=self.model_id,
-            save_consolidated=checkpoint_cfg.get("save_consolidated"),
+            save_consolidated=checkpoint_cfg.get("save_consolidated", False),
             is_peft=self.peft_cfg is not None,
             model_state_dict_keys=model_state_dict_keys,
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
         )
         self.restore_from = checkpoint_cfg.get("restore_from", None)
-        self.checkpointer = Checkpointer(
-            config=self.checkpoint_config,
+        self.checkpointer = self.checkpoint_config.build(
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
@@ -894,7 +918,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.dataloader, self.sampler = dataloader_cfg.instantiate(
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
-            batch_size=self.cfg.step_scheduler.local_batch_size,
+            batch_size=self.cfg.get("step_scheduler.local_batch_size"),
         )
 
         self.raw_steps_per_epoch = len(self.dataloader)
@@ -917,9 +941,9 @@ class TrainDiffusionRecipe(BaseRecipe):
                 self.dp_size = max(1, self.world_size // denom)
 
         # Infer local micro-batch size from dataloader if available
-        self.local_batch_size = self.cfg.step_scheduler.local_batch_size
+        self.local_batch_size = self.cfg.get("step_scheduler.local_batch_size")
         # Desired global effective batch size across all DP ranks and nodes
-        self.global_batch_size = self.cfg.step_scheduler.global_batch_size
+        self.global_batch_size = self.cfg.get("step_scheduler.global_batch_size")
         # Steps per epoch after gradient accumulation
         grad_acc_steps = max(1, self.global_batch_size // max(1, self.local_batch_size * self.dp_size))
         self.steps_per_epoch = ceil(self.raw_steps_per_epoch / grad_acc_steps)
@@ -943,10 +967,10 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.start_epoch = 0
         # Initialize StepScheduler for gradient accumulation and step/epoch bookkeeping
         self.step_scheduler = StepScheduler(
-            global_batch_size=self.cfg.step_scheduler.global_batch_size,
-            local_batch_size=self.cfg.step_scheduler.local_batch_size,
+            global_batch_size=self.cfg.get("step_scheduler.global_batch_size"),
+            local_batch_size=self.cfg.get("step_scheduler.local_batch_size"),
             dp_size=int(self.dp_size),
-            ckpt_every_steps=self.cfg.step_scheduler.ckpt_every_steps,
+            ckpt_every_steps=self.cfg.get("step_scheduler.ckpt_every_steps"),
             save_checkpoint_every_epoch=self.cfg.get("step_scheduler.save_checkpoint_every_epoch", False),
             dataloader=self.dataloader,
             val_every_steps=None,

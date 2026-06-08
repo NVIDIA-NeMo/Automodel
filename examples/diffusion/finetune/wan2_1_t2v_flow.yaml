@@ -10,8 +10,10 @@ dist_env:
   timeout_minutes: 30
 
 model:
-  pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+  pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-14B-Diffusers
   mode: finetune  # "finetune" loads pretrained weights, "pretrain" initializes random weights
+  torch_dtype: float32
+  compute_dtype: bfloat16
 
 step_scheduler:
   global_batch_size: 8
@@ -72,8 +74,11 @@ fsdp:
   pp_size: 1
   dp_replicate_size: 1
   dp_size: 8
+  activation_checkpointing: false
   defer_fsdp_grad_sync: true
-  enable_fsdp2_prefetch: true
+  reduce_dtype: bfloat16
+  enable_fsdp2_prefetch: false
+  enable_compile: true
   fsdp2_backward_prefetch_depth: 2
   fsdp2_forward_prefetch_depth: 1
 
@@ -81,7 +86,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
   diffusers_compatible: true
   restore_from: null
 

@@ -130,6 +130,18 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         Returns:
             Internal format state dict
         """
+        # Drop checkpoint keys for backbone layers past ``num_hidden_layers``
+        # (e.g. when loading the first N layers of a larger checkpoint for a
+        # downsized smoke run). The matcher tolerates both ``backbone.layers.{i}``
+        # and ``model.layers.{i}`` since the prefix is normalized after this.
+        num_layers = int(getattr(self.config, "num_hidden_layers", 0) or 0)
+        if num_layers > 0:
+            layer_idx_pattern = re.compile(r"^(?:backbone|model)\.layers\.(\d+)\.")
+            for key in list(hf_state_dict.keys()):
+                m = layer_idx_pattern.match(key)
+                if m is not None and int(m.group(1)) >= num_layers:
+                    hf_state_dict.pop(key)
+
         # Separate MTP keys; they live in their own top-level namespace and
         # are not subject to the backbone/model rename.
         mtp_state_dict: dict[str, Any] = {}
