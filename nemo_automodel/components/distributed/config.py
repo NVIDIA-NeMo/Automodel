@@ -176,6 +176,10 @@ class FSDP2Config:
             full activation checkpointing behavior. ``"selective"`` wraps transformer blocks with PyTorch selective
             activation checkpointing.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
+        reshard_after_forward (Optional[bool]): Override layer-level FSDP2 resharding.
+            If ``None`` (default), AutoModel reshares all but the last layer outside
+            pipeline parallelism. Set ``False`` for a ZeRO-2-like benchmark where
+            gathered parameters stay resident after forward.
         enable_async_tensor_parallel (bool): Enable async tensor parallelism via
             ``torch._inductor.config._micro_pipeline_tp``.  Overlaps ReduceScatter with
             compute in row-parallel layers.  Requires ``sequence_parallel=True`` (forced
@@ -209,6 +213,7 @@ class FSDP2Config:
     autocast_dtype: Optional[torch.dtype] = None
     activation_checkpointing: ActivationCheckpointingMode = False
     defer_fsdp_grad_sync: bool = True
+    reshard_after_forward: Optional[bool] = None
     enable_async_tensor_parallel: bool = False
     enable_compile: bool = False
     enable_fsdp2_prefetch: bool = False
@@ -296,10 +301,14 @@ class DDPConfig:
         activation_checkpointing (bool): Enable activation checkpointing if True.
         find_unused_parameters (bool): Forwarded to PyTorch DDP for models with
             conditionally unused trainable parameters.
+        broadcast_buffers (bool): Synchronize module buffers before each forward.
+        static_graph (bool): Tell DDP the used/unused parameter set is stable.
     """
 
     activation_checkpointing: bool = False
+    broadcast_buffers: bool = False
     find_unused_parameters: bool = False
+    static_graph: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""

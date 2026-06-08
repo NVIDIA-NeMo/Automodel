@@ -50,7 +50,9 @@ class DDPManager:
 
         # Extract config fields for easy access
         self.activation_checkpointing = config.activation_checkpointing
+        self.broadcast_buffers = config.broadcast_buffers
         self.find_unused_parameters = config.find_unused_parameters
+        self.static_graph = config.static_graph
 
         # Setup distributed environment
         self._setup_distributed()
@@ -128,5 +130,7 @@ class DDPManager:
         return DDP(
             model.to(self.device),
             device_ids=[self.device] if self.device.type == "cuda" else None,
+            broadcast_buffers=self.broadcast_buffers,
             find_unused_parameters=self.find_unused_parameters,
+            static_graph=self.static_graph,
         )

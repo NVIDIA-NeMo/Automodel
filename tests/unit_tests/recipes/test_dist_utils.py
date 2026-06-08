@@ -87,9 +87,19 @@ class TestParsing:
         assert result["strategy_config"].zero_dp_strategy == 3
 
     def test_ddp(self):
-        result = parse_distributed_section({"strategy": "ddp"})
+        result = parse_distributed_section(
+            {
+                "strategy": "ddp",
+                "broadcast_buffers": True,
+                "find_unused_parameters": True,
+                "static_graph": True,
+            }
+        )
         assert isinstance(result["strategy_config"], DDPConfig)
         assert result["strategy_config"].activation_checkpointing is False
+        assert result["strategy_config"].broadcast_buffers is True
+        assert result["strategy_config"].find_unused_parameters is True
+        assert result["strategy_config"].static_graph is True
 
     def test_all_parallelism_keys(self):
         cfg = {
