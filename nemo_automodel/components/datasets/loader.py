@@ -493,7 +493,9 @@ def build_dataloader_config(
         shuffle=dl.pop("shuffle", None),
         group_by_length=dl.pop("group_by_length", False),
         shuffle_buffer_size=dl.pop("shuffle_buffer_size", 10000),
-        batch_size=local_batch_size,
+        # batch_size is passed explicitly by ParallelAwareDataloader.build; pop any YAML
+        # dataloader.batch_size so it doesn't also land in loader_kwargs and collide.
+        batch_size=dl.pop("batch_size", local_batch_size),
         seed=seed,
         collate_fn=collate_fn,
         loader_kwargs=dl,
