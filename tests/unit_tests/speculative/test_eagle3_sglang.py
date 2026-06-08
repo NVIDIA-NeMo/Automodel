@@ -41,6 +41,7 @@ from nemo_automodel.components.speculative.eagle.target import (
     default_eagle3_aux_layer_ids,
     validate_eagle3_aux_layer_ids,
 )
+from nemo_automodel.components.speculative.eagle.target_runner import RunnerEagle3TargetModel
 
 _VOCAB = 32
 _HIDDEN = 16
@@ -132,6 +133,27 @@ def test_generate_batch_matches_colocated_hf():
     # The batch carries full logits (projection happens server-side), never the
     # precomputed encoding.
     assert sgl_batch.target_probs is None and sgl_batch.position_mask is None
+
+
+def test_engine_agnostic_backend_is_shared():
+    """The contract layer is engine-agnostic: the same backend works on any runner.
+
+    ``SGLangEagle3TargetModel`` only adds SGLang construction; the supervision
+    contract lives in ``RunnerEagle3TargetModel`` and a vLLM runner can reuse it
+    by implementing the same ``TargetRunner`` surface.
+    """
+    assert issubclass(SGLangEagle3TargetModel, RunnerEagle3TargetModel)
+
+    model = _FakeCausalLM().eval()
+    runner = _FakeSGLangRunner(model)
+    base = RunnerEagle3TargetModel(runner, aux_layer_ids=_AUX)
+    sgl = SGLangEagle3TargetModel(_FakeSGLangRunner(model), aux_layer_ids=_AUX)
+
+    input_ids, attention_mask, loss_mask = _inputs()
+    base_batch = base.generate_batch(input_ids, attention_mask, loss_mask)
+    sgl_batch = sgl.generate_batch(input_ids, attention_mask, loss_mask)
+    torch.testing.assert_close(base_batch.logits, sgl_batch.logits)
+    torch.testing.assert_close(base_batch.aux_hidden_states, sgl_batch.aux_hidden_states)
 
 
 def test_shift_semantics():

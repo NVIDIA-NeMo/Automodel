@@ -147,8 +147,8 @@ class _Eagle3LogitsOutput:  # pragma: no cover - only built inside the GPU-only 
 class SGLangTargetRunner:
     """Standalone SGLang ModelRunner that returns EAGLE-3 supervision tensors.
 
-    Built via :meth:`build`; consumed through the
-    :class:`~nemo_automodel.components.speculative.eagle.sglang_target.SGLangRunnerProtocol`
+    Built via :meth:`build`; consumed through the engine-agnostic
+    :class:`~nemo_automodel.components.speculative.eagle.target_runner.TargetRunner`
     surface (``model`` / ``set_aux_layers`` / ``forward_eagle3`` /
     ``input_embedding_weight``).
     """
