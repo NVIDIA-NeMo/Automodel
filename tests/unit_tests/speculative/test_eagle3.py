@@ -166,20 +166,24 @@ def test_build_eagle3_token_mapping_keeps_requested_vocab_size():
     assert selected_ids[1].item() == 1
 
 
-def _build_tiny_draft_model() -> LlamaEagle3DraftModel:
+def _make_draft_config(vocab_size: int = 128, draft_vocab_size: int = 16) -> LlamaConfig:
     config = LlamaConfig(
         hidden_size=32,
         intermediate_size=64,
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
-        vocab_size=128,
+        vocab_size=vocab_size,
         max_position_embeddings=64,
     )
     config.torch_dtype = torch.float32
-    config.draft_vocab_size = 16
+    config.draft_vocab_size = draft_vocab_size
     config.target_hidden_size = 32
-    return LlamaEagle3DraftModel(config).to(torch.float32)
+    return config
+
+
+def _build_tiny_draft_model() -> LlamaEagle3DraftModel:
+    return LlamaEagle3DraftModel(_make_draft_config()).to(torch.float32)
 
 
 def test_eagle3_trainer_rejects_non_positive_ttt_steps():
@@ -1205,3 +1209,76 @@ def test_eagle3_1_trainer_multi_step_runs_with_flags_enabled():
             f"fc_norm[{i}].weight did not receive a gradient -- the EAGLE-3.1 fc_norm path "
             f"is not in the autograd graph for that chunk."
         )
+
+
+def test_compressed_draft_registers_d2t_t2d_buffers():
+    """A compressed-vocab draft must own persistent d2t/t2d remap buffers."""
+    model = LlamaEagle3DraftModel(_make_draft_config(vocab_size=128, draft_vocab_size=16))
+
+    assert model.has_vocab_compression
+    assert model.d2t.shape == (16,) and model.d2t.dtype == torch.long
+    assert model.t2d.shape == (128,) and model.t2d.dtype == torch.bool
+
+    # Persistent buffers must land in the state dict so they serialize into the
+    # saved safetensors and load into vLLM/SGLang.
+    keys = model.state_dict().keys()
+    assert "d2t" in keys and "t2d" in keys
+
+
+def test_uncompressed_draft_has_no_remap_buffers():
+    """With ``draft_vocab_size == vocab_size`` vLLM expects no mapping; emit none."""
+    model = LlamaEagle3DraftModel(_make_draft_config(vocab_size=64, draft_vocab_size=64))
+
+    assert not model.has_vocab_compression
+    assert not hasattr(model, "d2t")
+    assert not hasattr(model, "t2d")
+    keys = model.state_dict().keys()
+    assert "d2t" not in keys and "t2d" not in keys
+    # No-op even when called, so callers need no compression branch of their own.
+    model.set_vocab_mapping(torch.arange(64, dtype=torch.long))
+
+
+def test_set_vocab_mapping_builds_offset_and_mask():
+    """d2t is the draft->target offset; t2d marks selected target ids."""
+    model = LlamaEagle3DraftModel(_make_draft_config(vocab_size=128, draft_vocab_size=4))
+    selected = torch.tensor([5, 9, 9, 100], dtype=torch.long)  # draft id -> target id
+
+    model.set_vocab_mapping(selected)
+
+    # vLLM remap: target_id == draft_id + d2t[draft_id].
+    base = torch.arange(4, dtype=torch.long)
+    assert torch.equal(base + model.d2t, selected)
+    # t2d is a boolean presence mask over the full target vocab.
+    expected_t2d = torch.zeros(128, dtype=torch.bool)
+    expected_t2d[selected] = True
+    assert torch.equal(model.t2d, expected_t2d)
+
+
+def test_set_vocab_mapping_rejects_wrong_length():
+    model = LlamaEagle3DraftModel(_make_draft_config(vocab_size=128, draft_vocab_size=4))
+    with pytest.raises(ValueError, match="draft_vocab_size"):
+        model.set_vocab_mapping(torch.arange(5, dtype=torch.long))
+
+
+def test_remap_buffers_survive_dtype_cast():
+    """``.to(dtype=...)`` must not corrupt the integer/bool remap buffers."""
+    model = LlamaEagle3DraftModel(_make_draft_config(vocab_size=128, draft_vocab_size=4))
+    model.set_vocab_mapping(torch.tensor([1, 2, 3, 4], dtype=torch.long))
+
+    model = model.to(torch.bfloat16)
+
+    assert model.d2t.dtype == torch.long
+    assert model.t2d.dtype == torch.bool
+
+
+def test_remap_buffers_round_trip_through_state_dict():
+    """Saved d2t/t2d restore exactly into a freshly constructed draft."""
+    config = _make_draft_config(vocab_size=128, draft_vocab_size=4)
+    src = LlamaEagle3DraftModel(config)
+    src.set_vocab_mapping(torch.tensor([7, 8, 50, 120], dtype=torch.long))
+
+    dst = LlamaEagle3DraftModel(config)
+    dst.load_state_dict(src.state_dict())
+
+    assert torch.equal(dst.d2t, src.d2t)
+    assert torch.equal(dst.t2d, src.t2d)

@@ -591,6 +591,19 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
         self.model = Eagle3LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
 
+        # Persistent d2t/t2d vocab-remap buffers, serialized into
+        # ``model.safetensors`` for vLLM/SGLang to consume at inference (see
+        # :meth:`set_vocab_mapping` for the mapping and why it matters). Created
+        # only when the draft vocab is compressed (``draft_vocab_size <
+        # vocab_size``); otherwise the draft logits are already in target space
+        # and inference engines expect no mapping. Populated by
+        # :meth:`set_vocab_mapping` during training, or restored from a
+        # checkpoint on resume / inference.
+        self.has_vocab_compression = self.draft_vocab_size < config.vocab_size
+        if self.has_vocab_compression:
+            self.register_buffer("d2t", torch.zeros(self.draft_vocab_size, dtype=torch.long), persistent=True)
+            self.register_buffer("t2d", torch.zeros(config.vocab_size, dtype=torch.bool), persistent=True)
+
         # P-EAGLE (parallel drafting): register the learnable ``mask_hidden``
         # placeholder only when enabled so EAGLE-3 / EAGLE-3.1 checkpoints
         # round-trip with no extra keys (see ``_PeagleDraftMixin``).
@@ -613,6 +626,39 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
             target_weight = target_weight.full_tensor()
         with torch.no_grad():
             self.model.embed_tokens.weight.copy_(target_weight)
+
+    def set_vocab_mapping(self, selected_token_ids: torch.Tensor) -> None:
+        """Populate the ``d2t`` / ``t2d`` vocab-remap buffers from the draft->target id map.
+
+        ``selected_token_ids`` has shape ``[draft_vocab_size]``; entry ``i`` is
+        the *target* vocab id of draft id ``i`` (the frequency-pruned mapping
+        built by ``build_eagle3_token_mapping``). This writes the two buffers
+        inference engines consume:
+
+        - ``d2t[i] = selected_token_ids[i] - i`` -- the offset form vLLM expects
+          (``target_id = draft_id + d2t[draft_id]``);
+        - ``t2d[target_id] = True`` for every selected target id -- the boolean
+          presence mask SGLang consumes.
+
+        These must be in the saved checkpoint: without them vLLM/SGLang find no
+        mapping, silently align draft ids to the first ``draft_vocab_size``
+        target ids, and acceptance rate collapses.
+
+        No-op when the draft vocab is not compressed (the buffers do not exist
+        and the draft logits are already in target space).
+        """
+        if not self.has_vocab_compression:
+            return
+        selected = selected_token_ids.reshape(-1).to(dtype=torch.long, device=self.d2t.device)
+        if selected.numel() != self.draft_vocab_size:
+            raise ValueError(
+                "set_vocab_mapping expected selected_token_ids of length "
+                f"draft_vocab_size={self.draft_vocab_size}, got {selected.numel()}."
+            )
+        base = torch.arange(self.draft_vocab_size, dtype=torch.long, device=selected.device)
+        self.d2t.copy_(selected - base)
+        self.t2d.zero_()
+        self.t2d[selected] = True
 
     def freeze_embeddings(self) -> None:
         """Freeze draft input embeddings."""
