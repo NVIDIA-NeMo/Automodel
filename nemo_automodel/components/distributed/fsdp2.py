@@ -95,6 +95,7 @@ class FSDP2Manager:
         self.offload_policy = config.offload_policy
         self.activation_checkpointing = config.activation_checkpointing
         self.defer_fsdp_grad_sync = config.defer_fsdp_grad_sync
+        self.reshard_after_forward = config.reshard_after_forward
         self.backend = config.backend
         self.enable_async_tensor_parallel = config.enable_async_tensor_parallel
         self.enable_compile = config.enable_compile
@@ -137,6 +138,7 @@ class FSDP2Manager:
             enable_fsdp2_prefetch=self.enable_fsdp2_prefetch,
             fsdp2_backward_prefetch_depth=self.fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth=self.fsdp2_forward_prefetch_depth,
+            reshard_after_forward=self.reshard_after_forward,
         )
 
         return model

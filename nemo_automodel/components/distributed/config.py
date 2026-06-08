@@ -84,6 +84,10 @@ class FSDP2Config:
             Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
         activation_checkpointing (bool): Enable activation checkpointing.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
+        reshard_after_forward (Optional[bool]): Override layer-level FSDP2 resharding.
+            If ``None`` (default), AutoModel reshares all but the last layer outside
+            pipeline parallelism. Set ``False`` for a ZeRO-2-like benchmark where
+            gathered parameters stay resident after forward.
         backend (str): Distributed backend.
         enable_async_tensor_parallel (bool): Enable async tensor parallelism via
             ``torch._inductor.config._micro_pipeline_tp``.  Overlaps ReduceScatter with
@@ -111,6 +115,7 @@ class FSDP2Config:
     autocast_dtype: Optional[torch.dtype] = None
     activation_checkpointing: bool = False
     defer_fsdp_grad_sync: bool = True
+    reshard_after_forward: Optional[bool] = None
     backend: str = "nccl"
     enable_async_tensor_parallel: bool = False
     enable_compile: bool = False
@@ -208,10 +213,16 @@ class DDPConfig:
     Attributes:
         activation_checkpointing (bool): Enable activation checkpointing if True.
         backend (str): Distributed backend, e.g. 'nccl' or 'gloo'.
+        broadcast_buffers (bool): Synchronize module buffers before each forward.
+        find_unused_parameters (bool): Traverse the autograd graph to support unused parameters.
+        static_graph (bool): Tell DDP the used/unused parameter set is stable.
     """
 
     activation_checkpointing: bool = False
     backend: str = "nccl"
+    broadcast_buffers: bool = False
+    find_unused_parameters: bool = False
+    static_graph: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""

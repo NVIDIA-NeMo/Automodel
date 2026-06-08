@@ -28,6 +28,8 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+from nemo_automodel.components.distributed.megatron_fsdp import fully_shard_optimizer
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -287,7 +289,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
             param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
 
         logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
-        self.optimizer = [self.cfg.optimizer.instantiate(params=param_groups)]
+        optimizer = self.cfg.optimizer.instantiate(params=param_groups)
+        if isinstance(self.distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
+            optimizer = fully_shard_optimizer(self.model_parts[0], optimizer)
+        self.optimizer = [optimizer]
         warn_if_torch_adam_with_bf16_params(
             optimizer=self.optimizer,
             optimizer_cfg=self.cfg.optimizer,
