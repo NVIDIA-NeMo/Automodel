@@ -32,29 +32,19 @@ import pytest
 import torch
 from transformers import LlamaConfig
 
-from nemo_automodel.components.speculative.eagle.core import PEagleTrainerModule
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.peagle_attention import create_peagle_mask_mod
 from nemo_automodel.components.speculative.eagle.peagle_data import (
     assign_cod_segments,
     generate_cod_sample_indices,
 )
+from nemo_automodel.components.speculative.eagle.peagle_trainer import PEagleTrainerModule
 
 # P-EAGLE's draft forward runs flex_attention, whose autograd is not implemented
 # on CPU in the CI torch build (even the forward errors once the inputs require
 # grad). Tests that drive the draft forward therefore run on CUDA and are skipped
 # when it is unavailable; the pure-tensor / mask-mod / plan / config tests stay on
 # CPU.
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-_gpu_only = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="P-EAGLE forward uses flex_attention, which has no CPU autograd support in the CI torch build.",
-)
-
-# P-EAGLE's draft forward runs flex_attention, whose autograd is not implemented
-# on CPU in the CI torch build (even the forward errors once the inputs require
-# grad). Tests that drive the draft forward therefore run on CUDA and are skipped
-# when it is unavailable; the pure-tensor / mask-mod / config tests stay on CPU.
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _gpu_only = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -71,6 +61,12 @@ def _build_tiny_draft_model(
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
+        # P-EAGLE compiles flex_attention on CUDA; Inductor's flex Triton kernel
+        # refuses to lower head_dim < 16. hidden_size // num_attention_heads = 8
+        # here, so set a decoupled head_dim >= 16 (the draft reads it via
+        # getattr(config, "head_dim", ...)). Keeps hidden_size/target_hidden_size
+        # at 32 so the rest of the tiny-config assertions are unchanged.
+        head_dim=16,
         vocab_size=128,
         max_position_embeddings=64,
     )
