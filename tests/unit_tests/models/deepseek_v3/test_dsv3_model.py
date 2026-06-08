@@ -97,6 +97,48 @@ class TestDeepseekV3BlockMlpDispatch:
         assert moe_mlp.calls[0][1] is padding_mask
 
 
+class TestDeepseekV3GatePrecision:
+    """DeepSeek-V3 should default router scoring to fp32 to match the HF reference."""
+
+    @staticmethod
+    def _tiny_config():
+        # first_k_dense_replace >= num_hidden_layers keeps every layer dense so no MoE/Gate
+        # is constructed on CPU; the gate_precision default is set on the backend regardless.
+        return DeepseekV3Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            first_k_dense_replace=1,
+            intermediate_size=128,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+        )
+
+    def test_gate_precision_defaults_to_fp32(self):
+        from nemo_automodel.components.models.common.utils import BackendConfig
+
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+        assert backend.gate_precision is None
+        model = DeepseekV3ForCausalLM(self._tiny_config(), backend=backend)
+        assert model.backend.gate_precision == torch.float32
+
+    def test_gate_precision_respects_explicit_override(self):
+        from nemo_automodel.components.models.common.utils import BackendConfig
+
+        backend = BackendConfig(
+            attn="sdpa",
+            linear="torch",
+            rms_norm="torch",
+            experts="torch",
+            dispatcher="torch",
+            gate_precision="bfloat16",
+        )
+        model = DeepseekV3ForCausalLM(self._tiny_config(), backend=backend)
+        assert model.backend.gate_precision == torch.bfloat16
+
+
 # NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py
 
 

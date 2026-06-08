@@ -29,7 +29,7 @@ configs:
   - gpt_oss/gpt_oss_120b.yaml
   - gpt_oss/gpt_oss_20b.yaml
   - gpt_oss/gpt_oss_20b_peft.yaml
-  - gpt_oss/gpt_oss_20b_single_gpu.yaml
+  - gpt_oss/gpt_oss_20b_single_gpu_peft.yaml
   - llama3_2/llama_3_2_3b_instruct_squad.yaml
   - llama3_2/llama_3_2_3b_instruct_squad_peft.yaml
   - llama3_3/llama_3_3_70b_instruct_squad.yaml
