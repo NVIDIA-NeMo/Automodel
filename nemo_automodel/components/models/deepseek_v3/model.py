@@ -25,7 +25,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import init_weights_in_fp32
+from nemo_automodel.components.models.common.utils import yield_fp32_model
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
@@ -345,8 +345,8 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         # Sample the random init in fp32, then cast to the resident dtype. Directly sampling in
         # bf16 distorts the init variance/mean and produces exploding early gradients for
-        # from-scratch pretraining; see init_weights_in_fp32 for the full rationale.
-        with init_weights_in_fp32(self, dtype):
+        # from-scratch pretraining; see yield_fp32_model for the full rationale.
+        with yield_fp32_model(self, dtype):
             with buffer_device:
                 self.model.init_weights(buffer_device=buffer_device)
                 final_out_std = self.config.hidden_size**-0.5

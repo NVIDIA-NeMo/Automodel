@@ -300,9 +300,9 @@ class NewMoEForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def initialize_weights(self, buffer_device=None, dtype=torch.bfloat16):
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         # Sampling init directly in bf16 distorts its variance/mean and causes exploding
-        # first-step gradients in from-scratch pretraining; init_weights_in_fp32 samples in fp32
+        # first-step gradients in from-scratch pretraining; yield_fp32_model samples in fp32
         # and casts back to the resident dtype on exit (see its docstring for the full rationale).
-        with init_weights_in_fp32(self, dtype):
+        with yield_fp32_model(self, dtype):
             with buffer_device:
                 self.model.init_weights(buffer_device=buffer_device)
                 final_out_std = self.config.hidden_size ** -0.5
@@ -436,7 +436,7 @@ In addition to the standard checklist in SKILL.md:
 - [ ] ForCausalLM inherits `MoEFSDPSyncMixin`
 - [ ] ForCausalLM has `update_moe_gate_bias()` method
 - [ ] ForCausalLM has `initialize_weights()` method
-- [ ] `initialize_weights()` wraps init in `init_weights_in_fp32(self, dtype)` (fp32 init, then cast)
+- [ ] `initialize_weights()` wraps init in `yield_fp32_model(self, dtype)` (fp32 init, then cast)
 - [ ] Gate defaults to fp32 (`gate_precision`) if routing is precision-sensitive (sigmoid/softmax)
 - [ ] Forward handles `thd` format via `squeeze_input_for_thd`
 - [ ] Forward passes `padding_mask` to MoE layers
