@@ -402,15 +402,8 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
 
             vision_tower = getattr(self.model, "vision_tower", None)
             if vision_tower is not None and pixel_values is not None:
-                # Dynamic import to keep a ``distributed -> checkpoint`` edge out
-                # of the static import graph: gemma4_moe.model -> state_dict_adapter
-                # -> components.checkpoint would otherwise break the import-linter
-                # ``independence`` contract. Mirrors qwen3_5_moe/cp_linear_attn.py.
-                import importlib
-
-                gemma4_model_module = importlib.import_module("nemo_automodel.components.models.gemma4_moe.model")
-                image_features = gemma4_model_module.get_gemma4_image_features_with_projector_dtype(
-                    self.model, pixel_values, image_position_ids=image_position_ids
+                image_features = self.model.get_image_features(
+                    pixel_values, image_position_ids=image_position_ids, return_dict=True
                 ).pooler_output
                 image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
 
