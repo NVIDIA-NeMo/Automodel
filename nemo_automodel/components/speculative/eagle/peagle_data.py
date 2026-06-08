@@ -99,3 +99,53 @@ def generate_cod_sample_indices(
     depth = torch.cat([torch.full((n,), i, device=device, dtype=torch.long) for i, n in enumerate(n_per_depth)])
 
     return anchor_pos, depth
+
+
+def assign_cod_segments(
+    anchor_pos: torch.Tensor,
+    depth: torch.Tensor,
+    seq_length: int,
+    num_segments: int,
+) -> torch.Tensor:
+    """Assign every COD-sampled element to one of ``num_segments`` segments.
+
+    Implements the sequence-partitioning assignment of P-EAGLE's Algorithm 1
+    (arXiv:2602.01469). A single COD sequence is split into ``S`` segments so the
+    parallel-drafting loss can be accumulated with separate forward/backward
+    passes -- one per segment -- dropping peak attention memory and letting the
+    draft train on long contexts that would otherwise OOM in the single flat
+    forward (:class:`PEagleTrainerModule` forward, ``sequence_partitions == 1``).
+
+    The algorithm's three phases collapse to a closed form here because every COD
+    element carries its chain start ``anchor_pos`` and ``depth`` (reference
+    position ``anchor_pos + depth``):
+
+    * **Phase 1 (depths 0 and 1, by position).** ``A[p] = max{s : B_s <= p}`` with
+      boundaries ``B = {0, L/S, ..., L}``. A depth-0 element sits at ``anchor_pos``;
+      a depth-1 element at ``anchor_pos + 1``.
+    * **Phase 2 (depths >= 2, by dependency).** ``A^g[p] = A^{g-1}[p-1]``: each
+      deeper element inherits the segment of its parent one position back in the
+      same rollout. Because a rollout shares one ``anchor_pos`` across depths, the
+      inheritance chain terminates at the depth-1 ancestor, so every element at
+      ``depth >= 1`` lands in the bucket of ``anchor_pos + 1``.
+
+    Phase 3 (causal completion -- each segment also reads every depth-0 position
+    up to its right boundary as key/value context) is applied by the caller when
+    it assembles a segment's flat input, not encoded in the returned assignment.
+
+    Args:
+        anchor_pos: Chain-start position per element, shape ``[total_sampled]``.
+        depth: COD round per element, shape ``[total_sampled]``.
+        seq_length: Original (padded) sequence length ``L``.
+        num_segments: Number of segments ``S`` (``>= 1``).
+
+    Returns:
+        Per-element segment id in ``[0, num_segments)``, shape ``[total_sampled]``.
+    """
+    if num_segments < 1:
+        raise ValueError(f"num_segments must be >= 1, got {num_segments}.")
+    # Phase 1/2 reduce to: depth 0 buckets on anchor_pos, depth >= 1 buckets on
+    # anchor_pos + 1 (the shared depth-1 ancestor of the rollout).
+    bucket_pos = torch.where(depth == 0, anchor_pos, anchor_pos + 1)
+    seg = (bucket_pos * num_segments) // seq_length
+    return seg.clamp_(min=0, max=num_segments - 1)

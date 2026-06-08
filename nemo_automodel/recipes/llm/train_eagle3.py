@@ -34,7 +34,6 @@ from transformers import AutoConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import (
-    Checkpointer,
     CheckpointingConfig,
     save_config,
 )
@@ -49,10 +48,10 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
 )
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
     HFEagle3TargetModel,
-    PEagleTrainerModule,
 )
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
 from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
@@ -65,6 +64,7 @@ from nemo_automodel.recipes.base_recipe import (
     _is_checkpoint_model_config_compatible,
     _resolve_restore_from_to_ckpt_dir,
 )
+from nemo_automodel.recipes.llm.peagle_recipe import PeagleRecipeMixin
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +119,7 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
-class TrainEagle3Recipe(BaseRecipe):
+class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
     """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
 
     def __init__(self, cfg):
@@ -198,41 +198,7 @@ class TrainEagle3Recipe(BaseRecipe):
         draft_config["parallel_drafting"] = parallel_drafting
         mask_token_id = None
         if parallel_drafting:
-            # ``mask_token_id`` must be chosen deliberately: it indexes the draft
-            # ``embed_tokens`` table for the masked draft slots and (with frozen
-            # embeddings) that row's vector is the only "mask token" signal. A
-            # silent default (e.g. 0) usually maps to a meaningful token and
-            # pollutes the masked-slot semantics, so require it explicitly and
-            # range-check it. The value is serialized into the draft config so
-            # vLLM reads the same id at serve time.
-            mask_token_id = recipe_cfg.get("mask_token_id", None)
-            if mask_token_id is None:
-                raise ValueError(
-                    "parallel_drafting=True requires recipe_args.mask_token_id to be set explicitly. "
-                    "Pick a reserved / rarely-used token id for the masked draft slots (e.g. one of "
-                    "Llama-3's reserved special tokens) so the masked-slot embedding does not collide "
-                    "with real content; the same id must be present in the draft config.json vLLM reads "
-                    "at serve time."
-                )
-            mask_token_id = int(mask_token_id)
-            if not 0 <= mask_token_id < target_config.vocab_size:
-                raise ValueError(
-                    f"mask_token_id={mask_token_id} is out of range for the target vocab "
-                    f"[0, {target_config.vocab_size}); it indexes the draft embed_tokens table."
-                )
-            draft_config["mask_token_id"] = mask_token_id
-            draft_config["num_depths"] = int(recipe_cfg.get("num_depths", 8))
-            draft_config["down_sample_ratio"] = float(recipe_cfg.get("down_sample_ratio", 0.7))
-            draft_config["down_sample_ratio_min"] = float(recipe_cfg.get("down_sample_ratio_min", 0.2))
-            # P-EAGLE stacks ``num_draft_layers`` draft decoder layers (the fused
-            # first layer + vanilla Llama layers). The speculators reference uses
-            # 4. This overrides the draft's ``num_hidden_layers`` (which would
-            # otherwise inherit the target's full depth); the EAGLE-3 TTT path
-            # ignores it and always builds a single layer.
-            draft_num_hidden_layers = int(recipe_cfg.get("num_draft_layers", 1))
-            draft_config["num_hidden_layers"] = draft_num_hidden_layers
-            if "layer_types" in draft_config:
-                draft_config["layer_types"] = draft_config["layer_types"][:draft_num_hidden_layers]
+            mask_token_id = self._configure_peagle_draft_config(recipe_cfg, draft_config, target_config)
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
@@ -260,18 +226,9 @@ class TrainEagle3Recipe(BaseRecipe):
         print_trainable_parameters(self.draft_model, name="Draft")
 
         if parallel_drafting:
-            # ``num_depths`` is P-EAGLE's K (number of parallel COD depths),
-            # default 8 to match speculators. The COD ratios shape how
-            # aggressively deeper depths are subsampled.
-            trainer_module = PEagleTrainerModule(
-                self.draft_model,
-                selected_token_ids=selected_token_ids,
-                selected_token_mask=selected_token_mask,
-                num_depths=int(recipe_cfg.get("num_depths", 8)),
-                mask_token_id=mask_token_id,
-                down_sample_ratio=float(recipe_cfg.get("down_sample_ratio", 0.7)),
-                down_sample_ratio_min=float(recipe_cfg.get("down_sample_ratio_min", 0.2)),
-            ).to(self.device)
+            trainer_module = self.build_peagle_trainer(
+                recipe_cfg, selected_token_ids, selected_token_mask, mask_token_id
+            )
         else:
             trainer_module = Eagle3TrainerModule(
                 self.draft_model,
@@ -361,6 +318,16 @@ class TrainEagle3Recipe(BaseRecipe):
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
+        # Optional Weights & Biases logging (rank 0 only).
+        self.wandb_run = None
+        if self.dist_env.is_main and self.cfg.get("wandb", None) is not None:
+            suppress_wandb_log_messages()
+            self.wandb_run = init_wandb_run(
+                self.cfg.wandb.to_dict(),
+                self.cfg.to_dict(),
+                default_name="eagle3_" + str(target_path).rstrip("/").split("/")[-1],
+            )
+
     def _setup_online_target(self, recipe_cfg, target_path, target_config):
         """Live path: load the target model and build the live dataloader.
 
@@ -444,6 +411,11 @@ class TrainEagle3Recipe(BaseRecipe):
             torch_dtype=self.compute_dtype,
             force_hf=bool(recipe_cfg.get("target_force_hf", False)),
         )
+        # Optional target attention backend (default: HF auto-select). Pin to
+        # ``sdpa`` to dodge the Qwen3 FA2 ``s_aux=None`` crash in transformers.
+        target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
+        if target_attn_implementation is not None:
+            target_kwargs["attn_implementation"] = target_attn_implementation
         if self.cfg.get("distributed", None) is not None:
             self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
             self.distributed_config = self.dist_setup.strategy_config
@@ -569,6 +541,7 @@ class TrainEagle3Recipe(BaseRecipe):
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         if self.target_wrapper is None:
             # Offline cache: the supervision is already in the batch.
+            batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
             return self.trainer_module(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
@@ -646,8 +619,7 @@ class TrainEagle3Recipe(BaseRecipe):
 
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
         dp_rank = dist.get_rank() if dist.is_initialized() else 0
-        self.checkpointer = Checkpointer(
-            config=self.checkpoint_config,
+        self.checkpointer = self.checkpoint_config.build(
             dp_rank=dp_rank,
             tp_rank=0,
             pp_rank=0,
@@ -918,6 +890,12 @@ class TrainEagle3Recipe(BaseRecipe):
         self.trainer_module.train()
         return (total_loss / total_batches.clamp_min(1.0), total_acc / total_batches.clamp_min(1.0))
 
+    def _wandb_log(self, data: dict, step: int) -> None:
+        """Log a metrics dict to W&B when a run is active (rank 0)."""
+        run = getattr(self, "wandb_run", None)
+        if run is not None:
+            run.log(data, step=step)
+
     def run_train_validation_loop(self):
         """Run the minimal EAGLE-3 train loop."""
         self.trainer_module.train()
@@ -964,21 +942,27 @@ class TrainEagle3Recipe(BaseRecipe):
             else:
                 batch_source = ((i, (b, None)) for i, b in enumerate(self.train_dataloader))
             for batch_idx, (batch, target_batch) in batch_source:
-                # Skip DDP's per-micro-batch all-reduce on every micro-batch
-                # except the one an optimizer step immediately follows; that
-                # step's all-reduce covers the whole locally-accumulated window.
-                sync_grads = _should_sync_grads(
-                    pending_micro_batches=pending_micro_batches,
-                    grad_accumulation_steps=self.grad_accumulation_steps,
-                    batch_idx=batch_idx,
-                    batches_per_epoch=batches_per_epoch,
-                    is_ddp=is_ddp,
-                )
-                sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
-                with sync_ctx:
-                    metrics = self._forward_batch(batch, target_batch)
-                    loss = metrics.loss / float(self.grad_accumulation_steps)
-                    loss.backward()
+                if self._peagle_partitioned:
+                    # P-EAGLE sequence partitioning owns its per-segment backward
+                    # and its own no_sync (the all-reduce fires on the last
+                    # segment), so it runs outside the grad-accum sync context.
+                    metrics = self._peagle_partitioned_step(batch)
+                else:
+                    # Skip DDP's per-micro-batch all-reduce on every micro-batch
+                    # except the one an optimizer step immediately follows; that
+                    # step's all-reduce covers the whole locally-accumulated window.
+                    sync_grads = _should_sync_grads(
+                        pending_micro_batches=pending_micro_batches,
+                        grad_accumulation_steps=self.grad_accumulation_steps,
+                        batch_idx=batch_idx,
+                        batches_per_epoch=batches_per_epoch,
+                        is_ddp=is_ddp,
+                    )
+                    sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
+                    with sync_ctx:
+                        metrics = self._forward_batch(batch, target_batch)
+                        loss = metrics.loss / float(self.grad_accumulation_steps)
+                        loss.backward()
 
                 running_loss = running_loss + metrics.loss.detach()
                 running_acc = running_acc + metrics.accuracy.detach()
@@ -987,7 +971,7 @@ class TrainEagle3Recipe(BaseRecipe):
                 pending_micro_batches += 1
 
                 if pending_micro_batches == self.grad_accumulation_steps:
-                    torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
@@ -1007,6 +991,16 @@ class TrainEagle3Recipe(BaseRecipe):
                                 mean_loss.item(),
                                 mean_acc.item(),
                                 current_lr,
+                            )
+                            self._wandb_log(
+                                {
+                                    "train/loss": mean_loss.item(),
+                                    "train/accuracy": mean_acc.item(),
+                                    "train/lr": current_lr,
+                                    "train/grad_norm": float(grad_norm),
+                                    "train/epoch": epoch,
+                                },
+                                step=self.runtime.global_step,
                             )
                         running_loss.zero_()
                         running_acc.zero_()
@@ -1030,7 +1024,7 @@ class TrainEagle3Recipe(BaseRecipe):
                 for p in self.trainer_module.parameters():
                     if p.grad is not None:
                         p.grad.mul_(scale)
-                torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -1050,6 +1044,16 @@ class TrainEagle3Recipe(BaseRecipe):
                             mean_loss.item(),
                             mean_acc.item(),
                             current_lr,
+                        )
+                        self._wandb_log(
+                            {
+                                "train/loss": mean_loss.item(),
+                                "train/accuracy": mean_acc.item(),
+                                "train/lr": current_lr,
+                                "train/grad_norm": float(grad_norm),
+                                "train/epoch": epoch,
+                            },
+                            step=self.runtime.global_step,
                         )
                     running_loss.zero_()
                     running_acc.zero_()
@@ -1077,6 +1081,10 @@ class TrainEagle3Recipe(BaseRecipe):
                         val_loss_dict["val_loss"],
                         val_loss_dict["val_accuracy"],
                     )
+                    self._wandb_log(
+                        {"val/loss": val_loss_dict["val_loss"], "val/accuracy": val_loss_dict["val_accuracy"]},
+                        step=self.runtime.global_step,
+                    )
             if getattr(self, "save_checkpoint_every_epoch", False):
                 self.save_checkpoint(
                     epoch=epoch + 1,
@@ -1093,6 +1101,9 @@ class TrainEagle3Recipe(BaseRecipe):
             # Release remote connections / shut down the target server's
             # client-idle watchdog. A no-op for the co-located backend.
             self.target_wrapper.close()
+
+        if getattr(self, "wandb_run", None) is not None:
+            self.wandb_run.finish()
 
         if self.dist_env.is_main:
             logger.info("Training complete: global_step=%s", self.runtime.global_step)

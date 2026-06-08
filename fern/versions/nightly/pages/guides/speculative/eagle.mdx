@@ -353,6 +353,7 @@ checkpoint:
 | `ttt_steps` | TTT unroll depth; 4 is the default, cost is linear per step |
 | `draft_vocab_size` | Draft output vocabulary size; smaller = faster inference |
 | `freeze_embeddings` | Freeze the embedding table copied from the target so only draft layers train (recommended `true`) |
+| `target_attn_implementation` | Optional attention backend for the frozen target (e.g. `sdpa`); defaults to HF auto-select. Set `sdpa` if the target's FlashAttention path is broken on your build (e.g. the Qwen3 FA2 `s_aux` crash) |
 | `fc_norm` | EAGLE-3.1: per-chunk independent RMSNorm (`ModuleList`) on auxiliary hidden states before the `fc` projection (default `false`) |
 | `norm_output` | EAGLE-3.1: feed the post-`model.norm` hidden state into the next TTT step and `lm_head` (default `false`) |
 | `warmup_ratio` | Fraction of total steps for LR warmup |

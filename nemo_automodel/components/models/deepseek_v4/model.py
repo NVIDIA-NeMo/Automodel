@@ -43,11 +43,12 @@ Compress-ratio sliding-window attention is not yet implemented.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -55,7 +56,11 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import (
+    _has_dtensor_params,
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+)
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
@@ -74,20 +79,29 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 @dataclass
-class DeepseekV4CausalLMOutput:
+class DeepseekV4CausalLMOutput(CausalLMOutputWithPast):
     """Output of DeepseekV4ForCausalLM.forward.
+
+    Subclasses ``transformers.modeling_outputs.CausalLMOutputWithPast`` so the
+    standard ``logits`` / ``hidden_states`` fields are present (the recipe's
+    fused cross-entropy path requires ``"hidden_states" in out`` and reads the
+    final hidden states off the output) while the DSV4-specific MTP fields are
+    carried as declared dataclass fields. As required by ``ModelOutput``, every
+    field after the first declares a ``None`` default.
 
     Attributes:
         logits: ``[B, S, vocab_size]`` next-token prediction logits.
+        hidden_states: Final pre-lm_head hidden states ``[B, S, hidden]``
+            (or ``[T, hidden]`` for packed THD), populated only when
+            ``output_hidden_states`` is set; otherwise ``None``.
         mtp_per_depth_h: Per-depth MTP hidden states (training mode only).
             List of length ``num_nextn_predict_layers``, each ``[B, S, hidden]``.
             ``None`` when MTP is disabled or in eval mode.
         mtp_loss_scaling_factor: Coefficient for the MTP auxiliary loss.
     """
 
-    logits: torch.Tensor
-    mtp_per_depth_h: list[torch.Tensor] | None = None
-    mtp_loss_scaling_factor: float = 0.1
+    mtp_per_depth_h: Optional[list[torch.Tensor]] = None
+    mtp_loss_scaling_factor: Optional[float] = None
 
 
 class DeepseekV4Block(nn.Module):
@@ -749,8 +763,13 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
     ) -> "DeepseekV4CausalLMOutput" | tuple[torch.Tensor, ...] | torch.Tensor:
+        if output_hidden_states is None:
+            output_hidden_states = getattr(getattr(self, "config", None), "output_hidden_states", False)
+
         is_pp_stage = self._is_pipeline_parallel_stage()
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
 
@@ -770,13 +789,17 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         else:
             hidden_states = model_out
             mtp_hc_hidden = None
-        if self.lm_head:
-            hidden_dtype = hidden_states.dtype
-            logits = self.lm_head(hidden_states.float()).to(hidden_dtype)
-        else:
-            logits = hidden_states
-        if thd_mode and logits.dim() == 2:
-            logits = logits.unsqueeze(0)
+
+        # Final hidden states (input to lm_head). Capture the FULL-sequence
+        # tensor before any logits_to_keep slicing so the fused cross-entropy
+        # path can recompute logits over every position.
+        final_hidden_states = hidden_states
+
+        # deepseek runs the lm_head in fp32: project in fp32 and cast the logits
+        # back to the hidden dtype via the shared helper.
+        logits = compute_lm_head_logits(
+            self.lm_head, hidden_states, logits_to_keep, is_thd=thd_mode, fp32_lm_head=True
+        ).logits
 
         if pp_mtp_enabled and self.lm_head is None:
             if not mtp_embed_inputs:
@@ -824,8 +847,17 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 return (logits, *mtp_per_depth_h)
             return logits
 
+        out_hidden_states = None
+        if output_hidden_states:
+            out_hidden_states = final_hidden_states
+            # Mirror the THD logits unsqueeze so hidden_states and logits share
+            # a leading [1, T, ...] layout for packed sequences.
+            if thd_mode and out_hidden_states.dim() == 2:
+                out_hidden_states = out_hidden_states.unsqueeze(0)
+
         return DeepseekV4CausalLMOutput(
             logits=logits,
+            hidden_states=out_hidden_states,
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
         )

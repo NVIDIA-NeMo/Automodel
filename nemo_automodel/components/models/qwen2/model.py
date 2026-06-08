@@ -45,6 +45,7 @@ from transformers.utils import TransformersKwargs, can_return_tuple
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
+    compute_lm_head_logits,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -470,15 +471,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
 
         hidden_states = outputs.last_hidden_state
 
-        # DTensor compatibility with pytorch 2.9.0: when logits_to_keep=0, slice(0, None, None) would select all elements
-        # but DTensor cannot handle sliced DTensor, which will raise error message:
-        # NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered.
-        # Solution: Skip slicing entirely when logits_to_keep=0 to avoid DTensor issues in TP with sequence parallel.
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None:

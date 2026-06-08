@@ -15,19 +15,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import (
+    _has_dtensor_params,
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+)
 from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2FlashConfig
 from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import MiMoV2FlashStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -665,9 +670,34 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | dict[str, torch.Tensor] | None = None,
         padding_mask: torch.Tensor | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> CausalLMOutputWithPast:
+        """Forward pass producing text logits.
+
+        Args:
+            input_ids: Input token IDs ``[B, S]`` (or THD-packed ``[T]``/``[1, T]``).
+            inputs_embeds: Pre-computed input embeddings (optional).
+            position_ids: Optional position indices.
+            attention_mask: 2D padding mask, 4D additive mask, or per-type dict.
+            padding_mask: Optional MoE padding mask.
+            logits_to_keep: If 0, compute logits for all positions (training default);
+                otherwise compute only the last ``logits_to_keep`` positions.
+            output_hidden_states: When set, the returned output carries the final
+                hidden states (input to ``lm_head``) in ``hidden_states``.
+            **kwargs: Additional arguments forwarded to the base model.
+
+        Returns:
+            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with
+            ``logits`` and, when requested, ``hidden_states``.
+        """
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
         hidden = self.model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -677,12 +707,12 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **kwargs,
         )
         if self.lm_head is None:
-            return hidden
-        if isinstance(logits_to_keep, int):
-            hidden = hidden[:, -logits_to_keep:, :] if logits_to_keep else hidden
-        else:
-            hidden = hidden[:, logits_to_keep, :]
-        return self.lm_head(hidden)
+            return CausalLMOutputWithPast(
+                logits=hidden,
+                hidden_states=hidden if output_hidden_states else None,
+            )
+
+        return compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
     def customize_pipeline_stage_modules(
         self,
