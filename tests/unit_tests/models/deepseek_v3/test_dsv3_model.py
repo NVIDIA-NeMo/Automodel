@@ -13,25 +13,50 @@
 # limitations under the License.
 
 import inspect
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from torch import nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3ForCausalLM, DeepseekV3Model
+from nemo_automodel.components.models.deepseek_v3.model import Block, DeepseekV3ForCausalLM, DeepseekV3Model
+
+
+class _RecordingMlp(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(self, *args):
+        self.calls.append(args)
+        return torch.zeros_like(args[0])
 
 
 class TestDeepseekV3ModelUpdates:
     def test_from_pretrained_classmethod(self):
         """Ensure classmethod from_pretrained builds config then delegates to from_config."""
-        cfg = DeepseekV3Config(vocab_size=100, hidden_size=64, num_attention_heads=4, num_hidden_layers=1,
-                               intermediate_size=128, qk_rope_head_dim=16, v_head_dim=16, qk_nope_head_dim=16)
+        cfg = DeepseekV3Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+        )
 
-        with patch("transformers.models.deepseek_v3.configuration_deepseek_v3.DeepseekV3Config.from_pretrained") as mock_from_pretrained:
+        with patch(
+            "transformers.models.deepseek_v3.configuration_deepseek_v3.DeepseekV3Config.from_pretrained"
+        ) as mock_from_pretrained:
             mock_from_pretrained.return_value = cfg
 
-            with patch.object(DeepseekV3ForCausalLM, "from_config", wraps=DeepseekV3ForCausalLM.from_config) as mock_from_config:
+            with patch.object(
+                DeepseekV3ForCausalLM, "from_config", wraps=DeepseekV3ForCausalLM.from_config
+            ) as mock_from_config:
                 model = DeepseekV3ForCausalLM.from_pretrained("deepseek/model")
                 assert isinstance(model, DeepseekV3ForCausalLM)
                 mock_from_pretrained.assert_called_once_with("deepseek/model")
@@ -44,6 +69,74 @@ class TestDeepseekV3ModelUpdates:
 
         assert hasattr(dsv3_mod, "ModelClass")
         assert dsv3_mod.ModelClass is DeepseekV3ForCausalLM
+
+
+class TestDeepseekV3BlockMlpDispatch:
+    def test_mlp_dispatch_uses_layer_role_after_checkpoint_wrapping(self):
+        """Checkpoint wrappers hide the original MLP/MoE type; dispatch must use layer role."""
+        x = torch.randn(2, 3, 8)
+        padding_mask = torch.ones(2, 3, dtype=torch.bool)
+
+        dense_mlp = _RecordingMlp()
+        dense_block = SimpleNamespace(is_moe_layer=False, mlp=checkpoint_wrapper(dense_mlp))
+        dense_out = Block._mlp(dense_block, x, padding_mask)
+
+        assert dense_out.shape == x.shape
+        assert len(dense_mlp.calls) == 1
+        assert len(dense_mlp.calls[0]) == 1
+        assert dense_mlp.calls[0][0] is x
+
+        moe_mlp = _RecordingMlp()
+        moe_block = SimpleNamespace(is_moe_layer=True, mlp=checkpoint_wrapper(moe_mlp))
+        moe_out = Block._mlp(moe_block, x, padding_mask)
+
+        assert moe_out.shape == x.shape
+        assert len(moe_mlp.calls) == 1
+        assert len(moe_mlp.calls[0]) == 2
+        assert moe_mlp.calls[0][0] is x
+        assert moe_mlp.calls[0][1] is padding_mask
+
+
+class TestDeepseekV3GatePrecision:
+    """DeepSeek-V3 should default router scoring to fp32 to match the HF reference."""
+
+    @staticmethod
+    def _tiny_config():
+        # first_k_dense_replace >= num_hidden_layers keeps every layer dense so no MoE/Gate
+        # is constructed on CPU; the gate_precision default is set on the backend regardless.
+        return DeepseekV3Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            first_k_dense_replace=1,
+            intermediate_size=128,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+        )
+
+    def test_gate_precision_defaults_to_fp32(self):
+        from nemo_automodel.components.models.common.utils import BackendConfig
+
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+        assert backend.gate_precision is None
+        model = DeepseekV3ForCausalLM(self._tiny_config(), backend=backend)
+        assert model.backend.gate_precision == torch.float32
+
+    def test_gate_precision_respects_explicit_override(self):
+        from nemo_automodel.components.models.common.utils import BackendConfig
+
+        backend = BackendConfig(
+            attn="sdpa",
+            linear="torch",
+            rms_norm="torch",
+            experts="torch",
+            dispatcher="torch",
+            gate_precision="bfloat16",
+        )
+        model = DeepseekV3ForCausalLM(self._tiny_config(), backend=backend)
+        assert model.backend.gate_precision == torch.bfloat16
 
 
 # NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py
@@ -75,8 +168,14 @@ class TestDeepseekV3ModelInputsEmbeds:
     def test_forward_raises_when_both_input_ids_and_inputs_embeds(self):
         """Test DeepseekV3Model raises error when both input_ids and inputs_embeds provided."""
         cfg = DeepseekV3Config(
-            vocab_size=100, hidden_size=64, num_attention_heads=4, num_hidden_layers=1,
-            intermediate_size=128, qk_rope_head_dim=16, v_head_dim=16, qk_nope_head_dim=16,
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
         )
 
         # Mock the backend to avoid any CUDA initialization

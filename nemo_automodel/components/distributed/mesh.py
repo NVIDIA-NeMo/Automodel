@@ -32,6 +32,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
 from nemo_automodel.components.distributed.config import (
+    ActivationCheckpointingMode,
     DDPConfig,
     FSDP2Config,
     MegatronFSDPConfig,
@@ -105,14 +106,15 @@ class MeshContext:
         moe_mesh: MoE-specific device mesh.
         pipeline_config: Pipeline-parallel schedule/splitting config.
         moe_config: MoE parallelizer settings.
-        activation_checkpointing: Whether activation checkpointing is enabled.
+        activation_checkpointing: Activation checkpointing mode. ``True`` means full checkpointing;
+            ``"selective"`` means PyTorch selective activation checkpointing.
     """
 
     # config fields
     strategy_config: Optional[Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]] = None
     pipeline_config: Optional["PipelineConfig"] = None
     moe_config: Optional["MoEParallelizerConfig"] = None
-    activation_checkpointing: bool = False
+    activation_checkpointing: ActivationCheckpointingMode = False
 
     # runtime mesh references
     device_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
@@ -202,7 +204,7 @@ class MeshContext:
         strategy_config: Optional[Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]] = None,
         pipeline_config: Optional["PipelineConfig"] = None,
         moe_config: Optional["MoEParallelizerConfig"] = None,
-        activation_checkpointing: bool = False,
+        activation_checkpointing: ActivationCheckpointingMode = False,
     ) -> "MeshContext":
         """Build a :class:`MeshContext` from ``DeviceMesh`` objects.
 
