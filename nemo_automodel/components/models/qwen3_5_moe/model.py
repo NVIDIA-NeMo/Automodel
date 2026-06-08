@@ -14,10 +14,13 @@
 
 """Qwen3.5-MoE (VL) NeMo Automodel support."""
 
+import copy
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 
@@ -58,6 +61,7 @@ except ModuleNotFoundError:
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule, roll_tensor
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
@@ -68,6 +72,14 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .cp_linear_attn import CPAwareGatedDeltaNet
 from .state_dict_adapter import Qwen3_5MoeStateDictAdapter
+
+
+@dataclass
+class Qwen3_5MoeCausalLMOutputWithPast(CausalLMOutputWithPast):
+    """Qwen3.5-MoE output extended with MTP auxiliary hidden states."""
+
+    mtp_per_depth_h: list[torch.Tensor] | None = None
+    mtp_loss_scaling_factor: float | None = None
 
 
 class Qwen3_5MoeBlock(Block):
@@ -169,6 +181,188 @@ class Qwen3_5MoeBlock(Block):
                 # HF Qwen3_5MoeRMSNormGated has no reset_parameters; manually reset weight to ones
                 self.linear_attn.norm.weight.data.fill_(1.0)
         self.mlp.init_weights(buffer_device)
+
+
+def _resolve_mtp_num_layers(config: Any, override: int | None = None) -> int:
+    if override is not None:
+        return int(override)
+    value = getattr(config, "num_nextn_predict_layers", None)
+    if value is None:
+        value = getattr(config, "mtp_num_hidden_layers", 0)
+    return int(value or 0)
+
+
+def _default_init_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{torch.cuda.current_device()}")
+    return torch.device("cpu")
+
+
+def build_mtp_config_from_hf(
+    config: Any,
+    *,
+    loss_scaling_factor: float = 0.1,
+    num_nextn_predict_layers: int | None = None,
+) -> MTPConfig:
+    """Build Qwen3.5-MoE MTP runtime config from HF-style config fields."""
+    num_layers = _resolve_mtp_num_layers(config, num_nextn_predict_layers)
+    return MTPConfig(
+        num_layers=num_layers,
+        layer_pattern="*" if num_layers > 0 else "",
+        loss_scaling_factor=loss_scaling_factor,
+    )
+
+
+def _make_mtp_block_config(config: Qwen3_5MoeTextConfig, layer_idx: int) -> Qwen3_5MoeTextConfig:
+    mtp_config = copy.copy(config)
+    layer_types = list(getattr(config, "layer_types", []) or [])
+    if len(layer_types) <= layer_idx:
+        fill = layer_types[-1] if layer_types else "full_attention"
+        layer_types.extend([fill] * (layer_idx + 1 - len(layer_types)))
+    layer_types[layer_idx] = "full_attention"
+    mtp_config.layer_types = layer_types
+    mtp_config.num_hidden_layers = max(int(getattr(config, "num_hidden_layers", 0) or 0), layer_idx + 1)
+    return mtp_config
+
+
+def _split_qwen3_5_moe_position_ids(
+    position_ids: torch.Tensor | None,
+    *,
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+    cache_position: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if position_ids is None:
+        if cache_position is None:
+            cache_position = torch.arange(0, seq_len, device=device)
+        position_ids = cache_position.view(1, 1, -1).expand(3, batch_size, -1)
+    elif position_ids.ndim == 2:
+        position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+    if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+        position_ids = position_ids[1:]
+    return position_ids
+
+
+def _freqs_cis_from_rotary(
+    rotary_emb: nn.Module,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> torch.Tensor:
+    cos, sin = rotary_emb(hidden_states, position_ids)
+    head_dim = cos.shape[-1] // 2
+    return torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
+
+
+def _rolled_embed_inputs(inputs_embeds: torch.Tensor, num_depths: int) -> tuple[torch.Tensor, ...]:
+    embed_inputs = []
+    cur = inputs_embeds
+    for _ in range(num_depths):
+        cur = roll_tensor(cur, shifts=-1, dim=-2)
+        embed_inputs.append(cur)
+    return tuple(embed_inputs)
+
+
+class Qwen3_5MoeMTPSublayer(Qwen3_5MoeBlock):
+    """One full-attention Qwen3.5-MoE MTP sublayer."""
+
+    def __init__(
+        self,
+        layer_idx: int,
+        config: Qwen3_5MoeTextConfig,
+        moe_config: MoEConfig,
+        backend: BackendConfig,
+        *,
+        has_fusion: bool = False,
+        has_final_norm: bool = False,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__(layer_idx, _make_mtp_block_config(config, layer_idx), moe_config, backend)
+        self.has_fusion = has_fusion
+        self.has_final_norm = has_final_norm
+        if has_fusion:
+            self.enorm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.hnorm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.eh_proj = initialize_linear_module(
+                backend.linear,
+                2 * config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                dtype=dtype,
+            )
+        if has_final_norm:
+            self.final_layernorm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        embed_input: torch.Tensor | None = None,
+        rotary_emb: nn.Module,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        if self.has_fusion:
+            if embed_input is None:
+                raise ValueError("first Qwen3.5-MoE MTP sublayer requires embed_input")
+            e = self.enorm(embed_input)
+            h = self.hnorm(hidden_states)
+            hidden_states = self.eh_proj(torch.cat([e, h], dim=-1))
+
+        freqs_cis = _freqs_cis_from_rotary(rotary_emb, hidden_states, position_ids)
+        hidden_states = super().forward(
+            x=hidden_states,
+            freqs_cis=freqs_cis,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            position_ids=position_ids,
+            **attn_kwargs,
+        )
+        if self.has_final_norm:
+            hidden_states = self.final_layernorm(hidden_states)
+        return hidden_states
+
+    @torch.no_grad()
+    def init_weights(self, buffer_device: torch.device) -> None:
+        super().init_weights(buffer_device)
+        if self.has_fusion:
+            self.enorm.reset_parameters()
+            self.hnorm.reset_parameters()
+            with buffer_device:
+                nn.init.trunc_normal_(self.eh_proj.weight, mean=0.0, std=0.02)
+        if self.has_final_norm:
+            self.final_layernorm.reset_parameters()
+
+
+def build_qwen3_5_moe_mtp(
+    config: Qwen3_5MoeTextConfig,
+    mtp_config: MTPConfig,
+    backend: BackendConfig,
+    moe_config: MoEConfig,
+    dtype: torch.dtype,
+) -> MTPModule:
+    """Construct Qwen3.5-MoE MTP blocks."""
+    base_layer_idx = int(config.num_hidden_layers)
+
+    def factory(*, global_idx, depth, sublayer_idx, block_type, has_fusion, has_final_norm):
+        del depth, sublayer_idx, block_type
+        return Qwen3_5MoeMTPSublayer(
+            base_layer_idx + global_idx,
+            config,
+            moe_config,
+            backend,
+            has_fusion=has_fusion,
+            has_final_norm=has_final_norm,
+            dtype=dtype,
+        )
+
+    return MTPModule(
+        mtp_config=mtp_config,
+        block_types_per_sublayer=["full_attention"],
+        sublayer_factory=factory,
+    )
 
 
 class Fp32SafeQwen3_5MoeTextRotaryEmbedding(Qwen3_5MoeTextRotaryEmbedding):
@@ -301,6 +495,11 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
+        # Resolve model dtype once; thread explicitly to every sub-module so
+        # fp32 master weights work even when construction is not wrapped in
+        # local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         # --------------- MoE config ---------------
         # Qwen3.5-MoE has MoE on every layer, with a shared expert + sigmoid gate.
         # No ``decoder_sparse_step`` — defaults to 1 so every layer is MoE.
@@ -325,14 +524,14 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             softmax_before_topk=True,
             shared_expert_gate=True,
             shared_expert_inter_dim=config.shared_expert_intermediate_size,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         # --------------- Layers ---------------
-        embed_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, dtype=embed_dtype)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, dtype=model_dtype)
 
         # Use Qwen3_5MoeBlock — same as Qwen3Next Block but with native GatedDeltaNet
         self.layers = nn.ModuleDict(
@@ -434,7 +633,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        buffer_device = buffer_device or _default_init_device()
 
         with buffer_device:
             if self.embed_tokens is not None:
@@ -494,11 +693,27 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         config: Qwen3_5MoeConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        mtp_loss_scaling_factor: float = 0.1,
+        num_nextn_predict_layers: int | None = None,
         **kwargs,
     ):
         if not _QWEN3_5_MOE_HF_AVAILABLE:
             raise UnavailableError("transformers.models.qwen3_5_moe is not available.")
         backend = backend or BackendConfig()
+
+        # _init_model() only overrides the top-level hf_config.torch_dtype; for
+        # VL configs the nested text_config / vision_config keep their original
+        # dtype (typically bf16 from the checkpoint's config.json). Propagate
+        # the user-requested dtype to every nested sub-config that exposes a
+        # torch_dtype attribute, before constructing the HF parent (whose
+        # vision encoder / multimodal code may read sub-config torch_dtype) and
+        # our text backend.
+        top_dtype = getattr(config, "torch_dtype", None)
+        if top_dtype is not None:
+            for sub_cfg in vars(config).values():
+                if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
+                    sub_cfg.torch_dtype = top_dtype
+
         # Initialize HF parent (creates self.model, self.lm_head, vision encoder, etc.)
         super().__init__(config)
 
@@ -516,7 +731,29 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Replace lm_head with NeMo backend linear
         self.lm_head = initialize_linear_module(
-            self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
+            self.backend.linear,
+            text_config.hidden_size,
+            text_config.vocab_size,
+            bias=False,
+            dtype=get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16),
+        )
+
+        dtype = get_dtype(text_config.torch_dtype, torch.bfloat16)
+        self.mtp_config = build_mtp_config_from_hf(
+            text_config,
+            loss_scaling_factor=mtp_loss_scaling_factor,
+            num_nextn_predict_layers=num_nextn_predict_layers,
+        )
+        self.mtp = (
+            build_qwen3_5_moe_mtp(
+                text_config,
+                self.mtp_config,
+                self.backend,
+                self.model.language_model.moe_config,
+                dtype=dtype,
+            )
+            if self.mtp_config.enabled
+            else None
         )
 
         # Expose moe_config for FSDP sync mixin
@@ -532,7 +769,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 text_config,
                 self.model.language_model.moe_config,
                 self.backend,
-                dtype=get_dtype(text_config.torch_dtype, torch.bfloat16),
+                dtype=dtype,
             )
 
         # Wrap vision rotary embedding with fp32-safe version
@@ -637,9 +874,62 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         hidden_states = outputs.last_hidden_state
 
-        return compute_lm_head_logits(
+        lm_output = compute_lm_head_logits(
             self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states
         )
+
+        mtp_per_depth_h: list[torch.Tensor] | None = None
+        if self.mtp is not None and self.training:
+            language_model = self.model.language_model
+            source_embeds = inputs_embeds if inputs_embeds is not None else language_model.embed_tokens(input_ids)
+            mtp_position_ids = _split_qwen3_5_moe_position_ids(
+                position_ids,
+                batch_size=source_embeds.shape[0],
+                seq_len=source_embeds.shape[1],
+                device=source_embeds.device,
+                cache_position=cache_position,
+            )
+            mtp_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key
+                not in {
+                    "pixel_values",
+                    "pixel_values_videos",
+                    "image_grid_thw",
+                    "video_grid_thw",
+                    "mm_token_type_ids",
+                }
+            }
+            if input_ids is None:
+                mtp_per_depth_h = self.mtp(
+                    hidden_states,
+                    embed_inputs=_rolled_embed_inputs(source_embeds, self.mtp.num_depths),
+                    position_ids=mtp_position_ids,
+                    attention_mask=attention_mask,
+                    padding_mask=padding_mask,
+                    rotary_emb=language_model.rotary_emb,
+                    **mtp_kwargs,
+                )
+            else:
+                mtp_per_depth_h = self.mtp(
+                    hidden_states,
+                    input_ids=input_ids,
+                    embed_fn=language_model.embed_tokens,
+                    position_ids=mtp_position_ids,
+                    attention_mask=attention_mask,
+                    padding_mask=padding_mask,
+                    rotary_emb=language_model.rotary_emb,
+                    **mtp_kwargs,
+                )
+            return Qwen3_5MoeCausalLMOutputWithPast(
+                logits=lm_output.logits,
+                hidden_states=lm_output.hidden_states,
+                mtp_per_depth_h=mtp_per_depth_h,
+                mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
+            )
+
+        return lm_output
 
     @torch.no_grad()
     def initialize_weights(
@@ -647,7 +937,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         buffer_device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
-        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        buffer_device = buffer_device or _default_init_device()
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
 
         with buffer_device:
@@ -666,6 +956,10 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                     a=-cutoff_factor * final_out_std,
                     b=cutoff_factor * final_out_std,
                 )
+            mtp = getattr(self, "mtp", None)
+            if mtp is not None:
+                for sublayer in mtp.layers:
+                    sublayer.init_weights(buffer_device=buffer_device)
 
         cast_model_to_dtype(self, dtype)
 

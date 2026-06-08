@@ -204,6 +204,14 @@ navigation:
             path: ../../model-coverage/vlm/llava-hf/llava.mdx
           - page: "Step-3.7-Flash"
             path: ../../model-coverage/vlm/stepfun-ai/step-3-7.mdx
+      - section: "Multimodal Models"
+        slug: multimodal
+        contents:
+          - page: "Overview"
+            path: ../../model-coverage/multimodal/index.mdx
+            slug: overview
+          - page: "BAGEL"
+            path: ../../model-coverage/multimodal/bytedance-seed/bagel.mdx
       - section: "Omni Models"
         slug: omni
         contents:
