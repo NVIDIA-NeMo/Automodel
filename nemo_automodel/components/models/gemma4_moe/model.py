@@ -19,7 +19,8 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
-from typing import Any, Optional, Union
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -84,6 +85,66 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 from .state_dict_adapter import Gemma4MoEStateDictAdapter
 
 
+def _first_floating_param_dtype(module: nn.Module | None) -> torch.dtype | None:
+    """Return the dtype of the first floating parameter in ``module``."""
+    if module is None:
+        return None
+    for param in module.parameters(recurse=True):
+        if param.is_floating_point():
+            return param.dtype
+    return None
+
+
+def _cast_floating_tensor(value: Any, dtype: torch.dtype) -> Any:
+    if isinstance(value, torch.Tensor) and value.is_floating_point() and value.dtype != dtype:
+        return value.to(dtype)
+    return value
+
+
+@contextmanager
+def _cast_gemma4_embedder_inputs_to_param_dtype(embedder: nn.Module | None) -> Iterator[None]:
+    """Cast transient multimodal embedder activations to the current param dtype.
+
+    FSDP2 mixed precision keeps resident parameters in fp32 for AdamW master
+    weights, but all-gathers them as bf16 for forward compute. HF Gemma4's
+    vision pooler intentionally emits float32 before the multimodal projector,
+    so the projector input must be recast to its current compute parameter dtype
+    without changing the resident parameter dtype.
+    """
+    target_dtype = _first_floating_param_dtype(embedder)
+    if embedder is None or target_dtype is None:
+        yield
+        return
+
+    def hook(
+        _module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        if "inputs_embeds" in kwargs:
+            kwargs = dict(kwargs)
+            kwargs["inputs_embeds"] = _cast_floating_tensor(kwargs["inputs_embeds"], target_dtype)
+            return args, kwargs
+        if args:
+            args = (_cast_floating_tensor(args[0], target_dtype), *args[1:])
+        return args, kwargs
+
+    handle = embedder.register_forward_pre_hook(hook, with_kwargs=True)
+    try:
+        yield
+    finally:
+        handle.remove()
+
+
+def get_gemma4_image_features_with_projector_dtype(
+    gemma4_model: nn.Module,
+    pixel_values: torch.Tensor,
+    *,
+    image_position_ids: torch.Tensor | None = None,
+) -> Any:
+    """Run HF Gemma4 image features with a dtype-safe projector boundary."""
+    with _cast_gemma4_embedder_inputs_to_param_dtype(getattr(gemma4_model, "embed_vision", None)):
+        return gemma4_model.get_image_features(pixel_values, image_position_ids=image_position_ids, return_dict=True)
+
+
 # ---------------------------------------------------------------------------
 # Gemma4-specific router that outputs NeMo-compatible (weights, indices)
 # ---------------------------------------------------------------------------
@@ -102,23 +163,38 @@ class Gemma4Gate(nn.Module):
         self.topk = config.top_k_experts
         self.num_experts = num_experts
 
+        # Thread dtype explicitly from config.torch_dtype so the router's own
+        # params (proj weight + scale) stay aligned with the rest of the model
+        # (fp32 under fp32 master weights) even when construction is not wrapped
+        # in local_torch_dtype(). Gemma4RMSNorm(with_scale=False) holds no
+        # learnable parameter, so it needs no dtype threading.
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         self.norm = Gemma4RMSNorm(hidden_size, eps=config.rms_norm_eps, with_scale=False)
-        self.proj = nn.Linear(hidden_size, num_experts, bias=False)
-        self.scale = nn.Parameter(torch.ones(hidden_size))
+        self.proj = nn.Linear(hidden_size, num_experts, bias=False, dtype=dtype)
+        self.scale = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         scalar_root_size = hidden_size**-0.5
         self.register_buffer("root_size", torch.tensor(scalar_root_size), persistent=False)
 
     def forward(self, x, token_mask=None, cp_mesh=None):
-        x_norm = self.norm(x)
-        x_norm = x_norm * self.root_size.to(x_norm.dtype)
-        x_norm = x_norm * self.scale.to(x_norm.dtype)
+        # Router math runs in fp32 regardless of parameter/activation storage
+        # dtype. With bf16 storage (e.g. bf16 weights + fp32 master weights via
+        # TE FusedAdam), bf16 logits can flip top-k expert selection, so keep
+        # the linear, scaling, and softmax in fp32 — mirroring the fp32 routing
+        # the standard MoE Gate enforces via gate_precision. Weights are cast
+        # back to the input dtype for the downstream expert computation.
+        input_dtype = x.dtype
 
-        expert_scores = self.proj(x_norm)
+        x_norm = self.norm(x).to(torch.float32)
+        x_norm = x_norm * self.root_size.to(torch.float32)
+        x_norm = x_norm * self.scale.to(torch.float32)
+
+        expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
         router_probs = F.softmax(expert_scores, dim=-1)
 
         weights, indices = torch.topk(router_probs, k=self.topk, dim=-1)
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-20)
-        return weights, indices, None
+        return weights.to(input_dtype), indices, None
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         pass
@@ -222,15 +298,21 @@ class Gemma4MoEDecoderLayer(nn.Module):
         past_key_values=None,
         use_cache: bool | None = False,
         cache_position: torch.LongTensor | None = None,
+        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         # --- Attention ---
         residual = x
         x = self.input_layernorm(x)
+        # HF's Gemma4TextAttention requires a `shared_kv_states` dict: kv-sharing
+        # layers read their keys/values from it and full-length layers write into
+        # it. The backend threads one dict through every layer so sharing works;
+        # for configs without kv-sharing (e.g. 26B-A4B) it stays empty.
         x, _ = self.self_attn(
             hidden_states=x,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
+            shared_kv_states=shared_kv_states if shared_kv_states is not None else {},
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -307,6 +389,14 @@ class Gemma4MoETextModelBackend(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
+        # Resolve model dtype once from config.torch_dtype and thread it into
+        # MoEConfig so the MoE expert params stay aligned with the rest of the
+        # model (fp32 under fp32 master weights). HF-native submodules
+        # (attention, Gemma4MLP, Gemma4RMSNorm, Gemma4TextScaledWordEmbedding)
+        # inherit their dtype from torch.get_default_dtype() via the
+        # local_torch_dtype() context established by _init_model().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
@@ -325,12 +415,12 @@ class Gemma4MoETextModelBackend(nn.Module):
             norm_topk_prob=True,
             expert_activation="geglu",
             softmax_before_topk=False,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.embed_tokens = Gemma4TextScaledWordEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -421,6 +511,9 @@ class Gemma4MoETextModelBackend(nn.Module):
         for layer_type in set(self.config.layer_types):
             position_embeddings[layer_type] = self.rotary_emb(hidden_states, position_ids, layer_type)
 
+        # Single dict shared across all layers so kv-sharing layers can reuse the
+        # full-length keys/values cached by earlier layers (HF contract).
+        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         for decoder_layer in self.layers.values():
             hidden_states = decoder_layer(
                 hidden_states,
@@ -428,6 +521,7 @@ class Gemma4MoETextModelBackend(nn.Module):
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_ids=position_ids,
                 padding_mask=padding_mask,
+                shared_kv_states=shared_kv_states,
                 **kwargs,
             )
 
@@ -561,6 +655,18 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if not getattr(cfg_text, "expert_intermediate_size", None) and getattr(cfg_text, "moe_intermediate_size", None):
             cfg_text.expert_intermediate_size = cfg_text.moe_intermediate_size
 
+        # _init_model() only overrides the top-level hf_config.torch_dtype; for
+        # VL configs the nested text_config / vision_config keep their original
+        # dtype (typically bf16 from the checkpoint's config.json). Propagate
+        # the user-requested dtype to every nested sub-config that exposes a
+        # torch_dtype attribute, before constructing the HF parent and our
+        # text backend.
+        top_dtype = getattr(config, "torch_dtype", None)
+        if top_dtype is not None:
+            for sub_cfg in vars(config).values():
+                if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
+                    sub_cfg.torch_dtype = top_dtype
+
         # Initialize the HF parent (creates self.model, self.lm_head, vision tower, etc.)
         super().__init__(config)
 
@@ -654,8 +760,8 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         # Handle vision tokens
         if pixel_values is not None:
-            image_features = self.model.get_image_features(
-                pixel_values, image_position_ids=image_position_ids, return_dict=True
+            image_features = get_gemma4_image_features_with_projector_dtype(
+                self.model, pixel_values, image_position_ids=image_position_ids
             ).pooler_output
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
 
