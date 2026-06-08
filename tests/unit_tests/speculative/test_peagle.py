@@ -65,12 +65,8 @@ _gpu_only = pytest.mark.skipif(
 def _build_tiny_draft_model(
     *, parallel_drafting: bool = False, mask_token_id: int = 0, device: str = _DEVICE
 ) -> LlamaEagle3DraftModel:
-    # head_dim must be >= 16: the compiled flex_attention (inductor) backend used on the
-    # CUDA forward path rejects smaller embedding dims (NYI). hidden_size=64 / 4 heads -> 16.
-    # target_hidden_size tracks hidden_size so aux_hidden_states (3 * hidden_size) matches
-    # the draft fc in_features (num_aux * target_hidden_size).
     config = LlamaConfig(
-        hidden_size=64,
+        hidden_size=32,
         intermediate_size=64,
         num_hidden_layers=2,
         num_attention_heads=4,
@@ -80,7 +76,7 @@ def _build_tiny_draft_model(
     )
     config.torch_dtype = torch.float32
     config.draft_vocab_size = 16
-    config.target_hidden_size = 64
+    config.target_hidden_size = 32
     config.parallel_drafting = parallel_drafting
     if parallel_drafting:
         config.mask_token_id = mask_token_id
