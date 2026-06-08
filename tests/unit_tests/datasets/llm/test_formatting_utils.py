@@ -85,3 +85,29 @@ def test_multiturn_mask_requires_assistant():
     formatted = [{"role": "user", "content": "a"}]
     with pytest.raises(AssertionError, match="At least one assistant message"):
         formatting_utils._build_multiturn_assistant_mask(_CountingTokenizer(), formatted, [0, 1])
+
+
+def test_mask_labels_to_last_turn_keeps_only_final_run():
+    # Two supervised runs separated by an ignored run; only the last survives.
+    labels = [-100, 1, 2, -100, -100, 3, 4, -100]
+    formatting_utils._mask_labels_to_last_turn(labels)
+    assert labels == [-100, -100, -100, -100, -100, 3, 4, -100]
+
+
+def test_mask_labels_to_last_turn_single_run_unchanged():
+    labels = [-100, -100, 5, 6, 7]
+    formatting_utils._mask_labels_to_last_turn(labels)
+    assert labels == [-100, -100, 5, 6, 7]
+
+
+def test_mask_labels_to_last_turn_no_supervised_tokens_is_noop():
+    labels = [-100, -100, -100]
+    formatting_utils._mask_labels_to_last_turn(labels)
+    assert labels == [-100, -100, -100]
+
+
+def test_mask_labels_to_last_turn_on_binary_mask():
+    # On a 0/1 assistant mask (ignore_index=0): keep only the last run of 1s.
+    mask = [0, 1, 1, 0, 1, 1, 1, 0]
+    formatting_utils._mask_labels_to_last_turn(mask, ignore_index=0)
+    assert mask == [0, 0, 0, 0, 1, 1, 1, 0]

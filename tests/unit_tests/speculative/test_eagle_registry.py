@@ -26,7 +26,6 @@ from nemo_automodel.components.speculative.eagle.registry import (
     resolve_eagle3_draft_spec,
 )
 
-
 # ── DraftSpec dataclass ──────────────────────────────────────────────────
 
 
