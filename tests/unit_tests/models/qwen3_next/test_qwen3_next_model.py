@@ -18,11 +18,10 @@ import pytest
 import torch
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_next.model import Block, Qwen3NextForCausalLM, Qwen3NextModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
-from nemo_automodel.components.models.common import BackendConfig
-
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -158,8 +157,10 @@ class TestBlock:
         x = torch.randn(batch, seq_len, qwen_config.hidden_size, device=device)
         freqs_cis = torch.randn(batch, seq_len, qwen_config.head_dim, device=device)
 
-        with patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn, \
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp:
+        with (
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+        ):
             out = block(x, freqs_cis=freqs_cis)
 
         assert out.shape == x.shape
@@ -174,8 +175,10 @@ class TestBlock:
         x = torch.randn(batch, seq_len, qwen_config.hidden_size, device=device)
         freqs_cis = torch.randn(batch, seq_len, qwen_config.head_dim, device=device)
 
-        with patch.object(block.linear_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn, \
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp:
+        with (
+            patch.object(block.linear_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+        ):
             out = block(x, freqs_cis=freqs_cis)
 
         assert out.shape == x.shape
@@ -190,8 +193,10 @@ class TestBlock:
         freqs_cis = torch.randn(1, 3, qwen_config.head_dim, device=device)
         attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.bool, device=device)
 
-        with patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn, \
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp:
+        with (
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+        ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask)
 
         mock_attn.assert_called_once()
@@ -210,8 +215,10 @@ class TestBlock:
         attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.bool, device=device)
         padding_mask = torch.tensor([[0, 0, 1]], dtype=torch.bool, device=device)
 
-        with patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn, \
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp:
+        with (
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)),
+            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+        ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask, padding_mask=padding_mask)
 
         _, kwargs = mock_mlp.call_args
@@ -241,10 +248,12 @@ class TestBlock:
     def test_init_weights_resets_sublayers_for_full_attention(self, qwen_config, backend_config):
         block = Block(layer_idx=0, config=qwen_config, moe_config=magic_moe_config(qwen_config), backend=backend_config)
 
-        with patch.object(block.input_layernorm, "reset_parameters") as mock_in, \
-            patch.object(block.post_attention_layernorm, "reset_parameters") as mock_post, \
-            patch.object(block.self_attn, "init_weights") as mock_attn, \
-            patch.object(block.mlp, "init_weights") as mock_mlp:
+        with (
+            patch.object(block.input_layernorm, "reset_parameters") as mock_in,
+            patch.object(block.post_attention_layernorm, "reset_parameters") as mock_post,
+            patch.object(block.self_attn, "init_weights") as mock_attn,
+            patch.object(block.mlp, "init_weights") as mock_mlp,
+        ):
             block.init_weights(torch.device("cpu"))
 
         mock_in.assert_called_once()
@@ -255,11 +264,13 @@ class TestBlock:
     def test_init_weights_resets_sublayers_for_linear_attention(self, qwen_config, backend_config):
         block = Block(layer_idx=1, config=qwen_config, moe_config=magic_moe_config(qwen_config), backend=backend_config)
 
-        with patch.object(block.input_layernorm, "reset_parameters") as mock_in, \
-            patch.object(block.post_attention_layernorm, "reset_parameters") as mock_post, \
-            patch.object(block.mlp, "init_weights") as mock_mlp:
+        with (
+            patch.object(block.input_layernorm, "reset_parameters") as mock_in,
+            patch.object(block.post_attention_layernorm, "reset_parameters") as mock_post,
+            patch.object(block.mlp, "init_weights") as mock_mlp,
+        ):
             # Initialize with actual linear_attn parameters
-            with patch("torch.nn.init.trunc_normal_") as mock_trunc:
+            with patch("torch.nn.init.trunc_normal_"):
                 block.init_weights(torch.device("cpu"))
 
         mock_in.assert_called_once()
@@ -300,7 +311,9 @@ class TestQwen3NextModel:
         freqs_mock = MagicMock(return_value=(1.0, torch.ones(qwen_config.head_dim // 2)))
 
         with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq", freqs_mock):
-            with patch.object(Block, "forward", side_effect=lambda *_, **__: torch.randn(batch, seq_len, qwen_config.hidden_size)) as mock_block:
+            with patch.object(
+                Block, "forward", side_effect=lambda *_, **__: torch.randn(batch, seq_len, qwen_config.hidden_size)
+            ) as mock_block:
                 out = model(input_ids)
 
         assert out.shape == (batch, seq_len, qwen_config.hidden_size)
@@ -311,11 +324,17 @@ class TestQwen3NextModel:
         batch, seq_len = 2, 4
         input_ids = torch.randint(0, qwen_config.vocab_size, (batch, seq_len))
 
-        with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq", return_value=(1.0, torch.ones(qwen_config.head_dim // 2))):
-            with patch.object(Block, "forward", side_effect=lambda *_, **kwargs: torch.randn(batch, seq_len, qwen_config.hidden_size)):
+        with patch.object(
+            model.rotary_emb,
+            "_compute_concentration_and_inv_freq",
+            return_value=(1.0, torch.ones(qwen_config.head_dim // 2)),
+        ):
+            with patch.object(
+                Block, "forward", side_effect=lambda *_, **kwargs: torch.randn(batch, seq_len, qwen_config.hidden_size)
+            ):
                 with patch("nemo_automodel.components.models.qwen3_next.model.position_ids_to_freqs_cis") as mock_freqs:
                     mock_freqs.return_value = torch.randn(batch, seq_len, qwen_config.head_dim)
-                    out = model(input_ids)
+                    model(input_ids)
 
         # Verify position_ids_to_freqs_cis was called
         mock_freqs.assert_called_once()
@@ -331,7 +350,11 @@ class TestQwen3NextModel:
         input_ids = torch.randint(0, qwen_config.vocab_size, (batch, seq_len))
         position_ids = torch.arange(seq_len).unsqueeze(0)
 
-        with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq", return_value=(1.0, torch.ones(qwen_config.head_dim // 2))):
+        with patch.object(
+            model.rotary_emb,
+            "_compute_concentration_and_inv_freq",
+            return_value=(1.0, torch.ones(qwen_config.head_dim // 2)),
+        ):
             with patch.object(Block, "forward", return_value=torch.zeros(batch, seq_len, qwen_config.hidden_size)):
                 out = model(input_ids, position_ids=position_ids)
 
@@ -342,7 +365,11 @@ class TestQwen3NextModel:
         batch, seq_len = 1, 3
         input_ids = torch.randint(0, qwen_config.vocab_size, (batch, seq_len))
 
-        with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq", return_value=(1.0, torch.ones(qwen_config.head_dim // 2))):
+        with patch.object(
+            model.rotary_emb,
+            "_compute_concentration_and_inv_freq",
+            return_value=(1.0, torch.ones(qwen_config.head_dim // 2)),
+        ):
             with patch("nemo_automodel.components.models.qwen3_next.model.position_ids_to_freqs_cis") as mock_freqs:
                 mock_freqs.return_value = torch.randn(batch, seq_len, qwen_config.head_dim)
                 with patch.object(Block, "forward", return_value=torch.zeros(batch, seq_len, qwen_config.hidden_size)):
@@ -355,8 +382,10 @@ class TestQwen3NextModel:
         model = Qwen3NextModel(qwen_config, backend=backend_config)
         original = model.embed_tokens.weight.clone()
 
-        with patch.object(model.norm, "reset_parameters") as mock_norm, \
-            patch.object(Block, "init_weights") as mock_layer_init:
+        with (
+            patch.object(model.norm, "reset_parameters") as mock_norm,
+            patch.object(Block, "init_weights") as mock_layer_init,
+        ):
             model.init_weights(torch.device("cpu"))
 
         mock_norm.assert_called_once()
@@ -367,8 +396,7 @@ class TestQwen3NextModel:
         model = Qwen3NextModel(qwen_config, backend=backend_config)
         device = torch.device("cpu")
 
-        with patch.object(model.norm, "reset_parameters"), \
-            patch.object(Block, "init_weights"):
+        with patch.object(model.norm, "reset_parameters"), patch.object(Block, "init_weights"):
             model.init_weights(buffer_device=device)
 
         assert model.rotary_emb.device == device
@@ -382,9 +410,14 @@ class TestQwen3NextForCausalLM:
         batch, seq_len = 2, 6
         input_ids = torch.randint(0, qwen_config.vocab_size, (batch, seq_len), device=device)
 
-        with patch.object(model.model, "forward", return_value=torch.randn(batch, seq_len, qwen_config.hidden_size, device=device).to(torch.bfloat16)):
-            logits = model(input_ids)
+        with patch.object(
+            model.model,
+            "forward",
+            return_value=torch.randn(batch, seq_len, qwen_config.hidden_size, device=device).to(torch.bfloat16),
+        ):
+            out = model(input_ids)
 
+        logits = getattr(out, "logits", out)
         assert logits.shape == (batch, seq_len, qwen_config.vocab_size)
 
     def test_forward_with_thd_format_squeezes_input(self, qwen_config, backend_config, device):
@@ -394,13 +427,20 @@ class TestQwen3NextForCausalLM:
         batch, seq_len = 1, 5
         input_ids = torch.randint(0, qwen_config.vocab_size, (batch, seq_len), device=device)
 
-        with patch("nemo_automodel.components.models.qwen3_next.model.squeeze_input_for_thd") as mock_squeeze, \
-             patch.object(model.model, "forward", return_value=torch.randn(seq_len, qwen_config.hidden_size, device=device).to(torch.bfloat16)):
+        with (
+            patch("nemo_automodel.components.models.qwen3_next.model.squeeze_input_for_thd") as mock_squeeze,
+            patch.object(
+                model.model,
+                "forward",
+                return_value=torch.randn(seq_len, qwen_config.hidden_size, device=device).to(torch.bfloat16),
+            ),
+        ):
             mock_squeeze.return_value = (input_ids.squeeze(0), None, None, {"qkv_format": "thd"})
-            logits = model(input_ids, qkv_format="thd")
+            out = model(input_ids, qkv_format="thd")
 
         mock_squeeze.assert_called_once()
         # Output should be unsqueezed back to batch dimension
+        logits = getattr(out, "logits", out)
         assert logits.shape == (batch, seq_len, qwen_config.vocab_size)
 
     def test_initialize_weights_invokes_submodules(self, qwen_config, backend_config):
@@ -417,14 +457,13 @@ class TestQwen3NextForCausalLM:
     def test_initialize_weights_uses_scaled_std_for_lm_head(self, qwen_config, backend_config):
         model = Qwen3NextForCausalLM(qwen_config, backend=backend_config)
 
-        with patch.object(model.model, "init_weights"), \
-             patch("torch.nn.init.trunc_normal_") as mock_trunc:
+        with patch.object(model.model, "init_weights"), patch("torch.nn.init.trunc_normal_") as mock_trunc:
             model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
 
         # Check that trunc_normal_ was called with scaled std
         mock_trunc.assert_called()
         call_args = mock_trunc.call_args
-        assert call_args[1]["std"] == qwen_config.hidden_size ** -0.5
+        assert call_args[1]["std"] == qwen_config.hidden_size**-0.5
 
     def test_initialize_weights_updates_rotary_emb_device_after_dtype_move(self, qwen_config, backend_config):
         model = Qwen3NextForCausalLM(qwen_config, backend=backend_config)
@@ -470,10 +509,14 @@ class TestQwen3NextModelClassmethods:
             layer_types=["full_attention", "linear_attention"],
         )
 
-        with patch("transformers.models.qwen3_next.configuration_qwen3_next.Qwen3NextConfig.from_pretrained") as mock_from_pretrained:
+        with patch(
+            "transformers.models.qwen3_next.configuration_qwen3_next.Qwen3NextConfig.from_pretrained"
+        ) as mock_from_pretrained:
             mock_from_pretrained.return_value = cfg
 
-            with patch.object(Qwen3NextForCausalLM, "from_config", wraps=Qwen3NextForCausalLM.from_config) as mock_from_config:
+            with patch.object(
+                Qwen3NextForCausalLM, "from_config", wraps=Qwen3NextForCausalLM.from_config
+            ) as mock_from_config:
                 model = Qwen3NextForCausalLM.from_pretrained("qwen3_next/model")
                 assert isinstance(model, Qwen3NextForCausalLM)
                 mock_from_pretrained.assert_called_once_with("qwen3_next/model")
