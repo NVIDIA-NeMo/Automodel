@@ -179,7 +179,7 @@ class SGLangTargetRunner:
         """
         import torch.distributed as dist
         from sglang.srt.configs.model_config import ModelConfig
-        from sglang.srt.distributed import init_distributed_environment, initialize_model_parallel
+        from sglang.srt.distributed import init_distributed_environment
         from sglang.srt.model_executor.model_runner import ModelRunner
         from sglang.srt.server_args import ServerArgs
 
@@ -199,8 +199,10 @@ class SGLangTargetRunner:
         )
 
         gpu_id = torch.cuda.current_device()
-        # Standalone server: SGLang manages its own single-rank world rather than
-        # reusing a trainer process group (the SpecForge embedded case).
+        # Standalone server: bring up only the world process group here, then let
+        # ModelRunner.init_torch_distributed build the tensor-parallel group. sglang
+        # >=0.5.9 always calls initialize_model_parallel inside ModelRunner, so doing
+        # it here too trips "tensor model parallel group is already initialized".
         if not dist.is_initialized():
             os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
             os.environ.setdefault("MASTER_PORT", str(int(server_args.port or 8000) + 200))
@@ -211,7 +213,6 @@ class SGLangTargetRunner:
                 local_rank=gpu_id,
                 distributed_init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
             )
-            initialize_model_parallel(tensor_model_parallel_size=tp_size)
 
         model_config = ModelConfig.from_server_args(server_args)
         model_runner = ModelRunner(
