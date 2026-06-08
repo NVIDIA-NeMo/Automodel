@@ -41,6 +41,7 @@ recipe_args:
   shuffle_seed: 42
   log_every_steps: 10
   max_grad_norm: 1.0
+  # mask_reasoning_content: true   # exclude <think>...</think> reasoning traces from loss
 
   # --- checkpoint cadence (independent; the fully-trained model is always saved) ---
   # ckpt_every_steps: 1000            # also save every N optimizer steps

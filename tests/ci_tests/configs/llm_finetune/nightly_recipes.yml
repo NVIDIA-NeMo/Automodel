@@ -38,7 +38,6 @@ configs:
 
   # -- gpt_oss --
   - gpt_oss/gpt_oss_20b.yaml
-  - gpt_oss/gpt_oss_20b_single_gpu.yaml
 
   # -- granite --
   - granite/granite_3_3_2b_instruct_squad.yaml
