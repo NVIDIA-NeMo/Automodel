@@ -35,6 +35,8 @@ def test_ddp_manager_forwards_ddp_constructor_flags(monkeypatch):
             broadcast_buffers=True,
             find_unused_parameters=True,
             static_graph=True,
+            bucket_cap_mb=64,
+            gradient_as_bucket_view=True,
         )
     )
 
@@ -47,3 +49,5 @@ def test_ddp_manager_forwards_ddp_constructor_flags(monkeypatch):
     assert ddp_ctor.call_args.kwargs["broadcast_buffers"] is True
     assert ddp_ctor.call_args.kwargs["find_unused_parameters"] is True
     assert ddp_ctor.call_args.kwargs["static_graph"] is True
+    assert ddp_ctor.call_args.kwargs["bucket_cap_mb"] == 64
+    assert ddp_ctor.call_args.kwargs["gradient_as_bucket_view"] is True

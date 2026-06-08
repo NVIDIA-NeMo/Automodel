@@ -216,6 +216,8 @@ class DDPConfig:
         broadcast_buffers (bool): Synchronize module buffers before each forward.
         find_unused_parameters (bool): Traverse the autograd graph to support unused parameters.
         static_graph (bool): Tell DDP the used/unused parameter set is stable.
+        bucket_cap_mb (Optional[float]): DDP gradient bucket size in MiB. ``None`` uses PyTorch's default.
+        gradient_as_bucket_view (bool): Make gradients views into DDP buckets after the first iteration.
     """
 
     activation_checkpointing: bool = False
@@ -223,6 +225,8 @@ class DDPConfig:
     broadcast_buffers: bool = False
     find_unused_parameters: bool = False
     static_graph: bool = False
+    bucket_cap_mb: Optional[float] = None
+    gradient_as_bucket_view: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""

@@ -63,6 +63,8 @@ class TestParsing:
                 "broadcast_buffers": True,
                 "find_unused_parameters": True,
                 "static_graph": True,
+                "bucket_cap_mb": 64,
+                "gradient_as_bucket_view": True,
             }
         )
         assert isinstance(result["strategy_config"], DDPConfig)
@@ -70,6 +72,8 @@ class TestParsing:
         assert result["strategy_config"].broadcast_buffers is True
         assert result["strategy_config"].find_unused_parameters is True
         assert result["strategy_config"].static_graph is True
+        assert result["strategy_config"].bucket_cap_mb == 64
+        assert result["strategy_config"].gradient_as_bucket_view is True
 
     def test_all_parallelism_keys(self):
         cfg = {
