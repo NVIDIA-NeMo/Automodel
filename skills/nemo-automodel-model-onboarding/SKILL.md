@@ -249,6 +249,50 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 }
 ```
 
+### 2.6 Keep intrinsically-fp32 params in fp32 compute
+
+Some parameters are numerically unstable in low precision and must be **computed** in fp32
+even when the rest of the model computes in bf16 — e.g. SSM/Mamba `A_log`, `dt_bias`, `D`;
+MoE sigmoid-gate bias (`e_score_correction_bias`); attention-sink bias; per-head `scale`.
+If your model has any such params, declare them in `_keep_in_fp32_modules_strict` as
+parameter-name substrings; sharding (`fully_shard_by_dtype`) reads this list and gives those
+params an fp32 compute dtype while everything else uses `mp_policy.param_dtype` (bf16). A
+plain dense LLM with no precision-sensitive params needs nothing here.
+
+Where to declare it:
+
+- **NeMo-native model class** (you own `model.py`): a class attribute, e.g.
+  `_keep_in_fp32_modules_strict = ["e_score_correction_bias"]` (see `deepseek_v4`, `ling_v2`).
+- **HF model you only patch** (e.g. Qwen3.5): set it on the instance inside `patch_hf_model`,
+  e.g. `model._keep_in_fp32_modules_strict = existing + ("_fp32_params",)`.
+
+Always declare the pin for these params. A normal checkpoint load also auto-records each
+param's original HF dtype and uses it as a fallback, but that recording is skipped on the
+quantized, from-scratch, and odd-checkpoint paths — so the explicit pin is the only signal
+that holds across every path.
+
+**Frozen submodules** (e.g. a frozen vision tower in a VLM) are a dtype-mismatch hazard under
+the fp32-master pattern: a frozen part that stays fp32 feeds bf16 trainable modules and trips
+a matmul at the seam. There are two distinct fp32 sources, and both are handled automatically
+(after materialization, checkpoint load, and sharding) by casting each maximal fully-frozen
+submodule toward `mp_policy.param_dtype` (bf16):
+
+- **Parameters** — a frozen submodule *excluded* from FSDP keeps fp32 (plain tensors) and is
+  cast; a frozen submodule that *is* sharded holds DTensor params, which are left to FSDP's
+  all-gather cast (re-casting sharded storage in place would desync FSDP bookkeeping).
+- **Buffers** — FSDP never casts buffers, so a frozen module's fp32 buffers (e.g.
+  standardization constants) would promote bf16 activations back to fp32 via type promotion.
+  Buffers are always plain tensors, so they are cast unconditionally — including inside sharded
+  frozen towers whose params FSDP already handles.
+
+This is safe because frozen modules are never updated. If a *frozen* part is also numerically
+sensitive and must compute in fp32, list it in `_keep_in_fp32_modules_strict` — the cast honors
+those keywords and leaves matching params and buffers in fp32.
+
+A model whose vision path forces fp32 *inside* a forward op that isn't a parameter or buffer
+(e.g. HF Gemma4's `get_image_features` feeding an fp32 activation into a bf16 projector) needs
+a per-model activation cast at that seam, since no parameter/buffer cast can reach it.
+
 ---
 
 ## Phase 3: Onboarding Example Config
@@ -374,6 +418,7 @@ that only surface in a full parity comparison.
 - [ ] Created example YAML config
 - [ ] Verified model loads via `NeMoAutoModelForCausalLM.from_pretrained()`
 - [ ] Created unit tests (forward shape, state_dict round-trip)
+- [ ] Declared `_keep_in_fp32_modules_strict` for every intrinsically-fp32 param (SSM `A_log`/`dt_bias`/`D`, MoE gate bias, attention-sink bias, `scale`, …) — see §2.6
 - [ ] Created layer equivalence tests for every rewritten layer (matching model dtype)
 - [ ] Created functional tests (training loss decreases)
 - [ ] Updated docs/model-coverage page
