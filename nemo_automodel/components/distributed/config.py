@@ -211,10 +211,13 @@ class DDPConfig:
     Attributes:
         activation_checkpointing (bool): Enable activation checkpointing if True.
         backend (str): Distributed backend, e.g. 'nccl' or 'gloo'.
+        find_unused_parameters (bool): Forwarded to PyTorch DDP for models with
+            conditionally unused trainable parameters.
     """
 
     activation_checkpointing: bool = False
     backend: str = "nccl"
+    find_unused_parameters: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""

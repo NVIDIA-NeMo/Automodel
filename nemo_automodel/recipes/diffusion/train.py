@@ -433,6 +433,7 @@ def build_model_and_optimizer(
             "backend": ddp_cfg.get("backend", "nccl"),
             "world_size": world_size,
             "activation_checkpointing": ddp_cfg.get("activation_checkpointing", False),
+            "find_unused_parameters": ddp_cfg.get("find_unused_parameters", False),
         }
     else:
         # FSDP configuration (default)
