@@ -15,7 +15,7 @@
 import importlib.util
 import logging
 import warnings
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -454,6 +454,55 @@ def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -
             _restore_fp32_buffers(model, fp32_keywords)
         else:
             _restore_fp32_modules(model, fp32_keywords)
+
+
+@contextmanager
+def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None):
+    """Run a block with the model temporarily in fp32, then cast it to ``restore_dtype``.
+
+    On entry the whole model is cast to fp32; on exit it is cast to ``restore_dtype``
+    (which defaults to the model's pre-context floating-point dtype, so by default the
+    original dtype is restored). The exit cast is a no-op when the target is already fp32.
+
+    The motivating use is from-scratch weight initialization. Sampling a random init directly
+    in a reduced-precision dtype (e.g. bf16) distorts the init's variance/mean schedule: bf16's
+    8-bit mantissa quantizes the small init magnitudes and biases the truncation/scaling
+    arithmetic used by ``normal_`` / ``trunc_normal_``. In a deep residual stack this compounds
+    and produces genuinely huge gradients on the first optimization steps of from-scratch
+    pretraining (flat / diverging loss). Sampling in fp32 and then casting back avoids this while
+    keeping reduced-precision storage: the round-to-bf16 of a correct fp32 sample is an unbiased
+    per-element perturbation that preserves the init statistics. Wrap the body of a model's
+    ``initialize_weights`` to keep that round-trip in one place.
+
+    Works whether or not the model is already FSDP2-sharded: both casts are *uniform* whole-model
+    casts, so FSDP2's invariant that every parameter in a group shares one dtype is preserved. In
+    the AutoModel pipeline ``initialize_weights`` actually runs after sharding (via
+    ``checkpointer.initialize_model_weights``), i.e. on DTensor params, which is supported.
+
+    ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` handling is delegated to
+    ``cast_model_to_dtype``: on an unsharded model those modules' params and buffers are restored
+    to fp32 on exit; on a sharded model only their buffers are (sharded fp32 params are pinned at
+    shard time, since FSDP2 forbids mixed dtypes within a group).
+
+    Args:
+        model: The model to run in fp32 within the context.
+        restore_dtype: The dtype to cast the model to on exit. Defaults to the model's current
+            floating-point dtype (captured before the fp32 cast), i.e. the original dtype.
+
+    Yields:
+        The same ``model``, now in fp32.
+
+    Example:
+        >>> with yield_fp32_model(self, dtype):
+        ...     self.model.init_weights(buffer_device=buffer_device)
+    """
+    if restore_dtype is None:
+        restore_dtype = next((p.dtype for p in model.parameters() if p.is_floating_point()), torch.float32)
+    cast_model_to_dtype(model, torch.float32)
+    try:
+        yield model
+    finally:
+        cast_model_to_dtype(model, restore_dtype)
 
 
 def _get_fp32_module_keywords(model: nn.Module) -> list[str]:
