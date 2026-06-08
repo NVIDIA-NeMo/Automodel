@@ -21,7 +21,7 @@ import os
 from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import ClassVar, Dict, List, Optional, Union
 
 import torch.distributed as dist
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -37,6 +37,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class MegatronPretrainingConfig:
     """Construction-time configuration for :class:`MegatronPretraining` (tokenizer is a build arg)."""
+
+    # The Megatron ``BlendedMegatronDatasetBuilder`` synchronizes index-cache construction across *all* ranks
+    # via ``torch.distributed.barrier()``. It must therefore run with every rank participating, not behind the
+    # ``FirstRankPerNode`` rank-0-first gate the loader applies by default (which would deadlock the builder's
+    # internal collectives). The loader checks this flag and skips that wrapper for Megatron.
+    manages_own_distributed_build: ClassVar[bool] = True
 
     paths: Path | List | Dict[str, List]
     """Paths of the data distributions (single path, list, dict, or path to a JSON blend file)."""
