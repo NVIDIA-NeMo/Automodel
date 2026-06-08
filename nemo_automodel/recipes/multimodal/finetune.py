@@ -59,7 +59,7 @@ from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa:
 )
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG  # noqa: E402
 from nemo_automodel.components.training.step_scheduler import StepScheduler  # noqa: E402
-from nemo_automodel.recipes._dist_setup import setup_distributed  # noqa: E402
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config  # noqa: E402
 from nemo_automodel.recipes.base_recipe import BaseRecipe  # noqa: E402
 
 try:
@@ -363,10 +363,10 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
                 distributed_config=self.distributed_config,
                 pipeline_config=self.pipeline_config,
-                moe_config=self.dist_setup.moe_config,
-                activation_checkpointing=self.dist_setup.activation_checkpointing,
+                moe_config=self.moe_parallel_config,
+                activation_checkpointing=self.activation_checkpointing,
                 device=self.dist_env.device,
-                mesh=self.dist_setup,
+                mesh=self.mesh_context,
             )
             fp8_config = build_fp8_config(self.cfg.fp8) if self.cfg.get("fp8", None) is not None else None
             compile_config = (
@@ -376,7 +376,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             model = apply_model_infrastructure(
                 model=model,
                 pretrained_model_name_or_path="",
-                mesh=self.dist_setup,
+                mesh=self.mesh_context,
                 peft_config=self.cfg.get("peft", None),
                 fp8_config=fp8_config,
                 qat_quantizer=qat_quantizer,
@@ -420,12 +420,19 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         self.dist_env = initialize_distributed(backend=backend, timeout_minutes=timeout)
         setup_logging()
 
-        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-        self.distributed_config = self.dist_setup.strategy_config
-        self.device_mesh = self.dist_setup.device_mesh
-        self.moe_mesh = self.dist_setup.moe_mesh
-        self.pp_enabled = self.dist_setup.pp_enabled
-        self.pipeline_config = self.dist_setup.pipeline_config
+        (
+            self.distributed_setup,
+            self.mesh_context,
+            self.distributed_config,
+            self.device_mesh,
+            self.moe_mesh,
+            self.pp_enabled,
+            self.pipeline_config,
+            self.moe_parallel_config,
+            self.activation_checkpointing,
+        ) = self._distributed_setup_attributes(
+            create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+        )
 
         if self.pp_enabled:
             raise NotImplementedError("Pipeline parallelism is not supported for FinetuneRecipeForMultimodal.")
@@ -519,8 +526,8 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 moe_mesh=self.moe_mesh,
                 distributed_config=self.distributed_config,
                 pipeline_config=self.pipeline_config,
-                cfg_moe=self.dist_setup.moe_config,
-                activation_checkpointing=self.dist_setup.activation_checkpointing,
+                cfg_moe=self.moe_parallel_config,
+                activation_checkpointing=self.activation_checkpointing,
             )
         else:
             raise ValueError(f"Unsupported model.init_mode={model_init_mode!r}; expected 'auto' or 'hf_backbones'.")
