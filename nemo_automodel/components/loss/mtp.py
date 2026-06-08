@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -171,10 +172,18 @@ class PipelineCausalLMLoss(nn.Module):
     models that don't emit a seq_idx tail.
     """
 
-    def __init__(self, loss_fn: nn.Module, model: nn.Module):
+    def __init__(
+        self,
+        loss_fn: nn.Module,
+        model: nn.Module,
+        scaling_factor: float | None = None,
+        ignore_index: int = -100,
+    ):
         super().__init__()
         self.loss_fn = loss_fn
         self.model = model
+        self.scaling_factor = scaling_factor
+        self.ignore_index = ignore_index
         # Legacy THD-pack fallback used when the model has no seq_idx tail.
         self.cu_seqlens: Optional[torch.Tensor] = None
 
@@ -205,13 +214,13 @@ class PipelineCausalLMLoss(nn.Module):
                     mtp_per_depth_logits = list(output[1:])
                 else:
                     mtp_per_depth_h = list(output[1:])
-            scaling_factor = get_mtp_loss_scaling_factor(self.model)
+            model_scaling_factor = get_mtp_loss_scaling_factor(self.model)
         else:
             logits = getattr(output, "logits", output)
             hidden_states = _get_final_hidden_states(output)
             mtp_per_depth_h = getattr(output, "mtp_per_depth_h", None)
             mtp_per_depth_logits = getattr(output, "mtp_per_depth_logits", None)
-            scaling_factor = getattr(output, "mtp_loss_scaling_factor", get_mtp_loss_scaling_factor(self.model))
+            model_scaling_factor = getattr(output, "mtp_loss_scaling_factor", get_mtp_loss_scaling_factor(self.model))
 
         loss = calculate_loss(
             self.loss_fn,
@@ -221,6 +230,7 @@ class PipelineCausalLMLoss(nn.Module):
             hidden_states=hidden_states,
         )
         if (mtp_per_depth_h is not None or mtp_per_depth_logits is not None) and self.model.training:
+            scaling_factor = self.scaling_factor if self.scaling_factor is not None else model_scaling_factor
             loss = loss + calculate_mtp_loss(
                 self.loss_fn,
                 mtp_per_depth_h=mtp_per_depth_h,
@@ -228,7 +238,26 @@ class PipelineCausalLMLoss(nn.Module):
                 labels=labels,
                 model=self.model,
                 scaling_factor=scaling_factor,
+                ignore_index=self.ignore_index,
                 cu_seqlens=self.cu_seqlens,
                 seq_idx=seq_idx_mb,
             )
         return loss
+
+
+@dataclass
+class MTPLossConfig:
+    """Typed config for the Multi-Token-Prediction auxiliary loss.
+
+    MTP is gated on the model emitting per-depth outputs; this config only
+    carries its hyperparameters. ``scaling_factor=None`` keeps the
+    model-provided value (``out.mtp_loss_scaling_factor`` /
+    ``get_mtp_loss_scaling_factor``); set it to override.
+    """
+
+    scaling_factor: float | None = None
+    ignore_index: int = -100
+
+    def build(self, loss_fn: nn.Module, model: nn.Module) -> PipelineCausalLMLoss:
+        """Build the pipeline-schedule, MTP-aware loss for ``loss_fn``/``model``."""
+        return PipelineCausalLMLoss(loss_fn, model, scaling_factor=self.scaling_factor, ignore_index=self.ignore_index)

@@ -279,7 +279,7 @@ navigation:
       - page: "Hy3-preview"
         path: ../../guides/llm/hy3.mdx
         slug: hy3-preview
-      - page: "Nemotron-3 Ultra"
+      - page: "Fine-Tune Nemotron-3-Ultra-550B"
         path: ../../guides/llm/nemotron-3-ultra.mdx
         slug: nemotron-3-ultra
       - page: "Pretrain Megatron Core Datasets with NeMo AutoModel"
