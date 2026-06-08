@@ -88,6 +88,22 @@ _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 logger = logging.getLogger(__name__)
 
 
+# NOTE [nemotron-singlegpu-lora]: the branches tagged with this marker below exist to make
+# single-GPU LoRA SFT of merged-expert Nemotron-H MoE (30B-class) fit on one 80GB GPU.  The
+# default DCP / set_model_state_dict load path transiently materializes a second on-device
+# copy of the (merged) expert weights, which OOMs when the whole model lives on one device.
+# The affected sites are:
+#   * Checkpointer.load                -- route single-device custom safetensors through the
+#                                         frugal full-state path instead of DCP
+#   * _load_full_state_dict_into_model -- normalize stray real (CPU) buffers onto the param
+#                                         device, and use plain load_state_dict when the model
+#                                         is not DTensor-sharded
+# Exercised by: examples/llm_finetune/nemotron/nemotron_nano_v3_singlegpu_lora.yaml
+# These are point fixes bolted onto an already-overloaded load path; a future checkpoint
+# refactor should consolidate the single-device vs. sharded loading logic into one place.
+# `grep -n nemotron-singlegpu-lora` finds every affected site.
+
+
 def _normalize_dtype_mapping_to_state_dict_keys(
     fqn_to_dtype_mapping: dict[str, str], state_dict_keys: list[str], base_model_prefix: str | None = None
 ) -> dict[str, str]:
@@ -588,10 +604,28 @@ class Checkpointer:
         # the broadcast_from_rank0 hang where rank 0's synchronous CPU→GPU copies
         # fall behind other ranks' async allocations.
         is_safetensors = _is_safetensors_checkpoint(model_path)
+        # [nemotron-singlegpu-lora] (see module note at top of file)
+        # Custom models (e.g. NemotronH) normally take the DCP path below, which converts the
+        # model's state dict to_hf to build load destinations.  For merged-expert MoE models that
+        # transiently materializes a second copy of the expert weights on-device, which OOMs when
+        # the whole model lives on one GPU.  On a single device there is no DTensor sharding, so the
+        # frugal full-state path (load to CPU, from_hf-merge on CPU, copy into the model) is correct
+        # and keeps device memory at ~model size — letting 30B-class MoE LoRA SFT fit on one 80GB GPU.
+        # World size inline (not via components.distributed) so the checkpoint component stays
+        # independent per the import-linter contract.
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+        else:
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        single_device_custom_safetensors = is_safetensors and _is_custom_model(model_state.model[0]) and world_size == 1
         if (
             is_init_step
             and len(model_state.model) == 1
-            and (_is_bin_checkpoint(model_path) or (is_safetensors and not _is_custom_model(model_state.model[0])))
+            and (
+                _is_bin_checkpoint(model_path)
+                or (is_safetensors and not _is_custom_model(model_state.model[0]))
+                or single_device_custom_safetensors
+            )
         ):
             t0 = time.monotonic()
             weights_only = not _is_remote_code_model(model_state.model[0])
@@ -1737,6 +1771,22 @@ def _load_full_state_dict_into_model(
                 if key not in state_dict:
                     state_dict[key] = torch.tensor([], dtype=torch.uint8)
 
+    # [nemotron-singlegpu-lora] (see module note at top of file)
+    # set_model_state_dict(full_state_dict=True) requires every parameter/buffer of a
+    # part to live on a single device.  Custom models (e.g. NemotronH/Mamba) can leave a
+    # concrete CPU buffer behind after meta materialization (initialize_model_weights only
+    # relocates *meta* buffers), which would trip "Multiple devices found".  Normalize any
+    # stray real buffer onto the part's single (non-meta) parameter device.  This is a no-op
+    # for HF models, which are already device-uniform.
+    for part in model_parts:
+        param_devices = {p.device for p in part.parameters() if p.device.type != "meta"}
+        if len(param_devices) == 1:
+            target_device = next(iter(param_devices))
+            for module in part.modules():
+                for buf_name, buf in list(module._buffers.items()):
+                    if buf is not None and buf.device.type != "meta" and buf.device != target_device:
+                        module._buffers[buf_name] = buf.to(target_device)
+
     # full_state_dict=True WITHOUT broadcast_from_rank0: every rank already
     # has the full checkpoint, so _distribute_state_dict slices each rank's
     # local DTensor shard independently -- zero NCCL collectives.
@@ -1745,8 +1795,23 @@ def _load_full_state_dict_into_model(
         full_state_dict=True,
     )
 
+    try:
+        from torch.distributed.tensor import DTensor
+    except ImportError:  # pragma: no cover - older torch
+        from torch.distributed._tensor import DTensor
+
+    # [nemotron-singlegpu-lora] (see module note at top of file)
     for part in model_parts:
-        set_model_state_dict(part, model_state_dict=state_dict, options=options)
+        if any(isinstance(p, DTensor) for p in part.parameters()):
+            # Sharded model (FSDP/TP): set_model_state_dict slices each rank's local
+            # DTensor shard from the full state dict.
+            set_model_state_dict(part, model_state_dict=state_dict, options=options)
+        else:
+            # Single-device (non-sharded) model: copy tensor-by-tensor with plain
+            # load_state_dict so device memory stays at ~model size.  set_model_state_dict's
+            # _distribute_state_dict would instead move the *entire* state dict onto the
+            # device (a second full copy), OOMing a 30B model on one 80GB GPU.
+            part.load_state_dict(state_dict, strict=False)
 
 
 def _convert_checkpoint_with_transformers(

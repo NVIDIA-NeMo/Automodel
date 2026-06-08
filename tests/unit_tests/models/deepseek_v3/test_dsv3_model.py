@@ -25,13 +25,25 @@ from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3ForCaus
 class TestDeepseekV3ModelUpdates:
     def test_from_pretrained_classmethod(self):
         """Ensure classmethod from_pretrained builds config then delegates to from_config."""
-        cfg = DeepseekV3Config(vocab_size=100, hidden_size=64, num_attention_heads=4, num_hidden_layers=1,
-                               intermediate_size=128, qk_rope_head_dim=16, v_head_dim=16, qk_nope_head_dim=16)
+        cfg = DeepseekV3Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+        )
 
-        with patch("transformers.models.deepseek_v3.configuration_deepseek_v3.DeepseekV3Config.from_pretrained") as mock_from_pretrained:
+        with patch(
+            "transformers.models.deepseek_v3.configuration_deepseek_v3.DeepseekV3Config.from_pretrained"
+        ) as mock_from_pretrained:
             mock_from_pretrained.return_value = cfg
 
-            with patch.object(DeepseekV3ForCausalLM, "from_config", wraps=DeepseekV3ForCausalLM.from_config) as mock_from_config:
+            with patch.object(
+                DeepseekV3ForCausalLM, "from_config", wraps=DeepseekV3ForCausalLM.from_config
+            ) as mock_from_config:
                 model = DeepseekV3ForCausalLM.from_pretrained("deepseek/model")
                 assert isinstance(model, DeepseekV3ForCausalLM)
                 mock_from_pretrained.assert_called_once_with("deepseek/model")
@@ -44,6 +56,48 @@ class TestDeepseekV3ModelUpdates:
 
         assert hasattr(dsv3_mod, "ModelClass")
         assert dsv3_mod.ModelClass is DeepseekV3ForCausalLM
+
+
+class TestDeepseekV3GatePrecision:
+    """DeepSeek-V3 should default router scoring to fp32 to match the HF reference."""
+
+    @staticmethod
+    def _tiny_config():
+        # first_k_dense_replace >= num_hidden_layers keeps every layer dense so no MoE/Gate
+        # is constructed on CPU; the gate_precision default is set on the backend regardless.
+        return DeepseekV3Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            first_k_dense_replace=1,
+            intermediate_size=128,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+        )
+
+    def test_gate_precision_defaults_to_fp32(self):
+        from nemo_automodel.components.models.common.utils import BackendConfig
+
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+        assert backend.gate_precision is None
+        model = DeepseekV3ForCausalLM(self._tiny_config(), backend=backend)
+        assert model.backend.gate_precision == torch.float32
+
+    def test_gate_precision_respects_explicit_override(self):
+        from nemo_automodel.components.models.common.utils import BackendConfig
+
+        backend = BackendConfig(
+            attn="sdpa",
+            linear="torch",
+            rms_norm="torch",
+            experts="torch",
+            dispatcher="torch",
+            gate_precision="bfloat16",
+        )
+        model = DeepseekV3ForCausalLM(self._tiny_config(), backend=backend)
+        assert model.backend.gate_precision == torch.bfloat16
 
 
 # NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py
@@ -75,8 +129,14 @@ class TestDeepseekV3ModelInputsEmbeds:
     def test_forward_raises_when_both_input_ids_and_inputs_embeds(self):
         """Test DeepseekV3Model raises error when both input_ids and inputs_embeds provided."""
         cfg = DeepseekV3Config(
-            vocab_size=100, hidden_size=64, num_attention_heads=4, num_hidden_layers=1,
-            intermediate_size=128, qk_rope_head_dim=16, v_head_dim=16, qk_nope_head_dim=16,
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
         )
 
         # Mock the backend to avoid any CUDA initialization

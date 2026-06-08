@@ -811,13 +811,13 @@ class TestModelHasDtensors:
 
 
 class TestLoadModelCustomModelGuard:
-    """Verify that custom models skip the fast safetensors path and use DCP instead.
+    """Verify custom-model load routing: sharded uses DCP, single-device uses the fast path.
 
-    The fast safetensors path loads the full state dict directly and uses
-    _load_full_state_dict_into_model, which bypasses the state_dict_adapter
-    conversion needed by custom MoE models. Custom models must use the
-    standard DCP path so that _maybe_adapt_state_dict_to_hf/from_hf handles
-    the HF <-> native key and tensor format conversion.
+    Under multi-rank (sharded) loading, custom models use the standard DCP path so each
+    rank slices its local DTensor shard. On a single device (world_size == 1) there is no
+    sharding, so a custom safetensors model takes the frugal full-state fast path instead
+    (which still applies the state_dict_adapter from_hf conversion on CPU). See
+    NOTE [nemotron-singlegpu-lora] in checkpointing.py.
     """
 
     def _make_checkpointer(self):
@@ -881,11 +881,10 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
     def test_custom_model_skips_fast_path_uses_dcp(self, mock_load_full, mock_load_hf, mock_is_st):
-        """Custom models (nemo_automodel.components.models.*) must NOT use the fast path.
+        """Under sharded (multi-rank) loading, a custom model uses the standard DCP path.
 
-        They must use the standard DCP path so that state_dict_adapter handles
-        the HF <-> native format conversion (e.g., merging individual MoE expert
-        weights into grouped tensors).
+        DCP lets each rank slice its local DTensor shard. The single-device exception is
+        covered by test_single_device_custom_model_uses_fast_path.
         """
         checkpointer = self._make_checkpointer()
 
@@ -902,6 +901,9 @@ class TestLoadModelCustomModelGuard:
 
         with (
             patch("os.path.exists", return_value=True),
+            # Simulate multi-rank (sharded) load so the single-device fast path is not taken.
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch.dict("os.environ", {"WORLD_SIZE": "2"}),
             patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as MockModelState,
             patch(
                 "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
@@ -924,6 +926,41 @@ class TestLoadModelCustomModelGuard:
         mock_load_full.assert_not_called()
         # DCP path should be used
         mock_dcp_load.assert_called_once()
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    def test_single_device_custom_model_uses_fast_path(self, mock_load_full, mock_load_hf, mock_is_st):
+        """On a single device (world_size == 1) a custom safetensors model uses the fast path.
+
+        The fast path applies the state_dict_adapter from_hf conversion on CPU (via
+        _maybe_adapt_state_dict_from_hf) and copies into the model, keeping device memory at
+        ~model size. DCP would transiently materialize a second on-device copy of the merged
+        expert weights and OOM a 30B-class MoE on one 80GB GPU.
+        See NOTE [nemotron-singlegpu-lora] in checkpointing.py.
+        """
+        checkpointer = self._make_checkpointer()
+
+        CustomModel = type("CustomModel", (torch.nn.Module,), {})
+        CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
+        model = CustomModel()
+        model.layer = torch.nn.Linear(4, 4)
+        assert _is_custom_model(model) is True
+
+        mock_load_hf.return_value = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            # Single-device (non-sharded) load.
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch.dict("os.environ", {"WORLD_SIZE": "1"}),
+            patch.object(checkpointer, "_do_load") as mock_dcp_load,
+        ):
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        # Single-device custom model takes the frugal fast path, not DCP.
+        mock_load_full.assert_called_once()
+        mock_dcp_load.assert_not_called()
 
 
 # =============================================================================
