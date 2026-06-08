@@ -29,8 +29,6 @@ The SwiGLU activation/gradient are computed by elementwise Triton kernels (``_sw
 a pure-torch fallback is used when Triton is unavailable. The matmuls stay on cuBLAS.
 """
 
-import os
-
 import torch
 import torch.nn.functional as F
 from packaging import version
@@ -411,11 +409,8 @@ def install_fused_lora_mlp(model) -> int:
     active dropout. This keeps the fused memory win on single-GPU and pure-DP while staying correct
     (and identical to the unfused path) under sharding.
 
-    Returns the number of MLP modules whose ``forward`` was swapped. Idempotent. Set
-    ``NEMO_AUTOMODEL_DISABLE_FUSED_LORA_MLP=1`` to skip fusion (e.g. for A/B memory comparisons).
+    Returns the number of MLP modules whose ``forward`` was swapped. Idempotent.
     """
-    if os.environ.get("NEMO_AUTOMODEL_DISABLE_FUSED_LORA_MLP", "0") == "1":
-        return 0
     count = 0
     for mlp in model.modules():
         if getattr(mlp, "_lora_mlp_fused", False):
