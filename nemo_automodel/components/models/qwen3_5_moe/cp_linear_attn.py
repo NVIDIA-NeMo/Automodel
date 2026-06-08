@@ -671,6 +671,14 @@ def patch_hf_model(model, cp_enabled=False):
             cp_enabled,
         )
 
+        # Declare the fp32-compute submodules so fully_shard_by_dtype keeps them in
+        # fp32 compute even under fp32 master weights (bf16 compute for the bulk). The
+        # ``_fp32_params`` holder created above is the authoritative marker; the
+        # GatedDeltaNet forward uses those params directly without re-upcasting.
+        existing = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
+        if "_fp32_params" not in existing:
+            model._keep_in_fp32_modules_strict = existing + ("_fp32_params",)
+
         # Attach a Qwen3.5 state_dict_adapter so saved checkpoints hide the
         # ``_fp32_params`` wrapping and remain HF-loadable directly.  Keep
         # ``from_hf`` in bare-key mode: adapter-mediated DCP loads operate in
