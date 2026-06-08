@@ -36,10 +36,11 @@ Notes vs. ``components/models/hy_v3`` (Hy3-preview 295B):
     of being hard-coded.
 """
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -48,7 +49,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.hy_mt2.layers import HyMT2Attention
 from nemo_automodel.components.models.hy_mt2.state_dict_adapter import HyMT2StateDictAdapter
@@ -349,9 +350,39 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+    ) -> CausalLMOutputWithPast:
+        """Forward pass returning :class:`CausalLMOutputWithPast`.
+
+        Args:
+            input_ids: Token IDs. BSHD: ``[B, S]``; THD: ``[1, T]`` (squeezed internally).
+            position_ids: Optional position indices.
+            attention_mask: Optional 2D padding mask.
+            padding_mask: Optional padding mask used by the THD squeeze helper.
+            logits_to_keep: If 0 (default) compute logits for all positions; if > 0
+                only compute logits for the last ``logits_to_keep`` positions
+                (avoids materialising the full logit matrix during generation /
+                enables fused-linear cross-entropy in training).
+            output_hidden_states: Whether to return the final hidden states (the
+                input to ``lm_head``) on the output. Defaults to the config flag.
+            **attn_kwargs: Additional attention kwargs forwarded to the base model
+                (e.g. qkv_format, cu_seqlens, CP kwargs).
+
+        Returns:
+            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with
+            ``logits`` and, when ``output_hidden_states`` is set, the final
+            ``hidden_states``.
+        """
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
@@ -365,25 +396,24 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        if self.lm_head is None:
-            logits = hidden
-        elif self._enable_lm_head_fp32 and self.lm_head.weight.dtype == torch.float32 and hidden.dtype != torch.float32:
-            # The MoE parallelizer (``distributed.moe.lm_head_precision:
-            # float32`` in the YAML) has already promoted ``lm_head.weight`` to
-            # fp32. Feed it fp32 input via ``nn.Linear`` -- which is
-            # DTensor-aware under FSDP2 -- and cast logits back to the input
-            # dtype. We must NOT use ``F.linear`` directly with a manually
-            # ``.float()``-ed weight here, because that bypasses nn.Linear's
-            # DTensor redistribution and crashes with
-            # "got mixed torch.Tensor and DTensor".
-            original_dtype = hidden.dtype
-            logits = self.lm_head(hidden.float()).to(original_dtype)
-        else:
-            logits = self.lm_head(hidden)
-
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
-            logits = logits.unsqueeze(0)
-        return logits
+        # When the MoE parallelizer promotes ``lm_head.weight`` to fp32
+        # (``distributed.moe.lm_head_precision: float32``), run the projection in
+        # fp32 and cast the logits back. Routing through ``nn.Linear`` (not
+        # ``F.linear``) keeps the DTensor redistribution intact under FSDP2.
+        fp32_lm_head = (
+            self._enable_lm_head_fp32
+            and self.lm_head is not None
+            and self.lm_head.weight.dtype == torch.float32
+            and hidden.dtype != torch.float32
+        )
+        return compute_lm_head_logits(
+            self.lm_head,
+            hidden,
+            logits_to_keep,
+            is_thd=is_thd,
+            fp32_lm_head=fp32_lm_head,
+            output_hidden_states=output_hidden_states,
+        )
 
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():

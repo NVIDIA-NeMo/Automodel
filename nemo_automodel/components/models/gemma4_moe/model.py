@@ -19,7 +19,7 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -33,7 +33,7 @@ def _make_missing(name: str):
 
 
 try:
-    from transformers.modeling_outputs import BaseModelOutputWithPast
+    from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
     from transformers.models.gemma4 import modeling_gemma4 as _g4
     from transformers.models.gemma4.configuration_gemma4 import (
         Gemma4Config,
@@ -72,8 +72,9 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     HFGemma4ForConditionalGeneration = _make_missing("Gemma4ForConditionalGeneration")
     HFGemma4Model = _make_missing("Gemma4Model")
     BaseModelOutputWithPast = _make_missing("BaseModelOutputWithPast")
+    CausalLMOutputWithPast = _make_missing("CausalLMOutputWithPast")
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
@@ -568,15 +569,29 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         pixel_values: torch.Tensor | None = None,
         image_position_ids: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
     ):
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(
+                self.config.text_config if hasattr(self.config, "text_config") else self.config,
+                "output_hidden_states",
+                False,
+            )
+        )
+
         if cache_position is None and input_ids is not None:
             seq_len = input_ids.shape[-1]
             cache_position = torch.arange(seq_len, device=input_ids.device)
 
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
-            # Dense path — delegate to HF forward
+            # Dense path — delegate to HF forward (which already supports
+            # logits_to_keep + output_hidden_states and returns a ModelOutput
+            # carrying logits and hidden_states).
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -586,6 +601,8 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 pixel_values=pixel_values,
                 image_position_ids=image_position_ids,
                 mm_token_type_ids=mm_token_type_ids,
+                logits_to_keep=logits_to_keep,
+                output_hidden_states=output_hidden_states,
                 **kwargs,
             )
 
@@ -624,17 +641,17 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         hidden_states = outputs.last_hidden_state
 
-        if self.lm_head is not None:
-            logits = self.lm_head(hidden_states)
-        else:
-            logits = hidden_states
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
             logits = logits / final_logit_softcapping
             logits = torch.tanh(logits)
             logits = logits * final_logit_softcapping
 
-        return logits
+        return CausalLMOutputWithPast(
+            logits=logits,
+            hidden_states=hidden_states if output_hidden_states else None,
+        )
 
     @torch.no_grad()
     def initialize_weights(
