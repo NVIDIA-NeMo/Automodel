@@ -225,6 +225,12 @@ def default_collater(batch, pad_seq_len_divisible=None):
     """
     Default batch collator that handles padding and batching.
 
+    Each example's fields are normally ``list[int]`` (``List[List[int]]`` across the batch), which are
+    padded and stacked. Datasets that already yield batched ``torch.Tensor`` fields (e.g.
+    :class:`~nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset`, which emits a
+    fully-formed ``[batch_size, seq_len]`` batch per item) are concatenated along the batch dimension instead,
+    so a single pre-batched example passes through unchanged.
+
     Args:
         batch: A batch of examples.
         pad_seq_len_divisible: If provided, pad sequence length to be divisible by this value.
@@ -236,17 +242,22 @@ def default_collater(batch, pad_seq_len_divisible=None):
     # ans contains a dict with:
     # key: str (e.g., "input_ids", "attention_mask", "labels", "loss_mask")
     # value: list[list[int]] (e.g., [[1, 2, 3], [4, 5, 6]])
-    ans = {
-        key: pad_within_micro(
-            extract_key_from_dicts(batch, key),
-            get_pad_token_from_key(key, pad_token_ids),
-            pad_seq_len_divisible,
-        )
-        for key in batch[0].keys()
-    }
+    ans = {}
+    for key in batch[0].keys():
+        values = extract_key_from_dicts(batch, key)
+        if all(isinstance(v, torch.Tensor) for v in values):
+            # Pre-batched fields: each value is a [batch_size, seq_len] tensor; concatenate along the
+            # batch dim rather than treating it as a ragged list[int] to be padded.
+            ans[key] = torch.cat([batchify(v) for v in values], dim=0)
+        else:
+            ans[key] = pad_within_micro(
+                values,
+                get_pad_token_from_key(key, pad_token_ids),
+                pad_seq_len_divisible,
+            )
 
-    # convert to tensors
-    result = {k: batchify(torch.LongTensor(v)) for k, v in ans.items()}
+    # convert to tensors (already-tensor fields are passed through batchify unchanged)
+    result = {k: batchify(v if isinstance(v, torch.Tensor) else torch.LongTensor(v)) for k, v in ans.items()}
 
     # Add padding_mask similar to cp_utils.py
     if "input_ids" in result:
