@@ -691,7 +691,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
-            self.cfg.dataloader,
+            # Raw ``dataloader`` config node (``cfg_dl``) expected by build_dataloader; the typed
+            # RecipeConfig.dataloader property is the LLM-recipe path and would eagerly resolve the
+            # dataset _target_ here (VLM keeps its own build_dataloader for processor/media handling).
+            self.cfg.get("dataloader", {}),
             _get_model_name(self.cfg.model),
             self.cfg.get("processor", None),
             device_mesh=self.device_mesh,
