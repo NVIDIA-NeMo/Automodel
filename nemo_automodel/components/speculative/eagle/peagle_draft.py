@@ -28,12 +28,16 @@ plus the helpers in this module, so the dependency stays one-way
 (``draft_llama`` -> ``peagle_draft``) with no circular import.
 """
 
+import logging
+
 import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from nemo_automodel.components.models.llama.rope_utils import apply_rotary_pos_emb
 from nemo_automodel.components.speculative.eagle.peagle_attention import create_peagle_mask_mod
+
+logger = logging.getLogger(__name__)
 
 # flex_attention compiled for the CUDA training path. Inductor's flex backend is
 # not available on CPU, and it currently requires query/key/value head dimensions
@@ -45,6 +49,7 @@ _peagle_flex_attention_compiled = torch.compile(
     flex_attention,
     mode="max-autotune-no-cudagraphs",
 )
+_peagle_flex_attention_compile_failed = False
 
 
 def _peagle_compile_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:

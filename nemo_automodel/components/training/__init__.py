@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Training utilities shared across recipes."""
+
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
 __all__ = ["StepSchedulerConfig"]
