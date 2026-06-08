@@ -422,11 +422,24 @@ class DataloaderConfig:
         ``runtime`` carries the dataset's runtime build args (``tokenizer=`` for LLM, ``processor=`` for VLM,
         ...); only the keys ``dataset_config.build`` accepts are forwarded.
         """
+        import contextlib
+
         from nemo_automodel.components.distributed.utils import FirstRankPerNode
         from nemo_automodel.components.training.rng import ScopedRNG
 
+        # ``FirstRankPerNode`` materializes the dataset on node-rank-0 first, gating the other ranks behind a
+        # Gloo barrier. That is correct for datasets that are built independently per rank, but it deadlocks
+        # builders that run their own collective synchronization across *all* ranks (e.g. Megatron's
+        # ``BlendedMegatronDatasetBuilder`` issues ``torch.distributed.barrier()`` internally): rank-0 would
+        # wait inside that NCCL barrier while the peers sit in the Gloo barrier here. Such configs opt out via
+        # ``manages_own_distributed_build`` and are built without the wrapper.
+        build_ctx = (
+            contextlib.nullcontext()
+            if getattr(self.dataset_config, "manages_own_distributed_build", False)
+            else FirstRankPerNode()
+        )
         with ScopedRNG(seed=self.seed, ranked=True):
-            with FirstRankPerNode():
+            with build_ctx:
                 dataset = self.dataset_config.build(**_filter_runtime(self.dataset_config.build, runtime))
 
             collate_override = None

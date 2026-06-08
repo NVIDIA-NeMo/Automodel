@@ -21,6 +21,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes._typed_config import RecipeConfig
+from nemo_automodel.recipes.llm.train_ft import _build_tokenizer
 
 """
 This test is to make sure that JSONL dataset can be checkpointed and loaded correctly.
@@ -48,7 +49,12 @@ def test_megatron_data_sharding():
 
     cfg.step_scheduler.max_steps = None
     cfg.step_scheduler.val_every_steps = 10
-    dataset = RecipeConfig(cfg).dataloader.build(dp_rank=dp_rank, dp_world_size=dp_world_size, pp_enabled=False)
+    # Megatron datasets require a tokenizer; the recipe supplies it via runtime (build(tokenizer=...)),
+    # so build it here the same way (from the dataset/model config) instead of relying on the default.
+    _, tokenizer = _build_tokenizer(cfg.model, cfg.dataset)
+    dataset = RecipeConfig(cfg).dataloader.build(
+        dp_rank=dp_rank, dp_world_size=dp_world_size, pp_enabled=False, tokenizer=tokenizer
+    )
 
     # fast-forward. not necessary, but we want to make sure the dataset is not at the beginning.
     for i, batch in enumerate(dataset):
