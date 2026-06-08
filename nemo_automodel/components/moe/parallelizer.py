@@ -50,6 +50,8 @@ def _moe_shard_placement(param):
     not change compute.
     """
     return Shard(0) if param.ndim < 2 else Shard(1)
+
+
 def _is_selective_ac(activation_checkpointing: object) -> bool:
     """Return True when the AC mode requests selective checkpointing.
 
