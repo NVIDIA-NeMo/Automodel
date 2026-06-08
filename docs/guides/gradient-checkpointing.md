@@ -1,6 +1,6 @@
-# Gradient (Activation) Checkpointing
+# Use Gradient (Activation) Checkpointing
 
-Gradient checkpointing, also called _activation checkpointing_, trades a little extra compute for a **large reduction in GPU memory** by recomputing intermediate activations during the backwards pass instead of storing them.  
+Gradient checkpointing, also called _activation checkpointing_, trades a little extra compute for a **large reduction in GPU memory** by recomputing intermediate activations during the backward pass instead of storing them.  
 It is especially powerful when combined with memory-efficient loss functions (e.g., Linear-Cut Cross-Entropy) and parameter sharding using FSDP.
 
 ## Enable Gradient Checkpointing
@@ -24,7 +24,7 @@ distributed:
 ```
 
 ### Configure Programmatically
-```python
+
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.distributed.config import DistributedSetup
 
@@ -53,7 +53,7 @@ loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 ```
 
-LC-CE and gradient checkpointing target **different memory hot-spots** (output layer vs. transformer blocks) so their benefits stack almost linearly.
+LC-CE and gradient checkpointing target **different memory hot-spots** (output layer vs. transformer blocks), so their benefits stack almost linearly.
 
 ## Example Memory Savings (H100-80GB, Llama-3.2-1B)
 | Technique | Max GPU Mem (GB) | Δ vs Baseline |
@@ -67,7 +67,7 @@ LC-CE and gradient checkpointing target **different memory hot-spots** (output l
 :::{note}
 - Measurements taken with local batch size = 8, sequence len = 2048, AdamW, PyTorch 2.8.
 - Peak memory reported by `torch.cuda.max_memory_allocated()` averaged across DP ranks.
-- Expect ±5 % variance depending on exact model, sequence length and GPU architecture.
+- Expect ±5 % variance depending on exact model, sequence length, and GPU architecture.
 :::
 
 ## Performance Considerations
@@ -84,7 +84,7 @@ automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama_3_2_1b_my_fine
 # If running on 1x GPU
 automodel examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml
 ```
-If we run with the above settings (activation ckpt = on, lc-ce = on, fsdp = on), look for a log line similar to:
+If you run with the above settings (activation ckpt = on, lc-ce = on, fsdp = on), look for a log line similar to:
 ```
 ... | mem 7.30 GiB | ...
 ```
