@@ -486,6 +486,7 @@ def build_dataloader_config(
     dl.pop(
         "dataloader_type", None
     )  # legacy Megatron key; ignored (megatron uses the default sampler), not a DataLoader kwarg
+    dl.pop("_target_", None)  # YAML dataloader target (loader is always ParallelAwareDataloader now); not a kwarg
     return DataloaderConfig(
         dataset_config=dataset_config,
         packing=packing,
