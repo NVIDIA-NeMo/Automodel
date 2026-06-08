@@ -261,7 +261,7 @@ def instantiate_infrastructure(
     pipeline_config: Optional[PipelineConfig] = None,
     qat_config: Optional[QATConfig] = None,
     moe_config: Optional[MoEParallelizerConfig] = None,
-    activation_checkpointing: bool = False,
+    activation_checkpointing: bool | str = False,
     device: Optional[torch.device] = None,
     mesh: Optional[MeshContext] = None,
     # Deprecated -- prefer passing ``mesh`` directly
