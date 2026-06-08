@@ -52,6 +52,28 @@ def _validate_strategy_kwargs(
         raise ValueError(f"Unknown options for strategy '{strategy_name}': {sorted(unknown)}")
 
 
+def _normalize_activation_checkpointing(value: Any) -> bool | str:
+    """Normalize YAML activation checkpointing values.
+
+    ``True`` keeps the existing full checkpointing behavior. ``"selective"``
+    enables PyTorch selective activation checkpointing for supported FSDP2
+    paths.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.lower().replace("-", "_")
+        if normalized in {"false", "off", "none", "disabled", "no"}:
+            return False
+        if normalized in {"true", "on", "full", "enabled", "yes"}:
+            return True
+        if normalized == "selective":
+            return "selective"
+    raise ValueError("distributed.activation_checkpointing must be a boolean or one of 'full', 'selective', 'false'.")
+
+
 def parse_distributed_section(cfg_dict: dict) -> dict:
     """Parse a flat distributed config dict into components for mesh creation.
 
@@ -89,7 +111,7 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     # -- sub-configs --------------------------------------------------------
     pipeline_dict: Optional[dict] = cfg.pop("pipeline", None)
     moe_dict: Optional[dict] = cfg.pop("moe", None)
-    activation_checkpointing: bool = cfg.pop("activation_checkpointing", False)
+    activation_checkpointing = _normalize_activation_checkpointing(cfg.pop("activation_checkpointing", False))
 
     # Strip Hydra / OmegaConf meta keys (e.g. ``_target_``, ``_recursive_``,
     # ``_convert_``) that may leak from YAML configs.  They have no meaning
@@ -149,6 +171,8 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     # strategy config; for EP configs it stays only on MeshContext
     # (the MoE infra reads it from there).
     ep_size: int = parallelism.get("ep_size") or 1
+    if activation_checkpointing == "selective" and strategy_name != "fsdp2":
+        raise ValueError("selective activation checkpointing is supported only for FSDP2 configs.")
 
     # YAML-level sanity: silently discard sub-configs that don't apply to the
     # current parallelism sizes (e.g. pipeline section present but pp_size=1,

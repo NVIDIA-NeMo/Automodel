@@ -36,12 +36,13 @@ Usage:
 """
 
 from dataclasses import InitVar, dataclass, fields
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 # Type alias for API signature
+ActivationCheckpointingMode = Union[bool, Literal["selective"]]
 DistributedConfig = Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]
 
 
@@ -82,7 +83,9 @@ class FSDP2Config:
             ``output_dtype=float32`` in mp_policy to keep the residual stream in fp32
             while running matmuls in lower precision.  Set to ``None`` to disable.
             Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
-        activation_checkpointing (bool): Enable activation checkpointing.
+        activation_checkpointing (bool | "selective"): Enable activation checkpointing. ``True`` keeps the existing
+            full activation checkpointing behavior. ``"selective"`` wraps transformer blocks with PyTorch selective
+            activation checkpointing.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
         backend (str): Distributed backend.
         enable_async_tensor_parallel (bool): Enable async tensor parallelism via
@@ -109,7 +112,7 @@ class FSDP2Config:
     mp_policy: Optional[MixedPrecisionPolicy] = None
     offload_policy: Optional[CPUOffloadPolicy] = None
     autocast_dtype: Optional[torch.dtype] = None
-    activation_checkpointing: bool = False
+    activation_checkpointing: ActivationCheckpointingMode = False
     defer_fsdp_grad_sync: bool = True
     backend: str = "nccl"
     enable_async_tensor_parallel: bool = False
