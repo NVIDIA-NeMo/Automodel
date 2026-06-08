@@ -292,6 +292,9 @@ navigation:
       - page: "Sequence Classification (SFT/PEFT) with NeMo AutoModel"
         path: ../../guides/llm/sequence-classification.mdx
         slug: sequence-classification
+      - page: "Retrieval Fine-Tuning (Bi-Encoder and Cross-Encoder)"
+        path: ../../guides/llm/retrieval-finetune.mdx
+        slug: retrieval-finetune
       - page: "Fine-Tune Gemma 3 and Gemma 3n"
         path: ../../guides/omni/gemma3-3n.mdx
         slug: gemma-3-3n
