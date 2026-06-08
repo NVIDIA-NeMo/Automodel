@@ -413,9 +413,10 @@ class TestQwen3VLMoeForConditionalGeneration:
             )
             mock_model_forward.return_value = mock_output
 
-            logits = model.forward(input_ids=input_ids)
+            out = model.forward(input_ids=input_ids)
 
         # Should return logits with vocab_size dimension
+        logits = out.logits
         assert logits.shape == (batch, seq_len, vl_config.text_config.vocab_size)
         mock_model_forward.assert_called_once()
 
@@ -519,7 +520,7 @@ class TestQwen3VLMoeForConditionalGeneration:
             )
 
             # Result should be logits from lm_head
-            assert result.shape == (batch, seq_len, vl_config.text_config.vocab_size)
+            assert result.logits.shape == (batch, seq_len, vl_config.text_config.vocab_size)
 
             # Verify squeeze_input_for_thd was called with correct args
             squeeze_args = mock_squeeze.call_args[0]

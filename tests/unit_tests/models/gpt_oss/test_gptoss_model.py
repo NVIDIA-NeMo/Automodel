@@ -433,7 +433,7 @@ class TestGptOssForCausalLM:
                 batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
             )
 
-            output = model(input_ids)
+            output = model(input_ids).logits
 
             assert output.shape == (batch_size, seq_len, gpt_config.vocab_size)
             assert output.device == device
@@ -466,11 +466,13 @@ class TestGptOssForCausalLM:
                 position_ids=position_ids,
                 qkv_format="thd",
                 cu_seqlens=cu_seqlens,
+                output_hidden_states=True,
             )
 
             # Logits must be 3D [1, T, V] after unsqueeze
-            assert output.ndim == 3
-            assert output.shape == (1, total_tokens, gpt_config.vocab_size)
+            assert output.logits.ndim == 3
+            assert output.logits.shape == (1, total_tokens, gpt_config.vocab_size)
+            assert output.hidden_states.shape == (1, total_tokens, gpt_config.hidden_size)
 
             # Verify backbone received squeezed 1D input_ids
             call_args = mock_model.call_args
@@ -491,7 +493,7 @@ class TestGptOssForCausalLM:
                 batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
             )
 
-            output = model(input_ids)
+            output = model(input_ids).logits
 
             # Standard 3D output [B, S, V] without unsqueeze
             assert output.ndim == 3

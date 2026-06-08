@@ -65,6 +65,7 @@ def test_encoder_loop_calls_gc_hook():
     recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
     recipe.model_parts = [MagicMock()]
     recipe.step_scheduler = _OneStepScheduler()
+    recipe.dataloader = SimpleNamespace(dataset=SimpleNamespace(set_epoch=MagicMock()))
     recipe.max_grad_norm = 1.0
     recipe._run_train_optim_step = MagicMock(return_value=_dummy_metrics())
     recipe._maybe_collect_garbage = MagicMock()
@@ -79,6 +80,28 @@ def test_encoder_loop_calls_gc_hook():
     recipe.run_train_validation_loop()
 
     recipe._maybe_collect_garbage.assert_called_once()
+
+
+def test_encoder_loop_sets_dataset_epoch():
+    dataset = SimpleNamespace(set_epoch=MagicMock())
+    recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
+    recipe.model_parts = [MagicMock()]
+    recipe.step_scheduler = _OneStepScheduler()
+    recipe.dataloader = SimpleNamespace(dataset=dataset)
+    recipe.max_grad_norm = 1.0
+    recipe._run_train_optim_step = MagicMock(return_value=_dummy_metrics())
+    recipe._maybe_collect_garbage = MagicMock()
+    recipe.log_train_metrics = MagicMock()
+    recipe.log_val_metrics = MagicMock()
+    recipe.save_checkpoint = MagicMock()
+    recipe.val_dataloader = None
+    recipe.metric_logger_train = SimpleNamespace(close=MagicMock())
+    recipe.metric_logger_valid = SimpleNamespace(close=MagicMock())
+    recipe.checkpointer = SimpleNamespace(close=MagicMock())
+
+    recipe.run_train_validation_loop()
+
+    dataset.set_epoch.assert_called_once_with(0)
 
 
 def test_vlm_loop_calls_gc_hook():
