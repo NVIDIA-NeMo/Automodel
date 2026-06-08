@@ -376,6 +376,7 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
         config = DDPConfig(
             activation_checkpointing=args.get("activation_checkpointing", False),
             backend=args.get("backend", "nccl"),
+            find_unused_parameters=args.get("find_unused_parameters", False),
         )
         logger.info("[Parallel] Creating DDPManager with config: %s", config)
         return DDPManager(config)
