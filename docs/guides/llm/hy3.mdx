@@ -73,11 +73,11 @@ Keys at layer indices ≥ `num_hidden_layers` (default 80) are silently dropped 
 
 A ready-to-use recipe ships at [`examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml). The yaml header documents how to adjust `ep_size` and `pp_size` for different cluster configurations.
 
-NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide.
+NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
 
 ### Standalone Slurm Script
 
-Below is a standalone Slurm script example for the HellaSwag recipe. Before running it, ensure your cluster environment is configured following the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide. Then submit the job:
+Below is a standalone Slurm script example for the HellaSwag recipe. Before running it, ensure your cluster environment is configured following the [Run on a Cluster](/job-launchers/slurm-cluster) guide. Then submit the job:
 
 ```bash
 export TRANSFORMERS_OFFLINE=1
