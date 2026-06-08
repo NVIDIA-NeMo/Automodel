@@ -40,9 +40,10 @@ from nemo_automodel.components.speculative.eagle.peagle_attention import create_
 logger = logging.getLogger(__name__)
 
 # flex_attention compiled for the CUDA training path. Inductor's flex backend is
-# not available on CPU (it raises ``InductorError``), so ``_peagle_flex_attention``
-# dispatches to eager ``flex_attention`` there -- correct, just slower -- which
-# keeps the P-EAGLE unit tests and CPU smoke checks runnable. The compiled
+# not available on CPU, and it currently requires query/key/value head dimensions
+# of at least 16. ``_peagle_flex_attention`` dispatches to eager
+# ``flex_attention`` for unsupported cases -- correct, just slower -- which keeps
+# P-EAGLE unit tests and small CPU/GPU smoke checks runnable. The compiled
 # callable is lazy, so importing this module on CPU costs nothing.
 _peagle_flex_attention_compiled = torch.compile(
     flex_attention,
@@ -51,20 +52,15 @@ _peagle_flex_attention_compiled = torch.compile(
 _peagle_flex_attention_compile_failed = False
 
 
+def _peagle_compile_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    """Return whether Inductor's flex-attention lowering supports these tensors."""
+    return q.is_cuda and q.shape[-1] >= 16 and k.shape[-1] >= 16 and v.shape[-1] >= 16
+
+
 def _peagle_flex_attention(q, k, v, *, block_mask, scale):
-    """Run P-EAGLE flex attention, falling back if Inductor cannot lower it."""
-    global _peagle_flex_attention_compile_failed
-    if q.is_cuda and not _peagle_flex_attention_compile_failed:
-        try:
-            return _peagle_flex_attention_compiled(q, k, v, block_mask=block_mask, scale=scale)
-        except Exception as exc:
-            exc_module = exc.__class__.__module__
-            is_compile_error = exc_module.startswith("torch._inductor") or exc_module.startswith("torch._dynamo")
-            if not is_compile_error:
-                raise
-            _peagle_flex_attention_compile_failed = True
-            logger.warning("Falling back to eager P-EAGLE flex attention after compile failure.", exc_info=True)
-    return flex_attention(q, k, v, block_mask=block_mask, scale=scale)
+    """Run the P-EAGLE flex attention, compiling only when Inductor supports it."""
+    flex = _peagle_flex_attention_compiled if _peagle_compile_supported(q, k, v) else flex_attention
+    return flex(q, k, v, block_mask=block_mask, scale=scale)
 
 
 class _PeagleAttentionMixin:

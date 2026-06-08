@@ -48,6 +48,7 @@ from transformers.utils import logging
 
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 
 logger = logging.get_logger(__name__)
 
@@ -510,6 +511,7 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -518,6 +520,8 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # Run the backbone with return_dict so we can reliably access the final
+        # hidden states regardless of the caller's return_dict preference.
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -527,11 +531,12 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            return_dict=True,
         )
 
-        hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        hidden_states = outputs.last_hidden_state
+
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
@@ -545,15 +550,20 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
                 softmax_normalizer = shift_logits.max(-1).values ** 2
                 loss = loss + z_loss_weight * softmax_normalizer.mean()
 
+        # Carry the FINAL hidden states (the input to lm_head) when requested so
+        # the recipe's FusedLinearCrossEntropy path can recompute logits cheaply.
+        out_hidden_states = hidden_states if output_hidden_states else None
+
         if not return_dict:
-            output = (logits,) + outputs[1:]
+            extras = (out_hidden_states, outputs.attentions) if output_hidden_states else ()
+            output = (logits,) + tuple(v for v in (outputs.past_key_values, *extras) if v is not None)
             return (loss,) + output if loss is not None else output
 
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
+            hidden_states=out_hidden_states,
             attentions=outputs.attentions,
         )
 
