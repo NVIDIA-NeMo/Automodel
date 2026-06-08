@@ -41,7 +41,7 @@ import torch
 
 from nemo_automodel.components.speculative.eagle.backend import Eagle3TargetBackend
 from nemo_automodel.components.speculative.eagle.remote import protocol, wire
-from nemo_automodel.components.speculative.eagle.remote.transport import NCCLTransport
+from nemo_automodel.components.speculative.eagle.remote.transport import NCCLTransport, nccl_transport_available
 from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
 
 logger = logging.getLogger(__name__)
@@ -103,6 +103,17 @@ class _ServerClient:
             if self._nccl_attempted:
                 return False
             self._nccl_attempted = True
+
+            # Only ask the server to bring up NCCL if this process can actually
+            # join the group. A client without sglang (the common disaggregated
+            # case: sglang target server + sglang-free training client) cannot,
+            # and contacting the server anyway leaves it blocked on a rendezvous
+            # that never completes until it times out. Fall back to wire instead.
+            if not nccl_transport_available():
+                logger.info("NCCL unavailable in this process (sglang not importable); using wire format")
+                self._nccl = None
+                return False
+
             port = self._nccl_port()
             self._nccl = NCCLTransport(nccl_port=port, host=self._host(), is_server=False)
 
