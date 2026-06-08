@@ -10,10 +10,18 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import requests
 import torch
-import torchvision.transforms as T
 from PIL import Image
-from torchvision.transforms.functional import InterpolationMode
 from transformers import BatchEncoding, PretrainedConfig, ProcessorMixin
+from transformers.image_processing_base import BatchFeature
+from transformers.image_processing_utils_fast import BaseImageProcessorFast, divide_to_patches
+from transformers.image_utils import (
+    ChannelDimension,
+    ImageInput,
+    SizeDict,
+    get_image_size,
+    make_list_of_images,
+)
+from transformers.utils import TensorType
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -79,24 +87,6 @@ def load_image(image):
             raise ValueError(f"Invalid image: {image}")
     else:
         raise ValueError(f"Invalid image: {image}")
-
-
-def build_transform(input_size, norm_type="imagenet"):
-    """Build a transform for an image."""
-    if norm_type == "imagenet":
-        MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
-    elif norm_type == "siglip":
-        MEAN, STD = SIGLIP_MEAN, SIGLIP_STD
-
-    transform = T.Compose(
-        [
-            T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
-            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-            T.ToTensor(),
-            T.Normalize(mean=MEAN, std=STD),
-        ]
-    )
-    return transform
 
 
 def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
@@ -165,6 +155,116 @@ def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnai
     return processed_images
 
 
+class LlamaNemotronVLImageProcessor(BaseImageProcessorFast):
+    """Fast batched image processor for Llama Nemotron VL retrieval inputs."""
+
+    model_input_names = ["pixel_values"]
+
+    def __init__(
+        self,
+        image_size: int = 512,
+        max_num_tiles: int = 6,
+        use_thumbnail: bool = True,
+        dynamic_image_size: bool = True,
+        norm_type: str = "siglip",
+        **kwargs,
+    ):
+        if norm_type == "imagenet":
+            image_mean, image_std = IMAGENET_MEAN, IMAGENET_STD
+        elif norm_type == "siglip":
+            image_mean, image_std = SIGLIP_MEAN, SIGLIP_STD
+        else:
+            raise ValueError(f"Invalid norm_type: {norm_type!r}. Must be 'imagenet' or 'siglip'.")
+
+        kwargs.setdefault("do_rescale", True)
+        kwargs.setdefault("rescale_factor", 1 / 255)
+        kwargs.setdefault("do_normalize", True)
+        kwargs.setdefault("image_mean", image_mean)
+        kwargs.setdefault("image_std", image_std)
+
+        super().__init__(**kwargs)
+        self.image_size = image_size
+        self.max_num_tiles = max_num_tiles
+        self.use_thumbnail = use_thumbnail
+        self.dynamic_image_size = dynamic_image_size
+        self.norm_type = norm_type
+
+    def dynamic_preprocess(
+        self,
+        image: torch.Tensor,
+        image_size: int = 512,
+        max_num_tiles: int = 6,
+        use_thumbnail: bool = True,
+    ) -> List[torch.Tensor]:
+        """Split one channel-first image tensor into dynamically sized square tiles."""
+        orig_height, orig_width = get_image_size(image, channel_dim=ChannelDimension.FIRST)
+        aspect_ratio = orig_width / orig_height
+
+        target_ratios = set(
+            (i, j)
+            for n in range(1, max_num_tiles + 1)
+            for i in range(1, n + 1)
+            for j in range(1, n + 1)
+            if i * j <= max_num_tiles and i * j >= 1
+        )
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+        target_aspect_ratio = find_closest_aspect_ratio(
+            aspect_ratio,
+            target_ratios,
+            orig_width,
+            orig_height,
+            image_size,
+        )
+
+        target_width = image_size * target_aspect_ratio[0]
+        target_height = image_size * target_aspect_ratio[1]
+        resized_img = self.resize(image, SizeDict(height=target_height, width=target_width))
+        patches = divide_to_patches(resized_img, image_size)
+        if use_thumbnail and len(patches) != 1:
+            patches.append(self.resize(image, SizeDict(height=image_size, width=image_size)))
+
+        return patches
+
+    def _preprocess(
+        self,
+        images: ImageInput,
+        image_size: Optional[int] = None,
+        max_num_tiles: Optional[int] = None,
+        use_thumbnail: Optional[bool] = None,
+        dynamic_image_size: Optional[bool] = None,
+        do_rescale: Optional[bool] = None,
+        return_tensors: Optional[Union[str, TensorType]] = None,
+        **kwargs,
+    ) -> BatchFeature:
+        image_size = image_size if image_size is not None else self.image_size
+        max_num_tiles = max_num_tiles if max_num_tiles is not None else self.max_num_tiles
+        use_thumbnail = use_thumbnail if use_thumbnail is not None else self.use_thumbnail
+        dynamic_image_size = dynamic_image_size if dynamic_image_size is not None else self.dynamic_image_size
+        do_rescale = do_rescale if do_rescale is not None else self.do_rescale
+
+        all_patches = []
+        num_patches = []
+        for image in make_list_of_images(images):
+            if dynamic_image_size:
+                patches = self.dynamic_preprocess(image, image_size, max_num_tiles, use_thumbnail)
+            else:
+                patches = [self.resize(image, SizeDict(height=image_size, width=image_size))]
+            all_patches.extend(patches)
+            num_patches.append(len(patches))
+
+        pixel_values = torch.stack(all_patches, dim=0)
+        pixel_values = self.rescale_and_normalize(
+            pixel_values,
+            do_rescale,
+            self.rescale_factor,
+            do_normalize=self.do_normalize,
+            image_mean=self.image_mean,
+            image_std=self.image_std,
+        )
+
+        return BatchFeature(data={"pixel_values": pixel_values, "num_patches": num_patches}, tensor_type=return_tensors)
+
+
 class LlamaNemotronVLProcessorConfig(PretrainedConfig):
     """Dummy Configuration for LlamaNemotronVLProcessor,
     just to register the processor with AutoProcessor."""
@@ -218,6 +318,13 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
         self.norm_type = norm_type
         self.system_message = system_message
         self.padding = padding
+        self.image_processor = LlamaNemotronVLImageProcessor(
+            image_size=image_size,
+            max_num_tiles=max_input_tiles,
+            use_thumbnail=use_thumbnail,
+            dynamic_image_size=dynamic_image_size,
+            norm_type=norm_type,
+        )
 
         super().__init__(self.tokenizer)
 
@@ -327,7 +434,8 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
         for idx, (image, text) in enumerate(zip(images, texts)):
             prefix = ""
             if image is not None and image != "":
-                pil_images_by_idx[idx] = load_image(image)
+                pil_image = load_image(image)
+                pil_images_by_idx[idx] = pil_image.convert("RGB") if pil_image.mode != "RGB" else pil_image
                 prefix = "<image>"
                 max_input_tile_by_idx[idx] = self.max_input_tiles
 
@@ -343,7 +451,26 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
             "The number of max_input_tile_by_idx and pil_images_by_idx should be the same."
         )
 
-        transform = build_transform(input_size=self.image_size, norm_type=self.norm_type)
+        pixel_values_by_idx = {}
+        if pil_images_by_idx:
+            image_indices = list(pil_images_by_idx.keys())
+            self.image_processor.image_size = self.image_size
+            self.image_processor.max_num_tiles = self.max_input_tiles
+            self.image_processor.use_thumbnail = self.use_thumbnail
+            self.image_processor.dynamic_image_size = self.dynamic_image_size
+            image_features = self.image_processor(
+                [pil_images_by_idx[idx] for idx in image_indices], return_tensors="pt"
+            )
+            pixel_values = image_features["pixel_values"].to(dtype=torch.bfloat16)
+            num_patches = image_features["num_patches"]
+            if isinstance(num_patches, torch.Tensor):
+                num_patches = num_patches.tolist()
+
+            offset = 0
+            for idx, patch_count in zip(image_indices, num_patches):
+                patch_count = int(patch_count)
+                pixel_values_by_idx[idx] = pixel_values[offset : offset + patch_count]
+                offset += patch_count
 
         template = get_conv_template(self.template)
         template.system_message = self.system_message
@@ -355,23 +482,7 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
         content_prompts = []
         pixel_values_list = []
         for i, content in enumerate(contents):
-            pil_image = pil_images_by_idx.get(i)
-            max_input_tiles = max_input_tile_by_idx.get(i)
-            if pil_image is not None:
-                if self.dynamic_image_size:
-                    image_tiles = dynamic_preprocess(
-                        pil_image,
-                        image_size=self.image_size,
-                        max_num=max_input_tiles,
-                        use_thumbnail=self.use_thumbnail,
-                    )
-                else:
-                    image_tiles = [pil_image]
-
-                pixel_values = [transform(item) for item in image_tiles]
-                pixel_values = torch.stack(pixel_values).to(dtype=torch.bfloat16)
-            else:
-                pixel_values = None
+            pixel_values = pixel_values_by_idx.get(i)
             pixel_values_list.append(pixel_values)
 
             if pixel_values is not None and "<image>" not in content:
