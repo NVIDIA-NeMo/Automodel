@@ -45,7 +45,13 @@ logger = logging.getLogger(__name__)
 
 def _uses_multi_vector_scoring(model) -> bool:
     """Return whether the model emits token-level embeddings for MaxSim scoring."""
+    model = _unwrap_model_for_attrs(model)
     return getattr(model, "pooling", None) in {"colbert", "multi_vector"}
+
+
+def _unwrap_model_for_attrs(model):
+    """Return the underlying model object for configuration-style attribute reads."""
+    return getattr(model, "module", model)
 
 
 def contrastive_scores_and_labels(
@@ -424,10 +430,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
         with train_ctx, sync_ctx:
             q_reps = model(query)
             p_reps = model(passage)
+            attr_model = _unwrap_model_for_attrs(model)
 
             n_passages = self.train_n_passages
             use_multi_vector_scoring = _uses_multi_vector_scoring(model)
-            if is_train and getattr(model, "do_distributed_inbatch_negative", False):
+            if is_train and getattr(attr_model, "do_distributed_inbatch_negative", False):
                 from nemo_automodel.components.models.common.inbatch_neg_utils import (
                     dist_gather_tensor,
                     dist_gather_tensor_with_dim1_padding,
@@ -438,7 +445,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
                 rank = torch.distributed.get_rank() if dist_initialized else 0
                 world_size = torch.distributed.get_world_size() if dist_initialized else 1
-                preserve_gather_grad = not getattr(model, "detach_distributed_inbatch_negatives", True)
+                preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
 
                 if use_multi_vector_scoring:
                     all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
@@ -462,7 +469,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     )
                     scores = torch.mm(q_reps, all_p.t())
                     labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
-                if model.l2_normalize:
+                if attr_model.l2_normalize:
                     scores = scores / self.temperature
                 passage_doc_ids = batch.get("passage_doc_ids")
                 if passage_doc_ids is not None:
@@ -484,7 +491,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     )
                 else:
                     scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
-                if model.l2_normalize:
+                if attr_model.l2_normalize:
                     scores = scores / self.temperature
             loss = F.cross_entropy(scores, labels)
 
@@ -580,7 +587,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         )
                     else:
                         scores, labels = contrastive_scores_and_labels(q_reps, p_reps, self.val_n_passages)
-                    if model.l2_normalize:
+                    attr_model = _unwrap_model_for_attrs(model)
+                    if attr_model.l2_normalize:
                         scores = scores / self.temperature
                     loss = F.cross_entropy(scores, labels)
 
