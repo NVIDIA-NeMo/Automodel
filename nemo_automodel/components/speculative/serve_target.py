@@ -53,7 +53,6 @@ import logging
 
 import torch
 
-from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM
 from nemo_automodel.components.speculative.eagle.remote.server import TargetModelServer, serve
 from nemo_automodel.components.speculative.eagle.target import HFEagle3TargetModel
 
@@ -62,6 +61,11 @@ logger = logging.getLogger(__name__)
 
 def _build_hf_target(args, device: torch.device, dtype: torch.dtype) -> HFEagle3TargetModel:
     """Load the target under HuggingFace and wrap it with aux-layer hooks."""
+    # Imported here (not at module top) so the sglang engine, which never loads
+    # the HF AutoModel, can run in a minimal environment without Automodel's full
+    # model stack -- mirroring the lazy sglang import in ``_build_sglang_target``.
+    from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM
+
     target_model = NeMoAutoModelForCausalLM.from_pretrained(
         args.target,
         torch_dtype=dtype,
