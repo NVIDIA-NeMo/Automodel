@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTextConfig,
     Qwen3OmniMoeThinkerConfig,
@@ -29,7 +30,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -309,8 +310,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         output_router_logits: bool | None = None,
         use_audio_in_video: bool | None = None,
         video_second_per_grid: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor | dict:
+    ) -> torch.Tensor | dict | CausalLMOutputWithPast:
         """Forward pass with multimodal fusion.
 
         Args:
@@ -330,11 +333,26 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             output_router_logits: Whether to output router logits
             use_audio_in_video: Whether audio is in video
             video_second_per_grid: Seconds per grid for videos
+            logits_to_keep: If > 0, only compute logits for the last
+                ``logits_to_keep`` token positions (0 = all positions). Enables
+                memory-efficient fused cross-entropy by letting the recipe request
+                a single-position lm_head projection alongside the final hidden
+                states.
+            output_hidden_states: When set, the returned output carries the final
+                hidden states (the input to ``lm_head``) so the recipe can run
+                fused linear cross-entropy.
             **attn_kwargs: Additional attention arguments
 
         Returns:
-            Logits tensor or dict with loss/aux_loss if labels provided
+            Logits tensor, a dict with loss/aux_loss if labels provided, or a
+            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`
+            carrying the final hidden states when ``output_hidden_states`` is set.
         """
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
         if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
@@ -473,10 +491,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             **attn_kwargs,
         )
 
-        logits = self.lm_head(hidden) if self.lm_head else hidden
+        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
 
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
-            logits = logits.unsqueeze(0)
+        if is_thd and output_hidden_states and hidden.dim() == 2:
+            hidden = hidden.unsqueeze(0)
 
         # 5. Optionally compute loss/aux outputs
         if labels is not None or output_router_logits:
@@ -499,7 +518,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 aux_loss = torch.tensor(0.0, device=logits.device)
                 output["aux_loss"] = aux_loss
 
+            if output_hidden_states:
+                output["hidden_states"] = hidden
+
             return output
+
+        if output_hidden_states:
+            return CausalLMOutputWithPast(logits=logits, hidden_states=hidden)
 
         return logits
 

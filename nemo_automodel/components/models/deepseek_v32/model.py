@@ -19,10 +19,18 @@ These classes subclass from DeepSeek V3, with the main difference being
 the use of DeepseekV32MLA (with Indexer) instead of the standard MLA.
 """
 
+from typing import Any, Optional, Union
+
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.models.common import BackendConfig, get_rope_config, initialize_rms_norm_module
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    compute_lm_head_logits,
+    get_rope_config,
+    initialize_rms_norm_module,
+)
 from nemo_automodel.components.models.deepseek_v3.model import (
     Block,
     DeepseekV3ForCausalLM,
@@ -33,6 +41,7 @@ from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Conf
 from nemo_automodel.components.models.deepseek_v32.layers import DeepseekV32MLA
 from nemo_automodel.components.models.deepseek_v32.state_dict_adapter import DeepSeekV32StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -217,6 +226,66 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
+        **attn_kwargs: Any,
+    ) -> CausalLMOutputWithPast:
+        """Forward pass returning :class:`CausalLMOutputWithPast`.
+
+        Supports both BSHD (``input_ids`` shape ``[B, S]`` -> hidden states
+        ``[B, S, H]``) and THD (``qkv_format == "thd"``; hidden states ``[T, H]``
+        after the batch dim is squeezed, with logits unsqueezed back to
+        ``[1, T, V]`` on exit).
+
+        Args:
+            input_ids: Input token IDs.
+            position_ids: Optional position indices.
+            attention_mask: Optional attention mask.
+            padding_mask: Optional padding mask.
+            logits_to_keep: If ``0`` (default) project all positions; if ``> 0``
+                (or a tensor of indices) only the last ``logits_to_keep`` positions
+                are projected through ``lm_head`` (memory-efficient generation /
+                fused-CE training).
+            output_hidden_states: When truthy, the returned output carries the
+                final (pre-``lm_head``) hidden states spanning the full sequence.
+            **attn_kwargs: Additional attention kwargs forwarded to the base model.
+
+        Returns:
+            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with
+            ``logits`` and, when ``output_hidden_states`` is set, ``hidden_states``.
+        """
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = attn_kwargs.get("qkv_format") == "thd"
+        if is_thd:
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
+        hidden_states = self.model(
+            input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            **attn_kwargs,
+        )
+
+        return compute_lm_head_logits(
+            self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
+        )
 
 
 ModelClass = DeepseekV32ForCausalLM
