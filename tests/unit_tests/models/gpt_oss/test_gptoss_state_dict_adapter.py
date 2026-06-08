@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import weakref
+
 import torch
 from unittest.mock import Mock, patch
 from transformers import GptOssConfig
@@ -291,6 +294,65 @@ class TestGPTOSSStateDictAdapter:
 
         # Irrelevant entries preserved
         assert "some.other" in out
+
+    def test_dequantize_frees_quantized_between_iterations(self):
+        # Regression guard for the per-layer free in _dequantize_block_scale_tensors:
+        # by the time layer N+1 is processed, layer N's quantized blocks/scales must
+        # be eligible for garbage collection. The previous implementation kept all
+        # layers' quantized tensors alive in a local dict until the loop ended,
+        # roughly doubling peak memory during GPT-OSS load.
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        layer0_blocks = torch.ones(1)
+        layer0_scales = torch.ones(1)
+        layer0_blocks_ref = weakref.ref(layer0_blocks)
+        layer0_scales_ref = weakref.ref(layer0_scales)
+        layer1_blocks = torch.ones(1)
+        layer1_scales = torch.ones(1)
+
+        state_dict = {
+            "model.layers.0.mlp.experts.gate_up_proj_blocks": layer0_blocks,
+            "model.layers.0.mlp.experts.gate_up_proj_scales": layer0_scales,
+            "model.layers.1.mlp.experts.gate_up_proj_blocks": layer1_blocks,
+            "model.layers.1.mlp.experts.gate_up_proj_scales": layer1_scales,
+        }
+
+        # Drop external references to layer 0 so the only remaining strong refs
+        # would be those held by the function's local mapping. With Step 1 in
+        # place, those refs are popped between iterations.
+        del layer0_blocks, layer0_scales
+
+        call_count = {"n": 0}
+        layer0_alive_during_layer1 = {"v": None}
+
+        def fake_convert(blocks, scales):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                # Drop our own references to args so GC can reclaim them
+                blocks = scales = None
+                gc.collect()
+                layer0_alive_during_layer1["v"] = (
+                    layer0_blocks_ref() is not None or layer0_scales_ref() is not None
+                )
+            return torch.randn(2, 2)
+
+        # Direct monkey-patch (not unittest.mock) so that argument references
+        # captured by call_args_list don't keep the quantized tensors alive
+        # and mask the per-iteration free we're trying to verify.
+        original = adapter._convert_moe_packed_tensors
+        adapter._convert_moe_packed_tensors = fake_convert
+        try:
+            adapter._dequantize_block_scale_tensors(state_dict)
+        finally:
+            adapter._convert_moe_packed_tensors = original
+
+        assert call_count["n"] == 2
+        assert layer0_alive_during_layer1["v"] is False, (
+            "layer 0 quantized tensors should be released before layer 1 is dequantized"
+        )
 
     def test_from_hf_detects_model_prefix(self):
         config = self.create_mock_config()

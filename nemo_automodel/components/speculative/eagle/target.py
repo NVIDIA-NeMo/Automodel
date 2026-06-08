@@ -23,6 +23,8 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.speculative.eagle.backend import Eagle3TargetBackend
+
 
 def _shift_left_with_zero(tensor: torch.Tensor) -> torch.Tensor:
     """Shift a batched sequence tensor left and zero-fill the tail.
@@ -38,17 +40,56 @@ def _shift_left_with_zero(tensor: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class Eagle3TargetBatch:
-    """Target-model outputs needed by the draft trainer."""
+    """Target-model supervision for one draft-training batch.
+
+    Carries exactly one supervision encoding (validated in ``__post_init__``),
+    both consumed directly by ``Eagle3TrainerModule.forward``:
+
+    - ``logits`` -- the target's full-vocab logits; the draft-vocab projection
+      happens trainer-side. Used by the co-located backend, where the tensor
+      never leaves the GPU.
+    - ``target_probs`` + ``position_mask`` -- the already-projected draft-vocab
+      distribution, so a backend that computes it itself (e.g. a remote server)
+      only transfers draft-vocab-sized tensors.
+    """
 
     aux_hidden_states: torch.Tensor
-    logits: torch.Tensor
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     loss_mask: torch.Tensor
+    logits: torch.Tensor | None = None
+    target_probs: torch.Tensor | None = None
+    position_mask: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        has_logits = self.logits is not None
+        has_precomputed = self.target_probs is not None and self.position_mask is not None
+        if has_logits == has_precomputed:
+            raise ValueError(
+                "Eagle3TargetBatch requires exactly one supervision source: either "
+                "`logits` (full-vocab, projected trainer-side) or both `target_probs` "
+                "and `position_mask` (precomputed over the draft vocab)."
+            )
+
+    def to_trainer_inputs(self) -> dict[str, torch.Tensor]:
+        """Return kwargs for ``Eagle3TrainerModule.forward``, dispatching on
+        whichever supervision encoding this batch carries."""
+        inputs = {
+            "input_ids": self.input_ids,
+            "attention_mask": self.attention_mask,
+            "loss_mask": self.loss_mask,
+            "aux_hidden_states": self.aux_hidden_states,
+        }
+        if self.logits is not None:
+            inputs["target_logits"] = self.logits
+        else:
+            inputs["target_probs"] = self.target_probs
+            inputs["position_mask"] = self.position_mask
+        return inputs
 
 
-class HFEagle3TargetModel:
-    """Thin wrapper that captures three auxiliary hidden states from a causal LM."""
+class HFEagle3TargetModel(Eagle3TargetBackend):
+    """Co-located backend that captures three auxiliary hidden states from a causal LM."""
 
     def __init__(self, model: nn.Module, aux_layer_ids: Sequence[int] | None = None):
         self.model = model.eval()

@@ -545,3 +545,78 @@ class TestParquetLoading:
         # Should fall through to JSON/JSONL loading or HF hub path, not the Parquet path
         result = tcd._load_openai_messages(str(tmp_path / "data.jsonl"), split="train")
         assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# ShareGPT `conversations` -> OpenAI `messages` auto-conversion
+# ---------------------------------------------------------------------------
+
+
+def test_conversations_to_messages_maps_sharegpt_roles():
+    conversations = [
+        {"from": "system", "value": "be nice"},
+        {"from": "human", "value": "hi"},
+        {"from": "gpt", "value": "hello"},
+    ]
+    out = tcd._conversations_to_messages(conversations)
+    assert out == [
+        {"role": "system", "content": "be nice"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+
+
+def test_conversations_to_messages_passes_openai_role_content_through():
+    # Some datasets just rename the column but keep OpenAI {role, content} turns.
+    conversations = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
+    out = tcd._conversations_to_messages(conversations)
+    assert out == conversations
+
+
+def test_conversations_to_messages_rejects_unknown_role():
+    with pytest.raises(ValueError, match="Unsupported ShareGPT role"):
+        tcd._conversations_to_messages([{"from": "function_call", "value": "{}"}])
+
+
+def test_conversations_to_messages_rejects_bad_shapes():
+    with pytest.raises(ValueError, match="must be a list"):
+        tcd._conversations_to_messages({"from": "human", "value": "hi"})
+    with pytest.raises(ValueError, match="must be a dict"):
+        tcd._conversations_to_messages(["not a dict"])
+
+
+def test_getitem_auto_converts_conversations(monkeypatch):
+    # A row carrying `conversations` (and no `messages`) must be converted and
+    # routed through format_chat_template as OpenAI messages.
+    captured = {}
+
+    def _fake_format(tokenizer, normalized, *args, **kwargs):
+        captured["normalized"] = normalized
+        return {"input_ids": [1], "labels": [1]}
+
+    monkeypatch.setattr(tcd, "format_chat_template", _fake_format)
+
+    ds = tcd.ChatDataset.__new__(tcd.ChatDataset)
+    ds.dataset = [{"conversations": [{"from": "human", "value": "hi"}, {"from": "gpt", "value": "hello"}]}]
+    ds.tokenizer = type("Tok", (), {"eos_token_id": 0})()
+    ds.pad_token_id = 0
+    ds.seq_length = None
+    ds.padding = False
+    ds.truncation = False
+    ds.mask_reasoning_content = False
+    ds.unshifted = False
+
+    out = ds[0]
+    assert out == {"input_ids": [1], "labels": [1]}
+    assert [m["role"] for m in captured["normalized"]] == ["user", "assistant"]
+    assert captured["normalized"][0]["content"] == "hi"
+
+
+def test_getitem_still_rejects_rows_without_messages_or_conversations(monkeypatch):
+    monkeypatch.setattr(tcd, "format_chat_template", lambda *a, **k: {})
+    ds = tcd.ChatDataset.__new__(tcd.ChatDataset)
+    ds.dataset = [{"something_else": []}]
+    ds.tokenizer = type("Tok", (), {"eos_token_id": 0})()
+    ds.pad_token_id = 0
+    with pytest.raises(ValueError, match="`messages`.*or a `conversations`"):
+        _ = ds[0]
