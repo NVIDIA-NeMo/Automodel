@@ -218,6 +218,7 @@ navigation:
           - page: "Qwen-Image"
             path: ./v0.4/pages/model-coverage/diffusion/qwen/qwen-image.mdx
   - section: "Recipes & E2E Examples"
+    slug: recipes-e2e-examples
     contents:
       - page: "Recipes and End-to-End Examples"
         path: ./v0.4/pages/guides/overview.mdx

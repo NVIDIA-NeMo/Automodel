@@ -254,6 +254,7 @@ navigation:
             path: ../../model-coverage/reranker/nvidia/llama-bidirectional.mdx
             slug: llama-bidirectional
   - section: "Recipes & E2E Examples"
+    slug: recipes-e2e-examples
     contents:
       - page: "Recipes and End-to-End Examples"
         path: ../../guides/overview.mdx
