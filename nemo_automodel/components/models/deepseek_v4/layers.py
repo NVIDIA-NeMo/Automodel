@@ -737,6 +737,76 @@ def eager_attention_with_sink(
     return torch.matmul(probs, value_states).transpose(1, 2).contiguous(), probs
 
 
+def sdpa_attention_with_sink(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+) -> tuple[torch.Tensor, None]:
+    """Fused-SDPA equivalent of :func:`eager_attention_with_sink`.
+
+    The per-head attention sink is an extra softmax column with logit
+    ``sinks[h]`` and a zero value vector.  Since that column contributes
+    nothing to the numerator and ``exp(sinks[h])`` to the denominator, the
+    sinked output equals the no-sink attention output rescaled per (head,
+    query) by::
+
+        out_with_sink = out_no_sink * sigmoid(lse - sinks[h])
+
+    where ``lse = log sum_j exp(scaled_score_j)`` is the log-sum-exp the
+    attention softmax already computes.  We therefore run the mem-efficient
+    SDPA (which returns ``lse`` and never materializes the ``[H, S, S+P]``
+    score matrix) over ``key``/``value`` with the additive ``attention_mask``,
+    then apply the rescale.  Numerically equivalent to the eager path (bf16
+    max-abs-diff ~2e-3) at a fraction of the activation memory.
+
+    Returns ``(attn_output [B, S, H, D], None)`` — ``attn_weights`` is not
+    materialized, matching the ``(output, weights)`` contract loosely (callers
+    in this model discard the weights).
+    """
+    batch, num_heads, seq_len, head_dim = query.shape
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+    kv_len = key_states.shape[2]
+    bias = None
+    if attention_mask is not None:
+        bias = attention_mask[:, :, :, :kv_len]
+        # The mem-efficient SDPA kernel requires attn_bias.stride(2) (the
+        # per-query row length == kv_len for a contiguous bias) to be a
+        # multiple of 8.  The compressor's pooled columns make
+        # kv_len = S + n_pooled non-aligned (e.g. 1161), so pad keys/values and
+        # the bias with fully-masked (-inf) columns up to the next multiple of 8.
+        # The padded keys contribute nothing (exp(-inf) == 0), so output and lse
+        # are unchanged.
+        align = 8
+        kv_len_padded = (kv_len + align - 1) // align * align
+        pad = kv_len_padded - kv_len
+        if pad:
+            min_val = torch.finfo(query.dtype).min
+            key_states = F.pad(key_states, (0, 0, 0, pad))
+            value_states = F.pad(value_states, (0, 0, 0, pad))
+            bias = F.pad(bias, (0, pad), value=min_val)
+            kv_len = kv_len_padded
+        # mem-efficient SDPA needs the bias expanded to the query-head count.
+        bias = bias.expand(batch, num_heads, seq_len, kv_len).to(query.dtype).contiguous()
+    out, lse, _, _ = torch.ops.aten._scaled_dot_product_efficient_attention(
+        query.contiguous(),
+        key_states.contiguous(),
+        value_states.contiguous(),
+        bias,
+        True,  # compute_log_sumexp -> needed for the sink rescale
+        dropout,
+        False,  # is_causal: causality is already encoded in attention_mask
+        scale=scaling,
+    )
+    sinks = module.sinks.to(torch.float32).view(1, num_heads, 1)  # [1, H, 1]
+    out = out * torch.sigmoid(lse.to(torch.float32) - sinks).unsqueeze(-1).to(out.dtype)
+    return out.transpose(1, 2).contiguous(), None
+
+
 def _build_indexer_topk_compressed_mask(
     attention_mask: torch.Tensor,
     indexer_topk: torch.Tensor,
@@ -1166,6 +1236,9 @@ class DeepseekV4Attention(nn.Module):
         self.attention_dropout = float(getattr(config, "attention_dropout", 0.0) or 0.0)
         self.is_causal = True
         self.scaling = self.head_dim**-0.5
+        # "eager" (default) materializes the full fp32 score matrix; "sdpa" uses
+        # the fused mem-efficient kernel + sink rescale (see sdpa_attention_with_sink).
+        self.attn_impl = str(getattr(config, "attn_impl", "eager") or "eager")
         # FP8 fake-quant toggles (training-only vLLM numerical alignment).
         # kv / o_proj use the hardcoded ue8m0 fp8_ds_mla format; attn_proj
         # covers the generic block-FP8 input/output projections (also UE8M0
@@ -1319,7 +1392,8 @@ class DeepseekV4Attention(nn.Module):
         if attention_mask is not None and full_kv.shape[2] > attention_mask.shape[-1]:
             attention_mask = F.pad(attention_mask, (0, full_kv.shape[2] - attention_mask.shape[-1]), value=0.0)
 
-        attn_output, attn_weights = eager_attention_with_sink(
+        attn_fn = sdpa_attention_with_sink if self.attn_impl == "sdpa" else eager_attention_with_sink
+        attn_output, attn_weights = attn_fn(
             self,
             q,
             full_kv,

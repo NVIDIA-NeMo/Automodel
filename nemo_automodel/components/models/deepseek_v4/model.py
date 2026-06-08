@@ -621,6 +621,19 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             elif _flag in kwargs:
                 setattr(config, _flag, kwargs.pop(_flag))
                 _applied_fp8_flags.append(_flag)
+        # attn_impl ("eager"|"sdpa") needs the same re-application: AutoConfig
+        # .from_pretrained drops unknown string kwargs, so a yaml/CLI
+        # hf_config_overrides.attn_impl never reaches the attention submodule's
+        # getattr(config, "attn_impl"). Env var (NEMO_AUTOMODEL_DSV4_ATTN_IMPL)
+        # takes precedence over the kwargs value, mirroring the fp8 flags.
+        _attn_impl_env = os.environ.get("NEMO_AUTOMODEL_DSV4_ATTN_IMPL")
+        if _attn_impl_env:
+            setattr(config, "attn_impl", _attn_impl_env.lower())
+            kwargs.pop("attn_impl", None)
+            _applied_fp8_flags.append(f"attn_impl={_attn_impl_env.lower()}(env)")
+        elif "attn_impl" in kwargs:
+            setattr(config, "attn_impl", kwargs.pop("attn_impl"))
+            _applied_fp8_flags.append(f"attn_impl={getattr(config, 'attn_impl', 'eager')}")
         if os.environ.get("NEMO_AUTOMODEL_DSV4_FAKE_QUANT_DEBUG", "0").lower() not in ("", "0", "false", "no", "off"):
             _rank = (
                 torch.distributed.get_rank()

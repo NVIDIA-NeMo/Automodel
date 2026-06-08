@@ -152,6 +152,11 @@ class DeepseekV4Config(PretrainedConfig):
         rms_norm_eps: float = 1e-6,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
+        # Attention kernel: "eager" materializes the [H, S, S+P] fp32 score matrix
+        # (reference path); "sdpa" uses the fused mem-efficient SDPA + a per-head
+        # attention-sink rescale (out * sigmoid(lse - sink)), which is numerically
+        # equivalent but avoids the O(H*S^2) score activation. Opt-in.
+        attn_impl: str = "eager",
         use_cache: bool = True,
         pad_token_id: int | None = None,
         bos_token_id: int = 0,
