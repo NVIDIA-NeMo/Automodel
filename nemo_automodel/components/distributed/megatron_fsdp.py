@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -24,6 +25,9 @@ from nemo_automodel.components.distributed.parallelizer import (
     _get_parallel_plan,
     megatron_fsdp_strategy_parallelize,
 )
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.config import DistributedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -173,3 +177,31 @@ def fully_shard_optimizer(
             "MegatronFSDP is not installed, please visit https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/distributed/fsdp/src for more information"
         )
     return megatron_fsdp_fully_shard_optimizer(optimizer)
+
+
+def maybe_shard_optimizer(
+    model_part: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    distributed_config: "DistributedConfig | None",
+    *,
+    allow: bool = True,
+) -> torch.optim.Optimizer:
+    """Shard the optimizer with Megatron-FSDP when the strategy requires it.
+
+    Returns the optimizer unchanged unless ``distributed_config`` is a
+    :class:`MegatronFSDPConfig` running in a distributed (world size > 1) job.
+
+    Args:
+        model_part: The (already sharded) model part the optimizer belongs to.
+        optimizer: The optimizer to (optionally) shard.
+        distributed_config: Distributed strategy config; only triggers sharding
+            when it is a :class:`MegatronFSDPConfig`.
+        allow: Guard for optimizers incompatible with Megatron-FSDP sharding
+            (e.g. Dion); asserts when sharding would otherwise apply.
+    """
+    if isinstance(distributed_config, MegatronFSDPConfig) and dist.get_world_size() > 1:
+        assert allow, "Dion optimizer does not support fully_shard_optimizer"
+        if not HAS_MEGATRON_FSDP:
+            return optimizer
+        return fully_shard_optimizer(model_part, optimizer)
+    return optimizer

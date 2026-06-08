@@ -51,16 +51,6 @@ _gpu_only = pytest.mark.skipif(
     reason="P-EAGLE forward uses flex_attention, which has no CPU autograd support in the CI torch build.",
 )
 
-# P-EAGLE's draft forward runs flex_attention, whose autograd is not implemented
-# on CPU in the CI torch build (even the forward errors once the inputs require
-# grad). Tests that drive the draft forward therefore run on CUDA and are skipped
-# when it is unavailable; the pure-tensor / mask-mod / config tests stay on CPU.
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-_gpu_only = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="P-EAGLE forward uses flex_attention, which has no CPU autograd support in the CI torch build.",
-)
-
 
 def _build_tiny_draft_model(
     *, parallel_drafting: bool = False, mask_token_id: int = 0, device: str = _DEVICE
@@ -71,6 +61,12 @@ def _build_tiny_draft_model(
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
+        # P-EAGLE compiles flex_attention on CUDA; Inductor's flex Triton kernel
+        # refuses to lower head_dim < 16. hidden_size // num_attention_heads = 8
+        # here, so set a decoupled head_dim >= 16 (the draft reads it via
+        # getattr(config, "head_dim", ...)). Keeps hidden_size/target_hidden_size
+        # at 32 so the rest of the tiny-config assertions are unchanged.
+        head_dim=16,
         vocab_size=128,
         max_position_embeddings=64,
     )

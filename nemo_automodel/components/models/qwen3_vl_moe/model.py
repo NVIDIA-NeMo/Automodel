@@ -31,7 +31,7 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -526,8 +526,17 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         padding_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        output_hidden_states: bool | None = None,
         **kwargs: Any,
     ):
+        text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(text_config, "output_hidden_states", False)
+        )
+
         # PP VLM support: retrieve pixel_values from stored chunks if not passed directly
         pixel_values = kwargs.get("pixel_values", None)
         pixel_values_videos = kwargs.get("pixel_values_videos", None)
@@ -604,12 +613,14 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
 
         hidden_states = outputs.last_hidden_state
 
-        if self.lm_head is not None:
-            logits = self.lm_head(hidden_states)
-        else:
-            logits = hidden_states
+        # Pipeline-parallel intermediate stage (no lm_head): pass hidden states through
+        # unchanged so the next stage receives the raw tensor it expects.
+        if self.lm_head is None:
+            return hidden_states
 
-        return logits
+        return compute_lm_head_logits(
+            self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states
+        )
 
     @torch.no_grad()
     def initialize_weights(

@@ -322,7 +322,7 @@ def _minimal_diffusion_recipe_cfg(
 
 
 def _patch_lightweight_diffusion_recipe_setup(monkeypatch):
-    monkeypatch.setattr(diffusion_train, "build_distributed", lambda _cfg: SimpleNamespace(is_main=False))
+    monkeypatch.setattr(diffusion_train, "initialize_distributed", lambda *args, **kwargs: SimpleNamespace(is_main=False))
     monkeypatch.setattr(diffusion_train, "setup_logging", lambda: None)
     monkeypatch.setattr(diffusion_train, "StatefulRNG", lambda *args, **kwargs: SimpleNamespace())
     monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
