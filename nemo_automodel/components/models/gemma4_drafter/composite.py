@@ -243,6 +243,7 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         moe_mesh: Any = None,
         distributed_config: Any = None,
         pipeline_config: Any = None,
+        distributed_setup: Any = None,
         freeze_config: Any = None,
         cache_dir: Optional[str] = None,
         **kwargs,
@@ -288,6 +289,9 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
             distributed_config: FSDP2 / Megatron-FSDP / DDP config object.
             pipeline_config: Must be ``None`` -- pipeline parallelism is not
                 supported when the drafter is attached.
+            distributed_setup: Resolved ``DistributedSetup`` (topology + policy)
+                shared by base and drafter. This is the path used by the VLM
+                finetune recipe; its ``pp_size`` and ``cp_size`` must be ``1``.
             freeze_config: Forwarded to the base only (the drafter is trained
                 end-to-end). Customize the drafter's freezing with explicit
                 ``requires_grad_`` calls on the returned composite if needed.
@@ -320,6 +324,25 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
             )
         if device_mesh is not None and "cp" in getattr(device_mesh, "mesh_dim_names", ()):
             if device_mesh["cp"].size() > 1:
+                raise ValueError(
+                    "Context parallelism is not supported with Gemma4WithDrafter "
+                    "(the drafter's shared_kv_states path is not CP-safe). "
+                    "Set `cp_size: 1` in the distributed config."
+                )
+        # The recipe path passes a resolved ``DistributedSetup`` instead of the
+        # separate mesh / config kwargs. Apply the same pp/cp guards to it so the
+        # KV-sharing invariant holds regardless of which entry point is used.
+        if distributed_setup is not None:
+            mesh_context = getattr(distributed_setup, "mesh_context", None)
+            if getattr(distributed_setup, "pipeline_config", None) is not None or (
+                mesh_context is not None and mesh_context.pp_size > 1
+            ):
+                raise ValueError(
+                    "Pipeline parallelism is not supported with Gemma4WithDrafter "
+                    "(the KV-sharing path between base and drafter is not pipeline-safe). "
+                    "Set `pp_size: 1` in the distributed config."
+                )
+            if mesh_context is not None and mesh_context.cp_size > 1:
                 raise ValueError(
                     "Context parallelism is not supported with Gemma4WithDrafter "
                     "(the drafter's shared_kv_states path is not CP-safe). "
@@ -360,9 +383,7 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         base = NeMoAutoModelForImageTextToText.from_pretrained(
             base_path,
             device_mesh=device_mesh,
-            moe_mesh=moe_mesh,
-            distributed_config=distributed_config,
-            pipeline_config=None,
+            distributed_setup=distributed_setup,
             freeze_config=freeze_config,
             **base_kwargs,
         )
@@ -386,9 +407,7 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         drafter = NeMoAutoModelForCausalLM.from_pretrained(
             drafter_path,
             device_mesh=device_mesh,
-            moe_mesh=moe_mesh,
-            distributed_config=distributed_config,
-            pipeline_config=None,
+            distributed_setup=distributed_setup,
             freeze_config=None,
             **drafter_kwargs,
         )
