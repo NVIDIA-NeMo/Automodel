@@ -333,7 +333,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
             tokenizer.padding_side = "left"
 
         self.dataloader = build_dataloader(
-            self.cfg.dataloader,
+            # Raw ``dataloader`` config node (retrieval nests dataset under dataloader.dataset);
+            # RecipeConfig.dataloader is the typed LLM-recipe property and resolves to None here.
+            self.cfg.get("dataloader"),
             self.tokenizer,
             seed=self.cfg.get("seed", 42),
             batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
