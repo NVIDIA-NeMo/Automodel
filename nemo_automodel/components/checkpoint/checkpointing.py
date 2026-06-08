@@ -738,7 +738,23 @@ class Checkpointer:
                     module._is_hf_initialized = False
 
             if hasattr(model, "initialize_weights"):
-                model.initialize_weights()
+                # Infer the target dtype from existing (floating-point)
+                # parameters so that a model constructed in fp32 (e.g. for fp32
+                # master weights under FSDP2) is not silently cast back to
+                # bf16 inside model.initialize_weights() -> cast_model_to_dtype().
+                param_dtype = None
+                for p in model.parameters():
+                    if p.is_floating_point():
+                        param_dtype = p.dtype
+                        break
+                try:
+                    if param_dtype is not None:
+                        model.initialize_weights(dtype=param_dtype)
+                    else:
+                        model.initialize_weights()
+                except TypeError:
+                    # Model's initialize_weights() does not accept a dtype kwarg.
+                    model.initialize_weights()
             else:
                 logging.warning(
                     "Warning: Model does not have initialize_weights method."
@@ -851,6 +867,27 @@ class Checkpointer:
         state.load_state_dict(
             torch.load(os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"), weights_only=False)
         )
+
+    def save_distributed_state(self, state: Any, state_name: str, path: str) -> None:
+        """Save a custom stateful object through DCP on all ranks.
+
+        This is intended for auxiliary objects whose state dict contains
+        sharded tensors, for example BAGEL EMA shadows under FSDP2. Rank-0
+        ``torch.save`` would only persist rank 0's local shard; DCP sees the
+        DTensor metadata and writes all shards correctly.
+        """
+        state_dir = os.path.join(path, state_name)
+        _ensure_dirs(state_dir)
+        state_dict = state.state_dict()
+        planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
+        dcp.save(state_dict, checkpoint_id=state_dir, planner=planner)
+
+    def load_distributed_state(self, state: Any, state_name: str, path: str) -> None:
+        """Load a custom stateful object previously saved with DCP."""
+        state_dir = os.path.join(path, state_name)
+        state_dict = state.state_dict()
+        dcp.load(state_dict, checkpoint_id=state_dir)
+        state.load_state_dict(state_dict)
 
     def close(self) -> None:
         """
