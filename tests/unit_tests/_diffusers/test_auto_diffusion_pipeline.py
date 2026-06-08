@@ -388,7 +388,30 @@ def test_create_parallel_manager_ddp():
         MockDDP.return_value = Mock()
         manager = _create_parallel_manager({"_manager_type": "ddp", "some_arg": "value"})
 
-    MockConfig.assert_called_once_with(activation_checkpointing=False, backend="nccl")
+    MockConfig.assert_called_once_with(
+        activation_checkpointing=False,
+        backend="nccl",
+        find_unused_parameters=False,
+    )
+    MockDDP.assert_called_once_with(MockConfig.return_value)
+    assert manager is MockDDP.return_value
+
+
+def test_create_parallel_manager_ddp_passes_find_unused_parameters():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
+
+    with (
+        patch(f"{MODULE_PATH}.DDPManager") as MockDDP,
+        patch(f"{MODULE_PATH}.DDPConfig") as MockConfig,
+    ):
+        MockDDP.return_value = Mock()
+        manager = _create_parallel_manager({"_manager_type": "ddp", "find_unused_parameters": True})
+
+    MockConfig.assert_called_once_with(
+        activation_checkpointing=False,
+        backend="nccl",
+        find_unused_parameters=True,
+    )
     MockDDP.assert_called_once_with(MockConfig.return_value)
     assert manager is MockDDP.return_value
 
