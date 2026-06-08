@@ -112,6 +112,17 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+def _detect_ffpa_impl(model) -> bool:
+    """Return True iff ``model`` (or its ``text_config``) sets ``_attn_implementation="ffpa"``."""
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return False
+    for sub in (cfg, getattr(cfg, "text_config", None)):
+        if sub is not None and getattr(sub, "_attn_implementation", None) == "ffpa":
+            return True
+    return False
+
+
 class ParallelizationStrategy(ABC):
     """Abstract base class for model parallelization strategies."""
 
@@ -234,7 +245,27 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     except Exception:
                         pass
 
-            if enable_compile:
+            if _detect_ffpa_impl(model):
+                # Selective AC: mark FFPA fwd ops MUST_SAVE so CuTeDSL kernels aren't replayed in backward.
+                from functools import partial
+
+                from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                    apply_activation_checkpointing,
+                )
+
+                from nemo_automodel._transformers.ffpa_attention import ffpa_selective_checkpoint_policy
+
+                layer_classes = tuple({type(layer) for layer in layers})
+                apply_activation_checkpointing(
+                    model,
+                    checkpoint_wrapper_fn=partial(
+                        checkpoint_wrapper,
+                        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                        context_fn=ffpa_selective_checkpoint_policy(),
+                    ),
+                    check_fn=lambda submodule: isinstance(submodule, layer_classes),
+                )
+            elif enable_compile:
                 # NO_REENTRANT is required for compile: REENTRANT's first forward runs under
                 # no_grad, causing AOT autograd to trace a forward-only graph that drops LoRA
                 # (and other trainable) weight gradients.  Wrapping must happen BEFORE FSDP2
