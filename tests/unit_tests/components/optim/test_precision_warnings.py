@@ -13,12 +13,11 @@
 # limitations under the License.
 
 import logging
-from types import SimpleNamespace
 
 import torch
 
-from nemo_automodel.components.training import precision_warnings
-from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
+from nemo_automodel.components.optim import precision_warnings
+from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 
 _WARNING_PREFIX = "Detected torch.optim.Adam/AdamW with trainable bf16 model parameters"
 
@@ -39,6 +38,26 @@ def test_warns_once_for_full_bf16_training_with_torch_adamw(caplog):
     assert "docs/guides/mixed-precision-training.md" in caplog.text
 
 
+def test_warns_for_torch_adam(caplog):
+    param = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+    optimizer = torch.optim.Adam([param], lr=1.0e-4)
+
+    with caplog.at_level(logging.WARNING):
+        warn_if_torch_adam_with_bf16_params(optimizer=optimizer, context="unit-test")
+
+    assert _WARNING_PREFIX in caplog.text
+
+
+def test_skips_non_adam_optimizer(caplog):
+    param = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+    optimizer = torch.optim.SGD([param], lr=1.0e-4)
+
+    with caplog.at_level(logging.WARNING):
+        warn_if_torch_adam_with_bf16_params(optimizer=optimizer, context="unit-test")
+
+    assert _WARNING_PREFIX not in caplog.text
+
+
 def test_skips_peft_bf16_training(caplog):
     param = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
     optimizer = torch.optim.AdamW([param], lr=1.0e-4)
@@ -57,17 +76,3 @@ def test_skips_full_fp32_training(caplog):
         warn_if_torch_adam_with_bf16_params(optimizer=optimizer, context="unit-test")
 
     assert _WARNING_PREFIX not in caplog.text
-
-
-def test_warns_from_optimizer_config_target_and_parameters(caplog):
-    param = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
-    optimizer_cfg = SimpleNamespace(_target_="torch.optim.AdamW")
-
-    with caplog.at_level(logging.WARNING):
-        warn_if_torch_adam_with_bf16_params(
-            optimizer_cfg=optimizer_cfg,
-            parameters=[param],
-            context="unit-test",
-        )
-
-    assert _WARNING_PREFIX in caplog.text

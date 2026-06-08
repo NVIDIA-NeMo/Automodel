@@ -520,9 +520,10 @@ class TestGemma4ForConditionalGeneration:
                 last_hidden_state=torch.randn(batch, seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
             ),
         ):
-            logits = model(input_ids)
+            out = model(input_ids)
 
-        assert logits.shape == (batch, seq, text_config.vocab_size)
+        # MoE forward now returns a CausalLMOutputWithPast (cut-CE support); read .logits.
+        assert out.logits.shape == (batch, seq, text_config.vocab_size)
 
     def test_forward_applies_logit_softcapping(self, backend_config, device):
         cfg = _make_gemma4_config(final_logit_softcapping=30.0)
@@ -540,9 +541,9 @@ class TestGemma4ForConditionalGeneration:
             "forward",
             return_value=MagicMock(last_hidden_state=large_hidden),
         ):
-            logits = model(input_ids)
+            out = model(input_ids)
 
-        assert logits.abs().max() <= 30.0 + 1e-2
+        assert out.logits.abs().max() <= 30.0 + 1e-2
 
     def test_forward_generates_cache_position(self, gemma4_config, backend_config, device):
         model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend_config)
