@@ -554,3 +554,57 @@ def test_val_pos_ids_uses_dist_env_device_not_model_device():
     # The buggy line would have raised:
     with pytest.raises(AttributeError, match="no attribute 'device'"):
         _ = torch.arange(0, 4).unsqueeze(0).to(model.device)
+
+
+def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
+    """``total_loss`` is all-reduced with include_cp=True, but ``total_tokens``
+    (measured pre-CP-shard) must NOT include CP — otherwise val_loss is scaled
+    down by cp_size. Guards the fix at finetune.py:_run_validation_epoch."""
+    from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
+
+    # No-op replacements for the heavy collaborators.
+    monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(vlm_finetune, "make_cp_batch_and_ctx", lambda mesh, batch: (nullcontext, batch))
+    monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
+    monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
+
+    class _Model(torch.nn.Module):
+        def eval(self):  # noqa: D401
+            return self
+
+        def forward(self, **batch):
+            return SimpleNamespace(logits=torch.zeros(1, 4, 8), hidden_states=None)
+
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.model_parts = [_Model()]
+    recipe.loss_fn = object()  # not a FusedLinearCrossEntropy
+    recipe.device_mesh = None  # CP inactive -> skip pre-embed branch
+    recipe.pp_enabled = False
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
+    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.001}])]
+    recipe._maybe_add_drafter_loss = lambda *, out, base_loss, labels, model, num_label_tokens: base_loss
+
+    allreduce_calls = []
+
+    def _fake_allreduce(tensor, include_cp=False):
+        allreduce_calls.append((tensor.tolist(), include_cp))
+        return tensor
+
+    recipe._dp_allreduce = _fake_allreduce
+
+    # One batch, 3 supervised tokens (-100 ignored).
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": torch.tensor([[1, 2, -100, 4]]),
+    }
+
+    result = recipe._run_validation_epoch([batch])
+
+    # total_loss all-reduced WITH cp; total_tokens and num_label_tokens WITHOUT.
+    loss_call = allreduce_calls[0]
+    tokens_call = allreduce_calls[1]
+    assert loss_call[1] is True, "total_loss must include CP ranks"
+    assert tokens_call[1] is False, "total_tokens must NOT be summed over CP ranks"
+    # val_loss = (2.0 * 3 tokens) / 3 tokens == 2.0
+    assert result.metrics["val_loss"] == pytest.approx(2.0)
