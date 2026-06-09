@@ -30,6 +30,16 @@ jobs:
         - Typos in code, comments, or strings
         - Missing or insufficient test coverage for changed code
         - Outdated or inaccurate documentation affected by the changes
+        - ModelCapabilities staleness on existing model classes. When a PR adds
+          a new parallelism axis (TP, CP, PP, or EP) to a model class that was
+          already onboarded — e.g. it adds a `tp_plan`/`_pp_plan`, wires
+          MoE/expert-parallel sharding, attaches a context-parallel hook, or
+          adds a new recipe YAML under `examples/*/<model>/` whose
+          `tp_size/cp_size/pp_size/ep_size > 1` — the contributor MUST flip the
+          corresponding `supports_tp/cp/pp/ep` flag from `False` to `True` on
+          that class's nested `ModelCapabilities` dataclass (static pattern) or
+          inside the `get_capabilities(cls, config)` classmethod (dynamic
+          dispatch pattern).
 
         Do NOT comment on:
         - Style preferences or formatting
