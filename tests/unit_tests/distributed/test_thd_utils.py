@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
 import pytest
+import torch
 
 from nemo_automodel.components.distributed.thd_utils import process_input_for_thd, split_batch_into_thd_chunks
 
@@ -23,7 +23,6 @@ class TestProcessInputForTHD:
 
     def test_basic_conversion(self):
         """Test basic conversion from BSHD to THD format with 2D token IDs."""
-        batch_size, seq_len = 2, 6
         batch = {
             "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]]),
             "labels": torch.tensor([[2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13]]),
@@ -230,11 +229,16 @@ class TestProcessInputForTHD:
 
     def test_chunking_basic(self):
         """Test basic chunking functionality."""
-        batch_size, seq_len = 4, 6
         batch = {
-            "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12], [13, 14, 15, 16, 17, 18], [19, 20, 21, 22, 23, 24]]),
-            "labels": torch.tensor([[2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13], [14, 15, 16, 17, 18, 19], [20, 21, 22, 23, 24, 25]]),
-            "position_ids": torch.tensor([[0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5]]),
+            "input_ids": torch.tensor(
+                [[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12], [13, 14, 15, 16, 17, 18], [19, 20, 21, 22, 23, 24]]
+            ),
+            "labels": torch.tensor(
+                [[2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13], [14, 15, 16, 17, 18, 19], [20, 21, 22, 23, 24, 25]]
+            ),
+            "position_ids": torch.tensor(
+                [[0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5]]
+            ),
             "seq_lens": torch.tensor([[6], [6], [6], [6]]),
             "seq_lens_padded": torch.tensor([[6], [6], [6], [6]]),
         }
@@ -257,24 +261,15 @@ class TestProcessInputForTHD:
     def test_chunking_with_packed_sequences(self):
         """Test chunking with multiple packed sequences per example."""
         batch = {
-            "input_ids": torch.tensor([
-                [1, 2, 3, 99, 4, 5],
-                [6, 7, 99, 8, 9, 10],
-                [11, 12, 13, 99, 14, 15],
-                [16, 17, 99, 18, 19, 20]
-            ]),
-            "labels": torch.tensor([
-                [2, 3, 99, 4, 5, 6],
-                [7, 8, 9, 10, 11, 12],
-                [12, 13, 99, 14, 15, 16],
-                [17, 18, 19, 20, 21, 22]
-            ]),
-            "position_ids": torch.tensor([
-                [0, 1, 2, 0, 0, 1],
-                [0, 1, 0, 0, 1, 2],
-                [0, 1, 2, 0, 0, 1],
-                [0, 1, 0, 0, 1, 2]
-            ]),
+            "input_ids": torch.tensor(
+                [[1, 2, 3, 99, 4, 5], [6, 7, 99, 8, 9, 10], [11, 12, 13, 99, 14, 15], [16, 17, 99, 18, 19, 20]]
+            ),
+            "labels": torch.tensor(
+                [[2, 3, 99, 4, 5, 6], [7, 8, 9, 10, 11, 12], [12, 13, 99, 14, 15, 16], [17, 18, 19, 20, 21, 22]]
+            ),
+            "position_ids": torch.tensor(
+                [[0, 1, 2, 0, 0, 1], [0, 1, 0, 0, 1, 2], [0, 1, 2, 0, 0, 1], [0, 1, 0, 0, 1, 2]]
+            ),
             "seq_lens": torch.tensor([[3, 2], [2, 3], [3, 2], [2, 3]]),
             "seq_lens_padded": torch.tensor([[4, 2], [3, 3], [4, 2], [3, 3]]),
         }
@@ -324,19 +319,18 @@ class TestProcessInputForTHDWithChunks:
         """Test that cu_seqlens with different lengths are padded correctly."""
         # Create a batch where different chunks will have different cu_seqlens lengths
         batch = {
-            "input_ids": torch.tensor([
-                [1, 2, 3, 99, 4, 5],  # 2 sequences (lengths 3, 2)
-                [6, 7, 8, 9, 10, 11],  # 1 sequence (length 6)
-                [12, 13, 14, 15, 99, 99],  # 1 sequence (length 4)
-                [16, 17, 99, 18, 19, 20]  # 2 sequences (lengths 2, 3)
-            ]),
+            "input_ids": torch.tensor(
+                [
+                    [1, 2, 3, 99, 4, 5],  # 2 sequences (lengths 3, 2)
+                    [6, 7, 8, 9, 10, 11],  # 1 sequence (length 6)
+                    [12, 13, 14, 15, 99, 99],  # 1 sequence (length 4)
+                    [16, 17, 99, 18, 19, 20],  # 2 sequences (lengths 2, 3)
+                ]
+            ),
             "labels": torch.randint(0, 100, (4, 6)),
-            "position_ids": torch.tensor([
-                [0, 1, 2, 0, 0, 1],
-                [0, 1, 2, 3, 4, 5],
-                [0, 1, 2, 3, 0, 0],
-                [0, 1, 0, 0, 1, 2]
-            ]),
+            "position_ids": torch.tensor(
+                [[0, 1, 2, 0, 0, 1], [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 0, 0], [0, 1, 0, 0, 1, 2]]
+            ),
             "seq_lens": torch.tensor([[3, 2, -1000], [6, -1000, -1000], [4, -1000, -1000], [2, 3, -1000]]),
             "seq_lens_padded": torch.tensor([[4, 2, -1000], [6, -1000, -1000], [4, -1000, -1000], [3, 3, -1000]]),
         }
@@ -496,7 +490,6 @@ class TestProcessInputForTHDWithChunks:
         assert result["position_ids"].dtype == torch.long
         assert result["cu_seqlens"].dtype == torch.int32
 
-
     def test_padding_mask_correctness(self):
         """Test that padding_mask is correctly generated."""
         batch = {
@@ -566,8 +559,7 @@ class TestTrailingPadAbsorption:
         packed = 1024
         sub = 112
         seq_lens = torch.tensor([[sub, sub, sub, sub, sub, -1000, -1000, -1000, -1000]])
-        seq_lens_padded = torch.tensor([[sub, sub, sub, sub, sub + (packed - 5 * sub),
-                                          -1000, -1000, -1000, -1000]])
+        seq_lens_padded = torch.tensor([[sub, sub, sub, sub, sub + (packed - 5 * sub), -1000, -1000, -1000, -1000]])
         batch = {
             "input_ids": torch.zeros((1, packed), dtype=torch.long),
             "labels": torch.zeros((1, packed), dtype=torch.long),
@@ -581,8 +573,7 @@ class TestTrailingPadAbsorption:
         # last slot is 576 (real 112 + trailing pad 464).
         expected_cu = torch.tensor([0, 112, 224, 336, 448, 1024], dtype=torch.int32)
         assert torch.equal(result["cu_seqlens"], expected_cu), (
-            f"cu_seqlens should be absorbed: expected {expected_cu.tolist()}, "
-            f"got {result['cu_seqlens'].tolist()}"
+            f"cu_seqlens should be absorbed: expected {expected_cu.tolist()}, got {result['cu_seqlens'].tolist()}"
         )
         # cu_seqlens_padded is dropped (equal to cu_seqlens, gated out).
         assert "cu_seqlens_padded" not in result
@@ -590,8 +581,7 @@ class TestTrailingPadAbsorption:
         # the pre-absorption max real sub-seq length (112). This is what
         # makes the layout TE-contract-clean.
         assert int(result["max_seqlen"].item()) == 576, (
-            f"max_seqlen should reflect post-absorption slot width 576; "
-            f"got {int(result['max_seqlen'].item())}"
+            f"max_seqlen should reflect post-absorption slot width 576; got {int(result['max_seqlen'].item())}"
         )
 
     def test_full_microbatch_absorbs_with_bumped_max_seqlen(self):
@@ -615,13 +605,10 @@ class TestTrailingPadAbsorption:
         # Absorption fires → cu_seqlens[-1] == packed_size.
         assert int(result["cu_seqlens"][-1].item()) == packed
         # cu_seqlens_padded dropped.
-        assert "cu_seqlens_padded" not in result, (
-            "cu_seqlens_padded should be omitted when absorption fired"
-        )
+        assert "cu_seqlens_padded" not in result, "cu_seqlens_padded should be omitted when absorption fired"
         # max_seqlen reflects the absorbed last slot width = 112 + 16 = 128.
         assert int(result["max_seqlen"].item()) == 128, (
-            f"max_seqlen should reflect post-absorption slot 128; "
-            f"got {int(result['max_seqlen'].item())}"
+            f"max_seqlen should reflect post-absorption slot 128; got {int(result['max_seqlen'].item())}"
         )
 
     def test_split_into_chunks_mixed_short_and_full(self):
@@ -631,14 +618,18 @@ class TestTrailingPadAbsorption:
         """
         packed = 1024
         sub = 112
-        seq_lens = torch.tensor([
-            [sub] * 9,
-            [sub, sub, sub, sub, sub, -1000, -1000, -1000, -1000],
-        ])
-        seq_lens_padded = torch.tensor([
-            [sub] * 8 + [sub + 16],
-            [sub, sub, sub, sub, sub + (packed - 5 * sub), -1000, -1000, -1000, -1000],
-        ])
+        seq_lens = torch.tensor(
+            [
+                [sub] * 9,
+                [sub, sub, sub, sub, sub, -1000, -1000, -1000, -1000],
+            ]
+        )
+        seq_lens_padded = torch.tensor(
+            [
+                [sub] * 8 + [sub + 16],
+                [sub, sub, sub, sub, sub + (packed - 5 * sub), -1000, -1000, -1000, -1000],
+            ]
+        )
         batch = {
             "input_ids": torch.zeros((2, packed), dtype=torch.long),
             "labels": torch.zeros((2, packed), dtype=torch.long),
