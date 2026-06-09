@@ -128,6 +128,38 @@ def _best_effort(label: str, fn) -> None:
         logger.exception("error %s during cleanup", label)
 
 
+def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_size: int) -> None:
+    """Reject P-EAGLE (parallel_drafting) combinations its trainer cannot honor.
+
+    ``PEagleTrainerModule.forward`` consumes the live colocated target's full-vocab
+    ``target_logits`` only. The remote and offline-cache backends instead supply
+    precomputed draft-vocab ``target_probs``/``position_mask`` (a parameter
+    mismatch), and sequence packing feeds ``position_ids``/``seq_lens``/
+    ``doc_remaining`` the P-EAGLE forward does not accept (and the partitioned
+    path would run the target on a packed row without per-document masking,
+    leaking across documents). P-EAGLE only safely supports a colocated live
+    target on non-packed sequences.
+    """
+    if backend != "colocated":
+        raise NotImplementedError(
+            f"parallel_drafting (P-EAGLE) only supports target_model_backend='colocated', got "
+            f"{backend!r}. The remote backend supplies precomputed draft-vocab supervision, which "
+            f"the P-EAGLE trainer (full-vocab target_logits) does not accept."
+        )
+    if cached_target_path is not None:
+        raise NotImplementedError(
+            "parallel_drafting (P-EAGLE) does not support the offline cached target "
+            "(cached_target_path); the cache stores precomputed draft-vocab supervision consumed "
+            "only by the EAGLE-3 TTT trainer."
+        )
+    if packed_sequence_size > 0:
+        raise NotImplementedError(
+            "parallel_drafting (P-EAGLE) does not support sequence packing (packed_sequence_size>0); "
+            "the P-EAGLE forward does not accept the per-document packing metadata "
+            "(position_ids/seq_lens/doc_remaining)."
+        )
+
+
 class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
     """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
 
@@ -168,6 +200,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # entirely and stream the cache instead. This is disk-heavy and largely
         # superseded by the online path -- see precompute_eagle3 for the warning.
         self.cached_target_path = recipe_cfg.get("cached_target_path", None)
+        # P-EAGLE (parallel_drafting) only safely supports a colocated live target
+        # on non-packed sequences; gate the unsupported combinations early, before
+        # loading the target -- see _validate_peagle_gates.
+        if bool(recipe_cfg.get("parallel_drafting", False)):
+            _validate_peagle_gates(
+                backend=recipe_cfg.get("target_model_backend", "colocated"),
+                cached_target_path=self.cached_target_path,
+                packed_sequence_size=int(recipe_cfg.get("packed_sequence_size", 0) or 0),
+            )
         self.dist_setup = None
         self.distributed_config = None
         self.device_mesh = None
