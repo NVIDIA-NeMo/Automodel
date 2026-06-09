@@ -116,7 +116,7 @@ def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> 
     by name, handling DTensor re-sharding for EP-parallel weights. This avoids
     DCP's set_model_state_dict() which raises KeyError on expert-parallel FQNs.
     """
-    from torch.distributed.tensor import DTensor, Replicate
+    from torch.distributed.tensor import DTensor, distribute_tensor
 
     # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
     # Without this, activation checkpointing causes key mismatches on reload.
@@ -135,10 +135,22 @@ def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> 
 
         if isinstance(param.data, DTensor):
             full_t = saved_tensor.to(param.data.to_local().device)
-            full_dt = DTensor.from_local(
-                full_t, device_mesh=param.data.device_mesh, placements=[Replicate()] * param.data.device_mesh.ndim
-            )
-            local_shard = full_dt.redistribute(placements=param.data.placements).to_local()
+            # Shard the full tensor directly onto the param's mesh/placements via
+            # distribute_tensor. We deliberately avoid the
+            # ``DTensor.from_local(..., Replicate).redistribute(param.placements)``
+            # round-trip: under FSDP2+TP a weight that TP shards on tensor-dim 0
+            # is wrapped by FSDP as ``(_StridedShard(0, split_factor=tp_size), Shard(0))``.
+            # That placement combination cannot be normalized into a ``shard_order``
+            # (PyTorch's DTensorSpec returns ``shard_order=None``), so the first
+            # cross-layout ``redistribute`` trips the ``assert shard_order is not None``
+            # in ``torch.distributed.tensor._redistribute._gen_transform_infos_non_cached``.
+            # ``distribute_tensor`` computes each rank's slice straight from the
+            # placements and never builds those transform infos, so it is robust to
+            # the missing shard_order metadata (custom-code archs at tp>1, e.g.
+            # NemotronFlash / DeciLM). See NVIDIA-NeMo/Automodel#2243.
+            local_shard = distribute_tensor(
+                full_t, device_mesh=param.data.device_mesh, placements=param.data.placements
+            ).to_local()
             param.data.to_local().copy_(local_shard)
         else:
             param.data.copy_(saved_tensor.to(param.data.device))
