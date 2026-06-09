@@ -45,6 +45,7 @@ from nemo_automodel.components.training.utils import (
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
+from nemo_automodel.recipes._dist_utils import parse_distributed_section
 from nemo_automodel.recipes._typed_config import RecipeConfig, _model_name_from_cfg
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.import_utils import safe_import_from
@@ -215,6 +216,76 @@ def _calculate_throughput_metrics(
         "log_window_seconds": elapsed_seconds,
         "log_window_steps": float(optimizer_steps),
         "log_window_samples": float(global_samples),
+    }
+
+
+def _build_diffusion_parallel_manager_args(
+    *,
+    fsdp_cfg: Optional[Dict[str, Any]],
+    ddp_cfg: Optional[Dict[str, Any]],
+    world_size: int,
+    dtype: torch.dtype,
+    compute_dtype: Optional[torch.dtype] = None,
+    lora_enabled: bool,
+) -> Dict[str, Any]:
+    """Build diffusion transformer manager args through the shared distributed parser."""
+    if compute_dtype is None:
+        compute_dtype = dtype
+
+    if fsdp_cfg is not None and ddp_cfg is not None:
+        raise ValueError(
+            "Cannot specify both 'fsdp' and 'ddp' configurations. "
+            "Please provide only one distributed training strategy."
+        )
+
+    if ddp_cfg is not None:
+        ddp_options = dict(ddp_cfg)
+        ddp_options.pop("backend", None)
+        parsed = parse_distributed_section({"strategy": "ddp", **ddp_options})
+        return {
+            "_manager_type": "ddp",
+            "world_size": world_size,
+            **parsed["strategy_config"].to_dict(),
+            "activation_checkpointing": parsed["activation_checkpointing"],
+        }
+
+    fsdp_options = dict(fsdp_cfg or {})
+    ignored_options = {"use_hf_tp_plan": fsdp_options.pop("use_hf_tp_plan", False)}
+    fsdp_options.pop("backend", None)
+    cpu_offload = bool(fsdp_options.pop("cpu_offload", False))
+    reduce_dtype = dtype_from_str(fsdp_options.pop("reduce_dtype", None), default=torch.float32)
+
+    param_dtype = None if lora_enabled else compute_dtype
+    parsed = parse_distributed_section(
+        {
+            "strategy": "fsdp2",
+            "activation_checkpointing": True,
+            "defer_fsdp_grad_sync": True,
+            "enable_fsdp2_prefetch": True,
+            **fsdp_options,
+            "mp_policy": MixedPrecisionPolicy(
+                param_dtype=param_dtype,
+                reduce_dtype=reduce_dtype,
+                output_dtype=compute_dtype,
+            ),
+            # CPU offload: sharded params + optimizer state live on host RAM and are
+            # paged to GPU per-block during forward/backward (saves GPU memory, adds H2D).
+            "offload_policy": CPUOffloadPolicy(pin_memory=True) if cpu_offload else None,
+        }
+    )
+
+    return {
+        "_manager_type": "fsdp2",
+        "world_size": world_size,
+        "dp_size": parsed["dp_size"],
+        "dp_replicate_size": parsed["dp_replicate_size"],
+        "tp_size": parsed["tp_size"],
+        "cp_size": parsed["cp_size"],
+        "pp_size": parsed["pp_size"],
+        "ep_size": parsed["ep_size"],
+        **parsed["strategy_config"].to_dict(),
+        "activation_checkpointing": parsed["activation_checkpointing"],
+        **ignored_options,
     }
 
 
@@ -405,13 +476,6 @@ def build_model_and_optimizer(
         ValueError: If both fsdp_cfg and ddp_cfg are provided.
         ValueError: If finetune_mode is False and pipeline_spec is not provided.
     """
-    # Validate mutually exclusive configs
-    if fsdp_cfg is not None and ddp_cfg is not None:
-        raise ValueError(
-            "Cannot specify both 'fsdp' and 'ddp' configurations. "
-            "Please provide only one distributed training strategy."
-        )
-
     logging.info("[INFO] Building NeMoAutoDiffusionPipeline with transformer parallel scheme...")
 
     if not dist.is_initialized():
@@ -424,73 +488,18 @@ def build_model_and_optimizer(
     lora_enabled = peft_cfg is not None
     _validate_precision_configuration(dtype, compute_dtype, ddp_cfg=ddp_cfg, peft_cfg=peft_cfg)
 
-    # param_dtype=None when LoRA: FSDP2 does not cast any parameter.
-    # In full training, FSDP2 casts gathered params to compute_dtype while
-    # the model can still be initialized in a different storage dtype.
-    param_dtype = None if lora_enabled else compute_dtype
-
-    # Build manager args based on which config is provided
     if ddp_cfg is not None:
-        # DDP configuration
         logging.info("[INFO] Using DDP (DistributedDataParallel) for training")
-        manager_args: Dict[str, Any] = {
-            "_manager_type": "ddp",
-            "backend": ddp_cfg.get("backend", "nccl"),
-            "world_size": world_size,
-            "activation_checkpointing": ddp_cfg.get("activation_checkpointing", False),
-            "find_unused_parameters": ddp_cfg.get("find_unused_parameters", False),
-        }
     else:
-        # FSDP configuration (default)
-        fsdp_cfg = fsdp_cfg or {}
         logging.info("[INFO] Using FSDP2 (Fully Sharded Data Parallel) for training")
-
-        dp_size = fsdp_cfg.get("dp_size")
-        tp_size = fsdp_cfg.get("tp_size", 1)
-        cp_size = fsdp_cfg.get("cp_size", 1)
-        pp_size = fsdp_cfg.get("pp_size", 1)
-
-        if dp_size is None:
-            denom = tp_size * cp_size * pp_size
-            if world_size % denom != 0:
-                raise ValueError(
-                    f"world_size ({world_size}) must be divisible by "
-                    f"tp_size*cp_size*pp_size ({tp_size}*{cp_size}*{pp_size}={denom})"
-                )
-            dp_size = world_size // denom
-
-        reduce_dtype = dtype_from_str(fsdp_cfg.get("reduce_dtype", None), default=torch.float32)
-
-        manager_args: Dict[str, Any] = {
-            "_manager_type": "fsdp2",
-            "dp_size": dp_size,
-            "dp_replicate_size": fsdp_cfg.get("dp_replicate_size", None),
-            "tp_size": tp_size,
-            "cp_size": cp_size,
-            "pp_size": pp_size,
-            "backend": "nccl",
-            "world_size": world_size,
-            "use_hf_tp_plan": fsdp_cfg.get("use_hf_tp_plan", False),
-            "sequence_parallel": fsdp_cfg.get("sequence_parallel", False),
-            "tp_plan": fsdp_cfg.get("tp_plan", None),
-            "patch_is_packed_sequence": fsdp_cfg.get("patch_is_packed_sequence", False),
-            "activation_checkpointing": fsdp_cfg.get("activation_checkpointing", True),
-            "defer_fsdp_grad_sync": fsdp_cfg.get("defer_fsdp_grad_sync", True),
-            "enable_async_tensor_parallel": fsdp_cfg.get("enable_async_tensor_parallel", False),
-            "enable_compile": fsdp_cfg.get("enable_compile", False),
-            "enable_fsdp2_prefetch": fsdp_cfg.get("enable_fsdp2_prefetch", True),
-            "fsdp2_backward_prefetch_depth": fsdp_cfg.get("fsdp2_backward_prefetch_depth", 2),
-            "fsdp2_forward_prefetch_depth": fsdp_cfg.get("fsdp2_forward_prefetch_depth", 1),
-            "mp_policy": MixedPrecisionPolicy(
-                param_dtype=param_dtype,
-                reduce_dtype=reduce_dtype,
-                output_dtype=compute_dtype,
-            ),
-            # CPU offload: when enabled, sharded params + optimizer state live on
-            # host RAM and are paged to GPU per-block during forward/backward.
-            # Saves ~21 GB per H100 for a 14B AdamW finetune; adds H2D traffic.
-            "offload_policy": CPUOffloadPolicy(pin_memory=True) if cpu_offload else None,
-        }
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=fsdp_cfg,
+        ddp_cfg=ddp_cfg,
+        world_size=world_size,
+        dtype=dtype,
+        compute_dtype=compute_dtype,
+        lora_enabled=lora_enabled,
+    )
 
     parallel_scheme = {"transformer": manager_args}
 

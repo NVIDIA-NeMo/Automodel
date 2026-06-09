@@ -19,6 +19,9 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 import torch
 
+from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
+from nemo_automodel.components.distributed.mesh import ParallelismSizes
+
 # Check if diffusers can be imported properly (may fail due to peft/transformers incompatibility)
 try:
     DIFFUSERS_AVAILABLE = True
@@ -363,84 +366,103 @@ def test_pipeline_spec_validate_for_from_config_passes_with_cls():
 def test_create_parallel_manager_fsdp2_default():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
+    mock_config = Mock()
     mock_mesh = Mock()
     mock_moe_mesh = Mock()
+    mock_setup = SimpleNamespace(
+        strategy_config=mock_config,
+        mesh_context=SimpleNamespace(device_mesh=mock_mesh, moe_mesh=mock_moe_mesh),
+    )
     with (
         patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
-        patch(f"{MODULE_PATH}.FSDP2Config") as MockConfig,
-        patch(f"{MODULE_PATH}.create_device_mesh", return_value=(mock_mesh, mock_moe_mesh)),
+        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup,
     ):
         MockFSDP2.return_value = Mock()
         manager = _create_parallel_manager({"world_size": 1})
 
-    MockConfig.assert_called_once()
-    MockFSDP2.assert_called_once_with(MockConfig.return_value, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
+    MockBuildSetup.assert_called_once()
+    assert MockBuildSetup.call_args.kwargs["world_size"] == 1
+    MockFSDP2.assert_called_once_with(mock_config, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
     assert manager is MockFSDP2.return_value
 
 
 def test_create_parallel_manager_ddp():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
+    mock_config = Mock()
+    mock_setup = SimpleNamespace(strategy_config=mock_config)
     with (
         patch(f"{MODULE_PATH}.DDPManager") as MockDDP,
-        patch(f"{MODULE_PATH}.DDPConfig") as MockConfig,
+        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup,
     ):
         MockDDP.return_value = Mock()
         manager = _create_parallel_manager({"_manager_type": "ddp", "some_arg": "value"})
 
-    MockConfig.assert_called_once_with(
-        activation_checkpointing=False,
-        backend="nccl",
-        find_unused_parameters=False,
-    )
-    MockDDP.assert_called_once_with(MockConfig.return_value)
+    MockBuildSetup.assert_called_once()
+    build_kwargs = MockBuildSetup.call_args.kwargs
+    assert isinstance(build_kwargs["strategy"], DDPConfig)
+    assert build_kwargs["parallelism_sizes"] == ParallelismSizes()
+    assert build_kwargs["world_size"] is None
+    assert build_kwargs["activation_checkpointing"] is False
+    assert not hasattr(build_kwargs["strategy"], "backend")
+    assert build_kwargs["strategy"].find_unused_parameters is False
+    MockDDP.assert_called_once_with(mock_config)
     assert manager is MockDDP.return_value
 
 
 def test_create_parallel_manager_ddp_passes_find_unused_parameters():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
+    mock_config = Mock()
+    mock_setup = SimpleNamespace(strategy_config=mock_config)
     with (
         patch(f"{MODULE_PATH}.DDPManager") as MockDDP,
-        patch(f"{MODULE_PATH}.DDPConfig") as MockConfig,
+        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup,
     ):
         MockDDP.return_value = Mock()
         manager = _create_parallel_manager({"_manager_type": "ddp", "find_unused_parameters": True})
 
-    MockConfig.assert_called_once_with(
-        activation_checkpointing=False,
-        backend="nccl",
-        find_unused_parameters=True,
-    )
-    MockDDP.assert_called_once_with(MockConfig.return_value)
+    MockBuildSetup.assert_called_once()
+    build_kwargs = MockBuildSetup.call_args.kwargs
+    assert isinstance(build_kwargs["strategy"], DDPConfig)
+    assert build_kwargs["strategy"].find_unused_parameters is True
+    MockDDP.assert_called_once_with(mock_config)
     assert manager is MockDDP.return_value
 
 
 def test_create_parallel_manager_explicit_fsdp2():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
+    mock_config = Mock()
     mock_mesh = Mock()
     mock_moe_mesh = Mock()
+    mock_setup = SimpleNamespace(
+        strategy_config=mock_config,
+        mesh_context=SimpleNamespace(device_mesh=mock_mesh, moe_mesh=mock_moe_mesh),
+    )
     with (
         patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
-        patch(f"{MODULE_PATH}.FSDP2Config") as MockConfig,
-        patch(f"{MODULE_PATH}.create_device_mesh", return_value=(mock_mesh, mock_moe_mesh)),
+        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup),
     ):
         MockFSDP2.return_value = Mock()
         _create_parallel_manager({"_manager_type": "fsdp2", "world_size": 1})
 
-    MockFSDP2.assert_called_once_with(MockConfig.return_value, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
+    MockFSDP2.assert_called_once_with(mock_config, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
 
 
 def test_create_parallel_manager_fsdp2_passes_perf_options():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
+    mock_config = Mock()
     mock_mesh = Mock()
     mock_moe_mesh = Mock()
+    mock_setup = SimpleNamespace(
+        strategy_config=mock_config,
+        mesh_context=SimpleNamespace(device_mesh=mock_mesh, moe_mesh=mock_moe_mesh),
+    )
     with (
         patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
-        patch(f"{MODULE_PATH}.FSDP2Config") as MockConfig,
-        patch(f"{MODULE_PATH}.create_device_mesh", return_value=(mock_mesh, mock_moe_mesh)),
+        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup,
     ):
         MockFSDP2.return_value = Mock()
         _create_parallel_manager(
@@ -459,16 +481,17 @@ def test_create_parallel_manager_fsdp2_passes_perf_options():
             }
         )
 
-    config_kwargs = MockConfig.call_args.kwargs
-    assert config_kwargs["sequence_parallel"] is True
-    assert config_kwargs["tp_plan"] == {"layer": "colwise"}
-    assert config_kwargs["patch_is_packed_sequence"] is True
-    assert config_kwargs["defer_fsdp_grad_sync"] is False
-    assert config_kwargs["enable_async_tensor_parallel"] is True
-    assert config_kwargs["enable_compile"] is True
-    assert config_kwargs["enable_fsdp2_prefetch"] is True
-    assert config_kwargs["fsdp2_backward_prefetch_depth"] == 4
-    assert config_kwargs["fsdp2_forward_prefetch_depth"] == 3
+    strategy_config = MockBuildSetup.call_args.kwargs["strategy"]
+    assert isinstance(strategy_config, FSDP2Config)
+    assert strategy_config.sequence_parallel is True
+    assert strategy_config.tp_plan == {"layer": "colwise"}
+    assert strategy_config.patch_is_packed_sequence is True
+    assert strategy_config.defer_fsdp_grad_sync is False
+    assert strategy_config.enable_async_tensor_parallel is True
+    assert strategy_config.enable_compile is True
+    assert strategy_config.enable_fsdp2_prefetch is True
+    assert strategy_config.fsdp2_backward_prefetch_depth == 4
+    assert strategy_config.fsdp2_forward_prefetch_depth == 3
 
 
 def test_create_parallel_manager_unknown_type_raises():
@@ -476,6 +499,13 @@ def test_create_parallel_manager_unknown_type_raises():
 
     with pytest.raises(ValueError, match="Unknown manager type"):
         _create_parallel_manager({"_manager_type": "unknown"})
+
+
+def test_create_parallel_manager_rejects_backend_option():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
+
+    with pytest.raises(ValueError, match="backend is not a parallel manager option"):
+        _create_parallel_manager({"_manager_type": "ddp", "backend": "gloo"})
 
 
 def test_create_parallel_manager_does_not_mutate_input():
@@ -892,7 +922,7 @@ def test_from_config_full_pipeline_mode():
 def test_import_diffusers_class_success():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _import_diffusers_class
 
-    with patch("diffusers.SomeClass", create=True, new="sentinel"):
+    with patch.dict("sys.modules", {"diffusers": SimpleNamespace(SomeClass="sentinel")}):
         result = _import_diffusers_class("SomeClass")
     assert result == "sentinel"
 
@@ -900,7 +930,10 @@ def test_import_diffusers_class_success():
 def test_import_diffusers_class_missing_raises():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _import_diffusers_class
 
-    with pytest.raises(ImportError, match="not found in diffusers"):
+    with (
+        patch.dict("sys.modules", {"diffusers": SimpleNamespace()}),
+        pytest.raises(ImportError, match="not found in diffusers"),
+    ):
         _import_diffusers_class("NonExistentClassName12345")
 
 
