@@ -199,13 +199,15 @@ def build_eagle3_dataloader(
         )
     sampler = None
     if distributed:
-        if dp_mesh is not None and dp_mesh.size() > 1:
-            # Context parallel: key on the dp sub-axis so the cp_size ranks in a dp
-            # group pull the same sample (CP shards its sequence across them);
-            # keying on the global rank would give each cp rank a different one.
+        if dp_mesh is not None:
+            # Context parallel: key on the dp sub-axis so the cp ranks in a dp
+            # group pull the SAME sample (CP shards its sequence across them).
+            # dp_size may be 1 (cp == world), which must still map to
+            # num_replicas=1 -- all data to the single dp group -- NOT the
+            # full-world sampler that would split data across the cp ranks.
             num_replicas, rank = dp_mesh.size(), dp_mesh.get_local_rank()
         else:
-            # Pure DP: default full-world sampler (num_replicas/rank from the PG).
+            # Pure DP without an explicit mesh: default full-world sampler.
             num_replicas, rank = None, None
         sampler = DistributedSampler(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle)
 

@@ -84,3 +84,15 @@ def test_dp_mesh_sampler_keys_on_dp_axis(monkeypatch):
     # Keyed on the dp sub-axis, not the global world.
     assert dl.sampler.num_replicas == 2
     assert dl.sampler.rank == 1
+
+
+def test_dp_mesh_size_one_uses_single_replica(monkeypatch):
+    """dp_size==1 (cp == world) must map to num_replicas=1 -- all data to the one
+    dp group -- not the full-world sampler that would split data across cp ranks."""
+    _patch_dataset(monkeypatch, n=8)
+    monkeypatch.setattr(eagle3.torch.cuda, "is_available", lambda: False)
+    dp_mesh = SimpleNamespace(size=lambda: 1, get_local_rank=lambda: 0)
+    dl = _build(distributed=True, dp_mesh=dp_mesh)
+    assert isinstance(dl.sampler, eagle3.DistributedSampler)
+    assert dl.sampler.num_replicas == 1
+    assert dl.sampler.rank == 0
