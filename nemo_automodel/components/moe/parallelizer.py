@@ -40,6 +40,18 @@ logger = logging.getLogger(__name__)
 _CP_STREAM = None
 
 
+def _moe_shard_placement(param):
+    """FSDP shard placement for grouped-expert params.
+
+    Shard on dim=1 for the (>=2D) expert weights since there may be more shards than
+    experts (dim=0). A 1D param (e.g. the per-expert bias of the experts="te"
+    GroupedLinear path, shape [out_features]) has no dim 1, so shard it on dim 0
+    instead. FSDP all-gathers before use, so the shard dim is a storage detail and does
+    not change compute.
+    """
+    return Shard(0) if param.ndim < 2 else Shard(1)
+
+
 def _is_selective_ac(activation_checkpointing: object) -> bool:
     """Return True when the AC mode requests selective checkpointing.
 
@@ -328,7 +340,7 @@ def apply_fsdp(
             fully_shard(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
-                shard_placement_fn=lambda _: Shard(1),
+                shard_placement_fn=_moe_shard_placement,
                 reshard_after_forward=reshard_after_forward,
                 mp_policy=mp_policy,
             )

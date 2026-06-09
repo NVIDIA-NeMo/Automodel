@@ -215,6 +215,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             self.target_wrapper.get_input_embeddings() if self.target_wrapper is not None else self._cached_embed_source
         )
         self.draft_model.copy_embeddings_from_target(embed_source)
+        # Embed the draft->target vocab map (d2t/t2d) into the draft so a
+        # compressed-vocab checkpoint carries the remap tables vLLM/SGLang need.
+        # No-op when the vocab is not compressed. See set_vocab_mapping.
+        self.draft_model.set_vocab_mapping(selected_token_ids)
         # EAGLE-3 TTT freezes the draft embeddings by default; P-EAGLE trains them
         # (speculators sets ``embed_requires_grad=True`` for parallel drafting).
         # Either default can still be overridden via ``recipe_args.freeze_embeddings``.

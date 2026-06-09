@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
@@ -257,6 +258,17 @@ class DeepseekV3Model(nn.Module):
 
 class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        # CP demonstrated on the Moonlight-16B-A3B convergence run
+        # (examples/convergence/tulu3/models/moonlight-16b/moonlight_16b_ep8_cp2_flashoptim.yaml).
+        supports_cp: bool = True
+        supports_pp: bool = True
+        supports_ep: bool = True
 
     @classmethod
     def from_config(

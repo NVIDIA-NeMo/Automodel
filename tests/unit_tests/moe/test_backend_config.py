@@ -332,3 +332,77 @@ class TestMoEConfig:
         """``swiglu_limit`` accepts positive floats for the DSV4 clamped variant."""
         config = MoEConfig(**base_moe_config_kwargs, swiglu_limit=limit)
         assert config.swiglu_limit == limit
+
+
+class TestBackendConfigMXFP8:
+    """MXFP8 backend wiring: the torch_mm_mxfp8 experts option + use_mxfp8 derivation."""
+
+    def test_experts_accepts_torch_mm_mxfp8(self):
+        """BackendConfig.experts accepts the torch_mm_mxfp8 value (dispatcher torch -> kept)."""
+        config = BackendConfig(experts="torch_mm_mxfp8", dispatcher="torch")
+        assert config.experts == "torch_mm_mxfp8"
+
+    def test_use_mxfp8_true_only_for_torch_mm_mxfp8(self):
+        """The use_mxfp8 predicate (as derived in experts.py) is True only for torch_mm_mxfp8."""
+
+        def _use_mxfp8(experts):
+            return experts == "torch_mm_mxfp8"
+
+        assert _use_mxfp8("torch_mm_mxfp8") is True
+        for other in ("torch", "torch_mm", "gmm", "te"):
+            assert _use_mxfp8(other) is False
+
+    def test_use_torch_mm_includes_both_torch_mm_variants(self):
+        """use_torch_mm (experts.py) covers both torch_mm and torch_mm_mxfp8."""
+
+        def _use_torch_mm(experts):
+            return experts in ("torch_mm", "torch_mm_mxfp8")
+
+        assert _use_torch_mm("torch_mm") is True
+        assert _use_torch_mm("torch_mm_mxfp8") is True
+        assert _use_torch_mm("gmm") is False
+
+
+class TestTEFp8ConfigRecipe:
+    """TEFp8Config.build_recipe recipe-string mapping (the 'mxfp8' shorthand)."""
+
+    def test_recipe_field_accepts_mxfp8(self):
+        from nemo_automodel.components.models.common.utils import TEFp8Config
+
+        cfg = TEFp8Config(recipe="mxfp8")
+        assert cfg.recipe == "mxfp8"
+
+    def test_build_recipe_mxfp8_maps_to_mxfp8blockscaling(self):
+        """recipe='mxfp8' -> a TE MXFP8BlockScaling instance (when TE is importable)."""
+        from nemo_automodel.components.models.common.utils import HAVE_TE, TEFp8Config
+
+        if not HAVE_TE:
+            pytest.skip("transformer_engine not importable")
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        recipe = TEFp8Config(recipe="mxfp8").build_recipe()
+        assert isinstance(recipe, MXFP8BlockScaling)
+
+    def test_build_recipe_prebuilt_object_passthrough(self):
+        """A pre-built recipe object is returned unchanged (when TE is importable)."""
+        from nemo_automodel.components.models.common.utils import HAVE_TE, TEFp8Config
+
+        if not HAVE_TE:
+            pytest.skip("transformer_engine not importable")
+        sentinel = object()
+        assert TEFp8Config(recipe=sentinel).build_recipe() is sentinel
+
+
+class TestBackendConfigCompileAttn:
+    """BackendConfig.compile_attn fullgraph-compile flag (drives both MLA and GQA attention)."""
+
+    def test_compile_attn_default_false(self):
+        assert BackendConfig().compile_attn is False
+
+    def test_compile_attn_explicit_true(self):
+        assert BackendConfig(compile_attn=True).compile_attn is True
+
+    def test_compile_mla_removed(self):
+        # compile_mla was consolidated into the generic compile_attn flag.
+        with pytest.raises(TypeError):
+            BackendConfig(compile_mla=True)

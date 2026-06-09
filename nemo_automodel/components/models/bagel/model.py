@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -212,6 +213,15 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
     """
 
     config_class = BagelConfig
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     def __init__(self, config: BagelConfig) -> None:
         super().__init__()
