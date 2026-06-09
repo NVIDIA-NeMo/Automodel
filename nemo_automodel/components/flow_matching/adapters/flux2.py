@@ -23,7 +23,6 @@ Supports FLUX.2-dev with:
 - 4D positional IDs (T, H, W, L) instead of Flux1's 3D (batch, y, x)
 """
 
-import random
 from typing import Any, Dict
 
 import torch
@@ -121,9 +120,10 @@ class Flux2Adapter(ModelAdapter):
         # Text embeddings from Mistral3 [B, seq, 15360]
         text_embeddings = batch["text_embeddings"].to(device, dtype=dtype)
 
-        # CFG dropout: zero entire text condition with probability cfg_dropout_prob
-        if random.random() < context.cfg_dropout_prob:
-            text_embeddings = torch.zeros_like(text_embeddings)
+        # CFG dropout: independently zero each sample's text condition
+        if context.cfg_dropout_prob > 0.0:
+            mask = torch.rand(batch_size, 1, 1, device=device) < context.cfg_dropout_prob
+            text_embeddings = text_embeddings.masked_fill(mask, 0.0)
 
         seq_len = text_embeddings.shape[1]
 
