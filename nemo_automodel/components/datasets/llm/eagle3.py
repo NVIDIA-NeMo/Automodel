@@ -24,6 +24,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from tqdm.auto import tqdm
 
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
 
@@ -38,6 +39,106 @@ def _stack_batch(features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
     return batch
 
 
+def build_packed_eagle3_dataset(
+    source_dataset,
+    *,
+    packed_sequence_size: int,
+    pad_token_id: int,
+) -> list[dict[str, list[int]]]:
+    """Greedily pack variable-length chat samples into rows of ``packed_sequence_size``.
+
+    Each source sample is one *document*; documents are concatenated into a
+    fixed-width row with ``position_ids`` reset per document and trailing pad
+    folded into the final document (so ``seq_lens`` sums to the row width).
+
+    Cross-document leakage at TTT boundaries is handled by ``doc_remaining[t]``
+    (real tokens after slot ``t`` within its document): the trainer supervises
+    slot ``t`` at step ``k`` to predict ``k+1`` ahead, valid iff
+    ``k < doc_remaining[t]``. This masks every cross-document / into-padding
+    supervision -- packing creates many such boundaries per row.
+
+    Returns a list of packed-row dicts with keys ``input_ids``, ``loss_mask``,
+    ``attention_mask``, ``position_ids``, ``doc_remaining`` (length
+    ``packed_sequence_size``) and ``seq_lens`` (per-document padded lengths).
+    """
+    packs: list[dict[str, list[int]]] = []
+    cur_ids: list[int] = []
+    cur_loss: list[int] = []
+    cur_pos: list[int] = []
+    cur_remaining: list[int] = []
+    cur_seq_lens: list[int] = []
+
+    def _flush() -> None:
+        nonlocal cur_ids, cur_loss, cur_pos, cur_remaining, cur_seq_lens
+        if not cur_ids:
+            return
+        valid_len = len(cur_ids)
+        num_pad = packed_sequence_size - valid_len
+        ids = cur_ids + [pad_token_id] * num_pad
+        loss = cur_loss + [0] * num_pad
+        attn = [1] * valid_len + [0] * num_pad
+        remaining = cur_remaining + [0] * num_pad
+        # Fold trailing pad into the final document (continue its position ids).
+        last_pos = cur_pos[-1] if cur_pos else -1
+        pos = cur_pos + [min(last_pos + 1 + j, packed_sequence_size - 1) for j in range(num_pad)]
+        seq_lens = list(cur_seq_lens)
+        if num_pad > 0:
+            seq_lens[-1] += num_pad
+        packs.append(
+            {
+                "input_ids": ids,
+                "loss_mask": loss,
+                "attention_mask": attn,
+                "position_ids": pos,
+                "doc_remaining": remaining,
+                "seq_lens": seq_lens,
+            }
+        )
+        cur_ids, cur_loss, cur_pos, cur_remaining, cur_seq_lens = [], [], [], [], []
+
+    for sample in source_dataset:
+        ids = list(sample["input_ids"])
+        loss = [int(bool(m)) for m in sample["loss_mask"]]
+        length = len(ids)
+        if length == 0:
+            continue
+        if length > packed_sequence_size:
+            # Guard: the source dataset's truncation should already cap at the row width.
+            ids = ids[:packed_sequence_size]
+            loss = loss[:packed_sequence_size]
+            length = packed_sequence_size
+        if cur_ids and len(cur_ids) + length > packed_sequence_size:
+            _flush()
+        cur_ids += ids
+        cur_loss += loss
+        cur_pos += list(range(length))
+        # Real tokens remaining after each slot within this document.
+        cur_remaining += list(range(length - 1, -1, -1))
+        cur_seq_lens.append(length)
+    _flush()
+
+    if not packs:
+        raise ValueError(
+            f"No packs were produced from the source dataset for packed_sequence_size="
+            f"{packed_sequence_size}. The dataset may be empty."
+        )
+    return packs
+
+
+def _pack_collate(features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    """Collate packed rows; ragged ``seq_lens`` is 0-padded to ``[B, max_docs]``."""
+    batch = {}
+    for key in ("input_ids", "loss_mask", "attention_mask", "position_ids", "doc_remaining"):
+        batch[key] = torch.tensor([feature[key] for feature in features], dtype=torch.long)
+    max_docs = max(len(feature["seq_lens"]) for feature in features)
+    seq_lens = torch.zeros(len(features), max_docs, dtype=torch.long)
+    for i, feature in enumerate(features):
+        row = feature["seq_lens"]
+        seq_lens[i, : len(row)] = torch.tensor(row, dtype=torch.long)
+    batch["seq_lens"] = seq_lens
+    return batch
+
+
 def build_eagle3_dataloader(
     *,
     data_path: str,
@@ -49,19 +150,68 @@ def build_eagle3_dataloader(
     split: str | None = None,
     distributed: bool = False,
     shuffle_seed: int | None = 42,
+    mask_reasoning_content: bool = False,
+    packed_sequence_size: int = 0,
 ) -> DataLoader:
-    """Build a dataloader backed by the repo's chat formatting utilities."""
-    dataset = ChatDataset(
-        data_path,
-        tokenizer=tokenizer,
-        split=split,
-        seq_length=seq_length,
-        padding="max_length",
-        truncation=True,
-        shuffle_seed=shuffle_seed,
-        unshifted=True,
-    )
+    """Build a dataloader backed by the repo's chat formatting utilities.
+
+    ``packed_sequence_size > 0`` (EAGLE-3 only) enables sequence packing (see
+    :func:`build_packed_eagle3_dataset`), removing the padding waste of the
+    default ``padding="max_length"`` path; ``== 0`` keeps the original behavior.
+    """
+    collate_fn = _stack_batch
+    if packed_sequence_size > 0:
+        # Source samples are unpadded (one document each); packing pads the row.
+        source = ChatDataset(
+            data_path,
+            tokenizer=tokenizer,
+            split=split,
+            seq_length=packed_sequence_size,
+            padding="do_not_pad",
+            truncation=True,
+            shuffle_seed=shuffle_seed,
+            unshifted=True,
+            mask_reasoning_content=mask_reasoning_content,
+        )
+        dataset = build_packed_eagle3_dataset(
+            source,
+            packed_sequence_size=packed_sequence_size,
+            pad_token_id=source.pad_token_id,
+        )
+        collate_fn = _pack_collate
+    else:
+        dataset = ChatDataset(
+            data_path,
+            tokenizer=tokenizer,
+            split=split,
+            seq_length=seq_length,
+            padding="max_length",
+            truncation=True,
+            shuffle_seed=shuffle_seed,
+            unshifted=True,
+            mask_reasoning_content=mask_reasoning_content,
+        )
     sampler = DistributedSampler(dataset, shuffle=shuffle) if distributed else None
+
+    # The EAGLE recipes load the target model onto CUDA before iterating, so the
+    # CUDA context is already initialized by the time these workers spawn. Two
+    # defaults are unsafe in that state and must be overridden when
+    # ``num_workers > 0``:
+    #   * ``fork`` (the Linux default start method) hands each worker a copy of
+    #     the parent's live CUDA context, which is invalid in the child and
+    #     aborts the worker with ``cudaErrorInitializationError`` -> SIGABRT.
+    #     ``forkserver`` starts workers from a clean process with no inherited
+    #     CUDA context.
+    #   * Without ``persistent_workers`` the pool is torn down and re-forked at
+    #     every epoch boundary -- exactly when the abort surfaced (the first
+    #     epoch ran fine). Keeping workers alive across epochs removes that
+    #     re-fork entirely.
+    worker_kwargs: dict[str, Any] = {}
+    if num_workers > 0:
+        worker_kwargs["persistent_workers"] = True
+        if torch.cuda.is_available():
+            worker_kwargs["multiprocessing_context"] = "forkserver"
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -69,8 +219,9 @@ def build_eagle3_dataloader(
         shuffle=shuffle and sampler is None,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        collate_fn=_stack_batch,
+        collate_fn=collate_fn,
         drop_last=False,
+        **worker_kwargs,
     )
 
 
@@ -116,18 +267,41 @@ def build_eagle3_token_mapping(
         selected_token_mask = torch.ones(target_vocab_size, dtype=torch.bool)
         return selected_token_ids, selected_token_mask
 
+    distributed = dist.is_available() and dist.is_initialized()
+    is_rank0 = (not distributed) or dist.get_rank() == 0
+    try:
+        total_batches = len(dataloader)
+    except TypeError:
+        total_batches = None
+
     counts = torch.zeros(target_vocab_size, dtype=torch.long)
-    for batch in dataloader:
+    total_supervised_tokens = 0
+    # Drive the progress bar manually and iterate ``dataloader`` directly: wrapping
+    # the loader in ``tqdm(dataloader)`` triggers a second ``__iter__`` on loaders
+    # without ``__len__``, which would double-scan a single-pass / streaming loader.
+    progress = tqdm(
+        total=total_batches,
+        desc=f"Counting supervised tokens for draft vocab ({draft_vocab_size})",
+        unit="batch",
+        disable=not is_rank0,
+        leave=True,
+    )
+    for step, batch in enumerate(dataloader):
         input_ids = batch["input_ids"]
         loss_mask = batch["loss_mask"].bool()
         supervised_ids = input_ids[loss_mask].to(torch.long).flatten()
+        progress.update(1)
         if supervised_ids.numel() == 0:
             continue
         in_range = (supervised_ids >= 0) & (supervised_ids < target_vocab_size)
         supervised_ids = supervised_ids[in_range]
+        total_supervised_tokens += supervised_ids.numel()
+        if is_rank0 and step % 100 == 0:
+            progress.set_postfix(tokens=total_supervised_tokens)
         counts.scatter_add_(0, supervised_ids, torch.ones_like(supervised_ids))
+    progress.close()
 
-    if dist.is_available() and dist.is_initialized():
+    if distributed:
         # NCCL collectives require CUDA tensors; move counts onto the current
         # device for the reduction and bring it back to CPU for the Python-side
         # selection logic below.
@@ -137,6 +311,15 @@ def build_eagle3_token_mapping(
             counts = counts_for_reduce.cpu()
         else:
             dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+
+    total_frequency = int(counts.sum().item())
+    unique_tokens = int((counts > 0).sum().item())
+    if is_rank0:
+        logger.info(
+            "Counted %d supervised tokens across %d unique target tokens",
+            total_frequency,
+            unique_tokens,
+        )
 
     selected: list[int] = []
     seen: set[int] = set()
@@ -165,6 +348,10 @@ def build_eagle3_token_mapping(
     selected_token_ids = torch.tensor(selected[:draft_vocab_size], dtype=torch.long)
     selected_token_mask = torch.zeros(target_vocab_size, dtype=torch.bool)
     selected_token_mask[selected_token_ids] = True
+    if is_rank0:
+        selected_frequency = int(counts[selected_token_ids].sum().item())
+        ratio = selected_frequency / total_frequency if total_frequency > 0 else 0.0
+        logger.info("top %d token frequency ratio: %.2f%%", selected_token_ids.numel(), ratio * 100)
     return selected_token_ids, selected_token_mask
 
 

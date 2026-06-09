@@ -38,6 +38,10 @@ model:
   pretrained_model_name_or_path: Qwen/Qwen3.6-27B
   attn_implementation: sdpa
   torch_dtype: bfloat16
+  text_config:
+    # Set to 0 to disable dense Qwen3.6 VLM MTP.
+    mtp_num_hidden_layers: 1
+  mtp_loss_scaling_factor: 0.1
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained

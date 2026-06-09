@@ -16,6 +16,7 @@ configs:
   # SFT
   - gemma3/gemma3_vl_4b_cord_v2.yaml
   - gemma3n/gemma3n_vl_4b_medpix.yaml
+  - gemma4/gemma4_26b_a4b_moe.yaml
   - internvl/internvl_3_5_4b.yaml
   - kimi/kimi2vl_cordv2.yaml
   - mistral/ministral3_3b_medpix.yaml

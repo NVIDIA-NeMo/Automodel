@@ -167,12 +167,49 @@ class NemotronV3MTPSublayer(NemotronV3Block):
             self.final_layernorm.reset_parameters()
 
 
+_VALID_BLOCK_TYPES = frozenset(_PATTERN_SYMBOL_TO_BLOCK_TYPE.values())
+
+
+def _resolve_block_types_per_sublayer(config) -> list[str] | None:
+    """Resolve the per-depth MTP block-type list from either HF field.
+
+    Super-V3 ships ``mtp_hybrid_override_pattern`` (symbol-string form like
+    ``"*E"``). Newer NemotronH variants ship ``mtp_layers_block_type``
+    (list-of-strings form like ``["attention", "moe"]``). Either is
+    accepted.
+
+    Args:
+        config: HF NemotronH config.
+
+    Returns:
+        Parsed list of block-type names, or ``None`` when neither field is set.
+
+    Raises:
+        ValueError: If ``mtp_layers_block_type`` contains an unknown block type.
+    """
+    pattern = getattr(config, "mtp_hybrid_override_pattern", None)
+    if pattern:
+        return parse_mtp_layer_pattern(pattern)
+    block_types = getattr(config, "mtp_layers_block_type", None)
+    if block_types:
+        block_types = list(block_types)
+        for bt in block_types:
+            if bt not in _VALID_BLOCK_TYPES:
+                raise ValueError(
+                    f"Unknown MTP block type {bt!r} in mtp_layers_block_type; "
+                    f"valid types are {sorted(_VALID_BLOCK_TYPES)}"
+                )
+        return block_types
+    return None
+
+
 def build_nemotron_v3_mtp(
     config,
     mtp_config: MTPConfig,
     backend: BackendConfig,
     moe_config,
     dtype: torch.dtype,
+    block_types: list[str] | None = None,
 ) -> MTPModule:
     """Construct the NemotronV3 MTP block.
 
@@ -183,13 +220,26 @@ def build_nemotron_v3_mtp(
         moe_config: MoE configuration shared with the main backbone (required
             when the MTP pattern contains MoE sublayers).
         dtype: Target dtype for newly created linear modules.
+        block_types: Optional pre-parsed list of block-type names (one per
+            inner sublayer). When supplied, bypasses
+            :func:`parse_mtp_layer_pattern` on ``mtp_config.layer_pattern``.
+            Required when ``mtp_config.layer_pattern`` is a length-only
+            sentinel (e.g. produced from ``mtp_layers_block_type``).
 
     Returns:
         A configured :class:`MTPModule`. Caller should not invoke this when
         ``mtp_config.enabled`` is ``False``.
     """
     base_layer_idx = config.num_hidden_layers
-    block_types_per_sublayer = parse_mtp_layer_pattern(mtp_config.layer_pattern)
+    if block_types is None:
+        block_types_per_sublayer = parse_mtp_layer_pattern(mtp_config.layer_pattern)
+    else:
+        block_types_per_sublayer = list(block_types)
+    if len(block_types_per_sublayer) != mtp_config.pattern_length:
+        raise ValueError(
+            f"block_types length {len(block_types_per_sublayer)} does not match "
+            f"mtp_config.pattern_length {mtp_config.pattern_length}"
+        )
 
     def factory(*, global_idx, depth, sublayer_idx, block_type, has_fusion, has_final_norm):
         return NemotronV3MTPSublayer(
@@ -219,10 +269,15 @@ def build_mtp_config_from_hf(
 ) -> MTPConfig:
     """Construct an :class:`MTPConfig` from an HF NemotronH config.
 
-    Reads ``num_nextn_predict_layers`` and ``mtp_hybrid_override_pattern``
-    directly off the HF config object (both present on the released Super V3
-    ``config.json``). Returns a disabled config (``num_layers=0``) when MTP
-    is not configured.
+    Reads ``num_nextn_predict_layers`` and resolves the per-depth pattern from
+    either ``mtp_hybrid_override_pattern`` (Super-V3 symbol-string form) or
+    ``mtp_layers_block_type`` (list-of-strings form). Returns a disabled
+    config (``num_layers=0``) when MTP is not configured.
+
+    When the pattern source is the list form, :attr:`MTPConfig.layer_pattern`
+    is set to a length-matching sentinel string of ``"X"`` characters — the
+    actual block-type names are carried separately into
+    :func:`build_nemotron_v3_mtp` via its ``block_types`` kwarg.
 
     Args:
         config: HF NemotronH config.
@@ -245,7 +300,14 @@ def build_mtp_config_from_hf(
         num_layers = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
     else:
         num_layers = int(num_nextn_predict_layers)
-    pattern = getattr(config, "mtp_hybrid_override_pattern", "") or ""
+
+    pattern = getattr(config, "mtp_hybrid_override_pattern", None) or ""
+    if not pattern:
+        block_types = getattr(config, "mtp_layers_block_type", None)
+        if block_types:
+            # Length-only sentinel; real block-type list flows through
+            # build_nemotron_v3_mtp's block_types kwarg.
+            pattern = "X" * len(list(block_types))
     return MTPConfig(
         num_layers=num_layers,
         layer_pattern=pattern,

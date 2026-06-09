@@ -51,6 +51,7 @@ class DDPManager:
         # Extract config fields for easy access
         self.activation_checkpointing = config.activation_checkpointing
         self.backend = config.backend
+        self.find_unused_parameters = config.find_unused_parameters
 
         # Setup distributed environment
         self._setup_distributed()
@@ -123,4 +124,8 @@ class DDPManager:
                 if hasattr(layer, "post_attention_layernorm"):
                     layers[i].post_attention_layernorm = checkpoint_wrapper(layers[i].post_attention_layernorm)
 
-        return DDP(model.to(self.device), device_ids=[self.device] if self.device.type == "cuda" else None)
+        return DDP(
+            model.to(self.device),
+            device_ids=[self.device] if self.device.type == "cuda" else None,
+            find_unused_parameters=self.find_unused_parameters,
+        )
