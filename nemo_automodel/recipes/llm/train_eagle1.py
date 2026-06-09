@@ -33,7 +33,6 @@ from transformers import AutoConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import (
-    Checkpointer,
     CheckpointingConfig,
     save_config,
 )
@@ -47,7 +46,7 @@ from nemo_automodel.components.speculative.eagle.registry import resolve_eagle1_
 from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
@@ -156,16 +155,12 @@ class TrainEagle1Recipe(BaseRecipe):
         self.device_mesh = None
         self.moe_mesh = None
         if self.cfg.get("distributed", None) is not None:
-            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+            self.dist_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
             self.distributed_config = self.dist_setup.strategy_config
-            self.device_mesh = self.dist_setup.device_mesh
-            self.moe_mesh = self.dist_setup.moe_mesh
+            self.device_mesh = self.dist_setup.mesh_context.device_mesh
+            self.moe_mesh = self.dist_setup.mesh_context.moe_mesh
             target_kwargs.update(
-                distributed_config=self.distributed_config,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                moe_config=self.dist_setup.moe_config,
-                activation_checkpointing=self.dist_setup.activation_checkpointing,
+                distributed_setup=self.dist_setup,
             )
         self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         if self.dist_setup is None:
@@ -186,6 +181,7 @@ class TrainEagle1Recipe(BaseRecipe):
             split=recipe_cfg.get("train_split", None),
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
         )
         self.val_dataloader = None
         if recipe_cfg.get("val_data_path", None):
@@ -199,6 +195,7 @@ class TrainEagle1Recipe(BaseRecipe):
                 split=recipe_cfg.get("val_split", None),
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+                mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
             )
 
         draft_config = target_config.to_dict()
@@ -335,8 +332,7 @@ class TrainEagle1Recipe(BaseRecipe):
 
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
         dp_rank = dist.get_rank() if dist.is_initialized() else 0
-        self.checkpointer = Checkpointer(
-            config=self.checkpoint_config,
+        self.checkpointer = self.checkpoint_config.build(
             dp_rank=dp_rank,
             tp_rank=0,
             pp_rank=0,

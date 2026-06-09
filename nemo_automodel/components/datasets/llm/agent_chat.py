@@ -92,6 +92,18 @@ def _json_load_if_str(value: Any) -> Any:
     return value
 
 
+def _reasoning_content(turn: Dict[str, Any]) -> Optional[str]:
+    """Return a turn's reasoning/thinking trace as a string, or ``None`` if absent.
+
+    Shared by every conversion path so the ``reasoning_content`` field is read
+    and coerced identically (a falsy/empty trace is treated as absent).
+    """
+    reasoning = turn.get("reasoning_content")
+    if not reasoning:
+        return None
+    return reasoning if isinstance(reasoning, str) else str(reasoning)
+
+
 def _sharegpt_to_chatml(conversations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert ShareGPT ``{from, value}`` turns to chatml ``{role, content}``."""
     out: List[Dict[str, Any]] = []
@@ -102,8 +114,9 @@ def _sharegpt_to_chatml(conversations: List[Dict[str, Any]]) -> List[Dict[str, A
         chatml_turn = {"role": _SHAREGPT_ROLE_MAP[src_role], "content": turn.get("value", "")}
         # Carry an explicit reasoning/thinking field through if the export
         # stores it alongside the turn (e.g. ``reasoning_content``).
-        if turn.get("reasoning_content"):
-            chatml_turn["reasoning_content"] = turn["reasoning_content"]
+        reasoning = _reasoning_content(turn)
+        if reasoning is not None:
+            chatml_turn["reasoning_content"] = reasoning
         out.append(chatml_turn)
     return out
 
@@ -202,9 +215,9 @@ def _convert_messages(
             # a warning by ``format_chat_template``). Carried through here so a
             # following tool_call group can merge onto this same turn.
             if role == "assistant":
-                reasoning = messages[i].get("reasoning_content")
-                if reasoning:
-                    msg["reasoning_content"] = reasoning if isinstance(reasoning, str) else str(reasoning)
+                reasoning = _reasoning_content(messages[i])
+                if reasoning is not None:
+                    msg["reasoning_content"] = reasoning
             out.append(msg)
             i += 1
 

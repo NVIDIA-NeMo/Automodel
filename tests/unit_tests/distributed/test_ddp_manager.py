@@ -25,13 +25,13 @@ def test_ddp_manager_forwards_ddp_constructor_flags(monkeypatch):
     monkeypatch.setattr(ddp_mod.dist, "is_initialized", lambda: True, raising=True)
     monkeypatch.setattr(ddp_mod.dist, "get_rank", lambda: 0, raising=True)
     monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda: 2, raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "get_backend", lambda: "gloo", raising=True)
 
     ddp_ctor = MagicMock(return_value="wrapped")
     monkeypatch.setattr(ddp_mod, "DDP", ddp_ctor, raising=True)
 
     manager = ddp_mod.DDPManager(
         DDPConfig(
-            backend="gloo",
             broadcast_buffers=True,
             find_unused_parameters=True,
             static_graph=True,

@@ -34,7 +34,6 @@ from transformers import AutoConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import (
-    Checkpointer,
     CheckpointingConfig,
     save_config,
 )
@@ -58,7 +57,7 @@ from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_
 from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
@@ -216,6 +215,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             self.target_wrapper.get_input_embeddings() if self.target_wrapper is not None else self._cached_embed_source
         )
         self.draft_model.copy_embeddings_from_target(embed_source)
+        # Embed the draft->target vocab map (d2t/t2d) into the draft so a
+        # compressed-vocab checkpoint carries the remap tables vLLM/SGLang need.
+        # No-op when the vocab is not compressed. See set_vocab_mapping.
+        self.draft_model.set_vocab_mapping(selected_token_ids)
         # EAGLE-3 TTT freezes the draft embeddings by default; P-EAGLE trains them
         # (speculators sets ``embed_requires_grad=True`` for parallel drafting).
         # Either default can still be overridden via ``recipe_args.freeze_embeddings``.
@@ -345,6 +348,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         #     precomputed supervision over HTTP + NCCL. No target weights are
         #     loaded here, which frees the training GPU's memory.
         backend = recipe_cfg.get("target_model_backend", "colocated")
+        # Sequence packing is colocated-only (the remote server does not yet honor
+        # per-document masking).
+        packed_sequence_size = recipe_cfg.get("packed_sequence_size", 0)
+        if packed_sequence_size > 0 and backend == "remote":
+            raise NotImplementedError(
+                "packed_sequence_size > 0 is only supported with the colocated target backend; "
+                "the remote backend does not yet propagate per-document masking."
+            )
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
         elif backend == "colocated":
@@ -362,6 +373,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             split=recipe_cfg.get("train_split", None),
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            packed_sequence_size=packed_sequence_size,
         )
         self.val_dataloader = None
         if recipe_cfg.get("val_data_path", None):
@@ -375,6 +388,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 split=recipe_cfg.get("val_split", None),
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+                mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                packed_sequence_size=packed_sequence_size,
             )
 
         special_token_ids = [
@@ -412,17 +427,18 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             torch_dtype=self.compute_dtype,
             force_hf=bool(recipe_cfg.get("target_force_hf", False)),
         )
+        # Optional target attention backend (default: HF auto-select). Pin to
+        # ``sdpa`` to dodge the Qwen3 FA2 ``s_aux=None`` crash in transformers.
+        target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
+        if target_attn_implementation is not None:
+            target_kwargs["attn_implementation"] = target_attn_implementation
         if self.cfg.get("distributed", None) is not None:
-            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+            self.dist_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
             self.distributed_config = self.dist_setup.strategy_config
-            self.device_mesh = self.dist_setup.device_mesh
-            self.moe_mesh = self.dist_setup.moe_mesh
+            self.device_mesh = self.dist_setup.mesh_context.device_mesh
+            self.moe_mesh = self.dist_setup.mesh_context.moe_mesh
             target_kwargs.update(
-                distributed_config=self.distributed_config,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                moe_config=self.dist_setup.moe_config,
-                activation_checkpointing=self.dist_setup.activation_checkpointing,
+                distributed_setup=self.dist_setup,
             )
         self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         # ``nn.Module.to`` is in-place; reassigning ``self.target_model`` would
@@ -535,6 +551,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if target_batch is not None:
             return self.trainer_module(**target_batch.to_trainer_inputs())
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        # Sequence-packing metadata (present only when packed_sequence_size > 0).
+        packing_kwargs = {}
+        if "seq_lens" in batch:
+            packing_kwargs = {
+                "position_ids": batch["position_ids"],
+                "seq_lens": batch["seq_lens"],
+                "doc_remaining": batch["doc_remaining"],
+            }
         if self.target_wrapper is None:
             # Offline cache: the supervision is already in the batch.
             batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -545,11 +569,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 aux_hidden_states=batch["aux_hidden_states"],
                 target_probs=batch["target_probs"],
                 position_mask=batch["position_mask"],
+                **packing_kwargs,
             )
         target_batch = self.target_wrapper.generate_batch(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             loss_mask=batch["loss_mask"],
+            **packing_kwargs,
         )
         return self.trainer_module(**target_batch.to_trainer_inputs())
 
@@ -615,8 +641,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
 
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
         dp_rank = dist.get_rank() if dist.is_initialized() else 0
-        self.checkpointer = Checkpointer(
-            config=self.checkpoint_config,
+        self.checkpointer = self.checkpoint_config.build(
             dp_rank=dp_rank,
             tp_rank=0,
             pp_rank=0,

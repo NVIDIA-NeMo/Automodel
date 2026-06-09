@@ -464,6 +464,91 @@ class TestFromHF:
 
         assert "model.language_model.layers.0.self_attn.q_proj.weight" in out
 
+    def test_maps_vlm_lm_head_to_outer_model(self, adapter):
+        lm_head = torch.randn(128, 64)
+        hf_state = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 64, 128),
+            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(4, 128, 64),
+            "model.lm_head.weight": lm_head,
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        assert "lm_head.weight" in out
+        assert "model.lm_head.weight" not in out
+        assert out["lm_head.weight"] is lm_head
+
+    def test_keeps_native_lm_head_outer_when_model_prefix_is_detected(self, adapter):
+        native_lm_head = torch.zeros(128, 64)
+        checkpoint_lm_head = torch.ones(128, 64)
+        hf_state = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 64, 128),
+            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(4, 128, 64),
+            "lm_head.weight": native_lm_head,
+            "model.lm_head.weight": checkpoint_lm_head,
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        assert "lm_head.weight" in out
+        assert "model.lm_head.weight" not in out
+        assert out["lm_head.weight"] is checkpoint_lm_head
+
+    def test_maps_mtp_fusion_keys_without_model_prefix(self, adapter):
+        tensor = torch.randn(64, 128)
+        hf_state = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 64, 128),
+            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(4, 128, 64),
+            "mtp.fc.weight": tensor,
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        assert "mtp.layers.0.eh_proj.weight" in out
+        assert "model.mtp.layers.0.eh_proj.weight" not in out
+        assert out["mtp.layers.0.eh_proj.weight"] is tensor
+
+    def test_converts_mtp_aggregated_experts(self, adapter):
+        gate_up = torch.randn(4, 32, 64)
+        down = torch.randn(4, 64, 32)
+
+        out = adapter.from_hf(
+            {
+                "mtp.layers.0.mlp.experts.gate_up_proj": gate_up,
+                "mtp.layers.0.mlp.experts.down_proj": down,
+            }
+        )
+
+        torch.testing.assert_close(
+            out["mtp.layers.0.mlp.experts.gate_and_up_projs"], gate_up.transpose(1, 2).to(adapter.dtype)
+        )
+        torch.testing.assert_close(out["mtp.layers.0.mlp.experts.down_projs"], down.transpose(1, 2).to(adapter.dtype))
+
+    def test_converts_mtp_split_experts(self, adapter):
+        hf_state = {}
+        expected_gate_up = []
+        expected_down = []
+        for expert_id in range(adapter.moe_config.n_routed_experts):
+            gate = torch.randn(32, 64)
+            up = torch.randn(32, 64)
+            down = torch.randn(64, 32)
+            hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.gate_proj.weight"] = gate
+            hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.up_proj.weight"] = up
+            hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.down_proj.weight"] = down
+            expected_gate_up.append(torch.cat((gate.transpose(0, 1), up.transpose(0, 1)), dim=1))
+            expected_down.append(down.transpose(0, 1))
+
+        out = adapter.from_hf(hf_state)
+
+        torch.testing.assert_close(
+            out["mtp.layers.0.mlp.experts.gate_and_up_projs"],
+            torch.stack(expected_gate_up, dim=0).to(adapter.dtype),
+        )
+        torch.testing.assert_close(
+            out["mtp.layers.0.mlp.experts.down_projs"],
+            torch.stack(expected_down, dim=0).to(adapter.dtype),
+        )
+
     def test_expert_parallel_sharding(self, adapter, monkeypatch):
         """When device_mesh is provided, from_hf should slice experts by rank."""
         gate_up = torch.randn(4, 32, 64)
@@ -569,6 +654,32 @@ class TestConvertSingleTensorToHf:
         assert len(result) == 1
         key, _ = result[0]
         assert key == "language_model.layers.0.mlp.experts.gate_up_proj"
+
+    def test_mtp_fusion_key_conversion(self, adapter):
+        tensor = torch.randn(64, 128)
+        result = adapter.convert_single_tensor_to_hf("mtp.layers.0.eh_proj.weight", tensor)
+
+        assert result == [("mtp.fc.weight", tensor)]
+
+    def test_mtp_expert_key_conversion(self, adapter):
+        tensor = torch.randn(4, 64, 128)
+        result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.gate_and_up_projs", tensor)
+
+        assert len(result) == 8
+        out = dict(result)
+        assert "mtp.layers.0.mlp.experts.0.gate_proj.weight" in out
+        assert "mtp.layers.0.mlp.experts.0.up_proj.weight" in out
+        torch.testing.assert_close(out["mtp.layers.0.mlp.experts.0.gate_proj.weight"], tensor[0, :, :64].T)
+        torch.testing.assert_close(out["mtp.layers.0.mlp.experts.0.up_proj.weight"], tensor[0, :, 64:].T)
+
+    def test_mtp_down_expert_key_conversion(self, adapter):
+        tensor = torch.randn(4, 64, 32)
+        result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.down_projs", tensor)
+
+        assert len(result) == 4
+        out = dict(result)
+        assert "mtp.layers.0.mlp.experts.0.down_proj.weight" in out
+        torch.testing.assert_close(out["mtp.layers.0.mlp.experts.0.down_proj.weight"], tensor[0].T)
 
 
 # ---------------------------------------------------------------------------

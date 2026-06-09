@@ -76,6 +76,7 @@ _DOC_ARCH_ALIASES = {
     "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeVLForConditionalGeneration",
     # Dense Qwen3.5 text/VL backbone; grouped with the VL variants on the
     # Qwen3.5-VL page.
+    "Qwen3_5ForCausalLM": "Qwen3.5",
     "Qwen3_5ForConditionalGeneration": "Qwen3.5",
     # HF split Seed-OSS into its own arch; the Seed page (``seed.md``) covers
     # both Seed-Coder and Seed-OSS under the "Seed-OSS" name.

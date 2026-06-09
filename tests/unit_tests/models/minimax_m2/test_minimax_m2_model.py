@@ -108,7 +108,7 @@ class TestRopeParametersFallback:
         """When config has no rope_parameters attr, MiniMaxM2Model should construct it."""
         cfg = MockMiniMaxM2ConfigNoRopeParams()
         assert not hasattr(cfg, "rope_parameters")
-        model = MiniMaxM2Model(cfg, backend)
+        MiniMaxM2Model(cfg, backend)
         assert hasattr(cfg, "rope_parameters")
         assert cfg.rope_parameters["rope_theta"] == 5000000.0
         assert cfg.rope_parameters["rope_type"] == "default"
@@ -118,7 +118,7 @@ class TestRopeParametersFallback:
         """When config.rope_parameters is explicitly None, it should be populated."""
         cfg = MockMiniMaxM2Config(rope_theta=500000.0)
         cfg.rope_parameters = None
-        model = MiniMaxM2Model(cfg, backend)
+        MiniMaxM2Model(cfg, backend)
         assert cfg.rope_parameters is not None
         assert cfg.rope_parameters["rope_theta"] == 500000.0
 
@@ -127,37 +127,57 @@ class TestRopeParametersFallback:
         custom_params = {"rope_theta": 42.0, "rope_type": "custom", "partial_rotary_factor": 0.25}
         cfg = MockMiniMaxM2Config()
         cfg.rope_parameters = custom_params
-        model = MiniMaxM2Model(cfg, backend)
+        MiniMaxM2Model(cfg, backend)
         assert cfg.rope_parameters is custom_params
 
     def test_partial_rotary_factor_computation(self, backend):
         """partial_rotary_factor should be rotary_dim / head_dim."""
         cfg = MockMiniMaxM2ConfigNoRopeParams(rotary_dim=4, head_dim=16)
-        model = MiniMaxM2Model(cfg, backend)
+        MiniMaxM2Model(cfg, backend)
         assert cfg.rope_parameters["partial_rotary_factor"] == pytest.approx(0.25)
 
     def test_defaults_when_rotary_dim_missing(self, backend):
         """When rotary_dim is absent, partial_rotary_factor should default to 1.0 (head_dim/head_dim)."""
         cfg = SimpleNamespace(
-            vocab_size=128, hidden_size=64, intermediate_size=32, num_hidden_layers=2,
-            num_attention_heads=4, num_key_value_heads=2, head_dim=16,
-            max_position_embeddings=256, rms_norm_eps=1e-6, rope_theta=10000.0,
-            num_local_experts=4, num_experts_per_tok=2, scoring_func="sigmoid",
-            use_qk_norm=True, torch_dtype="bfloat16",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=256,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            scoring_func="sigmoid",
+            use_qk_norm=True,
+            torch_dtype="bfloat16",
         )
-        model = MiniMaxM2Model(cfg, backend)
+        MiniMaxM2Model(cfg, backend)
         assert cfg.rope_parameters["partial_rotary_factor"] == pytest.approx(1.0)
 
     def test_defaults_when_rope_theta_missing(self, backend):
         """When rope_theta is absent, it should default to 5000000.0."""
         cfg = SimpleNamespace(
-            vocab_size=128, hidden_size=64, intermediate_size=32, num_hidden_layers=2,
-            num_attention_heads=4, num_key_value_heads=2, head_dim=16, rotary_dim=8,
-            max_position_embeddings=256, rms_norm_eps=1e-6,
-            num_local_experts=4, num_experts_per_tok=2, scoring_func="sigmoid",
-            use_qk_norm=True, torch_dtype="bfloat16",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            rotary_dim=8,
+            max_position_embeddings=256,
+            rms_norm_eps=1e-6,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            scoring_func="sigmoid",
+            use_qk_norm=True,
+            torch_dtype="bfloat16",
         )
-        model = MiniMaxM2Model(cfg, backend)
+        MiniMaxM2Model(cfg, backend)
         assert cfg.rope_parameters["rope_theta"] == 5000000.0
 
 
@@ -199,10 +219,30 @@ class TestMiniMaxM2ForCausalLM:
         model = MiniMaxM2ForCausalLM(config, backend=backend)
         input_ids = torch.randint(0, config.vocab_size, (2, 6))
 
-        with patch.object(model.model, "forward", return_value=torch.randn(2, 6, config.hidden_size, dtype=torch.bfloat16)):
-            logits = model(input_ids)
+        with patch.object(
+            model.model, "forward", return_value=torch.randn(2, 6, config.hidden_size, dtype=torch.bfloat16)
+        ):
+            out = model(input_ids)
 
+        # forward returns a CausalLMOutputWithPast; downstream reads getattr(out, "logits", out).
+        logits = getattr(out, "logits", out)
         assert logits.shape == (2, 6, config.vocab_size)
+
+    def test_forward_thd_hidden_states_match_logits_layout(self, config, backend):
+        model = MiniMaxM2ForCausalLM(config, backend=backend).to(torch.float32)
+        batch, seq = 1, 5
+        input_ids = torch.randint(0, config.vocab_size, (batch, seq))
+        position_ids = torch.arange(seq).unsqueeze(0)
+        hidden = torch.randn(seq, config.hidden_size)
+        with patch.object(model.model, "forward", return_value=hidden):
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                output_hidden_states=True,
+            )
+        assert out.logits.shape == (batch, seq, config.vocab_size)
+        assert out.hidden_states.shape == (batch, seq, config.hidden_size)
 
 
 class TestMoeOverrides:

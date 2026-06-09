@@ -386,49 +386,57 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     monkeypatch.setattr(vlm_finetune, "AutoPipeline", _FakePPModel)
     monkeypatch.setattr(
         vlm_finetune,
-        "build_distributed",
-        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+        "initialize_distributed",
+        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
     monkeypatch.setattr(vlm_finetune, "setup_logging", lambda: None)
     monkeypatch.setattr(vlm_finetune, "apply_cache_compatibility_patches", lambda: None)
     monkeypatch.setattr(vlm_finetune, "StatefulRNG", lambda *args, **kwargs: "rng")
-    monkeypatch.setattr(vlm_finetune, "build_loss_fn", lambda cfg: "loss_fn")
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.loss_fn",
+        property(lambda self: SimpleNamespace(build=lambda: "loss_fn")),
+    )
     monkeypatch.setattr(vlm_finetune, "_supports_logits_to_keep", lambda model: True)
     monkeypatch.setattr(
         vlm_finetune,
-        "setup_distributed",
+        "create_distributed_setup_from_config",
         lambda cfg, world_size: SimpleNamespace(
+            mesh_context=SimpleNamespace(
+                pp_enabled=True,
+                device_mesh=None,
+                moe_mesh=None,
+                cp_size=cp_size,
+                pp_size=2,
+            ),
             strategy_config=SimpleNamespace(),
             pipeline_config=SimpleNamespace(),
-            moe_config=None,
+            moe_parallel_config=None,
             activation_checkpointing=False,
-            pp_enabled=True,
-            device_mesh=None,
-            moe_mesh=None,
-            cp_size=cp_size,
-            pp_size=2,
         ),
     )
-    monkeypatch.setattr(
-        vlm_finetune,
-        "build_checkpoint_config",
-        lambda *args, **kwargs: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
-    )
-    monkeypatch.setattr(
-        vlm_finetune,
-        "Checkpointer",
-        lambda **kwargs: SimpleNamespace(
-            config=kwargs["config"],
+
+    def _stub_build_checkpoint_config(*args, **kwargs):
+        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+        cfg.build = lambda **kw: SimpleNamespace(
+            config=cfg,
             load_base_model=lambda *args, **kwargs: None,
             maybe_wait_for_staging=lambda: None,
             close=lambda: None,
-        ),
+        )
+        return cfg
+
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.checkpoint",
+        property(lambda self: _stub_build_checkpoint_config()),
     )
     monkeypatch.setattr(vlm_finetune, "build_model", lambda *args, **kwargs: _FakePPModel(stage0))
     monkeypatch.setattr(
-        vlm_finetune,
-        "build_optimizer",
-        lambda *args, **kwargs: [SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None)],
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(
+            lambda self: SimpleNamespace(
+                build=lambda *args, **kwargs: [SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None)]
+            )
+        ),
     )
 
     def _build_dataloader(*args, **kwargs):
@@ -437,11 +445,12 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
 
     monkeypatch.setattr(vlm_finetune, "build_dataloader", _build_dataloader)
     monkeypatch.setattr(
-        vlm_finetune,
-        "build_step_scheduler",
-        lambda *args, **kwargs: SimpleNamespace(step=0, epoch=0, epochs=[]),
+        "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
+        lambda self, *args, **kwargs: SimpleNamespace(step=0, epoch=0, epochs=[]),
     )
-    monkeypatch.setattr(vlm_finetune, "build_lr_scheduler", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "nemo_automodel.components.optim.optimizer.LRSchedulerConfig.build", lambda self, *args, **kwargs: []
+    )
     monkeypatch.setattr(
         vlm_finetune,
         "build_metric_logger",

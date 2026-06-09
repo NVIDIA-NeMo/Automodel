@@ -14,6 +14,7 @@
 
 import logging
 import types
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -26,11 +27,13 @@ from nemo_automodel.components.distributed.parallelizer import (
     megatron_fsdp_strategy_parallelize,
 )
 
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.config import DistributedConfig
+
 logger = logging.getLogger(__name__)
 
 try:
     from megatron_fsdp import MegatronFSDP
-    from megatron_fsdp.fully_shard import fully_shard_optimizer as megatron_fsdp_fully_shard_optimizer
     from megatron_fsdp.param_and_grad_buffer import ParamAndGradBuffer, make_fsdp_dtensor
 
     HAS_MEGATRON_FSDP = True
@@ -38,7 +41,6 @@ except (ImportError, FileNotFoundError, OSError):
     MegatronFSDP = None
     ParamAndGradBuffer = None
     make_fsdp_dtensor = None
-    megatron_fsdp_fully_shard_optimizer = None
     HAS_MEGATRON_FSDP = False
 
 
@@ -114,7 +116,7 @@ class MegatronFSDPManager:
         from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 
         config = MegatronFSDPConfig(zero_dp_strategy=3, overlap_grad_reduce=True)
-        # device_mesh created externally via create_device_mesh()
+        # device_mesh created externally via MeshContext.build()
         manager = MegatronFSDPManager(config, device_mesh=device_mesh)
         model, optimizer = manager.parallelize(model, optimizer)
     """
@@ -128,7 +130,6 @@ class MegatronFSDPManager:
         self.device_mesh = device_mesh
 
         # Extract config fields for easy access
-        self.sequence_parallel = config.sequence_parallel
         self.megatron_fsdp_unit_modules = config.megatron_fsdp_unit_modules
         self.zero_dp_strategy = config.zero_dp_strategy
         self.init_fsdp_with_meta_device = config.init_fsdp_with_meta_device
@@ -144,7 +145,6 @@ class MegatronFSDPManager:
         self.nccl_ub = config.nccl_ub
         self.fsdp_double_buffer = config.fsdp_double_buffer
         self.activation_checkpointing = config.activation_checkpointing
-        self.backend = config.backend
 
     def parallelize(self, model, optimizer=None):
         """
@@ -262,4 +262,32 @@ def fully_shard_optimizer(
     optimizer.step = types.MethodType(megatron_fsdp_optimizer_step, optimizer)
     optimizer.zero_grad = types.MethodType(megatron_fsdp_optimizer_zero_grad, optimizer)
     optimizer._nemo_megatron_fsdp_optimizer_patched = True
+    return optimizer
+
+
+def maybe_shard_optimizer(
+    model_part: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    distributed_config: "DistributedConfig | None",
+    *,
+    allow: bool = True,
+) -> torch.optim.Optimizer:
+    """Shard the optimizer with Megatron-FSDP when the strategy requires it.
+
+    Returns the optimizer unchanged unless ``distributed_config`` is a
+    :class:`MegatronFSDPConfig` running in a distributed (world size > 1) job.
+
+    Args:
+        model_part: The (already sharded) model part the optimizer belongs to.
+        optimizer: The optimizer to (optionally) shard.
+        distributed_config: Distributed strategy config; only triggers sharding
+            when it is a :class:`MegatronFSDPConfig`.
+        allow: Guard for optimizers incompatible with Megatron-FSDP sharding
+            (e.g. Dion); asserts when sharding would otherwise apply.
+    """
+    if isinstance(distributed_config, MegatronFSDPConfig) and dist.get_world_size() > 1:
+        assert allow, "Dion optimizer does not support fully_shard_optimizer"
+        if not HAS_MEGATRON_FSDP:
+            return optimizer
+        return fully_shard_optimizer(model_part, optimizer)
     return optimizer

@@ -28,6 +28,8 @@ plus the helpers in this module, so the dependency stays one-way
 (``draft_llama`` -> ``peagle_draft``) with no circular import.
 """
 
+import logging
+
 import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
@@ -35,20 +37,29 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from nemo_automodel.components.models.llama.rope_utils import apply_rotary_pos_emb
 from nemo_automodel.components.speculative.eagle.peagle_attention import create_peagle_mask_mod
 
+logger = logging.getLogger(__name__)
+
 # flex_attention compiled for the CUDA training path. Inductor's flex backend is
-# not available on CPU (it raises ``InductorError``), so ``_peagle_flex_attention``
-# dispatches to eager ``flex_attention`` there -- correct, just slower -- which
-# keeps the P-EAGLE unit tests and CPU smoke checks runnable. The compiled
+# not available on CPU, and it currently requires query/key/value head dimensions
+# of at least 16. ``_peagle_flex_attention`` dispatches to eager
+# ``flex_attention`` for unsupported cases -- correct, just slower -- which keeps
+# P-EAGLE unit tests and small CPU/GPU smoke checks runnable. The compiled
 # callable is lazy, so importing this module on CPU costs nothing.
 _peagle_flex_attention_compiled = torch.compile(
     flex_attention,
     mode="max-autotune-no-cudagraphs",
 )
+_peagle_flex_attention_compile_failed = False
+
+
+def _peagle_compile_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    """Return whether Inductor's flex-attention lowering supports these tensors."""
+    return q.is_cuda and q.shape[-1] >= 16 and k.shape[-1] >= 16 and v.shape[-1] >= 16
 
 
 def _peagle_flex_attention(q, k, v, *, block_mask, scale):
-    """Run the P-EAGLE flex attention, compiling only on CUDA."""
-    flex = _peagle_flex_attention_compiled if q.is_cuda else flex_attention
+    """Run the P-EAGLE flex attention, compiling only when Inductor supports it."""
+    flex = _peagle_flex_attention_compiled if _peagle_compile_supported(q, k, v) else flex_attention
     return flex(q, k, v, block_mask=block_mask, scale=scale)
 
 

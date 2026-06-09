@@ -32,6 +32,20 @@ logger = logging.getLogger(__name__)
 MODEL_ARCH_MAPPING = OrderedDict(
     [
         (
+            "BagelForUnifiedMultimodal",
+            (
+                "nemo_automodel.components.models.bagel.model",
+                "BagelForUnifiedMultimodal",
+            ),
+        ),
+        (
+            "BagelForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.bagel.model",
+                "BagelForUnifiedMultimodal",
+            ),
+        ),
+        (
             "BaichuanForCausalLM",
             ("nemo_automodel.components.models.baichuan.model", "BaichuanForCausalLM"),
         ),
@@ -210,6 +224,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen3_next.model", "Qwen3NextForCausalLM"),
         ),
         (
+            "Qwen3_5ForCausalLM",
+            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForCausalLM"),
+        ),
+        (
+            "Qwen3_5ForConditionalGeneration",
+            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForConditionalGeneration"),
+        ),
+        (
             "Qwen3OmniMoeForConditionalGeneration",
             (
                 "nemo_automodel.components.models.qwen3_omni_moe.model",
@@ -244,6 +266,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # checkpoint config.json.  Registered eagerly with AutoConfig so that
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
+    "bagel": ("nemo_automodel.components.models.bagel.configuration", "BagelConfig"),
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
     "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),

@@ -46,10 +46,26 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
-from transformers.models.gemma4.modeling_gemma4 import (
-    Gemma4ForConditionalGeneration,
-)
 
+try:
+    from transformers.models.gemma4.modeling_gemma4 import (
+        Gemma4ForConditionalGeneration,
+    )
+except (ImportError, ModuleNotFoundError):
+
+    class Gemma4ForConditionalGeneration:  # type: ignore[no-redef]
+        """Placeholder when the installed transformers build has no Gemma4."""
+
+        pass
+
+
+from nemo_automodel.components.distributed.activation_checkpointing import (
+    SELECTIVE_AC_WRAPPER_FLAG,
+    apply_selective_checkpointing_to_layers,
+    apply_submodule_checkpointing,
+    detect_kv_sharing_and_maybe_disable_cache,
+    is_selective_activation_checkpointing,
+)
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 
 
@@ -110,6 +126,74 @@ import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def apply_selective_activation_checkpointing(model: nn.Module, *, enable_compile: bool = False) -> None:
+    """Apply selective activation checkpointing to ``model`` end to end.
+
+    Standalone entry point (detects KV-sharing, disables ``use_cache``, and
+    wraps transformer blocks) for paths where the FSDP2 parallelize flow is
+    skipped -- notably single-GPU training.
+
+    Args:
+        model: The model to checkpoint.
+        enable_compile: Whether per-layer ``torch.compile`` will be applied.
+    """
+    layers = _extract_model_layers(model)
+    if not layers:
+        logger.warning("No transformer layers found; skipping selective activation checkpointing.")
+        return
+    has_kv_sharing = detect_kv_sharing_and_maybe_disable_cache(model)
+    apply_selective_checkpointing_to_layers(model, layers, has_kv_sharing, enable_compile=enable_compile)
+
+
+_BAGEL_FULL_LAYER_CHECKPOINT_MODULE_LISTS = (
+    "model.language_model.model.layers",
+    "model.vit_model.vision_model.encoder.layers",
+)
+
+
+def _get_module_by_fqn(module: nn.Module, fqn: str) -> Optional[nn.Module]:
+    obj = module
+    for part in fqn.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def _is_checkpoint_wrapped(module: nn.Module) -> bool:
+    return hasattr(module, "_checkpoint_wrapped_module")
+
+
+def _apply_bagel_full_layer_activation_checkpointing(model: nn.Module) -> bool:
+    """Apply native BAGEL-style activation checkpointing to whole logical layers."""
+    if type(model).__name__ != "BagelForUnifiedMultimodal":
+        return False
+
+    wrapped_count = 0
+    for fqn in _BAGEL_FULL_LAYER_CHECKPOINT_MODULE_LISTS:
+        container = _get_module_by_fqn(model, fqn)
+        if container is None:
+            logger.warning("BAGEL activation checkpointing skipped missing module list %s", fqn)
+            continue
+        if not isinstance(container, (nn.ModuleList, nn.ModuleDict)):
+            logger.warning(
+                "BAGEL activation checkpointing expected %s to be a module list, got %s",
+                fqn,
+                type(container),
+            )
+            continue
+
+        items = container.items() if isinstance(container, nn.ModuleDict) else enumerate(container)
+        for key, layer in list(items):
+            if _is_checkpoint_wrapped(layer):
+                continue
+            container[key] = checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+            wrapped_count += 1
+
+    logger.info("Applied BAGEL full-layer activation checkpointing to %d layers", wrapped_count)
+    return wrapped_count > 0
 
 
 class ParallelizationStrategy(ABC):
@@ -219,23 +303,15 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     except Exception as e:
                         logger.warning(f"Could not enable symmetric memory for TP group: {e}")
 
-        # Apply activation checkpointing to linear layers if requested
+        # Apply activation checkpointing to transformer blocks if requested
         if activation_checkpointing:
-            # Models with KV-shared layers (e.g. Gemma4 2B/4B) pass K/V from
-            # earlier layers to later layers through the DynamicCache.  Disabling
-            # the cache breaks this architectural dependency, so we must keep
-            # use_cache=True for those models.
-            _text_cfg = getattr(getattr(model, "config", None), "text_config", None) or getattr(model, "config", None)
-            _has_kv_sharing = getattr(_text_cfg, "num_kv_shared_layers", 0) > 0
+            _has_kv_sharing = detect_kv_sharing_and_maybe_disable_cache(model)
 
-            if not _has_kv_sharing:
-                if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
-                    try:
-                        model.config.use_cache = False
-                    except Exception:
-                        pass
-
-            if enable_compile:
+            if is_selective_activation_checkpointing(activation_checkpointing):
+                apply_selective_checkpointing_to_layers(model, layers, _has_kv_sharing, enable_compile=enable_compile)
+            elif _apply_bagel_full_layer_activation_checkpointing(model):
+                logger.info("Using BAGEL full-layer activation checkpointing; skipping submodule checkpoint wrappers.")
+            elif enable_compile:
                 # NO_REENTRANT is required for compile: REENTRANT's first forward runs under
                 # no_grad, causing AOT autograd to trace a forward-only graph that drops LoRA
                 # (and other trainable) weight gradients.  Wrapping must happen BEFORE FSDP2
@@ -267,24 +343,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 if _use_hf_native_grad_ckpt:
                     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
                 else:
-                    for i, layer in enumerate(layers):
-                        if hasattr(layer, "mlp"):
-                            layers[i].mlp = checkpoint_wrapper(layers[i].mlp)
-                        # Skip self_attn checkpointing for KV-shared models:
-                        # recomputation would double-write to the DynamicCache,
-                        # corrupting K/V entries that shared layers depend on.
-                        if hasattr(layer, "self_attn") and not _has_kv_sharing:
-                            layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
-
-                        if hasattr(layer, "input_layernorm"):
-                            layers[i].input_layernorm = checkpoint_wrapper(
-                                layers[i].input_layernorm  # type: ignore
-                            )
-
-                        if hasattr(layer, "post_attention_layernorm"):
-                            layers[i].post_attention_layernorm = checkpoint_wrapper(
-                                layers[i].post_attention_layernorm  # type: ignore
-                            )
+                    apply_submodule_checkpointing(layers, _has_kv_sharing)
 
         # Set up mixed precision policy
         if not mp_policy:
@@ -400,9 +459,15 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
 
+        fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
+
         for layer in layers:
             parallelizer_utils.fully_shard_by_dtype(
-                layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
+                layer,
+                mesh=dp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                fp32_compute_module_names=fp32_compute_module_names,
             )
 
         # do not reshard after forward for root model
@@ -432,6 +497,10 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         cp_enabled = cp_mesh_name in device_mesh.mesh_dim_names and device_mesh[cp_mesh_name].size() > 1
         patch_hf_model(model, cp_enabled=cp_enabled)
 
+        # Submodules that must compute in fp32 even under fp32 master weights (bf16
+        # compute). patch_hf_model declares ``_fp32_params`` on the model.
+        fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
+
         # Delegate TP, AC, mixed precision to the default strategy, but
         # override the FSDP sharding to use fully_shard_by_dtype.
         # Temporarily swap the global — safe because model init is single-threaded
@@ -451,6 +520,7 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                             mesh,
                             mp_policy,
                             offload_policy,
+                            fp32_compute_module_names=fp32_compute_module_names,
                         )
             else:
                 for _, sub in module.named_children():
@@ -569,6 +639,18 @@ class WanParallelizationStrategy(ParallelizationStrategy):
                     model.proj_out = parallelize_module(model.proj_out, tp_mesh, {"": RowwiseParallel()})
             except Exception as e:
                 logger.warning(f"Wan strategy: failed to TP blocks/proj_out: {e}")
+
+        # Activation checkpointing wraps every WanTransformerBlock so its
+        # forward activations are recomputed on backward instead of being
+        # held in memory. Critical for Wan2.2-A14B (14B params, ~30k-token
+        # video sequence) — without this, fp32 layer-norm casts in the block
+        # forward will OOM even on 8x80GB H100.
+        if activation_checkpointing and hasattr(model, "blocks"):
+            for idx in range(len(model.blocks)):
+                model.blocks[idx] = checkpoint_wrapper(
+                    model.blocks[idx],
+                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                )
 
         # Mixed precision default like Default strategy
         if not mp_policy:
@@ -734,6 +816,12 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     and mlp before FSDP2 sharding (done in DefaultParallelizationStrategy).  This
     function only handles the compile step.
 
+    Whole-block selective-AC wrappers (tagged with ``SELECTIVE_AC_WRAPPER_FLAG``)
+    are compiled OUTER -- the wrapper itself is compiled so the selective policy
+    is traced and the partitioner honors its recompute tags. Other layer-level
+    CheckpointWrappers (e.g. the PP path) are unwrapped and the decoder layer is
+    compiled directly.
+
     nn.Module.compile() is used instead of torch.compile() to compile in-place without
     introducing an _orig_mod wrapper, which would add a key prefix and break checkpoint
     loading.
@@ -748,14 +836,24 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     compiled_count = 0
     compiled_modules: set[int] = set()
 
+    def _compile_target(layer: nn.Module) -> nn.Module:
+        # Whole-block selective-AC wrappers must be compiled OUTER so the SAC
+        # policy is traced and the partitioner honors its recompute tags.
+        # Other CheckpointWrappers (e.g. PP full-layer wrap with sub-module AC
+        # inside) are unwrapped so the decoder layer is compiled directly.
+        if isinstance(layer, CheckpointWrapper):
+            if getattr(layer, SELECTIVE_AC_WRAPPER_FLAG, False):
+                return layer
+            return layer._checkpoint_wrapped_module
+        return layer
+
     def _compile_module_list(module_list: nn.ModuleList | nn.ModuleDict) -> None:
         nonlocal compiled_count
         # PP converts model.model.layers from nn.ModuleList to nn.ModuleDict (str keys).
         # enumerate(nn.ModuleDict) yields string keys, not modules -- use .items() instead.
         items = module_list.items() if isinstance(module_list, nn.ModuleDict) else enumerate(module_list)
         for _, layer in items:
-            # Unwrap any layer-level checkpoint wrapper (PP path) to reach the actual decoder layer.
-            actual_layer = layer._checkpoint_wrapped_module if isinstance(layer, CheckpointWrapper) else layer
+            actual_layer = _compile_target(layer)
             module_id = id(actual_layer)
             if module_id in compiled_modules:
                 continue
@@ -779,7 +877,7 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     else:
         logger.warning("_apply_per_layer_compile: using heuristic layer extraction")
         for layer in _extract_model_layers(model):
-            actual_layer = layer._checkpoint_wrapped_module if isinstance(layer, CheckpointWrapper) else layer
+            actual_layer = _compile_target(layer)
             module_id = id(actual_layer)
             if module_id in compiled_modules:
                 continue
@@ -1397,6 +1495,18 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         Gemma4ForConditionalGeneration: ["model.language_model.layers"],
         # String fallback in case of class identity mismatch across imports
         "Gemma4ForConditionalGeneration": ["model.language_model.layers"],
+        # BAGEL (text-to-image + understanding). String-keyed to avoid an
+        # import cycle: parallelizer is core distributed code, the BAGEL
+        # model lives under components/models/bagel/. Lists both the Qwen2
+        # decoder ModuleList and the SigLIP encoder ModuleList so each
+        # member becomes its own FSDP unit (matching upstream BAGEL's
+        # transformer_auto_wrap_policy class set; without the SigLIP
+        # entry, Stage 2 OOMs on 8x80GB because the SigLIP layers sit in
+        # the root FSDP unit's all-gather peak).
+        "BagelForUnifiedMultimodal": [
+            "model.language_model.model.layers",
+            "model.vit_model.vision_model.encoder.layers",
+        ],
     }
     LLM_MODEL_CLS_TO_LAYERS = {
         "NemotronHForCausalLM": ["backbone.layers"],
