@@ -896,6 +896,16 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 module = self._module()
                 module.selected_token_ids.copy_(ids.to(module.selected_token_ids.device))
                 module.selected_token_mask.copy_(mask.to(module.selected_token_mask.device))
+                # set_vocab_mapping was already called at setup() with the
+                # freshly-scanned mapping, but resume can restore a different one
+                # (the checkpoint's, e.g. when the data / split / cache changed).
+                # Re-apply it so the draft's d2t/t2d tables and -- the actual bug
+                # -- the remote target server (which projects to the draft vocab
+                # itself) match the checkpoint, not the setup-time scan. Colocated
+                # set_vocab_mapping is a no-op; the cached path has no target.
+                self.draft_model.set_vocab_mapping(module.selected_token_ids)
+                if getattr(self, "target_wrapper", None) is not None:
+                    self.target_wrapper.set_vocab_mapping(module.selected_token_ids, module.selected_token_mask)
 
     def _run_eval(self):
         if self.val_dataloader is None:
