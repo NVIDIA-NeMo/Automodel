@@ -129,6 +129,7 @@ class FlowMatchingPipeline:
         sigma_max: float = 1.0,
         # Loss weighting
         use_loss_weighting: bool = True,
+        loss_weighting_scheme: str = "linear",
         # Logging
         log_interval: int = 100,
         summary_log_interval: int = 10,
@@ -157,6 +158,10 @@ class FlowMatchingPipeline:
             sigma_min: Minimum sigma (0.0 for pretrain)
             sigma_max: Maximum sigma (1.0 for pretrain)
             use_loss_weighting: Whether to apply flow-based loss weighting
+            loss_weighting_scheme: Weighting strategy when use_loss_weighting is True:
+                - "linear": w = 1 + flow_shift * sigma
+                - "bsmntw": Bell-Shaped Midpoint Noise Timestep Weighting (Gaussian
+                  centered at t=num_train_timesteps/2)
             log_interval: Steps between detailed logs
             summary_log_interval: Steps between summary logs
             device: Device to use for computations
@@ -174,12 +179,37 @@ class FlowMatchingPipeline:
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.use_loss_weighting = use_loss_weighting
+        self.loss_weighting_scheme = loss_weighting_scheme
+
+        _VALID_SCHEMES = ("linear", "bsmntw")
+        if loss_weighting_scheme not in _VALID_SCHEMES:
+            raise ValueError(
+                f"Unknown loss_weighting_scheme: {loss_weighting_scheme!r}. Must be one of {_VALID_SCHEMES}"
+            )
+
+        # Precompute BSMNTW weight table if needed
+        if use_loss_weighting and loss_weighting_scheme == "bsmntw":
+            self._bsmntw_weights = self._build_bsmntw_weights()
+
         self.log_interval = log_interval
         self.summary_log_interval = summary_log_interval
         self.device = device if device is not None else torch.device("cuda")
 
         # Initialize noise schedule
         self.noise_schedule = LinearInterpolationSchedule()
+
+    def _build_bsmntw_weights(self) -> torch.Tensor:
+        """Build Bell-Shaped Midpoint Noise Timestep Weighting table.
+
+        Returns a 1D tensor of length num_train_timesteps with weights
+        following a Gaussian bell curve centered at the midpoint (t=steps/2).
+        """
+        steps = self.num_train_timesteps
+        t = torch.arange(steps, dtype=torch.float32)
+        w = torch.exp(-2.0 * ((t - steps / 2) / steps) ** 2)
+        w = w - w.min()
+        w = w * (steps / w.sum())
+        return w
 
     def sample_timesteps(
         self,
@@ -305,8 +335,13 @@ class FlowMatchingPipeline:
         loss_mask = batch.get("loss_mask") if batch is not None else None
 
         if self.use_loss_weighting:
-            loss_weight = 1.0 + self.flow_shift * sigma
-            loss_weight = loss_weight.view(-1, *([1] * (loss.ndim - 1)))
+            if self.loss_weighting_scheme == "bsmntw":
+                timestep_indices = (sigma * self.num_train_timesteps).long().clamp(0, self.num_train_timesteps - 1)
+                loss_weight = self._bsmntw_weights.to(model_pred.device)[timestep_indices]
+                loss_weight = loss_weight.view(-1, *([1] * (loss.ndim - 1)))
+            elif self.loss_weighting_scheme == "linear":
+                loss_weight = 1.0 + self.flow_shift * sigma
+                loss_weight = loss_weight.view(-1, *([1] * (loss.ndim - 1)))
         else:
             loss_weight = torch.ones_like(sigma).view(-1, *([1] * (loss.ndim - 1)))
 
@@ -326,6 +361,8 @@ class FlowMatchingPipeline:
         device: torch.device = torch.device("cuda"),
         dtype: torch.dtype = torch.bfloat16,
         global_step: int = 0,
+        collect_metrics: bool = True,
+        check_loss: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
         """
         Execute a single training step with flow matching.
@@ -346,6 +383,10 @@ class FlowMatchingPipeline:
             device: Device to use
             dtype: Data type for operations
             global_step: Current training step (for logging)
+            collect_metrics: Whether to collect scalar diagnostics. Disable in
+                hot training paths to avoid host/device synchronizations.
+            check_loss: Whether to run scalar loss explosion checks. Disable in
+                hot training paths to avoid host/device synchronizations.
 
         Returns:
             weighted_loss: Per-element weighted loss
@@ -359,9 +400,9 @@ class FlowMatchingPipeline:
 
         # Extract and prepare batch data (either image_latents or video_latents)
         if "video_latents" in batch:
-            latents = batch["video_latents"].to(device, dtype=dtype)
+            latents = batch["video_latents"].to(device, dtype=dtype, non_blocking=True)
         elif "image_latents" in batch:
-            latents = batch["image_latents"].to(device, dtype=dtype)
+            latents = batch["image_latents"].to(device, dtype=dtype, non_blocking=True)
         else:
             raise KeyError("Batch must contain either 'video_latents' or 'image_latents'")
 
@@ -436,7 +477,7 @@ class FlowMatchingPipeline:
         )
 
         # Safety check
-        if torch.isnan(average_weighted_loss) or average_weighted_loss > 100:
+        if check_loss and (torch.isnan(average_weighted_loss) or average_weighted_loss > 100):
             logger.error(f"[ERROR] Loss explosion! Loss={average_weighted_loss.item():.3f}")
             raise ValueError(f"Loss exploded: {average_weighted_loss.item()}")
 
@@ -451,23 +492,24 @@ class FlowMatchingPipeline:
                 f"w=[{loss_weight.min():.2f},{loss_weight.max():.2f}]"
             )
 
-        # Collect metrics
-        metrics = {
-            "loss": average_weighted_loss.item(),
-            "unweighted_loss": average_unweighted_loss.item(),
-            "sigma_min": sigma.min().item(),
-            "sigma_max": sigma.max().item(),
-            "sigma_mean": sigma.mean().item(),
-            "weight_min": loss_weight.min().item(),
-            "weight_max": loss_weight.max().item(),
-            "timestep_min": timesteps.min().item(),
-            "timestep_max": timesteps.max().item(),
-            "noisy_min": noisy_latents.min().item(),
-            "noisy_max": noisy_latents.max().item(),
-            "sampling_method": sampling_method,
-            "task_type": task_type,
-            "data_type": data_type,
-        }
+        metrics = {}
+        if collect_metrics:
+            metrics = {
+                "loss": average_weighted_loss.item(),
+                "unweighted_loss": average_unweighted_loss.item(),
+                "sigma_min": sigma.min().item(),
+                "sigma_max": sigma.max().item(),
+                "sigma_mean": sigma.mean().item(),
+                "weight_min": loss_weight.min().item(),
+                "weight_max": loss_weight.max().item(),
+                "timestep_min": timesteps.min().item(),
+                "timestep_max": timesteps.max().item(),
+                "noisy_min": noisy_latents.min().item(),
+                "noisy_max": noisy_latents.max().item(),
+                "sampling_method": sampling_method,
+                "task_type": task_type,
+                "data_type": data_type,
+            }
 
         return weighted_loss, average_weighted_loss, loss_mask, metrics
 

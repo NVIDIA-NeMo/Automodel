@@ -1,0 +1,83 @@
+recipe: TrainEagle3Recipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: meta-llama/Llama-3.2-1B
+  # ``train_data_path`` accepts either a HF dataset id or a local
+  # ``.jsonl`` / directory of ``.jsonl`` files. Each row must follow the
+  # OpenAI chat schema -- the ``ChatDataset`` ingestion path keys on a
+  # ``messages`` list of ``{role, content}`` entries:
+  #
+  #   {"messages": [
+  #     {"role": "system",    "content": "You are a helpful assistant."},
+  #     {"role": "user",      "content": "What is the capital of France?"},
+  #     {"role": "assistant", "content": "Paris."}
+  #   ]}
+  #
+  # ShareGPT-style datasets (e.g. PerfectBlend) that ship turns under a
+  # ``conversations`` column of ``{from, value}`` entries are auto-converted to
+  # the ``messages`` schema -- no manual column rename needed.
+  train_data_path: /path/to/train.jsonl
+  val_data_path: null
+  train_split: null
+  val_split: null
+  output_dir: ./outputs/eagle3_llama_mvp
+  seq_length: 1024
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 0
+  num_epochs: 1
+  ttt_steps: 4
+  draft_vocab_size: 8192
+  # Optional cache for the draft-vocab selection. The recipe otherwise scans
+  # the whole training set every run to rank token frequencies; set this to a
+  # path and the first run writes it while later runs load it and skip the scan.
+  # The cache is keyed only on the target/draft vocab sizes -- point it at a
+  # fresh path (or delete the file) if you change the training data.
+  # selected_token_ids_path: ./outputs/eagle3_llama_mvp/draft_token_map.pt
+  freeze_embeddings: true
+  # SpecForge OFFLINE path (legacy, disk-heavy): point this at a cache produced
+  # by `python -m nemo_automodel.components.speculative.precompute_eagle3` and the
+  # recipe streams the precomputed target supervision instead of loading/running
+  # the target. It costs ~80 MB/sample (tens of TB for a large corpus) and is
+  # largely superseded by the default online path -- leave it unset unless you
+  # are repeatedly re-training a draft on a fixed, bounded dataset.
+  # cached_target_path: /data/eagle3_cache/sharegpt_llama31
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+  # Checkpoint cadence (two independent knobs). The fully-trained model is always
+  # saved when the run completes; these only add intermediate checkpoints. Set
+  # ckpt_every_steps to save every N optimizer steps, and/or
+  # save_checkpoint_every_epoch to save at each epoch boundary; setting both
+  # stacks them. With neither set, only the end-of-run checkpoint is written.
+  # Directories are named epoch_{epoch}_step_{global_step}.
+  # ckpt_every_steps: 500
+  # save_checkpoint_every_epoch: false
+
+optimizer:
+  # TTT loss is a weighted mean (``Σ 0.8^i * L_i / Σ 0.8^i``), so LR is
+  # invariant to ``ttt_steps`` and to the decay constant in
+  # ``components/speculative/eagle/core.py``.
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/eagle3_llama_mvp/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true
+  # restore_from: LATEST  # set to "LATEST", a subdir name like "epoch_1_step_100", or an absolute path
+
+# Optional Weights & Biases logging. When this section is present (rank 0), the
+# recipe logs train/{loss,accuracy,lr,grad_norm,epoch} and val/{loss,accuracy}
+# every log_every_steps. Remove or comment out to disable.
+# wandb:
+#   project: eagle3
+#   entity: my-team
+#   name: ""   # empty -> defaults to eagle3_<target-model-name>

@@ -155,6 +155,43 @@ class TestInitializeAttnModuleAndFunc:
         finally:
             F.scaled_dot_product_attention = original_sdpa
 
+    def test_sdpa_masked_gqa_repeats_kv(self):
+        """Test SDPA mirrors HF behavior by expanding K/V when GQA is used with an explicit mask."""
+        _, attn_func = initialize_attn_module_and_func(
+            attn_impl="sdpa",
+            num_attention_heads=4,
+            num_qk_channels=8,
+            num_v_channels=8,
+            softmax_scale=0.125,
+            attn_mask_type="causal",
+            num_gqa_groups=2,
+        )
+
+        original_sdpa = F.scaled_dot_product_attention
+        sentinel = object()
+        wrapper = mock.MagicMock(return_value=sentinel)
+        F.scaled_dot_product_attention = wrapper
+        try:
+            q = torch.randn(1, 4, 3, 8)
+            k = torch.randn(1, 2, 3, 8)
+            v = torch.randn(1, 2, 3, 8)
+            attn_mask = torch.ones(1, 1, 3, 3, dtype=torch.bool)
+
+            result = attn_func(q, k, v, attn_mask=attn_mask)
+
+            assert result is sentinel
+            wrapper.assert_called_once()
+            args, kwargs = wrapper.call_args
+            assert torch.equal(args[0], q)
+            assert args[1].shape == q.shape
+            assert args[2].shape == q.shape
+            assert torch.equal(args[1], k.repeat_interleave(2, dim=-3))
+            assert torch.equal(args[2], v.repeat_interleave(2, dim=-3))
+            assert kwargs["enable_gqa"] is False
+            assert torch.equal(kwargs["attn_mask"], attn_mask)
+        finally:
+            F.scaled_dot_product_attention = original_sdpa
+
 
 class TestPreprocessArgsAndKwargsForAttn:
     """Tests for preprocess_args_and_kwargs_for_attn function."""
@@ -253,7 +290,7 @@ class TestPreprocessArgsAndKwargsForAttn:
         assert attn_kwargs["is_causal"] is True
 
     def test_sdpa_preprocessing_with_mask(self):
-        """Test SDPA preprocessing with attention mask."""
+        """Test SDPA preprocessing skips explicit mask when attention mask has no padding."""
         attention_mask = torch.ones(self.batch_size, self.seq_len, dtype=torch.bool)
 
         q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
@@ -263,6 +300,80 @@ class TestPreprocessArgsAndKwargsForAttn:
         # SDPA should still transpose even with mask
         expected_shape = (self.batch_size, self.seq_len, self.num_heads, self.head_dim)
         assert q_out.shape == expected_shape
+        assert "attn_mask" not in attn_kwargs
+        assert attn_kwargs["is_causal"] is True
+
+    def test_sdpa_preprocessing_with_padding_mask(self):
+        """Test SDPA builds a causal padding mask when the attention mask contains padding."""
+        q = torch.randn(1, 4, 1, 8)
+        k = torch.randn(1, 4, 1, 8)
+        v = torch.randn(1, 4, 1, 8)
+        attention_mask = torch.tensor([[True, True, False, True]])
+
+        q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, attention_mask=attention_mask, attn_impl="sdpa"
+        )
+
+        expected_mask = torch.tensor(
+            [
+                [
+                    [
+                        [True, False, False, False],
+                        [True, True, False, False],
+                        [True, True, False, False],
+                        [True, True, False, True],
+                    ]
+                ]
+            ]
+        )
+        assert q_out.shape == (1, 1, 4, 8)
+        assert k_out.shape == (1, 1, 4, 8)
+        assert v_out.shape == (1, 1, 4, 8)
+        assert torch.equal(attn_kwargs["attn_mask"], expected_mask)
+        assert attn_kwargs["is_causal"] is False
+
+    def test_sdpa_preprocessing_with_explicit_attention_bias(self):
+        """Test SDPA preserves a prebuilt additive attention mask."""
+        q = torch.randn(2, 4, 3, 8)
+        k = torch.randn(2, 4, 3, 8)
+        v = torch.randn(2, 4, 3, 8)
+        attention_mask = torch.zeros(2, 1, 4, 4)
+        attention_mask = attention_mask.masked_fill(torch.triu(torch.ones(4, 4), diagonal=1).bool(), float("-inf"))
+
+        q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, attention_mask=attention_mask, attn_impl="sdpa"
+        )
+
+        assert q_out.shape == (2, 3, 4, 8)
+        assert k_out.shape == (2, 3, 4, 8)
+        assert v_out.shape == (2, 3, 4, 8)
+        assert torch.equal(attn_kwargs["attn_mask"], attention_mask)
+        assert attn_kwargs["is_causal"] is False
+
+    def test_sdpa_preprocessing_with_sliding_window(self):
+        """Test SDPA builds a local causal mask when window_size is provided."""
+        q = torch.randn(1, 5, 1, 8)
+        k = torch.randn(1, 5, 1, 8)
+        v = torch.randn(1, 5, 1, 8)
+
+        q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, attention_mask=None, attn_impl="sdpa", window_size=(3, 0)
+        )
+
+        expected_mask = torch.tensor(
+            [
+                [True, False, False, False, False],
+                [True, True, False, False, False],
+                [True, True, True, False, False],
+                [False, True, True, True, False],
+                [False, False, True, True, True],
+            ]
+        )
+        assert q_out.shape == (1, 1, 5, 8)
+        assert k_out.shape == (1, 1, 5, 8)
+        assert v_out.shape == (1, 1, 5, 8)
+        assert torch.equal(attn_kwargs["attn_mask"], expected_mask)
+        assert attn_kwargs["is_causal"] is False
 
     def test_flex_preprocessing(self):
         """Test Flex preprocessing (transposes tensors like SDPA)."""

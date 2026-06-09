@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import inspect
 import logging
 import math
 import os
@@ -36,13 +37,25 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
     MULTIMODAL_SUFFIXES,
     TEXT_MODULE_ATTRS,
     get_text_module,
+    model_keeps_self_forward,
     patch_hf_model_for_pp,
 )
 
 logger = logging.getLogger(__name__)
 
 
+def _get_optional_hook(module: object, name: str) -> Callable | None:
+    try:
+        inspect.getattr_static(module, name)
+    except AttributeError:
+        return None
+    hook = getattr(module, name)
+    return hook if callable(hook) else None
+
+
 class ParallelizeFnProtocol(Protocol):
+    """Callable protocol for applying distributed parallelism to a model."""
+
     def __call__(
         self,
         model: torch.nn.Module,
@@ -62,6 +75,7 @@ def scale_grads_by_divisor(
     stages: list[PipelineStage],
     divisor: int,
 ) -> None:
+    """Scale pipeline stage gradients by a common divisor when supported."""
     for stage in stages:
         if hasattr(stage, "scale_grads"):
             stage.scale_grads(divisor)
@@ -170,6 +184,7 @@ def calculate_virtual_stages(
     is_single_stage_schedule: bool,
     round_to_pp_multiple: str | None = None,
 ) -> tuple[int, int]:
+    """Calculate virtual pipeline stages and layers per stage."""
     if layers_per_stage is not None:
         # Calculate number of virtual stages needed (using ceiling division)
         # This allows for unequal distribution where stages can differ by at most 1 layer
@@ -265,6 +280,7 @@ def _precompute_stage_shapes(
     model_config,
     microbatch_size: int,
     seq_len: int,
+    tensor_dtype: torch.dtype | None = None,
 ) -> None:
     """Precompute input/output meta tensors for each pipeline stage to bypass serial shape inference.
 
@@ -285,28 +301,40 @@ def _precompute_stage_shapes(
     hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)
 
     for stage in stages:
-        # Infer the computation dtype from the stage's parameters
-        try:
-            model_dtype = next(stage.submod.parameters()).dtype
-        except StopIteration:
-            model_dtype = torch.bfloat16
+        if tensor_dtype is None:
+            try:
+                model_dtype = next(stage.submod.parameters()).dtype
+            except StopIteration:
+                model_dtype = torch.bfloat16
+        else:
+            model_dtype = tensor_dtype
+
+        get_stage_metas = _get_optional_hook(stage.submod, "get_pipeline_stage_metas")
+        if get_stage_metas is not None:
+            stage.inputs_meta, outputs_meta = get_stage_metas(
+                is_first=stage.is_first,
+                microbatch_size=microbatch_size,
+                seq_len=seq_len,
+                dtype=model_dtype,
+            )
+            stage._configure_outputs_meta(outputs_meta)
+            continue
 
         # --- inputs_meta ---
         if stage.is_first:
             # First stage receives input_ids: [mb, seq_len] int64
             stage.inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
         else:
-            # Non-first stages receive hidden_states: [mb, seq_len, hidden_size]
             stage.inputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
 
         # --- outputs_meta ---
         has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
         if has_lm_head:
             # Last stage with lm_head produces logits: [mb, seq_len, vocab_size]
-            outputs_meta = (torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype),)
+            primary_output_meta = torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype)
         else:
-            # Intermediate stages produce hidden_states: [mb, seq_len, hidden_size]
-            outputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
+            primary_output_meta = torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype)
+        outputs_meta = (primary_output_meta,)
         stage._configure_outputs_meta(outputs_meta)
 
     logger.info(
@@ -321,6 +349,7 @@ def reset_pp_stage_shapes(
     model_config,
     microbatch_size: int,
     seq_len: int,
+    tensor_dtype: torch.dtype | None = None,
 ) -> None:
     """Reset pipeline stage infrastructure and recompute shapes for a new sequence length.
 
@@ -352,7 +381,7 @@ def reset_pp_stage_shapes(
         stage.grad_send_info = None
 
     # Analytically set shapes for the new seq_len (no forward pass)
-    _precompute_stage_shapes(stages, model_config, microbatch_size, seq_len)
+    _precompute_stage_shapes(stages, model_config, microbatch_size, seq_len, tensor_dtype=tensor_dtype)
 
     # Trigger _initialize_stage(s) on the next step() call.
     # PipelineScheduleSingle uses singular, PipelineScheduleMulti uses plural.
@@ -466,15 +495,34 @@ def split_model_into_stages(
             lm_head_fqn=lm_head_fqn,
         )
 
+        customize_stage_modules = _get_optional_hook(model, "customize_pipeline_stage_modules")
+        if customize_stage_modules is not None:
+            custom_module_names = customize_stage_modules(
+                module_names_per_stage,
+                layers_prefix=layers_prefix,
+                text_model=text_model,
+            )
+            if custom_module_names is not None:
+                module_names_per_stage = custom_module_names
+
     def _build_stage_from_modules(
         stage_idx: int, module_names: list[str], num_stages: int
     ) -> tuple[PipelineStage, nn.Module]:
         """Build a pipeline stage from specified module names."""
         # Deep copy the model
         stage_model = copy.deepcopy(model)
-        patch_hf_model_for_pp(
-            stage_model, patch_inner_model=patch_inner_model, patch_causal_lm_model=patch_causal_lm_model
-        )
+        # Two model implementation paths:
+        #   - HF / dedicated-patch path (LLMs, Gemma4 VLM, Mistral3 VLM): the
+        #     PP-aware forward lives in ``patch_hf_model_for_pp``.
+        #   - Custom-impl path that handles PP itself (Qwen3-VL-MoE, KimiVL,
+        #     Kimi-K2.5-VL, Qwen3.5-MoE): the model class declares
+        #     ``_pp_keep_self_forward = True`` so its own ``forward`` (which
+        #     pulls per-microbatch pixel_values from ``_vlm_pixel_values_chunks``)
+        #     stays intact.
+        if not model_keeps_self_forward(stage_model):
+            patch_hf_model_for_pp(
+                stage_model, patch_inner_model=patch_inner_model, patch_causal_lm_model=patch_causal_lm_model
+            )
         # Create a set of modules to keep
         modules_to_keep = set(module_names)
         modules_sorted = sorted(modules_to_keep, key=lambda x: x.split(".")[-1])
@@ -665,6 +713,7 @@ def pipeline_model(
     patch_stage_backward_maybe_with_nosync: bool = False,
     reduce_grad_per_microbatch: bool = False,
     seq_len: int | None = None,
+    tensor_dtype: torch.dtype | None = None,
 ) -> tuple[_PipelineSchedule, list[torch.nn.Module], bool, bool, list[PipelineStage]]:
     """HF-specific pipeline model splitting."""
     pp_size = world_mesh[pp_axis_name].size()
@@ -703,7 +752,7 @@ def pipeline_model(
     # Precompute stage shapes to bypass serial P2P shape inference.
     # This must happen *after* parallelization so that dtypes are final.
     if seq_len is not None:
-        _precompute_stage_shapes(stages, model.config, microbatch_size, seq_len)
+        _precompute_stage_shapes(stages, model.config, microbatch_size, seq_len, tensor_dtype=tensor_dtype)
 
     # Build pipeline schedule
     pp_schedule = build_pipeline_schedule(

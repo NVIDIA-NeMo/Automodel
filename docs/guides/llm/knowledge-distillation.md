@@ -87,7 +87,7 @@ distributed:
 # PEFT can be enabled by uncommenting below – student weights will remain small
 # peft:
 #   _target_: nemo_automodel.components._peft.lora.PeftConfig
-#   match_all_linear: true
+#   target_modules: '*_proj'
 #   dim: 16
 #   alpha: 32
 #   use_triton: true
@@ -170,7 +170,7 @@ logged to **WandB** when the corresponding section is enabled.
 ## Checkpoints and Inference
 
 - Checkpoints are written under the directory configured in the `checkpoint.checkpoint_dir` field at every `ckpt_every_steps`.
-- The final student model is saved according to the `checkpoint` section (e.g., `model_save_format: safetensors`, consolidated weights if `save_consolidated: true`).
+- The final student model is saved according to the `checkpoint` section (e.g., `model_save_format: safetensors`, consolidated weights if `save_consolidated: final` or `save_consolidated: every`).
 
 Load the distilled model:
 

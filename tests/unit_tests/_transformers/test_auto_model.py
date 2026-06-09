@@ -23,6 +23,7 @@ import torch
 from nemo_automodel._transformers.auto_model import (
     _MAX_BUILD_RETRIES,
     NeMoAutoModelForCausalLM,
+    _alias_remote_auto_map_for_target,
     _BaseNeMoAutoModelClass,
     _consume_config_overrides,
     _get_next_fallback_attn,
@@ -180,6 +181,81 @@ class TestUtilityFunctions:
         # Test with numeric strings
         assert _get_next_fallback_attn("123") == "eager"
         assert _get_next_fallback_attn("0") == "eager"
+
+
+class TestModelRuntimePatches:
+    """Test cases for model runtime patch dispatch."""
+
+    class _DummyModel(torch.nn.Module):
+        def __init__(self, architectures=None):
+            super().__init__()
+            self.config = types.SimpleNamespace(architectures=architectures)
+
+    def test_apply_model_runtime_patches_dispatches_by_architecture(self):
+        from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
+
+        model = self._DummyModel(["Qwen3_5ForCausalLM"])
+        mesh = types.SimpleNamespace(cp_size=1)
+        calls = []
+
+        def fake_hook(model, mesh):
+            calls.append((model, mesh))
+            return model
+
+        fake_module = types.SimpleNamespace(apply_model_runtime_patches=fake_hook)
+
+        with patch(
+            "nemo_automodel._transformers.kernel_patches.importlib.import_module",
+            return_value=fake_module,
+        ) as mock_import:
+            assert apply_model_runtime_patches(model, mesh) is model
+
+        mock_import.assert_called_once_with("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn")
+        assert calls == [(model, mesh)]
+
+    def test_apply_model_runtime_patches_deduplicates_hook_specs(self):
+        from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
+
+        model = self._DummyModel(["Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"])
+        mesh = types.SimpleNamespace(cp_size=2)
+        calls = []
+
+        def fake_hook(model, mesh):
+            calls.append((model, mesh))
+            return model
+
+        fake_module = types.SimpleNamespace(apply_model_runtime_patches=fake_hook)
+
+        with patch(
+            "nemo_automodel._transformers.kernel_patches.importlib.import_module",
+            return_value=fake_module,
+        ):
+            assert apply_model_runtime_patches(model, mesh) is model
+
+        assert calls == [(model, mesh)]
+
+    def test_apply_model_runtime_patches_is_noop_for_unregistered_model(self):
+        from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
+
+        model = self._DummyModel(["LlamaForCausalLM"])
+        mesh = types.SimpleNamespace(cp_size=1)
+
+        with patch("nemo_automodel._transformers.kernel_patches.importlib.import_module") as mock_import:
+            assert apply_model_runtime_patches(model, mesh) is model
+
+        mock_import.assert_not_called()
+
+    def test_apply_model_runtime_patches_skips_unavailable_hook(self):
+        from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
+
+        model = self._DummyModel(["Qwen3_5ForCausalLM"])
+        mesh = types.SimpleNamespace(cp_size=1)
+
+        with patch(
+            "nemo_automodel._transformers.kernel_patches.importlib.import_module",
+            side_effect=ImportError,
+        ):
+            assert apply_model_runtime_patches(model, mesh) is model
 
 
 class TestPatchLegacyFlashAttnFlag:
@@ -605,6 +681,28 @@ class TestConsumeConfigOverrides:
         assert "explicit_param" in kwargs
 
 
+class TestAliasRemoteAutoMapForTarget:
+    """Tests for the auto_map alias fallback used when a trust-remote-code config
+    ships only ``auto_map[AutoModel]`` and HF's ``AutoModelFor*`` resolution
+    can't find the right class.
+    """
+
+    def test_aliases_automodel_to_target_when_conditions_met(self):
+        cfg = MagicMock()
+        cfg.auto_map = {"AutoModel": "modeling.MyModel"}
+        result = _alias_remote_auto_map_for_target(
+            ("/some/path",), {"trust_remote_code": True, "config": cfg}, "AutoModelForCausalLM"
+        )
+        assert result is cfg
+        assert result.auto_map["AutoModelForCausalLM"] == "modeling.MyModel"
+
+    def test_returns_none_when_trust_remote_code_not_set(self):
+        cfg = MagicMock()
+        cfg.auto_map = {"AutoModel": "modeling.MyModel"}
+        result = _alias_remote_auto_map_for_target(("/some/path",), {"config": cfg}, "AutoModelForCausalLM")
+        assert result is None
+
+
 class TestGetCheckpointTensorDtypes:
     def test_uses_provided_state_dict_dtypes(self):
         state_dict = {
@@ -828,6 +926,100 @@ class TestModelMappingKeyErrorFallback:
         assert fake_model.linear.weight.dtype == torch.bfloat16
         assert fake_model.norm.weight.dtype == torch.float32
         mock_wrap.assert_called_once_with(FakeModel)
+
+    def test_force_hf_pretrained_explicit_fp32_promotes_all_to_fp32(self):
+        """Explicit fp32 request unifies every floating tensor to fp32 (master weights)."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 2, bias=False)
+                self.norm = torch.nn.LayerNorm(2)
+
+        fake_config = FakeConfig()
+        # Simulate HF's mixed-dtype load: most params bf16, a stray param fp32.
+        fake_model = FakeModel()
+        fake_model.linear.to(torch.bfloat16)
+        fake_model.norm.to(torch.float32)
+
+        cls = self._make_cls({})
+        cls._from_pretrained_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch(
+                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                return_value={
+                    "linear.weight": torch.bfloat16,
+                    "norm.weight": torch.float32,
+                },
+            ),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            _init_model(
+                cls,
+                "test-model",
+                attn_implementation="eager",
+                torch_dtype=torch.float32,
+                quantization_config=None,
+                force_hf=True,
+            )
+
+        assert fake_model.linear.weight.dtype == torch.float32
+        assert fake_model.norm.weight.dtype == torch.float32
+        # Storage was upcast to fp32, but the checkpoint's original (compute) dtype is
+        # recorded so downstream sharding can keep the bulk in bf16 compute.
+        assert fake_model.linear.weight._hf_compute_dtype == torch.bfloat16
+        assert fake_model.norm.weight._hf_compute_dtype == torch.float32
+
+    def test_force_hf_pretrained_explicit_bf16_preserves_intrinsic_fp32(self):
+        """Explicit bf16 request keeps bf16 params bf16 but preserves intrinsically-fp32 params."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 2, bias=False)
+                self.norm = torch.nn.LayerNorm(2)
+
+        fake_config = FakeConfig()
+        fake_model = FakeModel()
+        fake_model.linear.to(torch.bfloat16)
+        fake_model.norm.to(torch.float32)
+
+        cls = self._make_cls({})
+        cls._from_pretrained_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch(
+                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                return_value={
+                    "linear.weight": torch.bfloat16,
+                    "norm.weight": torch.float32,
+                },
+            ),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            _init_model(
+                cls,
+                "test-model",
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16,
+                quantization_config=None,
+                force_hf=True,
+            )
+
+        assert fake_model.linear.weight.dtype == torch.bfloat16
+        # promote(fp32, bf16) == fp32 -> intrinsically-fp32 checkpoint param survives.
+        assert fake_model.norm.weight.dtype == torch.float32
 
     def test_fallback_path_known_config_type(self):
         """Fallback (non-force_hf, no custom model) path: _model_mapping succeeds."""
@@ -1061,6 +1253,23 @@ class TestFromPretrainedSafetensorsFallback:
                 )
         assert NeMoAutoModelForCausalLM.__name__ == original_name
 
+    def test_aliases_and_retries_on_unrecognized_config_error(self):
+        """Unrecognized-config-class ValueError triggers auto_map alias + retry."""
+        patched_cfg = MagicMock()
+        sentinel = MagicMock()
+        error = ValueError("Unrecognized configuration class <class 'Foo'> for AutoModelForCausalLM")
+        with self._patch_parent_fp([error, sentinel]) as calls:
+            with patch(
+                "nemo_automodel._transformers.auto_model._alias_remote_auto_map_for_target",
+                return_value=patched_cfg,
+            ) as mock_alias:
+                result = NeMoAutoModelForCausalLM._from_pretrained_parent_class("test-model", trust_remote_code=True)
+        assert result is sentinel
+        assert len(calls) == 2
+        # Retry passes the patched config.
+        assert calls[1].get("config") is patched_cfg
+        mock_alias.assert_called_once()
+
 
 class TestBuildModelRetryDepth:
     """Tests for _build_model retry depth limiting (issue #1510)."""
@@ -1146,6 +1355,40 @@ class TestBuildModelRetryDepth:
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
             assert result is sentinel_model
             assert mock_init.call_count == 2
+
+    def test_build_model_applies_runtime_patches_before_infrastructure(self):
+        """Model runtime hooks run after construction and before sharding/checkpoint infra."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        order = []
+
+        def fake_runtime_patches(model, mesh):
+            order.append("runtime_patches")
+            return model
+
+        def fake_apply_infrastructure(*args, **kwargs):
+            order.append("infrastructure")
+            return sentinel_model
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model", return_value=(False, sentinel_model)),
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_runtime_patches", side_effect=fake_runtime_patches
+            ),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_infrastructure",
+                side_effect=fake_apply_infrastructure,
+            ),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+
+        assert result is sentinel_model
+        assert order == ["runtime_patches", "infrastructure"]
 
     def test_meta_tensor_runtime_error_retries_without_meta_device(self):
         """RuntimeError with 'meta tensors' triggers retry without meta device."""

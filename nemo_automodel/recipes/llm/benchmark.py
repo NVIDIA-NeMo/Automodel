@@ -43,7 +43,11 @@ def _infer_vocab_size(model_cfg):
     from transformers import AutoConfig
 
     config_section = model_cfg.config
-    trust_remote_code = getattr(config_section, "trust_remote_code", False)
+    # Recipes may set trust_remote_code either at the model level (nemo_automodel
+    # convention) or nested under `config` -- accept either.
+    trust_remote_code = getattr(model_cfg, "trust_remote_code", False) or getattr(
+        config_section, "trust_remote_code", False
+    )
 
     # Use the config's _target_ if it's a custom config class (e.g. DeepseekV32Config)
     config_target = getattr(config_section, "_target_", None)
@@ -52,7 +56,13 @@ def _infer_vocab_size(model_cfg):
     if config_target is not None and callable(config_target):
         target_name = getattr(config_target, "__qualname__", "")
         if "AutoConfig" not in target_name:
-            model_config = config_target.from_pretrained(config_section.pretrained_model_name_or_path)
+            if hasattr(config_target, "from_pretrained"):
+                # `_target_` resolved to a config class; call its classmethod.
+                model_config = config_target.from_pretrained(config_section.pretrained_model_name_or_path)
+            else:
+                # `_target_` already resolved to the factory itself
+                # (e.g. `DeepseekV32Config.from_pretrained`); invoke it directly.
+                model_config = config_target(config_section.pretrained_model_name_or_path)
     elif isinstance(config_target, str) and "AutoConfig" not in config_target:
         import importlib
 
@@ -214,7 +224,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Get benchmarking config
         steps = self._bench_steps
         warmup_steps = self._bench_warmup_steps
-        local_batch_size = self.cfg.step_scheduler.local_batch_size
+        local_batch_size = self.cfg.get("step_scheduler.local_batch_size")
         global_batch_size = self.cfg.step_scheduler.global_batch_size
 
         nsys_start = self._bench_nsys_start
@@ -439,7 +449,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "peak_tflops": peak_tflops,
                 "world_size": self.dist_env.world_size,
                 "global_batch_size": self.cfg.step_scheduler.global_batch_size,
-                "local_batch_size": self.cfg.step_scheduler.local_batch_size,
+                "local_batch_size": self.cfg.get("step_scheduler.local_batch_size"),
                 "seq_len": self._bench_seq_len,
             }
 
@@ -463,7 +473,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         ["Peak TFLOPs", peak_tflops],
                         ["World Size", self.dist_env.world_size],
                         ["Global Batch Size", self.cfg.step_scheduler.global_batch_size],
-                        ["Local Batch Size", self.cfg.step_scheduler.local_batch_size],
+                        ["Local Batch Size", self.cfg.get("step_scheduler.local_batch_size")],
                         ["Sequence Length", self._bench_seq_len],
                     ],
                 )
@@ -501,7 +511,7 @@ def main(config_path=None):
     Loads the configuration, sets up the recipe, and runs the benchmark.
     """
     if config_path is None:
-        # Default to moonlight_16b_torch.yaml in examples/benchmark/configs
+        # Default to moonlight_16b_torch.yaml in examples/llm_benchmark/moonlight
         config_path = (
             pathlib.Path(__file__).parent.parent.parent.resolve()
             / "examples"

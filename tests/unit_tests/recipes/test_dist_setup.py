@@ -18,11 +18,12 @@ Typed validation tests live in ``tests/unit_tests/distributed/test_mesh.py``.
 """
 
 import pytest
+import torch
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
-from nemo_automodel.recipes._dist_setup import parse_distributed_section
+from nemo_automodel.recipes._dist_setup import parse_distributed_section, setup_distributed
 
 # ---------------------------------------------------------------------------
 # Basic dict parsing
@@ -138,6 +139,30 @@ class TestPipeline:
     def test_pp_enabled_false_when_pp_eq_1(self):
         assert parse_distributed_section({"pp_size": 1})["pp_enabled"] is False
 
+    def test_pipeline_dtype_defaults_to_mp_policy_output_dtype(self):
+        """Unset pipeline.dtype is derived from the FSDP mp_policy output dtype (bf16 default)."""
+        result = parse_distributed_section({"pp_size": 2})
+        assert result["pipeline_config"].dtype == torch.bfloat16
+
+    def test_pipeline_dtype_explicit_match_kept(self, caplog):
+        cfg = {"pp_size": 2, "pipeline": {"dtype": "bfloat16"}}
+        with caplog.at_level("WARNING"):
+            result = parse_distributed_section(cfg)
+        assert result["pipeline_config"].dtype == torch.bfloat16
+        assert "does not match" not in caplog.text
+
+    def test_pipeline_dtype_explicit_mismatch_warns_and_kept(self, caplog):
+        cfg = {"pp_size": 2, "pipeline": {"dtype": "float32"}}
+        with caplog.at_level("WARNING"):
+            result = parse_distributed_section(cfg)
+        # Explicit value is honored (not overridden) but a mismatch warning fires.
+        assert result["pipeline_config"].dtype == torch.float32
+        assert "does not match" in caplog.text
+
+    def test_pipeline_dtype_not_set_when_pp_eq_1(self):
+        result = parse_distributed_section({"pp_size": 1})
+        assert result["pipeline_config"] is None
+
 
 # ---------------------------------------------------------------------------
 # MoE sub-config parsing
@@ -249,6 +274,34 @@ class TestActivationCheckpointingRouting:
     def test_works_with_ddp(self):
         result = parse_distributed_section({"strategy": "ddp", "activation_checkpointing": True})
         assert result["strategy_config"].activation_checkpointing is True
+
+    def test_selective_routes_to_fsdp2_strategy_when_no_ep(self):
+        result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "selective", "ep_size": 1})
+        assert result["strategy_config"].activation_checkpointing == "selective"
+        assert result["activation_checkpointing"] == "selective"
+
+    def test_full_string_routes_as_true(self):
+        result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "full"})
+        assert result["strategy_config"].activation_checkpointing is True
+        assert result["activation_checkpointing"] is True
+
+    def test_selective_allowed_for_ep(self):
+        # Selective AC is now supported with expert parallelism via the MoE
+        # parallelizer. For EP it is kept off the strategy config and carried on
+        # the parsed value (consumed by parallelize_model -> apply_ac).
+        result = parse_distributed_section(
+            {"strategy": "fsdp2", "activation_checkpointing": "selective", "ep_size": 2, "moe": {}}
+        )
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["activation_checkpointing"] == "selective"
+
+    def test_selective_rejected_for_non_fsdp2(self):
+        with pytest.raises(ValueError, match="FSDP2"):
+            parse_distributed_section({"strategy": "ddp", "activation_checkpointing": "selective"})
+
+    def test_unknown_activation_checkpointing_mode_rejected(self):
+        with pytest.raises(ValueError, match="activation_checkpointing"):
+            parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "sometimes"})
 
 
 # ---------------------------------------------------------------------------
@@ -394,3 +447,64 @@ class TestNoneParallelismValues:
     def test_ep_size_none_discards_moe_dict(self):
         result = parse_distributed_section({"ep_size": None, "moe": {"ignore_router_for_ac": True}})
         assert result["moe_config"] is None
+
+
+# ---------------------------------------------------------------------------
+# setup_distributed: world_size auto-detection
+# ---------------------------------------------------------------------------
+
+
+class TestSetupDistributedWorldSizeAutoDetect:
+    """``setup_distributed`` accepts an optional ``world_size`` and auto-detects
+    it from ``torch.distributed`` / ``WORLD_SIZE`` when not provided."""
+
+    @pytest.fixture
+    def patched_mesh(self, monkeypatch):
+        """Stub create_device_mesh to capture the world_size it receives."""
+        captured: dict = {}
+
+        def fake_create_device_mesh(strategy_config, **kwargs):
+            captured.update(kwargs)
+            return ("device_mesh_sentinel", None)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.mesh_utils.create_device_mesh",
+            fake_create_device_mesh,
+        )
+        # MeshContext.__post_init__ runs full validation against real meshes; bypass it.
+        monkeypatch.setattr(
+            "nemo_automodel.recipes._dist_setup.MeshContext",
+            lambda **kw: kw,
+        )
+        return captured
+
+    def test_explicit_world_size_used(self, patched_mesh):
+        setup_distributed({"strategy": "fsdp2"}, world_size=4)
+        assert patched_mesh["world_size"] == 4
+
+    def test_auto_detect_from_env(self, monkeypatch, patched_mesh):
+        """Falls back to WORLD_SIZE env var when torch.distributed is not initialized."""
+        import torch
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        monkeypatch.setenv("WORLD_SIZE", "8")
+        setup_distributed({"strategy": "fsdp2"})
+        assert patched_mesh["world_size"] == 8
+
+    def test_auto_detect_defaults_to_one(self, monkeypatch, patched_mesh):
+        """Falls back to 1 when neither torch.distributed nor WORLD_SIZE is set."""
+        import torch
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        monkeypatch.delenv("WORLD_SIZE", raising=False)
+        setup_distributed({"strategy": "fsdp2"})
+        assert patched_mesh["world_size"] == 1
+
+    def test_auto_detect_from_torch_distributed(self, monkeypatch, patched_mesh):
+        """Prefers torch.distributed.get_world_size() when initialized."""
+        import torch
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 16)
+        setup_distributed({"strategy": "fsdp2"})
+        assert patched_mesh["world_size"] == 16

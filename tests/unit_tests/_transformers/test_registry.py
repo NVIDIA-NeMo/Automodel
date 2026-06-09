@@ -172,6 +172,32 @@ def test_default_registry_has_static_entries():
         assert arch_name in inst.model_arch_name_to_cls.keys()
 
 
+def test_step3p7_registry_and_custom_config_registration():
+    """Step3p7 VLM support is available through the lazy registry and AutoConfig."""
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS, MODEL_ARCH_MAPPING
+
+    assert MODEL_ARCH_MAPPING["Step3p7ForConditionalGeneration"] == (
+        "nemo_automodel.components.models.step3p7.model",
+        "Step3p7ForConditionalGeneration",
+    )
+    assert MODEL_ARCH_MAPPING["Step3p6ForConditionalGeneration"] == (
+        "nemo_automodel.components.models.step3p7.model",
+        "Step3p7ForConditionalGeneration",
+    )
+    assert _CUSTOM_CONFIG_REGISTRATIONS["step3p5v"] == (
+        "nemo_automodel.components.models.step3p7.configuration_step3p7",
+        "Step3p5VConfig",
+    )
+    assert _CUSTOM_CONFIG_REGISTRATIONS["step3p7"] == (
+        "nemo_automodel.components.models.step3p7.configuration_step3p7",
+        "Step3p7Config",
+    )
+    assert CONFIG_MAPPING["step3p5v"].__name__ == "Step3p5VConfig"
+    assert CONFIG_MAPPING["step3p7"].__name__ == "Step3p7Config"
+
+
 def test_resolve_custom_model_cls_found():
     """resolve_custom_model_cls returns the class when it exists and has no supports_config."""
     from nemo_automodel._transformers import registry as reg
@@ -275,6 +301,33 @@ def test_kimi_k25_arch_alias_in_model_arch_mapping():
     )
     module_path, cls_name = MODEL_ARCH_MAPPING["KimiK25ForConditionalGeneration"]
     assert cls_name == "KimiK25VLForConditionalGeneration"
+
+
+def test_deepseek_v4_registered_in_arch_mapping():
+    """DeepseekV4ForCausalLM must be registered in MODEL_ARCH_MAPPING."""
+    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+
+    assert "DeepseekV4ForCausalLM" in MODEL_ARCH_MAPPING, (
+        "DeepseekV4ForCausalLM missing from MODEL_ARCH_MAPPING. "
+        "DSV4 checkpoints declare this architecture and need it routed to the "
+        "in-tree model implementation."
+    )
+    module_path, cls_name = MODEL_ARCH_MAPPING["DeepseekV4ForCausalLM"]
+    assert module_path == "nemo_automodel.components.models.deepseek_v4.model"
+    assert cls_name == "DeepseekV4ForCausalLM"
+
+
+def test_deepseek_v4_in_custom_config_registrations():
+    """deepseek_v4 model_type must be registered in _CUSTOM_CONFIG_REGISTRATIONS."""
+    from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS
+
+    assert "deepseek_v4" in _CUSTOM_CONFIG_REGISTRATIONS, (
+        "deepseek_v4 must be in _CUSTOM_CONFIG_REGISTRATIONS so AutoConfig.from_pretrained "
+        "can resolve DSV4 configs without trust_remote_code=True."
+    )
+    module_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS["deepseek_v4"]
+    assert module_path == "nemo_automodel.components.models.deepseek_v4.config"
+    assert cls_name == "DeepseekV4Config"
 
 
 def test_all_model_folders_registered_in_auto_map():

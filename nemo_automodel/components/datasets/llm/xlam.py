@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 
 from datasets import load_dataset
 
+from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 from nemo_automodel.components.datasets.llm.formatting_utils import _add_pad_token, format_chat_template
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,12 @@ def _convert_tool_calls(raw_calls: List[Dict], example_id: Optional[int] = None)
             logger.warning("Skipping call without name: %s", call)
             continue
         arguments = call.get("arguments", "")
+        if not isinstance(arguments, str):
+            # OpenAI tool calling format requires `function.arguments` to be a
+            # JSON-encoded string. Upstream xLAM uses string arguments, but
+            # derivative datasets may store them as dicts; serialize so the
+            # rendered chat template emits a consistent, valid JSON payload.
+            arguments = json.dumps(arguments, ensure_ascii=False)
 
         call_id = f"call_{example_id}_{idx}" if example_id is not None else f"call_{idx}"
         tool_calls.append(
@@ -109,7 +116,6 @@ def _convert_tool_calls(raw_calls: List[Dict], example_id: Optional[int] = None)
                 "type": "function",
                 "function": {
                     "name": name,
-                    # Keep arguments as JSON string per OpenAI tool calling format.
                     "arguments": arguments,
                 },
             }
@@ -192,8 +198,4 @@ def make_xlam_dataset(
         truncation,
     )
 
-    return dataset.map(
-        fmt_fn,
-        batched=False,
-        remove_columns=["id", "query", "answers", "tools"],
-    )
+    return LazyMappedDataset(dataset, fmt_fn)

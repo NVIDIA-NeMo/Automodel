@@ -106,7 +106,7 @@ class KimiVLConfig(PretrainedConfig):
         return output
 
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
 from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
@@ -317,8 +317,11 @@ class MoonVisionPatchEmbed(nn.Module):
         return self.pos_emb(x, grid_hws)
 
 
-def patch_merger(x: torch.Tensor, grid_hws: torch.Tensor, merge_kernel_size: List[int] = [2, 2]) -> List[torch.Tensor]:
+def patch_merger(
+    x: torch.Tensor, grid_hws: torch.Tensor, merge_kernel_size: List[int] | None = None
+) -> List[torch.Tensor]:
     """Merge patches."""
+    merge_kernel_size = [2, 2] if merge_kernel_size is None else merge_kernel_size
     d_model = x.size(-1)
     outputs = []
     pre_sum = 0
@@ -628,6 +631,10 @@ class KimiVLModel(nn.Module):
 class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """KimiVL model with backend-aware DeepseekV3 language model."""
 
+    # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
+    # patch_hf_model_for_pp must not replace it under PP.
+    _pp_keep_self_forward: bool = True
+
     @classmethod
     def from_config(cls, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):
         return cls(config, moe_config=moe_config, backend=backend, **kwargs)
@@ -692,13 +699,21 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         labels=None,
         use_cache=None,
         output_attentions=None,
-        output_hidden_states=None,
+        output_hidden_states: Optional[bool] = None,
         return_dict=None,
         pixel_values=None,
         image_grid_hws=None,
         padding_mask=None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ):
+        # Resolve from the text/decoder sub-config (the language model produces text logits).
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config.text_config, "output_hidden_states", False)
+        )
+
         # Retrieve pre-chunked VLM inputs from model attributes
         # This allows native forward to work with pipeline parallelism
         # finetune.py stores chunks on model, we retrieve them here per microbatch
@@ -731,7 +746,7 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
             **kwargs,
         )
 
-        logits = self.lm_head(hidden_states) if self.lm_head is not None else hidden_states
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None and self.lm_head is not None:

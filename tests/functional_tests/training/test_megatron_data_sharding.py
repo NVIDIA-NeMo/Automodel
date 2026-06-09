@@ -18,22 +18,28 @@ import torch
 import torch.distributed as dist
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.llm.train_ft import build_distributed, build_dataloader
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes.llm.train_ft import build_dataloader
 
 """
 This test is to make sure that JSONL dataset can be checkpointed and loaded correctly.
 """
+
 
 def gather_helper(input_tensor):
     tensor_list = [torch.zeros_like(input_tensor) for _ in range(2)]
     dist.all_gather(tensor_list, input_tensor)
     return tensor_list
 
+
 def test_megatron_data_sharding():
     cfg_path = Path(__file__).parents[4] / "examples" / "llm_pretrain" / "megatron_pretrain_gpt2.yaml"
     cfg = parse_args_and_load_config(cfg_path)
-    dist_env = build_distributed(cfg.get("dist_env", {}))
+    dist_env = initialize_distributed(
+        backend=cfg.get("dist_env", {}).get("backend", "nccl"),
+        timeout_minutes=cfg.get("dist_env", {}).get("timeout_minutes", 1),
+    )
     dist_setup = setup_distributed(cfg, world_size=dist_env.world_size)
     device_mesh = dist_setup.device_mesh
     dp_rank = device_mesh["dp"].get_local_rank()
@@ -64,7 +70,9 @@ def test_megatron_data_sharding():
     batch_to_test = {k: v.to(dist.get_rank()) for k, v in batch_to_test.items()}
 
     # ensure that labels are inputs left shifted by 1
-    assert torch.all(batch_to_test["labels"][:, :-1] == batch_to_test["input_ids"][:, 1:]), f"Labels are not inputs left shifted by 1"
+    assert torch.all(batch_to_test["labels"][:, :-1] == batch_to_test["input_ids"][:, 1:]), (
+        "Labels are not inputs left shifted by 1"
+    )
 
     dist.barrier()
     del dataset
@@ -72,8 +80,8 @@ def test_megatron_data_sharding():
     for key in ("input_ids", "labels"):
         gathered_tensors = gather_helper(batch_to_test[key])
         if tp_world_size > 1:
-            assert torch.all(gathered_tensors[0] == gathered_tensors[1]), f"Expected the same tensors for TP > 1"
+            assert torch.all(gathered_tensors[0] == gathered_tensors[1]), "Expected the same tensors for TP > 1"
         else:
-            assert torch.any(gathered_tensors[0] != gathered_tensors[1]), f"Expected different tensors for DP > 1"
+            assert torch.any(gathered_tensors[0] != gathered_tensors[1]), "Expected different tensors for DP > 1"
 
     dist.barrier()

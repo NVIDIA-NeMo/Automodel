@@ -22,7 +22,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.loss.kd_loss import KDLoss, _infer_tp_group_from_dtensor, _kl_forward_tp
+from nemo_automodel.components.loss.kd_loss import (
+    KDLoss,
+    _infer_tp_group_from_dtensor,
+    _kl_forward_chunked,
+    _kl_forward_tp,
+)
 
 # ---------------------------------------------------------------------------
 # Reference implementation (no TP, no T² scaling applied yet)
@@ -386,6 +391,71 @@ def test_pp_metric_buffers_normalize_like_non_pp_metrics():
 
     assert torch.allclose(ce_metric, expected_ce, atol=1e-6)
     assert torch.allclose(kd_metric, expected_kd, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Chunked KD loss
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 5, 128])
+def test_kd_loss_chunked_matches_unchunked(chunk_size):
+    """Chunked computation produces the same loss as the non-chunked path."""
+    torch.manual_seed(42)
+    student_logits = torch.randn(5, 20, dtype=torch.float32)
+    teacher_logits = torch.randn(5, 20, dtype=torch.float32)
+    labels = torch.tensor([0, 1, -100, 3, 4])
+
+    loss_unchunked = KDLoss()(student_logits, teacher_logits, labels)
+    loss_chunked = KDLoss(chunk_size=chunk_size)(student_logits, teacher_logits, labels)
+
+    assert torch.allclose(loss_unchunked, loss_chunked, atol=1e-6), (
+        f"Unchunked {loss_unchunked.item():.6f} != chunked (size={chunk_size}) {loss_chunked.item():.6f}"
+    )
+
+
+def test_kl_forward_chunked_matches_full():
+    """_kl_forward_chunked matches the non-chunked softmax computation."""
+    torch.manual_seed(7)
+    t_logits = torch.randn(8, 16, dtype=torch.float32)
+    s_logits = torch.randn(8, 16, dtype=torch.float32)
+
+    teacher_prob = F.softmax(t_logits, dim=-1)
+    student_logprob = F.log_softmax(s_logits, dim=-1)
+    ref = (teacher_prob * student_logprob).sum(-1)
+
+    chunked = _kl_forward_chunked(t_logits, s_logits, chunk_size=3)
+
+    assert torch.allclose(chunked, ref, atol=1e-6), f"max diff: {(chunked - ref).abs().max().item()}"
+
+
+def test_kd_loss_chunked_with_temperature():
+    """Chunked path with temperature scaling matches unchunked."""
+    torch.manual_seed(99)
+    student_logits = torch.randn(6, 10, dtype=torch.float32)
+    teacher_logits = torch.randn(6, 10, dtype=torch.float32)
+    labels = torch.tensor([0, 1, -100, 3, 4, 5])
+    temperature = 2.5
+
+    loss_unchunked = KDLoss(temperature=temperature)(student_logits, teacher_logits, labels)
+    loss_chunked = KDLoss(temperature=temperature, chunk_size=2)(student_logits, teacher_logits, labels)
+
+    assert torch.allclose(loss_unchunked, loss_chunked, atol=1e-5), (
+        f"Unchunked {loss_unchunked.item():.6f} != chunked {loss_chunked.item():.6f}"
+    )
+
+
+def test_kd_loss_chunked_with_num_batch_labels():
+    """Chunked path with num_batch_labels matches unchunked."""
+    torch.manual_seed(11)
+    student_logits = torch.randn(4, 8, dtype=torch.float32)
+    teacher_logits = torch.randn(4, 8, dtype=torch.float32)
+    labels = torch.tensor([0, 1, 2, 3])
+
+    loss_unchunked = KDLoss()(student_logits, teacher_logits, labels, num_batch_labels=10)
+    loss_chunked = KDLoss(chunk_size=2)(student_logits, teacher_logits, labels, num_batch_labels=10)
+
+    assert torch.allclose(loss_unchunked, loss_chunked, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

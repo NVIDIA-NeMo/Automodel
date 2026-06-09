@@ -36,12 +36,13 @@ Usage:
 """
 
 from dataclasses import InitVar, dataclass, fields
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 # Type alias for API signature
+ActivationCheckpointingMode = Union[bool, Literal["selective"]]
 DistributedConfig = Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]
 
 
@@ -63,21 +64,28 @@ class FSDP2Config:
             (non-packed) training only. Disable if using packed-sequence training
             (position_ids that reset to 0 mid-sequence). Default ``False``.
         mp_policy (Optional[MixedPrecisionPolicy]): MixedPrecisionPolicy for FSDP2.
-            Can be configured from YAML using the ``_target_`` pattern::
+            If ``None`` (default), uses bf16 forward/backward compute with fp32
+            gradient reduction. Pair this with ``model.torch_dtype: float32`` for
+            the Megatron-style fp32 master-weights pattern. Override from YAML
+            using the ``_target_`` pattern::
 
                 mp_policy:
                   _target_: torch.distributed.fsdp.MixedPrecisionPolicy
                   param_dtype: bfloat16
                   reduce_dtype: float32
-                  output_dtype: float32
+                  output_dtype: bfloat16
 
+            See ``docs/guides/mixed-precision-training.md`` for the full set of recommended
+            patterns and the bf16-storage trap.
         offload_policy (Optional[CPUOffloadPolicy]): CPUOffloadPolicy for CPU offloading.
         autocast_dtype (Optional[torch.dtype]): If set, wraps the forward pass in
             ``torch.autocast(device_type="cuda", dtype=autocast_dtype)``.  Use with
             ``output_dtype=float32`` in mp_policy to keep the residual stream in fp32
             while running matmuls in lower precision.  Set to ``None`` to disable.
             Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
-        activation_checkpointing (bool): Enable activation checkpointing.
+        activation_checkpointing (bool | "selective"): Enable activation checkpointing. ``True`` keeps the existing
+            full activation checkpointing behavior. ``"selective"`` wraps transformer blocks with PyTorch selective
+            activation checkpointing.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
         backend (str): Distributed backend.
         enable_async_tensor_parallel (bool): Enable async tensor parallelism via
@@ -104,7 +112,7 @@ class FSDP2Config:
     mp_policy: Optional[MixedPrecisionPolicy] = None
     offload_policy: Optional[CPUOffloadPolicy] = None
     autocast_dtype: Optional[torch.dtype] = None
-    activation_checkpointing: bool = False
+    activation_checkpointing: ActivationCheckpointingMode = False
     defer_fsdp_grad_sync: bool = True
     backend: str = "nccl"
     enable_async_tensor_parallel: bool = False
@@ -115,9 +123,12 @@ class FSDP2Config:
 
     def __post_init__(self):
         if self.mp_policy is None:
+            # FSDP2 default: bf16 compute and fp32 gradient reduction. Pair with
+            # ``model.torch_dtype: float32`` for fp32 optimizer state. See
+            # ``docs/guides/mixed-precision-training.md``.
             self.mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
-                reduce_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
                 output_dtype=torch.bfloat16,
                 cast_forward_inputs=True,
             )
@@ -200,10 +211,13 @@ class DDPConfig:
     Attributes:
         activation_checkpointing (bool): Enable activation checkpointing if True.
         backend (str): Distributed backend, e.g. 'nccl' or 'gloo'.
+        find_unused_parameters (bool): Forwarded to PyTorch DDP for models with
+            conditionally unused trainable parameters.
     """
 
     activation_checkpointing: bool = False
     backend: str = "nccl"
+    find_unused_parameters: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""

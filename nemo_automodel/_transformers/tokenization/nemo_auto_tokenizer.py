@@ -22,6 +22,11 @@ from jinja2.exceptions import TemplateError
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import BatchEncoding
 
+try:
+    from huggingface_hub.errors import StrictDataclassClassValidationError
+except ImportError:
+    StrictDataclassClassValidationError = ValueError
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,6 +98,36 @@ def _read_tokenizer_class(pretrained_model_name_or_path, **kwargs):
     if config is None:
         return None
     return config.get("tokenizer_class")
+
+
+def _retry_tokenizer_via_auto_map(pretrained_model_name_or_path, *args, **kwargs):
+    """Load a tokenizer by resolving ``auto_map['AutoTokenizer']`` directly.
+
+    Fallback for transformers>=5, where models whose tokenizer_config.json only
+    registers a slow ``PreTrainedTokenizer`` subclass (e.g. Moonlight's
+    TikTokenTokenizer) fail in ``AutoTokenizer.from_pretrained`` with
+    "Couldn't instantiate the backend tokenizer ...". Bypasses AutoTokenizer
+    by resolving the class from the remote module itself.
+
+    Returns ``None`` when ``auto_map`` has no ``AutoTokenizer`` entry, so the
+    caller can re-raise the original error.
+    """
+    config = _read_tokenizer_config(pretrained_model_name_or_path, **kwargs)
+    if config is None:
+        return None
+    ref = (config.get("auto_map") or {}).get("AutoTokenizer")
+    if isinstance(ref, (list, tuple)):
+        ref = next((r for r in ref if r), None)
+    if not ref:
+        return None
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        cls = get_class_from_dynamic_module(ref, str(pretrained_model_name_or_path))
+    except Exception:
+        logger.debug("Failed to resolve tokenizer class from auto_map", exc_info=True)
+        return None
+    return cls.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
 
 
 def _resolve_source_dir(pretrained_model_name_or_path, **kwargs):
@@ -326,7 +361,31 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             add_bos_token: Whether to add BOS token (default: True)
             add_eos_token: Whether to add EOS token (default: True)
         """
-        tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        try:
+            tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        except (ValueError, StrictDataclassClassValidationError) as e:
+            err = str(e)
+            if "num_hidden_layers" in err and ("layer_types" in err or "layer types" in err):
+                # AutoTokenizer.from_pretrained internally calls AutoConfig.from_pretrained,
+                # so configs whose layer_types length differs from num_hidden_layers (e.g.
+                # stepfun-ai/Step-3.5-Flash) trip validate_layer_type before the tokenizer
+                # is built. The tokenizer itself doesn't depend on layer_types, so relax
+                # the validator globally and retry.
+                from nemo_automodel._transformers.v4_patches.layer_types import relax_layer_types_validator
+
+                relax_layer_types_validator()
+                tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+            elif "backend tokenizer" in err and kwargs.get("trust_remote_code"):
+                # transformers>=5 removed the slow-only tokenizer path, so models whose
+                # auto_map registers only a slow PreTrainedTokenizer subclass (e.g.
+                # Moonlight's TikTokenTokenizer) fail with a misleading "install
+                # sentencepiece or tiktoken" message even when both are installed.
+                # Retry by resolving the class from the remote module directly.
+                tokenizer = _retry_tokenizer_via_auto_map(pretrained_model_name_or_path, *args, **kwargs)
+                if tokenizer is None:
+                    raise
+            else:
+                raise
 
         # Convert TikToken-based tokenizers to fast (Rust-backed) tokenizers so that
         # char_to_token() works natively for {% generation %} mask computation.
@@ -369,7 +428,7 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
 
         tokenizer._source_dir = _resolve_source_dir(pretrained_model_name_or_path, **kwargs)
 
-        tokenizer.__class__ = type(cls.__name__, (cls, base_tokenizer_cls), {})
+        tokenizer.__class__ = _enforced_tokenizer_class(base_tokenizer_cls)
         return tokenizer
 
     def apply_chat_template(self, conversation, *args, **kwargs):
@@ -460,6 +519,52 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             _restore_tokenizer_config(save_directory, original_config)
 
         return result
+
+    def __reduce__(self):
+        # The runtime class is a dynamically mixed ``(wrapper, base)`` type that
+        # pickle cannot locate by qualified name, so the default reducer fails
+        # with "it's not the same object as ...". This breaks DataLoader workers
+        # started with the ``forkserver`` method, which pickle their arguments
+        # (the dataset holds the tokenizer). Reconstruct through the base class
+        # instead -- it is importable by reference -- and re-derive the mixed
+        # class on the far side, then let ``__setstate__`` restore the state.
+        # Falls back to the default for instances without a captured base class.
+        base_class = getattr(self, "_base_class", None)
+        if base_class is None:
+            return super().__reduce__()
+        get_state = getattr(self, "__getstate__", None)
+        state = get_state() if get_state is not None else dict(self.__dict__)
+        return (_rebuild_enforced_tokenizer, (base_class,), state)
+
+
+# The BOS/EOS wrapper is mixed over the concrete HF tokenizer class at runtime
+# (``from_pretrained`` cannot know the base class ahead of time). Cache one mixed
+# class per base so repeated loads reuse it and every instance of a given base
+# shares an identity (stable ``isinstance`` / pickle reconstruction).
+_ENFORCED_TOKENIZER_CLASSES: dict[type, type] = {}
+
+
+def _enforced_tokenizer_class(base_tokenizer_cls: type) -> type:
+    """Return the cached BOS/EOS wrapper class mixed over ``base_tokenizer_cls``."""
+    mixed = _ENFORCED_TOKENIZER_CLASSES.get(base_tokenizer_cls)
+    if mixed is None:
+        mixed = type(
+            NeMoAutoTokenizerWithBosEosEnforced.__name__,
+            (NeMoAutoTokenizerWithBosEosEnforced, base_tokenizer_cls),
+            {},
+        )
+        _ENFORCED_TOKENIZER_CLASSES[base_tokenizer_cls] = mixed
+    return mixed
+
+
+def _rebuild_enforced_tokenizer(base_tokenizer_cls: type):
+    """Recreate a blank enforced-tokenizer instance while unpickling.
+
+    Used by ``NeMoAutoTokenizerWithBosEosEnforced.__reduce__``; pickle restores
+    the tokenizer state onto the returned instance via ``__setstate__``.
+    """
+    mixed = _enforced_tokenizer_class(base_tokenizer_cls)
+    return mixed.__new__(mixed)
 
 
 def _add_token(tokenized, value, position, key):

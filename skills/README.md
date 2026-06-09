@@ -1,28 +1,39 @@
 # Skills
 
-Reusable task guides for AI coding agents working in this repo.
+Task guides for AI coding agents using or developing NeMo AutoModel.
 
-Shared skills live here (`skills/`) so they don't conflict with anyone's
-personal `.claude/skills/` directory.
+Skills are split into two locations:
+
+- `skills/` contains customer-facing skills that can sync to the public catalog.
+- `.agents/contributor-skills/` contains contributor-facing workflow skills that
+  stay local to this repository and are not synced externally.
 
 ## Usage
 
-### Claude Code
+Public skills are synced to the global Claude Code skill registry via CI and
+are available to AI agents as invocable slash commands without any extra flags.
 
-Launch Claude Code with the `--add-dir` flag to auto-register the shared
-skills as slash commands:
+To invoke a skill manually, use `/<skill-name>` in your Claude Code session.
 
-```bash
-claude --add-dir skills
-```
-
-## Available skills
+## Public Catalog Skills
 
 | Skill | Description |
 |---|---|
-| `model-onboarding` | Onboard a new model family (LLM, VLM, MoE, etc.) |
-| `developer-guide` | Environment setup and day-to-day dev workflow |
-| `recipe-development` | Create and modify training/eval recipes |
+| `nemo-automodel-model-onboarding` | Onboard a new model family (LLM, VLM, MoE, etc.) |
+| `nemo-automodel-recipe-development` | Create and modify training/eval recipes |
+| `nemo-automodel-distributed-training` | FSDP2, HSDP, pipeline/context parallelism |
+| `nemo-automodel-launcher-config` | Slurm and SkyPilot job submission |
+
+## Contributor Skills
+
+See [.agents/contributor-skills](../.agents/contributor-skills/README.md) for
+the contributor-facing skills.
+
+| Skill | Description |
+|---|---|
+| `build-and-dependency` | Container setup, uv package management, environment variables, CLI usage |
+| `cicd` | Commit/PR workflow, CI trigger mechanism, failure investigation |
+| `fern-docs` | Maintain the Fern docs site under `fern/`: pages, slugs, redirects, version aliases, library reference |
+| `linting-and-formatting` | ruff rules, type hints, docstrings, copyright headers, code review checklist |
 | `parity-testing` | Verify numerical correctness against references |
-| `distributed-training` | FSDP2, HSDP, pipeline/context parallelism |
-| `launcher-config` | Slurm and SkyPilot job submission |
+| `testing` | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |

@@ -33,6 +33,34 @@ from .text_to_video_dataset import TextToVideoDataset, collate_optional_video_fi
 logger = logging.getLogger(__name__)
 
 
+def _stack_or_pad_text_tensors(tensors: List[torch.Tensor], sequence_length_multiple: int = 1) -> torch.Tensor:
+    """Stack text tensors, padding variable sequence lengths on the first dimension."""
+    shapes = [tuple(tensor.shape) for tensor in tensors]
+    if len(set(shapes)) == 1 and (
+        sequence_length_multiple <= 1 or tensors[0].ndim == 0 or tensors[0].shape[0] % sequence_length_multiple == 0
+    ):
+        return torch.stack(tensors)
+
+    first = tensors[0]
+    if first.ndim == 0:
+        raise RuntimeError(f"Cannot pad scalar text tensors with shapes: {shapes}")
+
+    trailing_shape = tuple(first.shape[1:])
+    if any(tensor.ndim != first.ndim or tuple(tensor.shape[1:]) != trailing_shape for tensor in tensors):
+        raise RuntimeError(f"Cannot collate text tensors with incompatible shapes: {shapes}")
+
+    max_sequence_length = max(tensor.shape[0] for tensor in tensors)
+    if sequence_length_multiple > 1:
+        max_sequence_length = (
+            (max_sequence_length + sequence_length_multiple - 1) // sequence_length_multiple
+        ) * sequence_length_multiple
+    padded = first.new_zeros((len(tensors), max_sequence_length, *trailing_shape))
+    for index, tensor in enumerate(tensors):
+        padded[index, : tensor.shape[0], ...] = tensor
+
+    return padded
+
+
 def collate_fn_production(batch: List[Dict]) -> Dict:
     """Production collate function with verification."""
     # Verify all samples have same resolution
@@ -62,14 +90,16 @@ def collate_fn_production(batch: List[Dict]) -> Dict:
         "aspect_ratio": aspect_ratios,
     }
 
-    # Handle text encodings
-    if "clip_hidden" in batch[0]:
-        output["clip_hidden"] = torch.stack([item["clip_hidden"] for item in batch])
-        output["pooled_prompt_embeds"] = torch.stack([item["pooled_prompt_embeds"] for item in batch])
-        output["prompt_embeds"] = torch.stack([item["prompt_embeds"] for item in batch])
-    else:
-        output["clip_tokens"] = torch.stack([item["clip_tokens"] for item in batch])
-        output["t5_tokens"] = torch.stack([item["t5_tokens"] for item in batch])
+    # Handle text encodings — model-agnostic: stack whichever keys are present
+    variable_length_text_keys = {"clip_hidden", "prompt_embeds", "clip_tokens", "t5_tokens"}
+    for key in ("clip_hidden", "pooled_prompt_embeds", "prompt_embeds", "clip_tokens", "t5_tokens"):
+        if key in batch[0]:
+            tensors = [item[key] for item in batch]
+            if key in variable_length_text_keys:
+                sequence_length_multiple = 8 if key == "prompt_embeds" else 1
+                output[key] = _stack_or_pad_text_tensors(tensors, sequence_length_multiple=sequence_length_multiple)
+            else:
+                output[key] = torch.stack(tensors)
 
     return output
 
@@ -110,8 +140,9 @@ def collate_fn_text_to_image(batch: List[Dict]) -> Dict:
     if "prompt_embeds" in production_batch:
         # Pre-encoded text embeddings
         image_batch["text_embeddings"] = production_batch["prompt_embeds"]
-        image_batch["pooled_prompt_embeds"] = production_batch["pooled_prompt_embeds"]
-        # Also include CLIP hidden for models that need it
+        # Include optional model-specific fields if present
+        if "pooled_prompt_embeds" in production_batch:
+            image_batch["pooled_prompt_embeds"] = production_batch["pooled_prompt_embeds"]
         if "clip_hidden" in production_batch:
             image_batch["clip_hidden"] = production_batch["clip_hidden"]
     else:

@@ -12,13 +12,77 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 from transformers.modeling_utils import _get_resolved_checkpoint_files, load_state_dict
+
+
+def get_rank_safe() -> int:
+    """Return the current distributed rank, defaulting to 0 when not initialized."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return int(os.environ.get("RANK", "0"))
+
+
+def get_world_size_safe() -> int:
+    """Return the current distributed world size, defaulting to 1 when not initialized."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def is_rank_0() -> bool:
+    """Return True on the main rank."""
+    return get_rank_safe() == 0
+
+
+def estimate_tensor_bytes(tensor: torch.Tensor) -> int:
+    """Estimate logical bytes in a tensor without materializing it."""
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+def estimate_state_dict_bytes(state_dict: dict[str, torch.Tensor]) -> int | None:
+    """Estimate logical bytes in a state dict without materializing tensors."""
+    total = 0
+    try:
+        for tensor in state_dict.values():
+            total += estimate_tensor_bytes(tensor)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    return total
+
+
+def get_safetensors_index_total_size(index_path: str | None) -> int | None:
+    """Return the total checkpoint size recorded in a Hugging Face safetensors index."""
+    if index_path is None:
+        return None
+    index_file = Path(index_path)
+    if index_file.is_dir():
+        index_file = index_file / "model.safetensors.index.json"
+    try:
+        with open(index_file) as f:
+            index = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    total_size = index.get("metadata", {}).get("total_size")
+    return total_size if isinstance(total_size, int) else None
+
+
+def format_bytes(num_bytes: int) -> str:
+    """Format bytes as a human-readable GiB value."""
+    return f"{num_bytes / 1024**3:.1f} GiB"
+
+
+def format_output_file_count(count: int) -> str:
+    """Format the output shard count for user-facing log messages."""
+    return f"{count} output {'file' if count == 1 else 'files'}"
 
 
 def resolve_trust_remote_code(pretrained_model_name_or_path):
@@ -49,6 +113,7 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
     """
     non_tied_lm_head_models = {
         "Qwen3OmniMoeThinkerForConditionalGeneration",  # complicated config structure
+        "Qwen3VLMoeForConditionalGeneration",  # top-level lm_head is untied despite nested text config
     }
     model_class_name = type(model).__name__
     for m in non_tied_lm_head_models:
@@ -198,7 +263,19 @@ def has_local_tied_lm_head(model: nn.Module) -> bool:
         return False
     lm_head_weight, _ = get_lm_head_weight_and_name(model)
     input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
-    return lm_head_weight is not None and input_embeddings_weight is not None
+    if lm_head_weight is None or input_embeddings_weight is None:
+        return False
+    # Even when ``config.tie_word_embeddings`` is ``True``, refuse to treat
+    # the two as locally tied if their shapes disagree. This handles
+    # speculative-decoding draft models that intentionally keep a
+    # full-vocab ``embed_tokens`` but a shrunk-vocab ``lm_head`` (e.g.
+    # EAGLE-3 with ``draft_vocab_size < target_vocab_size``). Without this
+    # check the save path would drop ``lm_head.weight`` from the state
+    # dict and the load path would resurrect it from ``embed_tokens``,
+    # producing a strict-load shape mismatch on resume.
+    if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
+        return False
+    return True
 
 
 def materialize_missing_tied_lm_head(

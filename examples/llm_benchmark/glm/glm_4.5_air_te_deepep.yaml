@@ -15,7 +15,7 @@
 # Benchmarking config for Qwen3 Next Te Deepep
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/glm_4.5_air_te_deepep.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/glm/glm_4.5_air_te_deepep.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction

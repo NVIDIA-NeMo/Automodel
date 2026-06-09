@@ -39,6 +39,8 @@ class MoEParallelizerConfig:
 
 @dataclass(kw_only=True)
 class MoEConfig:
+    """Configuration for routed and shared MoE expert modules."""
+
     n_routed_experts: int
     n_shared_experts: int
     n_activated_experts: int
@@ -58,6 +60,11 @@ class MoEConfig:
     expert_activation: Literal["swiglu", "quick_geglu", "geglu", "relu2"] = "swiglu"
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
+    # When > 0, ``expert_activation="swiglu"`` dispatches to a clamped FP32
+    # variant (gate clamped at max=limit, up clamped at +/-limit) matching
+    # DeepSeek V4's official ``Expert.forward`` with ``swiglu_limit``.
+    # Default 0.0 preserves the existing ``weighted_bias_swiglu_impl`` path.
+    swiglu_limit: float = 0.0
     softmax_before_topk: bool = False
     dtype: str | torch.dtype = torch.bfloat16
     shared_expert_gate: bool = False

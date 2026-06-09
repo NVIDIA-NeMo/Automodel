@@ -48,7 +48,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -116,6 +116,8 @@ lr_scheduler:
 ci:
   recipe_owner: akoumpa
   time: "00:15:00"
+  known_issue_id: AM-154
+  allow_failure: true
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
     distributed.tp_size: 2

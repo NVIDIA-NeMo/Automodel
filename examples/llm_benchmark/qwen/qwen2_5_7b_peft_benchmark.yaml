@@ -15,7 +15,7 @@
 # Benchmark configuration for Qwen2.5-7B with LoRA
 #
 # To run this recipe:
-#   automodel examples/llm_finetune/qwen/qwen2_5_7b_peft_benchmark.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/qwen/qwen2_5_7b_peft_benchmark.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
@@ -55,7 +55,7 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: true
+  target_modules: '*_proj'
   dim: 16
   alpha: 32
   dropout: 0.0

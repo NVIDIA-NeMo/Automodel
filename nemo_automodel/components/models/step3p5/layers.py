@@ -28,6 +28,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
 )
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class Step3p5RMSNorm(nn.Module):
@@ -97,9 +98,16 @@ class Step3p5RotaryEmbedding(nn.Module):
         inv_freq = self._compute_inv_freq()
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def _compute_inv_freq(self) -> torch.Tensor:
+    def _apply(self, fn):
+        super()._apply(fn)
+        if self.inv_freq is not None:
+            self._buffers["inv_freq"] = self._compute_inv_freq(device=self.inv_freq.device)
+        return self
+
+    def _compute_inv_freq(self, device: torch.device | None = None) -> torch.Tensor:
         """Compute inverse frequencies for rotary embeddings."""
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim))
+        positions = torch.arange(0, self.rotary_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (self.base ** (positions / self.rotary_dim))
         return inv_freq
 
     @torch.no_grad()
@@ -117,14 +125,15 @@ class Step3p5RotaryEmbedding(nn.Module):
         Returns:
             Tuple of (cos, sin) tensors.
         """
-        inv_freq = self.inv_freq.to(device=x.device, dtype=torch.float32)
-        inv_freq_expanded = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float().to(x.device)
 
-        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos()
-        sin = emb.sin()
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
@@ -145,9 +154,16 @@ class Step3p5MLP(nn.Module):
         self.intermediate_size = intermediate_size or config.intermediate_size
         self.swiglu_limit = swiglu_limit
 
-        self.gate_proj = initialize_linear_module(backend.linear, self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = initialize_linear_module(backend.linear, self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = initialize_linear_module(backend.linear, self.intermediate_size, self.hidden_size, bias=False)
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.gate_proj = initialize_linear_module(
+            backend.linear, self.hidden_size, self.intermediate_size, bias=False, dtype=dtype
+        )
+        self.up_proj = initialize_linear_module(
+            backend.linear, self.hidden_size, self.intermediate_size, bias=False, dtype=dtype
+        )
+        self.down_proj = initialize_linear_module(
+            backend.linear, self.intermediate_size, self.hidden_size, bias=False, dtype=dtype
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         up = self.up_proj(x)
@@ -198,17 +214,18 @@ class Step3p5Attention(nn.Module):
 
         # Projections
         attention_bias = getattr(config, "attention_bias", False)
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.q_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias
+            backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias, dtype=dtype
         )
         self.k_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias, dtype=dtype
         )
         self.v_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias, dtype=dtype
         )
         self.o_proj = initialize_linear_module(
-            backend.linear, self.num_heads * self.head_dim, config.hidden_size, attention_bias
+            backend.linear, self.num_heads * self.head_dim, config.hidden_size, attention_bias, dtype=dtype
         )
 
         # Per-head Q/K normalization using Step3p5RMSNorm
@@ -218,7 +235,9 @@ class Step3p5Attention(nn.Module):
         # Optional head-wise attention gate
         self.use_head_wise_attn_gate = getattr(config, "use_head_wise_attn_gate", False)
         if self.use_head_wise_attn_gate:
-            self.g_proj = initialize_linear_module(backend.linear, config.hidden_size, self.num_heads, bias=False)
+            self.g_proj = initialize_linear_module(
+                backend.linear, config.hidden_size, self.num_heads, bias=False, dtype=dtype
+            )
         else:
             self.g_proj = None
 
@@ -248,7 +267,7 @@ class Step3p5Attention(nn.Module):
         self,
         x: torch.Tensor,
         *,
-        freqs_cis: torch.Tensor,
+        freqs_cis: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         **attn_kwargs: Any,
@@ -279,6 +298,12 @@ class Step3p5Attention(nn.Module):
 
         # Apply rotary embeddings if enabled
         if self.use_rope:
+            if position_ids is not None and not self.backend.rope_fusion:
+                cos, sin = self.rotary_emb(x, position_ids)
+                rotary_half_dim = cos.shape[-1] // 2
+                freqs_cis = torch.cat((cos[..., :rotary_half_dim], sin[..., :rotary_half_dim]), dim=-1)
+            if freqs_cis is None:
+                raise ValueError("Step3p5Attention requires freqs_cis or position_ids when RoPE is enabled.")
             q, k = apply_rotary_emb_qk(
                 q,
                 k,

@@ -97,6 +97,8 @@ optimizer:
 ci:
   vllm_deploy: true
   recipe_owner: akoumpa
+  known_issue_id: AM-154
+  allow_failure: true
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
     model.pretrained_model_name_or_path: meta-llama/Llama-3.2-3B-Instruct

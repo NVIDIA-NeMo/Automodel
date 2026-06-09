@@ -1,7 +1,7 @@
 # Based on your existing config, modified for benchmarking
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/peft/llama_3_3_70b_instruct_squad_peft_pp.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/llama3_3/llama_3_3_70b_instruct_squad_peft_pp.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
@@ -41,7 +41,7 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 16
   alpha: 32
   use_triton: True

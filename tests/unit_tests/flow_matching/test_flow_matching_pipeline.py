@@ -463,6 +463,68 @@ class TestLossComputation:
 
         assert torch.allclose(average_unweighted_loss, expected_mse, atol=1e-6)
 
+    def test_bsmntw_weights_shape_and_sum(self, simple_adapter):
+        """Test that BSMNTW weights have correct shape and sum to num_train_timesteps."""
+        num_timesteps = 1000
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            flow_shift=3.0,
+            use_loss_weighting=True,
+            loss_weighting_scheme="bsmntw",
+            num_train_timesteps=num_timesteps,
+        )
+
+        weights = pipeline._bsmntw_weights
+        assert weights.shape == (num_timesteps,), f"Expected shape ({num_timesteps},), got {weights.shape}"
+        assert abs(weights.sum().item() - num_timesteps) < 1e-3, "Weights should sum to num_train_timesteps"
+
+    def test_bsmntw_weights_peak_at_midpoint(self, simple_adapter):
+        """Test that BSMNTW weights peak at the midpoint timestep."""
+        num_timesteps = 1000
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            flow_shift=3.0,
+            use_loss_weighting=True,
+            loss_weighting_scheme="bsmntw",
+            num_train_timesteps=num_timesteps,
+        )
+
+        weights = pipeline._bsmntw_weights
+        peak_idx = weights.argmax().item()
+        assert peak_idx == num_timesteps // 2, f"Peak should be at midpoint ({num_timesteps // 2}), got {peak_idx}"
+
+    def test_bsmntw_loss_weighting(self, simple_adapter):
+        """Test that BSMNTW applies correct per-sigma weights in compute_loss."""
+        num_timesteps = 1000
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            flow_shift=3.0,
+            use_loss_weighting=True,
+            loss_weighting_scheme="bsmntw",
+            num_train_timesteps=num_timesteps,
+        )
+
+        model_pred = torch.zeros(2, 16, 4, 8, 8)
+        target = torch.ones_like(model_pred)
+        sigma = torch.tensor([0.5, 0.1])  # midpoint and edge
+        batch = {}
+
+        _, _, _, _, loss_weight, _ = pipeline.compute_loss(model_pred, target, sigma, batch)
+
+        # Weight at sigma=0.5 (midpoint) should be higher than at sigma=0.1 (edge)
+        w_mid = loss_weight[0, 0, 0, 0, 0].item()
+        w_edge = loss_weight[1, 0, 0, 0, 0].item()
+        assert w_mid > w_edge, f"Midpoint weight ({w_mid}) should be > edge weight ({w_edge})"
+
+    def test_invalid_loss_weighting_scheme_raises(self, simple_adapter):
+        """Test that an invalid loss_weighting_scheme raises ValueError."""
+        with pytest.raises(ValueError, match="Unknown loss_weighting_scheme"):
+            FlowMatchingPipeline(
+                model_adapter=simple_adapter,
+                use_loss_weighting=True,
+                loss_weighting_scheme="invalid_scheme",
+            )
+
 
 class TestFullTrainingStep:
     """Test the complete training step."""
@@ -645,6 +707,29 @@ class TestFullTrainingStep:
         # Sigma values should be identical
         assert abs(metrics1["sigma_min"] - metrics2["sigma_min"]) < 1e-6
         assert abs(metrics1["sigma_max"] - metrics2["sigma_max"]) < 1e-6
+
+    def test_step_can_skip_scalar_metrics(self, simple_adapter, mock_model, sample_batch):
+        """Test disabling scalar metrics for the hot training path."""
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            timestep_sampling="uniform",
+            log_interval=1000,
+            summary_log_interval=1000,
+        )
+
+        weighted_loss, average_weighted_loss, loss_mask, metrics = pipeline.step(
+            mock_model,
+            sample_batch,
+            torch.device("cpu"),
+            torch.float32,
+            global_step=0,
+            collect_metrics=False,
+        )
+
+        assert isinstance(weighted_loss, torch.Tensor)
+        assert not torch.isnan(average_weighted_loss)
+        assert loss_mask is None
+        assert metrics == {}
 
 
 class TestFactoryFunctions:
@@ -919,6 +1004,41 @@ class TestPipelineEdgeCases:
         }
         with pytest.raises(ValueError, match="Loss exploded"):
             pipeline.step(big_model, batch, torch.device("cpu"), torch.float32, global_step=0)
+
+    def test_check_loss_false_skips_loss_explosion_guard(self, simple_adapter):
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            flow_shift=1.0,
+            use_loss_weighting=False,
+            log_interval=1000,
+            summary_log_interval=1000,
+        )
+
+        class HugeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(1, 1)
+
+            def forward(self, hidden_states, timestep, encoder_hidden_states, return_dict=False, **kwargs):
+                return (torch.full_like(hidden_states, 100.0),)
+
+        batch = {
+            "video_latents": torch.zeros(2, 16, 4, 8, 8),
+            "text_embeddings": torch.randn(2, 77, 4096),
+        }
+
+        _, average_weighted_loss, _, metrics = pipeline.step(
+            HugeModel(),
+            batch,
+            torch.device("cpu"),
+            torch.float32,
+            global_step=0,
+            collect_metrics=False,
+            check_loss=False,
+        )
+
+        assert average_weighted_loss > 100
+        assert metrics == {}
 
     def test_nan_loss_raises(self, simple_adapter):
         pipeline = FlowMatchingPipeline(

@@ -29,6 +29,7 @@ TEXT_MODULE_ATTRS = ("language_model", "text_model", "text_decoder")
 MULTIMODAL_SUFFIXES = (
     "vision_tower",
     "visual",
+    "vision_model",
     "image_encoder",
     "vision_encoder",
     "embed_vision",
@@ -39,6 +40,7 @@ MULTIMODAL_SUFFIXES = (
     "multi_modal_projector",
     "multimodal_projector",
     "vision_projector",
+    "vit_large_projector",
     "audio_projector",
 )
 
@@ -58,6 +60,7 @@ def get_text_module(model: nn.Module) -> nn.Module:
 
 
 def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callable:
+    """Create a pipeline-compatible forward method for HuggingFace inner models."""
     from transformers.cache_utils import Cache
     from transformers.modeling_outputs import BaseModelOutputWithPast
 
@@ -187,6 +190,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
 
 
 def create_pipeline_forward_causal_lm() -> Callable:
+    """Create a pipeline-compatible forward method for causal LM wrappers."""
     from transformers.cache_utils import Cache
     from transformers.modeling_outputs import BaseModelOutputWithPast
 
@@ -449,6 +453,123 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
     return pipeline_forward_gemma4_vlm
 
 
+def create_pipeline_forward_mistral3_vlm() -> Callable:
+    """Pipeline-compatible forward for Mistral3ForConditionalGeneration (VLM top-level).
+
+    Stage 0: embeds text tokens, runs vision_tower + multi_modal_projector for
+    image tokens, merges image features into inputs_embeds via
+    ``get_placeholder_mask``/``masked_scatter``, then calls the patched language
+    model. Non-first stages: passes hidden states straight through the patched
+    language model. Last stage: applies lm_head.
+
+    Mirrors the generic CausalLM PP forward but adds the Mistral3 vision path
+    so ``pixel_values``/``image_sizes`` reach ``get_image_features`` on stage 0.
+    Without this, the generic CausalLM path never touches vision_tower and
+    image tokens are embedded as garbage text tokens.
+    """
+
+    def pipeline_forward_mistral3_vlm(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        image_sizes: Optional[torch.Tensor] = None,
+        vision_feature_layer=None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        inner = self.model
+        lang_model = inner.language_model
+        embed_tokens = getattr(lang_model, "embed_tokens", None)
+        is_first_stage = embed_tokens is not None
+
+        # PP VLM: under the training loop, pixel_values and image_sizes are
+        # popped from the batch before schedule.step() and pre-chunked onto
+        # stage0_model._vlm_pixel_values_chunks (and _vlm_image_grid_hws_chunks
+        # for image_sizes). Retrieve the current microbatch's chunk here so
+        # vision_tower actually receives its inputs. Mirrors the Gemma4 VLM
+        # path at create_pipeline_forward_gemma4_vlm().
+        if pixel_values is None and is_first_stage:
+            chunks = getattr(self, "_vlm_pixel_values_chunks", None)
+            has_media_tokens = (
+                input_ids is not None
+                and hasattr(self.config, "image_token_id")
+                and (input_ids == self.config.image_token_id).any()
+            )
+            if chunks is not None and has_media_tokens:
+                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+                if chunk_idx < len(chunks):
+                    pixel_values = chunks[chunk_idx]
+                    grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
+                    if grid_chunks is not None and chunk_idx < len(grid_chunks):
+                        image_sizes = grid_chunks[chunk_idx]
+                    self._vlm_chunk_idx = chunk_idx + 1
+
+        if is_first_stage:
+            if inputs_embeds is None:
+                inputs_embeds = embed_tokens(input_ids)
+
+            vision_tower = getattr(inner, "vision_tower", None)
+            if vision_tower is not None and pixel_values is not None:
+                # HF's outer Mistral3ForConditionalGeneration.forward resolves
+                # `vision_feature_layer` from config via @merge_with_config_defaults.
+                # Our patched forward bypasses that decorator, so we must pull the
+                # config default explicitly — otherwise None flows through to
+                # `get_image_features` and the selected hidden state can differ.
+                if vision_feature_layer is None:
+                    vision_feature_layer = getattr(self.config, "vision_feature_layer", None)
+                image_features = inner.get_image_features(
+                    pixel_values=pixel_values,
+                    vision_feature_layer=vision_feature_layer,
+                    image_sizes=image_sizes,
+                    return_dict=True,
+                ).pooler_output
+                image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                special_image_mask = inner.get_placeholder_mask(
+                    input_ids, inputs_embeds=inputs_embeds, image_features=image_features
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+        else:
+            # Non-first stage: input_ids carries hidden states from the previous PP stage.
+            if inputs_embeds is None:
+                if input_ids is not None and input_ids.dtype in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                ):
+                    inputs_embeds = input_ids
+                else:
+                    raise ValueError("Expected float hidden states for non-first PP stage")
+
+        if cache_position is None and inputs_embeds is not None:
+            cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+
+        hidden_states = lang_model(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        if not isinstance(hidden_states, torch.Tensor):
+            hidden_states = hidden_states.last_hidden_state
+
+        if hasattr(self, "lm_head") and self.lm_head is not None:
+            return self.lm_head(hidden_states)
+        return hidden_states
+
+    return pipeline_forward_mistral3_vlm
+
+
+def _is_mistral3_vlm(model: torch.nn.Module) -> bool:
+    """Return True for Mistral3ForConditionalGeneration (Pixtral + Ministral3)."""
+    config = getattr(model, "config", None)
+    return config is not None and getattr(config, "model_type", None) == "mistral3"
+
+
 def _is_gemma4_vlm(model: torch.nn.Module) -> bool:
     """Return True only for Gemma4 VLM variants.
 
@@ -469,15 +590,32 @@ def _is_gemma4_vlm(model: torch.nn.Module) -> bool:
     return getattr(text_config, "model_type", None) == "gemma4"
 
 
+def model_keeps_self_forward(model: torch.nn.Module) -> bool:
+    """Return True when *model* opts out of pipeline-aware forward patching.
+
+    Used by the pipeline split call site to skip ``patch_hf_model_for_pp``
+    entirely for models whose own ``forward`` is already PP-aware (typically
+    because it pulls pixel_values out of ``self._vlm_pixel_values_chunks``
+    set by the training loop). Currently set on Qwen3-VL-MoE, Qwen3.5-MoE,
+    KimiVL, and Kimi-K2.5-VL.
+    """
+    return bool(getattr(type(model), "_pp_keep_self_forward", False))
+
+
 def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm_model: bool = True) -> None:
     """Patch a HF model/module to produce pipeline-compatible forward.
+
+    The caller is responsible for skipping this function when the model
+    opts out via ``model_keeps_self_forward(model)``. This function itself
+    only branches on the patch *flavor*:
 
     - Gemma4 VLM (``config.model_type == 'gemma4'`` with a nested text
       backbone at ``model.model.language_model``): patch the text backbone
       and VLM outer with Gemma4-specific VLM-aware forwards.
-    - Other models with ``model.model`` (e.g., LlamaForCausalLM and most
-      other VLMs): patch inner and outer with the generic CausalLM
-      forwards.
+    - Mistral3 VLM: patch the text backbone with the generic inner forward
+      and the outer with the Mistral3-specific VLM forward.
+    - Other models with ``model.model`` (e.g., LlamaForCausalLM and other
+      LLMs): patch inner and outer with the generic CausalLM forwards.
     - Else: patch the module itself with the generic inner forward.
     """
     inner_model = getattr(model, "model", None)
@@ -490,6 +628,14 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
             text_backbone.forward = types.MethodType(create_pipeline_forward_gemma4_text(), text_backbone)
         if patch_causal_lm_model:
             model.forward = types.MethodType(create_pipeline_forward_gemma4_vlm(), model)
+    elif inner_model is not None and text_backbone is not None and _is_mistral3_vlm(model):
+        # Mistral3 VLM (Pixtral + Ministral3 text): route pixel_values/image_sizes
+        # through vision_tower on stage 0 and let the text backbone use the
+        # generic inner PP forward.
+        if patch_inner_model:
+            text_backbone.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), text_backbone)
+        if patch_causal_lm_model:
+            model.forward = types.MethodType(create_pipeline_forward_mistral3_vlm(), model)
     elif inner_model is not None:
         if patch_inner_model:
             inner_model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), inner_model)
@@ -501,11 +647,33 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
 
 
 def init_hf_model_buffers(model: torch.nn.Module, device: torch.device) -> None:
+    """Initialize HuggingFace model buffers needed before pipeline execution."""
     if hasattr(getattr(model, "model", model), "rotary_emb"):
         rotary_owner = getattr(model, "model", model)
         if hasattr(rotary_owner.rotary_emb, "rope_init_fn"):
             inv_freq, _ = rotary_owner.rotary_emb.rope_init_fn(rotary_owner.rotary_emb.config, device)
             rotary_owner.rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
+
+
+# VLM model_types whose vision routing is handled inside ``patch_hf_model_for_pp``
+# (a dedicated ``pipeline_forward_*_vlm`` function reads ``_vlm_pixel_values_chunks``).
+_PP_VLM_MODEL_TYPES_WITH_DEDICATED_FORWARD: tuple[str, ...] = ("gemma4", "mistral3")
+
+
+def _is_vlm(model: torch.nn.Module) -> bool:
+    """Best-effort check for whether ``model`` is a vision-language model.
+
+    Looks at the standard VLM markers used elsewhere in the codebase: a nested
+    ``text_config``, a ``vision_tower`` attribute on the outer model, or a
+    ``visual`` attribute on the inner model (Qwen-VL convention).
+    """
+    config = getattr(model, "config", None)
+    if config is not None and getattr(config, "text_config", None) is not None:
+        return True
+    if hasattr(model, "vision_tower"):
+        return True
+    inner = getattr(model, "model", None)
+    return inner is not None and (hasattr(inner, "vision_tower") or hasattr(inner, "visual"))
 
 
 def validate_hf_model_for_pipeline_support(model: torch.nn.Module) -> None:
@@ -540,6 +708,32 @@ def validate_hf_model_for_pipeline_support(model: torch.nn.Module) -> None:
                 )
         if getattr(config, "is_encoder_decoder", False):
             issues.append("Encoder-Decoder models with cross-attention are not supported yet for pipeline parallelism.")
+
+        # VLM PP routing: vision_tower only runs on stage 0, and pixel_values
+        # are passed through the training loop's _vlm_pixel_values_chunks
+        # mechanism. The model class must either (a) be on the dedicated PP
+        # forward list (Gemma4 / Mistral3) or (b) declare
+        # _pp_keep_self_forward = True so its own forward is preserved.
+        # Otherwise patch_hf_model_for_pp replaces forward with the generic
+        # CausalLM path, which silently drops pixel_values and trains the
+        # language model on placeholder text embeddings.
+        if _is_vlm(model):
+            mt_outer = getattr(config, "model_type", None)
+            mt_inner = getattr(getattr(config, "text_config", None), "model_type", None)
+            has_dedicated = (
+                mt_outer in _PP_VLM_MODEL_TYPES_WITH_DEDICATED_FORWARD
+                or mt_inner in _PP_VLM_MODEL_TYPES_WITH_DEDICATED_FORWARD
+            )
+            keeps_own = bool(getattr(type(model), "_pp_keep_self_forward", False))
+            if not has_dedicated and not keeps_own:
+                issues.append(
+                    f"VLM model_type='{mt_outer}' is not on the pipeline-aware list "
+                    f"({', '.join(_PP_VLM_MODEL_TYPES_WITH_DEDICATED_FORWARD)}) and the model class "
+                    f"{type(model).__name__} does not declare ``_pp_keep_self_forward = True``. "
+                    "Without one of these, patch_hf_model_for_pp will replace the model's forward "
+                    "with the generic CausalLM forward, and pixel_values stored in "
+                    "``_vlm_pixel_values_chunks`` will never reach the vision tower."
+                )
 
     if issues:
         error_msg = f"Model '{model_name}' is not compatible with pipeline parallelism:\n\n"

@@ -49,9 +49,16 @@ _DOC_ARCH_ALIASES = {
     # registry uses ``LlavaOneVisionForConditionalGeneration`` (the NVIDIA
     # re-impl for LLaVA-OneVision-1.5 with RICE ViT).
     "LlavaOneVisionForConditionalGeneration": "LlavaOnevisionForConditionalGeneration",
+    # Registry also exposes the NVIDIA LLaVA-OneVision-1.5 re-impl under the
+    # class name ``LLaVAOneVision1_5_ForConditionalGeneration`` (all-caps
+    # "LLaVA" + explicit "1_5_" infix). The same model is documented on the
+    # lmms-lab/llava-onevision page under ``LlavaOneVisionForConditionalGeneration``.
+    "LLaVAOneVision1_5_ForConditionalGeneration": "LlavaOneVisionForConditionalGeneration",
     # Ministral3 text model; covered on the Ministral3 / Ministral3-VL pages
     # that list the VLM arch ``Mistral3ForConditionalGeneration``.
     "Ministral3ForCausalLM": "Mistral3ForConditionalGeneration",
+    # Bi-encoder variant of Ministral3, covered on the same Ministral3 / Ministral3-VL pages.
+    "Ministral3BidirectionalModel": "Mistral3ForConditionalGeneration",
     # Mistral4 text model is the backbone of Mistral-Small-4 VLM; documented
     # on the Mistral-Small-4 page via the recipe path ``mistral4``.
     "Mistral4ForCausalLM": "mistral4",
@@ -69,6 +76,7 @@ _DOC_ARCH_ALIASES = {
     "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeVLForConditionalGeneration",
     # Dense Qwen3.5 text/VL backbone; grouped with the VL variants on the
     # Qwen3.5-VL page.
+    "Qwen3_5ForCausalLM": "Qwen3.5",
     "Qwen3_5ForConditionalGeneration": "Qwen3.5",
     # HF split Seed-OSS into its own arch; the Seed page (``seed.md``) covers
     # both Seed-Coder and Seed-OSS under the "Seed-OSS" name.

@@ -206,8 +206,91 @@ def install_layer_types_patch_hook() -> bool:
     return True
 
 
+_VALIDATOR_RELAXED: bool = False
+
+
+def _noop_validate_layer_type(self):  # noqa: ARG001
+    """No-op replacement for ``PretrainedConfig.validate_layer_type``."""
+    return None
+
+
+_noop_validate_layer_type.__name__ = "validate_layer_type"
+
+
+def relax_layer_types_validator() -> bool:
+    """Disable ``PretrainedConfig.validate_layer_type`` and its registered copies.
+
+    Some upstream configs (e.g. ``stepfun-ai/Step-3.5-Flash``) ship
+    ``layer_types`` whose length differs from ``num_hidden_layers``; newer
+    transformers rejects such configs, and ``huggingface_hub`` wraps that
+    ``ValueError`` in ``StrictDataclassClassValidationError``. Suppressing the
+    validator lets downstream code load the config unmodified.
+
+    The ``huggingface_hub`` ``@strict`` decorator freezes validator references
+    on each class into ``__class_validators__`` at decoration time, so swapping
+    ``PretrainedConfig.validate_layer_type`` alone is insufficient: every
+    already-decorated subclass keeps its own list. This helper rewrites both
+    the class attribute and each list entry across the live subclass tree,
+    then newly-decorated subclasses pick up the no-op automatically via
+    ``getattr(cls, "validate_layer_type")`` at their decoration time.
+
+    Idempotent and best-effort: failures (missing attribute, transformers not
+    installed) are logged and swallowed so the caller is never broken.
+
+    Returns:
+        ``True`` if the patch was applied on this call, ``False`` otherwise.
+    """
+    global _VALIDATOR_RELAXED
+    if _VALIDATOR_RELAXED:
+        return False
+
+    try:
+        from transformers import PretrainedConfig
+    except ImportError:
+        logger.debug("[v4_patches.layer_types] transformers not importable; skipping relax.")
+        return False
+    except Exception as exc:
+        logger.warning("[v4_patches.layer_types] transformers import failed: %s", exc)
+        return False
+
+    if not hasattr(PretrainedConfig, "validate_layer_type"):
+        logger.debug("[v4_patches.layer_types] validate_layer_type missing; nothing to relax.")
+        _VALIDATOR_RELAXED = True
+        return False
+
+    try:
+        PretrainedConfig.validate_layer_type = _noop_validate_layer_type
+    except Exception as exc:
+        logger.warning("[v4_patches.layer_types] failed to rebind validate_layer_type: %s", exc)
+        return False
+
+    def _relax_subtree(cls) -> None:
+        validators = cls.__dict__.get("__class_validators__")
+        if isinstance(validators, list):
+            for i, v in enumerate(validators):
+                if getattr(v, "__name__", None) == "validate_layer_type":
+                    validators[i] = _noop_validate_layer_type
+        try:
+            subs = cls.__subclasses__()
+        except Exception:
+            return
+        for sub in subs:
+            _relax_subtree(sub)
+
+    try:
+        _relax_subtree(PretrainedConfig)
+    except Exception as exc:
+        logger.warning("[v4_patches.layer_types] subclass walk failed: %s", exc)
+        return False
+
+    _VALIDATOR_RELAXED = True
+    logger.info("[v4_patches.layer_types] relaxed validate_layer_type to no-op")
+    return True
+
+
 __all__ = [
     "DEFAULT_EXTRA_LAYER_TYPES",
     "install_layer_types_patch_hook",
     "patch_allowed_layer_types",
+    "relax_layer_types_validator",
 ]
