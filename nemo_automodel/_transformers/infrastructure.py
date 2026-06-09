@@ -522,7 +522,8 @@ def apply_model_infrastructure(
             for mp in model_parts:
                 model_wrapper.maybe_compile(mp)
         if isinstance(model_wrapper, DDPManager):
-            setattr(model.module, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
+            ddp_model = getattr(model, "module", model)
+            setattr(ddp_model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
         else:
             setattr(model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
 
