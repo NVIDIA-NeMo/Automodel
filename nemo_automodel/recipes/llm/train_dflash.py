@@ -129,7 +129,7 @@ class TrainDFlashRecipe(BaseRecipe):
         self.target_wrapper = HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids)
 
         self.block_size = int(recipe_cfg.get("block_size", 16))
-        self.mask_token_id = self._resolve_mask_token_id(recipe_cfg)
+        self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_config.vocab_size)
 
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
@@ -251,23 +251,36 @@ class TrainDFlashRecipe(BaseRecipe):
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
-    def _resolve_mask_token_id(self, recipe_cfg) -> int:
-        """Resolve the MASK token id used to fill non-anchor block positions."""
+    @staticmethod
+    def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
+        """Resolve and validate the MASK token id that fills non-anchor block positions.
+
+        DFlash fills every non-anchor slot of a ``[anchor, MASK, MASK, ...]`` block
+        with this id, and the draft's ``embed_tokens`` row at that id becomes the
+        learned "predict here" signal. It must be chosen deliberately (a reserved /
+        unused token), exactly like P-EAGLE's ``mask_token_id``: the previous silent
+        fallback to ``tokenizer.pad_token_id`` was unsafe because ``pad`` is commonly
+        aliased to ``eos`` (or another meaningful token), which conflates the mask
+        signal with real content and quietly degrades acceptance without erroring.
+        Require it explicitly and range-check it; the inference runtime must fill the
+        block slots with the same id.
+        """
         mask_token_id = recipe_cfg.get("mask_token_id", None)
         if mask_token_id is None:
-            mask_token_id = getattr(self.tokenizer, "pad_token_id", None)
-            if mask_token_id is not None:
-                logger.warning(
-                    "recipe_args.mask_token_id not set; falling back to tokenizer.pad_token_id=%d. "
-                    "Set it explicitly (e.g. a dedicated reserved token) if this is not intended.",
-                    mask_token_id,
-                )
-        if mask_token_id is None:
             raise ValueError(
-                "DFlash requires a mask_token_id: set recipe_args.mask_token_id (the token used for "
-                "non-anchor block positions), or ensure the tokenizer defines a pad_token_id."
+                "DFlash requires recipe_args.mask_token_id to be set explicitly (the token used for "
+                "non-anchor block positions). Pick a reserved / rarely-used token id -- e.g. a model-specific "
+                "reserved special token -- so the mask-slot embedding does not collide with real content, and "
+                "use the same id in the inference runtime. (The previous fallback to tokenizer.pad_token_id was "
+                "removed: pad is frequently aliased to eos, which silently degrades quality.)"
             )
-        return int(mask_token_id)
+        mask_token_id = int(mask_token_id)
+        if not 0 <= mask_token_id < vocab_size:
+            raise ValueError(
+                f"mask_token_id={mask_token_id} is out of range for the vocab [0, {vocab_size}); "
+                "it indexes the draft embed_tokens table."
+            )
+        return mask_token_id
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the EAGLE recipes."""
