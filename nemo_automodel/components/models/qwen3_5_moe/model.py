@@ -666,6 +666,15 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = True
+
     @classmethod
     def from_config(
         cls,
