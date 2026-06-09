@@ -28,6 +28,7 @@ model:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import torch
@@ -376,6 +377,15 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = True
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = False
 
     def __init__(
         self,

@@ -33,6 +33,7 @@ Example (YAML)::
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -474,6 +475,15 @@ class BaichuanModel(BaichuanPreTrainedModel):
 # ---------------------------------------------------------------------------
 class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     def __init__(self, config: BaichuanConfig, **model_kwargs):
         super().__init__(config)
