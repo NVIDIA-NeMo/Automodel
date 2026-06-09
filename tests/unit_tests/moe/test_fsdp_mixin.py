@@ -205,6 +205,42 @@ class TestIterFSDPModules:
         assert moe_model.audio_tower in modules
         assert moe_model.visual in modules
 
+    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
+    def test_iterates_outer_mtp_blocks_and_experts(self, mock_isinstance):
+        def isinstance_side_effect(obj, cls):
+            if cls.__name__ == 'FSDPModule':
+                return isinstance(obj, MockFSDPModule)
+            return isinstance(obj, cls)
+
+        mock_isinstance.side_effect = isinstance_side_effect
+
+        model = MockFSDPModule()
+        moe_model = MockMoEModel(MockBackend(), model)
+
+        mtp_block = MockFSDPModule()
+        mtp_block.mlp = Mock()
+        mtp_block.mlp.experts = MockFSDPModule()
+
+        mtp_moe_block = Mock()
+        mtp_moe_block.moe = Mock()
+        mtp_moe_block.moe.experts = MockFSDPModule()
+
+        moe_model.mtp = Mock()
+        moe_model.mtp.layers = Mock()
+        moe_model.mtp.layers.named_children = Mock(
+            return_value=[
+                ("mtp_layer_0", mtp_block),
+                ("mtp_layer_1", mtp_moe_block),
+            ]
+        )
+
+        modules = list(_iter_fsdp_modules(moe_model))
+
+        assert model in modules
+        assert mtp_block in modules
+        assert mtp_block.mlp.experts in modules
+        assert mtp_moe_block.moe.experts in modules
+
 
 class TestPrepareForGradAccumulation:
     """Test prepare_for_grad_accumulation method."""
