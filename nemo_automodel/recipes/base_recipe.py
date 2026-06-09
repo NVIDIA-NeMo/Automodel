@@ -48,6 +48,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.recipes._typed_config import RecipeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,13 @@ def is_optimizer(object):
     return isinstance(object, Optimizer) or (
         isinstance(object, list) and len(object) > 0 and all(isinstance(item, Optimizer) for item in object)
     )
+
+
+def is_distributed_stateful(object):
+    """
+    Checks whether object should be saved through distributed checkpointing.
+    """
+    return bool(getattr(object, "use_distributed_checkpointing", False)) and has_load_restore_state(object)
 
 
 def is_model(object):
@@ -233,7 +241,7 @@ class BaseRecipe:
             or is_tokenizer(value)
             or is_lr_scheduler(value)
             or is_optimizer(value)
-            or isinstance(value, ConfigNode)
+            or isinstance(value, (ConfigNode, RecipeConfig))
             or is_dataloader(value)
         )
 
@@ -242,6 +250,14 @@ class BaseRecipe:
                 raise RuntimeError(f"State key {key!r} is already tracked")
             self.__dict__["__state_tracked"].add(key)
         super().__setattr__(key, value)
+
+    def untrack_state(self, *keys: str) -> None:
+        """Stop tracking one or more attributes for BaseRecipe checkpointing."""
+        tracked = self.__dict__.get("__state_tracked")
+        if tracked is None:
+            return
+        for key in keys:
+            tracked.discard(key)
 
     def save_checkpoint(
         self,
@@ -268,6 +284,14 @@ class BaseRecipe:
 
         # Wait for any in-flight checkpoint (async case) to complete
         self.checkpointer.async_wait()
+
+        # Free GPU caches before DCP's gather-and-write. DCP allocates NCCL
+        # workspace and materializes DTensor shards on GPU; with CPU-offloaded
+        # FSDP2 the residual training-time fragments can leave just enough
+        # headroom to break the gather (cuda failure 2 / "out of memory").
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         # If a previous async checkpoint just finished, update the "latest" symlink now
         prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
@@ -337,7 +361,7 @@ class BaseRecipe:
                 model = getattr(self, key)
             elif is_optimizer(getattr(self, key)):
                 optimizer = getattr(self, key)
-            elif isinstance(getattr(self, key), ConfigNode):
+            elif isinstance(getattr(self, key), (ConfigNode, RecipeConfig)):
                 config = getattr(self, key)
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
@@ -345,6 +369,8 @@ class BaseRecipe:
                 tokenizer = getattr(self, key)
             elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
                 self.checkpointer.save_on_dp_ranks(getattr(self, key), key, path)
+            elif is_distributed_stateful(getattr(self, key)):
+                self.checkpointer.save_distributed_state(getattr(self, key), key, path)
             else:
                 if is_rank_0:
                     torch.save(
@@ -424,6 +450,13 @@ class BaseRecipe:
             if is_dist_initialized:
                 torch.distributed.barrier()
 
+        # Release NCCL workspace and DCP gather scratch back to the allocator.
+        # Without this, the next training step's backward sees a fragmented
+        # heap (~74 GB still resident on tight 14B FSDP2 runs) and OOMs.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
     def _update_checkpoint_symlink(self, link_name: str, target_dir: str) -> None:
         """
         Create or update a symlink named `link_name` under the checkpoint root
@@ -502,7 +535,9 @@ class BaseRecipe:
                 scheduler = obj
             elif is_dataloader(obj) or isinstance(obj, StatefulRNG):
                 self.checkpointer.load_on_dp_ranks(obj, key, ckpt_dir)
-            elif is_tokenizer(obj) or isinstance(obj, ConfigNode):
+            elif is_distributed_stateful(obj):
+                self.checkpointer.load_distributed_state(obj, key, ckpt_dir)
+            elif is_tokenizer(obj) or isinstance(obj, (ConfigNode, RecipeConfig)):
                 # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
                 continue

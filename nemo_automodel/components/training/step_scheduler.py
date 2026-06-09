@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
+from dataclasses import asdict, dataclass
 from math import ceil
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from torch.distributed.checkpoint.stateful import Stateful
 
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
+
+if TYPE_CHECKING:
+    from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
 
@@ -293,3 +299,63 @@ class StepScheduler(Stateful):
             s (dict): Dictionary containing 'step' and 'epoch'.
         """
         self.step, self.epoch = s["step"], s["epoch"]
+
+
+# ---------------------------------------------------------------------------
+# Typed config + builder
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StepSchedulerConfig:
+    """User-facing step scheduler configuration.
+
+    These fields correspond to the YAML-configurable parameters of the
+    training loop.  Runtime-only values (``dataloader``, ``dp_size``,
+    ``local_batch_size``) are passed separately to ``build_step_scheduler``.
+
+    Attributes:
+        global_batch_size: Total samples per optimizer step across all GPUs.
+        num_epochs: Number of training epochs.  When ``None`` the builder
+            derives it from ``max_steps``.  Default: 10.
+        max_steps: Hard cap on optimizer steps.  ``None`` means derive from
+            ``num_epochs * epoch_len``.
+        ckpt_every_steps: Save a checkpoint every N optimizer steps.
+            ``None`` defaults to once per epoch.
+        save_checkpoint_every_epoch: Also checkpoint at every epoch boundary.
+        val_every_steps: Run validation every N optimizer steps.
+            ``None`` disables periodic validation.
+        log_remote_every_steps: Log to WandB / MLflow every N steps.
+        gc_every_steps: Force ``gc.collect()`` every N steps.
+            ``None`` disables manual GC.
+        start_step: Initial global step (for checkpoint resume).
+        start_epoch: Initial epoch (for checkpoint resume).
+    """
+
+    global_batch_size: int = 32
+    num_epochs: int | None = 10
+    max_steps: int | None = None
+    ckpt_every_steps: int | None = 100
+    save_checkpoint_every_epoch: bool = True
+    val_every_steps: int | None = None
+    log_remote_every_steps: int = 1
+    gc_every_steps: int | None = None
+    start_step: int = 0
+    start_epoch: int = 0
+
+    def build(self, dataloader: DataLoader, dp_group_size: int, local_batch_size: int) -> StepScheduler:
+        """Build the step scheduler.
+
+        Args:
+            dataloader: The training dataloader.
+            dp_group_size: The size of the data parallel group.
+            local_batch_size: The size of the local batch.
+
+        Returns:
+            Configured StepScheduler.
+        """
+        kwargs = asdict(self)
+        kwargs["local_batch_size"] = local_batch_size
+        kwargs["dp_size"] = dp_group_size
+        kwargs["dataloader"] = dataloader
+        return StepScheduler(**kwargs)

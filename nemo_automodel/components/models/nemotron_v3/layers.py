@@ -29,6 +29,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class NemotronV3Attention(nn.Module):
@@ -47,17 +48,34 @@ class NemotronV3Attention(nn.Module):
         # Cached for debug-print role disambiguation (backbone vs mtp sublayer).
         self.num_hidden_layers = int(getattr(config, "num_hidden_layers", 0))
 
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.q_proj = initialize_linear_module(
-            self.backend.linear, self.hidden_size, self.num_attention_heads * self.head_dim, self.attention_bias
+            self.backend.linear,
+            self.hidden_size,
+            self.num_attention_heads * self.head_dim,
+            self.attention_bias,
+            dtype=dtype,
         )
         self.k_proj = initialize_linear_module(
-            self.backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, self.attention_bias
+            self.backend.linear,
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            self.attention_bias,
+            dtype=dtype,
         )
         self.v_proj = initialize_linear_module(
-            self.backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, self.attention_bias
+            self.backend.linear,
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            self.attention_bias,
+            dtype=dtype,
         )
         self.o_proj = initialize_linear_module(
-            self.backend.linear, self.num_attention_heads * self.head_dim, self.hidden_size, self.attention_bias
+            self.backend.linear,
+            self.num_attention_heads * self.head_dim,
+            self.hidden_size,
+            self.attention_bias,
+            dtype=dtype,
         )
 
         softmax_scale = self.head_dim**-0.5
@@ -597,6 +615,7 @@ class NemotronV3Block(nn.Module):
             backend.rms_norm,
             config.hidden_size,
             eps=config.layer_norm_epsilon,
+            dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
         )
 
         # Determine layer type from config

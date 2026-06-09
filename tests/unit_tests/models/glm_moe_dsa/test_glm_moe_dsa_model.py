@@ -262,9 +262,7 @@ class TestGlmMoeDsaModel:
         assert model.qk_rope_head_dim == config.qk_rope_head_dim
 
     def test_model_extracts_rope_theta_from_rope_parameters(self, config, backend_config):
-        with patch(
-            "nemo_automodel.components.models.glm_moe_dsa.model.precompute_freqs_cis"
-        ) as mock_precompute:
+        with patch("nemo_automodel.components.models.glm_moe_dsa.model.precompute_freqs_cis") as mock_precompute:
             mock_precompute.return_value = torch.randn(10)
             GlmMoeDsaModel(config, backend=backend_config)
 
@@ -291,9 +289,7 @@ class TestGlmMoeDsaModel:
         batch, seq_len = 2, 4
         input_ids = torch.randint(0, config.vocab_size, (batch, seq_len))
 
-        with patch(
-            "nemo_automodel.components.models.glm_moe_dsa.model.freqs_cis_from_position_ids"
-        ) as mock_freqs:
+        with patch("nemo_automodel.components.models.glm_moe_dsa.model.freqs_cis_from_position_ids") as mock_freqs:
             mock_freqs.return_value = torch.randn(batch, seq_len, config.qk_rope_head_dim // 2)
             with patch.object(
                 Block, "forward", side_effect=lambda *_, **__: torch.randn(batch, seq_len, config.hidden_size)
@@ -344,8 +340,9 @@ class TestGlmMoeDsaForCausalLM:
             "forward",
             return_value=torch.randn(batch, seq_len, config.hidden_size, device=device).to(torch.bfloat16),
         ):
-            logits = model(input_ids)
+            out = model(input_ids)
 
+        logits = out.logits
         assert logits.shape == (batch, seq_len, config.vocab_size)
 
     def test_forward_with_thd_format_squeezes_input(self, config, backend_config, device):
@@ -363,10 +360,12 @@ class TestGlmMoeDsaForCausalLM:
             ),
         ):
             mock_squeeze.return_value = (input_ids.squeeze(0), None, None, {"qkv_format": "thd"})
-            logits = model(input_ids, qkv_format="thd")
+            out = model(input_ids, qkv_format="thd", output_hidden_states=True)
 
         mock_squeeze.assert_called_once()
+        logits = out.logits
         assert logits.shape == (batch, seq_len, config.vocab_size)
+        assert out.hidden_states.shape == (batch, seq_len, config.hidden_size)
 
     def test_initialize_weights_invokes_submodules(self, config, backend_config):
         model = GlmMoeDsaForCausalLM(config, backend=backend_config)

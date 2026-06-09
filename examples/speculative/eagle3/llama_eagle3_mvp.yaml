@@ -73,3 +73,11 @@ checkpoint:
   model_save_format: safetensors
   save_consolidated: true
   # restore_from: LATEST  # set to "LATEST", a subdir name like "epoch_1_step_100", or an absolute path
+
+# Optional Weights & Biases logging. When this section is present (rank 0), the
+# recipe logs train/{loss,accuracy,lr,grad_norm,epoch} and val/{loss,accuracy}
+# every log_every_steps. Remove or comment out to disable.
+# wandb:
+#   project: eagle3
+#   entity: my-team
+#   name: ""   # empty -> defaults to eagle3_<target-model-name>

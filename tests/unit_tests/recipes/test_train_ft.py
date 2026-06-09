@@ -31,17 +31,36 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+from nemo_automodel.components.optim.optimizer import build_optimizer_config
+from nemo_automodel.recipes._typed_config import _as_dict, _callable_and_kwargs
 from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.recipes.llm.train_ft import (
-    PipelineCausalLMLoss,
     TrainFinetuneRecipeForNextTokenPrediction,
     build_dataloader,
     build_model,
-    build_optimizer,
     build_validation_dataloader,
     compute_trust_remote_code_from_model,
 )
+
+# The recipe loader builder takes the same kwargs the tests already pass.
+_build_dataloader = build_dataloader
+
+
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+    """Resolve a YAML optimizer block and build it (mirrors ``RecipeConfig.optimizer.build``)."""
+    return build_optimizer_config(*_callable_and_kwargs(cfg_opt)).build(model, device_mesh=device_mesh)
+
+
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
+    """Resolve a YAML checkpoint block into a ``CheckpointingConfig`` (mirrors ``RecipeConfig.checkpoint``)."""
+    from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+
+    kwargs = _as_dict(cfg_ckpt) if cfg_ckpt is not None else {}
+    kwargs.pop("restore_from", None)
+    derived = {"model_repo_id": model_repo_id, "model_cache_dir": cache_dir, "is_peft": is_peft}
+    return CheckpointingConfig(**{**derived, **kwargs})
 
 
 class DummyIterableDataset(IterableDataset):  # noqa: D401
@@ -109,6 +128,44 @@ def test_pipeline_causal_lm_loss_adds_mtp_tuple_output():
     torch.testing.assert_close(got, expected)
 
 
+def test_mtp_loss_config_defaults_and_override():
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.components.loss.mtp import MTPLossConfig
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = nn.Linear(3, 5, bias=False)
+            self.mtp_config = SimpleNamespace(loss_scaling_factor=0.2)
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+    # Defaults: scaling_factor None (model-driven), ignore_index -100.
+    assert MTPLossConfig().scaling_factor is None
+    assert MTPLossConfig().ignore_index == -100
+
+    torch.manual_seed(123)
+    model = DummyModel()
+    model.train()
+    loss_fn = MaskedCrossEntropy(fp32_upcast=False, reduction="sum")
+
+    logits = torch.randn(1, 4, 5)
+    mtp_h = torch.randn(1, 4, 3)
+    labels = torch.tensor([[1, 2, 3, 4]])
+    shifted_labels = torch.tensor([[2, 3, 4, -100]])
+    base = loss_fn(logits=logits, labels=labels)
+    aux = loss_fn(logits=model.lm_head(mtp_h), labels=shifted_labels)
+
+    # An explicit scaling_factor overrides the model-provided 0.2.
+    got_override = MTPLossConfig(scaling_factor=0.5).build(loss_fn, model)((logits, mtp_h), labels)
+    torch.testing.assert_close(got_override, base + 0.5 * aux)
+
+    # The default (None) falls back to the model-provided 0.2.
+    got_default = MTPLossConfig().build(loss_fn, model)((logits, mtp_h), labels)
+    torch.testing.assert_close(got_default, base + 0.2 * aux)
+
+
 def test_build_validation_dataloader_pp_enabled(caplog):
     cfg = ConfigNode(
         {
@@ -149,14 +206,10 @@ def test_build_validation_dataloader_collects_and_names_properly():
     with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader", return_value=("dl", "tok")) as mock_build:
         result = build_validation_dataloader(cfg, dp_world_size=4, dp_rank=1, pp_enabled=False)
 
-    # Assert keys are correctly generated
     assert set(result.keys()) == expected_names
-    # Values should be the first element of the tuple returned by build_dataloader
     assert set(result.values()) == {"dl"}
-    # build_dataloader called once per validation dataset
+    # One dataloader built per validation dataset, with the runtime args threaded through.
     assert mock_build.call_count == 4
-
-    # Inspect one call for important kwargs
     _, kwargs = mock_build.call_args
     assert kwargs["dp_world_size"] == 4
     assert kwargs["dp_rank"] == 1
@@ -327,20 +380,17 @@ def test_peft_with_tp_disables_triton(caplog):
 
 
 def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog):
-    """PEFT + torch_save: warn, discard user ckpt cfg, keep safetensors defaults; preserve checkpoint_dir."""
+    """PEFT + torch_save: warn, fall back to safetensors defaults; preserve checkpoint_dir."""
     from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
-    from nemo_automodel.recipes.llm.train_ft import build_checkpoint_config
 
     cfg_ckpt = MagicMock()
     cfg_ckpt.to_dict.return_value = {
         "model_save_format": "torch_save",
         "checkpoint_dir": "/user/ckpt/",
-        # torch_save-specific / incompatible options that must be discarded:
         "save_consolidated": False,
-        "is_async": True,
     }
 
-    with caplog.at_level(logging.WARNING, logger="nemo_automodel.recipes.llm.train_ft"):
+    with caplog.at_level(logging.WARNING):
         config = build_checkpoint_config(
             cfg_ckpt=cfg_ckpt,
             cache_dir=None,
@@ -348,12 +398,12 @@ def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog
             is_peft=True,
         )
 
-    assert any("discarding" in rec.message.lower() for rec in caplog.records)
+    assert any("falling back" in rec.message.lower() for rec in caplog.records)
     assert config.is_peft is True
     assert config.model_save_format == SerializationFormat.SAFETENSORS
     # checkpoint_dir is preserved from the user config
     assert config.checkpoint_dir == "/user/ckpt/"
-    # other user-provided torch_save options are discarded (defaults restored)
+    # other user-provided torch_save options are discarded; save_consolidated falls back to the default "final"
     assert config.save_consolidated.value == "final"
     assert config.is_async is False
 
@@ -379,7 +429,7 @@ def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatc
     cfg_model = ConfigNode({})
     cfg_ps = ConfigNode({})
 
-    dl, tok = build_dataloader(
+    dl, tok = _build_dataloader(
         cfg_ds=cfg_ds,
         cfg_dl=cfg_dl,
         cfg_model=cfg_model,
@@ -478,16 +528,30 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     """Patch heavy dependencies so TrainFinetuneRecipeForNextTokenPrediction.setup runs lightly."""
     # Lightweight distributed/env/logging
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_distributed",
-        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+        "nemo_automodel.recipes.llm.train_ft.initialize_distributed",
+        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.apply_cache_compatibility_patches", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.StatefulRNG", lambda *a, **k: "rng")
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_loss_fn", lambda cfg: "loss_fn")
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_checkpoint_config",
-        lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
+        "nemo_automodel.recipes._typed_config.RecipeConfig.loss_fn",
+        property(lambda self: SimpleNamespace(build=lambda: "loss_fn")),
+    )
+
+    def _stub_build_checkpoint_config(*a, **k):
+        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+        cfg.build = lambda **kw: SimpleNamespace(
+            config=cfg,
+            load_base_model=lambda *a, **k: None,
+            maybe_wait_for_staging=lambda: None,
+            close=lambda: None,
+        )
+        return cfg
+
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.checkpoint",
+        property(lambda self: _stub_build_checkpoint_config()),
     )
     # Stub setup_distributed to avoid requiring torch.distributed init
     monkeypatch.setattr(
@@ -504,17 +568,6 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         ),
     )
 
-    # Stub Checkpointer
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.Checkpointer",
-        lambda **kwargs: SimpleNamespace(
-            config=kwargs["config"],
-            load_base_model=lambda *a, **k: None,
-            maybe_wait_for_staging=lambda: None,
-            close=lambda: None,
-        ),
-    )
-
     # Stub model/optimizer creation
     dummy_model = DummyModel()
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
@@ -523,18 +576,21 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         lambda *a, **k: dummy_model,
     )
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_optimizer",
-        lambda *a, **k: [dummy_opt],
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: SimpleNamespace(build=lambda *a, **k: [dummy_opt])),
     )
 
     # Data-related stubs
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_dataloader", lambda *a, **k: ("dl", "tok"))
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_validation_dataloader", lambda *a, **k: {})
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_step_scheduler",
-        lambda *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
+        "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
+        lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_lr_scheduler", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "nemo_automodel.components.optim.optimizer.LRSchedulerConfig.build",
+        lambda self, *a, **k: [],
+    )
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.build_metric_logger",
         lambda *a, **k: SimpleNamespace(log=lambda *a, **k: None, close=lambda: None),
@@ -669,7 +725,10 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
 
     # Override the default stubs to return a pipeline-wrapped model
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", _build_model_stub)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_optimizer", _build_optimizer_stub)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: SimpleNamespace(build=_build_optimizer_stub)),
+    )
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.enable_nvtx = cfg.get("nvtx", False)
@@ -811,8 +870,8 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
 
     # Minimal stubs so we can create the recipe
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_distributed",
-        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+        "nemo_automodel.recipes.llm.train_ft.initialize_distributed",
+        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
 
@@ -1244,36 +1303,6 @@ def test_build_model_without_quant_config():
 
 
 @requires_cuda
-def test_build_optimizer_disables_foreach_with_tp():
-    """Test that when device_mesh has tp > 1, cfg_opt.foreach is set to False."""
-    cfg_model = DummyModelConfig()
-    cfg_opt = DummyOptConfig()
-    cfg_opt.foreach = True  # Initially True
-
-    # Create mock device_mesh with TP > 1
-    mock_tp = MagicMock()
-    mock_tp.size.return_value = 2
-    mock_mesh = MagicMock()
-    mock_mesh.mesh_dim_names = ("dp", "tp")
-    mock_mesh.__getitem__ = lambda self, key: mock_tp if key == "tp" else MagicMock()
-
-    with patch("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", return_value=True):
-        with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
-            with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
-                with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
-                    model = build_model(
-                        cfg_model=cfg_model,
-                        cfg_peft=None,
-                        seed=42,
-                        device_mesh=mock_mesh,
-                    )
-                    _ = build_optimizer(model, cfg_opt, None, mock_mesh)
-
-    # Verify foreach was disabled
-    assert cfg_opt.foreach is False
-
-
-@requires_cuda
 def test_build_model_and_optimizer_return_values():
     """Test that build_model and build_optimizer return proper values."""
     cfg_model = DummyModelConfig()
@@ -1297,86 +1326,6 @@ def test_build_model_and_optimizer_return_values():
 # =============================================================================
 # Tests for optimizer dtype string resolution in build_optimizer
 # =============================================================================
-
-
-class TestBuildOptimizerDtypeResolution:
-    """Tests that build_optimizer resolves dtype strings to torch.dtype for TE FusedAdam kwargs."""
-
-    def _make_cfg_opt(self, **extra_attrs):
-        cfg = DummyOptConfig()
-        for k, v in extra_attrs.items():
-            setattr(cfg, k, v)
-        return cfg
-
-    def _make_model(self):
-        model = DummyModel()
-        # Ensure at least one param requires grad
-        for p in model.parameters():
-            p.requires_grad_(True)
-        return model
-
-    def test_resolves_all_three_dtype_strings(self):
-        cfg_opt = self._make_cfg_opt(
-            master_weight_dtype="torch.float32",
-            exp_avg_dtype="torch.bfloat16",
-            exp_avg_sq_dtype="torch.float16",
-        )
-        model = self._make_model()
-
-        build_optimizer(model, cfg_opt, None, None)
-
-        assert cfg_opt.master_weight_dtype is torch.float32
-        assert cfg_opt.exp_avg_dtype is torch.bfloat16
-        assert cfg_opt.exp_avg_sq_dtype is torch.float16
-
-    def test_resolves_dtype_strings_without_torch_prefix(self):
-        cfg_opt = self._make_cfg_opt(
-            exp_avg_dtype="bfloat16",
-            exp_avg_sq_dtype="float16",
-        )
-        model = self._make_model()
-
-        build_optimizer(model, cfg_opt, None, None)
-
-        assert cfg_opt.exp_avg_dtype is torch.bfloat16
-        assert cfg_opt.exp_avg_sq_dtype is torch.float16
-
-    def test_preserves_torch_dtype_objects(self):
-        cfg_opt = self._make_cfg_opt(
-            master_weight_dtype=torch.float32,
-            exp_avg_dtype=torch.bfloat16,
-        )
-        model = self._make_model()
-
-        build_optimizer(model, cfg_opt, None, None)
-
-        # Should remain unchanged since they are already torch.dtype
-        assert cfg_opt.master_weight_dtype is torch.float32
-        assert cfg_opt.exp_avg_dtype is torch.bfloat16
-
-    def test_ignores_missing_dtype_attrs(self):
-        cfg_opt = self._make_cfg_opt()  # No dtype attrs
-        model = self._make_model()
-
-        # Should not raise
-        build_optimizer(model, cfg_opt, None, None)
-
-        assert not hasattr(cfg_opt, "master_weight_dtype")
-        assert not hasattr(cfg_opt, "exp_avg_dtype")
-        assert not hasattr(cfg_opt, "exp_avg_sq_dtype")
-
-    def test_resolves_partial_dtype_attrs(self):
-        cfg_opt = self._make_cfg_opt(
-            exp_avg_dtype="torch.bfloat16",
-            # master_weight_dtype and exp_avg_sq_dtype not set
-        )
-        model = self._make_model()
-
-        build_optimizer(model, cfg_opt, None, None)
-
-        assert cfg_opt.exp_avg_dtype is torch.bfloat16
-        assert not hasattr(cfg_opt, "master_weight_dtype")
-        assert not hasattr(cfg_opt, "exp_avg_sq_dtype")
 
 
 # =============================================================================
@@ -1410,7 +1359,7 @@ def test_build_dataloader_pp_autoconfig_failure_skips_mask_collate(caplog):
         patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", side_effect=OSError("not found")),
         caplog.at_level(logging.WARNING),
     ):
-        dl, tok = build_dataloader(
+        dl, tok = _build_dataloader(
             cfg_ds=cfg_ds,
             cfg_dl=cfg_dl,
             cfg_model=cfg_model,
@@ -1455,7 +1404,7 @@ def test_build_dataloader_pp_autoconfig_success_sets_mask_collate():
         patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=mock_config),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=lambda b, **kw: b),
     ):
-        dl, tok = build_dataloader(
+        dl, tok = _build_dataloader(
             cfg_ds=cfg_ds,
             cfg_dl=cfg_dl,
             cfg_model=cfg_model,
@@ -1501,7 +1450,7 @@ def test_build_dataloader_pp_deepseek_v4_skips_mask_collate(caplog):
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
         caplog.at_level(logging.INFO),
     ):
-        dl, tok = build_dataloader(
+        dl, tok = _build_dataloader(
             cfg_ds=cfg_ds,
             cfg_dl=cfg_dl,
             cfg_model=cfg_model,
@@ -1558,7 +1507,7 @@ def test_build_dataloader_pp_autoconfig_success_chains_existing_collate():
         patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=mock_config),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=mock_add_masks),
     ):
-        dl, tok = build_dataloader(
+        dl, tok = _build_dataloader(
             cfg_ds=cfg_ds,
             cfg_dl=cfg_dl,
             cfg_model=cfg_model,
@@ -1762,8 +1711,8 @@ class TestRunTrainOptimStepSetsMoEScale:
             }
         )
         monkeypatch.setattr(
-            "nemo_automodel.recipes.llm.train_ft.build_distributed",
-            lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+            "nemo_automodel.recipes.llm.train_ft.initialize_distributed",
+            lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
         )
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)

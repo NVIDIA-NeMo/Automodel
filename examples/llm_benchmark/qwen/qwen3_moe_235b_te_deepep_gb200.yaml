@@ -1,0 +1,114 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Benchmarking config for Qwen3 MoE 235B (A22B) Te Deepep, tuned for GB200 (BF16).
+#
+# GB200 deltas vs the generic qwen3_moe_235b_te_deepep.yaml:
+#   - peak_tflops: 989 -> 2500  (GB200 BF16 dense peak; generic recipe uses H100 989)
+#   - num_nodes/ci.nodes: 32 -> 8  (8 nodes x 4 GB200 = 32 GPUs; the pp=1 floor,
+#     same footprint as gpt-oss — proven placeable, fits 192GB with margin)
+#   - pp_size: 4 -> 1, ep_size: 32 -> 32  (pure expert parallelism, no pipeline)
+#   - dispatcher: deepep -> hybridep  (GB200: deepep fails EP-buffer init)
+#
+# Parallelism: ep_size=32 (==world=32), tp=pp=cp=1, dp_size=32. With lbs=4 and
+# global_batch_size=8192, GA = 8192 / (32*4) = 64 gradient-accumulation
+# micro-batches/step. seq_len=4096. pp=1 -> no pipeline / moe blocks.
+# warmup=2 + max_steps=5: each step is 64 microbatches so MFU is steady within
+# the first step; a couple measured steps give a stable number.
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
+seed: 1234
+
+benchmark:
+  warmup_steps: 2
+  peak_tflops: 2500  # GB200 BF16 dense peak TFLOPs
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+  num_nodes: 8
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 32
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 8192  # GA = GBS / (world*lbs) = 8192 / (32*4) = 64
+  local_batch_size: 4
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 5  # GA=256 -> each step is 256 microbatches; steady state in 1 step, a few measured steps suffice
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen3-235B-A22B
+  trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: true
+    experts: te  # TE GroupedLinear bf16 (no fp8) — te is the fastest bf16 expert backend in the bake-off
+    dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
+    fake_balanced_gate: true
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  seq_len: 4096
+  num_samples: 100000
+
+dataloader:
+  batch_size: null  # Dataset already yields batches
+  _target_: torch.utils.data.DataLoader
+  num_workers: 0
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1e-8
+  lr: 0.0001
+  weight_decay: 0
+  foreach: false  # ep32==world32: TE experts plain-tensor vs DTensor; per-param Adam avoids _foreach_lerp_ mix
+
+
+ci:
+  time: "01:00:00"
+  nodes: 8
+  ep_size: 32
