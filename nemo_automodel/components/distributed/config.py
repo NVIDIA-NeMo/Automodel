@@ -38,7 +38,7 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
@@ -48,7 +48,10 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
 # Type aliases for API signatures.
+ActivationCheckpointingMode = Union[bool, Literal["selective"]]
 DistributedStrategyConfig = Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]
+# Backwards-compatible alias for external / type-checking references.
+DistributedConfig = DistributedStrategyConfig
 
 
 @dataclass(frozen=True)
@@ -59,7 +62,7 @@ class DistributedSetup:
     strategy_config: DistributedStrategyConfig | None = None
     pipeline_config: "PipelineConfig | None" = None
     moe_parallel_config: "MoEParallelizerConfig | None" = None
-    activation_checkpointing: bool = False
+    activation_checkpointing: ActivationCheckpointingMode = False
 
     @classmethod
     def build(
@@ -68,7 +71,7 @@ class DistributedSetup:
         parallelism_sizes: "ParallelismSizes | None" = None,
         pipeline_config: "PipelineConfig | dict | None" = None,
         moe_parallel_config: "MoEParallelizerConfig | dict | None" = None,
-        activation_checkpointing: bool = False,
+        activation_checkpointing: ActivationCheckpointingMode = False,
         world_size: int | None = None,
     ) -> "DistributedSetup":
         """Create a resolved distributed setup from sizes and policy configs.
@@ -169,7 +172,9 @@ class FSDP2Config:
             ``output_dtype=float32`` in mp_policy to keep the residual stream in fp32
             while running matmuls in lower precision.  Set to ``None`` to disable.
             Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
-        activation_checkpointing (bool): Enable activation checkpointing.
+        activation_checkpointing (bool | "selective"): Enable activation checkpointing. ``True`` keeps the existing
+            full activation checkpointing behavior. ``"selective"`` wraps transformer blocks with PyTorch selective
+            activation checkpointing.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
         enable_async_tensor_parallel (bool): Enable async tensor parallelism via
             ``torch._inductor.config._micro_pipeline_tp``.  Overlaps ReduceScatter with
@@ -202,7 +207,7 @@ class FSDP2Config:
     )
     offload_policy: Optional[CPUOffloadPolicy] = None
     autocast_dtype: Optional[torch.dtype] = None
-    activation_checkpointing: bool = False
+    activation_checkpointing: ActivationCheckpointingMode = False
     defer_fsdp_grad_sync: bool = True
     enable_async_tensor_parallel: bool = False
     enable_compile: bool = False
@@ -289,9 +294,12 @@ class DDPConfig:
 
     Attributes:
         activation_checkpointing (bool): Enable activation checkpointing if True.
+        find_unused_parameters (bool): Forwarded to PyTorch DDP for models with
+            conditionally unused trainable parameters.
     """
 
     activation_checkpointing: bool = False
+    find_unused_parameters: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""

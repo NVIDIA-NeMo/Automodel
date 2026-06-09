@@ -761,6 +761,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logging.info("Disabling rope_fusion because cp_size=%d > 1", self.mesh_context.cp_size)
             self.cfg.model.backend.rope_fusion = False
 
+        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
+
         model = build_model(
             self.cfg.model,
             self.peft_config,

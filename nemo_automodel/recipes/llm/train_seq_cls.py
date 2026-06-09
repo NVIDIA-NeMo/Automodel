@@ -104,6 +104,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
+        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
         model = build_model(
             cfg_model=self.cfg.model,
             cfg_peft=self.peft_config,

@@ -240,6 +240,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
 
+        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
+
         checkpoint_config = self.cfg.checkpoint
 
         if self.cfg.get("clip_grad_norm.max_norm", None) is not None:

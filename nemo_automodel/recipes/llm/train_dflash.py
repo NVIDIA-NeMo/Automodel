@@ -141,6 +141,7 @@ class TrainDFlashRecipe(BaseRecipe):
             split=recipe_cfg.get("train_split", None),
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
         )
         self.val_dataloader = None
         if recipe_cfg.get("val_data_path", None):
@@ -154,6 +155,7 @@ class TrainDFlashRecipe(BaseRecipe):
                 split=recipe_cfg.get("val_split", None),
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+                mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
             )
 
         # DFlash draft config: a small non-causal Qwen3 stack that reuses the

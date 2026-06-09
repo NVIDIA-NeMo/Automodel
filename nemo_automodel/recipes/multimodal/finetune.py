@@ -363,7 +363,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
                 distributed_config=self.distributed_config,
                 pipeline_config=self.pipeline_config,
-                moe_config=self.moe_parallel_config,
+                moe_parallel_config=self.moe_parallel_config,
                 activation_checkpointing=self.activation_checkpointing,
                 device=self.dist_env.device,
                 mesh=self.mesh_context,

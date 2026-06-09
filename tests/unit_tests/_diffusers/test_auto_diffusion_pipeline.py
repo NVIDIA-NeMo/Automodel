@@ -405,6 +405,27 @@ def test_create_parallel_manager_ddp():
     assert build_kwargs["world_size"] is None
     assert build_kwargs["activation_checkpointing"] is False
     assert not hasattr(build_kwargs["strategy"], "backend")
+    assert build_kwargs["strategy"].find_unused_parameters is False
+    MockDDP.assert_called_once_with(mock_config)
+    assert manager is MockDDP.return_value
+
+
+def test_create_parallel_manager_ddp_passes_find_unused_parameters():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
+
+    mock_config = Mock()
+    mock_setup = SimpleNamespace(strategy_config=mock_config)
+    with (
+        patch(f"{MODULE_PATH}.DDPManager") as MockDDP,
+        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup,
+    ):
+        MockDDP.return_value = Mock()
+        manager = _create_parallel_manager({"_manager_type": "ddp", "find_unused_parameters": True})
+
+    MockBuildSetup.assert_called_once()
+    build_kwargs = MockBuildSetup.call_args.kwargs
+    assert isinstance(build_kwargs["strategy"], DDPConfig)
+    assert build_kwargs["strategy"].find_unused_parameters is True
     MockDDP.assert_called_once_with(mock_config)
     assert manager is MockDDP.return_value
 

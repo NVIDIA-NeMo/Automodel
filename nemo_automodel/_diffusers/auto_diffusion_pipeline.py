@@ -384,6 +384,7 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
         distributed_setup = DistributedSetup.build(
             strategy=DDPConfig(
                 activation_checkpointing=args.get("activation_checkpointing", False),
+                find_unused_parameters=args.get("find_unused_parameters", False),
             ),
             parallelism_sizes=parallelism,
             activation_checkpointing=args.get("activation_checkpointing", False),
