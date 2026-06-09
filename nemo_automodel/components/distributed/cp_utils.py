@@ -143,12 +143,17 @@ def make_target_cp_ctx(cp_mesh: DeviceMesh, input_ids, position_ids=None):
     if position_ids.shape[0] == 1 and batch_size > 1:
         position_ids = position_ids.expand(batch_size, -1)
 
+    # ``context_parallel`` shards these buffers in place and (being in
+    # ``no_restore_buffers``) does not restore them on exit, so they must be
+    # fresh tensors -- otherwise the caller's ``input_ids``/``position_ids``,
+    # which ``generate_batch`` still uses unsharded for the shifted outputs,
+    # would be corrupted. ``pad`` already produces a new tensor; ``clone`` the
+    # unpadded case.
     pad = (-orig_len) % cp_size
-    if pad:
-        input_ids = torch.nn.functional.pad(input_ids, (0, pad))
-        position_ids = torch.nn.functional.pad(position_ids, (0, pad))
-    ids_buf = input_ids.contiguous()
-    pos_buf = position_ids.contiguous()
+    ids_buf = torch.nn.functional.pad(input_ids, (0, pad)) if pad else input_ids.clone()
+    pos_buf = torch.nn.functional.pad(position_ids, (0, pad)) if pad else position_ids.clone()
+    ids_buf = ids_buf.contiguous()
+    pos_buf = pos_buf.contiguous()
 
     cp_ctx = context_parallel(
         cp_mesh,
