@@ -206,9 +206,10 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, nn.Module):
         self.model = Qwen3Model(config, backend=self.backend)
         # nn.Linear (not TE linear) so ColwiseParallel can shard lm_head.
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        if getattr(config, "tie_word_embeddings", False):
-            self.lm_head.weight = self.model.embed_tokens.weight
+        # Qwen3 HF checkpoints may set tie_word_embeddings=True while still
+        # carrying a distinct lm_head.weight. Treat the head as explicit so
+        # TP/FSDP checkpoint loading does not drop it as a tied alias.
+        self._nemo_force_untied_lm_head = True
 
         # Native key names already match HF format; adapter is a pass-through.
         self.state_dict_adapter = Qwen3StateDictAdapter(config)
@@ -262,7 +263,7 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, nn.Module):
             self.model.init_weights(buffer_device=buffer_device)
             final_out_std = self.config.hidden_size**-0.5
             cutoff_factor = 3
-            if self.lm_head is not None and not getattr(self.config, "tie_word_embeddings", False):
+            if self.lm_head is not None:
                 nn.init.trunc_normal_(
                     self.lm_head.weight,
                     mean=0.0,
