@@ -1,0 +1,135 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Full MiniMax M3 VL SFT: EP64, no pipeline parallelism.
+# MiniMax M3 is image-only here. MTP is left
+# disabled for SFT (num_mtp_modules=0); enable it only to reproduce MTP training.
+
+recipe: FinetuneRecipeForVLM
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 512
+  local_batch_size: 1
+  ckpt_every_steps: 100
+  val_every_steps: 25
+  log_remote_every_steps: 1
+  gc_every_steps: 10
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  # Local path of the provided checkpoint; replace with the HF id once published.
+  pretrained_model_name_or_path: /apps/models/minimax-m3-bf16_vv1-5layers
+  trust_remote_code: false
+  torch_dtype: bfloat16
+  text_config:
+    # SFT is MTP-free by default (the checkpoint's single MTP module is dropped on
+    # load).
+    num_mtp_modules: 0
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    # sdpa (not te): M3 sparse-attention layers emit an additive [B,H,T,T] bias
+    # from the DSA indexer, which only SDPA's explicit-mask path accepts. TE's
+    # DotProductAttention treats attention_mask as a boolean padding mask and
+    # crashes on the float bias (a TE block-sparse path is a perf follow-up).
+    attn: sdpa
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: gmm
+    dispatcher: deepep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+    # NOTE: the router gate is forced to fp32 by the model regardless of backend.
+
+processor:
+  # The checkpoint bundles its processor (auto_map -> processing_minimax.MiniMaxVLProcessor)
+  # but its remote-code __init__ drops chat_template during from_pretrained, so this
+  # helper loads it via AutoProcessor (trust_remote_code) and reattaches chat_template.jinja.
+  _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
+  pretrained_model_name_or_path: /apps/models/minimax-m3-bf16_vv1-5layers
+  trust_remote_code: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: vlm_checkpoints/minimax_m3_vl_5layers_sft_test/
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: true
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 2
+  persistent_workers: true
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 2048
+  drop_last: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation[:256]
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 2048
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 2.0e-6
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 2.0e-7
+
+wandb:
+  project: hiddentrail
+  entity: nvidia
+  name: minimax_m3_vl_sft_ep64_test_lr2e-6_valfix_every100
+  dir: vlm_checkpoints/minimax_m3_vl_sft_ep64_test/

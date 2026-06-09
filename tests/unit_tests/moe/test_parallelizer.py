@@ -940,6 +940,50 @@ def test_apply_fsdp_uses_dsv4_wrapper_only_for_deepseek_v4(monkeypatch):
     assert _find_call_by_first_arg(fully_shard_mock, block) is None
 
 
+@pytest.mark.parametrize(
+    "model_type, expects_dtype_aware",
+    [
+        ("minimax_m3", True),
+        ("minimax_m3_vl", True),
+        ("qwen3_moe", False),
+        ("deepseek_v3", False),
+        (None, False),
+    ],
+)
+def test_apply_fsdp_dtype_aware_sharding_only_for_minimax_m3(monkeypatch, model_type, expects_dtype_aware):
+    """Only MiniMax M3 routes blocks through fully_shard_by_dtype; other models keep fully_shard_default."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    fsbd_mock = MagicMock()
+    monkeypatch.setattr(P.parallelizer_utils, "fully_shard_by_dtype", fsbd_mock)
+
+    block = DummyBlock(mlp=DummyMoE())
+    model = DummyModel([block])
+    if model_type is not None:
+        model.config = types.SimpleNamespace(model_type=model_type)
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=object(),
+        ep_enabled=False,
+        ep_shard_enabled=False,
+    )
+
+    if expects_dtype_aware:
+        # M3: block goes through the dtype-aware sharder, not a direct fully_shard call.
+        assert _find_call_by_first_arg(fsbd_mock, block) is not None
+        assert _find_call_by_first_arg(fully_shard_mock, block) is None
+    else:
+        # Every other model keeps the original fully_shard_default (plain fully_shard) path.
+        assert _find_call_by_first_arg(fsbd_mock, block) is None
+        assert _find_call_by_first_arg(fully_shard_mock, block) is not None
+
+
 def test_parallelize_model_passes_lm_head_precision_to_apply_fsdp(monkeypatch):
     """Test that parallelize_model passes lm_head_precision to apply_fsdp."""
     P = _import_parallelizer_with_stubs(monkeypatch)

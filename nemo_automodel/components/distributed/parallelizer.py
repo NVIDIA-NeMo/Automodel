@@ -46,9 +46,12 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
-from transformers.models.gemma4.modeling_gemma4 import (
-    Gemma4ForConditionalGeneration,
-)
+try:
+    from transformers.models.gemma4.modeling_gemma4 import (
+        Gemma4ForConditionalGeneration,
+    )
+except (ImportError, ModuleNotFoundError):
+    Gemma4ForConditionalGeneration = None
 
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 
@@ -1184,6 +1187,9 @@ def validate_tp_mesh(model, tp_mesh):
             model_arch = model.config.architectures[0]
         except Exception:
             model_arch = None
+    gemma_conditional_classes = [Gemma3ForConditionalGeneration]
+    if Gemma4ForConditionalGeneration is not None:
+        gemma_conditional_classes.append(Gemma4ForConditionalGeneration)
 
     if model_cls in [
         Qwen2_5_VLForConditionalGeneration,
@@ -1214,7 +1220,7 @@ def validate_tp_mesh(model, tp_mesh):
         num_attention_heads = model.language_model.model.config.num_attention_heads
         num_key_value_heads = model.language_model.model.config.num_key_value_heads
 
-    elif model_cls in [Gemma3ForConditionalGeneration, Gemma4ForConditionalGeneration]:
+    elif model_cls in gemma_conditional_classes or model_cls.__name__ == "Gemma4ForConditionalGeneration":
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
     elif model_arch == "DeciLMForCausalLM" and getattr(model.config, "model_type", None) == "nemotron-nas":
@@ -1358,10 +1364,11 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         # module load (which would defeat test monkeypatches that stub the
         # module before first import).
         "Qwen3_5ForConditionalGeneration": ["model.language_model.layers", "model.visual.blocks"],
-        Gemma4ForConditionalGeneration: ["model.language_model.layers"],
         # String fallback in case of class identity mismatch across imports
         "Gemma4ForConditionalGeneration": ["model.language_model.layers"],
     }
+    if Gemma4ForConditionalGeneration is not None:
+        VLM_MODEL_CLS_TO_LAYERS[Gemma4ForConditionalGeneration] = ["model.language_model.layers"]
     LLM_MODEL_CLS_TO_LAYERS = {
         "NemotronHForCausalLM": ["backbone.layers"],
         GPT2LMHeadModel: ["transformer.h"],

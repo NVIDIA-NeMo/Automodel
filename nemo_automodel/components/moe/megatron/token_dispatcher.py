@@ -172,6 +172,10 @@ class _DeepepManager(_DispatchManager):
         """
         Dispatch the hidden_states
         """
+        # DeepEP dispatch supports bf16/fp16/fp8 hidden states but NOT fp32;
+        # fp32 input triggers an illegal memory access inside the dispatch kernel.
+        if hidden_states.dtype == torch.float32:
+            hidden_states = hidden_states.to(torch.bfloat16)
         # DeepEP only supports float32 probs
         if self.token_probs.dtype != torch.float32:
             if self.token_probs.dtype in [torch.bfloat16, torch.float16]:

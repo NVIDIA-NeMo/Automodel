@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from copy import copy
-from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -90,13 +90,40 @@ def iter_maximal_uniform_dtype_subtrees(
         yield it
 
 
-def _group_params_by_dtype(layer: nn.Module) -> Dict[torch.dtype, List[nn.Parameter]]:
+def _group_params_by_dtype(
+    layer: nn.Module, ignored_params: Optional[Set[nn.Parameter]] = None
+) -> Dict[torch.dtype, List[nn.Parameter]]:
     ans: Dict[torch.dtype, List[nn.Parameter]] = {}
+    ignored_param_ids = {id(param) for param in ignored_params or ()}
     for name, param in layer.named_parameters():
+        if id(param) in ignored_param_ids:
+            continue
         if param.dtype not in ans:
             ans[param.dtype] = []
         ans[param.dtype].append(param)
     return ans
+
+
+def _filter_fully_shard_kwargs(
+    module: nn.Module, fully_shard_kwargs: Dict[str, Any]
+) -> Dict[str, Any]:
+    if "ignored_params" not in fully_shard_kwargs:
+        return fully_shard_kwargs
+    if fully_shard_kwargs["ignored_params"] is None:
+        filtered_kwargs = dict(fully_shard_kwargs)
+        filtered_kwargs.pop("ignored_params", None)
+        return filtered_kwargs
+
+    ignored_param_ids = {id(param) for param in fully_shard_kwargs["ignored_params"]}
+    ignored_params = {
+        param for param in module.parameters() if id(param) in ignored_param_ids
+    }
+    filtered_kwargs = dict(fully_shard_kwargs)
+    if ignored_params:
+        filtered_kwargs["ignored_params"] = ignored_params
+    else:
+        filtered_kwargs.pop("ignored_params", None)
+    return filtered_kwargs
 
 
 def _get_module_from_path(layer: nn.Module, path: str) -> nn.Module:
@@ -110,12 +137,19 @@ def _fully_shard(
     mesh: DeviceMesh,
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy],
+    **fully_shard_kwargs: Any,
 ) -> None:
     if isinstance(module, nn.ModuleList):
         for layer in module:
-            _fully_shard(layer, mesh, mp_policy, offload_policy)
+            _fully_shard(layer, mesh, mp_policy, offload_policy, **fully_shard_kwargs)
     else:
-        fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+        fully_shard(
+            module,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            **_filter_fully_shard_kwargs(module, fully_shard_kwargs),
+        )
 
 
 def _mp_policy_with_param_dtype(
@@ -134,11 +168,14 @@ def fully_shard_by_dtype(
     mesh: DeviceMesh,
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy],
+    **fully_shard_kwargs: Any,
 ) -> None:
     """Fully shard a module, splitting mixed-dtype subtrees when needed."""
     # calling _group_params_by_dtype is not optimal here, because we may
     # end up with two traversals over the module, but this code is not in the hot path.
-    grouped_params = _group_params_by_dtype(module)
+    grouped_params = _group_params_by_dtype(
+        module, fully_shard_kwargs.get("ignored_params")
+    )
     if len(grouped_params) == 0:
         return
     elif len(grouped_params) == 1:
@@ -148,6 +185,7 @@ def fully_shard_by_dtype(
             mesh=mesh,
             mp_policy=_mp_policy_with_param_dtype(mp_policy, dtype),
             offload_policy=offload_policy,
+            **_filter_fully_shard_kwargs(module, fully_shard_kwargs),
         )
     else:
         least_items_dtype = min(grouped_params.items(), key=lambda x: len(x[1]))[0]
@@ -162,6 +200,7 @@ def fully_shard_by_dtype(
                     mesh=mesh,
                     mp_policy=_mp_policy_with_param_dtype(mp_policy, dtype),
                     offload_policy=offload_policy,
+                    **fully_shard_kwargs,
                 )
         if len(grouped_params) == 2:
             parent_dtype = next(dtype for dtype in grouped_params if dtype != least_items_dtype)
@@ -170,4 +209,5 @@ def fully_shard_by_dtype(
                 mesh=mesh,
                 mp_policy=_mp_policy_with_param_dtype(mp_policy, parent_dtype),
                 offload_policy=offload_policy,
+                **_filter_fully_shard_kwargs(module, fully_shard_kwargs),
             )

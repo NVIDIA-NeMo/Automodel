@@ -29,6 +29,7 @@ from torch.distributed.tensor import Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
+from nemo_automodel.components.distributed import parallelizer_utils
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import (
@@ -48,6 +49,24 @@ def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
     inner_model = getattr(model, "model", None)
     inner_config = getattr(inner_model, "config", None)
     return getattr(inner_config, "model_type", None) == "deepseek_v4"
+
+
+def _is_minimax_m3_model(model: torch.nn.Module) -> bool:
+    """True for MiniMax M3 (text ``minimax_m3``, VL ``minimax_m3_vl``).
+
+    M3 is the only model whose transformer blocks mix parameter dtypes (fp32
+    ``MiniMaxM3RMSNorm`` weights alongside bf16 projections/experts), so it is
+    the only model that needs the dtype-aware FSDP path in :func:`apply_fsdp`.
+    """
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    if isinstance(model_type, str) and model_type.startswith("minimax_m3"):
+        return True
+
+    inner_model = getattr(model, "model", None)
+    inner_config = getattr(inner_model, "config", None)
+    inner_type = getattr(inner_config, "model_type", None)
+    return isinstance(inner_type, str) and inner_type.startswith("minimax_m3")
 
 
 def _get_cp_stream() -> torch.cuda.Stream:
@@ -299,7 +318,21 @@ def apply_fsdp(
         ignored_params = None
         if isinstance(moe_module, MoE) and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())
-        fully_shard_default(block, ignored_params=ignored_params)
+        # MiniMax M3 blocks are genuinely mixed-dtype (fp32 MiniMaxM3RMSNorm
+        # weights alongside bf16 projections/experts); a single fully_shard call
+        # cannot wrap them, so route ONLY M3 through the dtype-aware sharder.
+        # Every other model keeps the original fully_shard_default path unchanged.
+        if _is_minimax_m3_model(model):
+            parallelizer_utils.fully_shard_by_dtype(
+                block,
+                mesh=fsdp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                reshard_after_forward=reshard_after_forward,
+                ignored_params=ignored_params,
+            )
+        else:
+            fully_shard_default(block, ignored_params=ignored_params)
 
     if hasattr(_model, "embed_tokens") and _model.embed_tokens is not None:
         fully_shard_default(_model.embed_tokens)

@@ -761,6 +761,13 @@ class GroupedExpertsDeepEP(nn.Module):
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
 
+        # Run the expert path (DeepEP dispatch + grouped GEMM) in the MoE compute dtype.
+        # Under fp32 master-weight loading the activation arrives in fp32 (the fp32 router
+        # lives in an fp32 FSDP subtree whose cast_forward_inputs upcasts the residual);
+        # cast it back to the compute dtype so DeepEP (which supports only bf16/fp16/fp8)
+        # can dispatch and the GEMM runs at the model's precision. No-op when already matching.
+        x = x.to(self.config.dtype)
+
         indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
             hidden_states=x,

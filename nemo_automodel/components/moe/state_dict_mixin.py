@@ -146,13 +146,22 @@ class MoESplitExpertsStateDictMixin:
                 + (f" (and {missing_count - 5} more)" if missing_count > 5 else "")
             )
 
-    def _split_experts_weights(self, weight: torch.Tensor, n_experts: int) -> list[torch.Tensor]:
+    def _split_experts_weights(
+        self,
+        weight: torch.Tensor,
+        n_experts: int,
+        device_mesh: Optional[DeviceMesh] = None,
+    ) -> list[torch.Tensor]:
         """Split grouped expert weights into individual expert weights.
         For grouped expert weights with shape [n_experts, ...], split into n_experts tensors each with shape [...].
         Supports both regular tensors and DTensors.
         """
         if is_dtensor(weight):
-            split_weights, expert_ids = split_experts_weights_dtensor_aware(weight, n_experts)
+            split_weights, expert_ids = split_experts_weights_dtensor_aware(
+                weight,
+                n_experts,
+                device_mesh=device_mesh,
+            )
             self._last_expert_ids = expert_ids
             return split_weights
         else:
@@ -203,6 +212,7 @@ class MoESplitExpertsStateDictMixin:
         n_experts: int,
         inter_dim: int,
         expert_segment: str,
+        device_mesh: Optional[DeviceMesh] = None,
     ) -> list[tuple[str, torch.Tensor]]:
         """Convert a grouped MoE expert LoRA tensor to per-expert HF PEFT format.
 
@@ -220,7 +230,7 @@ class MoESplitExpertsStateDictMixin:
         layer_num = match.group(2)
         suffix = fqn.rsplit(".", 1)[-1]
 
-        splits = self._split_experts_weights(tensor, n_experts)
+        splits = self._split_experts_weights(tensor, n_experts, device_mesh=device_mesh)
         result: list[tuple[str, torch.Tensor]] = []
 
         for i, w in enumerate(splits):
@@ -555,7 +565,7 @@ class MoESplitExpertsStateDictMixin:
             if is_dtensor(tensor):
                 validate_dtensor_expert_sharding(tensor, n_experts, f"gate_and_up_projs layer {layer_num}")
 
-            splits = self._split_experts_weights(tensor, n_experts)
+            splits = self._split_experts_weights(tensor, n_experts, device_mesh=kwargs.get("device_mesh"))
             result = []
             for i, w in enumerate(splits):
                 expert_id = self._last_expert_ids[i]
@@ -587,7 +597,7 @@ class MoESplitExpertsStateDictMixin:
             if is_dtensor(tensor):
                 validate_dtensor_expert_sharding(tensor, n_experts, f"down_projs (DeepEP) layer {layer_num}")
 
-            splits = self._split_experts_weights(tensor, n_experts)
+            splits = self._split_experts_weights(tensor, n_experts, device_mesh=kwargs.get("device_mesh"))
             result = []
             for i, w in enumerate(splits):
                 expert_id = self._last_expert_ids[i]
@@ -604,6 +614,13 @@ class MoESplitExpertsStateDictMixin:
         _LORA_EXPERT_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
         for suffix in _LORA_EXPERT_SUFFIXES:
             if f".{expert_segment}.{suffix}" in fqn and fqn.endswith(f".{suffix}"):
-                return self._convert_lora_expert_to_hf(fqn, tensor, n_experts, inter_dim, expert_segment)
+                return self._convert_lora_expert_to_hf(
+                    fqn,
+                    tensor,
+                    n_experts,
+                    inter_dim,
+                    expert_segment,
+                    device_mesh=kwargs.get("device_mesh"),
+                )
 
         return None

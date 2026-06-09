@@ -1,0 +1,100 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# MiniMax M3 text-only SFT smoke test. This uses the text config from the local
+# MiniMax M3 VL checkpoint and does not construct or execute the vision path.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 100
+  val_every_steps: null
+  log_remote_every_steps: 1
+  gc_every_steps: 10
+  max_steps: 1
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: true
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /apps/models/minimax-m3-bf16_vv1-5layers
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  architectures: [MiniMaxM3SparseForCausalLM]
+  text_config:
+    architectures: [MiniMaxM3SparseForCausalLM]
+    torch_dtype: bfloat16
+    num_mtp_modules: 0
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: gmm
+    dispatcher: deepep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: llm_checkpoints/minimax_m3_5layers_hellaswag_sft_test/
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
+  shuffle: true
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 2.0e-6
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 2.0e-7
+
+wandb:
+  project: hiddentrail
+  entity: nvidia
+  name: minimax_m3_5layers_text_sft_test
+  dir: llm_checkpoints/minimax_m3_5layers_hellaswag_sft_test/

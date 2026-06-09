@@ -386,6 +386,13 @@ class MiniMaxM3Attention(nn.Module):
             cp_rank=attn_kwargs.get("cp_rank", 0),
         )
 
+        # SDPA's additive (float) mask must share the query dtype. M3 builds its
+        # block-sparse / padding attention bias in float32, so align it to the
+        # compute dtype here. Kept local to M3 rather than in the shared attention
+        # util so other models' attention paths are unaffected. Boolean key-padding
+        # masks (dim <= 2) are left untouched and handled by the shared util.
+        if attention_mask is not None and attention_mask.is_floating_point():
+            attention_mask = attention_mask.to(q.dtype)
         q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
             q, k, v, attention_mask, self.backend.attn, **attn_kwargs
         )

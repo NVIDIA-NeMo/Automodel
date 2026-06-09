@@ -30,7 +30,36 @@ def get_submesh(device_mesh: DeviceMesh, dims: tuple[str, ...]) -> DeviceMesh:
     return device_mesh[dims]
 
 
-def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> tuple[torch.Tensor, int, int]:
+def _get_ep_mesh(device_mesh: Optional[DeviceMesh]) -> Optional[DeviceMesh]:
+    if device_mesh is None:
+        return None
+    if "ep" in device_mesh.mesh_dim_names:
+        return get_submesh(device_mesh, ("ep",))
+    return None
+
+
+def _expert_range_for_ep_mesh(ep_mesh: DeviceMesh, n_experts: int) -> tuple[int, int]:
+    current_rank = ep_mesh.get_local_rank()
+    world_size = ep_mesh.size()
+
+    experts_per_rank = n_experts // world_size
+    remainder = n_experts % world_size
+
+    if current_rank < remainder:
+        experts_on_rank = experts_per_rank + 1
+        start_expert = current_rank * experts_on_rank
+    else:
+        experts_on_rank = experts_per_rank
+        start_expert = remainder * (experts_per_rank + 1) + (current_rank - remainder) * experts_per_rank
+
+    return start_expert, start_expert + experts_on_rank
+
+
+def get_expert_slice_for_rank(
+    experts_tensor: torch.Tensor,
+    n_experts: int,
+    device_mesh: Optional[DeviceMesh] = None,
+) -> tuple[torch.Tensor, int, int]:
     """
     Get the slice of experts present on the current rank for a DTensor.
 
@@ -40,6 +69,9 @@ def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> t
     Args:
         experts_tensor: Input tensor containing expert weights [n_experts, ...]
         n_experts: Total number of experts across all ranks
+        device_mesh: Optional fallback MoE mesh. This is used when the tensor
+            itself is a DTensor on a non-EP mesh but already contains the local
+            expert slice.
 
     Returns:
         tuple of (local_tensor, start_expert_id, end_expert_id)
@@ -53,41 +85,41 @@ def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> t
     dtensor = experts_tensor
     local_tensor = dtensor.to_local()
 
-    device_mesh = dtensor.device_mesh
-    assert "ep" in device_mesh.mesh_dim_names, "ep mesh dimension not found"
-    ep_mesh = get_submesh(device_mesh, ("ep",))
-    current_rank = ep_mesh.get_local_rank()
+    dtensor_mesh = dtensor.device_mesh
+    ep_mesh = _get_ep_mesh(dtensor_mesh) or _get_ep_mesh(device_mesh)
 
     placement = dtensor.placements[-1]  # Assume single device mesh for now
     if isinstance(placement, Shard) and placement.dim == 0:
+        if ep_mesh is None:
+            if local_tensor.shape[0] == n_experts:
+                return local_tensor, 0, n_experts
+            raise ValueError(
+                "Cannot infer expert range for DTensor sharded on dim 0 "
+                f"without an ep mesh; tensor mesh dims are {dtensor_mesh.mesh_dim_names}"
+            )
         # Tensor is sharded along expert dimension
-        world_size = ep_mesh.size()
-
-        # Calculate expert range for this rank
-        experts_per_rank = n_experts // world_size
-        remainder = n_experts % world_size
-
-        if current_rank < remainder:
-            # First `remainder` ranks get one extra expert
-            experts_on_rank = experts_per_rank + 1
-            start_expert = current_rank * experts_on_rank
-        else:
-            # Remaining ranks get standard number of experts
-            experts_on_rank = experts_per_rank
-            start_expert = remainder * (experts_per_rank + 1) + (current_rank - remainder) * experts_per_rank
-
-        end_expert = start_expert + experts_on_rank
+        start_expert, end_expert = _expert_range_for_ep_mesh(ep_mesh, n_experts)
         return local_tensor, start_expert, end_expert
     elif isinstance(placement, Replicate):
         # Tensor is replicated - all ranks have full data
+        if local_tensor.shape[0] != n_experts and ep_mesh is not None:
+            start_expert, end_expert = _expert_range_for_ep_mesh(ep_mesh, n_experts)
+            return local_tensor, start_expert, end_expert
         return local_tensor, 0, n_experts
     else:
         # Other sharding patterns - assume full range for now
         # Could be extended to handle sharding along other dimensions
+        if local_tensor.shape[0] != n_experts and ep_mesh is not None:
+            start_expert, end_expert = _expert_range_for_ep_mesh(ep_mesh, n_experts)
+            return local_tensor, start_expert, end_expert
         return local_tensor, 0, n_experts
 
 
-def split_experts_weights_dtensor_aware(weight: torch.Tensor, n_experts: int) -> tuple[list[torch.Tensor], list[int]]:
+def split_experts_weights_dtensor_aware(
+    weight: torch.Tensor,
+    n_experts: int,
+    device_mesh: Optional[DeviceMesh] = None,
+) -> tuple[list[torch.Tensor], list[int]]:
     """
     Split expert weights, handling both regular tensors and DTensors.
 
@@ -96,13 +128,15 @@ def split_experts_weights_dtensor_aware(weight: torch.Tensor, n_experts: int) ->
     Args:
         weight: Expert weights tensor [n_experts, ...] (regular tensor or DTensor)
         n_experts: Total number of experts across all ranks
+        device_mesh: Optional fallback MoE mesh used to recover local expert ids
+            when ``weight`` is a DTensor on a mesh without an ``ep`` dimension.
 
     Returns:
         tuple of (split_weights, expert_ids)
         - split_weights: List of individual expert weight tensors
         - expert_ids: List of global expert IDs corresponding to split_weights
     """
-    local_tensor, start_expert, end_expert = get_expert_slice_for_rank(weight, n_experts)
+    local_tensor, start_expert, end_expert = get_expert_slice_for_rank(weight, n_experts, device_mesh=device_mesh)
     local_n_experts = end_expert - start_expert
     if local_tensor.shape[0] != local_n_experts:
         raise ValueError(
@@ -120,19 +154,24 @@ def split_experts_weights_dtensor_aware(weight: torch.Tensor, n_experts: int) ->
         original_placements = weight.placements
         mesh_dim_names = list(weight.device_mesh.mesh_dim_names)
 
-        # 'ep' is guaranteed to be present; remove it
-        ep_dim_idx = mesh_dim_names.index("ep")
-        remaining_mesh_dims = mesh_dim_names[:ep_dim_idx] + mesh_dim_names[ep_dim_idx + 1 :]
+        if "ep" in mesh_dim_names:
+            # 'ep' is guaranteed to be present; remove it
+            ep_dim_idx = mesh_dim_names.index("ep")
+            remaining_mesh_dims = mesh_dim_names[:ep_dim_idx] + mesh_dim_names[ep_dim_idx + 1 :]
 
-        # Build device mesh without 'ep'
-        if remaining_mesh_dims and any(map(lambda x: get_submesh(device_mesh, (x,)).size() > 1, remaining_mesh_dims)):
-            new_device_mesh = get_submesh(device_mesh, tuple(remaining_mesh_dims))
+            # Build device mesh without 'ep'
+            if remaining_mesh_dims and any(map(lambda x: get_submesh(device_mesh, (x,)).size() > 1, remaining_mesh_dims)):
+                new_device_mesh = get_submesh(device_mesh, tuple(remaining_mesh_dims))
+            else:
+                new_device_mesh = None
+                is_weight_dtensor = False
+
+            # Placements without the 'ep' dimension
+            new_placements_template = original_placements[:ep_dim_idx] + original_placements[ep_dim_idx + 1 :]
         else:
             new_device_mesh = None
             is_weight_dtensor = False
-
-        # Placements without the 'ep' dimension
-        new_placements_template = original_placements[:ep_dim_idx] + original_placements[ep_dim_idx + 1 :]
+            new_placements_template = []
 
     for i in range(local_n_experts):
         expert_weight = local_tensor[i]  # Shape: [...] (expert dimension removed)

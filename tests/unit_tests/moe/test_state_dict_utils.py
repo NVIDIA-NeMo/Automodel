@@ -113,6 +113,40 @@ class TestGetExpertSliceForRank:
         assert start_expert == 0
         assert end_expert == 8
 
+    @patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor")
+    @patch("nemo_automodel.components.moe.state_dict_utils.get_submesh")
+    def test_dtensor_without_ep_uses_fallback_moe_mesh(self, mock_get_submesh, mock_is_dtensor):
+        mock_is_dtensor.return_value = True
+
+        mock_dtensor = Mock()
+        mock_local_tensor = torch.randn(2, 16, 32)
+        mock_dtensor.to_local.return_value = mock_local_tensor
+
+        mock_dtensor_mesh = Mock()
+        mock_dtensor_mesh.mesh_dim_names = ["dp_shard"]
+        mock_dtensor.device_mesh = mock_dtensor_mesh
+
+        mock_moe_mesh = Mock()
+        mock_moe_mesh.mesh_dim_names = ["ep"]
+
+        mock_ep_mesh = Mock()
+        mock_ep_mesh.get_local_rank.return_value = 2
+        mock_ep_mesh.size.return_value = 4
+        mock_get_submesh.return_value = mock_ep_mesh
+
+        from torch.distributed._tensor.placement_types import Replicate
+        mock_dtensor.placements = [Replicate()]
+
+        local_tensor, start_expert, end_expert = get_expert_slice_for_rank(
+            mock_dtensor,
+            8,
+            device_mesh=mock_moe_mesh,
+        )
+
+        assert torch.equal(local_tensor, mock_local_tensor)
+        assert start_expert == 4
+        assert end_expert == 6
+
 
 class TestSplitExpertsWeightsDtensorAware:
     def test_regular_tensor(self):
@@ -159,6 +193,39 @@ class TestSplitExpertsWeightsDtensorAware:
 
         assert len(split_weights) == 2
         assert expert_ids == [2, 3]
+
+    @patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor")
+    @patch("nemo_automodel.components.moe.state_dict_utils.get_submesh")
+    def test_dtensor_without_ep_splits_with_fallback_moe_mesh(self, mock_get_submesh, mock_is_dtensor):
+        mock_is_dtensor.return_value = True
+
+        mock_weight = Mock()
+        local_weight = torch.randn(2, 16, 32)
+        mock_weight.to_local.return_value = local_weight
+        mock_weight.device_mesh = Mock()
+        mock_weight.device_mesh.mesh_dim_names = ["dp_shard"]
+
+        from torch.distributed._tensor.placement_types import Replicate
+        mock_weight.placements = [Replicate()]
+
+        mock_moe_mesh = Mock()
+        mock_moe_mesh.mesh_dim_names = ["ep"]
+
+        mock_ep_mesh = Mock()
+        mock_ep_mesh.get_local_rank.return_value = 1
+        mock_ep_mesh.size.return_value = 4
+        mock_get_submesh.return_value = mock_ep_mesh
+
+        split_weights, expert_ids = split_experts_weights_dtensor_aware(
+            mock_weight,
+            8,
+            device_mesh=mock_moe_mesh,
+        )
+
+        assert len(split_weights) == 2
+        assert expert_ids == [2, 3]
+        assert torch.equal(split_weights[0], local_weight[0])
+        assert torch.equal(split_weights[1], local_weight[1])
 
 
 class TestValidateDtensorExpertSharding:

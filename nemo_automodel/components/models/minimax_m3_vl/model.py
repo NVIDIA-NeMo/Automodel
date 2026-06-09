@@ -56,6 +56,24 @@ class MiniMaxM3CausalLMOutput:
     mtp_per_depth_logits: list[torch.Tensor] | None = None
 
 
+def _apply_config_overrides(config: Any, kwargs: dict[str, Any], nested_config_names: tuple[str, ...] = ()) -> None:
+    """Apply config-only kwargs while leaving infrastructure kwargs for model construction."""
+    for nested_name in nested_config_names:
+        nested_overrides = kwargs.pop(nested_name, None)
+        if nested_overrides is None:
+            continue
+        nested_config = getattr(config, nested_name, None)
+        if isinstance(nested_overrides, dict) and nested_config is not None:
+            for key, value in nested_overrides.items():
+                setattr(nested_config, key, value)
+        else:
+            setattr(config, nested_name, nested_overrides)
+
+    for key in list(kwargs):
+        if hasattr(config, key):
+            setattr(config, key, kwargs.pop(key))
+
+
 def build_moe_config(config: Any, dtype: torch.dtype) -> MoEConfig:
     """Build the routed-expert ``MoEConfig`` for the M3 backbone.
 
@@ -86,7 +104,12 @@ def build_moe_config(config: Any, dtype: torch.dtype) -> MoEConfig:
         activation_limit=float(getattr(config, "swiglu_limit", 7.0)),
         softmax_before_topk=False,
         force_e_score_correction_bias=bool(getattr(config, "use_routing_bias", True)),
-        dtype=dtype,
+        # Run the MoE (router/experts/dispatch) in the low-precision compute dtype even
+        # when the model is loaded with fp32 master weights. DeepEP dispatch only supports
+        # bf16/fp16/fp8, and the expert GEMM should match the model's bf16 compute
+        # precision; the fp32 master copy is preserved by the optimizer (FusedAdam
+        # master_weights). For non-fp32 loads, keep the model dtype unchanged.
+        dtype=(torch.bfloat16 if dtype == torch.float32 else dtype),
     )
 
 
@@ -261,6 +284,7 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
         config = MiniMaxM3VLTextConfig.from_pretrained(pretrained_model_name_or_path)
+        _apply_config_overrides(config, kwargs)
         return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(
@@ -381,6 +405,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
         config = MiniMaxM3VLConfig.from_pretrained(pretrained_model_name_or_path)
+        _apply_config_overrides(config, kwargs, nested_config_names=("text_config", "vision_config"))
         return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(
