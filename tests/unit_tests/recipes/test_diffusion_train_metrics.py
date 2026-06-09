@@ -460,6 +460,7 @@ def test_build_diffusion_parallel_manager_args_parses_ddp_config():
         "_manager_type": "ddp",
         "world_size": 4,
         "activation_checkpointing": True,
+        "find_unused_parameters": False,
     }
 
 
