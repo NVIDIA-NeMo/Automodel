@@ -824,7 +824,6 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         image_grid_hws: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
-        seq_index: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
         """Build full-sequence multimodal embeddings and mRoPE positions before CP sharding."""
@@ -888,17 +887,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             position_ids, rope_deltas = self.model.get_rope_index(input_ids, **rope_kwargs)
             self.model.rope_deltas = rope_deltas
 
-        if seq_index is None:
-            seq_index = (
-                torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
-                .unsqueeze(0)
-                .expand(inputs_embeds.shape[0], -1)
-                .contiguous()
-            )
-        elif seq_index.ndim == 2 and seq_index.shape[0] == 1 and inputs_embeds.shape[0] > 1:
-            seq_index = seq_index.expand(inputs_embeds.shape[0], -1).contiguous()
-
-        return {"inputs_embeds": inputs_embeds, "position_ids": position_ids, "seq_index": seq_index}
+        return {"inputs_embeds": inputs_embeds, "position_ids": position_ids}
 
     def forward(
         self,
