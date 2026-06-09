@@ -65,6 +65,7 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     apply_submodule_checkpointing,
     detect_kv_sharing_and_maybe_disable_cache,
     is_selective_activation_checkpointing,
+    stabilize_kv_sharing_across_fsdp,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 
@@ -374,6 +375,13 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             reshard_after_forward=False,
             offload_policy=offload_policy,
         )
+
+        # KV-sharing models (e.g. Gemma 3n) thread a single ``shared_kv_states``
+        # dict between decoder layers; FSDP2's per-layer input-cast rebuilds that
+        # dict per layer (cast_forward_inputs=True), so the producer's K/V never
+        # reach the consuming shared layers -> KeyError on the first forward.
+        # Re-establish a single canonical dict now that every layer is wrapped.
+        stabilize_kv_sharing_across_fsdp(model)
 
         return model
 
