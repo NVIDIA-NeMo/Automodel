@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from nemo_automodel.recipes.llm import train_dflash
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
 
 
@@ -86,3 +87,23 @@ def test_resolve_mask_token_id_raises_without_any():
     cfg = SimpleNamespace(get=lambda k, d=None: d)
     with pytest.raises(ValueError, match="mask_token_id"):
         TrainDFlashRecipe._resolve_mask_token_id(obj, cfg)
+
+
+def test_all_ranks_have_valid_single_process_passes_local_flag():
+    # No DDP -> the local flag passes through unchanged (no collective).
+    assert train_dflash._all_ranks_have_valid(1, is_ddp=False, device="cpu") is True
+    assert train_dflash._all_ranks_have_valid(0, is_ddp=False, device="cpu") is False
+
+
+def test_all_ranks_have_valid_ddp_min_reduces_across_ranks(monkeypatch):
+    """Under DDP the flag is MIN-reduced: one rank without anchors makes all skip."""
+    monkeypatch.setattr(train_dflash.dist, "is_available", lambda: True)
+    monkeypatch.setattr(train_dflash.dist, "is_initialized", lambda: True)
+
+    # Another rank skipped -> the collective drives the flag to 0 -> all skip.
+    monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda t, op=None: t.fill_(0))
+    assert train_dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is False
+
+    # Every rank valid -> MIN leaves the 1 in place -> all run the backward.
+    monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda t, op=None: None)
+    assert train_dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is True
