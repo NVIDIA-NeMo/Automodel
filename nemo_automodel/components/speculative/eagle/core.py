@@ -92,6 +92,9 @@ class Eagle3TrainerModule(nn.Module):
         *,
         target_probs: torch.Tensor | None = None,
         position_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> Eagle3StepMetrics:
         """Run the EAGLE-3 unrolled draft loss for one batch.
 
@@ -106,6 +109,11 @@ class Eagle3TrainerModule(nn.Module):
         ``attention_mask`` is held constant across TTT steps -- only
         ``input_ids`` / ``loss_mask`` / ``position_mask`` /
         ``target_probs`` roll forward by one position per step.
+
+        Packing: ``position_ids`` / ``seq_lens`` make the draft's Block-1 attention
+        document-level block-causal, and ``doc_remaining`` gates supervision per
+        step (slot ``t`` valid at step ``k`` only while ``k < doc_remaining[t]``),
+        masking every cross-document TTT prediction.
 
         Two supervision sources are accepted: the live path passes the
         target's full-vocab ``target_logits`` and the draft distribution is
@@ -163,17 +171,27 @@ class Eagle3TrainerModule(nn.Module):
                 input_ids=cur_input_ids,
                 projected_hidden_states=cur_hidden_states,
                 attention_mask=attention_mask,
+                position_ids=position_ids,
                 cache_hidden=cache_hidden,
+                seq_lens=seq_lens,
             )
             logits = self.draft_model.compute_logits(cur_hidden_states)
+
+            # Packing: drop supervision whose step_idx-ahead target crosses this
+            # slot's document boundary. Gate recomputed per step (depends on step_idx).
+            step_position_mask = cur_position_mask
+            if doc_remaining is not None:
+                in_doc = (step_idx < doc_remaining).unsqueeze(-1)
+                step_position_mask = cur_position_mask & in_doc
+
             step_loss = masked_soft_cross_entropy(
                 logits=logits,
                 target_probs=cur_target_probs,
-                position_mask=cur_position_mask,
+                position_mask=step_position_mask,
             )
             running_loss = running_loss + step_loss * (0.8**step_idx)
 
-            valid_mask = cur_position_mask.squeeze(-1).bool()
+            valid_mask = step_position_mask.squeeze(-1).bool()
             correct = (logits.argmax(dim=-1) == cur_target_probs.argmax(dim=-1)) & valid_mask
             running_correct = running_correct + correct.sum()
             running_valid = running_valid + valid_mask.sum()

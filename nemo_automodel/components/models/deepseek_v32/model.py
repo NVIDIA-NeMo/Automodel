@@ -69,11 +69,13 @@ class DeepseekV32Block(Block):
         from nemo_automodel.components.models.common import initialize_rms_norm_module
         from nemo_automodel.components.moe.layers import MLP, MoE
 
+        self.is_moe_layer = layer_idx >= config.first_k_dense_replace
+
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
 
-        if layer_idx < config.first_k_dense_replace:
+        if not self.is_moe_layer:
             self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
         else:
             self.mlp = MoE(moe_config, backend)

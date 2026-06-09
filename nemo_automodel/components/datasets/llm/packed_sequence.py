@@ -384,3 +384,33 @@ def packed_block_causal_mask(seq_lens: list[torch.Tensor]):
         _MaskType: BlockMask or Tensor if torch version < 2.5.0.
     """
     return create_block_causal_mask(seq_lens=seq_lens)
+
+
+def build_block_causal_additive_mask(
+    seq_lens: torch.Tensor,
+    *,
+    seq_length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a ``[B, 1, T, T]`` additive block-causal mask directly on ``device``.
+
+    In-document causal attention is allowed (``0``); cross-document and padding
+    positions are ``finfo(dtype).min``. ``seq_lens`` is the ``[B, max_docs]``
+    0-padded per-document length tensor; each row's non-zero entries sum to
+    ``seq_length`` (trailing pad folded into the final document).
+    """
+    min_value = torch.finfo(dtype).min
+    seq_lens = seq_lens.to(device)
+    positions = torch.arange(seq_length, device=device)
+    # Per-position document id: the count of document boundaries at or before the
+    # position. 0-length padding entries leave the cumulative boundary unchanged,
+    # so they never split a real document. ``[B, T]``.
+    boundaries = seq_lens.cumsum(dim=1)  # [B, max_docs]
+    doc_id = (boundaries.unsqueeze(1) <= positions.view(1, -1, 1)).sum(dim=2)  # [B, T]
+    same_doc = doc_id.unsqueeze(2) == doc_id.unsqueeze(1)  # [B, T, T]
+    causal = torch.tril(torch.ones(seq_length, seq_length, dtype=torch.bool, device=device))
+    # In-document lower-triangular attention is allowed; everything else is masked.
+    allowed = same_doc & causal
+    mask = torch.where(allowed, torch.zeros((), dtype=dtype, device=device), min_value)
+    return mask.unsqueeze(1)

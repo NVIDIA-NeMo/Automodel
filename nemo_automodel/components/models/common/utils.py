@@ -668,10 +668,87 @@ def compute_lm_head_logits(
     return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_out)
 
 
+def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.dtype | None) -> None:
+    """Cast the floating-point tensors of frozen submodules to ``compute_dtype``.
+
+    When parameters are stored in fp32 (the fp32-master-weights pattern) while compute runs
+    in bf16, a fully frozen submodule -- such as a frozen vision tower -- can still produce
+    fp32 values that flow into bf16 trainable modules and raise a dtype mismatch in the next
+    matmul. This walks each maximal fully-frozen submodule and casts its parameters and
+    buffers to ``compute_dtype``, handling the two tensor kinds differently:
+
+    * **Parameters** are cast only when they are plain (unsharded) tensors. Sharded (DTensor)
+      params are left as-is: FSDP all-gathers them to the compute dtype during forward, and
+      changing a sharded param's dtype in place would desync FSDP's flat-parameter and
+      ``orig_dtype`` bookkeeping.
+    * **Buffers** are always cast. Buffers are never sharded, so they stay in their stored
+      dtype regardless of the wrapper; an fp32 buffer (for example a standardization
+      constant) used in a forward op promotes the surrounding bf16 activations to fp32.
+
+    Tensors whose qualified name matches ``_keep_in_fp32_modules`` or
+    ``_keep_in_fp32_modules_strict`` are left in fp32. The function is a no-op when
+    ``compute_dtype`` is None and for tensors already in ``compute_dtype``. Frozen modules are
+    never updated, so casting them does not affect training accuracy.
+
+    Args:
+        model: The model, already materialized, checkpoint-loaded, and sharded.
+        compute_dtype: The compute dtype (``mp_policy.param_dtype``); None disables the cast.
+    """
+    if compute_dtype is None:
+        return
+
+    try:
+        from torch.distributed.tensor import DTensor
+    except ImportError:
+        DTensor = ()
+
+    fp32_keywords = _get_fp32_module_keywords(model)
+
+    def _is_fp32_pinned(name: str) -> bool:
+        return any(kw in name for kw in fp32_keywords)
+
+    # ``named_modules`` yields parents before children, so the first fully-frozen subtree
+    # we accept is always maximal; descendants are skipped via the ancestor check below.
+    # Sharded subtrees are included so their buffers get cast; their params are skipped per-tensor.
+    selected: list[str] = []
+    for name, module in model.named_modules():
+        params = list(module.parameters(recurse=True))
+        if not params:
+            continue
+        if any(p.requires_grad for p in params):
+            continue
+        if any(name == anc or name.startswith(anc + ".") for anc in selected):
+            continue
+        selected.append(name)
+
+    for name in selected:
+        module = model.get_submodule(name) if name else model
+        prefix = f"{name}." if name else ""
+        # Parameters: cast plain (unsharded) floats; leave sharded (DTensor) params to FSDP.
+        for param_name, param in module.named_parameters():
+            full_name = prefix + param_name
+            if _is_fp32_pinned(full_name):
+                continue
+            if DTensor and isinstance(param, DTensor):
+                continue
+            if param.is_floating_point() and param.dtype != compute_dtype:
+                param.data = param.data.to(compute_dtype)
+        # Buffers: never FSDP-managed (always plain tensors), so always safe to cast.
+        for buffer_name, buf in module.named_buffers():
+            full_name = prefix + buffer_name
+            if _is_fp32_pinned(full_name):
+                continue
+            if buf.is_floating_point() and buf.dtype != compute_dtype:
+                owner_name, _, leaf = buffer_name.rpartition(".")
+                owner = module.get_submodule(owner_name) if owner_name else module
+                owner._buffers[leaf] = buf.to(compute_dtype)
+
+
 __all__ = [
     "BackendConfig",
     "Float32RMSNorm",
     "TEFp8Config",
+    "cast_frozen_modules_to_compute_dtype",
     "cast_model_to_dtype",
     "compute_lm_head_logits",
     "get_is_first_microbatch",

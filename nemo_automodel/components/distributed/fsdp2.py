@@ -17,9 +17,13 @@ from typing import Optional
 
 from torch.distributed.device_mesh import DeviceMesh
 
+from nemo_automodel.components.distributed.activation_checkpointing import (
+    is_selective_activation_checkpointing,
+)
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.parallelizer import (
+    apply_selective_activation_checkpointing,
     fsdp2_strategy_parallelize,
 )
 
@@ -115,7 +119,12 @@ class FSDP2Manager:
         if get_world_size_safe() == 1:
             logger.info("World size is 1, skipping parallelization.")
             if self.activation_checkpointing:
-                if hasattr(model, "gradient_checkpointing_enable"):
+                if is_selective_activation_checkpointing(self.activation_checkpointing):
+                    # Selective AC works on a plain model (no FSDP required), so
+                    # honor it on a single GPU instead of silently falling back
+                    # to full HF gradient checkpointing.
+                    apply_selective_activation_checkpointing(model, enable_compile=self.enable_compile)
+                elif hasattr(model, "gradient_checkpointing_enable"):
                     model.gradient_checkpointing_enable()
                 else:
                     logger.error("Model does not support gradient checkpointing.")

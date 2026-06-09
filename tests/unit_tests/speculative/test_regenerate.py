@@ -152,6 +152,7 @@ def test_resume_manifest_mismatch_raises(tmp_path: Path):
         max_new_tokens=128,
         temperature=0.0,
         top_p=1.0,
+        reasoning="none",
     )
     manifest = _build_manifest(args)
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -180,6 +181,7 @@ def test_resume_without_manifest_and_existing_shards_raises(tmp_path: Path):
         "max_new_tokens": 128,
         "temperature": 0.0,
         "top_p": 1.0,
+        "reasoning": "none",
     }
     with pytest.raises(ValueError, match="manifest.json is missing"):
         _ensure_manifest_compatible(tmp_path, manifest, resume=True, existing_shards={0})
@@ -201,6 +203,7 @@ def test_fresh_run_with_existing_shards_refuses_to_clobber(tmp_path: Path):
         max_new_tokens=128,
         temperature=0.0,
         top_p=1.0,
+        reasoning="none",
     )
     with pytest.raises(ValueError, match="already contains"):
         _ensure_manifest_compatible(
@@ -226,6 +229,7 @@ def test_fresh_run_into_empty_dir_writes_manifest(tmp_path: Path):
         max_new_tokens=128,
         temperature=0.0,
         top_p=1.0,
+        reasoning="none",
     )
     manifest = _build_manifest(args)
     _ensure_manifest_compatible(tmp_path, manifest, resume=False, existing_shards=set())
@@ -248,6 +252,7 @@ def test_build_manifest_excludes_self_referential_and_operational_fields():
         shard_size=1000,
         max_new_tokens=128,
         temperature=0.0,
+        reasoning="none",
         top_p=1.0,
         # Operational knobs that intentionally do NOT belong in the manifest.
         concurrency=99,
@@ -417,6 +422,7 @@ def _run_args(tmp_path: Path, *, resume: bool, shard_size: int = 2) -> SimpleNam
         max_retries=0,
         resume=resume,
         log_level="INFO",
+        reasoning="none",
     )
 
 
@@ -524,7 +530,7 @@ def test_chat_completion_retries_on_5xx_then_succeeds(monkeypatch):
 
     result = asyncio.run(_chat_completion(session, "http://stub/completions", {}, timeout_s=1.0, max_retries=3))
 
-    assert result == "ok"
+    assert result == {"role": "assistant", "content": "ok"}
     assert session.call_count == 3
     assert len(sleep_calls) == 2  # slept once after each failed attempt
     assert sleep_calls[0] == 1.0  # 2**0 = 1

@@ -19,8 +19,7 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
-from contextlib import contextmanager
-from typing import Any, Iterator, Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -83,66 +82,6 @@ from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .state_dict_adapter import Gemma4MoEStateDictAdapter
-
-
-def _first_floating_param_dtype(module: nn.Module | None) -> torch.dtype | None:
-    """Return the dtype of the first floating parameter in ``module``."""
-    if module is None:
-        return None
-    for param in module.parameters(recurse=True):
-        if param.is_floating_point():
-            return param.dtype
-    return None
-
-
-def _cast_floating_tensor(value: Any, dtype: torch.dtype) -> Any:
-    if isinstance(value, torch.Tensor) and value.is_floating_point() and value.dtype != dtype:
-        return value.to(dtype)
-    return value
-
-
-@contextmanager
-def _cast_gemma4_embedder_inputs_to_param_dtype(embedder: nn.Module | None) -> Iterator[None]:
-    """Cast transient multimodal embedder activations to the current param dtype.
-
-    FSDP2 mixed precision keeps resident parameters in fp32 for AdamW master
-    weights, but all-gathers them as bf16 for forward compute. HF Gemma4's
-    vision pooler intentionally emits float32 before the multimodal projector,
-    so the projector input must be recast to its current compute parameter dtype
-    without changing the resident parameter dtype.
-    """
-    target_dtype = _first_floating_param_dtype(embedder)
-    if embedder is None or target_dtype is None:
-        yield
-        return
-
-    def hook(
-        _module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
-    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        if "inputs_embeds" in kwargs:
-            kwargs = dict(kwargs)
-            kwargs["inputs_embeds"] = _cast_floating_tensor(kwargs["inputs_embeds"], target_dtype)
-            return args, kwargs
-        if args:
-            args = (_cast_floating_tensor(args[0], target_dtype), *args[1:])
-        return args, kwargs
-
-    handle = embedder.register_forward_pre_hook(hook, with_kwargs=True)
-    try:
-        yield
-    finally:
-        handle.remove()
-
-
-def get_gemma4_image_features_with_projector_dtype(
-    gemma4_model: nn.Module,
-    pixel_values: torch.Tensor,
-    *,
-    image_position_ids: torch.Tensor | None = None,
-) -> Any:
-    """Run HF Gemma4 image features with a dtype-safe projector boundary."""
-    with _cast_gemma4_embedder_inputs_to_param_dtype(getattr(gemma4_model, "embed_vision", None)):
-        return gemma4_model.get_image_features(pixel_values, image_position_ids=image_position_ids, return_dict=True)
 
 
 # ---------------------------------------------------------------------------
@@ -760,8 +699,8 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         # Handle vision tokens
         if pixel_values is not None:
-            image_features = get_gemma4_image_features_with_projector_dtype(
-                self.model, pixel_values, image_position_ids=image_position_ids
+            image_features = self.model.get_image_features(
+                pixel_values, image_position_ids=image_position_ids, return_dict=True
             ).pooler_output
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
 
