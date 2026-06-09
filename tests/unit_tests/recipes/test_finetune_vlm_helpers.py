@@ -3061,3 +3061,56 @@ def test_build_dataloader_default_get_rope_index_is_none():
 
     assert "get_rope_index" in captured, "neat_pack_dataset_vlm must receive get_rope_index kwarg even when None"
     assert captured["get_rope_index"] is None
+
+
+def _run_build_dataloader_capturing_wrapper(dataset_cfg):
+    """Run build_dataloader (pretokenize path) and return the PreTokenizedDatasetWrapper mock."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    wrapper_mock = MagicMock(return_value=MagicMock())
+    _, ctx_managers = _patches_for_packing(lambda *a, **k: MagicMock())
+
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        # Override the wrapper patch from _patches_for_packing so we can inspect call kwargs.
+        stack.enter_context(
+            patch(
+                "nemo_automodel.components.datasets.vlm.datasets.PreTokenizedDatasetWrapper",
+                wrapper_mock,
+            )
+        )
+        build_dataloader(
+            dataset_cfg,
+            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            "test/model",
+            None,
+            None,
+            42,
+            1,
+            cfg_ps=_make_packing_cfg(pack_size=64),
+        )
+    return wrapper_mock
+
+
+def test_build_dataloader_inject_fake_images_defaults_true():
+    """When dataset cfg omits inject_fake_images, the wrapper defaults to True."""
+    wrapper_mock = _run_build_dataloader_capturing_wrapper(_make_dataset_cfg())
+    assert wrapper_mock.call_args.kwargs["inject_fake_images"] is True
+
+
+def test_build_dataloader_forwards_inject_fake_images_false():
+    """inject_fake_images=False in dataset cfg must reach PreTokenizedDatasetWrapper."""
+    cfg = MagicMock(spec=["get", "instantiate", "path_or_dataset"])
+    cfg.get.side_effect = lambda key, default=None: {
+        "path_or_dataset": None,
+        "truncate": True,
+        "inject_fake_images": False,
+    }.get(key, default)
+    cfg.path_or_dataset = None
+    cfg.instantiate.return_value = []
+
+    wrapper_mock = _run_build_dataloader_capturing_wrapper(cfg)
+    assert wrapper_mock.call_args.kwargs["inject_fake_images"] is False
