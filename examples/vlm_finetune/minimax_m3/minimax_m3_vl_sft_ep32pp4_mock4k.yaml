@@ -34,12 +34,12 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   # Local path of the provided checkpoint; replace with the HF id once published.
-  pretrained_model_name_or_path: /workspace/minimax-m3-preview_vv1
+  pretrained_model_name_or_path: /workspace/minimax-m3-bf16_vv1
   trust_remote_code: false
   torch_dtype: bfloat16
   text_config:
-    # SFT is MTP-free by default (the checkpoint's single MTP module is dropped on
-    # load).
+    # The bf16 checkpoint ships no MTP weights
+    # (its config declares 7, but none are present), so this must stay 0.
     num_mtp_modules: 0
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
@@ -63,7 +63,7 @@ processor:
   # but its remote-code __init__ drops chat_template during from_pretrained, so this
   # helper loads it via AutoProcessor (trust_remote_code) and reattaches chat_template.jinja.
   _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
-  pretrained_model_name_or_path: /workspace/minimax-m3-preview_vv1
+  pretrained_model_name_or_path: /workspace/minimax-m3-bf16_vv1
   trust_remote_code: true
 
 checkpoint:
@@ -74,8 +74,8 @@ checkpoint:
   checkpoint_dir: vlm_checkpoints/minimax_m3_vl_sft_ep32pp4_mock4k/
   model_save_format: safetensors
   save_consolidated: false
-  # Load MXFP8 base weights: request *_scale_inv tensors and dequantize on load.
-  dequantize_base_checkpoint: true
+  # BF16 base checkpoint: weights load directly (no MXFP8 *_scale_inv / dequant).
+  dequantize_base_checkpoint: false
 
 distributed:
   strategy: fsdp2

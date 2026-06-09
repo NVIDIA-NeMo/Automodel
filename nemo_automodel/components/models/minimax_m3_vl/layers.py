@@ -373,7 +373,11 @@ class MiniMaxM3Attention(nn.Module):
             # rather than becoming eligible for top-k block selection.
             if attention_mask is not None:
                 sparse_bias = sparse_bias + _padding_mask_to_additive_bias(attention_mask, sparse_bias)
-            attention_mask = sparse_bias
+            # Match the query dtype: an fp32 additive mask with bf16 q/k/v disqualifies
+            # SDPA's flash/mem-efficient kernels (fp32 accumulation) and forces the math
+            # backend (bf16 accumulation), which loses ~20% in the attention output at
+            # long context. A same-dtype mask keeps SDPA on the mem-efficient path.
+            attention_mask = sparse_bias.to(q.dtype)
 
         q, k = apply_rotary_emb_qk(
             q,
