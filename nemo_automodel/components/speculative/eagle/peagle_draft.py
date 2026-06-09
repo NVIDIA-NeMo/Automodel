@@ -33,6 +33,7 @@ import logging
 import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.llama.rope_utils import apply_rotary_pos_emb
 from nemo_automodel.components.speculative.eagle.peagle_attention import create_peagle_mask_mod
@@ -177,6 +178,22 @@ class _PeagleDraftMixin:
         """
         return self.project_hidden_states(self.mask_hidden.view(1, -1))
 
+    def _run_draft_layer(self, layer_fn, *args, **kwargs):
+        """Run one P-EAGLE draft layer, optionally under activation checkpointing.
+
+        When ``gradient_checkpointing`` is enabled (training only), the layer's
+        activations are freed after the forward and recomputed during the
+        backward (``torch.utils.checkpoint``), trading one extra forward per
+        layer for a lower activation-memory peak on the long flattened COD
+        sequence. ``use_reentrant=False`` is required so the non-tensor P-EAGLE
+        argument (``block_mask``) passes through and so the recompute composes
+        with the flex-attention path. With the flag off (the default, and in
+        eval) the layer runs directly with no overhead.
+        """
+        if self.gradient_checkpointing and self.training:
+            return checkpoint(layer_fn, *args, use_reentrant=False, **kwargs)
+        return layer_fn(*args, **kwargs)
+
     def forward_peagle(
         self,
         sampled_input_ids: torch.Tensor,
@@ -201,14 +218,15 @@ class _PeagleDraftMixin:
         """
         draft_input_embeds = self.embed_input_ids(sampled_input_ids)
         # Layer 0 fuses ``[embed, hidden]`` (2H); deeper layers refine plain H.
-        hidden_states = self.model.layers[0].forward_peagle(
+        hidden_states = self._run_draft_layer(
+            self.model.layers[0].forward_peagle,
             input_embeds=draft_input_embeds,
             hidden_states=sampled_projected_hidden,
             position_ids=position_ids,
             block_mask=block_mask,
         )
         for layer in self.model.layers[1:]:
-            hidden_states = layer.forward_peagle(hidden_states, position_ids, block_mask)
+            hidden_states = self._run_draft_layer(layer.forward_peagle, hidden_states, position_ids, block_mask)
         if getattr(self.config, "norm_output", False):
             hidden_states = self.model.norm(hidden_states)
         return hidden_states
