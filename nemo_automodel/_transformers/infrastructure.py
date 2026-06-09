@@ -320,10 +320,16 @@ def instantiate_infrastructure(
 
         if moe_parallel_config is None:
             moe_parallel_config = MoEParallelizerConfig()
+        # Forward the model wrapper's mp_policy (from FSDP2Config) to expert
+        # sharding when the MoE config doesn't set its own, so a custom precision
+        # policy isn't silently dropped for EP models.
+        moe_kwargs = moe_parallel_config.to_dict()
+        if moe_kwargs.get("mp_policy") is None and model_wrapper is not None:
+            moe_kwargs["mp_policy"] = getattr(model_wrapper, "mp_policy", None)
         parallelize_fn = partial(
             parallelize_model,
             activation_checkpointing=activation_checkpointing,
-            **moe_parallel_config.to_dict(),
+            **moe_kwargs,
         )
     elif autopipeline is not None and model_wrapper is not None:
         parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)

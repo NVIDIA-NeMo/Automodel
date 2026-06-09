@@ -491,9 +491,8 @@ MeshContext (single source of truth for parallelism):
 
 ```
 components/distributed/mesh.py
-    MeshContext  -- strategy_config, device_mesh, moe_mesh, pipeline_config, moe_config
+    MeshContext  -- device_mesh, moe_mesh
                     Properties: tp_size, pp_size, cp_size, ep_size, dp_size, dp_replicate_size
-    STRATEGY_MAP -- {"fsdp2": FSDP2Config, "megatron_fsdp": MegatronFSDPConfig, "ddp": DDPConfig}
     MeshAxisName -- PP, DP, DP_REPLICATE, DP_SHARD, DP_SHARD_CP, DP_CP, CP, TP, EP, EP_SHARD
 ```
 
@@ -556,8 +555,9 @@ recipes/_dist_utils.py
 MoE config:
 
 ```
-components/moe/config.py
+components/distributed/config.py
     MoEParallelizerConfig  -- reshard_after_forward, ignore_router_for_ac, wrap_outer_model, etc.
+components/moe/config.py
     MoEConfig              -- n_routed_experts, n_activated_experts, score_func, etc.
 ```
 
