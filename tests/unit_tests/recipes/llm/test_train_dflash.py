@@ -84,7 +84,9 @@ def test_resolve_mask_token_id_requires_explicit():
 
 def test_resolve_mask_token_id_range_checks():
     """An id outside the vocab (a typo, or a stale token from another model) is
-    rejected rather than indexing the embed table out of bounds."""
-    cfg = SimpleNamespace(get=lambda k, d=None: 5000 if k == "mask_token_id" else d)
-    with pytest.raises(ValueError, match="out of range"):
-        TrainDFlashRecipe._resolve_mask_token_id(cfg, vocab_size=1000)
+    rejected rather than indexing the embed table out of bounds -- both the upper
+    (>= vocab_size) and the lower (< 0) bound."""
+    for bad in (5000, -1):
+        cfg = SimpleNamespace(get=lambda k, d=None, _v=bad: _v if k == "mask_token_id" else d)
+        with pytest.raises(ValueError, match="out of range"):
+            TrainDFlashRecipe._resolve_mask_token_id(cfg, vocab_size=1000)
