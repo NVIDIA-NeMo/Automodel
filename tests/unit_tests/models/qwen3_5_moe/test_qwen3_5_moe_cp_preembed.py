@@ -66,18 +66,17 @@ class TestPrepareModelInputsForCP:
         with pytest.raises(ValueError, match="requires input_ids"):
             model.prepare_model_inputs_for_cp(input_ids=None)
 
-    def test_text_only_builds_embeds_positions_and_seq_index(self):
+    def test_text_only_builds_embeds_and_positions(self):
         model = _build_model()
         input_ids = torch.tensor([[5, 6, 7, 8]])
 
         out = model.prepare_model_inputs_for_cp(input_ids=input_ids)
 
-        assert set(out) == {"inputs_embeds", "position_ids", "seq_index"}
+        # seq_index is derived inside the CP linear-attn layer, not here.
+        assert set(out) == {"inputs_embeds", "position_ids"}
         assert out["inputs_embeds"].shape == (1, 4, 4)
         # position_ids came from get_rope_index (mRoPE [3, B, S]).
         assert out["position_ids"].shape == (3, 1, 4)
-        # seq_index defaults to a per-row arange.
-        assert out["seq_index"].tolist() == [[0, 1, 2, 3]]
         # rope_deltas stashed back onto the inner model.
         assert model.model.rope_deltas is not None
 
@@ -94,25 +93,6 @@ class TestPrepareModelInputsForCP:
 
         assert called["count"] == 0, "get_rope_index must not run when position_ids provided"
         assert out["position_ids"] is pos
-
-    def test_singleton_seq_index_expands_to_batch(self):
-        model = _build_model()
-        input_ids = torch.tensor([[5, 6, 7, 8], [1, 2, 3, 4]])
-        seq_index = torch.arange(4).unsqueeze(0)  # [1, S]
-
-        out = model.prepare_model_inputs_for_cp(input_ids=input_ids, seq_index=seq_index)
-
-        assert out["seq_index"].shape == (2, 4)
-        assert torch.equal(out["seq_index"][0], out["seq_index"][1])
-
-    def test_seq_index_passthrough_when_batch_matches(self):
-        model = _build_model()
-        input_ids = torch.tensor([[5, 6, 7, 8]])
-        seq_index = torch.tensor([[3, 2, 1, 0]])
-
-        out = model.prepare_model_inputs_for_cp(input_ids=input_ids, seq_index=seq_index)
-
-        assert torch.equal(out["seq_index"], seq_index)
 
     def test_image_grid_hws_promoted_to_thw(self):
         """image_grid_hws of shape [N, 2] is promoted to [N, 3] by prepending a temporal=1 column."""
@@ -160,11 +140,12 @@ class TestForwardPreEmbedDispatch:
         model.prepare_model_inputs_for_cp = _fake_prepare
 
         input_ids = torch.tensor([[5, 6, 7, 8]])
-        out = model.forward(input_ids=input_ids, _pre_embed_only=True, seq_index=torch.arange(4).unsqueeze(0))
+        pixel_values = torch.randn(4, 8)
+        out = model.forward(input_ids=input_ids, _pre_embed_only=True, pixel_values=pixel_values)
 
         assert out is sentinel
         assert torch.equal(captured["input_ids"], input_ids)
-        assert "seq_index" in captured["kwargs"]
+        assert "pixel_values" in captured["kwargs"]
 
 
 def _build_inner_model():
