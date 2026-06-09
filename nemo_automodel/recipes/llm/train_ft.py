@@ -309,7 +309,6 @@ def build_model(
     return model
 
 
-
 def compute_trust_remote_code_from_model(cfg_model):
     """Compute the value of trust_remote_code based on the model configuration.
 

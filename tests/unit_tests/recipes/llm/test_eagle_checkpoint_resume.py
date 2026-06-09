@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -444,6 +445,28 @@ def test_eagle_async_checkpoint_retention_prunes_completed_window(tmp_path, reci
 # ---------------------------------------------------------------------------
 # save_checkpoint: FileExistsError when checkpoint dir already exists
 # ---------------------------------------------------------------------------
+
+
+def test_eagle1_final_checkpoint_saved_before_close(tmp_path):
+    """EAGLE-1 saves the final checkpoint before finalizing/closing async checkpointing."""
+    recipe = _bare_eagle1_recipe(tmp_path)
+    recipe.num_epochs = 1
+    recipe.grad_accumulation_steps = 1
+    recipe.max_grad_norm = 1.0
+    recipe.ckpt_every_steps = None
+    recipe.save_checkpoint_every_epoch = False
+    recipe.train_dataloader = []
+    recipe.runtime.global_step = 1
+    events = []
+
+    recipe._maybe_save_final_checkpoint = lambda completed_epochs: events.append(("final", completed_epochs)) or True
+    recipe._finalize_pending_checkpoint = lambda: events.append(("finalize", None))
+    recipe.checkpointer.close = lambda: events.append(("close", None))
+    recipe._run_eval = lambda: None
+
+    recipe.run_train_validation_loop()
+
+    assert events == [("final", 1), ("finalize", None), ("close", None)]
 
 
 def test_eagle1_save_checkpoint_raises_on_existing_dir(tmp_path):
