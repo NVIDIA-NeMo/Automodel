@@ -424,7 +424,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             tokenizer=self.tokenizer,
             seq_length=recipe_cfg.seq_length,
             batch_size=recipe_cfg.micro_batch_size,
-            shuffle=True,
+            shuffle=recipe_cfg.get("train_shuffle", True),
             num_workers=recipe_cfg.get("num_workers", 0),
             split=recipe_cfg.get("train_split", None),
             distributed=self.dist_env.world_size > 1,
