@@ -1,0 +1,59 @@
+recipe: TrainEagle3Recipe
+
+# EAGLE-3 with context parallelism on the (colocated) target.
+#
+# CP shards the frozen target's forward along the sequence dimension across the
+# "cp" device submesh, then gathers the aux hidden states / logits back to the
+# full sequence so the draft stays CP-unaware. Notes:
+#   * cp_size must divide the number of GPUs; dp_size = world_size / cp_size.
+#   * The target must run on SDPA (CP rewrites the causal mask), so set
+#     target_attn_implementation: sdpa.
+#   * CP is incompatible with sequence packing -- keep packed_sequence_size: 0.
+#
+# Run (single node, cp_size=2 over 2 GPUs):
+#   automodel examples/speculative/eagle3/qwen3_eagle3_cp.yaml \
+#       --nproc-per-node 2 --distributed.cp_size=2
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-4B
+  target_attn_implementation: sdpa
+  draft_attn_implementation: sdpa
+  train_data_path: ./cache/dataset/perfectblend-messages
+  val_data_path: null
+  train_split: "train[:64]"
+  val_split: null
+  output_dir: ./outputs/eagle3_qwen3_4b_cp
+  seq_length: 2048
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 0
+  num_epochs: 1
+  ttt_steps: 7
+  draft_vocab_size: 32000
+  freeze_embeddings: true
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 1
+  max_grad_norm: 1.0
+  # CP is incompatible with sequence packing (the 4D block-causal mask), so it
+  # is gated off when cp_size > 1. Keep packing disabled here.
+  packed_sequence_size: 0
+
+rng:
+  seed: 42
+
+distributed:
+  strategy: fsdp2
+  cp_size: 1
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: false
