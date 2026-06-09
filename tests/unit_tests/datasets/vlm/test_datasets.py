@@ -1575,3 +1575,88 @@ class TestRobustDatasetWrapperFakeImageInjection:
         # Original conversation should be unchanged
         assert len(original_conv[0]["content"]) == 1
         assert original_conv[0]["content"][0]["type"] == "text"
+
+
+class _FakeProcessor:
+    """Minimal processor stand-in for PreTokenizedDatasetWrapper tests."""
+
+    def apply_chat_template(self, conversations, tokenize=False):
+        return ["rendered text"]
+
+    def __call__(self, **kwargs):
+        import torch
+
+        return {
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1]]),
+        }
+
+
+class TestPreTokenizedDatasetWrapperInjectFakeImages:
+    """The ``inject_fake_images`` flag gates fake-image injection for pure-text samples."""
+
+    def _patch_pipeline(self, monkeypatch):
+        """Stub out the heavy media/tokenization helpers used by ``__getitem__``."""
+        import torch
+
+        import nemo_automodel.components.datasets.vlm.collate_fns as collate_fns
+        import nemo_automodel.components.datasets.vlm.fake_image as fake_image
+
+        monkeypatch.setattr(ds, "_preload_media", lambda example, processor, **kw: example)
+        monkeypatch.setattr(ds, "_build_video_metadata", lambda conversation: None)
+        monkeypatch.setattr(fake_image, "_conversation_has_media", lambda conversation: False)
+        monkeypatch.setattr(
+            collate_fns,
+            "_extract_media_from_conversations",
+            lambda conversations: ([], []),
+        )
+        monkeypatch.setattr(
+            collate_fns,
+            "build_labels_from_template",
+            lambda input_ids, conversations, processor: torch.tensor([[1, 2, 3, 4]]),
+        )
+
+        inject_calls = []
+        mask_calls = []
+
+        def _fake_inject(conversation):
+            inject_calls.append(conversation)
+            return conversation
+
+        monkeypatch.setattr(fake_image, "inject_fake_image_into_conversation", _fake_inject)
+        monkeypatch.setattr(
+            fake_image,
+            "mask_fake_vision_tokens_single",
+            lambda output, processor: mask_calls.append(output),
+        )
+        return inject_calls, mask_calls
+
+    def _make_dataset(self):
+        return [
+            {
+                "conversation": [
+                    {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                ]
+            }
+        ]
+
+    def test_default_injects_fake_image_for_text_only(self, monkeypatch):
+        inject_calls, mask_calls = self._patch_pipeline(monkeypatch)
+        wrapper = ds.PreTokenizedDatasetWrapper(self._make_dataset(), _FakeProcessor())
+        assert wrapper.inject_fake_images is True
+
+        wrapper[0]
+
+        assert len(inject_calls) == 1, "fake image should be injected for pure-text samples by default"
+        assert len(mask_calls) == 1, "injected fake vision tokens should be masked"
+
+    def test_disabled_skips_injection(self, monkeypatch):
+        inject_calls, mask_calls = self._patch_pipeline(monkeypatch)
+        wrapper = ds.PreTokenizedDatasetWrapper(self._make_dataset(), _FakeProcessor(), inject_fake_images=False)
+        assert wrapper.inject_fake_images is False
+
+        wrapper[0]
+
+        assert inject_calls == [], "injection must be skipped when inject_fake_images=False"
+        assert mask_calls == [], "no masking when nothing was injected"
