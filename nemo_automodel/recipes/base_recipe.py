@@ -500,6 +500,37 @@ class BaseRecipe:
                 f"Updated LOWEST_VAL checkpoint symlink to {os.path.basename(target_dir)} (val_loss={val_loss:.4f})"
             )
 
+    def _finalize_pending_checkpoint(self) -> None:
+        """Wait the final async checkpoint write and flush its deferred symlinks.
+
+        The async ``save_checkpoint`` path defers the ``latest`` / ``best`` symlink
+        update to the *next* save's preamble. After the final checkpoint there is
+        no next save, so the training loop must call this once at the end --
+        otherwise the last async write may be left unfinished and ``latest`` /
+        ``best`` still point at the previous checkpoint. A no-op when checkpointing
+        is disabled or no async save is pending.
+        """
+        checkpointer = getattr(self, "checkpointer", None)
+        if checkpointer is None or not getattr(checkpointer.config, "enabled", False):
+            return
+        checkpointer.async_wait()
+        is_dist_initialized = torch.distributed.is_initialized()
+        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
+        if prev_pending is not None:
+            if is_rank_0:
+                self._update_latest_symlink(prev_pending)
+            setattr(self, "_last_pending_checkpoint_dir", None)
+            if is_dist_initialized:
+                torch.distributed.barrier()
+        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
+        if prev_best_pending is not None:
+            if is_rank_0 and prev_best_pending.get("val") is not None:
+                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
+            setattr(self, "_last_pending_best_checkpoint_info", None)
+            if is_dist_initialized:
+                torch.distributed.barrier()
+
     def _validate_checkpoint_dir_exists(self, ckpt_dir: str, restore_from: str, is_rank_0: bool) -> None:
         """Validate resolved checkpoint directory exists; raise FileNotFoundError with a helpful message."""
         if os.path.exists(ckpt_dir):

@@ -1122,6 +1122,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 self._log_saved_checkpoint("epoch", epoch + 1, self.runtime.global_step)
 
         self._maybe_save_final_checkpoint(self.num_epochs)
+        self._finalize_pending_checkpoint()
 
         if self.target_wrapper is not None:
             # Release remote connections / shut down the target server's

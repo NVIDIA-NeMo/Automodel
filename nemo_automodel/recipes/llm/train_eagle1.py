@@ -784,6 +784,7 @@ class TrainEagle1Recipe(BaseRecipe):
                 )
 
         self._maybe_save_final_checkpoint(self.num_epochs)
+        self._finalize_pending_checkpoint()
 
         if getattr(self, "wandb_run", None) is not None:
             self.wandb_run.finish()

@@ -638,6 +638,7 @@ class TrainDFlashRecipe(BaseRecipe):
                 self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
 
         self._maybe_save_final_checkpoint(self.num_epochs)
+        self._finalize_pending_checkpoint()
 
 
 def main(config_path: str | None = None):
