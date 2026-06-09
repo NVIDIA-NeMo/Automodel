@@ -638,6 +638,18 @@ class WanParallelizationStrategy(ParallelizationStrategy):
             except Exception as e:
                 logger.warning(f"Wan strategy: failed to TP blocks/proj_out: {e}")
 
+        # Activation checkpointing wraps every WanTransformerBlock so its
+        # forward activations are recomputed on backward instead of being
+        # held in memory. Critical for Wan2.2-A14B (14B params, ~30k-token
+        # video sequence) — without this, fp32 layer-norm casts in the block
+        # forward will OOM even on 8x80GB H100.
+        if activation_checkpointing and hasattr(model, "blocks"):
+            for idx in range(len(model.blocks)):
+                model.blocks[idx] = checkpoint_wrapper(
+                    model.blocks[idx],
+                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                )
+
         # Mixed precision default like Default strategy
         if not mp_policy:
             mp_policy = MixedPrecisionPolicy(
