@@ -102,18 +102,23 @@ class TEFp8Config:
     """Configuration for Transformer Engine FP8 quantization.
 
     When present (not None) in BackendConfig, FP8 is enabled.
-    The ``recipe`` field accepts either a string shorthand (``"current"`` or ``"block"``)
-    or a pre-built TE recipe object (e.g. ``Float8CurrentScaling(fp8_dpa=True)``).
+    The ``recipe`` field accepts either a string shorthand (``"current"``, ``"block"``,
+    or ``"mxfp8"``) or a pre-built TE recipe object (e.g. ``Float8CurrentScaling(fp8_dpa=True)``).
+
+    ``"mxfp8"`` selects TE's :class:`MXFP8BlockScaling` recipe (e4m3 data + e8m0 block
+    scales). Unlike torchao's MXFP8 grouped GEMM, TE's MXFP8 backward is mature (no
+    e8m0-overflow NaN), which is why GPT-OSS experts (grouped + bias) use the
+    ``experts="te"`` path with this recipe instead of ``experts="torch_mm_mxfp8"``.
     """
 
-    recipe: Literal["current", "block"] | Any = "current"
+    recipe: Literal["current", "block", "mxfp8"] | Any = "current"
 
     def build_recipe(self):
         """Build and return the TE FP8 recipe object.
 
         If ``recipe`` is already a TE recipe object (e.g. ``Float8CurrentScaling(...)``),
-        it is returned directly.  String values ``"current"`` and ``"block"`` are
-        mapped to the corresponding TE recipe class.
+        it is returned directly.  String values ``"current"``, ``"block"``, and
+        ``"mxfp8"`` are mapped to the corresponding TE recipe class.
         """
         if not HAVE_TE:
             return None
@@ -124,6 +129,16 @@ class TEFp8Config:
 
         from transformer_engine.common.recipe import Float8BlockScaling, Float8CurrentScaling
 
+        if self.recipe == "mxfp8":
+            try:
+                from transformer_engine.common.recipe import MXFP8BlockScaling
+            except ImportError as e:  # TE too old for MXFP8 (added ~v2.3)
+                raise ImportError(
+                    "te_fp8.recipe='mxfp8' requires transformer_engine.common.recipe.MXFP8BlockScaling "
+                    "(TE >= ~2.3). The installed TE does not provide it; rebuild on a newer TE image."
+                ) from e
+            logger.warning("te_fp8.recipe='mxfp8': using TE MXFP8BlockScaling (mature MXFP8 backward).")
+            return MXFP8BlockScaling()
         if self.recipe == "block":
             return Float8BlockScaling()
         return Float8CurrentScaling()
@@ -150,7 +165,10 @@ class BackendConfig:
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
             "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
-            "torch_mm" uses torch._grouped_mm.
+            "torch_mm" uses torch._grouped_mm, "torch_mm_mxfp8" uses torch._grouped_mm
+            dispatch but routes the expert grouped GEMMs through torchao's MXFP8
+            scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
+            else falls back to torch._grouped_mm at runtime).
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP for token dispatch,
             "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
@@ -170,13 +188,18 @@ class BackendConfig:
         enable_fsdp_optimizations: Whether to enable FSDP2 optimizations.
         gate_precision: Optional dtype override for the gate computation. Accepts
             torch.dtype or string (e.g., "torch.float32", "float32").
+        compile_attn: torch.compile(fullgraph) the attention module's forward — both the
+            DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
+            attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
-    experts: Literal["torch", "te", "gmm", "torch_mm"] = "torch_mm" if torch.cuda.is_available() else "torch"
+    experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
+        "torch_mm" if torch.cuda.is_available() else "torch"
+    )
     dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep"] = (
         "deepep"
         if HAVE_DEEP_EP and torch.cuda.is_available()
@@ -196,6 +219,13 @@ class BackendConfig:
     enable_fsdp_optimizations: bool = False
     te_fp8: TEFp8Config | None = None
     gate_precision: str | torch.dtype | None = None
+    # When True, torch.compile(fullgraph=True) the attention module's forward to fuse its many
+    # small ops (projections, RoPE, reshapes, SDPA). Applies to both the DeepSeek-V3 MLA and
+    # standard GQA attention (e.g. Qwen3-MoE). The compiled region must contain no TE
+    # custom-autograd submodules (TE's fused attention/Linear/RMSNorm are black boxes that
+    # fullgraph can't trace), so it requires attn="sdpa", linear="torch", rms_norm="torch",
+    # rope_fusion=False. Default False.
+    compile_attn: bool = False
 
     def __post_init__(self):
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
