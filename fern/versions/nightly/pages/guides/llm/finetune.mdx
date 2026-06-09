@@ -258,7 +258,7 @@ Unlike the sections above, `step_scheduler` has **no `_target_`** — it is not 
 All other settings (distributed strategy, optimizer, checkpointing, logging) use sensible defaults. See the [Full Configuration Reference](#full-configuration-reference) to customize them.
 
 <Note>
-Most example recipes use bf16 training by default for memory and throughput. If you are running long fine-tuning, especially full-parameter SFT, and need higher-precision optimizer state, configure it explicitly instead of assuming it from the mixed-precision compute policy. See the [mixed-precision training guide](/development/mixed-precision-training) for the recommended TE and torch AdamW patterns.
+Most example recipes run forward/backward in bf16 for memory and throughput. For **full-parameter SFT with a `torch.optim` optimizer** (such as `torch.optim.AdamW`), AutoModel now defaults `model.torch_dtype` to `float32` when you leave it unset, so the parameters act as an fp32 master copy and the Adam state stays full precision (PEFT/LoRA, TE FusedAdam, and an explicit `model.torch_dtype` are left untouched). See the [mixed-precision training guide](/development/mixed-precision-training) for the recommended TE and torch AdamW patterns and how to opt out.
 </Note>
 
 ### Full Config YAML
