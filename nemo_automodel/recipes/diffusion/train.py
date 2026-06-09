@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 import wandb
 from huggingface_hub.constants import HF_HUB_CACHE
-from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
@@ -365,6 +365,7 @@ def build_model_and_optimizer(
     pipeline_spec: Optional[Dict[str, Any]] = None,
     peft_cfg=None,
     model_type=None,
+    active_transformer: Optional[str] = None,
 ) -> tuple[NeMoAutoDiffusionPipeline, torch.optim.Optimizer, Any]:
     """Build the diffusion model, parallel scheme, and optimizer.
 
@@ -392,6 +393,10 @@ def build_model_and_optimizer(
         peft_cfg: PeftConfig instance or None. When provided, only LoRA params
             are trained; base weights are frozen and sharded by FSDP2 for memory.
         model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
+        active_transformer: For two-transformer pipelines (Wan2.2), select which
+            transformer to finetune. ``"transformer"`` (default for Wan2.2 = high-noise)
+            or ``"transformer_2"`` (low-noise). The unused transformer is dropped
+            before device placement so only one transformer lives on GPU.
 
     Returns:
         Tuple of (pipeline, optimizer, device_mesh or None).
@@ -433,6 +438,7 @@ def build_model_and_optimizer(
             "backend": ddp_cfg.get("backend", "nccl"),
             "world_size": world_size,
             "activation_checkpointing": ddp_cfg.get("activation_checkpointing", False),
+            "find_unused_parameters": ddp_cfg.get("find_unused_parameters", False),
         }
     else:
         # FSDP configuration (default)
@@ -480,6 +486,10 @@ def build_model_and_optimizer(
                 reduce_dtype=reduce_dtype,
                 output_dtype=compute_dtype,
             ),
+            # CPU offload: when enabled, sharded params + optimizer state live on
+            # host RAM and are paged to GPU per-block during forward/backward.
+            # Saves ~21 GB per H100 for a 14B AdamW finetune; adds H2D traffic.
+            "offload_policy": CPUOffloadPolicy(pin_memory=True) if cpu_offload else None,
         }
 
     parallel_scheme = {"transformer": manager_args}
@@ -487,6 +497,8 @@ def build_model_and_optimizer(
     if finetune_mode:
         # Finetuning: load from pretrained weights
         logging.info("[INFO] Loading pretrained model for finetuning")
+        if active_transformer is not None:
+            logging.info("[INFO] Active transformer: %s", active_transformer)
         pipe, created_managers = NeMoAutoDiffusionPipeline.from_pretrained(
             model_id,
             torch_dtype=dtype,
@@ -497,6 +509,7 @@ def build_model_and_optimizer(
             low_cpu_mem_usage=True,
             peft_cfg=peft_cfg,
             model_type=model_type,
+            active_transformer=active_transformer,
             transformer_engine_linear=transformer_engine_linear,
             transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
             fuse_qkv_projections=fuse_qkv_projections,
@@ -681,6 +694,17 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
+            # For two-stage Wan2.2 finetuning, suffix the wandb run name with the
+            # active stage so high-noise and low-noise runs are distinguishable.
+            # Normalize to lowercase to match self.stage so the wandb suffix and the
+            # internal stage name stay consistent. Mutating the cached WandbConfig
+            # before build() makes the suffix take effect (build() uses self.name).
+            stage_for_wandb = self.cfg.get("model.stage", None)
+            if stage_for_wandb is not None:
+                stage_for_wandb = str(stage_for_wandb).lower()
+                current_name = self.cfg.get("wandb.name", None)
+                if current_name is not None and not str(current_name).endswith(f"_{stage_for_wandb}"):
+                    self.cfg.wandb.name = f"{current_name}_{stage_for_wandb}"
             model_name = _model_name_from_cfg(self.cfg.model) if "model" in self.cfg else None
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=model_name)
             if run is not None:
@@ -808,6 +832,20 @@ class TrainDiffusionRecipe(BaseRecipe):
                     "model.optimize_hunyuan_flash_varlen_mask=true requires model.attention_backend=flash_varlen"
                 )
 
+        # Two-stage finetuning (Wan2.2 T2V-A14B): each stage trains only one
+        # transformer against a restricted timestep range. The stage knob both
+        # selects the active transformer and clamps the sigma sampling window so
+        # this run only sees noise levels its transformer is responsible for.
+        self.stage = self.cfg.get("model.stage", None)
+        self.boundary_ratio = self.cfg.get("model.boundary_ratio", None)
+        self.active_transformer = None
+        if self.stage is not None:
+            stage = str(self.stage).lower()
+            if stage not in ("high_noise", "low_noise"):
+                raise ValueError(f"model.stage must be 'high_noise' or 'low_noise', got {self.stage!r}")
+            self.stage = stage
+            self.active_transformer = "transformer" if stage == "high_noise" else "transformer_2"
+
         logging.info("[INFO] Flow Matching V2 Pipeline")
         logging.info(f"[INFO]   - Adapter type: {self.adapter_type}")
         logging.info(f"[INFO]   - Timestep sampling: {self.timestep_sampling}")
@@ -817,6 +855,8 @@ class TrainDiffusionRecipe(BaseRecipe):
         logging.info(f"[INFO]   - CFG dropout prob: {self.cfg_dropout_prob}")
         logging.info(f"[INFO]   - Use loss weighting: {self.use_loss_weighting}")
         logging.info(f"[INFO]   - Loss weighting scheme: {self.loss_weighting_scheme}")
+        if self.stage is not None:
+            logging.info(f"[INFO]   - Two-stage finetune: stage={self.stage}, active={self.active_transformer}")
 
         # Get pipeline_spec for pretraining mode (required when mode != "finetune")
         pipeline_spec_cfg = self.cfg.get("model.pipeline_spec", None)
@@ -863,6 +903,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             pipeline_spec=pipeline_spec,
             peft_cfg=self.peft_cfg,
             model_type=self.model_type,
+            active_transformer=self.active_transformer,
         )
 
         self.model = self.pipe.transformer
@@ -876,6 +917,37 @@ class TrainDiffusionRecipe(BaseRecipe):
             logging.info("[INFO] Enabled Hunyuan flash-varlen 2D mask optimization")
 
         self.peft_config = getattr(self.pipe, "_peft_config", None)
+
+        # Resolve sigma range for two-stage finetuning now that the pipeline
+        # is loaded and we can read its boundary_ratio config.
+        if self.stage is not None:
+            if self.boundary_ratio is None:
+                pipe_cfg = getattr(self.pipe, "config", None)
+                self.boundary_ratio = pipe_cfg.get("boundary_ratio") if pipe_cfg is not None else None
+            if self.boundary_ratio is None:
+                raise ValueError(
+                    "model.stage is set but no boundary_ratio could be resolved. "
+                    "Set model.boundary_ratio in YAML, or use a pipeline whose config "
+                    "carries boundary_ratio (e.g. Wan-AI/Wan2.2-T2V-A14B-Diffusers)."
+                )
+            self.boundary_ratio = float(self.boundary_ratio)
+            # A boundary outside (0, 1) collapses the stage sigma window to an empty
+            # or degenerate range (e.g. boundary_ratio=0.0 with stage=low_noise gives
+            # sigma_min=sigma_max=0.0), silently yielding a useless model.
+            if not (0.0 < self.boundary_ratio < 1.0):
+                raise ValueError(f"model.boundary_ratio must be in (0, 1), got {self.boundary_ratio}")
+            if self.stage == "high_noise":
+                self.sigma_min = self.boundary_ratio
+                self.sigma_max = 1.0
+            else:
+                self.sigma_min = 0.0
+                self.sigma_max = self.boundary_ratio
+            logging.info(
+                "[INFO]   - Stage sigma range: [%.4f, %.4f] (boundary_ratio=%.4f)",
+                self.sigma_min,
+                self.sigma_max,
+                self.boundary_ratio,
+            )
 
         checkpoint_cfg = self.cfg.get("checkpoint", None)
 

@@ -72,6 +72,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     yarn_get_mscale,
 )
 from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -120,6 +121,7 @@ class DeepseekV32Indexer(nn.Module):
 
         self.backend = backend
         linear_impl = backend.linear
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
 
         # Project Q from q_lora residual -> num_heads * head_dim
         self.wq_b = initialize_linear_module(
@@ -127,6 +129,7 @@ class DeepseekV32Indexer(nn.Module):
             in_features=self.q_lora_rank,
             out_features=self.num_heads * self.head_dim,
             bias=False,
+            dtype=dtype,
         )
 
         # Project K from hidden states -> single head_dim (shared across heads)
@@ -135,10 +138,11 @@ class DeepseekV32Indexer(nn.Module):
             in_features=self.hidden_size,
             out_features=self.head_dim,
             bias=False,
+            dtype=dtype,
         )
 
         # LayerNorm for K (official uses LayerNorm, not RMSNorm)
-        self.k_norm = nn.LayerNorm(self.head_dim)
+        self.k_norm = nn.LayerNorm(self.head_dim, dtype=dtype)
 
         # Per-head weight projection from hidden states
         self.weights_proj = initialize_linear_module(
@@ -146,6 +150,7 @@ class DeepseekV32Indexer(nn.Module):
             in_features=self.hidden_size,
             out_features=self.num_heads,
             bias=False,
+            dtype=dtype,
         )
 
     def forward(
@@ -299,17 +304,23 @@ class DeepseekV32MLA(nn.Module):
         rms_norm_impl = backend.rms_norm
 
         hidden_size = config.hidden_size
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
 
         # V3.2 always uses q_lora (q_lora_rank is not None)
         self.q_a_proj = initialize_linear_module(
-            linear_impl=linear_impl, in_features=hidden_size, out_features=self.q_lora_rank, bias=False
+            linear_impl=linear_impl,
+            in_features=hidden_size,
+            out_features=self.q_lora_rank,
+            bias=False,
+            dtype=dtype,
         )
-        self.q_a_layernorm = initialize_rms_norm_module(rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank)
+        self.q_a_layernorm = initialize_rms_norm_module(rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, dtype=dtype)
         self.q_b_proj = initialize_linear_module(
             linear_impl=linear_impl,
             in_features=self.q_lora_rank,
             out_features=self.n_heads * self.qk_head_dim,
             bias=False,
+            dtype=dtype,
         )
 
         self.kv_a_proj_with_mqa = initialize_linear_module(
@@ -317,19 +328,24 @@ class DeepseekV32MLA(nn.Module):
             in_features=hidden_size,
             out_features=self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
+            dtype=dtype,
         )
-        self.kv_a_layernorm = initialize_rms_norm_module(rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank)
+        self.kv_a_layernorm = initialize_rms_norm_module(
+            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, dtype=dtype
+        )
         self.kv_b_proj = initialize_linear_module(
             linear_impl=linear_impl,
             in_features=self.kv_lora_rank,
             out_features=self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
+            dtype=dtype,
         )
         self.o_proj = initialize_linear_module(
             linear_impl=linear_impl,
             in_features=self.n_heads * self.v_head_dim,
             out_features=hidden_size,
             bias=False,
+            dtype=dtype,
         )
         self.softmax_scale = self.qk_head_dim**-0.5
 

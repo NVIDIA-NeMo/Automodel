@@ -86,6 +86,7 @@ class GenerationConfig:
     max_new_tokens: int
     temperature: float
     top_p: float
+    reasoning: str = "none"
 
 
 def _build_manifest(args: argparse.Namespace) -> dict[str, Any]:
@@ -110,6 +111,7 @@ def _build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "max_new_tokens": args.max_new_tokens,
         "temperature": args.temperature,
         "top_p": args.top_p,
+        "reasoning": args.reasoning,
     }
 
 
@@ -264,8 +266,8 @@ async def _chat_completion(
     *,
     timeout_s: float,
     max_retries: int,
-) -> str:
-    """POST ``payload`` to ``url`` and return the assistant text, with bounded retries."""
+) -> dict[str, Any]:
+    """POST ``payload`` to ``url`` and return the assistant message dict, with bounded retries."""
     aiohttp = _import_aiohttp()
     last_err: Exception | None = None
     for attempt in range(max_retries + 1):
@@ -276,7 +278,7 @@ async def _chat_completion(
                     raise RuntimeError(f"HTTP {resp.status} from {url}: {text[:200]}")
                 resp.raise_for_status()
                 data = await resp.json()
-                return data["choices"][0]["message"]["content"]
+                return data["choices"][0]["message"]
         except Exception as exc:  # noqa: BLE001 -- retry any transport / 5xx error
             last_err = exc
             if attempt == max_retries:
@@ -303,15 +305,22 @@ async def _regenerate_one(
     max_retries: int,
 ) -> list[dict[str, Any]]:
     """Call the target server once and return ``prompt + [assistant]``."""
-    payload = {
+    payload: dict[str, Any] = {
         "model": gen_cfg.model,
         "messages": prompt,
         "max_tokens": gen_cfg.max_new_tokens,
         "temperature": gen_cfg.temperature,
         "top_p": gen_cfg.top_p,
     }
-    content = await _chat_completion(session, url, payload, timeout_s=timeout_s, max_retries=max_retries)
-    return [*prompt, {"role": "assistant", "content": content}]
+    if gen_cfg.reasoning == "disable":
+        payload["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+    msg = await _chat_completion(session, url, payload, timeout_s=timeout_s, max_retries=max_retries)
+    resp_msg: dict[str, Any] = {"role": "assistant", "content": msg.get("content", "")}
+    if gen_cfg.reasoning == "save":
+        reasoning_content = msg.get("reasoning_content")
+        if reasoning_content:
+            resp_msg["reasoning_content"] = reasoning_content
+    return [*prompt, resp_msg]
 
 
 async def _process_shard(
@@ -391,6 +400,7 @@ async def _run(args: argparse.Namespace) -> int:
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
+        reasoning=args.reasoning,
     )
     url = args.target_server.rstrip("/") + "/chat/completions"
     timeout = aiohttp.ClientTimeout(total=args.timeout_s)
@@ -494,6 +504,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--timeout-s", type=float, default=600.0, help="Per-request timeout in seconds.")
     parser.add_argument("--max-retries", type=int, default=3, help="Retries on 5xx / 429 / transport errors.")
+    parser.add_argument(
+        "--reasoning",
+        choices=["none", "save", "disable"],
+        default="none",
+        help=(
+            "Reasoning mode: 'none' for standard models (default), "
+            "'save' to store reasoning_content from the response, "
+            "or 'disable' to suppress thinking via extra_body chat_template_kwargs."
+        ),
+    )
     parser.add_argument(
         "--resume", action="store_true", help="Skip shard indices whose parquet file already exists in --output-dir."
     )

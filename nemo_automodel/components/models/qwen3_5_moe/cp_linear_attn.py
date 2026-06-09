@@ -671,16 +671,27 @@ def patch_hf_model(model, cp_enabled=False):
             cp_enabled,
         )
 
-        # Attach a state_dict_adapter so saved checkpoints hide the
-        # ``_fp32_params`` wrapping and remain HF-loadable directly.
+        # Declare the fp32-compute submodules so fully_shard_by_dtype keeps them in
+        # fp32 compute even under fp32 master weights (bf16 compute for the bulk). The
+        # ``_fp32_params`` holder created above is the authoritative marker; the
+        # GatedDeltaNet forward uses those params directly without re-upcasting.
+        existing = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
+        if "_fp32_params" not in existing:
+            model._keep_in_fp32_modules_strict = existing + ("_fp32_params",)
+
+        # Attach a Qwen3.5 state_dict_adapter so saved checkpoints hide the
+        # ``_fp32_params`` wrapping and remain HF-loadable directly.  Keep
+        # ``from_hf`` in bare-key mode: adapter-mediated DCP loads operate in
+        # the HF key namespace even when physical params live in ``_fp32_params``.
         # Use dynamic import to avoid pulling ``components.checkpoint`` into
         # this file's static import graph: ``cp_linear_attn`` is reached from
         # ``components.distributed.parallelizer`` and the adapter inherits
         # from ``components.checkpoint.state_dict_adapter``, which would
         # otherwise create a forbidden ``distributed -> checkpoint`` chain
         # under the import-linter ``independence`` contract.
-        if not hasattr(model, "state_dict_adapter"):
-            import importlib
+        import importlib
 
-            adapter_module = importlib.import_module("nemo_automodel.components.models.qwen3_5.state_dict_adapter")
-            model.state_dict_adapter = adapter_module.Qwen3_5DenseStateDictAdapter()
+        adapter_module = importlib.import_module("nemo_automodel.components.models.qwen3_5.state_dict_adapter")
+        adapter = getattr(model, "state_dict_adapter", None)
+        if adapter is None:
+            model.state_dict_adapter = adapter_module.Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=False)
