@@ -14,8 +14,8 @@
 
 """Qwen3.5-MoE (VL) NeMo Automodel support."""
 
-import inspect
 import copy
+import inspect
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
