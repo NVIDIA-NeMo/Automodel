@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import logging
 import math
+import types
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
@@ -672,7 +674,71 @@ def apply_lora_to_linear_modules(
     if n_fused_mlps:
         logger.info("Fused %d LoRA SwiGLU/ReLU2 MLP module(s) for memory-efficient backward.", n_fused_mlps)
 
+    patch_gemma3n_inplace_lora_views(model)
+
     return num_modules_matched
+
+
+def patch_gemma3n_inplace_lora_views(model: nn.Module) -> int:
+    """Make gemma3n's ``per_layer_model_projection`` LoRA output safe to mutate in place.
+
+    transformers gemma3n ``Gemma3nTextModel.project_per_layer_inputs`` mutates the output of
+    ``self.per_layer_model_projection(inputs_embeds)`` in place (``per_layer_projection *= ...``).
+    When that projection is a LoRA-patched linear using the memory-efficient
+    :class:`LoRATritonFunction`, the returned tensor is a view of the custom autograd Function's
+    output. Some torch versions flag such a view and forbid the in-place op with
+    ``RuntimeError: Output 0 of LoRATritonFunctionBackward is a view and is being modified inplace``.
+
+    This wraps the (single) ``per_layer_model_projection`` module's ``forward`` so it returns a
+    fresh, non-view tensor via :meth:`~torch.Tensor.clone`. ``clone`` is an identity in the autograd
+    graph (gradients pass straight through), so numerics and gradients are unchanged; it only
+    detaches the output from the Function's view so the downstream in-place op is legal. The clone
+    is scoped to this one gemma3n module, so non-gemma3n LoRA pays nothing.
+
+    Detection is structural (a module that owns both a ``per_layer_model_projection`` submodule and
+    a ``project_per_layer_inputs`` method) rather than class-name based, so it keeps working across
+    transformers renames and applies wherever the text backbone is nested inside a VLM wrapper. It
+    is a no-op when the projection is not a LoRA module (e.g. it was excluded from ``target_modules``),
+    when it was already wrapped, or when transformers lacks these attributes.
+
+    Args:
+        model: The (already LoRA-patched) model to scan and wrap in place.
+
+    Returns:
+        int: Number of ``per_layer_model_projection`` modules wrapped.
+    """
+    n_wrapped = 0
+    for module in model.modules():
+        proj = getattr(module, "per_layer_model_projection", None)
+        if proj is None or not callable(getattr(module, "project_per_layer_inputs", None)):
+            continue
+        # Only the memory-efficient LoRA path returns a view; a plain Linear or the non-efficient
+        # LoRA path (res + lora_res) already returns a fresh tensor, so wrapping is unnecessary.
+        if not isinstance(proj, LinearLoRA) or not getattr(proj, "use_memory_efficient_lora", False):
+            continue
+        if getattr(proj, "_nemo_inplace_view_safe", False):
+            continue
+
+        orig_forward = proj.forward
+
+        @functools.wraps(orig_forward.__func__ if hasattr(orig_forward, "__func__") else orig_forward)
+        def _clone_forward(self, x, _orig=orig_forward):
+            out = _orig(x)
+            # ``clone`` only matters when the output is a view of a custom-Function output; it is a
+            # cheap autograd identity otherwise. Guard on tensor-ness to stay robust to odd returns.
+            return out.clone() if isinstance(out, torch.Tensor) else out
+
+        proj.forward = types.MethodType(_clone_forward, proj)
+        proj._nemo_inplace_view_safe = True
+        n_wrapped += 1
+
+    if n_wrapped:
+        logger.info(
+            "Patched %d gemma3n per_layer_model_projection LoRA module(s) to return a non-view "
+            "tensor (project_per_layer_inputs mutates it in place).",
+            n_wrapped,
+        )
+    return n_wrapped
 
 
 class LoRATritonFunction(torch.autograd.Function):
