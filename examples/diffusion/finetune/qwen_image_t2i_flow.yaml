@@ -3,6 +3,8 @@ model:
   mode: "finetune"
   cache_dir: null
   attention_backend: "flash"
+  torch_dtype: float32
+  compute_dtype: bfloat16
 
 optim:
   learning_rate: 1e-5
