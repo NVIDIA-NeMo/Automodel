@@ -429,3 +429,120 @@ class TestTELinearLoRA:
         assert patched.lora_B.weight.grad is not None, "lora_B should have gradients"
         assert torch.isfinite(patched.lora_A.weight.grad).all(), "lora_A gradients should be finite"
         assert torch.isfinite(patched.lora_B.weight.grad).all(), "lora_B gradients should be finite"
+
+
+class _Gemma3nTextModelMini(nn.Module):
+    """Minimal stand-in for transformers ``Gemma3nTextModel`` exercising the bug.
+
+    Owns a ``per_layer_model_projection`` linear and a ``project_per_layer_inputs`` method whose
+    first op mutates the projection output in place (``*=``), exactly like the real HF method.
+    """
+
+    class _Cfg:
+        num_hidden_layers = 3
+
+    class _Norm(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(d))
+
+        def forward(self, x):
+            var = x.float().pow(2).mean(-1, keepdim=True)
+            return (x * torch.rsqrt(var + 1e-6).to(x.dtype)) * (1.0 + self.weight)
+
+    def __init__(self, p=8, d=5, nlayers=3):
+        super().__init__()
+        self.config = self._Cfg()
+        self.config.num_hidden_layers = nlayers
+        self.hidden_size_per_layer_input = d
+        self.per_layer_model_projection = nn.Linear(p, d * nlayers, bias=False)
+        self.per_layer_projection_norm = self._Norm(d)
+        self.register_buffer("per_layer_projection_scale", torch.tensor(d**-0.5))
+        self.register_buffer("per_layer_input_scale", torch.tensor(2.0**0.5))
+
+    def project_per_layer_inputs(self, inputs_embeds, per_layer_inputs=None, inplace=True):
+        per_layer_projection = self.per_layer_model_projection(inputs_embeds)
+        scale = self.per_layer_projection_scale.to(dtype=inputs_embeds.dtype, device=per_layer_projection.device)
+        if inplace:
+            per_layer_projection *= scale  # the offending in-place op (HF parity)
+        else:
+            per_layer_projection = per_layer_projection * scale
+        per_layer_projection = per_layer_projection.reshape(
+            *inputs_embeds.shape[:-1], self.config.num_hidden_layers, self.hidden_size_per_layer_input
+        )
+        per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
+        if per_layer_inputs is None:
+            return per_layer_projection
+        if per_layer_projection.shape != per_layer_inputs.shape:
+            per_layer_inputs = per_layer_inputs[..., : self.config.num_hidden_layers, :]
+        return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale.to(
+            dtype=inputs_embeds.dtype, device=per_layer_projection.device
+        )
+
+
+def test_patch_gemma3n_inplace_lora_views_wraps_and_preserves_numerics():
+    """The gemma3n patch makes the in-place projection legal without changing numerics or grads."""
+    from nemo_automodel.components._peft.lora import patch_gemma3n_inplace_lora_views
+
+    p, d, nlayers = 8, 5, 3
+    torch.manual_seed(0)
+    patched_model = _Gemma3nTextModelMini(p, d, nlayers)
+    patch_linear_module(
+        patched_model.per_layer_model_projection, dim=4, alpha=8, use_triton=False, use_memory_efficient_lora=True
+    )
+
+    # Reference: identical weights, out-of-place consumer, no model-side patch.
+    torch.manual_seed(0)
+    ref_model = _Gemma3nTextModelMini(p, d, nlayers)
+    patch_linear_module(
+        ref_model.per_layer_model_projection, dim=4, alpha=8, use_triton=False, use_memory_efficient_lora=True
+    )
+
+    assert patch_gemma3n_inplace_lora_views(patched_model) == 1
+    # Idempotent: a second call wraps nothing.
+    assert patch_gemma3n_inplace_lora_views(patched_model) == 0
+
+    inputs_embeds = torch.randn(2, 3, p)
+    per_layer_inputs = torch.randn(2, 3, nlayers, d)
+
+    for with_pli in (False, True):
+        pli = per_layer_inputs if with_pli else None
+
+        for m in (patched_model, ref_model):
+            m.per_layer_model_projection.lora_A.weight.grad = None
+            m.per_layer_model_projection.lora_B.weight.grad = None
+
+        x_patched = inputs_embeds.detach().clone().requires_grad_(True)
+        # With the patch, the in-place consumer must NOT raise.
+        out_patched = patched_model.project_per_layer_inputs(
+            x_patched, pli.detach().clone() if with_pli else None, inplace=True
+        )
+        out_patched.sum().backward()
+
+        x_ref = inputs_embeds.detach().clone().requires_grad_(True)
+        out_ref = ref_model.project_per_layer_inputs(x_ref, pli.detach().clone() if with_pli else None, inplace=False)
+        out_ref.sum().backward()
+
+        assert torch.allclose(out_patched, out_ref, atol=1e-6)
+        assert torch.allclose(x_patched.grad, x_ref.grad, atol=1e-6)
+        assert torch.allclose(
+            patched_model.per_layer_model_projection.lora_A.weight.grad,
+            ref_model.per_layer_model_projection.lora_A.weight.grad,
+            atol=1e-6,
+        )
+        assert torch.allclose(
+            patched_model.per_layer_model_projection.lora_B.weight.grad,
+            ref_model.per_layer_model_projection.lora_B.weight.grad,
+            atol=1e-6,
+        )
+
+
+def test_patch_gemma3n_inplace_lora_views_noop_without_lora():
+    """The patch is a no-op when per_layer_model_projection was not LoRA-patched."""
+    from nemo_automodel.components._peft.lora import patch_gemma3n_inplace_lora_views
+
+    model = _Gemma3nTextModelMini()
+    # Plain nn.Linear projection (e.g. excluded from target_modules) -> nothing to wrap.
+    assert patch_gemma3n_inplace_lora_views(model) == 0
+    # A non-gemma3n model (no per_layer_model_projection) is also a no-op.
+    assert patch_gemma3n_inplace_lora_views(DummyModel()) == 0
