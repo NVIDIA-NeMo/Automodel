@@ -281,6 +281,36 @@ def generate_job(
     return variants
 
 
+def _build_noop_placeholder_job(scope: str, test_folder: str) -> Dict[str, Any]:
+    """
+    Build a single self-contained no-op job for an otherwise-empty child pipeline.
+
+    GitLab rejects a child pipeline that defines zero visible jobs with
+    "jobs config should contain at least one visible job", which fails the parent
+    bridge. Some (test_folder, scope) combos legitimately have no recipes to run
+    (e.g. llm_benchmark/vlm_benchmark at nightly scope have only override_recipes.yml
+    and no nightly_recipes.yml), so we emit this placeholder to keep the pipeline
+    valid without scheduling any real work.
+
+    The job is intentionally NOT `extends`-ing any cluster/GPU template
+    (.automodel_test_base / .base_sbatch_template_launcher): it must run on a plain
+    runner, request no GPU/SLURM allocation, and always succeed. It reuses the
+    "performance" stage (defined in automodel_ci_template.yml and the natural stage
+    for benchmark folders) so it slots into the existing stage list, and uses
+    `when: always` so it is a visible, always-running job.
+    """
+    return {
+        "stage": "performance",
+        "when": "always",
+        "variables": {
+            "TEST_LEVEL": f"{scope}",
+        },
+        "script": [
+            f'echo "No {test_folder} recipes for scope {scope}; nothing to run."',
+        ],
+    }
+
+
 def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[str, Any]:
     """
     Generate a complete CI test pipeline YAML for the given test folder and scope.
@@ -319,6 +349,12 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[
         for suffix, job in generate_job(config, config_override, scope, test_folder, automodel_dir):
             job["variables"]["MODEL_FAMILY"] = model_name
             pipeline[f"{config_name}{suffix}"] = job
+
+    # A child pipeline with no visible jobs (only "include") is rejected by GitLab.
+    # When this scope/folder produced no jobs, emit a single no-op placeholder so the
+    # pipeline stays valid and the parent bridge succeeds.
+    if not any(k != "include" for k in pipeline):
+        pipeline[f"{test_folder}_no_nightly_recipes"] = _build_noop_placeholder_job(scope, test_folder)
 
     return pipeline
 
