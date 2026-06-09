@@ -1101,6 +1101,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         for v in self.metric_logger_valid.values():
             v.close()
 
+        self._finalize_pending_checkpoint()
         self.checkpointer.close()
 
         # Mark the MLflow run KILLED if training exited via SIGTERM.

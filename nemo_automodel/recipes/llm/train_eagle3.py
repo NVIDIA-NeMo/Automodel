@@ -679,30 +679,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             return
         self.checkpointer.async_wait()
 
-        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
-        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
+        self._complete_pending_checkpoint()
 
         ckpt_root = self.checkpoint_config.checkpoint_dir
         path = os.path.join(str(ckpt_root), f"epoch_{epoch}_step_{step}")
         is_dist_initialized = dist.is_initialized()
         is_rank_0 = (not is_dist_initialized) or dist.get_rank() == 0
-        best_val_metric = (
-            val_loss.get(next(iter(val_loss.keys())) if len(val_loss) == 1 else best_metric_key) if val_loss else None
-        )
-
-        if prev_pending is not None:
-            if is_rank_0:
-                self._update_latest_symlink(prev_pending)
-            setattr(self, "_last_pending_checkpoint_dir", None)
-            if is_dist_initialized:
-                dist.barrier()
-
-        if prev_best_pending is not None:
-            if is_rank_0 and prev_best_pending.get("val") is not None:
-                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
-            setattr(self, "_last_pending_best_checkpoint_info", None)
-            if is_dist_initialized:
-                dist.barrier()
+        best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
+        best_val_metric = val_loss.get(best_metric_name) if val_loss else None
 
         if is_rank_0:
             if os.path.exists(path):
@@ -743,13 +727,21 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
 
         if getattr(self.checkpointer.config, "is_async", False):
             setattr(self, "_last_pending_checkpoint_dir", path)
-            if best_val_metric is not None:
-                setattr(self, "_last_pending_best_checkpoint_info", {"path": path, "val": float(best_val_metric)})
+            setattr(
+                self,
+                "_last_pending_best_checkpoint_info",
+                {
+                    "path": path,
+                    "val": float(best_val_metric) if best_val_metric is not None else None,
+                    "metric_key": best_metric_name,
+                },
+            )
         else:
             if is_rank_0:
                 self._update_latest_symlink(path)
                 if best_val_metric is not None:
-                    self._update_best_symlink(path, float(best_val_metric))
+                    self._update_best_symlink(path, float(best_val_metric), best_metric_name)
+                self._prune_old_checkpoints()
             if is_dist_initialized:
                 dist.barrier()
 
@@ -1133,6 +1125,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
 
         if self.dist_env.is_main:
             logger.info("Training complete: global_step=%s", self.runtime.global_step)
+        self._finalize_pending_checkpoint()
+        self.checkpointer.close()
 
 
 def main(config_path=None):
