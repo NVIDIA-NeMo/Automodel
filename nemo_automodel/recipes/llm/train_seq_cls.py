@@ -30,6 +30,7 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.optim.precision_warnings import resolve_storage_dtype
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
@@ -106,7 +107,16 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
-        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
+        # Default storage dtype to fp32 for full-parameter torch.optim training so the
+        # parameters serve as the fp32 master copy (no-op for PEFT / TE FusedAdam /
+        # explicit model.torch_dtype). Must run before build_model.
+        resolve_storage_dtype(
+            self.cfg.get("model"),
+            self.cfg.get("optimizer"),
+            is_peft=self.peft_config is not None,
+            context="llm-seq-cls",
+            logger=logger,
+        )
         model = build_model(
             cfg_model=self.cfg.model,
             cfg_peft=self.peft_config,

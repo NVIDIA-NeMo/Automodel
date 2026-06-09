@@ -34,7 +34,10 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sy
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
+from nemo_automodel.components.optim.precision_warnings import (
+    resolve_storage_dtype,
+    warn_if_torch_adam_with_bf16_params,
+)
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.components.utils.compile_utils import build_compile_config
@@ -255,7 +258,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
 
-        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
+        # Default storage dtype to fp32 for full-parameter torch.optim training so the
+        # parameters serve as the fp32 master copy (no-op for PEFT / TE FusedAdam /
+        # explicit model.torch_dtype). Must run before the model is instantiated.
+        resolve_storage_dtype(
+            self.cfg.get("model"),
+            self.cfg.get("optimizer"),
+            is_peft=self.peft_config is not None,
+            context="retrieval",
+            logger=logger,
+        )
 
         checkpoint_config = self.cfg.checkpoint
 

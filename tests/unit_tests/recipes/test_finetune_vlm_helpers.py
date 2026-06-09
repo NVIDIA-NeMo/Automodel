@@ -2903,7 +2903,7 @@ def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
     assert cfg.model.backend.rope_fusion is True
 
 
-def test_vlm_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
+def test_vlm_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch):
     cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True, optimizer_target="torch.optim.AdamW")
     _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
@@ -2917,7 +2917,7 @@ def test_vlm_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
 
-    assert not hasattr(cfg.model, "torch_dtype")
+    assert cfg.model.torch_dtype == "float32"
 
 
 def test_vlm_rope_fusion_stays_false_when_already_disabled(monkeypatch):

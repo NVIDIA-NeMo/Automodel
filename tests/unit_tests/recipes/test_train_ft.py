@@ -1080,7 +1080,7 @@ def test_nvtx_false_skips_patching(monkeypatch):
     assert patch_calls == []
 
 
-def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
+def test_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch):
     cfg = _minimal_cfg_with_nvtx(nvtx_value=False, optimizer_target="torch.optim.AdamW")
 
     _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
@@ -1095,7 +1095,7 @@ def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
 
-    assert not hasattr(cfg.model, "torch_dtype")
+    assert cfg.model.torch_dtype == "float32"
 
 
 def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
