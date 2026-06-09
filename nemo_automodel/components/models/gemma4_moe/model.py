@@ -82,6 +82,7 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
+from .cp_attention import attach_gemma4_cp_allgather_attention, gemma4_vision_group_ids
 from .state_dict_adapter import Gemma4MoEStateDictAdapter
 
 
@@ -209,6 +210,7 @@ class Gemma4MoEDecoderLayer(nn.Module):
 
         # Reuse HF modules
         self.self_attn = Gemma4Attention(config=config, layer_idx=layer_idx)
+        attach_gemma4_cp_allgather_attention(self.self_attn)
         self.mlp = Gemma4MLP(config, layer_idx)
 
         # Norms
@@ -265,7 +267,7 @@ class Gemma4MoEDecoderLayer(nn.Module):
                     "num_warps": 4,
                 },
             }
-        if padding_mask is not None and getattr(self.self_attn, "_cp_uses_sdpa_hook", False):
+        if padding_mask is not None and getattr(self.self_attn, "_cp_uses_attention_hook", False):
             attn_kwargs = {**attn_kwargs, "padding_mask": padding_mask}
         x, _ = self.self_attn(
             hidden_states=x,
@@ -327,16 +329,6 @@ def _derive_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
     return attention_mask.bool().logical_not()
 
 
-def _vision_group_ids(mm_token_type_ids: torch.Tensor) -> torch.Tensor:
-    """Return per-image-block ids for Gemma4 vision tokens, or -1 for text/padding."""
-    is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
-    is_prev_vision = torch.roll(is_vision, shifts=1, dims=-1)
-    is_prev_vision[..., 0] = False
-    new_vision_starts = is_vision & ~is_prev_vision
-    group_ids = torch.cumsum(new_vision_starts.int(), dim=1) - 1
-    return torch.where(is_vision, group_ids, -1)
-
-
 def _build_packed_gemma4_causal_mask_mapping(
     packed_seq_ids: torch.Tensor,
     mm_token_type_ids: torch.Tensor,
@@ -370,7 +362,7 @@ def _build_packed_gemma4_causal_mask_mapping(
     q_positions = positions.view(1, seq_len, 1)
     kv_positions = positions.view(1, 1, seq_len)
 
-    vision_group_ids = _vision_group_ids(mm_token_type_ids)
+    vision_group_ids = gemma4_vision_group_ids(mm_token_type_ids)
 
     if as_block_mask:
         from torch.nn.attention.flex_attention import create_block_mask
@@ -558,10 +550,14 @@ class Gemma4MoETextModelBackend(nn.Module):
             mm_token_type_ids = torch.zeros(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
 
         if cp_enabled:
-            # CP uses the manual all-gather SDPA hook.  The hook sees local Q and
-            # all-gathered global K/V, so HF's local 4D masks have the wrong key
-            # length.  Pass no mask here; the hook rebuilds the local-query /
-            # global-key Gemma4 mask from mm_token_type_ids.
+            # The CP hook replaces HF's SDPA call with Gemma4's Flex all-gather
+            # attention. Force the HF attention dispatcher through SDPA so
+            # configs that default to eager attention still enter the hook.
+            self.config._attn_implementation = "sdpa"
+            # CP uses Gemma4's model-owned all-gather attention hook. The hook
+            # sees local Q and all-gathered global K/V, so HF's local 4D masks
+            # have the wrong key length. Pass no mask here; the hook rebuilds
+            # the local-query/global-key Gemma4 mask from model metadata.
             causal_mask_mapping = {"full_attention": None, "sliding_attention": None}
         elif use_vision_bidirectional_mask and packed_seq_ids is not None:
             causal_mask_mapping = _build_packed_gemma4_causal_mask_mapping(
@@ -959,7 +955,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         inputs_embeds = self.model.get_input_embeddings()(llm_input_ids)
         prepared_inputs: dict[str, Any] = {
             "inputs_embeds": inputs_embeds,
-            "mm_token_type_ids": mm_token_type_ids if mm_token_type_ids is not None else special_image_mask.to(torch.long),
+            "mm_token_type_ids": mm_token_type_ids
+            if mm_token_type_ids is not None
+            else special_image_mask.to(torch.long),
             "_cp_manual_allgather": True,
         }
 

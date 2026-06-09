@@ -355,11 +355,14 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     # Prefer nested text modules when present (VLM models)
     _model = get_text_module(_model)
 
-    # Set model-level flag so the forward pass can null out attention_mask.
+    # Set CP flags so wrapper and text-module forward paths can prepare
+    # full-sequence embeddings and null out local attention masks.
     # With CP the mask is not sharded along the sequence dim and TE asserts
     # "Padding mask not supported with context parallelism!".
+    model._cp_enabled = True
     _model._cp_enabled = True
 
+    has_non_te_attention = False
     for _, block in _model.layers.named_children():
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
@@ -374,10 +377,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                     cp_comm_type=attn_cp_comm_type,
                 )
             else:
-                logger.warning(
-                    "Skipping TE CP setup for block with non-TE attention module: %s",
-                    type(attn_module).__name__,
-                )
+                has_non_te_attention = True
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
 
@@ -405,6 +405,17 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         moe_module = block.moe if hasattr(block, "moe") else block.mlp
         if isinstance(moe_module, MoE):
             moe_module.cp_mesh = cp_mesh
+
+    if has_non_te_attention:
+        from nemo_automodel.components.distributed.cp_utils import (
+            attach_context_parallel_hooks,
+            attach_cp_attention_hooks,
+            attach_linear_attn_position_hooks,
+        )
+
+        attach_context_parallel_hooks(_model)
+        attach_linear_attn_position_hooks(_model)
+        attach_cp_attention_hooks(_model, cp_mesh)
 
 
 def parallelize_model(
