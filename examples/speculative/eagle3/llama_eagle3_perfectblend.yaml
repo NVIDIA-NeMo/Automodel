@@ -26,6 +26,11 @@ recipe_args:
 
   seq_length: 2048
 
+  # Sequence packing (EAGLE-3, colocated backend only). > 0 packs variable-length
+  # samples into rows of this width with per-document block-causal attention,
+  # removing padding waste. Set to seq_length (or larger); 0 disables.
+  packed_sequence_size: 2048
+
   # 8 GPUs * micro_batch=1 * grad_accum=4 -> effective batch 32.
   micro_batch_size: 1
   grad_accumulation_steps: 4

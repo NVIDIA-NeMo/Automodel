@@ -52,6 +52,7 @@ from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
@@ -261,7 +262,7 @@ def instantiate_infrastructure(
     pipeline_config: Optional[PipelineConfig] = None,
     qat_config: Optional[QATConfig] = None,
     moe_config: Optional[MoEParallelizerConfig] = None,
-    activation_checkpointing: bool = False,
+    activation_checkpointing: bool | str = False,
     device: Optional[torch.device] = None,
     mesh: Optional[MeshContext] = None,
     # Deprecated -- prefer passing ``mesh`` directly
@@ -625,6 +626,19 @@ def apply_model_infrastructure(
             attach_context_parallel_hooks(mp)
             if is_compile_enabled:
                 attach_cp_sdpa_hooks(mp, cp_mesh)
+
+    # Frozen submodules (e.g. a frozen vision tower) either land in the root FSDP unit
+    # (sharded) or are excluded from wrapping, depending on the model/parallelizer. In
+    # both cases FSDP mixed precision never casts their buffers, and an excluded frozen
+    # module also keeps its storage-dtype params. Under fp32 master weights + bf16 compute
+    # that leaves frozen fp32 tensors feeding bf16 trainable modules -> dtype-mismatch
+    # matmul at the seam. Cast frozen params/buffers to the compute dtype so the whole
+    # forward runs uniformly. No-op for pure-fp32 / pure-bf16 runs and when no mp_policy
+    # is available (DDP/PP).
+    compute_dtype = getattr(getattr(model_wrapper, "mp_policy", None), "param_dtype", None)
+    if compute_dtype is not None:
+        for mp in model.parts if hasattr(model, "parts") else [model]:
+            cast_frozen_modules_to_compute_dtype(mp, compute_dtype)
 
     model = _apply_runtime_compatibility_fixes(model)
     return model

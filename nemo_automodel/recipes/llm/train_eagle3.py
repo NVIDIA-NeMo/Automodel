@@ -215,6 +215,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             self.target_wrapper.get_input_embeddings() if self.target_wrapper is not None else self._cached_embed_source
         )
         self.draft_model.copy_embeddings_from_target(embed_source)
+        # Embed the draft->target vocab map (d2t/t2d) into the draft so a
+        # compressed-vocab checkpoint carries the remap tables vLLM/SGLang need.
+        # No-op when the vocab is not compressed. See set_vocab_mapping.
+        self.draft_model.set_vocab_mapping(selected_token_ids)
         # EAGLE-3 TTT freezes the draft embeddings by default; P-EAGLE trains them
         # (speculators sets ``embed_requires_grad=True`` for parallel drafting).
         # Either default can still be overridden via ``recipe_args.freeze_embeddings``.
@@ -344,6 +348,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         #     precomputed supervision over HTTP + NCCL. No target weights are
         #     loaded here, which frees the training GPU's memory.
         backend = recipe_cfg.get("target_model_backend", "colocated")
+        # Sequence packing is colocated-only (the remote server does not yet honor
+        # per-document masking).
+        packed_sequence_size = recipe_cfg.get("packed_sequence_size", 0)
+        if packed_sequence_size > 0 and backend == "remote":
+            raise NotImplementedError(
+                "packed_sequence_size > 0 is only supported with the colocated target backend; "
+                "the remote backend does not yet propagate per-document masking."
+            )
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
         elif backend == "colocated":
@@ -361,6 +373,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             split=recipe_cfg.get("train_split", None),
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            packed_sequence_size=packed_sequence_size,
         )
         self.val_dataloader = None
         if recipe_cfg.get("val_data_path", None):
@@ -374,6 +388,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 split=recipe_cfg.get("val_split", None),
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+                mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                packed_sequence_size=packed_sequence_size,
             )
 
         special_token_ids = [
@@ -539,6 +555,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if target_batch is not None:
             return self.trainer_module(**target_batch.to_trainer_inputs())
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        # Sequence-packing metadata (present only when packed_sequence_size > 0).
+        packing_kwargs = {}
+        if "seq_lens" in batch:
+            packing_kwargs = {
+                "position_ids": batch["position_ids"],
+                "seq_lens": batch["seq_lens"],
+                "doc_remaining": batch["doc_remaining"],
+            }
         if self.target_wrapper is None:
             # Offline cache: the supervision is already in the batch.
             batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -549,11 +573,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 aux_hidden_states=batch["aux_hidden_states"],
                 target_probs=batch["target_probs"],
                 position_mask=batch["position_mask"],
+                **packing_kwargs,
             )
         target_batch = self.target_wrapper.generate_batch(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             loss_mask=batch["loss_mask"],
+            **packing_kwargs,
         )
         return self.trainer_module(**target_batch.to_trainer_inputs())
 

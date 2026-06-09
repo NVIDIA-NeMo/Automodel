@@ -228,6 +228,15 @@ def build_qwen3_5_dense_mtp(
 class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     """Qwen3.5 dense causal LM with optional Megatron-style MTP head."""
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = True
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = False
+
     @classmethod
     def from_config(
         cls,
@@ -402,6 +411,15 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = True
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = False
 
     @classmethod
     def from_config(
