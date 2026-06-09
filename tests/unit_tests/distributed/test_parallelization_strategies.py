@@ -152,10 +152,17 @@ def mock_distributed_env(monkeypatch):
         "nemo_automodel.components.distributed.parallelizer.parallelize_module", parallelize_module_mock, raising=False
     )
 
-    # Mock checkpoint wrapper
+    # Mock checkpoint wrapper. Sub-module/whole-block wrapping now lives in
+    # activation_checkpointing.py and calls that module's checkpoint_wrapper, so
+    # patch it there too.
     checkpoint_wrapper_mock = MagicMock(side_effect=lambda x: x)
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper", checkpoint_wrapper_mock, raising=False
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
+        checkpoint_wrapper_mock,
+        raising=False,
     )
 
     # Mock apply_fsdp2_sharding_recursively

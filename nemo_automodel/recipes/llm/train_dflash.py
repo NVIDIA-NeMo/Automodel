@@ -108,11 +108,16 @@ class TrainDFlashRecipe(BaseRecipe):
         )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
+        target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
+        target_kwargs = {}
+        if target_attn_implementation is not None:
+            target_kwargs["attn_implementation"] = target_attn_implementation
         self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
             target_path,
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
             force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            **target_kwargs,
         )
         self.target_model.to(self.device)
         self.target_model.requires_grad_(False)

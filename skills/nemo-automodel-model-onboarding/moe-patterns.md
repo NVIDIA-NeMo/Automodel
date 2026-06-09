@@ -246,7 +246,10 @@ def update_moe_gate_bias(self) -> None:
 
 ```python
 class NewMoEForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]  # If using sigmoid routing
+    # Pin every intrinsically-fp32 param (sigmoid-gate bias here; add SSM A_log/dt_bias,
+    # attention-sink bias, scale, etc. as applicable). See SKILL.md §2.6 -- this keeps
+    # them in fp32 compute even under fp32 master weights.
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]  # if using sigmoid routing
 
     @classmethod
     def from_config(cls, config, moe_config=None, backend=None, **kwargs):
@@ -441,4 +444,4 @@ In addition to the standard checklist in SKILL.md:
 - [ ] Forward handles `thd` format via `squeeze_input_for_thd`
 - [ ] Forward passes `padding_mask` to MoE layers
 - [ ] State dict adapter handles expert weight stacking/unstacking
-- [ ] `_keep_in_fp32_modules_strict` set for gate bias if using sigmoid routing
+- [ ] `_keep_in_fp32_modules_strict` set for every intrinsically-fp32 param (sigmoid-gate bias `e_score_correction_bias`, and any others) — see SKILL.md §2.6

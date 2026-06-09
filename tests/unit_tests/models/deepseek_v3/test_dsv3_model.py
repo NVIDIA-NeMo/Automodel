@@ -13,13 +13,26 @@
 # limitations under the License.
 
 import inspect
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from torch import nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3ForCausalLM, DeepseekV3Model
+from nemo_automodel.components.models.deepseek_v3.model import Block, DeepseekV3ForCausalLM, DeepseekV3Model
+
+
+class _RecordingMlp(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(self, *args):
+        self.calls.append(args)
+        return torch.zeros_like(args[0])
 
 
 class TestDeepseekV3ModelUpdates:
@@ -56,6 +69,32 @@ class TestDeepseekV3ModelUpdates:
 
         assert hasattr(dsv3_mod, "ModelClass")
         assert dsv3_mod.ModelClass is DeepseekV3ForCausalLM
+
+
+class TestDeepseekV3BlockMlpDispatch:
+    def test_mlp_dispatch_uses_layer_role_after_checkpoint_wrapping(self):
+        """Checkpoint wrappers hide the original MLP/MoE type; dispatch must use layer role."""
+        x = torch.randn(2, 3, 8)
+        padding_mask = torch.ones(2, 3, dtype=torch.bool)
+
+        dense_mlp = _RecordingMlp()
+        dense_block = SimpleNamespace(is_moe_layer=False, mlp=checkpoint_wrapper(dense_mlp))
+        dense_out = Block._mlp(dense_block, x, padding_mask)
+
+        assert dense_out.shape == x.shape
+        assert len(dense_mlp.calls) == 1
+        assert len(dense_mlp.calls[0]) == 1
+        assert dense_mlp.calls[0][0] is x
+
+        moe_mlp = _RecordingMlp()
+        moe_block = SimpleNamespace(is_moe_layer=True, mlp=checkpoint_wrapper(moe_mlp))
+        moe_out = Block._mlp(moe_block, x, padding_mask)
+
+        assert moe_out.shape == x.shape
+        assert len(moe_mlp.calls) == 1
+        assert len(moe_mlp.calls[0]) == 2
+        assert moe_mlp.calls[0][0] is x
+        assert moe_mlp.calls[0][1] is padding_mask
 
 
 class TestDeepseekV3GatePrecision:

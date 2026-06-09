@@ -18,6 +18,7 @@ Typed validation tests live in ``tests/unit_tests/distributed/test_mesh.py``.
 """
 
 import pytest
+import torch
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
@@ -138,6 +139,30 @@ class TestPipeline:
     def test_pp_enabled_false_when_pp_eq_1(self):
         assert parse_distributed_section({"pp_size": 1})["pp_enabled"] is False
 
+    def test_pipeline_dtype_defaults_to_mp_policy_output_dtype(self):
+        """Unset pipeline.dtype is derived from the FSDP mp_policy output dtype (bf16 default)."""
+        result = parse_distributed_section({"pp_size": 2})
+        assert result["pipeline_config"].dtype == torch.bfloat16
+
+    def test_pipeline_dtype_explicit_match_kept(self, caplog):
+        cfg = {"pp_size": 2, "pipeline": {"dtype": "bfloat16"}}
+        with caplog.at_level("WARNING"):
+            result = parse_distributed_section(cfg)
+        assert result["pipeline_config"].dtype == torch.bfloat16
+        assert "does not match" not in caplog.text
+
+    def test_pipeline_dtype_explicit_mismatch_warns_and_kept(self, caplog):
+        cfg = {"pp_size": 2, "pipeline": {"dtype": "float32"}}
+        with caplog.at_level("WARNING"):
+            result = parse_distributed_section(cfg)
+        # Explicit value is honored (not overridden) but a mismatch warning fires.
+        assert result["pipeline_config"].dtype == torch.float32
+        assert "does not match" in caplog.text
+
+    def test_pipeline_dtype_not_set_when_pp_eq_1(self):
+        result = parse_distributed_section({"pp_size": 1})
+        assert result["pipeline_config"] is None
+
 
 # ---------------------------------------------------------------------------
 # MoE sub-config parsing
@@ -249,6 +274,34 @@ class TestActivationCheckpointingRouting:
     def test_works_with_ddp(self):
         result = parse_distributed_section({"strategy": "ddp", "activation_checkpointing": True})
         assert result["strategy_config"].activation_checkpointing is True
+
+    def test_selective_routes_to_fsdp2_strategy_when_no_ep(self):
+        result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "selective", "ep_size": 1})
+        assert result["strategy_config"].activation_checkpointing == "selective"
+        assert result["activation_checkpointing"] == "selective"
+
+    def test_full_string_routes_as_true(self):
+        result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "full"})
+        assert result["strategy_config"].activation_checkpointing is True
+        assert result["activation_checkpointing"] is True
+
+    def test_selective_allowed_for_ep(self):
+        # Selective AC is now supported with expert parallelism via the MoE
+        # parallelizer. For EP it is kept off the strategy config and carried on
+        # the parsed value (consumed by parallelize_model -> apply_ac).
+        result = parse_distributed_section(
+            {"strategy": "fsdp2", "activation_checkpointing": "selective", "ep_size": 2, "moe": {}}
+        )
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["activation_checkpointing"] == "selective"
+
+    def test_selective_rejected_for_non_fsdp2(self):
+        with pytest.raises(ValueError, match="FSDP2"):
+            parse_distributed_section({"strategy": "ddp", "activation_checkpointing": "selective"})
+
+    def test_unknown_activation_checkpointing_mode_rejected(self):
+        with pytest.raises(ValueError, match="activation_checkpointing"):
+            parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "sometimes"})
 
 
 # ---------------------------------------------------------------------------

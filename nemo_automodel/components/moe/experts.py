@@ -37,6 +37,7 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_swiglu_impl,
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
+from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 
 # ── EP variable-length collective helpers ──
 
@@ -226,7 +227,10 @@ class GroupedExperts(nn.Module):
         self.n_routed_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
-        self.use_torch_mm = backend is not None and backend.experts == "torch_mm"
+        # "torch_mm_mxfp8" dispatches identically to "torch_mm" but routes the grouped
+        # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
+        self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
+        self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -493,10 +497,17 @@ class GroupedExperts(nn.Module):
                 # torch._grouped_mm does not support bias yet (raises
                 # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
                 # Apply bias manually after each grouped GEMM via _apply_bias.
-                output1 = torch._grouped_mm(permuted_x, gate_and_up_projs, offs=offs)
+                # select_grouped_mm routes through torchao MXFP8 (with the contiguous-
+                # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
+                # MXFP8: the grouped_mm wrapper clamps its quant input (see
+                # select_grouped_mm) so a bias-shifted value can't overflow the e8m0
+                # block scale -> nan. The bias-add stays a bf16 separate add (torchao
+                # v0.17.0 has no bias arg). bf16 path byte-identical.
+                grouped_mm = select_grouped_mm(self.use_mxfp8)
+                output1 = grouped_mm(permuted_x, gate_and_up_projs, offs)
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                 output1 = self.expert_activation_grouped(output1, permuted_probs)
-                output2 = torch._grouped_mm(output1, down_projs, offs=offs)
+                output2 = grouped_mm(output1, down_projs, offs)
                 output2 = _apply_bias(output2, down_proj_bias, tokens_per_expert, permuted_probs)
             else:
                 output2 = _torch_mm_experts_fwd(
@@ -506,6 +517,7 @@ class GroupedExperts(nn.Module):
                     tokens_per_expert,
                     permuted_probs,
                     self.expert_activation_grouped,
+                    use_mxfp8=self.use_mxfp8,
                 )
 
             scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
@@ -643,7 +655,10 @@ class GroupedExpertsDeepEP(nn.Module):
         super().__init__()
 
         self.config = config
-        self.use_torch_mm = backend is not None and backend.experts == "torch_mm"
+        # "torch_mm_mxfp8" dispatches identically to "torch_mm" but routes the grouped
+        # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
+        self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
+        self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
@@ -765,13 +780,20 @@ class GroupedExpertsDeepEP(nn.Module):
                     # torch._grouped_mm does not support bias yet (raises
                     # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
                     # Apply bias manually after each grouped GEMM via _apply_bias.
+                    # select_grouped_mm routes through torchao MXFP8 (with the contiguous-
+                    # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
                     offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
-                    output1 = torch._grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs=offs)
-                    gate_up_proj_bias = self.gate_up_proj_bias.to_local().to(compute_dtype)
+                    grouped_mm = select_grouped_mm(self.use_mxfp8)
+                    output1 = grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs)
+                    gate_up_proj_bias = self.gate_up_proj_bias.to_local()
+                    # MXFP8: the grouped_mm wrapper clamps its quant input (see
+                    # select_grouped_mm) so a bias-shifted value can't overflow the e8m0
+                    # block scale -> nan (seen on gpt-oss). The bias-add stays a bf16
+                    # separate add (torchao v0.17.0 has no bias arg). bf16 path unchanged.
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                     output1 = self.expert_activation(output1, permuted_probs)
-                    output2 = torch._grouped_mm(output1, down_projs, offs=offs)
-                    down_bias = self.down_proj_bias.to_local().to(compute_dtype)
+                    output2 = grouped_mm(output1, down_projs, offs)
+                    down_bias = self.down_proj_bias.to_local()
                     output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
                 else:
                     output2 = _torch_mm_experts_fwd(
@@ -781,6 +803,7 @@ class GroupedExpertsDeepEP(nn.Module):
                         tokens_per_expert_gpu,
                         permuted_probs,
                         self.expert_activation,
+                        use_mxfp8=self.use_mxfp8,
                     )
             else:
                 tokens_per_expert = tokens_per_expert.to("cpu")
@@ -814,12 +837,23 @@ class GroupedExpertsDeepEP(nn.Module):
 
 
 def _torch_mm_experts_fwd(
-    hidden_states, gate_and_up_projs, down_projs, tokens_per_expert, permuted_probs, activation_fn
+    hidden_states,
+    gate_and_up_projs,
+    down_projs,
+    tokens_per_expert,
+    permuted_probs,
+    activation_fn,
+    use_mxfp8=False,
 ):
+    # torchao's MXFP8 quantizer (mx_tensor.to_mx) strictly asserts is_contiguous() on each
+    # operand it quantizes, unlike torch._grouped_mm. select_grouped_mm returns a wrapper
+    # that makes A contiguous and relays out B (so its transpose is contiguous, the layout
+    # torchao wants); when mxfp8 is off it returns plain torch._grouped_mm (byte-identical).
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
-    output1 = torch._grouped_mm(hidden_states, gate_and_up_projs, offs=offs)
+    grouped_mm = select_grouped_mm(use_mxfp8)
+    output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
     output1 = activation_fn(output1, permuted_probs)
-    output2 = torch._grouped_mm(output1, down_projs, offs=offs)
+    output2 = grouped_mm(output1, down_projs, offs)
     return output2
 
 
