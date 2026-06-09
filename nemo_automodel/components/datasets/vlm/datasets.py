@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import json
 import logging
 import math
@@ -20,6 +22,7 @@ import random
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import torch.utils.data
 from datasets import load_dataset
@@ -33,6 +36,18 @@ from nemo_automodel.components.datasets.vlm.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RdrDatasetConfig:
+    """Construction-time configuration for the RDR dataset."""
+
+    path_or_dataset: str = "quintend/rdr-items"
+    split: str = "train"
+
+    def build(self) -> list:
+        """Build the RDR dataset from this config."""
+        return make_rdr_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
 
 def make_rdr_dataset(path_or_dataset="quintend/rdr-items", split="train", **kwargs):
@@ -67,6 +82,18 @@ def make_rdr_dataset(path_or_dataset="quintend/rdr-items", split="train", **kwar
 
     return [format(example) for example in dataset]
     # return dataset.map(format, batched=False)
+
+
+@dataclass
+class CordV2DatasetConfig:
+    """Construction-time configuration for the CORD-V2 dataset."""
+
+    path_or_dataset: str = "naver-clova-ix/cord-v2"
+    split: str = "train"
+
+    def build(self) -> list:
+        """Build the CORD-V2 dataset from this config."""
+        return make_cord_v2_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
 
 def make_cord_v2_dataset(
@@ -301,6 +328,18 @@ def make_tulu3_magicoder_text_mix_dataset(
         if limit_total is not None and len(out) >= limit_total:
             break
     return out
+
+
+@dataclass
+class UnimmChatDatasetConfig:
+    """Construction-time configuration for the UniMM-Chat dataset."""
+
+    path_or_dataset: str = "Yirany/UniMM-Chat"
+    split: str = "train"
+
+    def build(self) -> list:
+        """Build the UniMM-Chat dataset from this config."""
+        return make_unimm_chat_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
 
 def make_unimm_chat_dataset(path_or_dataset="Yirany/UniMM-Chat", split="train", **kwargs):
@@ -759,6 +798,29 @@ class _ExamplesWithStats(list):
     __slots__ = ("stats",)
 
 
+@dataclass
+class MetaDatasetConfig:
+    """Construction-time configuration for the meta VLM dataset."""
+
+    path_or_dataset: str = ""
+    dataset_names: list[str] | None = None
+    split: str = "train"
+    shard_data: bool = False
+    rank: int | None = None
+    world_size: int | None = None
+
+    def build(self) -> list:
+        """Build the meta VLM dataset from this config."""
+        return make_meta_dataset(
+            path_or_dataset=self.path_or_dataset,
+            dataset_names=self.dataset_names,
+            split=self.split,
+            shard_data=self.shard_data,
+            rank=self.rank,
+            world_size=self.world_size,
+        )
+
+
 def make_meta_dataset(
     path_or_dataset,
     dataset_names=None,
@@ -996,6 +1058,26 @@ def make_meta_dataset(
     return result
 
 
+@dataclass
+class PreTokenizedDatasetWrapperConfig:
+    """Construction-time configuration for :class:`PreTokenizedDatasetWrapper`."""
+
+    max_length: int | None = None
+    max_retries: int = 10
+    truncate: bool = False
+
+    def build(self, *, dataset, processor, post_tokenize_hook=None) -> "PreTokenizedDatasetWrapper":
+        """Build a :class:`PreTokenizedDatasetWrapper` from this config."""
+        return PreTokenizedDatasetWrapper(
+            dataset=dataset,
+            processor=processor,
+            max_length=self.max_length,
+            max_retries=self.max_retries,
+            truncate=self.truncate,
+            post_tokenize_hook=post_tokenize_hook,
+        )
+
+
 class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
     """Dataset wrapper that tokenizes samples in ``__getitem__``.
 
@@ -1189,6 +1271,17 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         from nemo_automodel.components.datasets.vlm.collate_fns import make_robust_collate
 
         return make_robust_collate(self, collate_fn, self.max_retries)
+
+
+@dataclass
+class RobustDatasetWrapperConfig:
+    """Construction-time configuration for :class:`RobustDatasetWrapper`."""
+
+    max_retries: int = 10
+
+    def build(self, *, dataset) -> "RobustDatasetWrapper":
+        """Build a :class:`RobustDatasetWrapper` from this config."""
+        return RobustDatasetWrapper(dataset=dataset, max_retries=self.max_retries)
 
 
 class RobustDatasetWrapper(torch.utils.data.Dataset):

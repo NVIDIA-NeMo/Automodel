@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 
@@ -313,6 +314,42 @@ def _conversations_to_messages(conversations: Any) -> List[Dict[str, Any]]:
             )
         messages.append({"role": role, "content": turn.get("value", turn.get("content", ""))})
     return messages
+
+
+@dataclass
+class ChatDatasetConfig:
+    """Construction-time configuration for :class:`ChatDataset`."""
+
+    path_or_dataset_id: Union[str, Sequence[str]]
+    split: Optional[str] = None
+    name: Optional[str] = None
+    seq_length: Optional[int] = None
+    padding: Union[str, bool] = "do_not_pad"
+    truncation: Union[str, bool] = "do_not_truncate"
+    start_of_turn_token: Optional[str] = None
+    chat_template: Optional[str] = None
+    shuffle_seed: Optional[int] = None
+    mask_reasoning_content: bool = False
+    unshifted: bool = False
+    skip_invalid_samples: bool = False
+
+    def build(self, *, tokenizer) -> "ChatDataset":
+        """Build a :class:`ChatDataset` from this config and a runtime tokenizer."""
+        return ChatDataset(
+            path_or_dataset_id=self.path_or_dataset_id,
+            tokenizer=tokenizer,
+            split=self.split,
+            name=self.name,
+            seq_length=self.seq_length,
+            padding=self.padding,
+            truncation=self.truncation,
+            start_of_turn_token=self.start_of_turn_token,
+            chat_template=self.chat_template,
+            shuffle_seed=self.shuffle_seed,
+            mask_reasoning_content=self.mask_reasoning_content,
+            unshifted=self.unshifted,
+            skip_invalid_samples=self.skip_invalid_samples,
+        )
 
 
 class ChatDataset(Dataset):

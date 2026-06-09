@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
 import logging
 import sys
 import types
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -31,21 +30,81 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
-from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
-from nemo_automodel.components.optim.optimizer import build_optimizer_config
-from nemo_automodel.recipes._typed_config import _as_dict, _callable_and_kwargs
+from nemo_automodel.components.datasets.loader import (
+    DataloaderConfig,
+    build_dataloader_config,
+    make_collate_fn,
+    make_dataset_config,
+    make_packing_config,
+)
 from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+from nemo_automodel.components.optim.optimizer import build_optimizer_config
+from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
-    build_dataloader,
+    _build_pp_collate_wrapper,
     build_model,
-    build_validation_dataloader,
     compute_trust_remote_code_from_model,
 )
 
-# The recipe loader builder takes the same kwargs the tests already pass.
-_build_dataloader = build_dataloader
+
+def _target_kwargs(node):
+    if node is None:
+        return None, {}
+    if isinstance(node, str):
+        return node, {}
+    return _callable_and_kwargs(node)
+
+
+def _build_loader(
+    cfg_ds,
+    cfg_dl,
+    cfg_model,
+    cfg_ps,
+    *,
+    seed,
+    local_batch_size,
+    global_batch_size,
+    max_steps,
+    val_check_interval,
+    dp_rank,
+    dp_world_size,
+    pp_enabled,
+    cp_size=1,
+    model=None,
+):
+    """Resolve loader YAML like ``RecipeConfig.dataloader`` and build it."""
+    del global_batch_size, max_steps, val_check_interval
+    target, ds_kwargs = _callable_and_kwargs(cfg_ds)
+    ds_kwargs.pop("tokenizer", None)
+    dataset_config = make_dataset_config(target, ds_kwargs)
+    dl = _as_dict(cfg_dl)
+    dl.pop("_target_", None)
+    collate = make_collate_fn(*_target_kwargs(dl.pop("collate_fn", None)))
+    ps = _as_dict(cfg_ps)
+    packing = None
+    if ps.get("packed_sequence_size", 0) > 0:
+        packing = make_packing_config(ps.pop("packing_strategy", "thd"), ps)
+    config = build_dataloader_config(
+        dataset_config,
+        dataloader=dl,
+        packing=packing,
+        collate_fn=collate,
+        seed=seed,
+        local_batch_size=local_batch_size,
+    )
+    with patch("nemo_automodel.components.training.rng.ScopedRNG", lambda *a, **k: nullcontext()):
+        loader = config.build(
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            pp_enabled=pp_enabled,
+            model=model,
+            cp_size=cp_size,
+            collate_wrapper=_build_pp_collate_wrapper(cfg_model, pp_enabled),
+        )
+    return loader, None
 
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
@@ -166,7 +225,7 @@ def test_mtp_loss_config_defaults_and_override():
     torch.testing.assert_close(got_default, base + 0.2 * aux)
 
 
-def test_build_validation_dataloader_pp_enabled(caplog):
+def test_validation_dataloaders_pp_enabled(caplog):
     cfg = ConfigNode(
         {
             "model": {},
@@ -175,13 +234,14 @@ def test_build_validation_dataloader_pp_enabled(caplog):
     )
 
     with caplog.at_level(logging.WARNING):
-        result = build_validation_dataloader(cfg, dp_world_size=2, dp_rank=0, pp_enabled=True)
+        result = RecipeConfig(cfg).validation_dataloaders
 
     assert result == {}
 
 
-def test_build_validation_dataloader_collects_and_names_properly():
-    # Multiple validation dataset keys with different separators
+def test_validation_dataloaders_collects_and_names_properly():
+    # Multiple validation dataset keys with different separators, each resolved to a DataloaderConfig.
+    ds_target = "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset"
     cfg = ConfigNode(
         {
             "model": {},
@@ -194,30 +254,22 @@ def test_build_validation_dataloader_collects_and_names_properly():
                 "val_every_steps": 10,
             },
             # Keys to be discovered via cfg.to_dict().keys()
-            "validation_dataset": {"some": "cfg"},
-            "validation_dataset_val": {"some": "cfg"},
-            "validation_dataset-test": {"some": "cfg"},
-            "validation_dataset.foo": {"some": "cfg"},
+            "validation_dataset": {"_target_": ds_target},
+            "validation_dataset_val": {"_target_": ds_target},
+            "validation_dataset-test": {"_target_": ds_target},
         }
     )
 
-    expected_names = {"default", "val", "test", "foo"}
+    expected_names = {"default", "val", "test"}
 
-    with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader", return_value=("dl", "tok")) as mock_build:
-        result = build_validation_dataloader(cfg, dp_world_size=4, dp_rank=1, pp_enabled=False)
+    result = RecipeConfig(cfg).validation_dataloaders
 
     assert set(result.keys()) == expected_names
-    assert set(result.values()) == {"dl"}
-    # One dataloader built per validation dataset, with the runtime args threaded through.
-    assert mock_build.call_count == 4
-    _, kwargs = mock_build.call_args
-    assert kwargs["dp_world_size"] == 4
-    assert kwargs["dp_rank"] == 1
-    assert kwargs["pp_enabled"] is False
-    assert kwargs["cp_size"] == 3
+    assert all(isinstance(v, DataloaderConfig) for v in result.values())
+    assert all(v.batch_size == 8 for v in result.values())
 
 
-def test_build_validation_dataloader_no_validation_keys():
+def test_validation_dataloaders_no_validation_keys():
     cfg = ConfigNode(
         {
             "model": {},
@@ -225,11 +277,7 @@ def test_build_validation_dataloader_no_validation_keys():
         }
     )
 
-    with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader") as mock_build:
-        result = build_validation_dataloader(cfg, dp_world_size=1, dp_rank=0, pp_enabled=False)
-
-    assert result == {}
-    mock_build.assert_not_called()
+    assert RecipeConfig(cfg).validation_dataloaders == {}
 
 
 class DummyLinear(nn.Module):
@@ -408,7 +456,7 @@ def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog
     assert config.is_async is False
 
 
-def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatch):
+def test_build_loader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatch):
     # cfg_ds: target resolves to this test module dataset class
     cfg_ds = ConfigNode(
         {
@@ -417,19 +465,11 @@ def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatc
             "num_shards": 4,
         }
     )
-    # cfg_dl: target captures kwargs and returns sentinel
-    cfg_dl = ConfigNode(
-        {
-            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
-            "shuffle": True,
-            "shuffle_buffer_size": 8,
-            "num_workers": 0,
-        }
-    )
+    cfg_dl = ConfigNode({"shuffle": True, "shuffle_buffer_size": 8, "num_workers": 0})
     cfg_model = ConfigNode({})
     cfg_ps = ConfigNode({})
 
-    dl, tok = _build_dataloader(
+    loader, tok = _build_loader(
         cfg_ds=cfg_ds,
         cfg_dl=cfg_dl,
         cfg_model=cfg_model,
@@ -445,14 +485,8 @@ def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatc
         cp_size=1,
     )
 
-    assert dl == "dl"
     assert tok is None
-    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
-    captured = getattr(mod.dl_factory_capture, "captured")
-    # Ensure shuffle-related keys are not forwarded to DataLoader instantiation
-    assert "shuffle" not in captured and "shuffle_buffer_size" not in captured
-    ds = captured["dataset"]
-    # Avoid fragile identity issues from re-imports; validate by name and interface
+    ds = loader.dataset
     assert ds.__class__.__name__ == "DummyIterableDataset"
     # Shard path used when num_shards >= dp_world_size
     assert ds._shard == (2, 1)
@@ -581,8 +615,15 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     )
 
     # Data-related stubs
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_dataloader", lambda *a, **k: ("dl", "tok"))
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_validation_dataloader", lambda *a, **k: {})
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._build_tokenizer", lambda cfg_model, cfg_ds: ({}, None))
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.dataloader",
+        property(lambda self: SimpleNamespace(build=lambda **k: "dl")),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.validation_dataloaders",
+        property(lambda self: {}),
+    )
     monkeypatch.setattr(
         "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
         lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
@@ -878,6 +919,10 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
     # Mock helper functions to avoid needing full config
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: False)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.dataloader",
+        property(lambda self: SimpleNamespace(collate_fn=None)),
+    )
 
     # Create the recipe without calling setup
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
@@ -1333,12 +1378,12 @@ def test_build_model_and_optimizer_return_values():
 # =============================================================================
 
 # =============================================================================
-# Tests for PP mask precomputation guard in build_dataloader
+# Tests for PP mask precomputation guard in the loader build
 # =============================================================================
 
 
-def test_build_dataloader_pp_autoconfig_failure_skips_mask_collate(caplog):
-    """When AutoConfig.from_pretrained raises, mask precomputation is skipped and a warning is logged."""
+def _pp_loader(cfg_model, cfg_dl, **patches):
+    """Build a PP-enabled iterable loader and return its resolved ``collate_fn``."""
     cfg_ds = ConfigNode(
         {
             "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
@@ -1346,189 +1391,80 @@ def test_build_dataloader_pp_autoconfig_failure_skips_mask_collate(caplog):
             "num_shards": 4,
         }
     )
-    cfg_dl = ConfigNode(
-        {
-            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
-            "num_workers": 0,
-        }
+    loader, _ = _build_loader(
+        cfg_ds=cfg_ds,
+        cfg_dl=cfg_dl,
+        cfg_model=cfg_model,
+        cfg_ps=ConfigNode({}),
+        seed=123,
+        local_batch_size=2,
+        global_batch_size=4,
+        max_steps=None,
+        val_check_interval=None,
+        dp_rank=0,
+        dp_world_size=1,
+        pp_enabled=True,
     )
+    return loader.collate_fn
+
+
+def test_pp_autoconfig_failure_skips_masks(caplog):
+    """When AutoConfig.from_pretrained raises, the collate is left unwrapped and a warning is logged."""
+    calls = []
+    cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
     cfg_model = ConfigNode({"pretrained_model_name_or_path": "bad/model"})
-    cfg_ps = ConfigNode({})
 
     with (
         patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", side_effect=OSError("not found")),
+        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
         caplog.at_level(logging.WARNING),
     ):
-        dl, tok = _build_dataloader(
-            cfg_ds=cfg_ds,
-            cfg_dl=cfg_dl,
-            cfg_model=cfg_model,
-            cfg_ps=cfg_ps,
-            seed=123,
-            local_batch_size=2,
-            global_batch_size=4,
-            max_steps=None,
-            val_check_interval=None,
-            dp_rank=0,
-            dp_world_size=1,
-            pp_enabled=True,
-        )
+        collate_fn = _pp_loader(cfg_model, cfg_dl)
 
     assert "Failed to load model config for causal mask precomputation" in caplog.text
-    # collate_fn should NOT have been set since AutoConfig failed
-    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
-    captured = getattr(mod.dl_factory_capture, "captured")
-    assert "collate_fn" not in captured
-
-
-def test_build_dataloader_pp_autoconfig_success_sets_mask_collate():
-    """When AutoConfig.from_pretrained succeeds and no collate_fn exists, a mask-only collate is set."""
-    cfg_ds = ConfigNode(
-        {
-            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
-            "tokenizer": None,
-            "num_shards": 4,
-        }
-    )
-    cfg_dl = ConfigNode(
-        {
-            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
-            "num_workers": 0,
-        }
-    )
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": "good/model"})
-    cfg_ps = ConfigNode({})
-
-    mock_config = MagicMock()
-    with (
-        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=mock_config),
-        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=lambda b, **kw: b),
-    ):
-        dl, tok = _build_dataloader(
-            cfg_ds=cfg_ds,
-            cfg_dl=cfg_dl,
-            cfg_model=cfg_model,
-            cfg_ps=cfg_ps,
-            seed=123,
-            local_batch_size=2,
-            global_batch_size=4,
-            max_steps=None,
-            val_check_interval=None,
-            dp_rank=0,
-            dp_world_size=1,
-            pp_enabled=True,
-        )
-
-    # collate_fn should have been set (mask-only path)
-    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
-    captured = getattr(mod.dl_factory_capture, "captured")
-    assert "collate_fn" in captured
-    assert callable(captured["collate_fn"])
-
-
-def test_build_dataloader_pp_deepseek_v4_skips_mask_collate(caplog):
-    """DeepSeek V4 computes causal masks internally, so PP mask precomputation is skipped."""
-    cfg_ds = ConfigNode(
-        {
-            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
-            "tokenizer": None,
-            "num_shards": 4,
-        }
-    )
-    cfg_dl = ConfigNode(
-        {
-            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
-            "num_workers": 0,
-        }
-    )
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": "deepseek-ai/DeepSeek-V4-Pro"})
-    cfg_ps = ConfigNode({})
-
-    mock_config = MagicMock(model_type="deepseek_v4")
-    with (
-        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=mock_config),
-        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
-        caplog.at_level(logging.INFO),
-    ):
-        dl, tok = _build_dataloader(
-            cfg_ds=cfg_ds,
-            cfg_dl=cfg_dl,
-            cfg_model=cfg_model,
-            cfg_ps=cfg_ps,
-            seed=123,
-            local_batch_size=2,
-            global_batch_size=4,
-            max_steps=None,
-            val_check_interval=None,
-            dp_rank=0,
-            dp_world_size=1,
-            pp_enabled=True,
-        )
-
-    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
-    captured = getattr(mod.dl_factory_capture, "captured")
-    assert "collate_fn" not in captured
-    assert "Skipping pipeline parallel causal mask precomputation for model_type=deepseek_v4" in caplog.text
+    collate_fn(["dummy"])
+    assert calls == ["base"]
     add_masks.assert_not_called()
 
 
-def test_build_dataloader_pp_autoconfig_success_chains_existing_collate():
-    """When AutoConfig.from_pretrained succeeds and collate_fn exists, they are chained."""
+def test_pp_deepseek_v4_skips_masks(caplog):
+    """DeepSeek V4 computes masks internally, so PP mask precomputation is skipped."""
+    calls = []
+    cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
+    cfg_model = ConfigNode({"pretrained_model_name_or_path": "deepseek-ai/DeepSeek-V4-Pro"})
+    with (
+        patch(
+            "nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained",
+            return_value=MagicMock(model_type="deepseek_v4"),
+        ),
+        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
+        caplog.at_level(logging.INFO),
+    ):
+        collate_fn = _pp_loader(cfg_model, cfg_dl)
+
+    collate_fn(["dummy"])
+    assert calls == ["base"]
+    add_masks.assert_not_called()
+    assert "Skipping pipeline parallel causal mask precomputation for model_type=deepseek_v4" in caplog.text
+
+
+def test_pp_autoconfig_success_chains_masks():
+    """When AutoConfig succeeds, the resolved collate is wrapped with mask precomputation."""
     call_order = []
-
-    def my_collate(batch):
-        call_order.append("base")
-        return batch
-
-    cfg_ds = ConfigNode(
-        {
-            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
-            "tokenizer": None,
-            "num_shards": 4,
-        }
-    )
-    cfg_dl = ConfigNode(
-        {
-            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
-            "num_workers": 0,
-            "collate_fn": my_collate,
-        }
-    )
+    cfg_dl = ConfigNode({"collate_fn": lambda b: call_order.append("base") or b, "num_workers": 0})
     cfg_model = ConfigNode({"pretrained_model_name_or_path": "good/model"})
-    cfg_ps = ConfigNode({})
-
-    mock_config = MagicMock()
 
     def mock_add_masks(batch, model_config=None):
         call_order.append("masks")
         return batch
 
     with (
-        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=mock_config),
+        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=MagicMock()),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=mock_add_masks),
     ):
-        dl, tok = _build_dataloader(
-            cfg_ds=cfg_ds,
-            cfg_dl=cfg_dl,
-            cfg_model=cfg_model,
-            cfg_ps=cfg_ps,
-            seed=123,
-            local_batch_size=2,
-            global_batch_size=4,
-            max_steps=None,
-            val_check_interval=None,
-            dp_rank=0,
-            dp_world_size=1,
-            pp_enabled=True,
-        )
+        collate_fn = _pp_loader(cfg_model, cfg_dl)
 
-    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
-    captured = getattr(mod.dl_factory_capture, "captured")
-    assert "collate_fn" in captured
-    chained_fn = captured["collate_fn"]
-
-    # Invoke the chained collate to verify ordering
-    chained_fn(["dummy_batch"])
+    collate_fn(["dummy_batch"])
     assert call_order == ["base", "masks"]
 
 
@@ -2012,6 +1948,7 @@ class TestRunValidationToolCallEval:
     def _run(self, recipe, monkeypatch):
         # max_memory_allocated() is CUDA-only; stub it so the CPU metrics build works.
         monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: 0)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", lambda **kwargs: nullcontext())
         return recipe._run_validation_epoch([])  # empty loader -> straight to the eval block
 
     def test_fsdp2_skips_in_loop_eval(self, monkeypatch):

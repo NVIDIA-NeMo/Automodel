@@ -28,9 +28,12 @@ This keeps the packing setup O(N) and lightweight, while the expensive
 tokenization + media loading is distributed across ``num_workers``.
 """
 
+from __future__ import annotations
+
 import inspect
 import logging
 import time
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
@@ -414,6 +417,41 @@ def _build_packed_vlm_sample(
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class PackedDatasetWrapperConfig:
+    """Construction-time configuration for :class:`PackedDatasetWrapper`."""
+
+    pack_size: int = 2048
+    """Target packed sequence length (after autoregressive shift)."""
+    padding_idx: int = 0
+    """Token ID used for padding packed sequences."""
+    max_retries: int = 10
+    """Max retries when a sample fails to tokenize during materialization."""
+
+    def build(
+        self,
+        *,
+        inner_dataset,
+        bins: list[list[int]],
+        get_rope_index: Callable | None = None,
+    ) -> "PackedDatasetWrapper":
+        """Build a :class:`PackedDatasetWrapper` from this config.
+
+        Args:
+            inner_dataset: The tokenizing dataset (e.g. ``PreTokenizedDatasetWrapper``).
+            bins: Bin assignments from ``greedy_knapsack`` / ``neat_pack_dataset_vlm``.
+            get_rope_index: Optional ``model.get_rope_index`` callable for mRoPE support.
+        """
+        return PackedDatasetWrapper(
+            inner_dataset=inner_dataset,
+            bins=bins,
+            pack_size=self.pack_size,
+            padding_idx=self.padding_idx,
+            get_rope_index=get_rope_index,
+            max_retries=self.max_retries,
+        )
+
+
 class PackedDatasetWrapper(torch.utils.data.Dataset):
     """A Dataset that materializes packs lazily in ``__getitem__``.
 
@@ -515,6 +553,47 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class NeatPackConfig:
+    """Construction-time configuration for the VLM neat-packing pipeline."""
+
+    pack_size: int = 2048
+    """Target packed sequence length (after autoregressive shift)."""
+    padding_idx: int = 0
+    """Token ID used for padding packed sequences."""
+    drop_long_samples: bool = False
+    """If ``True``, samples whose estimated length exceeds ``pack_size`` are dropped."""
+    max_packs: int | None = None
+    """Optional cap on the total number of packs produced."""
+    packing_ratio: float = 1.0
+    """Knapsack bin fill ratio. Values below 1.0 leave headroom for estimation errors."""
+    balance_media_tokens: bool = True
+    """If ``True``, use VT-balanced knapsack to distribute visual tokens evenly."""
+
+    def build(self, *, dataset, ds_raw=None, get_rope_index=None, processor=None) -> "PackedDatasetWrapper":
+        """Build a neat-packed VLM dataset from this config.
+
+        Args:
+            dataset: ``PreTokenizedDatasetWrapper`` for per-sample tokenization.
+            ds_raw: Raw conversations dataset for fast length estimation. Falls back to
+                ``len(dataset)`` when ``None``.
+            get_rope_index: Optional ``model.get_rope_index`` callable for mRoPE support.
+            processor: Optional HuggingFace processor for accurate media token estimation.
+        """
+        return neat_pack_dataset_vlm(
+            dataset=dataset,
+            pack_size=self.pack_size,
+            padding_idx=self.padding_idx,
+            drop_long_samples=self.drop_long_samples,
+            max_packs=self.max_packs,
+            get_rope_index=get_rope_index,
+            ds_raw=ds_raw,
+            packing_ratio=self.packing_ratio,
+            processor=processor,
+            balance_media_tokens=self.balance_media_tokens,
+        )
 
 
 def neat_pack_dataset_vlm(
