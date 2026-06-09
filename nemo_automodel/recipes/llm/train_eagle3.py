@@ -47,6 +47,7 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
     read_manifest,
 )
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.eagle import (
@@ -119,6 +120,42 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
+def _submesh_or_none(device_mesh, name: str):
+    """Return the named 1D submesh (e.g. "cp"/"dp") or None if absent.
+
+    Uses ``get_flat_mesh`` so ``_flatten()``-created axes ("dp") resolve on
+    PyTorch 2.9-2.11, where a plain ``device_mesh[name]`` is deprecated or the
+    name is missing from ``mesh_dim_names``.
+    """
+    if device_mesh is None:
+        return None
+    try:
+        return get_flat_mesh(device_mesh, name)
+    except KeyError:
+        return None
+
+
+def _validate_cp_gates(cp_size: int, backend: str, packed_sequence_size: int) -> None:
+    """Reject context-parallel combinations the EAGLE-3 target path cannot honor.
+
+    CP shards the target forward along the sequence and forces ``is_causal`` (the
+    self_attn hooks strip the attention_mask), so it is incompatible with sequence
+    packing (which needs the 4D block-causal mask) and with the remote backend
+    (whose target runs out-of-process).
+    """
+    if cp_size > 1 and backend == "remote":
+        raise NotImplementedError(
+            "Context parallelism (cp_size>1) is only supported with the colocated target "
+            "backend; the remote backend runs the target out-of-process."
+        )
+    if cp_size > 1 and packed_sequence_size > 0:
+        raise NotImplementedError(
+            "Context parallelism (cp_size>1) is not yet supported with sequence packing; CP "
+            "strips the 4D block-causal mask that packing relies on. Set cp_size=1 or "
+            "packed_sequence_size=0."
+        )
+
+
 class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
     """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
 
@@ -163,6 +200,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.distributed_config = None
         self.device_mesh = None
         self.moe_mesh = None
+        # Context-parallel ("cp") and data-parallel ("dp") submeshes, populated
+        # from device_mesh when a colocated target builds one (None otherwise).
+        self.cp_mesh = None
+        self.dp_mesh = None
         if self.cached_target_path is None:
             selected_token_ids, selected_token_mask = self._setup_online_target(recipe_cfg, target_path, target_config)
         else:
@@ -241,12 +282,23 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 ttt_steps=recipe_cfg.ttt_steps,
             ).to(self.device)
         if self.dist_env.world_size > 1:
+            # Under context parallelism the draft is replicated across cp ranks
+            # (it runs on the full gathered sequence), so restrict the gradient
+            # all-reduce to the dp sub-axis to avoid redundant cp all-reduces.
+            # With cp_size==1 the dp group spans the whole world -> process_group
+            # is None -> today's full-world DDP, unchanged.
+            dp_process_group = (
+                self.dp_mesh.get_group()
+                if self.dp_mesh is not None and self.dp_mesh.size() < self.dist_env.world_size
+                else None
+            )
             trainer_module = DistributedDataParallel(
                 trainer_module,
                 device_ids=[self.device.index] if self.device.type == "cuda" else None,
                 output_device=self.device.index if self.device.type == "cuda" else None,
                 broadcast_buffers=False,
                 find_unused_parameters=False,
+                process_group=dp_process_group,
             )
         self.trainer_module = trainer_module
 
@@ -356,6 +408,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 "packed_sequence_size > 0 is only supported with the colocated target backend; "
                 "the remote backend does not yet propagate per-document masking."
             )
+        # Context parallelism gates (read from config: the cp submesh is only
+        # built later, inside the colocated path).
+        cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
+        _validate_cp_gates(cp_size, backend, packed_sequence_size)
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
         elif backend == "colocated":
@@ -375,6 +431,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
             packed_sequence_size=packed_sequence_size,
+            dp_mesh=self.dp_mesh,
         )
         self.val_dataloader = None
         if recipe_cfg.get("val_data_path", None):
@@ -390,6 +447,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
                 packed_sequence_size=packed_sequence_size,
+                dp_mesh=self.dp_mesh,
             )
 
         special_token_ids = [
@@ -437,6 +495,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             self.distributed_config = self.dist_setup.strategy_config
             self.device_mesh = self.dist_setup.device_mesh
             self.moe_mesh = self.dist_setup.moe_mesh
+            # Capture the cp/dp submeshes: the target forward runs CP on "cp",
+            # while the draft DDP group, dataloader sampler, and checkpointer key
+            # on "dp" (cp ranks within a dp group share data and draft weights).
+            self.cp_mesh = _submesh_or_none(self.device_mesh, "cp")
+            self.dp_mesh = _submesh_or_none(self.device_mesh, "dp")
             target_kwargs.update(
                 distributed_config=self.distributed_config,
                 device_mesh=self.device_mesh,
@@ -457,6 +520,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.target_wrapper = HFEagle3TargetModel(
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
+            cp_mesh=self.cp_mesh,
         )
 
     def _setup_remote_target(self, recipe_cfg):
@@ -644,7 +708,12 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             ckpt_kwargs["model_state_dict_keys"] = draft_state_dict_keys
 
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
-        dp_rank = dist.get_rank() if dist.is_initialized() else 0
+        # Under CP, several global ranks share one dp index (and identical draft
+        # weights), so shard checkpoints by dp position, not global rank. With
+        # cp_size==1 dp_mesh.get_local_rank() == global rank -> unchanged / resume
+        # compatible with pre-CP checkpoints.
+        dp_mesh = getattr(self, "dp_mesh", None)
+        dp_rank = dp_mesh.get_local_rank() if dp_mesh is not None else (dist.get_rank() if dist.is_initialized() else 0)
         self.checkpointer = self.checkpoint_config.build(
             dp_rank=dp_rank,
             tp_rank=0,

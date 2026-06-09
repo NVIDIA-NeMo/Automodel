@@ -101,6 +101,89 @@ def create_context_parallel_ctx(
     )
 
 
+def make_target_cp_ctx(cp_mesh: DeviceMesh, input_ids, position_ids=None):
+    """Build a context-parallel context for a frozen target forward.
+
+    Shards ``input_ids`` (and ``position_ids``) along the sequence dim across
+    ``cp_mesh`` so the target's self-attention runs as ring attention. Unlike
+    :func:`make_cp_batch_and_ctx`, this does not require ``labels`` and is meant
+    for the EAGLE-3 target wrapper, which gathers the aux/logits back to the full
+    sequence (see :func:`gather_cp_seq`) before handing them to the draft.
+
+    Load balancing is disabled (``_cp_options.enable_load_balance = False``) so
+    each rank holds a contiguous sequence chunk and the gather is a plain ordered
+    concat (no round-robin un-permute). The sharding is thrown away right after
+    the forward, so load balancing buys nothing here, and the ordered shard makes
+    the gather deterministic. This is a process-global torch flag; the EAGLE-3
+    recipe is the only context-parallel user in its process.
+
+    The sequence is right-padded to a multiple of ``cp_size``; the returned
+    ``orig_len`` lets the caller slice the gathered outputs back down.
+
+    Args:
+        cp_mesh: The context-parallel device (sub)mesh.
+        input_ids: ``[B, T]`` token ids.
+        position_ids: Optional ``[B, T]`` (or ``[1, T]``) position ids; an arange
+            is injected when omitted.
+
+    Returns:
+        ``(cp_ctx, sharded_input_ids, sharded_position_ids, orig_len)``. Enter
+        ``cp_ctx`` to run the target forward on the sharded tensors.
+    """
+    from torch.distributed.tensor.experimental import context_parallel
+    from torch.distributed.tensor.experimental._attention import _cp_options
+
+    _cp_options.enable_load_balance = False
+
+    cp_size = cp_mesh.size()
+    batch_size, orig_len = input_ids.shape[0], input_ids.shape[1]
+    if position_ids is None:
+        position_ids = torch.arange(orig_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+    position_ids = position_ids.to(input_ids.device)
+    if position_ids.shape[0] == 1 and batch_size > 1:
+        position_ids = position_ids.expand(batch_size, -1)
+
+    pad = (-orig_len) % cp_size
+    if pad:
+        input_ids = torch.nn.functional.pad(input_ids, (0, pad))
+        position_ids = torch.nn.functional.pad(position_ids, (0, pad))
+    ids_buf = input_ids.contiguous()
+    pos_buf = position_ids.contiguous()
+
+    cp_ctx = context_parallel(
+        cp_mesh,
+        buffers=[ids_buf, pos_buf],
+        buffer_seq_dims=[1, 1],
+        no_restore_buffers={ids_buf, pos_buf},
+    )
+    return cp_ctx, ids_buf, pos_buf, orig_len
+
+
+def gather_cp_seq(cp_mesh: DeviceMesh, tensors: List[torch.Tensor], seq_dim: int, orig_len: int):
+    """Gather context-parallel sharded ``tensors`` back to the full sequence.
+
+    Inverse of the sharding done by :func:`make_target_cp_ctx`. Uses torch's
+    ``context_parallel_unshard`` with ``load_balancer=None`` (matching the
+    load-balancing-disabled sharding) and slices the right-pad back off.
+
+    Args:
+        cp_mesh: The context-parallel device (sub)mesh used to shard.
+        tensors: Local-shard tensors (e.g. captured aux hidden states, logits),
+            each sharded to ``T/cp`` along ``seq_dim``.
+        seq_dim: The sequence dimension to gather along.
+        orig_len: The pre-pad sequence length to slice back to.
+
+    Returns:
+        A list of full-sequence tensors of length ``orig_len`` along ``seq_dim``.
+    """
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor.experimental._attention import context_parallel_unshard
+
+    local_tensors = [t.to_local() if isinstance(t, DTensor) else t for t in tensors]
+    full = context_parallel_unshard(cp_mesh, local_tensors, [seq_dim] * len(local_tensors))
+    return [t.narrow(seq_dim, 0, orig_len).contiguous() for t in full]
+
+
 def attach_context_parallel_hooks(model: torch.nn.Module):
     """Attach forward pre-hooks to self_attn modules to fix attention masks for context parallelism.
 

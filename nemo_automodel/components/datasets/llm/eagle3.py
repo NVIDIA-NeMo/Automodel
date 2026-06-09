@@ -152,12 +152,18 @@ def build_eagle3_dataloader(
     shuffle_seed: int | None = 42,
     mask_reasoning_content: bool = False,
     packed_sequence_size: int = 0,
+    dp_mesh=None,
 ) -> DataLoader:
     """Build a dataloader backed by the repo's chat formatting utilities.
 
     ``packed_sequence_size > 0`` (EAGLE-3 only) enables sequence packing (see
     :func:`build_packed_eagle3_dataset`), removing the padding waste of the
     default ``padding="max_length"`` path; ``== 0`` keeps the original behavior.
+
+    ``dp_mesh`` (the "dp" device submesh) is required for context parallelism: the
+    sampler then distributes by data-parallel rank so the ``cp_size`` ranks within
+    a dp group receive the identical sample (CP shards its sequence across them).
+    When ``None`` the sampler falls back to the full-world default (pure DP).
     """
     collate_fn = _stack_batch
     if packed_sequence_size > 0:
@@ -191,7 +197,17 @@ def build_eagle3_dataloader(
             unshifted=True,
             mask_reasoning_content=mask_reasoning_content,
         )
-    sampler = DistributedSampler(dataset, shuffle=shuffle) if distributed else None
+    sampler = None
+    if distributed:
+        if dp_mesh is not None and dp_mesh.size() > 1:
+            # Context parallel: key on the dp sub-axis so the cp_size ranks in a dp
+            # group pull the same sample (CP shards its sequence across them);
+            # keying on the global rank would give each cp rank a different one.
+            num_replicas, rank = dp_mesh.size(), dp_mesh.get_local_rank()
+        else:
+            # Pure DP: default full-world sampler (num_replicas/rank from the PG).
+            num_replicas, rank = None, None
+        sampler = DistributedSampler(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle)
 
     # The EAGLE recipes load the target model onto CUDA before iterating, so the
     # CUDA context is already initialized by the time these workers spawn. Two
