@@ -455,6 +455,20 @@ def _maybe_save_custom_model_code(
     code, copy the ``.py`` files from the cached ``transformers_modules`` directory so the
     consolidated checkpoint carries ``modeling_*.py`` locally and reloads without needing
     ``trust_remote_code=True``.
+
+    Importantly, the consolidated checkpoint must carry *every* ``.py`` file the custom
+    modeling code needs at import time -- not only the ``auto_map``-referenced
+    ``modeling_*.py`` and its *direct* relative imports. HF's dynamic-module loader copies
+    only direct relative imports into ``transformers_modules/<hash>/`` at load time (see
+    ``transformers.dynamic_module_utils.check_imports``), but resolves the *transitive*
+    closure (``get_relative_import_files``) when the module is later imported. For
+    Nemotron-Flash this matters: ``modeling_nemotron_flash.py`` imports
+    ``.fused_mha_with_cache``, which in turn imports ``.triton_attention``. If only the
+    cached ``transformers_modules`` dir is used as the copy source, ``triton_attention.py``
+    is missing and reloading the consolidated checkpoint dies with
+    ``FileNotFoundError: .../triton_attention.py``. We therefore (a) also use the model's
+    full HF snapshot dir (which contains *all* repo ``.py`` files) as a copy source, and
+    (b) walk the transitive relative-import closure and copy any still-missing aux module.
     """
     copied: set[str] = set()
 
@@ -479,10 +493,22 @@ def _maybe_save_custom_model_code(
         elif os.path.isdir(original_model_path):
             _copy_py_tree(original_model_path)
 
-    # Fallback: HF hub id path — resolve custom code via the model class's module file.
-    # Needed for trust_remote_code models (e.g. Nemotron-Flash) so reloads from the
-    # consolidated dir have has_local_code=True and don't require trust_remote_code.
-    if model_part is not None and not copied:
+    # Collect all source dirs that may hold custom-code ``.py`` files so that the
+    # transitive-import closure below can find every aux module. The HF snapshot dir
+    # is the authoritative source: it contains the full set of repo ``.py`` files,
+    # whereas the cached ``transformers_modules/<hash>/`` dir only holds the modeling
+    # file plus its *direct* relative imports.
+    source_dirs: list[str] = []
+    if original_model_path is not None and os.path.isdir(original_model_path):
+        source_dirs.append(original_model_path)
+
+    # Resolve custom code via the model class's module file (the cached
+    # ``transformers_modules`` dir) and via the model's HF snapshot dir. Needed for
+    # trust_remote_code models (e.g. Nemotron-Flash) so reloads from the consolidated
+    # dir have has_local_code=True and don't require trust_remote_code. We always run
+    # this (not only when ``copied`` is empty) so the snapshot dir is available as a
+    # fallback source for transitively-imported files that the cached module dir omits.
+    if model_part is not None:
         custom_dirs: set[str] = set()
         for cls in _iter_custom_code_classes(model_part):
             try:
@@ -495,8 +521,107 @@ def _maybe_save_custom_model_code(
             if not module_name.startswith("transformers_modules."):
                 continue
             custom_dirs.add(os.path.dirname(src_file))
+        # The model's full HF snapshot dir carries all repo ``.py`` files; prefer it as
+        # a source so transitive imports (e.g. triton_attention.py) are always present.
+        snapshot_dir = _resolve_hf_snapshot_dir(model_part)
+        if snapshot_dir is not None:
+            custom_dirs.add(snapshot_dir)
         for src_dir in custom_dirs:
-            _copy_py_tree(src_dir)
+            if src_dir not in source_dirs:
+                source_dirs.append(src_dir)
+        # Only copy from the cached module dirs when nothing was copied yet; otherwise we
+        # keep the original directory structure from ``original_model_path``/snapshot and
+        # rely on the transitive-closure pass below to fill any gaps.
+        if not copied:
+            for src_dir in source_dirs:
+                _copy_py_tree(src_dir)
+
+    # Transitive-import closure: ensure every ``.py`` reachable via relative imports from
+    # the copied modeling/aux files is present in ``hf_metadata_dir``. HF copies only the
+    # *direct* imports into its module cache, so without this pass a transitively-imported
+    # module (e.g. ``triton_attention.py``, imported by ``fused_mha_with_cache.py``) would
+    # be missing and break the consolidated reload. Pull any missing target from the
+    # known source dirs (the snapshot dir holds the complete set).
+    _copy_transitive_relative_imports(hf_metadata_dir, source_dirs, copied)
+
+
+def _resolve_hf_snapshot_dir(model_part: nn.Module) -> str | None:
+    """Return the local HF hub snapshot dir for ``model_part``, or None.
+
+    Uses the model's ``name_or_path`` (or ``config.name_or_path``) to locate the cached
+    snapshot directory under the HF hub cache. This directory contains the full set of
+    repo files (all ``.py`` modules), unlike the dynamic-module cache which only holds the
+    modeling file and its direct relative imports.
+    """
+    name_or_path = getattr(model_part, "name_or_path", None) or getattr(
+        getattr(model_part, "config", None), "name_or_path", None
+    )
+    if not name_or_path:
+        return None
+    # Already a local path (dir or snapshot) -> use directly.
+    if os.path.isdir(name_or_path):
+        return name_or_path
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+    except ImportError:
+        return None
+    if not HF_HUB_CACHE:
+        return None
+    repo_dir = f"models--{name_or_path.replace('/', '--')}"
+    snapshots_root = os.path.join(HF_HUB_CACHE, repo_dir, "snapshots")
+    snapshot_dirs = [p for p in glob.glob(os.path.join(snapshots_root, "*")) if os.path.isdir(p)]
+    return snapshot_dirs[0] if snapshot_dirs else None
+
+
+def _copy_transitive_relative_imports(hf_metadata_dir: str, source_dirs: list[str], copied: set[str]) -> None:
+    """Copy the transitive relative-import closure of custom modeling code into the checkpoint.
+
+    Scans every ``.py`` already present in ``hf_metadata_dir`` for relative imports
+    (``from .x import ...`` / ``import .x``), recursively, and for any imported module that
+    is not yet present, copies it from the first matching ``source_dirs`` entry. This
+    guarantees the consolidated checkpoint is self-contained for HF dynamic-module reloads.
+    """
+    try:
+        from transformers.dynamic_module_utils import get_relative_imports
+    except ImportError:
+        return
+
+    def _find_in_sources(rel_module: str) -> str | None:
+        # rel_module may be dotted (e.g. ``pkg.mod``); map to a relative .py path.
+        rel_py = os.path.join(*rel_module.split(".")) + ".py"
+        for src_dir in source_dirs:
+            candidate = os.path.join(src_dir, rel_py)
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    # Seed the queue with all .py files currently in the checkpoint dir.
+    queue = [p for p in glob.glob(os.path.join(hf_metadata_dir, "**", "*.py"), recursive=True)]
+    seen: set[str] = set(queue)
+    while queue:
+        module_file = queue.pop()
+        try:
+            rel_imports = get_relative_imports(module_file)
+        except OSError:
+            continue
+        base_dir = os.path.dirname(module_file)
+        for rel_module in rel_imports:
+            dst_path = os.path.join(base_dir, *rel_module.split(".")) + ".py"
+            if os.path.isfile(dst_path):
+                # Already present; still recurse into it to follow its imports.
+                if dst_path not in seen:
+                    seen.add(dst_path)
+                    queue.append(dst_path)
+                continue
+            src_path = _find_in_sources(rel_module)
+            if src_path is None:
+                continue
+            os.makedirs(os.path.dirname(dst_path) or hf_metadata_dir, exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+            copied.add(dst_path)
+            if dst_path not in seen:
+                seen.add(dst_path)
+                queue.append(dst_path)
 
 
 def _iter_custom_code_classes(model_part: nn.Module):

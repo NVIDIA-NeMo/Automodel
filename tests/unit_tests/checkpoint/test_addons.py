@@ -76,6 +76,101 @@ def test_maybe_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
     assert list(dst_root.rglob("*.py")) == []
 
 
+def test_maybe_save_custom_model_code_copies_transitive_relative_imports(tmp_path):
+    """A consolidated checkpoint must carry transitively-imported custom modules.
+
+    Mirrors Nemotron-Flash: ``modeling_*.py`` imports ``.fused_mha_with_cache`` which
+    imports ``.triton_attention``. ``triton_attention.py`` is a *transitive* (second-level)
+    relative import, so copying only the modeling file and its direct imports leaves it out
+    and reloading the consolidated dir would die with FileNotFoundError. The transitive
+    closure pass must pull it in.
+    """
+    src_root = tmp_path / "src_model_code"
+    dst_root = tmp_path / "hf_meta"
+    src_root.mkdir(parents=True)
+    dst_root.mkdir(parents=True)
+
+    _write(str(src_root / "configuration_x.py"), "class XConfig:\n    pass\n")
+    _write(
+        str(src_root / "modeling_x.py"),
+        "from .configuration_x import XConfig\nfrom .fused_mha import mha\n",
+    )
+    # Direct import of modeling that itself imports the transitive module.
+    _write(str(src_root / "fused_mha.py"), "from .triton_attention import attn\n\ndef mha():\n    return attn()\n")
+    # Transitive (second-level) import.
+    _write(str(src_root / "triton_attention.py"), "def attn():\n    return 1\n")
+
+    _maybe_save_custom_model_code(str(src_root), str(dst_root))
+
+    assert (dst_root / "modeling_x.py").exists()
+    assert (dst_root / "configuration_x.py").exists()
+    assert (dst_root / "fused_mha.py").exists()
+    # The key assertion: the transitively-imported module must be present.
+    assert (dst_root / "triton_attention.py").exists()
+
+
+def test_maybe_save_custom_model_code_fills_transitive_gap_from_snapshot(tmp_path, monkeypatch):
+    """When the resolved custom-code (module-cache) dir is missing a transitive import,
+    the model's HF snapshot dir must supply it.
+
+    Reproduces the CI failure path: HF's dynamic-module cache holds only the modeling file
+    plus its *direct* relative imports (no ``triton_attention.py``), but the full snapshot
+    dir resolved from ``config.name_or_path`` carries every repo ``.py``. ``original_model_path``
+    is None so only the model_part fallback runs.
+    """
+    import inspect as _inspect
+
+    import nemo_automodel.components.checkpoint.addons as addons
+
+    # Full HF snapshot dir (has everything, incl. the transitive triton_attention.py).
+    snap = tmp_path / "hub" / "models--acme--Custom-1B" / "snapshots" / "abc123"
+    snap.mkdir(parents=True)
+    _write(str(snap / "configuration_x.py"), "class XConfig:\n    pass\n")
+    _write(str(snap / "modeling_x.py"), "from .configuration_x import XConfig\nfrom .fused_mha import mha\n")
+    _write(str(snap / "fused_mha.py"), "from .triton_attention import attn\n\ndef mha():\n    return attn()\n")
+    _write(str(snap / "triton_attention.py"), "def attn():\n    return 1\n")
+
+    # Partial module-cache dir: modeling + direct imports only (NO triton_attention.py).
+    modcache = tmp_path / "modcache"
+    modcache.mkdir()
+    for name in ("modeling_x.py", "configuration_x.py", "fused_mha.py"):
+        _write(str(modcache / name), (snap / name).read_text())
+    _write(str(modcache / "__init__.py"), "")
+    assert not (modcache / "triton_attention.py").exists()
+
+    dst_root = tmp_path / "hf_meta"
+    dst_root.mkdir()
+
+    class _Cls:
+        __module__ = "transformers_modules.acme.modeling_x"
+
+    class _Config:
+        name_or_path = "acme/Custom-1B"
+
+    class _Model(nn.Module):
+        name_or_path = "acme/Custom-1B"
+        config = _Config()
+
+    # Point the custom-code class resolution at the partial module-cache dir.
+    monkeypatch.setattr(addons, "_iter_custom_code_classes", lambda mp: iter([_Cls]))
+    orig_getfile = _inspect.getfile
+    monkeypatch.setattr(
+        _inspect,
+        "getfile",
+        lambda c: str(modcache / "modeling_x.py") if c is _Cls else orig_getfile(c),
+    )
+    # Resolve the snapshot via the fake hub cache root (read inside _resolve_hf_snapshot_dir).
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(tmp_path / "hub"), raising=False)
+
+    _maybe_save_custom_model_code(None, str(dst_root), model_part=_Model())
+
+    # triton_attention.py was absent from the module cache but present in the snapshot;
+    # the transitive-closure pass must have copied it from the snapshot.
+    assert (dst_root / "triton_attention.py").exists()
+    assert (dst_root / "modeling_x.py").exists()
+    assert (dst_root / "fused_mha.py").exists()
+
+
 def test_model_state_disables_tied_embeddings_for_non_tied_models():
     """
     Ensure ModelState explicitly disables tied embeddings for models listed in
