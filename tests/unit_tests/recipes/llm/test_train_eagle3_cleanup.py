@@ -15,8 +15,8 @@
 """Teardown guarantees for the EAGLE-3 training loop.
 
 ``run_train_validation_loop`` must release training resources (disconnect the
-remote target, finish the W&B run, destroy the process group) on *any* exit
-path, not just normal completion. A mid-training exception that skipped the
+remote target, finish the W&B run) on *any* exit path, not just normal
+completion. A mid-training exception that skipped the
 remote-target ``close()`` would otherwise leave the long-lived target server
 with a stale client-idle state and a half-open NCCL transport.
 """
