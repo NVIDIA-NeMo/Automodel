@@ -70,12 +70,12 @@ class Flux2Adapter(ModelAdapter):
     def _pack_latents(self, latents: torch.Tensor) -> torch.Tensor:
         """Flatten spatial dims: [B, C, H, W] -> [B, H*W, C]."""
         b, c, h, w = latents.shape
-        return latents.reshape(b, c, h * w).permute(0, 2, 1)
+        return latents.reshape(b, c, h * w).permute(0, 2, 1).contiguous()
 
     def _unpack_latents(self, latents: torch.Tensor, h: int, w: int) -> torch.Tensor:
         """Restore spatial dims: [B, seq, C] -> [B, C, H, W]."""
         b, _, c = latents.shape
-        return latents.permute(0, 2, 1).reshape(b, c, h, w)
+        return latents.permute(0, 2, 1).contiguous().reshape(b, c, h, w)
 
     def _prepare_latent_ids(self, h_p: int, w_p: int, batch_size: int, device: torch.device) -> torch.Tensor:
         """

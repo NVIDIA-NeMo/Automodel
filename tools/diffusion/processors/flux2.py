@@ -100,6 +100,7 @@ class Flux2Processor(BaseModelProcessor):
 
         logger.info("  Configuring Mistral3 text encoder...")
         pipeline.text_encoder = pipeline.text_encoder.to(device)
+        pipeline.text_encoder.eval()
         models["pipeline"] = pipeline  # encode_prompt lives here
 
         torch.cuda.empty_cache()
