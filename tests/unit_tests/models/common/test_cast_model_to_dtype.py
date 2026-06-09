@@ -22,12 +22,14 @@ from nemo_automodel.components.models.common.utils import (
     _has_dtensor_params,
     _restore_fp32_buffers,
     _restore_fp32_modules,
+    cast_frozen_modules_to_compute_dtype,
     cast_model_to_dtype,
 )
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 class SimpleModel(nn.Module):
     """A small model for dtype testing."""
@@ -62,6 +64,18 @@ class ModelWithStrictFp32(nn.Module):
         self.head = nn.Linear(4, 2)
 
 
+class ModelWithStrictFp32Parameter(nn.Module):
+    """Model that declares one strict fp32 parameter by qualified parameter name."""
+
+    _keep_in_fp32_modules_strict = ["mixer.scale"]
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4)
+        self.mixer = nn.Module()
+        self.mixer.scale = nn.Parameter(torch.ones(4))
+
+
 class ModelWithBothFp32Attrs(nn.Module):
     """Model with both _keep_in_fp32_modules and _keep_in_fp32_modules_strict."""
 
@@ -78,6 +92,7 @@ class ModelWithBothFp32Attrs(nn.Module):
 # ---------------------------------------------------------------------------
 # Tests for _get_fp32_module_keywords()
 # ---------------------------------------------------------------------------
+
 
 class TestGetFp32ModuleKeywords:
     def test_no_attributes(self):
@@ -126,6 +141,7 @@ class TestGetFp32ModuleKeywords:
 # Tests for _restore_fp32_modules()
 # ---------------------------------------------------------------------------
 
+
 class TestRestoreFp32Modules:
     def test_matching_modules_restored(self):
         model = SimpleModel()
@@ -156,6 +172,7 @@ class TestRestoreFp32Modules:
 # Tests for cast_model_to_dtype()
 # ---------------------------------------------------------------------------
 
+
 class TestCastModelToDtype:
     def test_simple_model_cast_to_bf16(self):
         model = SimpleModel()
@@ -179,6 +196,13 @@ class TestCastModelToDtype:
         cast_model_to_dtype(model, torch.bfloat16)
 
         assert model.head.weight.dtype == torch.float32
+        assert model.linear.weight.dtype == torch.bfloat16
+
+    def test_strict_fp32_parameters_preserved(self):
+        model = ModelWithStrictFp32Parameter()
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert model.mixer.scale.dtype == torch.float32
         assert model.linear.weight.dtype == torch.bfloat16
 
     def test_both_fp32_attrs_preserved(self):
@@ -207,6 +231,7 @@ class TestCastModelToDtype:
 # ---------------------------------------------------------------------------
 # Tests for DTensor-aware casting
 # ---------------------------------------------------------------------------
+
 
 class TestDTensorAwareCasting:
     def test_has_dtensor_params_false_for_plain_model(self):
@@ -256,6 +281,95 @@ class TestDTensorAwareCasting:
 
         assert model.norm.weight.dtype == torch.float32
         assert model.linear.weight.dtype == torch.bfloat16
+
+
+class _VLMLike(nn.Module):
+    """A frozen tower + trainable backbone, mirroring the VLM finetune layout."""
+
+    def __init__(self, keep_fp32=None):
+        super().__init__()
+        if keep_fp32 is not None:
+            self._keep_in_fp32_modules = keep_fp32
+        # Frozen vision tower (excluded from FSDP) with a norm submodule.
+        self.vision = nn.Module()
+        self.vision.proj = nn.Linear(4, 4)
+        self.vision.norm = nn.LayerNorm(4)
+        self.vision.register_buffer("pos", torch.zeros(4))
+        for p in self.vision.parameters():
+            p.requires_grad_(False)
+        # Trainable language backbone.
+        self.language = nn.Linear(4, 2)
+
+
+class TestCastFrozenModulesToComputeDtype:
+    def test_frozen_tower_cast_trainable_untouched(self):
+        model = _VLMLike()
+        # Whole model starts fp32.
+        assert model.vision.proj.weight.dtype == torch.float32
+        assert model.language.weight.dtype == torch.float32
+
+        cast_frozen_modules_to_compute_dtype(model, torch.bfloat16)
+
+        # Frozen tower (params + buffers) cast to the compute dtype.
+        assert model.vision.proj.weight.dtype == torch.bfloat16
+        assert model.vision.norm.weight.dtype == torch.bfloat16
+        assert model.vision.pos.dtype == torch.bfloat16
+        # Trainable backbone is left for FSDP to cast.
+        assert model.language.weight.dtype == torch.float32
+
+    def test_none_compute_dtype_is_noop(self):
+        model = _VLMLike()
+        cast_frozen_modules_to_compute_dtype(model, None)
+        assert model.vision.proj.weight.dtype == torch.float32
+
+    def test_respects_keep_in_fp32_modules(self):
+        model = _VLMLike(keep_fp32=["norm"])
+        cast_frozen_modules_to_compute_dtype(model, torch.bfloat16)
+
+        assert model.vision.proj.weight.dtype == torch.bfloat16
+        # Frozen norm is pinned to fp32 even though the rest of the tower is bf16.
+        assert model.vision.norm.weight.dtype == torch.float32
+
+    def test_already_compute_dtype_noop(self):
+        model = _VLMLike()
+        model.vision.to(torch.bfloat16)
+        cast_frozen_modules_to_compute_dtype(model, torch.bfloat16)
+        assert model.vision.proj.weight.dtype == torch.bfloat16
+
+    def test_fully_trainable_model_untouched(self):
+        model = SimpleModel()  # all params require grad
+        cast_frozen_modules_to_compute_dtype(model, torch.bfloat16)
+        for p in model.parameters():
+            assert p.dtype == torch.float32
+
+    def test_sharded_frozen_param_skipped_but_buffer_cast(self, monkeypatch):
+        """A sharded (DTensor) frozen param is left to FSDP, but its fp32 buffers are still cast.
+
+        This mirrors the sharded frozen-tower case (e.g. gemma4 vision tower in the root
+        FSDP unit): FSDP all-gathers the params to the compute dtype itself, but never casts
+        buffers, so an fp32 buffer would promote bf16 activations back to fp32. We simulate a
+        DTensor param with a ``nn.Parameter`` subclass and patch the ``DTensor`` symbol the
+        function imports at call time.
+        """
+        import torch.distributed.tensor as dt_mod
+
+        class _FakeDTensor(nn.Parameter):
+            pass
+
+        monkeypatch.setattr(dt_mod, "DTensor", _FakeDTensor, raising=False)
+
+        model = _VLMLike()
+        # Mark the frozen proj weight as a "sharded" param (DTensor-like instance).
+        model.vision.proj.weight = _FakeDTensor(model.vision.proj.weight.data, requires_grad=False)
+
+        cast_frozen_modules_to_compute_dtype(model, torch.bfloat16)
+
+        # Sharded param is left untouched (FSDP would down-cast it at all-gather).
+        assert model.vision.proj.weight.dtype == torch.float32
+        # Plain frozen param in the same subtree is still cast.
+        assert model.vision.norm.weight.dtype == torch.bfloat16
+        # Frozen buffer is always cast (never FSDP-managed) -- the actual fix.
+        assert model.vision.pos.dtype == torch.bfloat16
 
 
 class TestRestoreFp32Buffers:

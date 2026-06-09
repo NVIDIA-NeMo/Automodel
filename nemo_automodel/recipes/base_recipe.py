@@ -48,6 +48,9 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.recipes._typed_config import RecipeConfig
+
+logger = logging.getLogger(__name__)
 
 
 def has_load_restore_state(object):
@@ -115,6 +118,13 @@ def is_optimizer(object):
     return isinstance(object, Optimizer) or (
         isinstance(object, list) and len(object) > 0 and all(isinstance(item, Optimizer) for item in object)
     )
+
+
+def is_distributed_stateful(object):
+    """
+    Checks whether object should be saved through distributed checkpointing.
+    """
+    return bool(getattr(object, "use_distributed_checkpointing", False)) and has_load_restore_state(object)
 
 
 def is_model(object):
@@ -202,6 +212,22 @@ class BaseRecipe:
     BaseRecipe provides checkpoint load/save functionality for recipes.
     """
 
+    @staticmethod
+    def _distributed_setup_attributes(distributed_setup):
+        """Return common recipe attributes derived from a distributed setup."""
+        mesh_context = distributed_setup.mesh_context
+        return (
+            distributed_setup,
+            mesh_context,
+            distributed_setup.strategy_config,
+            mesh_context.device_mesh,
+            mesh_context.moe_mesh,
+            mesh_context.pp_enabled,
+            distributed_setup.pipeline_config,
+            distributed_setup.moe_parallel_config,
+            distributed_setup.activation_checkpointing,
+        )
+
     def __setattr__(self, key, value):
         """
         Overriden __setattr__ to keep track of stateful classes.
@@ -231,14 +257,23 @@ class BaseRecipe:
             or is_tokenizer(value)
             or is_lr_scheduler(value)
             or is_optimizer(value)
-            or isinstance(value, ConfigNode)
+            or isinstance(value, (ConfigNode, RecipeConfig))
             or is_dataloader(value)
         )
 
         if should_track and not any(substr in key.lower() for substr in ("val", "eval", "test", "loss")):
-            assert key not in self.__dict__["__state_tracked"]
+            if key in self.__dict__["__state_tracked"]:
+                raise RuntimeError(f"State key {key!r} is already tracked")
             self.__dict__["__state_tracked"].add(key)
         super().__setattr__(key, value)
+
+    def untrack_state(self, *keys: str) -> None:
+        """Stop tracking one or more attributes for BaseRecipe checkpointing."""
+        tracked = self.__dict__.get("__state_tracked")
+        if tracked is None:
+            return
+        for key in keys:
+            tracked.discard(key)
 
     def save_checkpoint(
         self,
@@ -265,6 +300,14 @@ class BaseRecipe:
 
         # Wait for any in-flight checkpoint (async case) to complete
         self.checkpointer.async_wait()
+
+        # Free GPU caches before DCP's gather-and-write. DCP allocates NCCL
+        # workspace and materializes DTensor shards on GPU; with CPU-offloaded
+        # FSDP2 the residual training-time fragments can leave just enough
+        # headroom to break the gather (cuda failure 2 / "out of memory").
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         # If a previous async checkpoint just finished, update the "latest" symlink now
         prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
@@ -295,9 +338,10 @@ class BaseRecipe:
         )
 
         if is_rank_0:
-            assert not os.path.exists(path), f"Checkpoint directory {path} already exists"
+            if os.path.exists(path):
+                raise FileExistsError(f"Checkpoint directory {path} already exists")
             os.makedirs(path, exist_ok=True)
-            print(f"Saving checkpoint to {path}", flush=True)
+            logger.info("Saving checkpoint to %s", path)
 
             def to_item(x):
                 if isinstance(x, torch.Tensor):
@@ -308,18 +352,23 @@ class BaseRecipe:
             loss_dict = {"train_loss": train_loss}
             if val_loss:
                 # the name of the key can be "default", so we rename it to "val_loss"
-                key = next(iter(val_loss.keys()))
-                loss_dict["val_loss"] = val_loss.pop(key) if len(val_loss) == 1 else loss_dict.update(val_loss)
+                if len(val_loss) == 1:
+                    key = next(iter(val_loss.keys()))
+                    loss_dict["val_loss"] = val_loss[key]
+                else:
+                    loss_dict.update(val_loss)
             with open(os.path.join(path, "losses.json"), "w") as f:
                 try:
                     json.dump({k: to_item(v) for k, v in loss_dict.items()}, f)
-                except:
-                    pass
+                except (TypeError, ValueError, OSError):
+                    logger.warning("Failed to write checkpoint loss metadata to %s", f.name, exc_info=True)
 
         if is_dist_initialized:
             torch.distributed.barrier()
 
         model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
+        step_scheduler = getattr(self, "step_scheduler", None)
+        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
 
         for key in sorted(self.__dict__["__state_tracked"]):
             if is_model(getattr(self, key)):
@@ -328,7 +377,7 @@ class BaseRecipe:
                 model = getattr(self, key)
             elif is_optimizer(getattr(self, key)):
                 optimizer = getattr(self, key)
-            elif isinstance(getattr(self, key), ConfigNode):
+            elif isinstance(getattr(self, key), (ConfigNode, RecipeConfig)):
                 config = getattr(self, key)
             elif is_lr_scheduler(getattr(self, key)):
                 scheduler = getattr(self, key)
@@ -336,6 +385,8 @@ class BaseRecipe:
                 tokenizer = getattr(self, key)
             elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
                 self.checkpointer.save_on_dp_ranks(getattr(self, key), key, path)
+            elif is_distributed_stateful(getattr(self, key)):
+                self.checkpointer.save_distributed_state(getattr(self, key), key, path)
             else:
                 if is_rank_0:
                     torch.save(
@@ -346,7 +397,13 @@ class BaseRecipe:
         # For multi-stage PP models, use checkpointer directly to handle all parts
         # For single models, use save_pretrained for HF-compatible API
         if isinstance(model, list) and len(model) > 1:
-            self.checkpointer.save_model(model, path, peft_config=self.peft_config, tokenizer=tokenizer)
+            self.checkpointer.save_model(
+                model,
+                path,
+                peft_config=self.peft_config,
+                tokenizer=tokenizer,
+                is_final_checkpoint=is_final_checkpoint,
+            )
         else:
             unwrapped_model = model[0] if isinstance(model, list) else model
             # Unwrap DDP if present
@@ -364,14 +421,23 @@ class BaseRecipe:
                         checkpointer=self.checkpointer,
                         tokenizer=tokenizer,
                         peft_config=self.peft_config,
+                        is_final_checkpoint=is_final_checkpoint,
                     )
                 else:
                     self.checkpointer.save_model(
-                        model=unwrapped_model, weights_path=path, peft_config=self.peft_config, tokenizer=tokenizer
+                        model=unwrapped_model,
+                        weights_path=path,
+                        peft_config=self.peft_config,
+                        tokenizer=tokenizer,
+                        is_final_checkpoint=is_final_checkpoint,
                     )
             else:
                 self.checkpointer.save_model(
-                    model=unwrapped_model, weights_path=path, peft_config=self.peft_config, tokenizer=tokenizer
+                    model=unwrapped_model,
+                    weights_path=path,
+                    peft_config=self.peft_config,
+                    tokenizer=tokenizer,
+                    is_final_checkpoint=is_final_checkpoint,
                 )
 
         # Sync before checkpointing for Dion
@@ -399,6 +465,13 @@ class BaseRecipe:
                     self._update_best_symlink(path, float(best_val_metric))
             if is_dist_initialized:
                 torch.distributed.barrier()
+
+        # Release NCCL workspace and DCP gather scratch back to the allocator.
+        # Without this, the next training step's backward sees a fragmented
+        # heap (~74 GB still resident on tight 14B FSDP2 runs) and OOMs.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
     def _update_checkpoint_symlink(self, link_name: str, target_dir: str) -> None:
         """
@@ -478,7 +551,9 @@ class BaseRecipe:
                 scheduler = obj
             elif is_dataloader(obj) or isinstance(obj, StatefulRNG):
                 self.checkpointer.load_on_dp_ranks(obj, key, ckpt_dir)
-            elif is_tokenizer(obj) or isinstance(obj, ConfigNode):
+            elif is_distributed_stateful(obj):
+                self.checkpointer.load_distributed_state(obj, key, ckpt_dir)
+            elif is_tokenizer(obj) or isinstance(obj, (ConfigNode, RecipeConfig)):
                 # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
                 continue
@@ -563,7 +638,24 @@ class BaseRecipe:
 
         model, optimizer, scheduler = self._load_checkpoint_tracked_state(ckpt_dir)
 
-        self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
+        # Composite models (e.g. ``Gemma4WithDrafter``) save weights to multiple
+        # HF-format sub-directories instead of a single ``model/`` dir. Dispatch
+        # to the model's own ``load_pretrained`` when it provides one so the
+        # composite knows how to read its custom layout. This mirrors the
+        # save-side dispatch in ``save_checkpoint``.
+        from torch.nn.parallel import DistributedDataParallel
+
+        # ``model`` here may be a single ``nn.Module`` (LLM/diffusion recipes)
+        # or a ``list[nn.Module]`` (VLM recipe stores ``self.model_parts``).
+        # Peek at the first element when given a single-item list so we can
+        # check for the composite hook regardless of recipe shape.
+        candidate = model[0] if isinstance(model, list) and len(model) == 1 else model
+        if isinstance(candidate, DistributedDataParallel):
+            candidate = candidate.module
+        if hasattr(candidate, "load_pretrained") and hasattr(candidate.load_pretrained, "__func__"):
+            candidate.load_pretrained(ckpt_dir, checkpointer=self.checkpointer)
+        else:
+            self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
         self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
 
     def _log_experiment_details(self):
@@ -584,7 +676,7 @@ class BaseRecipe:
             details_yaml = yaml.safe_dump(details, sort_keys=False, default_flow_style=False).strip()
             for line in ("Experiment_details:\n" + details_yaml).splitlines():
                 logging.info(line)
-        except Exception:
+        except yaml.YAMLError:
             logging.info(f"Experiment details: {details}")
         # Config (print original placeholders for reproducibility; no internal keys like _original_strings)
         try:
@@ -592,24 +684,26 @@ class BaseRecipe:
             cfg_yaml = config_to_yaml_str(cfg_obj, use_orig_values=True)
             if cfg_yaml:
                 print(cfg_yaml, flush=True)
-        except Exception:
-            logging.info("Recipe config: <unavailable>")
+        except (AttributeError, TypeError, ValueError, yaml.YAMLError):
+            logger.info("Recipe config: <unavailable>", exc_info=True)
 
     def _log_library_versions(self):
         """Log import paths and versions for nemo_automodel, transformers, and torch."""
         if not getattr(self, "dist_env", None) or not getattr(self.dist_env, "is_main", False):
             return
+        nemo_am = None
         try:
             import nemo_automodel as nemo_am
 
             nemo_path = Path(getattr(nemo_am, "__file__", "<unknown>")).resolve().as_posix()
-        except Exception:
+        except (ImportError, OSError, RuntimeError):
             nemo_path = "<unknown>"
+        hf_transformers = None
         try:
             import transformers as hf_transformers
 
             tfm_path = Path(getattr(hf_transformers, "__file__", "<unknown>")).resolve().as_posix()
-        except Exception:
+        except (ImportError, OSError, RuntimeError):
             tfm_path = "<unknown>"
         libs = {
             "nemo_automodel": {"version": getattr(nemo_am, "__version__", None), "import_path": nemo_path},
@@ -937,7 +1031,7 @@ def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[
     try:
         with open(config_path, "r") as f:
             ckpt_cfg = yaml.safe_load(f) or {}
-    except Exception as e:
+    except (OSError, yaml.YAMLError) as e:
         return True, f"failed to read checkpoint config.yaml (cannot validate): {e}"
 
     # Prefer raw_config (same representation that was saved) to avoid
@@ -949,7 +1043,7 @@ def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[
             cur_cfg = current_cfg.to_dict()
         else:
             cur_cfg = dict(current_cfg)
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         cur_cfg = {}
 
     ckpt_sig = _extract_model_signature(ckpt_cfg)

@@ -97,6 +97,41 @@ def test_suppress_wandb_log_messages(monkeypatch):
     assert logging.getLogger("wandb").level == logging.CRITICAL
 
 
+def _install_wandb_with_init(captured: dict) -> None:
+    """Stub ``wandb`` with an ``init`` that records its kwargs and a ``Settings``."""
+    wandb = types.ModuleType("wandb")
+
+    def _init(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(log=lambda *a, **k: None, finish=lambda: None)
+
+    wandb.init = _init
+    wandb.Settings = lambda **kw: ("settings", kw)
+    sys.modules["wandb"] = wandb
+
+
+def test_init_wandb_run_uses_default_name_and_forwards_config():
+    captured: dict = {}
+    _install_wandb_with_init(captured)
+
+    from nemo_automodel.components.loggers.wandb_utils import init_wandb_run
+
+    init_wandb_run({"project": "p", "name": ""}, {"a": 1}, default_name="eagle1_model")
+    assert captured["project"] == "p"
+    assert captured["name"] == "eagle1_model"  # empty name -> default
+    assert captured["config"] == {"a": 1}
+
+
+def test_init_wandb_run_keeps_explicit_name():
+    captured: dict = {}
+    _install_wandb_with_init(captured)
+
+    from nemo_automodel.components.loggers.wandb_utils import init_wandb_run
+
+    init_wandb_run({"project": "p", "name": "myrun"}, {}, default_name="fallback")
+    assert captured["name"] == "myrun"
+
+
 @pytest.fixture(autouse=True)
 def _clean_sys_modules():
     """

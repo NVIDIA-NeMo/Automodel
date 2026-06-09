@@ -22,6 +22,8 @@ from diffusers.utils import export_to_video
 
 
 def parse_args():
+    """Parse command-line options for HunyuanVideo validation."""
+
     p = argparse.ArgumentParser("HunyuanVideo-1.5 T2V Validation")
 
     # Model configuration
@@ -99,6 +101,8 @@ def load_prompts_from_meta_files(meta_folder: str):
 
 
 def main():
+    """Run HunyuanVideo text-to-video validation."""
+
     args = parse_args()
 
     print("=" * 80)

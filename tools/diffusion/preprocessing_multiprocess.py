@@ -992,6 +992,8 @@ def preprocess_video_dataset(
 
 
 def main():
+    """Run image or video preprocessing from the command line."""
+
     parser = argparse.ArgumentParser(
         description="Unified preprocessing tool for images and videos",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1052,7 +1054,7 @@ Examples:
         "--processor",
         type=str,
         required=True,
-        choices=["wan", "wan2.1", "hunyuan", "hunyuanvideo", "hunyuanvideo-1.5"],
+        choices=["wan", "wan2.1", "wan2.2", "hunyuan", "hunyuanvideo", "hunyuanvideo-1.5"],
     )
     video_parser.add_argument("--model_name", type=str, default=None, help="Model name (uses processor default)")
     video_parser.add_argument("--mode", type=str, default="video", choices=["video", "frames"], help="Processing mode")

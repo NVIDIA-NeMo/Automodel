@@ -1,18 +1,19 @@
 # MiniCPM
 
-[MiniCPM](https://github.com/OpenBMB/MiniCPM) is a compact language model series from OpenBMB / Tsinghua University, designed to deliver strong performance at small parameter counts using model merging and continuous training techniques.
+[MiniCPM](https://github.com/OpenBMB/MiniCPM) is a compact language model series from OpenBMB and Tsinghua University, designed to deliver strong performance at small parameter counts using model merging and continuous training techniques.
 
 :::{card}
 | | |
 |---|---|
 | **Task** | Text Generation |
-| **Architecture** | `MiniCPMForCausalLM` / `MiniCPM3ForCausalLM` |
-| **Parameters** | 2B – 4B |
+| **Architecture** | `MiniCPMForCausalLM` / `MiniCPM3ForCausalLM` / `MiniCPM5ForCausalLM` |
+| **Parameters** | 1B – 4B |
 | **HF Org** | [openbmb](https://huggingface.co/openbmb) |
 :::
 
 ## Available Models
 
+- **MiniCPM5-1B** (`MiniCPM5ForCausalLM`): 1B
 - **MiniCPM3-4B** (`MiniCPM3ForCausalLM`): 4B
 - **MiniCPM-2B-sft-bf16** (`MiniCPMForCausalLM`): 2B, SFT
 - **MiniCPM-2B-dpo-bf16** (`MiniCPMForCausalLM`): 2B, DPO
@@ -21,11 +22,13 @@
 
 - `MiniCPMForCausalLM` — MiniCPM v1/v2
 - `MiniCPM3ForCausalLM` — MiniCPM3
+- `MiniCPM5ForCausalLM` — MiniCPM5
 
 ## Example HF Models
 
 | Model | HF ID |
 |---|---|
+| MiniCPM5 1B | [`openbmb/MiniCPM5-1B`](https://huggingface.co/openbmb/MiniCPM5-1B) |
 | MiniCPM 2B SFT | [`openbmb/MiniCPM-2B-sft-bf16`](https://huggingface.co/openbmb/MiniCPM-2B-sft-bf16) |
 | MiniCPM3 4B | [`openbmb/MiniCPM3-4B`](https://huggingface.co/openbmb/MiniCPM3-4B) |
 
@@ -47,14 +50,15 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
 ```
 
-**3. Fine-tune** by adapting a base LLM recipe — override the model ID on the CLI:
+**3. Fine-tune** using one of the provided MiniCPM5 recipes:
 
 ```bash
-automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path <MODEL_HF_ID>
-```
+# Full fine-tuning
+automodel examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml --nproc-per-node 8
 
-Replace `<MODEL_HF_ID>` with the model ID from **Example HF Models** above.
+# LoRA fine-tuning
+automodel examples/llm_finetune/minicpm/minicpm5_1b_squad_peft.yaml --nproc-per-node 8
+```
 
 :::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
@@ -75,18 +79,19 @@ cd /opt/Automodel
 **3. Fine-tune**:
 
 ```bash
-automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+automodel --nproc-per-node=8 examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml \
   --model.pretrained_model_name_or_path <MODEL_HF_ID>
 ```
 :::
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+Refer to the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
-## Fine-Tuning
+## Fine-Tune
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+Refer to the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
+- [openbmb/MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B)
 - [openbmb/MiniCPM-2B-sft-bf16](https://huggingface.co/openbmb/MiniCPM-2B-sft-bf16)
 - [openbmb/MiniCPM3-4B](https://huggingface.co/openbmb/MiniCPM3-4B)

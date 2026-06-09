@@ -12,33 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MoE parallelizer configuration."""
+"""MoE model configuration."""
 
-from dataclasses import dataclass, fields
-from typing import Any, Dict, Literal, Optional, Union
+from dataclasses import dataclass
+from typing import Literal, Optional
 
 import torch
-from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy
 
 from nemo_automodel.shared.utils import dtype_from_str
 
 
-@dataclass
-class MoEParallelizerConfig:
-    """Configuration for MoE model parallelization (EP + FSDP settings)."""
-
-    ignore_router_for_ac: bool = False
-    reshard_after_forward: bool = False
-    lm_head_precision: Optional[Union[str, torch.dtype]] = None
-    wrap_outer_model: bool = True
-    mp_policy: Optional[MixedPrecisionPolicy] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {f.name: getattr(self, f.name) for f in fields(self)}
-
-
 @dataclass(kw_only=True)
 class MoEConfig:
+    """Configuration for routed and shared MoE expert modules."""
+
     n_routed_experts: int
     n_shared_experts: int
     n_activated_experts: int

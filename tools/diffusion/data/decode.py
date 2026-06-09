@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 
 class VideoDecoder:
+    """Decode preprocessed diffusion latent metadata back into videos."""
+
     def __init__(
         self,
         wan21_model_id: str = "Wan-AI/Wan2.1-T2V-14B-Diffusers",
@@ -110,8 +112,10 @@ class VideoDecoder:
         # Check model version
         model_version = data.get("model_version", "unknown")
         logger.info(f"Model version: {model_version}")
-        if model_version != "wan2.1":
-            logger.warning(f"⚠️  This .meta file was created with {model_version}, but you're using a Wan2.1 decoder!")
+        # Wan2.1 and Wan2.2 share the same AutoencoderKLWan VAE, so both decode
+        # correctly with this Wan decoder. Only warn for genuinely unknown versions.
+        if model_version not in ("wan2.1", "wan2.2"):
+            logger.warning(f"⚠️  This .meta file was created with {model_version}, but you're using a Wan decoder!")
             logger.warning("   Decoding may not work correctly if versions don't match.")
 
         # Check if first frame exists

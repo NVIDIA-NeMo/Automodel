@@ -15,8 +15,16 @@
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd.graph import saved_tensors_hooks
 
-from nemo_automodel.components._peft.lora import LinearLoRA, PeftConfig, apply_lora_to_linear_modules, patch_linear_module
+from nemo_automodel.components._peft.lora import (
+    LinearLoRA,
+    LoRATritonFunction,
+    PeftConfig,
+    apply_lora_to_linear_modules,
+    patch_linear_module,
+)
 from nemo_automodel.shared.import_utils import safe_import_te
 
 HAS_TE, transformer_engine = safe_import_te()
@@ -107,6 +115,15 @@ def test_lora_patch_applies_to_selected_module_with_str_dtype(model):
     assert not isinstance(model.linear2, LinearLoRA)
 
 
+def test_peft_config_memory_efficient_lora_round_trip():
+    """PeftConfig should default memory-efficient LoRA on and preserve explicit overrides."""
+    assert PeftConfig().use_memory_efficient_lora is True
+
+    cfg = PeftConfig.from_dict({"use_memory_efficient_lora": False})
+    assert cfg.use_memory_efficient_lora is False
+    assert cfg.to_dict()["use_memory_efficient_lora"] is False
+
+
 def test_forward_output_consistency(dummy_input):
     """Verifies that model output shape remains the same after LoRA patching,
     but values change due to the added LoRA components.
@@ -139,6 +156,148 @@ def test_backward_pass(dummy_input):
     grads = [p.grad for p in model.parameters() if p.requires_grad]
     assert any(g is not None for g in grads), "Some parameters should receive gradients"
     assert all(torch.isfinite(g).all() for g in grads if g is not None), "Gradients should be finite"
+
+
+@pytest.mark.parametrize("input_shape", [(5, 16), (2, 3, 16)])
+def test_memory_efficient_lora_matches_legacy_forward_and_backward(input_shape):
+    """Custom autograd LoRA should match the legacy two-linear implementation."""
+    torch.manual_seed(1234)
+    scale = 2.0
+    lora_dim = 4
+    out_features = 12
+
+    x = torch.randn(*input_shape, requires_grad=True)
+    lora_A = torch.randn(lora_dim, input_shape[-1], requires_grad=True)
+    lora_B = torch.randn(out_features, lora_dim, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    lora_A_ref = lora_A.detach().clone().requires_grad_(True)
+    lora_B_ref = lora_B.detach().clone().requires_grad_(True)
+
+    efficient = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, False)
+    legacy = F.linear(F.linear(x_ref, lora_A_ref) * scale, lora_B_ref)
+
+    grad = torch.randn_like(legacy)
+    efficient.backward(grad)
+    legacy.backward(grad)
+
+    assert torch.allclose(efficient, legacy)
+    assert torch.allclose(x.grad, x_ref.grad)
+    assert torch.allclose(lora_A.grad, lora_A_ref.grad)
+    assert torch.allclose(lora_B.grad, lora_B_ref.grad)
+
+
+@pytest.mark.parametrize("input_shape", [(5, 16), (2, 3, 16)])
+def test_memory_efficient_lora_with_residual_matches_legacy_forward_and_backward(input_shape):
+    """Custom autograd LoRA should fold residual addition without changing gradients."""
+    torch.manual_seed(1234)
+    scale = 2.0
+    lora_dim = 4
+    out_features = 12
+    output_shape = (*input_shape[:-1], out_features)
+
+    x = torch.randn(*input_shape, requires_grad=True)
+    lora_A = torch.randn(lora_dim, input_shape[-1], requires_grad=True)
+    lora_B = torch.randn(out_features, lora_dim, requires_grad=True)
+    res = torch.randn(*output_shape, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    lora_A_ref = lora_A.detach().clone().requires_grad_(True)
+    lora_B_ref = lora_B.detach().clone().requires_grad_(True)
+    res_ref = res.detach().clone().requires_grad_(True)
+
+    efficient = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, False, res)
+    legacy = res_ref + F.linear(F.linear(x_ref, lora_A_ref) * scale, lora_B_ref)
+
+    grad = torch.randn_like(legacy)
+    efficient.backward(grad)
+    legacy.backward(grad)
+
+    assert torch.allclose(efficient, legacy)
+    assert torch.allclose(x.grad, x_ref.grad)
+    assert torch.allclose(lora_A.grad, lora_A_ref.grad)
+    assert torch.allclose(lora_B.grad, lora_B_ref.grad)
+    assert torch.allclose(res.grad, res_ref.grad)
+
+
+def test_memory_efficient_lora_saves_less_forward_state():
+    """The custom autograd path should not save the intermediate x @ lora_A.T activation."""
+    torch.manual_seed(1234)
+    x = torch.randn(8, 16, requires_grad=True)
+    lora_A = torch.randn(4, 16, requires_grad=True)
+    lora_B = torch.randn(12, 4, requires_grad=True)
+    scale = 2.0
+
+    def collect_saved_tensors(fn):
+        saved = []
+
+        def pack_hook(tensor):
+            saved.append(tuple(tensor.shape))
+            return tensor
+
+        with saved_tensors_hooks(pack_hook, lambda tensor: tensor):
+            fn()
+        return saved
+
+    legacy_saved = collect_saved_tensors(lambda: F.linear(F.linear(x, lora_A) * scale, lora_B))
+    efficient_saved = collect_saved_tensors(lambda: LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, False))
+
+    assert (8, 4) in legacy_saved
+    assert (8, 4) not in efficient_saved
+    assert sum(torch.tensor(shape).prod().item() for shape in efficient_saved) < sum(
+        torch.tensor(shape).prod().item() for shape in legacy_saved
+    )
+
+
+def test_linear_lora_memory_efficient_flag_controls_saved_state():
+    """LinearLoRA should use the memory-efficient autograd path when the flag is enabled."""
+    torch.manual_seed(1234)
+    base = nn.Linear(16, 12, bias=False)
+    x = torch.randn(8, 16, requires_grad=True)
+    legacy = LinearLoRA(base, dim=4, alpha=8, use_memory_efficient_lora=False)
+    efficient = LinearLoRA(base, dim=4, alpha=8, use_memory_efficient_lora=True)
+
+    def collect_saved_tensors(fn):
+        saved = []
+
+        def pack_hook(tensor):
+            saved.append(tuple(tensor.shape))
+            return tensor
+
+        with saved_tensors_hooks(pack_hook, lambda tensor: tensor):
+            fn()
+        return saved
+
+    legacy_saved = collect_saved_tensors(lambda: legacy(x))
+    efficient_saved = collect_saved_tensors(lambda: efficient(x))
+
+    assert (8, 4) in legacy_saved
+    assert (8, 4) not in efficient_saved
+
+
+def test_linear_lora_memory_efficient_matches_legacy_module_forward_and_backward():
+    """LinearLoRA should preserve legacy module behavior when folding the residual add."""
+    torch.manual_seed(1234)
+    base = nn.Linear(16, 12, bias=False)
+    x = torch.randn(8, 16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    legacy = LinearLoRA(base, dim=4, alpha=8, use_memory_efficient_lora=False)
+    efficient = LinearLoRA(base, dim=4, alpha=8, use_memory_efficient_lora=True)
+
+    with torch.no_grad():
+        legacy.lora_A.weight.normal_()
+        legacy.lora_B.weight.normal_()
+        efficient.lora_A.weight.copy_(legacy.lora_A.weight)
+        efficient.lora_B.weight.copy_(legacy.lora_B.weight)
+
+    efficient_out = efficient(x)
+    legacy_out = legacy(x_ref)
+    grad = torch.randn_like(legacy_out)
+    efficient_out.backward(grad)
+    legacy_out.backward(grad)
+
+    assert torch.allclose(efficient_out, legacy_out)
+    assert torch.allclose(x.grad, x_ref.grad)
+    assert torch.allclose(efficient.lora_A.weight.grad, legacy.lora_A.weight.grad)
+    assert torch.allclose(efficient.lora_B.weight.grad, legacy.lora_B.weight.grad)
 
 
 def test_lora_layers_are_trainable():
@@ -231,9 +390,7 @@ class TestTELinearLoRA:
         """patch_linear_module should set super_fwd for TE Linear."""
         from transformer_engine.pytorch.module.linear import Linear as TELinear
 
-        te_linear = TELinear(
-            in_features=16, out_features=32, bias=False, params_dtype=torch.bfloat16
-        ).cuda()
+        te_linear = TELinear(in_features=16, out_features=32, bias=False, params_dtype=torch.bfloat16).cuda()
         patched = patch_linear_module(te_linear, dim=4, alpha=8, use_triton=False)
         assert hasattr(patched, "super_fwd"), "super_fwd should be set for TE Linear"
         assert patched.super_fwd is not None
@@ -243,24 +400,16 @@ class TestTELinearLoRA:
         """lora_A and lora_B should be TE Linear when base module is TE Linear."""
         from transformer_engine.pytorch.module.linear import Linear as TELinear
 
-        te_linear = TELinear(
-            in_features=16, out_features=32, bias=False, params_dtype=torch.bfloat16
-        ).cuda()
+        te_linear = TELinear(in_features=16, out_features=32, bias=False, params_dtype=torch.bfloat16).cuda()
         patched = patch_linear_module(te_linear, dim=4, alpha=8, use_triton=False)
-        assert isinstance(patched.lora_A, TELinear), (
-            f"lora_A should be TE Linear, got {type(patched.lora_A)}"
-        )
-        assert isinstance(patched.lora_B, TELinear), (
-            f"lora_B should be TE Linear, got {type(patched.lora_B)}"
-        )
+        assert isinstance(patched.lora_A, TELinear), f"lora_A should be TE Linear, got {type(patched.lora_A)}"
+        assert isinstance(patched.lora_B, TELinear), f"lora_B should be TE Linear, got {type(patched.lora_B)}"
 
     def test_forward_pass(self):
         """Patched TE Linear should produce valid output."""
         from transformer_engine.pytorch.module.linear import Linear as TELinear
 
-        te_linear = TELinear(
-            in_features=16, out_features=32, bias=False, params_dtype=torch.bfloat16
-        ).cuda()
+        te_linear = TELinear(in_features=16, out_features=32, bias=False, params_dtype=torch.bfloat16).cuda()
         patched = patch_linear_module(te_linear, dim=4, alpha=8, use_triton=False)
         x = torch.randn(2, 16, device="cuda", dtype=torch.bfloat16)
         out = patched(x)
@@ -271,9 +420,7 @@ class TestTELinearLoRA:
         """Backward pass through patched TE Linear should produce gradients on LoRA params."""
         from transformer_engine.pytorch.module.linear import Linear as TELinear
 
-        te_linear = TELinear(
-            in_features=16, out_features=32, bias=False, params_dtype=torch.bfloat16
-        ).cuda()
+        te_linear = TELinear(in_features=16, out_features=32, bias=False, params_dtype=torch.bfloat16).cuda()
         patched = patch_linear_module(te_linear, dim=4, alpha=8, use_triton=False)
         x = torch.randn(2, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         out = patched(x)

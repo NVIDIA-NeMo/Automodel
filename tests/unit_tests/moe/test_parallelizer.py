@@ -57,6 +57,9 @@ class LayerContainer:
         self._blocks = blocks
         self.registered = {}
 
+    def children(self):
+        return iter(self._blocks)
+
     def named_children(self):
         return [(str(i), b) for i, b in enumerate(self._blocks)]
 
@@ -283,6 +286,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.moe.experts",
         "nemo_automodel.components.distributed.pipelining",
         "nemo_automodel.components.distributed.pipelining.hf_utils",
+        "nemo_automodel.components.distributed.mesh_utils",
     ]:
         if mod in sys.modules:
             sys.modules.pop(mod)
@@ -304,6 +308,10 @@ def _import_parallelizer_with_stubs(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.pipelining", pipelining_stub)
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.pipelining.hf_utils", hf_utils_stub)
+
+    mesh_utils_stub = types.ModuleType("nemo_automodel.components.distributed.mesh_utils")
+    mesh_utils_stub.get_submesh = lambda mesh, axis_names: mesh[axis_names]
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.mesh_utils", mesh_utils_stub)
 
     # Stub dtype_from_str utility
     shared_utils_stub = types.ModuleType("nemo_automodel.shared.utils")
@@ -488,6 +496,29 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     for _, kwargs in wrapper_mock.call_args_list:
         assert "context_fn" not in kwargs or kwargs["context_fn"] is None
     assert len(model.layers.registered) == 2
+
+
+def test_apply_ac_uses_block_local_checkpointing_when_available(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class BlockWithLocalAC(DummyBlock):
+        def __init__(self):
+            super().__init__()
+            self.activation_checkpointing = False
+
+        def set_activation_checkpointing(self, enabled=True):
+            self.activation_checkpointing = enabled
+
+    block = BlockWithLocalAC()
+    model = DummyModel([block])
+    wrapper_mock = MagicMock()
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
+
+    P.apply_ac(model, ignore_router=True, hidden_size=7168, num_experts=256)
+
+    wrapper_mock.assert_not_called()
+    assert block.activation_checkpointing is True
+    assert model.layers.registered["0"] is block
 
 
 def test_apply_ac_custom_policy_respects_hidden_and_expert_dims(monkeypatch):
@@ -744,7 +775,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     )
     apply_ep_mock.assert_called_once()
     # AC enabled
-    apply_ac_mock.assert_called_once_with(model, ignore_router=False)
+    apply_ac_mock.assert_called_once_with(model, ignore_router=False, selective=False)
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args
     # handle positional or keyword invocations
@@ -878,6 +909,35 @@ def test_apply_fsdp_without_lm_head_precision_uses_default_policy(monkeypatch):
 
     # Should only have one MixedPrecisionPolicy call (the default one)
     assert mp_policy_mock.call_count == 1
+
+
+def test_apply_fsdp_uses_dsv4_wrapper_only_for_deepseek_v4(monkeypatch):
+    """DeepSeek-V4 gets its model-specific dtype wrapper without changing generic MoE FSDP."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+
+    dsv4_fsdp_stub = types.ModuleType("nemo_automodel.components.models.deepseek_v4.fsdp")
+    dsv4_fully_shard_mock = MagicMock()
+    dsv4_fsdp_stub.fully_shard_deepseek_v4 = dsv4_fully_shard_mock
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.models.deepseek_v4.fsdp", dsv4_fsdp_stub)
+
+    block = DummyBlock(mlp=DummyMoE())
+    model = DummyModel([block])
+    model.config = types.SimpleNamespace(model_type="deepseek_v4")
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=object(),
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        lm_head_precision=None,
+    )
+
+    assert _find_call_by_first_arg(dsv4_fully_shard_mock, block) is not None
+    assert _find_call_by_first_arg(fully_shard_mock, block) is None
 
 
 def test_parallelize_model_passes_lm_head_precision_to_apply_fsdp(monkeypatch):
@@ -1455,7 +1515,11 @@ def test_apply_ac_text_config_takes_priority_over_llm_config(monkeypatch):
         return "CTX"
 
     monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda b, **kw: (kw.get("context_fn") and kw["context_fn"](), b)[1]))
+    monkeypatch.setattr(
+        P,
+        "ptd_checkpoint_wrapper",
+        MagicMock(side_effect=lambda b, **kw: (kw.get("context_fn") and kw["context_fn"](), b)[1]),
+    )
 
     class TextConfig:
         hidden_size = 256
@@ -1592,6 +1656,85 @@ def test_parallelize_model_ignore_router_for_ac_defaults_to_false(monkeypatch):
     apply_ac_mock.assert_called_once()
     args, kwargs = apply_ac_mock.call_args
     assert kwargs.get("ignore_router") is False
+    # Full (True) AC is not selective.
+    assert kwargs.get("selective") is False
+
+
+def test_parallelize_model_passes_selective_to_apply_ac(monkeypatch):
+    """parallelize_model translates activation_checkpointing='selective' into selective=True."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_ac_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_ac", apply_ac_mock)
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_fsdp", MagicMock())
+
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+
+    model = Outer()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=None,
+        dp_axis_names=("dp",),
+        activation_checkpointing="selective",
+    )
+
+    apply_ac_mock.assert_called_once()
+    _, kwargs = apply_ac_mock.call_args
+    assert kwargs.get("selective") is True
+    assert kwargs.get("ignore_router") is False
+
+
+def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
+    """selective=True wraps every block with the shared dense selective policy and
+    does not require hidden_size/num_experts (router dims are only needed for the
+    router-save policy)."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    sentinel_ctx = object()
+    sentinel_flag = "_nemo_selective_ac"
+    dense_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+    dense_stub.make_selective_checkpoint_context_fn = MagicMock(return_value=sentinel_ctx)
+    dense_stub.SELECTIVE_AC_WRAPPER_FLAG = sentinel_flag
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.activation_checkpointing", dense_stub)
+
+    wrapped = []
+
+    class _Wrapper:
+        def __init__(self, block):
+            self.block = block
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        assert preserve_rng_state is True
+        assert context_fn is sentinel_ctx
+        w = _Wrapper(block)
+        wrapped.append(w)
+        return w
+
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    blocks = [DummyBlock(), DummyBlock(), DummyBlock()]
+    model = DummyModel(blocks)
+
+    # No hidden_size/num_experts provided — selective path must not need them.
+    P.apply_ac(model, selective=True)
+
+    assert len(wrapped) == 3
+    assert len(model.layers.registered) == 3
+    dense_stub.make_selective_checkpoint_context_fn.assert_called_once()
+    # Each wrapper is tagged so _apply_per_layer_compile compiles it OUTER
+    # (preserving the selective policy) rather than collapsing to inner compile.
+    for w in wrapped:
+        assert getattr(w, sentinel_flag, False) is True
 
 
 # ============================================================================
@@ -2071,9 +2214,13 @@ class _FakeSelfAttn:
 
 
 class _FakeBlockWithAttn:
-    def __init__(self, attn_module, moe=None):
+    def __init__(self, attn_module, moe=None, layer_type=None, attention_type=None):
         self.self_attn = _FakeSelfAttn(attn_module)
         self.mlp = moe if moe is not None else object()
+        if layer_type is not None:
+            self.layer_type = layer_type
+        if attention_type is not None:
+            self.attention_type = attention_type
 
 
 def test_apply_cp_skips_non_te_attention(monkeypatch):
@@ -2141,6 +2288,31 @@ def test_apply_cp_configures_te_attention(monkeypatch):
     P.apply_cp(model, cp_mesh)
 
     te_attn.set_context_parallel_group.assert_called_once()
+
+
+def test_apply_cp_uses_attention_type_and_all_gather_for_sliding_attention(monkeypatch):
+    """Blocks that name attention style with ``attention_type`` should still
+    receive TE context-parallel setup."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class DotProductAttention:
+        def __init__(self):
+            self.set_context_parallel_group = MagicMock()
+
+    _setup_te_and_dist_stubs(monkeypatch, DotProductAttention)
+
+    te_attn = DotProductAttention()
+    block = _FakeBlockWithAttn(te_attn, attention_type="sliding_attention")
+    model = DummyModel([block])
+
+    cp_mesh = MagicMock()
+    cp_mesh.get_group.return_value = MagicMock()
+
+    P.apply_cp(model, cp_mesh, cp_comm_type="p2p")
+
+    te_attn.set_context_parallel_group.assert_called_once()
+    _, kwargs = te_attn.set_context_parallel_group.call_args
+    assert kwargs["cp_comm_type"] == "all_gather"
 
 
 def test_apply_cp_mixed_te_and_non_te(monkeypatch):

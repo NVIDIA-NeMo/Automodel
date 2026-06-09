@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PipelineInfo:
+    """Runtime state produced by pipeline-parallel setup."""
+
     enabled: bool
     schedule: Optional[_PipelineSchedule]
     has_first_stage: bool
@@ -164,6 +166,7 @@ class AutoPipeline:
             patch_stage_backward_maybe_with_nosync=self.patch_stage_backward_maybe_with_nosync,
             reduce_grad_per_microbatch=not self.defer_fsdp_grad_sync,
             seq_len=self.pp_seq_len,
+            tensor_dtype=self.dtype,
         )
 
         # Update PipelineInfo state
@@ -207,6 +210,7 @@ class AutoPipeline:
             self._model_config,
             self.pp_microbatch_size,
             seq_len,
+            tensor_dtype=self.dtype,
         )
         self._pp_current_seq_len = seq_len
         logger.debug(f"PP stage shapes updated for seq_len={seq_len}")

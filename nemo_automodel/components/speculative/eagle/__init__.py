@@ -1,0 +1,59 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""EAGLE-3 training components.
+
+Only the EAGLE-3-native model and trainer classes live here. Generic
+helpers were moved to the project's canonical locations:
+
+- ``masked_soft_cross_entropy`` -> ``nemo_automodel.components.loss.soft_ce``
+- ``build_eagle3_dataloader`` / ``build_eagle3_token_mapping``
+  -> ``nemo_automodel.components.datasets.llm.eagle3``
+
+Import them directly from those modules.
+"""
+
+from nemo_automodel.components.speculative.eagle.backend import Eagle3TargetBackend
+from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule
+from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
+from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
+from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
+from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
+from nemo_automodel.components.speculative.eagle.peagle_trainer import PEagleTrainerModule
+from nemo_automodel.components.speculative.eagle.registry import (
+    EAGLE1_DRAFT_REGISTRY,
+    EAGLE3_DRAFT_REGISTRY,
+    DraftSpec,
+    resolve_eagle1_draft_spec,
+    resolve_eagle3_draft_spec,
+)
+from nemo_automodel.components.speculative.eagle.target import HFEagle3TargetModel
+from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
+
+__all__ = [
+    "EagleTrainerModule",
+    "Eagle3TrainerModule",
+    "PEagleTrainerModule",
+    "Eagle3TargetBackend",
+    "HFEagleTargetModel",
+    "HFEagle3TargetModel",
+    "LlamaEagleDraftModel",
+    "LlamaEagle3DraftModel",
+    "GptOssEagle3DraftModel",
+    "DraftSpec",
+    "EAGLE1_DRAFT_REGISTRY",
+    "EAGLE3_DRAFT_REGISTRY",
+    "resolve_eagle1_draft_spec",
+    "resolve_eagle3_draft_spec",
+]

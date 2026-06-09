@@ -40,6 +40,77 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
 _shared_experts_stream: Optional[torch.cuda.Stream] = None
 
 
+def _record_stream_safe(t: torch.Tensor, stream: Optional[torch.cuda.Stream]) -> None:
+    """Tell the caching allocator that ``stream`` uses ``t``'s storage.
+
+    Required whenever a tensor allocated on one CUDA stream is read/written on
+    another stream: without it the allocator may recycle the block while
+    ``stream`` is still using it (cross-stream use-after-free -> corrupted
+    values). No-op for non-CUDA tensors; handles DTensor by recording on the
+    local shard.
+    """
+    if stream is None or not isinstance(t, torch.Tensor):
+        return
+    local = t.to_local() if hasattr(t, "to_local") else t
+    if local.is_cuda:
+        local.record_stream(stream)
+
+
+class _SharedExpertStreamFork(torch.autograd.Function):
+    """Fork the shared-expert input ``x`` into the side stream.
+
+    Data-identity op; it only enforces cross-stream ordering + allocator safety
+    so the side-stream overlap is correct in BOTH passes. A raw ``wait_stream``
+    is forward-only and has no backward mirror, which (together with missing
+    ``record_stream``) is the cross-stream race that corrupts gradients.
+
+    * forward (main stream): the side stream waits for main so it observes ``x``.
+    * backward (main stream): ``grad_x`` was produced by the shared-expert
+      subgraph on the side stream, so main waits for side before that gradient
+      is accumulated into ``x``'s ``.grad`` alongside the main-stream branches.
+    """
+
+    @staticmethod
+    def forward(ctx, x, side_stream):
+        ctx.main_stream = torch.cuda.current_stream()
+        ctx.side_stream = side_stream
+        side_stream.wait_stream(ctx.main_stream)
+        _record_stream_safe(x, side_stream)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_x):
+        ctx.main_stream.wait_stream(ctx.side_stream)
+        _record_stream_safe(grad_x, ctx.main_stream)
+        return grad_x, None
+
+
+class _SharedExpertStreamJoin(torch.autograd.Function):
+    """Join the shared-expert output ``z`` back to the main stream.
+
+    * forward (main stream): main waits for the side stream so ``z`` is ready
+      before it is added to the routed output. Applied AFTER ``experts()`` is
+      launched so the shared-expert compute overlaps the dispatch comm.
+    * backward (main stream): ``grad_z`` is produced on the main stream by the
+      ``y + z`` add; the side stream waits for main before the shared-expert
+      subgraph (replayed on the side stream) consumes it.
+    """
+
+    @staticmethod
+    def forward(ctx, z, side_stream):
+        ctx.main_stream = torch.cuda.current_stream()
+        ctx.side_stream = side_stream
+        ctx.main_stream.wait_stream(side_stream)
+        _record_stream_safe(z, ctx.main_stream)
+        return z
+
+    @staticmethod
+    def backward(ctx, grad_z):
+        ctx.side_stream.wait_stream(ctx.main_stream)
+        _record_stream_safe(grad_z, ctx.side_stream)
+        return grad_z, None
+
+
 class MLP(nn.Module):
     """
     Multi-Layer Perceptron (MLP) used as a feed-forward layer.
@@ -60,6 +131,7 @@ class MLP(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         activation: str = "swiglu",
         bias: bool = False,
+        swiglu_limit: float = 0.0,
     ):
         """
         Initializes the MLP layer.
@@ -71,6 +143,9 @@ class MLP(nn.Module):
             dtype (torch.dtype): Data type for weights.
             activation (str): Activation function - "swiglu" (default) or "relu2".
             bias (bool): Whether to use bias in linear layers.
+            swiglu_limit (float): When > 0 and activation is gated, run SwiGLU
+                in fp32 with one-sided gate clamp ``max=limit`` and symmetric
+                up clamp ``±limit``. Matches DSV4 reference ``Expert.forward``.
         """
         super().__init__()
         if activation not in ("swiglu", "relu2"):
@@ -78,6 +153,7 @@ class MLP(nn.Module):
 
         self.activation = activation
         self.is_gated = is_gated_activation(activation)
+        self.swiglu_limit = float(swiglu_limit)
 
         self.up_proj = initialize_linear_module(
             linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
@@ -103,10 +179,16 @@ class MLP(nn.Module):
         Returns:
             torch.Tensor: Output tensor after MLP computation.
         """
-        if self.is_gated:
-            return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-        else:
+        if not self.is_gated:
             return self.down_proj(F.relu(self.up_proj(x)).pow(2))
+        if self.swiglu_limit > 0.0:
+            # Mirror DSV4 reference Expert.forward: fp32 SwiGLU with one-sided
+            # gate clamp and symmetric up clamp; cast back before down_proj.
+            dtype = x.dtype
+            gate = self.gate_proj(x).float().clamp(max=self.swiglu_limit)
+            up = self.up_proj(x).float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            return self.down_proj((F.silu(gate) * up).to(dtype))
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
@@ -130,6 +212,7 @@ class FakeBalancedGate(nn.Module):
         self.n_activated_experts = config.n_activated_experts
         self.skip_first_n_experts = skip_first_n_experts
         self.noise = noise
+        self.bias_update_factor = 0.0
 
     def forward(
         self,
@@ -207,7 +290,8 @@ class Gate(nn.Module):
         topk (int): Number of top experts activated for each input.
         n_groups (int): Number of groups for routing.
         topk_groups (int): Number of groups to route inputs to.
-        score_func (str): Scoring function ('softmax', 'sigmoid', 'softmax_with_bias', or 'sqrtsoftplus').
+        score_func (str): Scoring function ('softmax', 'sigmoid', 'sigmoid_with_bias',
+            'softmax_with_bias', or 'sqrtsoftplus').
         route_scale (float): Scaling factor for routing weights.
         weight (torch.nn.Parameter): Learnable weights for the gate.
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
@@ -344,13 +428,33 @@ class Gate(nn.Module):
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sqrtsoftplus":
             # sqrt(softplus(x)) = sqrt(log(1 + exp(x))), used in DeepSeek V4.
-            scores = torch.sqrt(F.softplus(scores.float())).to(scores.dtype)
+            scores = torch.sqrt(F.softplus(scores.float()))
             original_scores = scores
 
             if self.e_score_correction_bias is not None:
                 scores = scores + self.e_score_correction_bias
 
             indices = torch.topk(scores, self.topk, dim=-1)[1]
+            weights = original_scores.gather(1, indices)
+        elif self.score_func == "sigmoid_with_bias":
+            scores = scores.sigmoid()
+            original_scores = scores
+            scores_for_choice = scores
+
+            if self.e_score_correction_bias is not None:
+                scores_for_choice = scores_for_choice + self.e_score_correction_bias
+
+            if self.n_groups > 1:
+                scores_for_choice = scores_for_choice.view(x.size(0), self.n_groups, -1)
+                group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
+                group_idx = torch.topk(group_scores, k=self.topk_groups, dim=-1, sorted=False)[1]
+                group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+                score_mask = group_mask.unsqueeze(-1).expand_as(scores_for_choice).reshape(x.size(0), -1)
+                scores_for_choice = scores_for_choice.reshape(x.size(0), -1).masked_fill(
+                    ~score_mask.bool(), float("-inf")
+                )
+
+            indices = torch.topk(scores_for_choice, k=self.topk, dim=-1, sorted=False)[1]
             weights = original_scores.gather(1, indices)
         else:
             scores = scores.sigmoid()
@@ -522,6 +626,16 @@ class Gate(nn.Module):
             torch.Tensor: Auxiliary loss for load balancing.
                 Shape is [].
         """
+        # Pin aux-loss arithmetic to fp32. The activation-checkpoint recompute pass
+        # does not replay FSDP2 MixedPrecisionPolicy cast_forward_inputs, so `x` and
+        # anything derived from `x.dtype` (including original_scores in some MoE
+        # configs) can differ between forward and recompute. Doing the cast inside
+        # the AC region — rather than at the Gate level — guarantees the saved
+        # tensors of this region (expert_scores [n_experts] and the aux-loss scalar)
+        # are fp32 on both passes regardless of upstream behavior.
+        original_scores = original_scores.float()
+        expert_load = expert_load.float()
+
         context_length = token_mask.sum()
         expert_scores = (original_scores * token_mask.unsqueeze(-1)).sum(dim=0)
 
@@ -589,12 +703,14 @@ class MoE(nn.Module):
             )
             self.experts = GroupedExperts(config, backend=backend)
         elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep"):
-            if backend.experts in ("gmm", "torch_mm"):
+            if backend.experts in ("gmm", "torch_mm", "torch_mm_mxfp8"):
                 self.experts = GroupedExpertsDeepEP(
                     config,
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,
                     dispatcher_num_sms=backend.dispatcher_num_sms,
+                    dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                    dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
             else:
                 # experts == "te"
@@ -603,6 +719,8 @@ class MoE(nn.Module):
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,
                     dispatcher_num_sms=backend.dispatcher_num_sms,
+                    dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                    dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
         else:
             # Default to torch experts
@@ -616,6 +734,7 @@ class MoE(nn.Module):
                 dtype=config.dtype,
                 activation=config.shared_expert_activation,
                 bias=config.expert_bias,
+                swiglu_limit=config.swiglu_limit,
             )
             if config.shared_expert_gate:
                 self.shared_expert_gate = initialize_linear_module(backend.linear, config.dim, 1, False)
@@ -676,37 +795,43 @@ class MoE(nn.Module):
 
         weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
 
-        if self.shared_experts is None:
-            y = self.experts(x_latent, token_mask, weights, indices)
-            # Apply latent projection after MoE if enabled
-            if self.fc2_latent_proj is not None:
-                y = self.fc2_latent_proj(y)
-            return y.view(shape)
+        # Shared-expert output (optionally gated).  Run on a side CUDA stream to
+        # overlap with the grouped-expert dispatch comm.  The fork/join autograd
+        # fences (_SharedExpertStreamFork / _SharedExpertStreamJoin) make the
+        # overlap correct in BOTH forward and backward: a raw wait_stream is
+        # forward-only, and its missing backward mirror plus the missing
+        # record_stream is a cross-stream race that corrupts gradients (grad-norm
+        # explosion at high tokens/microbatch on some hardware).  shared_experts
+        # stays in the normal autograd graph, so FSDP2's post-backward
+        # reduce-scatter hooks and gradient accumulation are unaffected; expert
+        # parallelism only touches the routed ``experts`` path on the main stream.
+        z = None
+        side_stream = None
+        if self.shared_experts is not None:
+            global _shared_experts_stream
+            if _shared_experts_stream is None:
+                _shared_experts_stream = torch.cuda.Stream()
+            side_stream = _shared_experts_stream
 
-        # Execute shared experts in a separate stream to overlap compute with the
-        # communication for grouped experts.
-        global _shared_experts_stream
-        if _shared_experts_stream is None:
-            _shared_experts_stream = torch.cuda.Stream()
+            # Fork into the side stream (fences main->side fwd, side->main bwd).
+            x_se = _SharedExpertStreamFork.apply(x, side_stream)
+            with torch.cuda.stream(side_stream):
+                z = self.shared_experts(x_se)
+                if self.shared_expert_gate is not None:
+                    z = torch.nn.functional.sigmoid(self.shared_expert_gate(x_se)) * z
 
-        _shared_experts_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(_shared_experts_stream):
-            z = self.shared_experts(x)
-            if self.shared_expert_gate is not None:
-                z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
-
+        # Routed experts on the main stream — runs concurrently with the
+        # shared-expert side stream above; the join below waits for it.
         y = self.experts(x_latent, token_mask, weights, indices)
+        if side_stream is not None:
+            # Join back to the main stream (fences side->main fwd, main->side bwd).
+            z = _SharedExpertStreamJoin.apply(z, side_stream)
 
-        # Apply latent projection after MoE if enabled
         if self.fc2_latent_proj is not None:
             y = self.fc2_latent_proj(y)
-
-        # Wait for the shared experts stream to complete all operations before
-        # adding together the outputs of grouped experts and shared experts.
-        torch.cuda.current_stream().wait_stream(_shared_experts_stream)
-
-        # Reshape the outputs back to 3-D.
-        return (y + z).view(shape)
+        if z is not None:
+            y = y + z
+        return y.view(shape)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)

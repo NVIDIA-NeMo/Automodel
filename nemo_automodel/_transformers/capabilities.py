@@ -96,15 +96,22 @@ def _is_hybrid(model: "nn.Module") -> bool:
 
     Detected via config attributes used by NemotronH (``layers_block_type``)
     and HF hybrid models (``hybrid_override_pattern``, ``is_hybrid_model``).
+    For VLM wrappers, also inspect the inner ``language_model``'s config.
     """
-    config = getattr(model, "config", None)
-    if config is None:
-        return False
-    for attr in ("layers_block_type", "hybrid_override_pattern"):
-        pattern = getattr(config, attr, None)
-        if pattern and any(str(c).upper() == "M" for c in pattern):
+    candidates = [getattr(model, "config", None)]
+    inner = getattr(model, "language_model", None)
+    if inner is not None:
+        candidates.append(getattr(inner, "config", None))
+    for config in candidates:
+        if config is None:
+            continue
+        for attr in ("layers_block_type", "hybrid_override_pattern"):
+            pattern = getattr(config, attr, None)
+            if pattern and any(str(c).upper() == "M" for c in pattern):
+                return True
+        if getattr(config, "is_hybrid_model", False) is True:
             return True
-    return getattr(config, "is_hybrid_model", False) is True
+    return False
 
 
 class ModelSupports:

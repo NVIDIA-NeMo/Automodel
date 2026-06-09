@@ -975,3 +975,97 @@ class TestTryConvertTikTokenToNative:
             pad_token=None,
         )
         assert result.chat_template == "dummy template"
+
+
+class TestEnforcedTokenizerPicklability:
+    """The runtime tokenizer class is mixed dynamically over the HF base class.
+
+    A plain ``type(...)`` mix is unpicklable (pickle cannot find it by qualified
+    name), which broke DataLoader workers started with the ``forkserver`` method
+    (they pickle their arguments, and the dataset holds the tokenizer). These
+    tests cover the cache + ``__reduce__`` machinery that makes instances
+    round-trip through pickle.
+    """
+
+    @staticmethod
+    def _make_wrapped_tokenizer():
+        import pickle
+
+        from tokenizers import Tokenizer, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import _enforced_tokenizer_class
+
+        backend = Tokenizer(models.WordLevel(vocab={"a": 0, "b": 1, "c": 2, "[UNK]": 3}, unk_token="[UNK]"))
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        tok = PreTrainedTokenizerFast(tokenizer_object=backend)
+        # Mirror what from_pretrained stashes before swapping the runtime class.
+        tok._base_class = PreTrainedTokenizerFast
+        tok._original_tokenizer_config = None
+        tok._original_tokenizer_class = None
+        tok._source_dir = None
+        tok.__class__ = _enforced_tokenizer_class(PreTrainedTokenizerFast)
+        return tok, pickle
+
+    def test_enforced_class_is_cached_and_mixed(self):
+        from transformers import PreTrainedTokenizerFast
+
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+            NeMoAutoTokenizerWithBosEosEnforced,
+            _enforced_tokenizer_class,
+        )
+
+        cls1 = _enforced_tokenizer_class(PreTrainedTokenizerFast)
+        cls2 = _enforced_tokenizer_class(PreTrainedTokenizerFast)
+        assert cls1 is cls2  # cached per base class
+        assert issubclass(cls1, NeMoAutoTokenizerWithBosEosEnforced)
+        assert issubclass(cls1, PreTrainedTokenizerFast)
+        # The runtime name is preserved so save_pretrained / introspection are unchanged.
+        assert cls1.__name__ == NeMoAutoTokenizerWithBosEosEnforced.__name__
+
+    def test_pickle_round_trip_preserves_behavior(self):
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+            NeMoAutoTokenizerWithBosEosEnforced,
+        )
+
+        tok, pickle = self._make_wrapped_tokenizer()
+        before = tok("a b c")["input_ids"]
+        tok2 = pickle.loads(pickle.dumps(tok))
+        assert isinstance(tok2, NeMoAutoTokenizerWithBosEosEnforced)
+        assert tok2("a b c")["input_ids"] == before
+        assert type(tok2) is type(tok)
+
+    def test_pickle_round_trip_with_cold_cache(self):
+        """forkserver workers import the module fresh, so the cache starts empty."""
+        import nemo_automodel._transformers.tokenization.nemo_auto_tokenizer as m
+
+        tok, pickle = self._make_wrapped_tokenizer()
+        blob = pickle.dumps(tok)
+        m._ENFORCED_TOKENIZER_CLASSES.clear()
+        tok2 = pickle.loads(blob)
+        assert isinstance(tok2, m.NeMoAutoTokenizerWithBosEosEnforced)
+        assert tok2("a b c")["input_ids"] == tok("a b c")["input_ids"]
+
+    def test_rebuild_helper_returns_mixed_instance(self):
+        from transformers import PreTrainedTokenizerFast
+
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+            NeMoAutoTokenizerWithBosEosEnforced,
+            _enforced_tokenizer_class,
+            _rebuild_enforced_tokenizer,
+        )
+
+        obj = _rebuild_enforced_tokenizer(PreTrainedTokenizerFast)
+        assert isinstance(obj, NeMoAutoTokenizerWithBosEosEnforced)
+        assert type(obj) is _enforced_tokenizer_class(PreTrainedTokenizerFast)
+
+    def test_reduce_falls_back_without_base_class(self):
+        """An instance that never went through from_pretrained uses the default reducer."""
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+            NeMoAutoTokenizerWithBosEosEnforced,
+        )
+
+        bare = NeMoAutoTokenizerWithBosEosEnforced.__new__(NeMoAutoTokenizerWithBosEosEnforced)
+        # No _base_class attribute -> __reduce__ should defer to super().
+        result = bare.__reduce__()
+        assert isinstance(result, tuple)

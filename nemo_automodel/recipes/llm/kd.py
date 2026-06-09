@@ -53,11 +53,13 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
@@ -74,7 +76,6 @@ from nemo_automodel.recipes.llm.train_ft import (
     _uses_te_dot_product_attention,
     _uses_thd_collater,
     build_model,
-    calculate_loss,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,9 +92,7 @@ def _build_teacher_model(
     cfg_teacher,
     seed,
     has_packed_sequence,
-    device_mesh=None,
-    moe_mesh=None,
-    distributed_config=None,
+    distributed_setup: DistributedSetup | None = None,
     device=None,
 ):
     """Build and initialize the teacher model for knowledge distillation.
@@ -105,9 +104,7 @@ def _build_teacher_model(
         cfg_teacher: Configuration for teacher model instantiation.
         seed: Random seed for reproducibility.
         has_packed_sequence: Whether using packed sequences.
-        device_mesh: Device mesh for distributed training.
-        moe_mesh: MOE mesh for expert parallelism.
-        distributed_config: Strategy-specific distributed config.
+        distributed_setup: Resolved distributed topology and policy object.
         device: Device to place the teacher model on.
 
     Returns:
@@ -125,9 +122,7 @@ def _build_teacher_model(
     with ScopedRNG(seed=seed, ranked=True):
         kwargs: Dict[str, Any] = {
             "has_packed_sequence": has_packed_sequence,
-            "device_mesh": device_mesh,
-            "moe_mesh": moe_mesh,
-            "distributed_config": distributed_config,
+            "distributed_setup": distributed_setup,
         }
 
         teacher_model = cfg_teacher.instantiate(**kwargs)
@@ -147,11 +142,9 @@ def _build_teacher_model_with_pp(
     cfg_teacher,
     seed: int,
     has_packed_sequence: bool,
-    device_mesh,
-    moe_mesh,
-    distributed_config,
     pipeline_config: PipelineConfig,
-    dist_setup,
+    distributed_setup: DistributedSetup,
+    activation_checkpointing: bool,
 ) -> Any:
     """Build teacher model with same parallelization as student (TP/EP/SP/PP).
 
@@ -166,11 +159,9 @@ def _build_teacher_model_with_pp(
         cfg_teacher: Configuration for teacher model instantiation.
         seed: Random seed for reproducibility.
         has_packed_sequence: Whether using packed sequences.
-        device_mesh: Device mesh for distributed training.
-        moe_mesh: MOE mesh for expert parallelism.
-        distributed_config: Strategy-specific distributed config.
         pipeline_config: PipelineConfig from the student, used as a template.
-        dist_setup: Distributed setup object (provides moe_config, activation_checkpointing).
+        distributed_setup: Student distributed setup, used as a template.
+        activation_checkpointing: Whether to enable activation checkpointing.
 
     Returns:
         The frozen teacher AutoPipeline with a ``_teacher_logits_capture`` attribute.
@@ -202,6 +193,13 @@ def _build_teacher_model_with_pp(
         scale_grads_in_schedule=pipeline_config.scale_grads_in_schedule,
         loss_fn=_teacher_capture_loss_fn,
     )
+    teacher_distributed_setup = DistributedSetup(
+        mesh_context=distributed_setup.mesh_context,
+        strategy_config=distributed_setup.strategy_config,
+        pipeline_config=teacher_pipeline_config,
+        moe_parallel_config=distributed_setup.moe_parallel_config,
+        activation_checkpointing=activation_checkpointing,
+    )
 
     with ScopedRNG(seed=seed, ranked=True):
         teacher_model = build_model(
@@ -212,13 +210,8 @@ def _build_teacher_model_with_pp(
             cfg_fp8=None,
             cfg_compile=None,
             cfg_quantization=None,
-            device_mesh=device_mesh,
-            moe_mesh=moe_mesh,
-            distributed_config=distributed_config,
-            pipeline_config=teacher_pipeline_config,
+            distributed_setup=teacher_distributed_setup,
             cfg_qat=None,
-            cfg_moe=dist_setup.moe_config,
-            activation_checkpointing=dist_setup.activation_checkpointing,
         )
 
     # Freeze all teacher parameters.
@@ -276,11 +269,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 cfg_teacher=self.cfg.get("teacher_model", None),
                 seed=self.cfg.get("seed", 42),
                 has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                distributed_config=self.distributed_config,
                 pipeline_config=self.pipeline_config,
-                dist_setup=self.dist_setup,
+                distributed_setup=self.distributed_setup,
+                activation_checkpointing=self.activation_checkpointing,
             )
             self.teacher_pp = self.teacher_model
             if self.pipeline_config.pp_microbatch_size != self.pipeline_config.pp_batch_size:
@@ -294,9 +285,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 cfg_teacher=self.cfg.get("teacher_model", None),
                 seed=self.cfg.get("seed", 42),
                 has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                distributed_config=self.distributed_config,
+                distributed_setup=self.distributed_setup,
                 device=teacher_device,
             )
             self.teacher_pp = None
@@ -797,9 +786,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             for mp in self.model_parts:
                 mp.eval()
 
-            total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
-            ce_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
-            kd_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
+            total_loss = 0.0
+            total_ce_loss = 0.0
+            total_kd_loss = 0.0
             total_num_label_tokens = 0
 
             for batch in val_dataloader:
@@ -811,24 +800,35 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     num_batches=1,
                     is_train=False,
                 )
+                # _forward_backward_step returns per-token-averaged losses.
+                # Multiply back by num_label_tokens to get the raw sum for
+                # correct weighted averaging across batches.
+                total_loss += local_loss.item() * num_label_tokens
+                total_ce_loss += _ce_loss.item() * num_label_tokens
+                total_kd_loss += _kd_loss.item() * num_label_tokens
                 total_num_label_tokens += num_label_tokens
-                ce_loss += _ce_loss
-                kd_loss += _kd_loss
-                total_loss += local_loss
 
-        total_loss = self._dp_allreduce(total_loss, include_cp=True).item()
-        ce_loss = self._dp_allreduce(ce_loss, include_cp=True).item()
-        kd_loss = self._dp_allreduce(kd_loss, include_cp=True).item()
+        total_loss = self._dp_allreduce(
+            torch.tensor(total_loss, dtype=torch.float32, device=self.dist_env.device), include_cp=True
+        ).item()
+        total_ce_loss = self._dp_allreduce(
+            torch.tensor(total_ce_loss, dtype=torch.float32, device=self.dist_env.device), include_cp=True
+        ).item()
+        total_kd_loss = self._dp_allreduce(
+            torch.tensor(total_kd_loss, dtype=torch.float32, device=self.dist_env.device), include_cp=True
+        ).item()
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
 
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
+        val_ce_loss = total_ce_loss / max(total_num_label_tokens, 1e-8)
+        val_kd_loss = total_kd_loss / max(total_num_label_tokens, 1e-8)
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
             metrics={
                 "val_loss": val_loss,
-                "ce_loss": ce_loss,
-                "kd_loss": kd_loss,
+                "ce_loss": val_ce_loss,
+                "kd_loss": val_kd_loss,
                 "lr": self.optimizer[0].param_groups[0]["lr"],
                 "num_label_tokens": total_num_label_tokens,
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,

@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
+import gc
+import weakref
 from unittest.mock import Mock, patch
+
+import torch
 from transformers import GptOssConfig
 
-from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.models.common import BackendConfig
-
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
+from nemo_automodel.components.moe.config import MoEConfig
+
 
 class TestApplyKeyMapping:
     def _make_adapter(self):
@@ -131,6 +134,7 @@ class TestApplyKeyMapping:
         # This one endswith mapping key and should be replaced, preserving prefix
         assert "Xmlp.gate.weight" in out
         assert "Xmlp.router.weight" not in out
+
 
 class TestGPTOSSStateDictAdapter:
     def create_mock_config(self, **overrides):
@@ -291,6 +295,63 @@ class TestGPTOSSStateDictAdapter:
 
         # Irrelevant entries preserved
         assert "some.other" in out
+
+    def test_dequantize_frees_quantized_between_iterations(self):
+        # Regression guard for the per-layer free in _dequantize_block_scale_tensors:
+        # by the time layer N+1 is processed, layer N's quantized blocks/scales must
+        # be eligible for garbage collection. The previous implementation kept all
+        # layers' quantized tensors alive in a local dict until the loop ended,
+        # roughly doubling peak memory during GPT-OSS load.
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+        adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
+
+        layer0_blocks = torch.ones(1)
+        layer0_scales = torch.ones(1)
+        layer0_blocks_ref = weakref.ref(layer0_blocks)
+        layer0_scales_ref = weakref.ref(layer0_scales)
+        layer1_blocks = torch.ones(1)
+        layer1_scales = torch.ones(1)
+
+        state_dict = {
+            "model.layers.0.mlp.experts.gate_up_proj_blocks": layer0_blocks,
+            "model.layers.0.mlp.experts.gate_up_proj_scales": layer0_scales,
+            "model.layers.1.mlp.experts.gate_up_proj_blocks": layer1_blocks,
+            "model.layers.1.mlp.experts.gate_up_proj_scales": layer1_scales,
+        }
+
+        # Drop external references to layer 0 so the only remaining strong refs
+        # would be those held by the function's local mapping. With Step 1 in
+        # place, those refs are popped between iterations.
+        del layer0_blocks, layer0_scales
+
+        call_count = {"n": 0}
+        layer0_alive_during_layer1 = {"v": None}
+
+        def fake_convert(blocks, scales):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                # Drop our own references to args so GC can reclaim them
+                del blocks, scales
+                gc.collect()
+                layer0_alive_during_layer1["v"] = layer0_blocks_ref() is not None or layer0_scales_ref() is not None
+            return torch.randn(2, 2)
+
+        # Direct monkey-patch (not unittest.mock) so that argument references
+        # captured by call_args_list don't keep the quantized tensors alive
+        # and mask the per-iteration free we're trying to verify.
+        original = adapter._convert_moe_packed_tensors
+        adapter._convert_moe_packed_tensors = fake_convert
+        try:
+            adapter._dequantize_block_scale_tensors(state_dict)
+        finally:
+            adapter._convert_moe_packed_tensors = original
+
+        assert call_count["n"] == 2
+        assert layer0_alive_during_layer1["v"] is False, (
+            "layer 0 quantized tensors should be released before layer 1 is dequantized"
+        )
 
     def test_from_hf_detects_model_prefix(self):
         config = self.create_mock_config()
@@ -465,8 +526,10 @@ class TestConvertMoePackedTensors:
         def fake_empty(shape, placements=None, device_mesh=None, dtype=None):
             return FakeDTensor(torch.empty(shape, dtype=dtype), placements=placements, device_mesh=device_mesh)
 
-        with patch("torch.cuda.is_available", return_value=False), \
-             patch("torch.distributed.tensor.empty", create=True, side_effect=fake_empty):
+        with (
+            patch("torch.cuda.is_available", return_value=False),
+            patch("torch.distributed.tensor.empty", create=True, side_effect=fake_empty),
+        ):
             out = adapter._convert_moe_packed_tensors(blocks, scales, dtype=torch.float32, rows_per_chunk=4)
 
         # Unwrap local tensor for validation
@@ -541,8 +604,10 @@ class TestConvertMoePackedTensors:
         def fake_empty(shape, placements=None, device_mesh=None, dtype=None):
             return FakeDTensor(torch.empty(shape, dtype=dtype), placements=placements, device_mesh=device_mesh)
 
-        with patch("torch.cuda.is_available", return_value=False), \
-             patch("torch.distributed.tensor.empty", create=True, side_effect=fake_empty):
+        with (
+            patch("torch.cuda.is_available", return_value=False),
+            patch("torch.distributed.tensor.empty", create=True, side_effect=fake_empty),
+        ):
             out = adapter._convert_moe_packed_tensors(blocks, scales, dtype=torch.float32, rows_per_chunk=1)
 
         out_local = out.to_local() if hasattr(out, "to_local") else out
@@ -577,8 +642,10 @@ class TestSingleGPUScenarios:
         scales = torch.tensor([[[127]]], dtype=torch.uint8)
 
         # CUDA available but single-process world (no distributed multi-GPU)
-        with patch("torch.cuda.is_available", return_value=True), \
-             patch("torch.distributed.get_world_size", return_value=1):
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=1),
+        ):
             out = adapter._convert_moe_packed_tensors(blocks, scales, dtype=torch.float32, rows_per_chunk=4)
 
         assert not out.is_cuda
@@ -599,8 +666,10 @@ class TestSingleGPUScenarios:
             "model.layers.0.mlp.router.weight": torch.randn(1),
         }
 
-        with patch("torch.cuda.is_available", return_value=True), \
-             patch("torch.distributed.get_world_size", return_value=1):
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=1),
+        ):
             out = adapter.from_hf(hf_state)
 
         # Dequantized key should be mapped to internal name and remain on CPU
@@ -714,27 +783,40 @@ class TestDTensorPaths:
         adapter = self._make_adapter()
 
         class FakeShard:
-            def __init__(self, dim): self.dim = dim
+            def __init__(self, dim):
+                self.dim = dim
+
         class FakeReplicate:
             pass
+
         class Mesh:
-            def __init__(self, names): self.mesh_dim_names = names
+            def __init__(self, names):
+                self.mesh_dim_names = names
+
         class FakeDTensor:
             def __init__(self, shape, placements, device_mesh):
-                self._shape = shape; self.placements = placements; self.device_mesh = device_mesh
+                self._shape = shape
+                self.placements = placements
+                self.device_mesh = device_mesh
+
             @property
-            def shape(self): return self._shape
+            def shape(self):
+                return self._shape
 
         fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
-        tensor = FakeDTensor((2, 64, 128), placements=(FakeShard(1), FakeReplicate()), device_mesh=Mesh(("ep", "ep_shard")))
+        tensor = FakeDTensor(
+            (2, 64, 128), placements=(FakeShard(1), FakeReplicate()), device_mesh=Mesh(("ep", "ep_shard"))
+        )
 
         def fake_ones(shape, placements=None, device_mesh=None, dtype=None):
             return FakeDTensor(shape, placements=placements, device_mesh=device_mesh)
 
-        with patch("torch.distributed.tensor.DTensor", new=FakeDTensor, create=True), \
-             patch("torch.distributed.tensor.Shard", new=FakeShard, create=True), \
-             patch("torch.distributed.tensor.Replicate", new=FakeReplicate, create=True), \
-             patch("torch.distributed.tensor.ones", create=True, side_effect=fake_ones):
+        with (
+            patch("torch.distributed.tensor.DTensor", new=FakeDTensor, create=True),
+            patch("torch.distributed.tensor.Shard", new=FakeShard, create=True),
+            patch("torch.distributed.tensor.Replicate", new=FakeReplicate, create=True),
+            patch("torch.distributed.tensor.ones", create=True, side_effect=fake_ones),
+        ):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
         out = dict(result)
@@ -791,6 +873,7 @@ class TestDTensorPaths:
 
             def to_local(self):
                 return self.tensor
+
             def redistribute(self, placements=None):
                 return FakeDTensor(self.tensor, placements or self.placements, self.device_mesh)
 
@@ -809,19 +892,25 @@ class TestDTensorPaths:
 
         # blocks nibble 0x12 -> [1.0, 0.5], exponent 127 -> 0
         mesh = type("Mesh", (), {"mesh_dim_names": ("ep_shard", "ep")})
-        blocks = FakeDTensor(torch.tensor([[[[0x12]]]], dtype=torch.uint8), placements=("Pr", ("Shard", 0)), device_mesh=mesh)
-        scales = FakeDTensor(torch.tensor([[[127]]], dtype=torch.uint8), placements=("Pr", ("Shard", 0)), device_mesh=mesh)
+        blocks = FakeDTensor(
+            torch.tensor([[[[0x12]]]], dtype=torch.uint8), placements=("Pr", ("Shard", 0)), device_mesh=mesh
+        )
+        scales = FakeDTensor(
+            torch.tensor([[[127]]], dtype=torch.uint8), placements=("Pr", ("Shard", 0)), device_mesh=mesh
+        )
 
         def fake_empty(shape, placements=None, device_mesh=None, dtype=None):
             # Must allocate a DTensor-like container preserving placements and mesh
             return FakeDTensor(torch.empty(shape, dtype=dtype), placements=placements, device_mesh=device_mesh)
 
-        with patch("torch.distributed.tensor.DTensor", new=FakeDTensor, create=True), \
-             patch("torch.distributed.tensor.empty", create=True, side_effect=fake_empty), \
-             patch("torch.distributed.tensor.Shard", new=lambda dim: ("Shard", dim), create=True), \
-             patch("torch.distributed.tensor.Replicate", new=lambda: "Pr", create=True), \
-             patch("torch.cuda.is_available", return_value=True), \
-             patch("torch.distributed.get_world_size", return_value=2):
+        with (
+            patch("torch.distributed.tensor.DTensor", new=FakeDTensor, create=True),
+            patch("torch.distributed.tensor.empty", create=True, side_effect=fake_empty),
+            patch("torch.distributed.tensor.Shard", new=lambda dim: ("Shard", dim), create=True),
+            patch("torch.distributed.tensor.Replicate", new=lambda: "Pr", create=True),
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+        ):
             out = adapter._convert_moe_packed_tensors(blocks, scales, dtype=torch.float32, rows_per_chunk=4)
 
         # Simulated CUDA move occurred

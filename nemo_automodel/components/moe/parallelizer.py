@@ -40,11 +40,68 @@ logger = logging.getLogger(__name__)
 _CP_STREAM = None
 
 
+def _moe_shard_placement(param):
+    """FSDP shard placement for grouped-expert params.
+
+    Shard on dim=1 for the (>=2D) expert weights since there may be more shards than
+    experts (dim=0). A 1D param (e.g. the per-expert bias of the experts="te"
+    GroupedLinear path, shape [out_features]) has no dim 1, so shard it on dim 0
+    instead. FSDP all-gathers before use, so the shard dim is a storage detail and does
+    not change compute.
+    """
+    return Shard(0) if param.ndim < 2 else Shard(1)
+
+
+def _is_selective_ac(activation_checkpointing: object) -> bool:
+    """Return True when the AC mode requests selective checkpointing.
+
+    Kept inline (rather than imported from the dense FSDP2 parallelizer) so that
+    threading the mode does not pull the heavy ``distributed.parallelizer`` module
+    into the lightweight call path.
+    """
+    return (
+        isinstance(activation_checkpointing, str) and activation_checkpointing.lower().replace("-", "_") == "selective"
+    )
+
+
+def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) == "deepseek_v4":
+        return True
+
+    inner_model = getattr(model, "model", None)
+    inner_config = getattr(inner_model, "config", None)
+    return getattr(inner_config, "model_type", None) == "deepseek_v4"
+
+
 def _get_cp_stream() -> torch.cuda.Stream:
     global _CP_STREAM
     if _CP_STREAM is None:
         _CP_STREAM = torch.cuda.Stream()
     return _CP_STREAM
+
+
+def _iter_transformer_and_mtp_blocks(model: nn.Module):
+    inner = model.model if hasattr(model, "model") and model.model is not None else model
+    text_model = get_text_module(inner)
+
+    layers = getattr(text_model, "layers", None)
+    if layers is not None:
+        for layer_id, block in layers.named_children():
+            yield layers, layer_id, block
+
+    mtp = getattr(model, "mtp", None)
+    mtp_layers = getattr(mtp, "layers", None)
+    if mtp_layers is not None:
+        for layer_id, block in mtp_layers.named_children():
+            yield mtp_layers, layer_id, block
+
+
+def _get_moe_module(block: nn.Module) -> MoE | None:
+    for name in ("moe", "mlp"):
+        module = getattr(block, name, None)
+        if isinstance(module, MoE):
+            return module
 
 
 class ExpertParallel(ParallelStyle):
@@ -73,6 +130,28 @@ class ExpertParallel(ParallelStyle):
         )
 
 
+def _iter_moe_blocks(model_wrapper: nn.Module, backbone: nn.Module):
+    """Yield decoder blocks that may contain MoE sublayers.
+
+    Covers the main backbone (``backbone.layers``) plus an optional MTP
+    auxiliary head (``model_wrapper.mtp.layers``) when present. MTP sublayers
+    are not registered under ``backbone.layers`` but carry the same MoE
+    structure and must receive the same EP / FSDP treatment so their
+    state-dict round-trips cleanly.
+
+    Args:
+        model_wrapper: Outer model (e.g. ``NemotronHForCausalLM``) — the
+            attribute that may carry the MTP head.
+        backbone: Inner backbone (``model_wrapper.model``, possibly text-only
+            after VLM unwrapping) whose ``.layers`` holds the main decoder
+            stack.
+    """
+    yield from backbone.layers.children()
+    mtp_module = getattr(model_wrapper, "mtp", None)
+    if mtp_module is not None and hasattr(mtp_module, "layers"):
+        yield from mtp_module.layers.children()
+
+
 def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None = None):
     """Applies EP to MoE module."""
     assert ep_mesh.size() > 1
@@ -84,20 +163,21 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
     # Prefer nested text modules when present
     _model = get_text_module(_model)
 
-    for _, block in _model.layers.named_children():
-        moe_module = block.moe if hasattr(block, "moe") else block.mlp
-        if isinstance(moe_module, MoE):
-            # GroupedExpertsTEGroupedLinear uses TE's GroupedLinear which creates
-            # local experts directly. It doesn't support DTensor wrapping, so we
-            # skip distribute_module entirely and just initialize token dispatcher.
-            if isinstance(moe_module.experts, GroupedExpertsTE):
-                moe_module.experts.init_token_dispatcher(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
-            else:
-                parallelize_module(
-                    module=moe_module.experts,
-                    device_mesh=ep_mesh,
-                    parallelize_plan=ExpertParallel(),
-                )
+    for block in _iter_moe_blocks(model, _model):
+        moe_module = _get_moe_module(block)
+        if moe_module is None:
+            continue
+        # GroupedExpertsTEGroupedLinear uses TE's GroupedLinear which creates
+        # local experts directly. It doesn't support DTensor wrapping, so we
+        # skip distribute_module entirely and just initialize token dispatcher.
+        if isinstance(moe_module.experts, GroupedExpertsTE):
+            moe_module.experts.init_token_dispatcher(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
+        else:
+            parallelize_module(
+                module=moe_module.experts,
+                device_mesh=ep_mesh,
+                parallelize_plan=ExpertParallel(),
+            )
 
 
 def apply_ac(
@@ -105,6 +185,7 @@ def apply_ac(
     ignore_router: bool = False,
     hidden_size: int | None = None,
     num_experts: int | None = None,
+    selective: bool = False,
 ):
     """Apply activation checkpointing to the model.
 
@@ -114,7 +195,31 @@ def apply_ac(
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
         num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
             first, then falls back to model.config attributes.
+        selective: If True, applies TorchTitan-style per-op selective activation checkpointing
+            (shared with the dense FSDP2 path) to each block. Takes precedence over
+            ``ignore_router``; the shared policy already saves expert-parallel communication
+            collectives and ``topk``, so it composes with expert parallelism.
     """
+    if selective:
+        # Reuse the dense FSDP2 selective policy so the save-op set (attention,
+        # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
+        from nemo_automodel.components.distributed.activation_checkpointing import (
+            SELECTIVE_AC_WRAPPER_FLAG,
+            make_selective_checkpoint_context_fn,
+        )
+
+        selective_context_fn = make_selective_checkpoint_context_fn()
+        for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+            block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, context_fn=selective_context_fn)
+            # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
+            # selective policy visible to the partitioner) instead of unwrapping and
+            # compiling the block inner, which would collapse selective AC into full
+            # recompute. The flag is only read when per-layer torch.compile is
+            # enabled, so it is a no-op for every other mode.
+            setattr(block, SELECTIVE_AC_WRAPPER_FLAG, True)
+            parent_layers.register_module(layer_id, block)
+        return
+
     # Derive hidden_size and num_experts from model.config if not provided
     if hidden_size is None:
         cfg = getattr(model, "config", None)
@@ -141,32 +246,40 @@ def apply_ac(
             else:
                 raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
 
+    def _is_router_projection(func, args) -> bool:
+        aten = torch.ops.aten
+        mm = getattr(getattr(aten, "mm", None), "default", None)
+        addmm = getattr(getattr(aten, "addmm", None), "default", None)
+        linear = getattr(getattr(aten, "linear", None), "default", None)
+        if func == mm:
+            return len(args) == 2 and args[1].shape == (hidden_size, num_experts)
+        if func == addmm:
+            return len(args) >= 3 and args[2].shape == (hidden_size, num_experts)
+        if func == linear:
+            return len(args) >= 2 and args[1].shape == (num_experts, hidden_size)
+        return False
+
     def _custom_policy(ctx, func, *args, **kwargs):
-        if func == torch.ops.aten.mm.default:
-            if len(args) == 2 and (args[1].shape == (hidden_size, num_experts)):
-                return CheckpointPolicy.MUST_SAVE
-            else:
-                return CheckpointPolicy.PREFER_RECOMPUTE
-        else:
-            return CheckpointPolicy.PREFER_RECOMPUTE
+        if _is_router_projection(func, args):
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
 
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
 
-    if hasattr(model, "model") and model.model is not None:
-        _model = model.model
-    else:
-        _model = model
-    _model = get_text_module(_model)
-    for layer_id, block in _model.layers.named_children():
-        if ignore_router:
+    for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+        if ignore_router and hasattr(block, "set_activation_checkpointing"):
+            block.set_activation_checkpointing(True)
+        elif ignore_router:
             block = ptd_checkpoint_wrapper(
-                block, preserve_rng_state=True, context_fn=selective_checkpointing_context_fn
+                block,
+                preserve_rng_state=True,
+                context_fn=selective_checkpointing_context_fn,
             )
         else:
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
 
-        _model.layers.register_module(layer_id, block)
+        parent_layers.register_module(layer_id, block)
 
 
 def apply_fsdp(
@@ -181,6 +294,8 @@ def apply_fsdp(
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
 ):
+    """Apply FSDP wrapping to MoE transformer blocks and model-level modules."""
+
     if isinstance(lm_head_precision, str):
         lm_head_precision = dtype_from_str(lm_head_precision, default=None)
 
@@ -192,8 +307,14 @@ def apply_fsdp(
             cast_forward_inputs=True,
         )
 
+    fully_shard_impl = fully_shard
+    if _is_deepseek_v4_model(model):
+        from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
+
+        fully_shard_impl = fully_shard_deepseek_v4
+
     fully_shard_default = functools.partial(
-        fully_shard,
+        fully_shard_impl,
         mesh=fsdp_mesh,
         reshard_after_forward=reshard_after_forward,
         mp_policy=mp_policy,
@@ -204,19 +325,24 @@ def apply_fsdp(
         _model = model.model
     else:
         _model = model
-    # handle VLM
+    # Prefer nested text modules when present (VLM models)
     _model = get_text_module(_model)
 
-    for _, block in _model.layers.named_children():
-        moe_module = block.moe if hasattr(block, "moe") else block.mlp
+    for block in _iter_moe_blocks(model, _model):
+        moe_module = _get_moe_module(block)
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
+            # Forward the same mp_policy used elsewhere so that when params are
+            # kept in fp32 (e.g. for fp32 master weights under FSDP2) the
+            # all-gathered expert weights are still cast to param_dtype for
+            # forward compute (required by GMM / TE kernels that expect bf16).
             fully_shard(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
-                shard_placement_fn=lambda _: Shard(1),
+                shard_placement_fn=_moe_shard_placement,
                 reshard_after_forward=reshard_after_forward,
+                mp_policy=mp_policy,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters
@@ -227,7 +353,6 @@ def apply_fsdp(
         ignored_params = None
         if isinstance(moe_module, MoE) and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())
-
         fully_shard_default(block, ignored_params=ignored_params)
 
     if hasattr(_model, "embed_tokens") and _model.embed_tokens is not None:
@@ -273,6 +398,8 @@ def apply_fsdp(
 
 
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
+    """Configure context parallelism for attention and MoE layers."""
+
     from transformer_engine.pytorch.attention import DotProductAttention
 
     if hasattr(model, "model") and model.model is not None:
@@ -287,10 +414,10 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     # "Padding mask not supported with context parallelism!".
     _model._cp_enabled = True
 
-    for _, block in _model.layers.named_children():
-        layer_type = getattr(block, "layer_type", "full_attention")
+    for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
+        layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
-        if layer_type == "full_attention":
+        if layer_type in ("full_attention", "sliding_attention"):
             attn_module = block.self_attn.attn_module
             if not isinstance(attn_module, DotProductAttention):
                 logger.warning(
@@ -298,11 +425,12 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                     type(attn_module).__name__,
                 )
                 continue
+            attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
             attn_module.set_context_parallel_group(
                 cp_mesh.get_group(),
                 torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
                 _get_cp_stream(),
-                cp_comm_type=cp_comm_type,
+                cp_comm_type=attn_cp_comm_type,
             )
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
@@ -343,13 +471,15 @@ def parallelize_model(
     tp_axis_name: str | None = None,
     ep_axis_name: str | None = None,
     ep_shard_axis_names: tuple[str, ...] | None = None,
-    activation_checkpointing: bool = False,
+    activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = False,
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
 ):
+    """Apply context, expert, activation-checkpointing, and FSDP parallelism."""
+
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for custom MoE models"
     )
@@ -368,7 +498,11 @@ def parallelize_model(
         apply_ep(model, moe_mesh[ep_axis_name], moe_mesh=moe_mesh)
 
     if activation_checkpointing:
-        apply_ac(model, ignore_router=ignore_router_for_ac)
+        apply_ac(
+            model,
+            ignore_router=ignore_router_for_ac,
+            selective=_is_selective_ac(activation_checkpointing),
+        )
 
     if ep_shard_axis_names is not None:
         ep_shard_mesh = moe_mesh[ep_shard_axis_names]

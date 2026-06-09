@@ -53,6 +53,26 @@ class MoESplitExpertsStateDictMixin:
 
         return is_gated_activation(self.moe_config.expert_activation)
 
+    def _register_inplace_loaded_key(self, fqn: str, prefix_override: str | None) -> None:
+        """Mark ``fqn`` as loaded via in-place views so ``_from_hf_w_merged_experts`` skips its rebuild.
+
+        The tracked key must match the native_key that the from_hf merge loop
+        reconstructs from the HF per-expert keys. For backbone tensors the
+        native_key equals ``fqn``; for MTP tensors (``prefix_override="mtp."``)
+        the HF keys live under the ``mtp.`` namespace and from_hf processes
+        them with that prefix stripped, so the tracked key is also the
+        ``mtp.``-less form. The user of this set (``_from_hf_w_merged_experts``)
+        receives the matching stripped key when called via the adapter's
+        per-namespace dispatch.
+        """
+        if prefix_override is not None and prefix_override.endswith("."):
+            tracked = fqn[len(prefix_override) :] if fqn.startswith(prefix_override) else fqn
+        else:
+            tracked = fqn
+        if not hasattr(self, "_inplace_loaded_native_keys") or self._inplace_loaded_native_keys is None:
+            self._inplace_loaded_native_keys = set()
+        self._inplace_loaded_native_keys.add(tracked)
+
     @property
     def _hf_prefix(self) -> str:
         """Prefix for HuggingFace format keys. Override in subclass."""
@@ -340,14 +360,18 @@ class MoESplitExpertsStateDictMixin:
 
         return result
 
-    def _to_hf_w_split_experts(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    def _to_hf_w_split_experts(self, state_dict: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         """Convert DeepEP format to HuggingFace format.
-        Handles: gate_and_up_projs, down_projs -> individual expert weights
+
+        Handles ``gate_and_up_projs`` / ``down_projs`` -> individual expert
+        weights. Forwards ``**kwargs`` to
+        ``_convert_single_merged_expert_to_hf_split_experts`` for adapter
+        compatibility (e.g. ``exclude_key_regex``).
         """
         hf_state_dict: dict[str, Any] = {}
 
         for fqn, tensor in state_dict.items():
-            converted = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+            converted = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
             if converted is not None:
                 for key, value in converted:
                     hf_state_dict[key] = value
@@ -401,6 +425,9 @@ class MoESplitExpertsStateDictMixin:
             rf"(?P<prefix>(?:model\.)?(?:language_model\.)?)layers\.(\d+)\.{re.escape(expert_segment)}\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
         )
 
+        inplace_loaded_keys: set = getattr(self, "_inplace_loaded_native_keys", None) or set()
+        consumed_inplace_keys: set = set()
+
         for key in list(hf_state_dict.keys()):
             value = hf_state_dict.pop(key)
             if f".{expert_segment}." in key and key.endswith(".weight"):
@@ -413,16 +440,22 @@ class MoESplitExpertsStateDictMixin:
                 layer_num, expert_num, which = m.group(2), m.group(3), m.group(4)
                 expert_num = int(expert_num)
 
+                if which in ["gate_proj", "up_proj"]:
+                    native_key = f"{prefix}layers.{layer_num}.{expert_segment}.gate_and_up_projs"
+                else:  # down_proj
+                    native_key = f"{prefix}layers.{layer_num}.{expert_segment}.down_projs"
+
+                # Skip rebuild: DCP wrote through the view; model already holds the data.
+                if native_key in inplace_loaded_keys:
+                    consumed_inplace_keys.add(native_key)
+                    del value
+                    continue
+
                 if not should_load_expert_for_rank(expert_num, device_mesh, n_experts):
                     continue
 
                 if layer_num not in expert_weights_by_layer:
                     expert_weights_by_layer[layer_num] = {}
-
-                if which in ["gate_proj", "up_proj"]:
-                    native_key = f"{prefix}layers.{layer_num}.{expert_segment}.gate_and_up_projs"
-                else:  # down_proj
-                    native_key = f"{prefix}layers.{layer_num}.{expert_segment}.down_projs"
 
                 if native_key not in expert_weights_by_layer[layer_num]:
                     expert_weights_by_layer[layer_num][native_key] = {}
@@ -473,11 +506,20 @@ class MoESplitExpertsStateDictMixin:
                         stacked = torch.stack(tensors, dim=0).to(self.dtype)
                         state_dict[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
 
-                        # Free completed expert tensors to release GPU memory
+                        # Aggressively release intermediates so the per-layer
+                        # transient does not pile on top of the model's
+                        # already-materialized GPU DTensors. Without this,
+                        # ``tensors``/``stacked`` and the per-expert dict
+                        # entries hang around until Python's refcount GC
+                        # eventually runs — too late under tight GPU budgets
+                        # (e.g. a large MoE on 2 nodes / 8 GPUs).
+                        del tensors, stacked
                         del expert_weights_by_layer[layer_num][native_key]
                         if not expert_weights_by_layer[layer_num]:
                             del expert_weights_by_layer[layer_num]
                         gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
                 else:  # down_proj
                     expert_weights_by_layer[layer_num][native_key][expert_num] = value
@@ -499,18 +541,24 @@ class MoESplitExpertsStateDictMixin:
                         stacked = torch.stack(ordered, dim=0)
                         stacked = stacked.to(self.dtype)
 
-                        dtensor = create_dtensor_from_local(stacked, device_mesh, rank)
-                        state_dict[native_key] = dtensor
+                        state_dict[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
 
-                        # Free completed expert tensors to release GPU memory
+                        # See gate/up branch above for the cleanup rationale.
+                        del ordered, stacked
                         del expert_weights_by_layer[layer_num][native_key]
                         if not expert_weights_by_layer[layer_num]:
                             del expert_weights_by_layer[layer_num]
                         gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
             else:
                 if not key.endswith("_scale_inv"):
                     state_dict[key] = value
+
+        # Drop consumed entries so a subsequent from_hf (e.g. MTP merge after backbone) starts clean.
+        if consumed_inplace_keys:
+            self._inplace_loaded_native_keys -= consumed_inplace_keys
 
         # Recombine any per-expert HF LoRA keys back to grouped format
         state_dict = self._recombine_lora_expert_keys(state_dict)
@@ -518,47 +566,89 @@ class MoESplitExpertsStateDictMixin:
         return state_dict
 
     def _convert_single_merged_expert_to_hf_split_experts(
-        self, fqn: str, tensor: torch.Tensor, **kwargs
+        self,
+        fqn: str,
+        tensor: torch.Tensor,
+        *,
+        prefix_override: str | None = None,
+        **kwargs,
     ) -> list[tuple[str, torch.Tensor]]:
         """Convert a single merged expert tensor from native format to split HuggingFace format.
 
+        When ``tensor`` is a model DTensor with a plain (non-DTensor) local
+        split — i.e. ``ep_shard == 1`` — the per-expert outputs are returned
+        as **non-contiguous strided views** into the local storage of the
+        model's grouped DTensor instead of newly-allocated contiguous copies.
+        DCP's ``target.copy_(source)`` then writes safetensors data directly
+        through the views into the model's storage, and
+        ``_from_hf_w_merged_experts`` skips the rebuild for the corresponding
+        native key (tracked in ``_inplace_loaded_native_keys``). For loads of
+        large MoE checkpoints this avoids tens of GB of per-expert
+        scratch on top of the already-materialized model.
+
+        Save callers must materialize the views before serializing —
+        ``safetensors.torch.save`` rejects non-contiguous tensors. See
+        ``_materialize_to_hf_views_for_save`` in ``checkpointing.py``.
+
         Args:
-            fqn: Fully qualified name of the tensor in native format
-            tensor: The tensor to convert
+            fqn: Fully qualified name of the tensor in native format.
+            tensor: The tensor to convert.
+            prefix_override: When provided, replaces ``self._hf_prefix`` in
+                emitted HF keys. Used to route conversions through namespaces
+                outside the main backbone, e.g. ``"mtp."`` for the MTP head.
+            **kwargs: Absorbed for forward-compatibility with base callers
+                that forward arbitrary state-dict kwargs (e.g. ``exclude_key_regex``).
 
         Returns:
-            List of (fqn, tensor) tuples in HuggingFace format, or None if not an expert tensor
+            List of (fqn, tensor) tuples in HuggingFace format, or None if not an expert tensor.
         """
         n_experts = self.moe_config.n_routed_experts
         inter_dim = self.moe_config.moe_inter_dim
-        prefix = self._hf_prefix
+        prefix = prefix_override if prefix_override is not None else self._hf_prefix
         expert_segment = self._expert_path_segment
+
+        from nemo_automodel.components.moe.state_dict_utils import (
+            is_dtensor,
+            validate_dtensor_expert_sharding,
+        )
 
         if f".{expert_segment}.gate_and_up_projs" in fqn and fqn.endswith(".gate_and_up_projs"):
             layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
-
-            from nemo_automodel.components.moe.state_dict_utils import (
-                is_dtensor,
-                validate_dtensor_expert_sharding,
-            )
 
             if is_dtensor(tensor):
                 validate_dtensor_expert_sharding(tensor, n_experts, f"gate_and_up_projs layer {layer_num}")
 
             splits = self._split_experts_weights(tensor, n_experts)
+
+            # In-place views only engage when splits are plain (ep_shard==1).
+            inplace_ok = is_dtensor(tensor) and len(splits) > 0 and not is_dtensor(splits[0])
+            if inplace_ok:
+                self._register_inplace_loaded_key(fqn, prefix_override)
+
             result = []
             for i, w in enumerate(splits):
                 expert_id = self._last_expert_ids[i]
                 if self._is_gated_moe:
                     # Gated: split into gate_proj and up_proj
-                    w_gate = w[:, :inter_dim].transpose(0, 1).contiguous()
-                    w_up = w[:, inter_dim:].transpose(0, 1).contiguous()
+                    if inplace_ok:
+                        w_gate = w[:, :inter_dim].transpose(0, 1)
+                        w_up = w[:, inter_dim:].transpose(0, 1)
+                    else:
+                        w_gate = w[:, :inter_dim].transpose(0, 1).contiguous()
+                        w_up = w[:, inter_dim:].transpose(0, 1).contiguous()
                     result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.gate_proj.weight", w_gate))
                     result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.up_proj.weight", w_up))
                 else:
                     # Non-gated: only up_proj (tensor is [dim, inter_dim], not [dim, 2*inter_dim])
-                    w_up = w.transpose(0, 1).contiguous()
+                    if inplace_ok:
+                        w_up = w.transpose(0, 1)
+                    else:
+                        w_up = w.transpose(0, 1).contiguous()
                     result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.up_proj.weight", w_up))
+            del splits
+            if not inplace_ok and isinstance(tensor, torch.Tensor) and not tensor.is_meta and torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
             return result
 
         elif (
@@ -569,24 +659,32 @@ class MoESplitExpertsStateDictMixin:
         ):
             layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
 
-            from nemo_automodel.components.moe.state_dict_utils import (
-                is_dtensor,
-                validate_dtensor_expert_sharding,
-            )
-
             if is_dtensor(tensor):
                 validate_dtensor_expert_sharding(tensor, n_experts, f"down_projs (DeepEP) layer {layer_num}")
 
             splits = self._split_experts_weights(tensor, n_experts)
+            inplace_ok = is_dtensor(tensor) and len(splits) > 0 and not is_dtensor(splits[0])
+            if inplace_ok:
+                self._register_inplace_loaded_key(fqn, prefix_override)
+
             result = []
             for i, w in enumerate(splits):
                 expert_id = self._last_expert_ids[i]
+                if inplace_ok:
+                    w_down = w.transpose(0, 1)
+                else:
+                    w_down = w.transpose(0, 1).contiguous()
                 result.append(
                     (
                         f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.down_proj.weight",
-                        w.transpose(0, 1).contiguous(),
+                        w_down,
                     )
                 )
+            # See gate_and_up branch above for the cleanup rationale.
+            del splits
+            if not inplace_ok and isinstance(tensor, torch.Tensor) and not tensor.is_meta and torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
             return result
 
         # MoE expert LoRA keys: split grouped 3-D adapter tensors into per-expert

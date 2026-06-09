@@ -19,7 +19,7 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -33,7 +33,7 @@ def _make_missing(name: str):
 
 
 try:
-    from transformers.modeling_outputs import BaseModelOutputWithPast
+    from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
     from transformers.models.gemma4 import modeling_gemma4 as _g4
     from transformers.models.gemma4.configuration_gemma4 import (
         Gemma4Config,
@@ -72,8 +72,10 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     HFGemma4ForConditionalGeneration = _make_missing("Gemma4ForConditionalGeneration")
     HFGemma4Model = _make_missing("Gemma4Model")
     BaseModelOutputWithPast = _make_missing("BaseModelOutputWithPast")
+    CausalLMOutputWithPast = _make_missing("CausalLMOutputWithPast")
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel._transformers.model_capabilities import ModelCapabilities
+from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
@@ -100,25 +102,38 @@ class Gemma4Gate(nn.Module):
         self.topk = config.top_k_experts
         self.num_experts = num_experts
 
+        # Thread dtype explicitly from config.torch_dtype so the router's own
+        # params (proj weight + scale) stay aligned with the rest of the model
+        # (fp32 under fp32 master weights) even when construction is not wrapped
+        # in local_torch_dtype(). Gemma4RMSNorm(with_scale=False) holds no
+        # learnable parameter, so it needs no dtype threading.
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         self.norm = Gemma4RMSNorm(hidden_size, eps=config.rms_norm_eps, with_scale=False)
-        self.proj = nn.Linear(hidden_size, num_experts, bias=False)
-        self.scale = nn.Parameter(torch.ones(hidden_size))
+        self.proj = nn.Linear(hidden_size, num_experts, bias=False, dtype=dtype)
+        self.scale = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         scalar_root_size = hidden_size**-0.5
         self.register_buffer("root_size", torch.tensor(scalar_root_size), persistent=False)
 
     def forward(self, x, token_mask=None, cp_mesh=None):
-        x_norm = self.norm(x)
-        x_norm = x_norm * self.root_size.to(x_norm.dtype)
-        x_norm = x_norm * self.scale.to(x_norm.dtype)
+        # Router math runs in fp32 regardless of parameter/activation storage
+        # dtype. With bf16 storage (e.g. bf16 weights + fp32 master weights via
+        # TE FusedAdam), bf16 logits can flip top-k expert selection, so keep
+        # the linear, scaling, and softmax in fp32 — mirroring the fp32 routing
+        # the standard MoE Gate enforces via gate_precision. Weights are cast
+        # back to the input dtype for the downstream expert computation.
+        input_dtype = x.dtype
 
-        expert_scores = self.proj(x_norm)
+        x_norm = self.norm(x).to(torch.float32)
+        x_norm = x_norm * self.root_size.to(torch.float32)
+        x_norm = x_norm * self.scale.to(torch.float32)
+
+        expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
         router_probs = F.softmax(expert_scores, dim=-1)
 
-        # Top-k on raw scores (matching HF Gemma4Router behaviour)
-        _, indices = torch.topk(expert_scores, k=self.topk, dim=-1)
-        weights = router_probs.gather(-1, indices)
+        weights, indices = torch.topk(router_probs, k=self.topk, dim=-1)
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-20)
-        return weights, indices, None
+        return weights.to(input_dtype), indices, None
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         pass
@@ -222,15 +237,21 @@ class Gemma4MoEDecoderLayer(nn.Module):
         past_key_values=None,
         use_cache: bool | None = False,
         cache_position: torch.LongTensor | None = None,
+        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         # --- Attention ---
         residual = x
         x = self.input_layernorm(x)
+        # HF's Gemma4TextAttention requires a `shared_kv_states` dict: kv-sharing
+        # layers read their keys/values from it and full-length layers write into
+        # it. The backend threads one dict through every layer so sharing works;
+        # for configs without kv-sharing (e.g. 26B-A4B) it stays empty.
         x, _ = self.self_attn(
             hidden_states=x,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
+            shared_kv_states=shared_kv_states if shared_kv_states is not None else {},
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -264,6 +285,26 @@ class Gemma4MoEDecoderLayer(nn.Module):
         return x
 
 
+def _convert_bool_4d_mask_to_additive(attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Convert a 4D bool allowed-mask to HF additive format (0.0 allowed, -inf masked)."""
+    if attention_mask.ndim != 4 or attention_mask.dtype != torch.bool:
+        return attention_mask
+    additive = torch.zeros(attention_mask.shape, dtype=dtype, device=attention_mask.device)
+    return additive.masked_fill(~attention_mask, torch.finfo(dtype).min)
+
+
+def _derive_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Derive 2D padding mask (True = pad) from 1D, 2D, or 4D attention mask."""
+    if attention_mask.ndim == 2:
+        return attention_mask == 0
+    if attention_mask.ndim == 4:
+        diagonal = torch.diagonal(attention_mask[:, 0], dim1=-2, dim2=-1)
+        if attention_mask.dtype == torch.bool:
+            return diagonal.logical_not()
+        return diagonal != 0
+    return attention_mask.bool().logical_not()
+
+
 # ---------------------------------------------------------------------------
 # Text model backend
 # ---------------------------------------------------------------------------
@@ -287,6 +328,14 @@ class Gemma4MoETextModelBackend(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
+        # Resolve model dtype once from config.torch_dtype and thread it into
+        # MoEConfig so the MoE expert params stay aligned with the rest of the
+        # model (fp32 under fp32 master weights). HF-native submodules
+        # (attention, Gemma4MLP, Gemma4RMSNorm, Gemma4TextScaledWordEmbedding)
+        # inherit their dtype from torch.get_default_dtype() via the
+        # local_torch_dtype() context established by _init_model().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
@@ -305,12 +354,12 @@ class Gemma4MoETextModelBackend(nn.Module):
             norm_topk_prob=True,
             expert_activation="geglu",
             softmax_before_topk=False,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.embed_tokens = Gemma4TextScaledWordEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -356,7 +405,10 @@ class Gemma4MoETextModelBackend(nn.Module):
             position_ids = cache_position.unsqueeze(0)
 
         if padding_mask is None and attention_mask is not None:
-            padding_mask = attention_mask.bool().logical_not()
+            padding_mask = _derive_padding_mask(attention_mask)
+
+        if attention_mask is not None:
+            attention_mask = _convert_bool_4d_mask_to_additive(attention_mask, inputs_embeds.dtype)
 
         hidden_states = inputs_embeds
 
@@ -398,6 +450,9 @@ class Gemma4MoETextModelBackend(nn.Module):
         for layer_type in set(self.config.layer_types):
             position_embeddings[layer_type] = self.rotary_emb(hidden_states, position_ids, layer_type)
 
+        # Single dict shared across all layers so kv-sharing layers can reuse the
+        # full-length keys/values cached by earlier layers (HF contract).
+        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         for decoder_layer in self.layers.values():
             hidden_states = decoder_layer(
                 hidden_states,
@@ -405,6 +460,7 @@ class Gemma4MoETextModelBackend(nn.Module):
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_ids=position_ids,
                 padding_mask=padding_mask,
+                shared_kv_states=shared_kv_states,
                 **kwargs,
             )
 
@@ -455,6 +511,47 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     """
 
     @classmethod
+    def get_capabilities(cls, config: "Gemma4Config") -> ModelCapabilities:
+        """Return the capabilities for a specific config (no model instance needed).
+
+        Dispatches in two layers so the same class can serve every Gemma4
+        checkpoint honestly:
+
+        1. If ``config.text_config.enable_moe_block`` is True → MoE variant
+           (e.g. ``google/gemma-4-26B-A4B-it``).
+        2. Else if ``config.audio_config`` is not ``None`` → dense + audio
+           variant (e.g. ``google/gemma-4-E2B-it``, ``google/gemma-4-E4B-it``).
+        3. Else → plain dense variant (e.g. ``google/gemma-4-31B-it``).
+
+        Args:
+            config: The model's ``Gemma4Config`` (or anything exposing a
+                ``text_config`` with ``enable_moe_block`` and an
+                ``audio_config`` attribute).
+
+        Returns:
+            A populated :class:`ModelCapabilities` for this specific config.
+        """
+        text_config = getattr(config, "text_config", config)
+        if bool(getattr(text_config, "enable_moe_block", False)):
+            # MoE variant: gemma-4-26B-A4B-it
+            return ModelCapabilities(
+                supports_tp=False,
+                supports_cp=True,
+                supports_pp=False,
+                supports_ep=True,
+            )
+        if getattr(config, "audio_config", None) is not None:
+            # Dense + audio variant: gemma-4-E2B-it, gemma-4-E4B-it
+            return ModelCapabilities()
+        # Plain dense variant: gemma-4-31B-it
+        return ModelCapabilities(
+            supports_tp=True,
+            supports_cp=False,
+            supports_pp=True,
+            supports_ep=False,
+        )
+
+    @classmethod
     def from_config(
         cls,
         config: Gemma4Config,
@@ -496,6 +593,18 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             cfg_text.moe_intermediate_size = cfg_text.expert_intermediate_size
         if not getattr(cfg_text, "expert_intermediate_size", None) and getattr(cfg_text, "moe_intermediate_size", None):
             cfg_text.expert_intermediate_size = cfg_text.moe_intermediate_size
+
+        # _init_model() only overrides the top-level hf_config.torch_dtype; for
+        # VL configs the nested text_config / vision_config keep their original
+        # dtype (typically bf16 from the checkpoint's config.json). Propagate
+        # the user-requested dtype to every nested sub-config that exposes a
+        # torch_dtype attribute, before constructing the HF parent and our
+        # text backend.
+        top_dtype = getattr(config, "torch_dtype", None)
+        if top_dtype is not None:
+            for sub_cfg in vars(config).values():
+                if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
+                    sub_cfg.torch_dtype = top_dtype
 
         # Initialize the HF parent (creates self.model, self.lm_head, vision tower, etc.)
         super().__init__(config)
@@ -547,15 +656,29 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         pixel_values: torch.Tensor | None = None,
         image_position_ids: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
     ):
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(
+                self.config.text_config if hasattr(self.config, "text_config") else self.config,
+                "output_hidden_states",
+                False,
+            )
+        )
+
         if cache_position is None and input_ids is not None:
             seq_len = input_ids.shape[-1]
             cache_position = torch.arange(seq_len, device=input_ids.device)
 
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
-            # Dense path — delegate to HF forward
+            # Dense path — delegate to HF forward (which already supports
+            # logits_to_keep + output_hidden_states and returns a ModelOutput
+            # carrying logits and hidden_states).
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -565,6 +688,8 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 pixel_values=pixel_values,
                 image_position_ids=image_position_ids,
                 mm_token_type_ids=mm_token_type_ids,
+                logits_to_keep=logits_to_keep,
+                output_hidden_states=output_hidden_states,
                 **kwargs,
             )
 
@@ -603,17 +728,17 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         hidden_states = outputs.last_hidden_state
 
-        if self.lm_head is not None:
-            logits = self.lm_head(hidden_states)
-        else:
-            logits = hidden_states
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
             logits = logits / final_logit_softcapping
             logits = torch.tanh(logits)
             logits = logits * final_logit_softcapping
 
-        return logits
+        return CausalLMOutputWithPast(
+            logits=logits,
+            hidden_states=hidden_states if output_hidden_states else None,
+        )
 
     @torch.no_grad()
     def initialize_weights(

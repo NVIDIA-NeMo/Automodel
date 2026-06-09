@@ -15,8 +15,8 @@
 
 """Extract per-layer activations from NeMo AutoModel using the training code path.
 
-Uses the same distributed setup as training (EP, FSDP, backend config) and
-registers forward hooks on decoder layers to capture hidden states. Saves
+Uses the same distributed environment and mesh context as training (EP, FSDP,
+backend config) and registers forward hooks on decoder layers to capture hidden states. Saves
 activations and final logits for comparison against HF Transformers.
 
 Run via torchrun:
@@ -54,6 +54,8 @@ DEFAULT_PROMPTS = [
 
 
 def main():
+    """Extract NeMo AutoModel activations for comparison."""
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Training YAML config")
     parser.add_argument("--output-file", required=True, help="Path to save activations (.pt)")
@@ -82,10 +84,10 @@ def main():
     sys.argv = ["extract_nemo_activations.py", "--config", args.config] + extra
     cfg = parse_args_and_load_config()
 
-    # --- Distributed setup ---
+    # --- Distributed environment and mesh context ---
     from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
     from nemo_automodel.components.loggers.log_utils import setup_logging
-    from nemo_automodel.recipes._dist_setup import setup_distributed
+    from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
     from nemo_automodel.recipes.llm.train_ft import build_distributed, build_model
     from nemo_automodel.shared.te_patches import apply_te_patches
 
@@ -93,9 +95,10 @@ def main():
     setup_logging()
     apply_cache_compatibility_patches()
     apply_te_patches()
-    dist_setup = setup_distributed(cfg, world_size=dist_env.world_size)
+    distributed_setup = create_distributed_setup_from_config(cfg, world_size=dist_env.world_size)
+    mesh_context = distributed_setup.mesh_context
 
-    if dist_setup.cp_size > 1 and cfg.get("model.backend.rope_fusion", False):
+    if mesh_context.cp_size > 1 and cfg.get("model.backend.rope_fusion", False):
         cfg.model.backend.rope_fusion = False
 
     # --- Build model ---
@@ -103,12 +106,7 @@ def main():
         cfg.model,
         cfg_peft=None,
         seed=cfg.get("seed", 42),
-        device_mesh=dist_setup.device_mesh,
-        moe_mesh=dist_setup.moe_mesh,
-        distributed_config=dist_setup.strategy_config,
-        pipeline_config=dist_setup.pipeline_config,
-        cfg_moe=dist_setup.moe_config,
-        activation_checkpointing=dist_setup.activation_checkpointing,
+        distributed_setup=distributed_setup,
     )
     model.eval()
 

@@ -41,6 +41,7 @@ model:
   use_liger_kernel: true
   use_sdpa_patching: true
   torch_dtype: bfloat16
+  do_distributed_inbatch_negative: false
 
 tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
@@ -143,4 +144,10 @@ distributed:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: oliverholworthy
+  time: "01:30:00"
+  nodes: 1
+  embed_eval: true

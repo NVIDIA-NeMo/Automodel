@@ -28,6 +28,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class MiniMaxM2Attention(nn.Module):
@@ -42,29 +43,35 @@ class MiniMaxM2Attention(nn.Module):
         self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.num_heads
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
 
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         self.q_proj = initialize_linear_module(
             backend.linear,
             config.hidden_size,
             self.num_heads * self.head_dim,
             bias=False,
+            dtype=dtype,
         )
         self.k_proj = initialize_linear_module(
             backend.linear,
             config.hidden_size,
             self.num_kv_heads * self.head_dim,
             bias=False,
+            dtype=dtype,
         )
         self.v_proj = initialize_linear_module(
             backend.linear,
             config.hidden_size,
             self.num_kv_heads * self.head_dim,
             bias=False,
+            dtype=dtype,
         )
         self.o_proj = initialize_linear_module(
             backend.linear,
             self.num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
+            dtype=dtype,
         )
 
         # HF MiniMax applies RMSNorm over flattened q/k projection dims before head reshape.
@@ -73,11 +80,13 @@ class MiniMaxM2Attention(nn.Module):
                 backend.rms_norm,
                 self.num_heads * self.head_dim,
                 eps=config.rms_norm_eps,
+                dtype=dtype,
             )
             self.k_norm = initialize_rms_norm_module(
                 backend.rms_norm,
                 self.num_kv_heads * self.head_dim,
                 eps=config.rms_norm_eps,
+                dtype=dtype,
             )
         else:
             self.q_norm = None

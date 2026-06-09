@@ -61,7 +61,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: false
 
 distributed:
   strategy: fsdp2
@@ -111,12 +111,12 @@ lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
 
-ci:
-  recipe_owner: akoumpa
-  time: "00:30:00"
-
 wandb:
   project: huiyingl_workspace
   entity: Nemo-automodel
   name: devstral_24b_squad_peft
   dir: logs/wandb
+
+ci:
+  recipe_owner: akoumpa
+  time: "00:30:00"
