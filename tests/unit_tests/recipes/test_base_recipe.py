@@ -754,6 +754,15 @@ def test_step_scheduler_log_includes_checkpoint_retention_policy(tmp_path, caplo
     assert "disabled; keeping all checkpoints" in caplog.text
     assert "checkpoint.max_recent_checkpoints=None" in caplog.text
 
+    caplog.clear()
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=2)
+    recipe_inst.checkpointer.config.enabled = False
+    with caplog.at_level(logging.INFO):
+        recipe_inst._log_step_scheduler_details(step_scheduler)
+
+    assert "inactive because checkpointing is disabled" in caplog.text
+    assert "keeping the most recent" not in caplog.text
+
 
 def test_checkpoint_retention_max_recent_one_preserves_latest_resume(tmp_path):
     """checkpoint.max_recent_checkpoints=1 prunes older checkpoints and keeps LATEST resumable."""
@@ -808,6 +817,26 @@ def test_checkpoint_retention_preserves_lowest_val_pointer_target(tmp_path):
     assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_200"]
     assert (tmp_path / "LOWEST_VAL").exists(follow_symlinks=False) or (tmp_path / "LOWEST_VAL.txt").exists()
     assert recipe_inst.load_checkpoint(restore_from="epoch_0_step_100") is None
+
+
+def test_checkpoint_restore_from_lowest_val_text_fallback(tmp_path):
+    """restore_from=LOWEST_VAL resolves text fallback pointers, not only symlinks."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+    recipe_inst.save_checkpoint(
+        epoch=0,
+        step=100,
+        train_loss=float(loss.item()),
+        val_loss={"val_loss": 0.1},
+    )
+    (tmp_path / "LOWEST_VAL").unlink(missing_ok=True)
+    (tmp_path / "LOWEST_VAL.txt").write_text("epoch_0_step_100")
+
+    assert recipe_inst.load_checkpoint(restore_from="LOWEST_VAL") is None
 
 
 def test_checkpoint_retention_preserves_arbitrary_checkpoint_pointer_target(tmp_path):

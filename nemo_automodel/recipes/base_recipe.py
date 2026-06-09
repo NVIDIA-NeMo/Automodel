@@ -254,7 +254,11 @@ def _resolve_restore_from_to_ckpt_dir(checkpoint_dir: str, restore_from: str) ->
         - str: resolved checkpoint directory
         - None: if restore_from='LATEST' but no checkpoint found (caller should start fresh)
     """
-    # Handle "LATEST" keyword for convenience
+    # Handle checkpoint-root pointers such as LATEST and LOWEST_VAL.
+    if os.path.sep not in restore_from and not os.path.isabs(restore_from):
+        pointed_checkpoint = _read_checkpoint_pointer(checkpoint_dir, restore_from)
+        if pointed_checkpoint is not None and pointed_checkpoint.is_dir():
+            return os.fspath(pointed_checkpoint)
     if restore_from.upper() == "LATEST":
         return _find_latest_checkpoint(checkpoint_dir)
 
@@ -537,15 +541,19 @@ class BaseRecipe:
 
         # Update latest symlink according to sync/async behavior
         if getattr(self.checkpointer.config, "is_async", False):
-            # Async: defer symlink until the next call (after async_wait completes)
+            # Async: defer symlink publication until the next call (after async_wait completes).
+            # Store a best-publish record on every rank so _complete_pending_checkpoint has a uniform
+            # barrier sequence even when validation metrics are only present on rank 0.
             setattr(self, "_last_pending_checkpoint_dir", path)
-            # Defer best symlink update similarly, capturing the metric used for comparison
-            if best_val_metric is not None:
-                setattr(
-                    self,
-                    "_last_pending_best_checkpoint_info",
-                    {"path": path, "val": float(best_val_metric), "metric_key": best_metric_name},
-                )
+            setattr(
+                self,
+                "_last_pending_best_checkpoint_info",
+                {
+                    "path": path,
+                    "val": float(best_val_metric) if best_val_metric is not None else None,
+                    "metric_key": best_metric_name,
+                },
+            )
         else:
             # Sync: update immediately
             if is_rank_0:
@@ -598,9 +606,15 @@ class BaseRecipe:
     def _finalize_pending_checkpoint(self) -> None:
         """Wait for the final async checkpoint, publish it, and apply retention."""
         checkpointer = getattr(self, "checkpointer", None)
-        if checkpointer is None or not checkpointer.config.enabled:
+        if checkpointer is None:
             return
-        checkpointer.async_wait()
+        config = getattr(checkpointer, "config", None)
+        if config is not None and not getattr(config, "enabled", True):
+            return
+        async_wait = getattr(checkpointer, "async_wait", None)
+        if async_wait is None:
+            return
+        async_wait()
         self._complete_pending_checkpoint()
 
     def _update_checkpoint_symlink(self, link_name: str, target_dir: str) -> None:
@@ -989,18 +1003,21 @@ class BaseRecipe:
             "Max train steps": step_scheduler.max_steps,
         }
         checkpoint_config = getattr(getattr(self, "checkpointer", None), "config", None)
-        if checkpoint_config is not None and hasattr(checkpoint_config, "max_recent_checkpoints"):
-            max_recent_checkpoints = checkpoint_config.max_recent_checkpoints
-            if max_recent_checkpoints is None:
-                attrs["Checkpoint retention"] = (
-                    "disabled; keeping all checkpoints (checkpoint.max_recent_checkpoints=None)"
-                )
-            else:
-                attrs["Checkpoint retention"] = (
-                    f"keeping the most recent {max_recent_checkpoints} checkpoint(s), "
-                    "plus pointer-protected checkpoints "
-                    f"(checkpoint.max_recent_checkpoints={max_recent_checkpoints})"
-                )
+        if checkpoint_config is not None:
+            if not getattr(checkpoint_config, "enabled", True):
+                attrs["Checkpoint retention"] = "inactive because checkpointing is disabled"
+            elif hasattr(checkpoint_config, "max_recent_checkpoints"):
+                max_recent_checkpoints = checkpoint_config.max_recent_checkpoints
+                if max_recent_checkpoints is None:
+                    attrs["Checkpoint retention"] = (
+                        "disabled; keeping all checkpoints (checkpoint.max_recent_checkpoints=None)"
+                    )
+                else:
+                    attrs["Checkpoint retention"] = (
+                        f"keeping the most recent {max_recent_checkpoints} checkpoint(s), "
+                        "plus pointer-protected checkpoints "
+                        f"(checkpoint.max_recent_checkpoints={max_recent_checkpoints})"
+                    )
         logging.info("Step scheduler:")
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")

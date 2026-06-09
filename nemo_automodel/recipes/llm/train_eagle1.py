@@ -416,12 +416,15 @@ class TrainEagle1Recipe(BaseRecipe):
 
         if getattr(self.checkpointer.config, "is_async", False):
             setattr(self, "_last_pending_checkpoint_dir", path)
-            if best_val_metric is not None:
-                setattr(
-                    self,
-                    "_last_pending_best_checkpoint_info",
-                    {"path": path, "val": float(best_val_metric), "metric_key": best_metric_name},
-                )
+            setattr(
+                self,
+                "_last_pending_best_checkpoint_info",
+                {
+                    "path": path,
+                    "val": float(best_val_metric) if best_val_metric is not None else None,
+                    "metric_key": best_metric_name,
+                },
+            )
         else:
             if is_rank_0:
                 self._update_latest_symlink(path)
