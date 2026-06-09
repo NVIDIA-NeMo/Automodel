@@ -258,8 +258,8 @@ neither. CI enforces this via
 that omits this declaration will fail the L0 unit-test job.
 
 The canonical `ModelCapabilities` dataclass (four bool fields: `supports_tp`,
-`supports_cp`, `supports_pp`, `supports_ep`) lives at
-`nemo_automodel._transformers.model_capabilities`.
+`supports_cp`, `supports_pp`, `supports_ep`) is re-exported at the package
+top level as `nemo_automodel.ModelCapabilities`.
 
 **Convention: declare what is verified by a recipe YAML.** A flag is `True`
 only when at least one `examples/*/*.yaml` for this class sets that
@@ -299,7 +299,7 @@ Return the canonical `ModelCapabilities` and branch on a config field that
 cleanly distinguishes the variants:
 
 ```python
-from nemo_automodel._transformers.model_capabilities import ModelCapabilities
+from nemo_automodel import ModelCapabilities
 
 
 class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
