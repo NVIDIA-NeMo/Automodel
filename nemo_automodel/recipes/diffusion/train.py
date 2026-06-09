@@ -29,7 +29,7 @@ from huggingface_hub.constants import HF_HUB_CACHE
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
-from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
