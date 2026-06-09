@@ -57,7 +57,7 @@ from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_
 from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
@@ -433,16 +433,12 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if target_attn_implementation is not None:
             target_kwargs["attn_implementation"] = target_attn_implementation
         if self.cfg.get("distributed", None) is not None:
-            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+            self.dist_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
             self.distributed_config = self.dist_setup.strategy_config
-            self.device_mesh = self.dist_setup.device_mesh
-            self.moe_mesh = self.dist_setup.moe_mesh
+            self.device_mesh = self.dist_setup.mesh_context.device_mesh
+            self.moe_mesh = self.dist_setup.mesh_context.moe_mesh
             target_kwargs.update(
-                distributed_config=self.distributed_config,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                moe_config=self.dist_setup.moe_config,
-                activation_checkpointing=self.dist_setup.activation_checkpointing,
+                distributed_setup=self.dist_setup,
             )
         self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         # ``nn.Module.to`` is in-place; reassigning ``self.target_model`` would

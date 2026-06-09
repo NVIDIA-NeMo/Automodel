@@ -399,17 +399,19 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     monkeypatch.setattr(vlm_finetune, "_supports_logits_to_keep", lambda model: True)
     monkeypatch.setattr(
         vlm_finetune,
-        "setup_distributed",
+        "create_distributed_setup_from_config",
         lambda cfg, world_size: SimpleNamespace(
+            mesh_context=SimpleNamespace(
+                pp_enabled=True,
+                device_mesh=None,
+                moe_mesh=None,
+                cp_size=cp_size,
+                pp_size=2,
+            ),
             strategy_config=SimpleNamespace(),
             pipeline_config=SimpleNamespace(),
-            moe_config=None,
+            moe_parallel_config=None,
             activation_checkpointing=False,
-            pp_enabled=True,
-            device_mesh=None,
-            moe_mesh=None,
-            cp_size=cp_size,
-            pp_size=2,
         ),
     )
 
