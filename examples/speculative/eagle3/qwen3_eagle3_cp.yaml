@@ -20,8 +20,11 @@ dist_env:
 
 recipe_args:
   target_model_name_or_path: Qwen/Qwen3-4B
+  # The target must run on SDPA for CP (ring attention via DTensor dispatch).
   target_attn_implementation: sdpa
-  draft_attn_implementation: sdpa
+  # The draft model only supports eager / flash_attention_2 (not sdpa); the
+  # draft runs on the full gathered sequence and is unaffected by CP.
+  draft_attn_implementation: flash_attention_2
   train_data_path: ./cache/dataset/perfectblend-messages
   val_data_path: null
   train_split: "train[:64]"
