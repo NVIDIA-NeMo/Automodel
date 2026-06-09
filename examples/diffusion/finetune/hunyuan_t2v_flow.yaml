@@ -6,6 +6,8 @@ model:
   # the mask optimization is the fastest validated full fine-tuning setup.
   attention_backend: "flash_varlen"
   optimize_hunyuan_flash_varlen_mask: true
+  torch_dtype: float32
+  compute_dtype: bfloat16
 
 optim:
   learning_rate: 5e-6

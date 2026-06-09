@@ -12,6 +12,8 @@ dist_env:
 model:
   pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
   mode: finetune  # "finetune" loads pretrained weights, "pretrain" initializes random weights
+  torch_dtype: float32
+  compute_dtype: bfloat16
 
 step_scheduler:
   global_batch_size: 8
