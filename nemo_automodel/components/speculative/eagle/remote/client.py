@@ -129,19 +129,31 @@ class _ServerClient:
             return True
 
     def generate(self, payload: bytes) -> dict[str, Optional[torch.Tensor]]:
-        """POST /generate and return the supervision tensors (NCCL or wire)."""
+        """POST /generate and return the supervision tensors (NCCL or wire).
+
+        ``/generate`` is the per-step hot path, so a transient timeout / connection
+        reset here would otherwise abort a long remote-training run. The wire path
+        is an idempotent HTTP round-trip, so it reuses :meth:`request`'s
+        exponential-backoff retry. The NCCL path is deliberately a single attempt:
+        the POST triggers a server-side NCCL send paired with the ``recv_tensors``
+        below, so a blind retry would issue a second send and desync the 2-process
+        data-plane group (the client's one recv vs the server's two sends would
+        hang). Recovering the NCCL path needs a transport resync (tear down +
+        re-init, or fall back to wire) and is tracked separately.
+        """
         if self._nccl_enabled and not self._nccl_attempted:
             self._init_nccl()
-        headers = {"Content-Type": "application/octet-stream"}
         use_nccl = self._nccl is not None and self._nccl.is_initialized
-        if use_nccl:
-            headers[protocol.NCCL_HEADER] = "1"
+        if not use_nccl:
+            return wire.decode(self.request(protocol.EP_GENERATE, payload), map_location="cpu")
         url = f"{self.url}/{protocol.EP_GENERATE}"
+        headers = {"Content-Type": "application/octet-stream", protocol.NCCL_HEADER: "1"}
         resp = self._session.post(url, data=payload, timeout=self.timeout, headers=headers)
         resp.raise_for_status()
-        if resp.headers.get(protocol.NCCL_HEADER) == "1" and use_nccl:
+        if resp.headers.get(protocol.NCCL_HEADER) == "1":
             keys_order, metadata = protocol.decode_nccl_metadata(resp.content)
             return self._nccl.recv_tensors(metadata, keys_order)
+        # Server fell back to wire despite the client offering NCCL.
         return wire.decode(resp.content, map_location="cpu")
 
     def close(self) -> None:
