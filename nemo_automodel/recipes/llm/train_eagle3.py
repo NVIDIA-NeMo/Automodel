@@ -929,6 +929,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         try:
             self._train_epochs(start_epoch, batches_per_epoch, is_ddp)
             self._maybe_save_final_checkpoint(self.num_epochs)
+            self._finalize_pending_checkpoint()
             if self.dist_env.is_main:
                 logger.info("Training complete: global_step=%s", self.runtime.global_step)
         finally:
