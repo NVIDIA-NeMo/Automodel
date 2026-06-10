@@ -7,6 +7,14 @@ TPS = tokens / (fwd + loss + bwd), optimizer step excluded.
 Usage:
     torchrun --nproc-per-node=8 blog_experiments/bench_automodel.py --model gptoss_20b
     torchrun --nproc-per-node=8 blog_experiments/bench_automodel.py --model qwen3_30b
+
+    # Nemotron-3-Ultra-550B (full fine-tune): full FT needs ~4.4 TB of resident state
+    # (8 B/param), so it requires multi-node. Verified config: 16 H100 nodes (128 GPUs),
+    # EP=64, lbs=2, balanced gate -> ~876 tps/gpu @ 58.5 GiB. Activation checkpointing +
+    # fused linear CE + MTP are enabled by the config (all defaults below).
+    #   srun --nodes=16 --ntasks-per-node=1 bash -c 'torchrun --nnodes=16 --nproc-per-node=8 \
+    #     --rdzv-backend=c10d --rdzv-endpoint="$MASTER_ADDR":29500 --node-rank=$SLURM_NODEID \
+    #     blog_experiments/bench_automodel.py --model nemotron_ultra'
 """
 
 import argparse
@@ -17,7 +25,6 @@ import time
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
 
 # Per-model backend configs matching the YAML configs
 MODEL_CONFIGS = {
@@ -46,7 +53,7 @@ MODEL_CONFIGS = {
             "experts": "torch_mm",
             "gate_precision": "bf16",
             "dispatcher": "deepep",
-            "fake_balanced_gate": False,
+            "fake_balanced_gate": True,
             "enable_hf_state_dict_adapter": True,
             "enable_fsdp_optimizations": True,
         },
@@ -63,6 +70,7 @@ MODEL_CONFIGS = {
             "rms_norm": "te",
             "experts": "torch_mm",
             "dispatcher": "deepep",
+            "fake_balanced_gate": True,
             "enable_hf_state_dict_adapter": True,
             "enable_fsdp_optimizations": True,
         },
@@ -70,6 +78,35 @@ MODEL_CONFIGS = {
         "trust_remote_code": True,
         "local_batch_size": 1,
         "returns_logits_only": False,
+    },
+    "nemotron_ultra": {
+        "pretrained_model_name_or_path": "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16",
+        "backend": {
+            "attn": "te",
+            "linear": "te",
+            "rms_norm": "te",
+            "experts": "torch_mm",
+            "dispatcher": "deepep",
+            "fake_balanced_gate": True,
+            "enable_fsdp_optimizations": False,
+        },
+        "extra_kwargs": {
+            "num_nextn_predict_layers": 2,
+            "mtp_use_repeated_layer": True,
+            "mtp_loss_scaling_factor": 0.1,
+            "output_hidden_states": True,
+        },
+        "trust_remote_code": True,
+        "local_batch_size": 2,
+        "returns_logits_only": False,
+        "ep_size": 64,
+        "activation_checkpointing": True,
+        "moe": {
+            "reshard_after_forward": True,
+            "wrap_outer_model": False,
+        },
+        "use_fused_ce": True,  # fused LM-head projection + CE; no [lbs, seq, vocab] logits
+        "use_mtp": True,
     },
 }
 
@@ -96,33 +133,35 @@ def compute_causal_lm_loss(logits, labels):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, choices=list(MODEL_CONFIGS.keys()))
-    parser.add_argument("--lbs", type=int, default=None, help="Override local batch size")
     parser.add_argument("--seq-len", type=int, default=SEQ_LEN, help="Sequence length")
     parser.add_argument("--steps", type=int, default=TIMED_STEPS)
     parser.add_argument("--warmup", type=int, default=WARMUP_STEPS)
-    parser.add_argument("--ep-size", type=int, default=8)
     args = parser.parse_args()
 
     cfg = MODEL_CONFIGS[args.model]
     seq_len = args.seq_len
-    lbs = args.lbs if args.lbs is not None else cfg["local_batch_size"]
+    lbs = cfg["local_batch_size"]
 
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    torch.cuda.set_device(rank)
+
+    ep_size = cfg.get("ep_size", 8)
 
     log(rank, f"=== Automodel Benchmark: {args.model} ===")
-    log(rank, f"World size: {world_size}, LBS: {lbs}, Seq len: {seq_len}, EP: {args.ep_size}")
+    log(rank, f"World size: {world_size}, LBS: {lbs}, Seq len: {seq_len}, EP: {ep_size}")
     log(rank, f"Warmup: {args.warmup}, Timed steps: {args.steps}")
     log(rank, f"Backend: {cfg['backend']}")
+    log(rank, f"MoE: {cfg.get('moe')}")
 
     # --- Set up distributed mesh with EP ---
     from nemo_automodel import NeMoAutoModelForCausalLM
-    from nemo_automodel.recipes._dist_setup import setup_distributed
     from nemo_automodel.components.models.common.utils import BackendConfig
+    from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 
-    dist_setup = setup_distributed(
+    dist_setup = create_distributed_setup_from_config(
         {
             "strategy": "fsdp2",
             "dp_size": None,
@@ -130,7 +169,9 @@ def main():
             "tp_size": 1,
             "pp_size": 1,
             "cp_size": 1,
-            "ep_size": args.ep_size,
+            "ep_size": ep_size,
+            "activation_checkpointing": cfg.get("activation_checkpointing", False),
+            **({"moe": cfg["moe"]} if "moe" in cfg else {}),
         },
         world_size=world_size,
     )
@@ -144,10 +185,7 @@ def main():
         cfg["pretrained_model_name_or_path"],
         torch_dtype=torch.bfloat16,
         trust_remote_code=cfg["trust_remote_code"],
-        device_mesh=dist_setup.device_mesh,
-        moe_mesh=dist_setup.moe_mesh,
-        distributed_config=dist_setup.strategy_config,
-        moe_config=dist_setup.moe_config,
+        distributed_setup=dist_setup,
         backend=backend_config,
         **cfg["extra_kwargs"],
     )
@@ -163,17 +201,54 @@ def main():
     # --- Dummy data ---
     # Get vocab size from model config
     vocab_size = model.config.vocab_size
-    device = torch.device(f"cuda:{rank}")
+    device = torch.device(f"cuda:{local_rank}")
     input_ids = torch.randint(0, vocab_size, (lbs, seq_len), device=device)
     labels = input_ids.clone()
 
     total_tokens_per_step = lbs * seq_len * world_size
     returns_logits_only = cfg.get("returns_logits_only", True)
+    use_fused_ce = cfg.get("use_fused_ce", False)
+    use_mtp = cfg.get("use_mtp", False)
+
+    if use_fused_ce:
+        from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+        from nemo_automodel.components.loss.utils import calculate_loss
+        from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+
+        if use_mtp:
+            from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+
+        fused_loss_fn = FusedLinearCrossEntropy()
+        num_label_tokens = int((labels != -100).sum().item())
 
     def forward_and_loss():
-        """Returns loss. Handles both raw-logits and CausalLMOutput models."""
-        if returns_logits_only:
-            logits = model(input_ids=input_ids)
+        """Returns loss. Handles raw-logits, CausalLMOutput, and fused-CE (+MTP) models."""
+        if use_fused_ce:
+            out = model(input_ids=input_ids, logits_to_keep=1)
+            loss = calculate_loss(
+                fused_loss_fn,
+                labels=labels,
+                model=model,
+                hidden_states=get_final_hidden_states(out),
+                num_label_tokens=num_label_tokens,
+            )
+            if use_mtp:
+                # MTP only fires in model.train() (set above); mtp_per_depth_h is None otherwise.
+                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+                if mtp_per_depth_h is not None:
+                    loss = loss + calculate_mtp_loss(
+                        fused_loss_fn,
+                        mtp_per_depth_h=mtp_per_depth_h,
+                        labels=labels,
+                        model=model,
+                        scaling_factor=out.mtp_loss_scaling_factor,
+                        num_label_tokens=num_label_tokens,
+                    )
+            return loss
+        elif returns_logits_only:
+            out = model(input_ids=input_ids)
+            # Merged main returns a CausalLMOutput; older builds returned a raw logits tensor.
+            logits = out.logits if hasattr(out, "logits") else out
             return compute_causal_lm_loss(logits, labels)
         else:
             out = model(input_ids=input_ids, labels=labels)
@@ -260,7 +335,7 @@ def main():
             "world_size": world_size,
             "local_batch_size": lbs,
             "seq_len": seq_len,
-            "ep_size": args.ep_size,
+            "ep_size": ep_size,
             "tokens_per_step": total_tokens_per_step,
             "warmup_steps": args.warmup,
             "timed_steps": args.steps,
@@ -277,8 +352,11 @@ def main():
 
         print("\n=== SUMMARY ===")
         print(json.dumps(summary, indent=2))
-        print(f"RESULT: automodel {args.model} EP={args.ep_size} — {summary['tps_per_gpu_avg']:.0f} tps/gpu "
-              f"(+/- {summary['tps_per_gpu_std']:.0f}), peak mem {summary['peak_mem_gib']:.1f} GiB")
+        print(
+            f"RESULT: automodel {args.model} EP={ep_size} — avg over {args.steps} post-warmup steps: "
+            f"{summary['tps_per_gpu_avg']:.0f} tps/gpu (+/- {summary['tps_per_gpu_std']:.0f}) | "
+            f"{summary['tps_total_avg']:.0f} tps total ({world_size} GPUs), peak mem {summary['peak_mem_gib']:.1f} GiB"
+        )
 
     dist.destroy_process_group()
 
