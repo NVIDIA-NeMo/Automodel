@@ -559,6 +559,13 @@ class MoESplitExpertsStateDictMixin:
         # Drop consumed entries so a subsequent from_hf (e.g. MTP merge after backbone) starts clean.
         if consumed_inplace_keys:
             self._inplace_loaded_native_keys -= consumed_inplace_keys
+            # These native keys were loaded in-place via strided views into model storage (DCP
+            # writes the checkpoint tensors straight through them), so they are intentionally
+            # absent from the returned state_dict but are NOT missing. Record them so the
+            # checkpoint loader's key-diff can exclude them and only flag genuinely unloaded params.
+            self._view_loaded_native_keys = (
+                getattr(self, "_view_loaded_native_keys", None) or set()
+            ) | consumed_inplace_keys
 
         # Recombine any per-expert HF LoRA keys back to grouped format
         state_dict = self._recombine_lora_expert_keys(state_dict)
