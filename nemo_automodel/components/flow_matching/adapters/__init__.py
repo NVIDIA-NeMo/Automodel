@@ -34,6 +34,7 @@ Usage:
 
 from .base import FlowMatchingContext, ModelAdapter
 from .flux import FluxAdapter
+from .flux2 import Flux2Adapter
 from .hunyuan import HunyuanAdapter
 from .qwen_image import QwenImageAdapter
 from .simple import SimpleAdapter
@@ -42,6 +43,7 @@ __all__ = [
     "FlowMatchingContext",
     "ModelAdapter",
     "FluxAdapter",
+    "Flux2Adapter",
     "HunyuanAdapter",
     "QwenImageAdapter",
     "SimpleAdapter",
