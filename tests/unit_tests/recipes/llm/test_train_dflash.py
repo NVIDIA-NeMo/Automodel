@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from nemo_automodel.recipes.llm import train_dflash
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
 
 
@@ -81,19 +82,43 @@ def test_maybe_save_final_checkpoint(every, save_epoch, gs, should_fire):
 
 
 def test_resolve_mask_token_id_prefers_explicit():
-    obj = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=5))
     cfg = SimpleNamespace(get=lambda k, d=None: 99 if k == "mask_token_id" else d)
-    assert TrainDFlashRecipe._resolve_mask_token_id(obj, cfg) == 99
+    assert TrainDFlashRecipe._resolve_mask_token_id(cfg, vocab_size=1000) == 99
 
 
-def test_resolve_mask_token_id_falls_back_to_pad():
-    obj = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=5))
+def test_resolve_mask_token_id_requires_explicit():
+    """Unset mask_token_id is a hard error (no silent fallback to pad, which often
+    aliases eos and would quietly degrade the mask-slot semantics)."""
     cfg = SimpleNamespace(get=lambda k, d=None: d)  # nothing set
-    assert TrainDFlashRecipe._resolve_mask_token_id(obj, cfg) == 5
+    with pytest.raises(ValueError, match="mask_token_id to be set explicitly"):
+        TrainDFlashRecipe._resolve_mask_token_id(cfg, vocab_size=1000)
 
 
-def test_resolve_mask_token_id_raises_without_any():
-    obj = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=None))
-    cfg = SimpleNamespace(get=lambda k, d=None: d)
-    with pytest.raises(ValueError, match="mask_token_id"):
-        TrainDFlashRecipe._resolve_mask_token_id(obj, cfg)
+def test_resolve_mask_token_id_range_checks():
+    """An id outside the vocab (a typo, or a stale token from another model) is
+    rejected rather than indexing the embed table out of bounds -- both the upper
+    (>= vocab_size) and the lower (< 0) bound."""
+    for bad in (5000, -1):
+        cfg = SimpleNamespace(get=lambda k, d=None, _v=bad: _v if k == "mask_token_id" else d)
+        with pytest.raises(ValueError, match="out of range"):
+            TrainDFlashRecipe._resolve_mask_token_id(cfg, vocab_size=1000)
+
+
+def test_all_ranks_have_valid_single_process_passes_local_flag():
+    # No DDP -> the local flag passes through unchanged (no collective).
+    assert train_dflash._all_ranks_have_valid(1, is_ddp=False, device="cpu") is True
+    assert train_dflash._all_ranks_have_valid(0, is_ddp=False, device="cpu") is False
+
+
+def test_all_ranks_have_valid_ddp_min_reduces_across_ranks(monkeypatch):
+    """Under DDP the flag is MIN-reduced: one rank without anchors makes all skip."""
+    monkeypatch.setattr(train_dflash.dist, "is_available", lambda: True)
+    monkeypatch.setattr(train_dflash.dist, "is_initialized", lambda: True)
+
+    # Another rank skipped -> the collective drives the flag to 0 -> all skip.
+    monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda t, op=None: t.fill_(0))
+    assert train_dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is False
+
+    # Every rank valid -> MIN leaves the 1 in place -> all run the backward.
+    monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda t, op=None: None)
+    assert train_dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is True

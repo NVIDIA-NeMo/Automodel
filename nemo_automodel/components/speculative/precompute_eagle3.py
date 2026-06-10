@@ -52,7 +52,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
+from typing import Any
 
 import torch
 
@@ -63,6 +65,8 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
     CACHE_KEYS,
     DTYPE_MAP,
     existing_shard_indices,
+    manifest_path,
+    read_manifest,
     write_manifest,
     write_shard,
     write_target_embeddings,
@@ -119,6 +123,38 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"--dtype must be one of {sorted(DTYPE_MAP)}, got {args.dtype!r}")
 
 
+def _ensure_resume_compatible(cache_dir: str, manifest: dict[str, Any], existing_shards: set[int]) -> None:
+    """Refuse to ``--resume`` into a cache produced with a different configuration.
+
+    Every manifest field shapes the shard contents or their addressing: the
+    ``target_probs`` columns follow ``selected_token_ids`` (which moves with the
+    dataset, shuffle seed, and draft vocab size), sample order follows the
+    dataset, and tensor shapes follow ``seq_length`` / ``dtype``. Shards from a
+    mismatched run are indistinguishable by shape alone, so without this check a
+    resume after changing e.g. ``--input-data`` or ``--shuffle-seed`` would keep
+    the old shards and bless them with the new manifest, silently corrupting the
+    supervision that training reads back.
+    """
+    if not os.path.exists(manifest_path(cache_dir)):
+        if existing_shards:
+            raise ValueError(
+                f"--resume was requested for {cache_dir}, but its manifest is missing, so the existing "
+                "shards cannot be verified against the current configuration. Delete the directory and "
+                "start fresh."
+            )
+        return
+    recorded = read_manifest(cache_dir)
+    recorded.pop("format_version", None)
+    if recorded != manifest:
+        mismatched = sorted(k for k in recorded.keys() | manifest.keys() if recorded.get(k) != manifest.get(k))
+        raise ValueError(
+            f"--resume was requested for {cache_dir}, but the recorded manifest does not match the current "
+            f"run configuration (mismatched fields: {mismatched}). Existing shards would be silently "
+            "inconsistent with newly written ones. Re-run with the original settings, or delete the "
+            "directory and start fresh."
+        )
+
+
 def _run(args: argparse.Namespace) -> int:
     """Load the target, scan the dataset once, and write the sharded cache. Returns an exit code."""
     _validate_args(args)
@@ -173,6 +209,26 @@ def _run(args: argparse.Namespace) -> int:
     selected_token_ids = selected_token_ids.to(device)
     selected_token_mask = selected_token_mask.to(device)
 
+    manifest = {
+        "target_model": args.target_model,
+        "target_vocab_size": target_vocab_size,
+        "draft_vocab_size": int(selected_token_ids.numel()),
+        "seq_length": args.seq_length,
+        "dtype": args.dtype,
+        "num_samples": num_samples,
+        "shard_size": args.shard_size,
+        "aux_hidden_dim": int(target_model.config.hidden_size) * len(target_wrapper.aux_layer_ids),
+        "aux_layer_ids": list(target_wrapper.aux_layer_ids),
+        "selected_token_ids": selected_token_ids.cpu().tolist(),
+    }
+    if args.resume:
+        _ensure_resume_compatible(args.output_dir, manifest, existing)
+    # Written before the shard loop (every field is already known here) so an
+    # interrupted run leaves a manifest behind for the resume check above. An
+    # incomplete cache still cannot be trained on: CachedEagle3Dataset verifies
+    # the shard count against ``num_samples`` before serving any sample.
+    write_manifest(args.output_dir, manifest)
+
     logger.info(
         "Precomputing EAGLE-3 cache: %d samples, shard_size=%d, draft_vocab=%d, dtype=%s -> %s",
         num_samples,
@@ -225,21 +281,6 @@ def _run(args: argparse.Namespace) -> int:
 
     _flush()  # trailing partial shard
 
-    write_manifest(
-        args.output_dir,
-        {
-            "target_model": args.target_model,
-            "target_vocab_size": target_vocab_size,
-            "draft_vocab_size": int(selected_token_ids.numel()),
-            "seq_length": args.seq_length,
-            "dtype": args.dtype,
-            "num_samples": num_samples,
-            "shard_size": args.shard_size,
-            "aux_hidden_dim": int(target_model.config.hidden_size) * len(target_wrapper.aux_layer_ids),
-            "aux_layer_ids": list(target_wrapper.aux_layer_ids),
-            "selected_token_ids": selected_token_ids.cpu().tolist(),
-        },
-    )
     logger.info("Done. Cache written to %s", args.output_dir)
     return 0
 
