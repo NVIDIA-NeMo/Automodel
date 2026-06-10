@@ -19,7 +19,6 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
-from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextGatedDeltaNet
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -30,7 +29,11 @@ from nemo_automodel.components.models.common import (
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
-from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
+from nemo_automodel.components.models.qwen3_next.layers import (
+    Qwen3NextAttention,
+    Qwen3NextFp32GatedDeltaNet,
+    Qwen3NextRMSNorm,
+)
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -44,7 +47,9 @@ class Block(nn.Module):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx]
         if self.layer_type == "linear_attention":
-            self.linear_attn = Qwen3NextGatedDeltaNet(config, layer_idx)
+            # fp32-aware GatedDeltaNet: keeps the intrinsically-fp32 A_log/dt_bias decay
+            # gate in fp32 under FSDP mixed precision (see Qwen3NextFp32GatedDeltaNet).
+            self.linear_attn = Qwen3NextFp32GatedDeltaNet(config, layer_idx)
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(config, layer_idx, backend)
 

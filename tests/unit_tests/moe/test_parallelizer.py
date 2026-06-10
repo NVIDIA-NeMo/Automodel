@@ -275,6 +275,24 @@ def _install_torch_and_layers_stubs(monkeypatch):
     experts_stub.GroupedExpertsTE = GroupedExpertsTE
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.experts", experts_stub)
 
+    # Stub the GatedDeltaNet fp32 helper (imported lazily inside apply_fsdp). The real
+    # module pulls in the heavy ``models.common`` package and ``torch.nn.functional``,
+    # neither of which exists under the stubbed ``torch`` used here. Parent packages are
+    # stubbed too so the lazy ``from ...common.gated_delta_net_fp32 import ...`` does not
+    # trigger their real (heavy) ``__init__``.
+    models_pkg = types.ModuleType("nemo_automodel.components.models")
+    models_common_pkg = types.ModuleType("nemo_automodel.components.models.common")
+    gdn_fp32_stub = types.ModuleType("nemo_automodel.components.models.common.gated_delta_net_fp32")
+    gdn_fp32_stub.HOLDER_NAME = "_fp32_params"
+    gdn_fp32_stub.isolate_gated_delta_net_fp32_params = lambda model: False
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.models", models_pkg)
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.models.common", models_common_pkg)
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.models.common.gated_delta_net_fp32",
+        gdn_fp32_stub,
+    )
+
 
 def _import_parallelizer_with_stubs(monkeypatch):
     import importlib
@@ -629,6 +647,40 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
 
     model_call = _find_call_by_first_arg(fully_shard_mock, model)
     assert model_call is not None and model_call[1]["mesh"] is fsdp_mesh
+
+
+def test_shard_fp32_gdn_holders_shards_each_holder(monkeypatch):
+    """``_shard_fp32_gdn_holders`` fully_shards each ``_fp32_params`` holder in a block."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+
+    holder = type("Holder", (), {"_modules": {}})()
+    gdn = type("GDN", (), {"_modules": {"_fp32_params": holder}})()
+    block = type(
+        "Block",
+        (),
+        {"_modules": {"linear_attn": gdn}, "modules": lambda self: iter([self, gdn, holder])},
+    )()
+
+    mesh = object()
+    mp_policy = object()
+    count = P._shard_fp32_gdn_holders(
+        block,
+        mesh=mesh,
+        mp_policy=mp_policy,
+        offload_policy=None,
+        reshard_after_forward=False,
+    )
+
+    assert count == 1
+    holder_call = _find_call_by_first_arg(fully_shard_mock, holder)
+    assert holder_call is not None
+    _, kwargs = holder_call
+    assert kwargs["mesh"] is mesh
+    assert kwargs["mp_policy"] is mp_policy
+    assert kwargs["reshard_after_forward"] is False
 
 
 def test_apply_fsdp_without_ep_enabled_has_no_ignored_params(monkeypatch):

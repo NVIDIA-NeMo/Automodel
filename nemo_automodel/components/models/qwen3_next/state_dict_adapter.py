@@ -20,6 +20,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.gated_delta_net_fp32 import strip_fp32_holder_key
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 
@@ -147,6 +148,10 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                 if pattern in key:
                     new_key = new_key.replace(pattern, replacement)
                     break
+            # Hide the GatedDeltaNet fp32 holder wrapping so saved checkpoints keep the
+            # bare HF key (``...linear_attn.A_log`` instead of
+            # ``...linear_attn._fp32_params.A_log``) and stay directly HF-loadable.
+            new_key = strip_fp32_holder_key(new_key)
             mapped_result.append((new_key, value))
 
         if exclude_key_regex:

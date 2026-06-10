@@ -557,3 +557,44 @@ class TestConvertSingleTensorToHf:
             assert len(result) == 1
             assert result[0][0] == "model.layers.0.mlp.shared_expert.gate_proj.weight"
             assert "exclude_me.weight" not in [k for k, _ in result]
+
+
+class TestFp32HolderKeyStripping:
+    """After FSDP isolation, A_log/dt_bias live under ``linear_attn._fp32_params.*``.
+
+    The adapter must hide that wrapping on save so checkpoints stay HF-loadable.
+    """
+
+    def _make_adapter(self):
+        moe_config = Mock()
+        moe_config.n_routed_experts = 8
+        moe_config.moe_inter_dim = 512
+        backend = Mock()
+        backend.dispatcher = "torch"
+        backend.experts = "torch"
+        return Qwen3NextStateDictAdapter(config=Mock(), moe_config=moe_config, backend=backend, dtype=torch.float32)
+
+    def test_convert_single_tensor_strips_a_log(self):
+        adapter = self._make_adapter()
+        result = adapter.convert_single_tensor_to_hf(
+            "model.layers.1.linear_attn._fp32_params.A_log", torch.zeros(4)
+        )
+        assert [k for k, _ in result] == ["model.layers.1.linear_attn.A_log"]
+
+    def test_convert_single_tensor_strips_dt_bias(self):
+        adapter = self._make_adapter()
+        result = adapter.convert_single_tensor_to_hf(
+            "model.layers.0.linear_attn._fp32_params.dt_bias", torch.ones(4)
+        )
+        assert [k for k, _ in result] == ["model.layers.0.linear_attn.dt_bias"]
+
+    def test_to_hf_strips_holder(self):
+        adapter = self._make_adapter()
+        out = adapter.to_hf({"model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4)})
+        assert "model.layers.0.linear_attn.A_log" in out
+        assert all("_fp32_params" not in k for k in out)
+
+    def test_bare_key_unchanged(self):
+        adapter = self._make_adapter()
+        result = adapter.convert_single_tensor_to_hf("model.layers.0.linear_attn.A_log", torch.zeros(4))
+        assert [k for k, _ in result] == ["model.layers.0.linear_attn.A_log"]

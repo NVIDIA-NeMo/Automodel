@@ -104,6 +104,39 @@ def _get_moe_module(block: nn.Module) -> MoE | None:
             return module
 
 
+def _shard_fp32_gdn_holders(
+    block: nn.Module,
+    *,
+    mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy,
+    offload_policy: OffloadPolicy | None,
+    reshard_after_forward: bool,
+) -> int:
+    """Shard each GatedDeltaNet ``_fp32_params`` holder in ``block`` as its own fp32 unit.
+
+    The holder carries the intrinsically-fp32 ``A_log``/``dt_bias`` params. Sharding it
+    on its own FSDP unit with an fp32 ``mp_policy`` keeps the decay-gate computation in
+    fp32 even though the surrounding block computes in ``param_dtype`` (bf16). The holder
+    becomes a nested FSDP unit, so the subsequent block-level ``fully_shard`` excludes its
+    params automatically (same mechanism used for expert-parallel experts).
+    """
+    from nemo_automodel.components.models.common.gated_delta_net_fp32 import HOLDER_NAME
+
+    count = 0
+    for module in block.modules():
+        holder = module._modules.get(HOLDER_NAME)
+        if holder is not None:
+            fully_shard(
+                holder,
+                mesh=mesh,
+                reshard_after_forward=reshard_after_forward,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+            )
+            count += 1
+    return count
+
+
 class ExpertParallel(ParallelStyle):
     """
     ExpertParallel class is used to shard the MoE parameters on the EP mesh.
@@ -321,6 +354,26 @@ def apply_fsdp(
         offload_policy=offload_policy,
     )
 
+    # Isolate intrinsically-fp32 GatedDeltaNet params (A_log/dt_bias) into per-layer
+    # ``_fp32_params`` holders so they can be sharded as fp32 FSDP units under bf16
+    # param_dtype. No-op for models without GatedDeltaNet layers (e.g. DeepSeek-V3).
+    from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
+        isolate_gated_delta_net_fp32_params,
+    )
+
+    has_fp32_gdn = isolate_gated_delta_net_fp32_params(model)
+    fp32_holder_mp_policy = None
+    if has_fp32_gdn:
+        # param_dtype=fp32 keeps A_log/dt_bias in fp32 for the gate; output_dtype=fp32
+        # keeps the resulting decay gate in fp32 (the MoE default output_dtype is bf16,
+        # which would otherwise round the gate back down).
+        fp32_holder_mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.float32,
+            reduce_dtype=mp_policy.reduce_dtype,
+            output_dtype=torch.float32,
+            cast_forward_inputs=mp_policy.cast_forward_inputs,
+        )
+
     if hasattr(model, "model") and model.model is not None:
         _model = model.model
     else:
@@ -350,6 +403,16 @@ def apply_fsdp(
         # If FSDP is enabled for grouped experts, the parameters are automatically
         # removed from the FSDP for the transformer block due to the rules of the
         # PyTorch FSDP implementation.
+        # Shard fp32 GatedDeltaNet holders as their own nested fp32 units before the
+        # block-level shard, so the block's bf16 ``fully_shard`` excludes them.
+        if fp32_holder_mp_policy is not None:
+            _shard_fp32_gdn_holders(
+                block,
+                mesh=fsdp_mesh,
+                mp_policy=fp32_holder_mp_policy,
+                offload_policy=offload_policy,
+                reshard_after_forward=reshard_after_forward,
+            )
         ignored_params = None
         if isinstance(moe_module, MoE) and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())

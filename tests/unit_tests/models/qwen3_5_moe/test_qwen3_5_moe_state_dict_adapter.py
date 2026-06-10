@@ -780,3 +780,37 @@ class TestFromHFEpShard:
         # No ep_shard slicing — full transposed tensor
         assert local_gate.shape == (n_experts, hidden, inter)
         torch.testing.assert_close(local_gate, gate_up_hf.transpose(1, 2).to(adapter.dtype))
+
+
+# ---------------------------------------------------------------------------
+# GatedDeltaNet fp32 holder key stripping (HF-clean saves)
+# ---------------------------------------------------------------------------
+class TestFp32HolderKeyStripping:
+    """After FSDP isolation, A_log/dt_bias live under ``linear_attn._fp32_params.*``.
+
+    The adapter must hide that wrapping on save so checkpoints stay HF-loadable.
+    """
+
+    def test_to_hf_strips_a_log_holder(self, adapter):
+        sd = {"model.language_model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4)}
+        out = adapter.to_hf(sd)
+        assert "model.language_model.layers.0.linear_attn.A_log" in out
+        assert all("_fp32_params" not in k for k in out)
+
+    def test_to_hf_strips_dt_bias_holder(self, adapter):
+        sd = {"model.language_model.layers.2.linear_attn._fp32_params.dt_bias": torch.ones(4)}
+        out = adapter.to_hf(sd)
+        assert "model.language_model.layers.2.linear_attn.dt_bias" in out
+        assert all("_fp32_params" not in k for k in out)
+
+    def test_convert_single_tensor_strips_holder(self, adapter):
+        result = adapter.convert_single_tensor_to_hf(
+            "model.language_model.layers.1.linear_attn._fp32_params.A_log", torch.zeros(4)
+        )
+        assert [k for k, _ in result] == ["model.language_model.layers.1.linear_attn.A_log"]
+
+    def test_bare_key_unchanged(self, adapter):
+        result = adapter.convert_single_tensor_to_hf(
+            "model.language_model.layers.0.linear_attn.A_log", torch.zeros(4)
+        )
+        assert [k for k, _ in result] == ["model.language_model.layers.0.linear_attn.A_log"]
