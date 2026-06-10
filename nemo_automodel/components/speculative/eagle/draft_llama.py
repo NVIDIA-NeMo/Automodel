@@ -665,6 +665,10 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
         self.config = config
         self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
         self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
+        # Activation checkpointing for the P-EAGLE draft layers (training-only
+        # memory knob; toggled via ``gradient_checkpointing_enable`` and read by
+        # ``_PeagleDraftMixin.forward_peagle``). Off by default; never serialized.
+        self.gradient_checkpointing = False
 
         self.model = Eagle3LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
@@ -741,6 +745,21 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
     def freeze_embeddings(self) -> None:
         """Freeze draft input embeddings."""
         self.model.embed_tokens.weight.requires_grad_(False)
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
+        """Enable activation checkpointing for the P-EAGLE draft layers.
+
+        Training-only memory knob: recomputes each ``forward_peagle`` layer in the
+        backward instead of storing its activations (the EAGLE-3 TTT ``forward``
+        path is unaffected). ``gradient_checkpointing_kwargs`` is accepted for
+        HF-API parity but ignored -- recompute is always non-reentrant, the only
+        mode compatible with the non-tensor ``block_mask``.
+        """
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self) -> None:
+        """Disable activation checkpointing for the P-EAGLE draft layers."""
+        self.gradient_checkpointing = False
 
     def project_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         """Project concatenated target aux states from ``num_aux * H_target`` to draft hidden size.
