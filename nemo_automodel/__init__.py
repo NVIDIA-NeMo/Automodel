@@ -56,6 +56,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "NeMoAutoModelCrossEncoder": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelCrossEncoder"),
     "NeMoAutoTokenizer": ("nemo_automodel._transformers.auto_tokenizer", "NeMoAutoTokenizer"),
     "NeMoAutoDiffusionPipeline": ("nemo_automodel._diffusers.auto_diffusion_pipeline", "NeMoAutoDiffusionPipeline"),
+    "ModelCapabilities": ("nemo_automodel._transformers.model_capabilities", "ModelCapabilities"),
+    "query_capabilities": ("nemo_automodel._transformers.model_capabilities", "query_capabilities"),
 }
 
 __all__ = sorted([*_SUBMODULES, "__version__", "__package_name__", *_LAZY_ATTRS.keys()])

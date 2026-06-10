@@ -271,7 +271,7 @@ class TestStep3p5ForCausalLM:
         with patch.object(
             model.model, "forward", return_value=torch.randn(batch, seq, config.hidden_size).to(torch.bfloat16)
         ):
-            logits = model(input_ids)
+            logits = model(input_ids).logits
 
         assert logits.shape == (batch, seq, config.vocab_size)
 

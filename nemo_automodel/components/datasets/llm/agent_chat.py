@@ -92,6 +92,18 @@ def _json_load_if_str(value: Any) -> Any:
     return value
 
 
+def _reasoning_content(turn: Dict[str, Any]) -> Optional[str]:
+    """Return a turn's reasoning/thinking trace as a string, or ``None`` if absent.
+
+    Shared by every conversion path so the ``reasoning_content`` field is read
+    and coerced identically (a falsy/empty trace is treated as absent).
+    """
+    reasoning = turn.get("reasoning_content")
+    if not reasoning:
+        return None
+    return reasoning if isinstance(reasoning, str) else str(reasoning)
+
+
 def _sharegpt_to_chatml(conversations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert ShareGPT ``{from, value}`` turns to chatml ``{role, content}``."""
     out: List[Dict[str, Any]] = []
@@ -102,8 +114,9 @@ def _sharegpt_to_chatml(conversations: List[Dict[str, Any]]) -> List[Dict[str, A
         chatml_turn = {"role": _SHAREGPT_ROLE_MAP[src_role], "content": turn.get("value", "")}
         # Carry an explicit reasoning/thinking field through if the export
         # stores it alongside the turn (e.g. ``reasoning_content``).
-        if turn.get("reasoning_content"):
-            chatml_turn["reasoning_content"] = turn["reasoning_content"]
+        reasoning = _reasoning_content(turn)
+        if reasoning is not None:
+            chatml_turn["reasoning_content"] = reasoning
         out.append(chatml_turn)
     return out
 
@@ -202,9 +215,9 @@ def _convert_messages(
             # a warning by ``format_chat_template``). Carried through here so a
             # following tool_call group can merge onto this same turn.
             if role == "assistant":
-                reasoning = messages[i].get("reasoning_content")
-                if reasoning:
-                    msg["reasoning_content"] = reasoning if isinstance(reasoning, str) else str(reasoning)
+                reasoning = _reasoning_content(messages[i])
+                if reasoning is not None:
+                    msg["reasoning_content"] = reasoning
             out.append(msg)
             i += 1
 
@@ -273,38 +286,6 @@ def _truncate_messages_to_fit(
     # Even the final exchange alone overflows; return it and let token-level
     # truncation (if enabled) clip the remainder.
     return system + history[boundaries[-1] :]
-
-
-def _mask_labels_to_last_turn(labels: List[int], ignore_index: int = -100) -> List[int]:
-    """Restrict the loss to the final assistant turn (``mask_history``).
-
-    ``labels`` come from :func:`format_chat_template` with every assistant
-    turn supervised; non-assistant tokens are already ``ignore_index``.
-    Because the chat template renders each assistant message as a single
-    contiguous span, supervised tokens form one maximal run per assistant
-    turn separated by ``ignore_index`` runs. This keeps only the last such
-    run and masks every earlier supervised token in place.
-
-    Args:
-        labels: per-token labels (``ignore_index`` marks unsupervised tokens).
-        ignore_index: the value marking unsupervised tokens.
-
-    Returns:
-        The same list, mutated so only the final supervised run is kept.
-    """
-    last = -1
-    for i in range(len(labels) - 1, -1, -1):
-        if labels[i] != ignore_index:
-            last = i
-            break
-    if last < 0:
-        return labels
-    start = last
-    while start - 1 >= 0 and labels[start - 1] != ignore_index:
-        start -= 1
-    for i in range(start):
-        labels[i] = ignore_index
-    return labels
 
 
 def _format_example(
@@ -400,10 +381,8 @@ def _format_example_impl(
         truncation=truncation,
         answer_only_loss_mask=True,
         mask_reasoning_content=mask_reasoning_content,
+        train_on_last_turn_only=train_on_last_turn_only,
     )
-    if train_on_last_turn_only:
-        _mask_labels_to_last_turn(tokenized["labels"])
-
     # Truncation (or over-aggressive last-turn masking) can leave a sample with no
     # supervised tokens at all — every label is ``ignore_index`` (-100). A single
     # such sample is harmless: the loss normalizes by the batch's supervised-token

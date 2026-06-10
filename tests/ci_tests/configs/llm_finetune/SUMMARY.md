@@ -17,7 +17,6 @@ The nightly scope uses only the recipes listed in [nightly_recipes.yml](nightly_
 | gemma_3_270m_squad | 00:20:00 | 1 | ✅ | ✅ | - |
 | glm_4_9b_chat_hf_squad | 00:10:00 | 1 | - | - | - |
 | gpt_oss_20b | 00:15:00 | 1 | ✅ | ✅ | ✅ |
-| gpt_oss_20b_single_gpu | 00:10:00 | 1 | - | - | - |
 | granite_3_3_2b_instruct_squad | 00:10:00 | 1 | - | - | - |
 | llama3_1_8b_hellaswag_pp | 00:10:00 | 1 | - | - | - |
 | llama3_2_1b_hellaswag | 00:15:00 | 1 | ✅ | - | - |

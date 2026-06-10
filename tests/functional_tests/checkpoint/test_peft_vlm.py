@@ -640,6 +640,7 @@ def test_hf_peft_checkpoint():
         "moe_rank_scaling": False,
         "target_modules": [],
         "use_dora": False,
+        "use_memory_efficient_lora": True,
         "use_triton": True,
     }
 
@@ -772,6 +773,7 @@ def test_hf_peft_checkpoint():
     source_model = trainer.model_parts[0]
 
     from nemo_automodel.components.checkpoint.checkpointing import _load_hf_checkpoint_preserving_dtype
+
     hf_model_path = cfg.get("model.pretrained_model_name_or_path")
     hf_state_dict = _load_hf_checkpoint_preserving_dtype(hf_model_path) or {}
     print(f"HF checkpoint loaded: {len(hf_state_dict)} keys from {hf_model_path}", flush=True)
@@ -782,9 +784,7 @@ def test_hf_peft_checkpoint():
     print(f"Model param keys  (first 10, no lora): {model_keys_sorted[:10]}", flush=True)
     param_mismatches = []
     buffer_mismatches = []
-    for (sn, sp), (rn, rp) in zip(
-        source_model.named_parameters(), restored_model.named_parameters()
-    ):
+    for (sn, sp), (rn, rp) in zip(source_model.named_parameters(), restored_model.named_parameters()):
         assert sn == rn, f"Parameter name mismatch: {sn} vs {rn}"
         sp_full = sp.full_tensor() if hasattr(sp, "full_tensor") else sp
         rp_full = rp.full_tensor() if hasattr(rp, "full_tensor") else rp
@@ -818,9 +818,7 @@ def test_hf_peft_checkpoint():
                 f"src_norm={sp_full.float().norm().item():.4f} rst_norm={rp_full.float().norm().item():.4f} "
                 f"| {src_vs_hf} | {rst_vs_hf}"
             )
-    for (sn, sb), (rn, rb) in zip(
-        source_model.named_buffers(), restored_model.named_buffers()
-    ):
+    for (sn, sb), (rn, rb) in zip(source_model.named_buffers(), restored_model.named_buffers()):
         assert sn == rn, f"Buffer name mismatch: {sn} vs {rn}"
         if sb.is_meta or rb.is_meta:
             buffer_mismatches.append(f"  BUFFER {sn}: src_meta={sb.is_meta} rst_meta={rb.is_meta}")
@@ -836,13 +834,16 @@ def test_hf_peft_checkpoint():
                 f"max_diff={diff.max().item():.6e} mean_diff={diff.mean().item():.6e}"
             )
     if param_mismatches or buffer_mismatches:
-        print(f"\n{'='*80}", flush=True)
-        print(f"WEIGHT COMPARISON: {len(param_mismatches)} param mismatches, {len(buffer_mismatches)} buffer mismatches", flush=True)
+        print(f"\n{'=' * 80}", flush=True)
+        print(
+            f"WEIGHT COMPARISON: {len(param_mismatches)} param mismatches, {len(buffer_mismatches)} buffer mismatches",
+            flush=True,
+        )
         for m in param_mismatches:
             print(m, flush=True)
         for m in buffer_mismatches:
             print(m, flush=True)
-        print(f"{'='*80}\n", flush=True)
+        print(f"{'=' * 80}\n", flush=True)
     else:
         print("WEIGHT COMPARISON: All parameters and buffers match exactly.", flush=True)
 

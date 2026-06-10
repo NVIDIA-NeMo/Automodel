@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import pathlib
+from collections import deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -32,7 +33,6 @@ from transformers import AutoConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import (
-    Checkpointer,
     CheckpointingConfig,
     save_config,
 )
@@ -47,35 +47,30 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
 )
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
     HFEagle3TargetModel,
 )
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
+from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
     _is_checkpoint_model_config_compatible,
     _resolve_restore_from_to_ckpt_dir,
 )
+from nemo_automodel.recipes.llm._spec_train_utils import (
+    make_warmup_cosine_schedule,
+    optim_steps_per_epoch,
+    should_sync_grads,
+)
+from nemo_automodel.recipes.llm.peagle_recipe import PeagleRecipeMixin
 
 logger = logging.getLogger(__name__)
-
-
-def _optim_steps_per_epoch(num_batches_per_epoch: int, grad_accumulation_steps: int) -> int:
-    """Return ceil(num_batches / accum), the actual number of optimizer steps per epoch.
-
-    Floor division silently drops the trailing partial accumulation window
-    (up to ``grad_accumulation_steps - 1`` micro-batches) from the LR
-    scheduler's view of training, even though the trainer now flushes those
-    gradients with an explicit step. Ceil keeps the scheduler aligned with
-    the actual number of ``optimizer.step()`` calls.
-    """
-    if num_batches_per_epoch <= 0 or grad_accumulation_steps <= 0:
-        return 0
-    return -(-num_batches_per_epoch // grad_accumulation_steps)
 
 
 def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
@@ -85,7 +80,48 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
-class TrainEagle3Recipe(BaseRecipe):
+def _best_effort(label: str, fn) -> None:
+    """Run a teardown step, logging (never raising) on failure so one failed step
+    does not abort the rest of cleanup."""
+    try:
+        fn()
+    except Exception:
+        logger.exception("error %s during cleanup", label)
+
+
+def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_size: int) -> None:
+    """Reject P-EAGLE (parallel_drafting) combinations its trainer cannot honor.
+
+    ``PEagleTrainerModule.forward`` consumes the live colocated target's full-vocab
+    ``target_logits`` only. The remote and offline-cache backends instead supply
+    precomputed draft-vocab ``target_probs``/``position_mask`` (a parameter
+    mismatch), and sequence packing feeds ``position_ids``/``seq_lens``/
+    ``doc_remaining`` the P-EAGLE forward does not accept (and the partitioned
+    path would run the target on a packed row without per-document masking,
+    leaking across documents). P-EAGLE only safely supports a colocated live
+    target on non-packed sequences.
+    """
+    if backend != "colocated":
+        raise NotImplementedError(
+            f"parallel_drafting (P-EAGLE) only supports target_model_backend='colocated', got "
+            f"{backend!r}. The remote backend supplies precomputed draft-vocab supervision, which "
+            f"the P-EAGLE trainer (full-vocab target_logits) does not accept."
+        )
+    if cached_target_path is not None:
+        raise NotImplementedError(
+            "parallel_drafting (P-EAGLE) does not support the offline cached target "
+            "(cached_target_path); the cache stores precomputed draft-vocab supervision consumed "
+            "only by the EAGLE-3 TTT trainer."
+        )
+    if packed_sequence_size > 0:
+        raise NotImplementedError(
+            "parallel_drafting (P-EAGLE) does not support sequence packing (packed_sequence_size>0); "
+            "the P-EAGLE forward does not accept the per-document packing metadata "
+            "(position_ids/seq_lens/doc_remaining)."
+        )
+
+
+class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
     """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
 
     def __init__(self, cfg):
@@ -125,6 +161,15 @@ class TrainEagle3Recipe(BaseRecipe):
         # entirely and stream the cache instead. This is disk-heavy and largely
         # superseded by the online path -- see precompute_eagle3 for the warning.
         self.cached_target_path = recipe_cfg.get("cached_target_path", None)
+        # P-EAGLE (parallel_drafting) only safely supports a colocated live target
+        # on non-packed sequences; gate the unsupported combinations early, before
+        # loading the target -- see _validate_peagle_gates.
+        if bool(recipe_cfg.get("parallel_drafting", False)):
+            _validate_peagle_gates(
+                backend=recipe_cfg.get("target_model_backend", "colocated"),
+                cached_target_path=self.cached_target_path,
+                packed_sequence_size=int(recipe_cfg.get("packed_sequence_size", 0) or 0),
+            )
         self.dist_setup = None
         self.distributed_config = None
         self.device_mesh = None
@@ -152,6 +197,19 @@ class TrainEagle3Recipe(BaseRecipe):
         # T x T causal block (Eagle3LlamaAttention merges FA's softmax_lse
         # with the diagonal-extension columns in log space).
         draft_config["attn_implementation"] = recipe_cfg.get("draft_attn_implementation", "eager")
+        # P-EAGLE (parallel drafting). When enabled, the draft registers a
+        # learnable ``mask_hidden`` placeholder and the trainer predicts all
+        # ``num_depths`` draft tokens in a single COD-subsampled parallel forward
+        # (https://github.com/vllm-project/speculators/pull/480) instead of
+        # EAGLE-3's autoregressive TTT unroll. ``mask_token_id`` is the reserved
+        # token id placed at masked multi-token-prediction slots; ``num_depths``
+        # and the COD ratios are serialized into the draft ``config.json`` so the
+        # saved checkpoint loads into vLLM's parallel-drafting runtime unchanged.
+        parallel_drafting = bool(recipe_cfg.get("parallel_drafting", False))
+        draft_config["parallel_drafting"] = parallel_drafting
+        mask_token_id = None
+        if parallel_drafting:
+            mask_token_id = self._configure_peagle_draft_config(recipe_cfg, draft_config, target_config)
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
@@ -168,15 +226,37 @@ class TrainEagle3Recipe(BaseRecipe):
             self.target_wrapper.get_input_embeddings() if self.target_wrapper is not None else self._cached_embed_source
         )
         self.draft_model.copy_embeddings_from_target(embed_source)
-        if recipe_cfg.get("freeze_embeddings", True):
+        # Embed the draft->target vocab map (d2t/t2d) into the draft so a
+        # compressed-vocab checkpoint carries the remap tables vLLM/SGLang need.
+        # No-op when the vocab is not compressed. See set_vocab_mapping.
+        self.draft_model.set_vocab_mapping(selected_token_ids)
+        # EAGLE-3 TTT freezes the draft embeddings by default; P-EAGLE trains them
+        # (speculators sets ``embed_requires_grad=True`` for parallel drafting).
+        # Either default can still be overridden via ``recipe_args.freeze_embeddings``.
+        freeze_embeddings_default = not parallel_drafting
+        if recipe_cfg.get("freeze_embeddings", freeze_embeddings_default):
             self.draft_model.freeze_embeddings()
+        # P-EAGLE memory knob: recompute the draft layers' activations in the
+        # backward instead of storing them, lowering the activation peak of the
+        # long flattened COD sequence (complements ``sequence_partitions``).
+        # Off by default; only affects the parallel-drafting forward.
+        if recipe_cfg.get("draft_gradient_checkpointing", False):
+            self.draft_model.gradient_checkpointing_enable()
+        # The target's "Model summary" is logged by apply_model_infrastructure when it
+        # loads; the draft is built directly, so log its (trainable) summary here too.
+        print_trainable_parameters(self.draft_model, name="Draft")
 
-        trainer_module = Eagle3TrainerModule(
-            self.draft_model,
-            selected_token_ids=selected_token_ids,
-            selected_token_mask=selected_token_mask,
-            ttt_steps=recipe_cfg.ttt_steps,
-        ).to(self.device)
+        if parallel_drafting:
+            trainer_module = self.build_peagle_trainer(
+                recipe_cfg, selected_token_ids, selected_token_mask, mask_token_id
+            )
+        else:
+            trainer_module = Eagle3TrainerModule(
+                self.draft_model,
+                selected_token_ids=selected_token_ids,
+                selected_token_mask=selected_token_mask,
+                ttt_steps=recipe_cfg.ttt_steps,
+            ).to(self.device)
         if self.dist_env.world_size > 1:
             trainer_module = DistributedDataParallel(
                 trainer_module,
@@ -197,8 +277,20 @@ class TrainEagle3Recipe(BaseRecipe):
         )
         self.grad_accumulation_steps = recipe_cfg.get("grad_accumulation_steps", 1)
         self.max_grad_norm = recipe_cfg.get("max_grad_norm", 1.0)
+        self.target_prefetch_depth = self._resolve_prefetch_depth(recipe_cfg)
         self.num_epochs = recipe_cfg.num_epochs
         self.log_every_steps = recipe_cfg.get("log_every_steps", 10)
+        # Checkpoint cadence. The two knobs are independent:
+        #   * ``ckpt_every_steps``            -- save every N optimizer steps (None/<=0 = off).
+        #   * ``save_checkpoint_every_epoch`` -- save at each epoch boundary (off by default).
+        # The fully-trained model is always saved once the run completes; these
+        # only add intermediate checkpoints (and stack when both are set). With
+        # both off, the end-of-run checkpoint is the only one written.
+        # NOTE: field names mirror StepScheduler (components/training/step_scheduler.py),
+        # which the SFT recipe uses for the same cadence; EAGLE hand-rolls its own
+        # loop, so a future refactor could adopt StepScheduler here too.
+        self.ckpt_every_steps = recipe_cfg.get("ckpt_every_steps", None)
+        self.save_checkpoint_every_epoch = recipe_cfg.get("save_checkpoint_every_epoch", False)
         self.output_dir = pathlib.Path(recipe_cfg.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -218,21 +310,14 @@ class TrainEagle3Recipe(BaseRecipe):
         # final epoch trains at ``min_lr_ratio`` instead of the intended decay.
         total_optim_steps = max(
             1,
-            self.num_epochs * _optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps),
+            self.num_epochs * optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps),
         )
         warmup_ratio = float(opt_cfg.get("warmup_ratio", 0.05))
         min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
         warmup_steps = max(1, int(warmup_ratio * total_optim_steps))
-
-        def _lr_lambda(step: int) -> float:
-            if step < warmup_steps:
-                return float(step + 1) / float(warmup_steps)
-            progress = (step - warmup_steps) / max(1, total_optim_steps - warmup_steps)
-            progress = min(max(progress, 0.0), 1.0)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, _lr_lambda)
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, make_warmup_cosine_schedule(warmup_steps, total_optim_steps, min_lr_ratio)
+        )
         self.total_optim_steps = total_optim_steps
         self.warmup_steps = warmup_steps
         self.min_lr_ratio = min_lr_ratio
@@ -247,6 +332,16 @@ class TrainEagle3Recipe(BaseRecipe):
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
+        # Optional Weights & Biases logging (rank 0 only).
+        self.wandb_run = None
+        if self.dist_env.is_main and self.cfg.get("wandb", None) is not None:
+            suppress_wandb_log_messages()
+            self.wandb_run = init_wandb_run(
+                self.cfg.wandb.to_dict(),
+                self.cfg.to_dict(),
+                default_name="eagle3_" + str(target_path).rstrip("/").split("/")[-1],
+            )
+
     def _setup_online_target(self, recipe_cfg, target_path, target_config):
         """Live path: load the target model and build the live dataloader.
 
@@ -255,6 +350,84 @@ class TrainEagle3Recipe(BaseRecipe):
         ``(selected_token_ids, selected_token_mask)`` draft-vocab mapping built
         by scanning the training data.
         """
+        # ``target_model_backend`` selects where the frozen target runs:
+        #   - ``colocated`` (default): load the target on this GPU and capture
+        #     supervision in-process.
+        #   - ``remote``: the target runs as a standalone server (see
+        #     ``serve_target``); this process only holds the draft and pulls
+        #     precomputed supervision over HTTP + NCCL. No target weights are
+        #     loaded here, which frees the training GPU's memory.
+        backend = recipe_cfg.get("target_model_backend", "colocated")
+        # Sequence packing is colocated-only (the remote server does not yet honor
+        # per-document masking).
+        packed_sequence_size = recipe_cfg.get("packed_sequence_size", 0)
+        if packed_sequence_size > 0 and backend == "remote":
+            raise NotImplementedError(
+                "packed_sequence_size > 0 is only supported with the colocated target backend; "
+                "the remote backend does not yet propagate per-document masking."
+            )
+        if backend == "remote":
+            self._setup_remote_target(recipe_cfg)
+        elif backend == "colocated":
+            self._setup_colocated_target(recipe_cfg, target_path)
+        else:
+            raise ValueError(f"Unknown target_model_backend={backend!r}; expected 'colocated' or 'remote'.")
+
+        self.train_dataloader = build_eagle3_dataloader(
+            data_path=recipe_cfg.train_data_path,
+            tokenizer=self.tokenizer,
+            seq_length=recipe_cfg.seq_length,
+            batch_size=recipe_cfg.micro_batch_size,
+            shuffle=True,
+            num_workers=recipe_cfg.get("num_workers", 0),
+            split=recipe_cfg.get("train_split", None),
+            distributed=self.dist_env.world_size > 1,
+            shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            packed_sequence_size=packed_sequence_size,
+        )
+        self.val_dataloader = None
+        if recipe_cfg.get("val_data_path", None):
+            self.val_dataloader = build_eagle3_dataloader(
+                data_path=recipe_cfg.val_data_path,
+                tokenizer=self.tokenizer,
+                seq_length=recipe_cfg.seq_length,
+                batch_size=recipe_cfg.micro_batch_size,
+                shuffle=False,
+                num_workers=recipe_cfg.get("num_workers", 0),
+                split=recipe_cfg.get("val_split", None),
+                distributed=self.dist_env.world_size > 1,
+                shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+                mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                packed_sequence_size=packed_sequence_size,
+            )
+
+        special_token_ids = [
+            getattr(self.tokenizer, "bos_token_id", None),
+            getattr(self.tokenizer, "eos_token_id", None),
+            getattr(self.tokenizer, "pad_token_id", None),
+            getattr(self.tokenizer, "unk_token_id", None),
+        ]
+        # ``selected_token_ids_path`` (optional) caches the draft-vocab selection
+        # so reruns skip the full-dataset frequency scan. When unset, the mapping
+        # is rebuilt every setup (original behavior). On resume this still runs,
+        # but ``_load_extra_state`` then overrides it with the checkpoint's saved
+        # mapping -- so the cache only matters for cold starts.
+        selected_token_ids, selected_token_mask = load_or_build_eagle3_token_mapping(
+            self.train_dataloader,
+            target_vocab_size=target_config.vocab_size,
+            draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
+            special_token_ids=special_token_ids,
+            cache_path=recipe_cfg.get("selected_token_ids_path", None),
+        )
+        # A remote target computes ``target_probs`` server-side, so it needs the
+        # draft-vocab mapping. Co-located backends keep it on the trainer module
+        # (the default ``set_vocab_mapping`` is a no-op).
+        self.target_wrapper.set_vocab_mapping(selected_token_ids, selected_token_mask)
+        return selected_token_ids, selected_token_mask
+
+    def _setup_colocated_target(self, recipe_cfg, target_path):
+        """Load the target on this GPU and capture supervision in-process."""
         # Optional ``distributed:`` YAML section. Required for targets that do
         # not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). ``force_hf`` is
         # opt-in; default ``False`` so HF architectures with an AutoModel custom
@@ -264,17 +437,18 @@ class TrainEagle3Recipe(BaseRecipe):
             torch_dtype=self.compute_dtype,
             force_hf=bool(recipe_cfg.get("target_force_hf", False)),
         )
+        # Optional target attention backend (default: HF auto-select). Pin to
+        # ``sdpa`` to dodge the Qwen3 FA2 ``s_aux=None`` crash in transformers.
+        target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
+        if target_attn_implementation is not None:
+            target_kwargs["attn_implementation"] = target_attn_implementation
         if self.cfg.get("distributed", None) is not None:
-            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+            self.dist_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
             self.distributed_config = self.dist_setup.strategy_config
-            self.device_mesh = self.dist_setup.device_mesh
-            self.moe_mesh = self.dist_setup.moe_mesh
+            self.device_mesh = self.dist_setup.mesh_context.device_mesh
+            self.moe_mesh = self.dist_setup.mesh_context.moe_mesh
             target_kwargs.update(
-                distributed_config=self.distributed_config,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                moe_config=self.dist_setup.moe_config,
-                activation_checkpointing=self.dist_setup.activation_checkpointing,
+                distributed_setup=self.dist_setup,
             )
         self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         # ``nn.Module.to`` is in-place; reassigning ``self.target_model`` would
@@ -291,49 +465,41 @@ class TrainEagle3Recipe(BaseRecipe):
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
         )
 
-        self.train_dataloader = build_eagle3_dataloader(
-            data_path=recipe_cfg.train_data_path,
-            tokenizer=self.tokenizer,
-            seq_length=recipe_cfg.seq_length,
-            batch_size=recipe_cfg.micro_batch_size,
-            shuffle=True,
-            num_workers=recipe_cfg.get("num_workers", 0),
-            split=recipe_cfg.get("train_split", None),
-            distributed=self.dist_env.world_size > 1,
-            shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
-        )
-        self.val_dataloader = None
-        if recipe_cfg.get("val_data_path", None):
-            self.val_dataloader = build_eagle3_dataloader(
-                data_path=recipe_cfg.val_data_path,
-                tokenizer=self.tokenizer,
-                seq_length=recipe_cfg.seq_length,
-                batch_size=recipe_cfg.micro_batch_size,
-                shuffle=False,
-                num_workers=recipe_cfg.get("num_workers", 0),
-                split=recipe_cfg.get("val_split", None),
-                distributed=self.dist_env.world_size > 1,
-                shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+    def _setup_remote_target(self, recipe_cfg):
+        """Connect to one or more remote target servers (no target loaded here)."""
+        urls = recipe_cfg.get("remote_urls", None)
+        if not urls and recipe_cfg.get("remote_url", None):
+            urls = [recipe_cfg.remote_url]
+        if not urls:
+            raise ValueError(
+                "target_model_backend='remote' requires recipe_args.remote_urls "
+                "(or remote_url) pointing at a running serve_target instance."
             )
-
-        special_token_ids = [
-            getattr(self.tokenizer, "bos_token_id", None),
-            getattr(self.tokenizer, "eos_token_id", None),
-            getattr(self.tokenizer, "pad_token_id", None),
-            getattr(self.tokenizer, "unk_token_id", None),
-        ]
-        # ``selected_token_ids_path`` (optional) caches the draft-vocab selection
-        # so reruns skip the full-dataset frequency scan. When unset, the mapping
-        # is rebuilt every setup (original behavior). On resume this still runs,
-        # but ``_load_extra_state`` then overrides it with the checkpoint's saved
-        # mapping -- so the cache only matters for cold starts.
-        return load_or_build_eagle3_token_mapping(
-            self.train_dataloader,
-            target_vocab_size=target_config.vocab_size,
-            draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
-            special_token_ids=special_token_ids,
-            cache_path=recipe_cfg.get("selected_token_ids_path", None),
+        self.target_model = None
+        self.target_wrapper = RemoteEagle3TargetModel.from_urls(
+            list(urls),
+            device=self.device,
+            timeout=recipe_cfg.get("remote_timeout", 120),
+            max_retries=recipe_cfg.get("remote_max_retries", 3),
         )
+
+    def _resolve_prefetch_depth(self, recipe_cfg) -> int:
+        """Validate and cap the prefetch depth for the configured backend."""
+        depth = int(recipe_cfg.get("target_prefetch_depth", 0))
+        if depth < 0:
+            raise ValueError(f"target_prefetch_depth must be >= 0, got {depth}.")
+        if depth == 0:
+            return 0
+        if self.target_wrapper is None or not self.target_wrapper.supports_async:
+            raise ValueError(
+                "target_prefetch_depth > 0 requires an async-capable backend (target_model_backend='remote')."
+            )
+        # One in-flight request per server keeps NCCL recv ordering unambiguous.
+        num_servers = getattr(self.target_wrapper, "num_remote_servers", 1)
+        capped = min(depth, num_servers)
+        if capped != depth and self.dist_env.is_main:
+            logger.info("Capping target_prefetch_depth %d -> %d (one in-flight request per server).", depth, capped)
+        return capped
 
     def _setup_cached_target(self, recipe_cfg, target_config):
         """Offline path: stream a precomputed cache; no target model is loaded.
@@ -385,11 +551,27 @@ class TrainEagle3Recipe(BaseRecipe):
             )
         return selected_token_ids, selected_token_mask
 
-    def _forward_batch(self, batch):
-        """Run the trainer module for one batch, from the live target or the cache."""
+    def _forward_batch(self, batch, target_batch=None):
+        """Run the trainer module for one batch, from the live target or the cache.
+
+        ``target_batch`` may be supplied when the supervision was prefetched
+        asynchronously (remote backend); it is already on the training device
+        and self-contained, so the raw ``batch`` is not needed.
+        """
+        if target_batch is not None:
+            return self.trainer_module(**target_batch.to_trainer_inputs())
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        # Sequence-packing metadata (present only when packed_sequence_size > 0).
+        packing_kwargs = {}
+        if "seq_lens" in batch:
+            packing_kwargs = {
+                "position_ids": batch["position_ids"],
+                "seq_lens": batch["seq_lens"],
+                "doc_remaining": batch["doc_remaining"],
+            }
         if self.target_wrapper is None:
             # Offline cache: the supervision is already in the batch.
+            batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
             return self.trainer_module(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
@@ -397,19 +579,54 @@ class TrainEagle3Recipe(BaseRecipe):
                 aux_hidden_states=batch["aux_hidden_states"],
                 target_probs=batch["target_probs"],
                 position_mask=batch["position_mask"],
+                **packing_kwargs,
             )
         target_batch = self.target_wrapper.generate_batch(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             loss_mask=batch["loss_mask"],
+            **packing_kwargs,
         )
-        return self.trainer_module(
-            input_ids=target_batch.input_ids,
-            attention_mask=target_batch.attention_mask,
-            loss_mask=target_batch.loss_mask,
-            aux_hidden_states=target_batch.aux_hidden_states,
-            target_logits=target_batch.logits,
-        )
+        return self.trainer_module(**target_batch.to_trainer_inputs())
+
+    def _prefetched_batches(self, dataloader):
+        """Yield ``(batch, target_batch)`` keeping up to ``target_prefetch_depth``
+        remote target requests in flight, so target inference on the server(s)
+        overlaps draft training on this GPU.
+
+        Requests are dispatched round-robin across servers by the backend; the
+        depth is capped to the server count (see ``setup``) so each server has
+        at most one in-flight request -- required for NCCL recv ordering.
+        """
+        depth = self.target_prefetch_depth
+        it = iter(dataloader)
+        queue: deque = deque()
+        exhausted = False
+
+        def fill():
+            nonlocal exhausted
+            while not exhausted and len(queue) < depth:
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    exhausted = True
+                    return
+                handle = self.target_wrapper.generate_batch_async(
+                    batch["input_ids"], batch["attention_mask"], batch["loss_mask"]
+                )
+                queue.append((batch, handle))
+
+        fill()
+        while queue:
+            batch, handle = queue.popleft()
+            target_batch = handle.result()
+            # Refill only after the popped request completed: round-robin makes
+            # its server the next dispatch target, so refilling before the
+            # result would put a second request in flight on a busy server and
+            # break the one-in-flight-per-server invariant that NCCL recv
+            # ordering and the server's hook-based aux capture rely on.
+            fill()
+            yield batch, target_batch
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the standard recipes."""
@@ -440,8 +657,7 @@ class TrainEagle3Recipe(BaseRecipe):
 
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
         dp_rank = dist.get_rank() if dist.is_initialized() else 0
-        self.checkpointer = Checkpointer(
-            config=self.checkpoint_config,
+        self.checkpointer = self.checkpoint_config.build(
             dp_rank=dp_rank,
             tp_rank=0,
             pp_rank=0,
@@ -549,6 +765,62 @@ class TrainEagle3Recipe(BaseRecipe):
             if is_dist_initialized:
                 dist.barrier()
 
+    def _log_saved_checkpoint(self, kind: str, epoch: int, step: int) -> None:
+        """Log a saved checkpoint on rank 0 when checkpointing is enabled."""
+        ckpt_cfg = getattr(self, "checkpoint_config", None)
+        if self.dist_env.is_main and ckpt_cfg is not None and ckpt_cfg.enabled:
+            logger.info("Saved %s checkpoint to %s/epoch_%d_step_%d", kind, ckpt_cfg.checkpoint_dir, epoch, step)
+
+    def _maybe_save_step_checkpoint(self, epoch: int) -> bool:
+        """Save a checkpoint mid-epoch when ``ckpt_every_steps`` is configured.
+
+        Called after every optimizer step. Saves whenever ``ckpt_every_steps`` is
+        a positive integer and the current ``global_step`` is a multiple of it.
+        Returns True if a checkpoint was written. The checkpoint directory is
+        named ``epoch_{epoch}_step_{global_step}`` so it never collides with the
+        end-of-epoch checkpoint (which uses ``epoch + 1``).
+        """
+        every = getattr(self, "ckpt_every_steps", None)
+        if every is None or every <= 0 or self.runtime.global_step % every != 0:
+            return False
+        self.save_checkpoint(
+            epoch=epoch,
+            step=self.runtime.global_step,
+            train_loss=None,
+            val_loss=None,
+            best_metric_key="val_loss",
+        )
+        self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
+        return True
+
+    def _maybe_save_final_checkpoint(self, completed_epochs: int) -> bool:
+        """Always save the fully-trained model at the end of a completed run,
+        unless a periodic checkpoint already captured the final step.
+
+        The end-of-run state is otherwise easy to lose: with no cadence nothing is
+        saved at all, and with a pure step cadence the final step is skipped
+        whenever the total step count is not a multiple of ``ckpt_every_steps``.
+        This is a no-op only when a step or epoch checkpoint already landed on the
+        final step, so it never duplicates or collides with one.
+        """
+        gs = self.runtime.global_step
+        if gs <= 0:
+            return False
+        every = getattr(self, "ckpt_every_steps", None)
+        saved_by_step = bool(every and every > 0 and gs % every == 0)
+        saved_by_epoch = bool(getattr(self, "save_checkpoint_every_epoch", False))
+        if saved_by_step or saved_by_epoch:
+            return False
+        self.save_checkpoint(
+            epoch=completed_epochs,
+            step=gs,
+            train_loss=None,
+            val_loss=None,
+            best_metric_key="val_loss",
+        )
+        self._log_saved_checkpoint("final", completed_epochs, gs)
+        return True
+
     def _save_extra_state(self, path: str, epoch: int) -> None:
         """Persist EAGLE-3 meta: global_step, epoch, and vocab mapping tensors."""
         torch.save(
@@ -636,6 +908,16 @@ class TrainEagle3Recipe(BaseRecipe):
                 module = self._module()
                 module.selected_token_ids.copy_(ids.to(module.selected_token_ids.device))
                 module.selected_token_mask.copy_(mask.to(module.selected_token_mask.device))
+                # set_vocab_mapping was already called at setup() with the
+                # freshly-scanned mapping, but resume can restore a different one
+                # (the checkpoint's, e.g. when the data / split / cache changed).
+                # Re-apply it so the draft's d2t/t2d tables and -- the actual bug
+                # -- the remote target server (which projects to the draft vocab
+                # itself) match the checkpoint, not the setup-time scan. Colocated
+                # set_vocab_mapping is a no-op; the cached path has no target.
+                self.draft_model.set_vocab_mapping(module.selected_token_ids)
+                if getattr(self, "target_wrapper", None) is not None:
+                    self.target_wrapper.set_vocab_mapping(module.selected_token_ids, module.selected_token_mask)
 
     def _run_eval(self):
         if self.val_dataloader is None:
@@ -656,6 +938,12 @@ class TrainEagle3Recipe(BaseRecipe):
         self.trainer_module.train()
         return (total_loss / total_batches.clamp_min(1.0), total_acc / total_batches.clamp_min(1.0))
 
+    def _wandb_log(self, data: dict, step: int) -> None:
+        """Log a metrics dict to W&B when a run is active (rank 0)."""
+        run = getattr(self, "wandb_run", None)
+        if run is not None:
+            run.log(data, step=step)
+
     def run_train_validation_loop(self):
         """Run the minimal EAGLE-3 train loop."""
         self.trainer_module.train()
@@ -663,10 +951,12 @@ class TrainEagle3Recipe(BaseRecipe):
             batches_per_epoch = len(self.train_dataloader)
         except TypeError:
             batches_per_epoch = None
+        is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
         start_epoch = max(0, int(getattr(self, "_resume_epoch", 0)))
         if start_epoch >= self.num_epochs:
             if self.dist_env.is_main:
                 logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
+            self._finalize_training()
             return
         if self.dist_env.is_main:
             logger.info(
@@ -683,6 +973,37 @@ class TrainEagle3Recipe(BaseRecipe):
                 self.min_lr_ratio,
             )
 
+        try:
+            self._train_epochs(start_epoch, batches_per_epoch, is_ddp)
+            self._maybe_save_final_checkpoint(self.num_epochs)
+            self._finalize_pending_checkpoint()
+            if self.dist_env.is_main:
+                logger.info("Training complete: global_step=%s", self.runtime.global_step)
+        finally:
+            self._finalize_training()
+
+    def _finalize_training(self) -> None:
+        """Release training resources on any exit path (normal, early-return, or
+        exception). Best-effort: each step is guarded so a failure in one does not
+        block the others.
+
+        The high-value step is disconnecting the remote target. Without it a
+        mid-training crash leaves the long-lived target server with a stale
+        client-idle state and a half-open NCCL transport, so the next run cannot
+        connect. ``close()`` is a no-op for the co-located backend. The process
+        group is intentionally left alone -- it is a framework-global resource
+        that direct callers (tests, the interactive launcher) reuse after the
+        loop returns, and ``initialize_distributed`` already destroys it at
+        process exit.
+        """
+        if getattr(self, "target_wrapper", None) is not None:
+            _best_effort("closing target backend", self.target_wrapper.close)
+        if getattr(self, "wandb_run", None) is not None:
+            _best_effort("finishing W&B run", self.wandb_run.finish)
+
+    def _train_epochs(self, start_epoch, batches_per_epoch, is_ddp):
+        """Run the epoch loop (extracted so :meth:`run_train_validation_loop` can
+        wrap it in ``try/finally`` and guarantee teardown on any exit path)."""
         for epoch in range(start_epoch, self.num_epochs):
             if hasattr(self.train_dataloader.sampler, "set_epoch"):
                 self.train_dataloader.sampler.set_epoch(epoch)
@@ -694,10 +1015,34 @@ class TrainEagle3Recipe(BaseRecipe):
 
             batches_processed = 0
             pending_micro_batches = 0
-            for batch_idx, batch in enumerate(self.train_dataloader):
-                metrics = self._forward_batch(batch)
-                loss = metrics.loss / float(self.grad_accumulation_steps)
-                loss.backward()
+            # With prefetch the supervision is fetched asynchronously and paired
+            # with its batch; otherwise the target runs inline (target_batch=None).
+            if self.target_prefetch_depth > 0:
+                batch_source = enumerate(self._prefetched_batches(self.train_dataloader))
+            else:
+                batch_source = ((i, (b, None)) for i, b in enumerate(self.train_dataloader))
+            for batch_idx, (batch, target_batch) in batch_source:
+                if self._peagle_partitioned:
+                    # P-EAGLE sequence partitioning owns its per-segment backward
+                    # and its own no_sync (the all-reduce fires on the last
+                    # segment), so it runs outside the grad-accum sync context.
+                    metrics = self._peagle_partitioned_step(batch)
+                else:
+                    # Skip DDP's per-micro-batch all-reduce on every micro-batch
+                    # except the one an optimizer step immediately follows; that
+                    # step's all-reduce covers the whole locally-accumulated window.
+                    sync_grads = should_sync_grads(
+                        pending_micro_batches=pending_micro_batches,
+                        grad_accumulation_steps=self.grad_accumulation_steps,
+                        batch_idx=batch_idx,
+                        batches_per_epoch=batches_per_epoch,
+                        is_ddp=is_ddp,
+                    )
+                    sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
+                    with sync_ctx:
+                        metrics = self._forward_batch(batch, target_batch)
+                        loss = metrics.loss / float(self.grad_accumulation_steps)
+                        loss.backward()
 
                 running_loss = running_loss + metrics.loss.detach()
                 running_acc = running_acc + metrics.accuracy.detach()
@@ -706,12 +1051,13 @@ class TrainEagle3Recipe(BaseRecipe):
                 pending_micro_batches += 1
 
                 if pending_micro_batches == self.grad_accumulation_steps:
-                    torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.runtime.global_step += 1
                     pending_micro_batches = 0
+                    self._maybe_save_step_checkpoint(epoch)
 
                     if self.runtime.global_step % self.log_every_steps == 0:
                         mean_loss = _all_reduce_mean(running_loss / max(running_steps, 1))
@@ -725,6 +1071,16 @@ class TrainEagle3Recipe(BaseRecipe):
                                 mean_loss.item(),
                                 mean_acc.item(),
                                 current_lr,
+                            )
+                            self._wandb_log(
+                                {
+                                    "train/loss": mean_loss.item(),
+                                    "train/accuracy": mean_acc.item(),
+                                    "train/lr": current_lr,
+                                    "train/grad_norm": float(grad_norm),
+                                    "train/epoch": epoch,
+                                },
+                                step=self.runtime.global_step,
                             )
                         running_loss.zero_()
                         running_acc.zero_()
@@ -748,12 +1104,13 @@ class TrainEagle3Recipe(BaseRecipe):
                 for p in self.trainer_module.parameters():
                     if p.grad is not None:
                         p.grad.mul_(scale)
-                torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.runtime.global_step += 1
                 pending_micro_batches = 0
+                self._maybe_save_step_checkpoint(epoch)
 
                 if running_steps > 0:
                     mean_loss = _all_reduce_mean(running_loss / max(running_steps, 1))
@@ -767,6 +1124,16 @@ class TrainEagle3Recipe(BaseRecipe):
                             mean_loss.item(),
                             mean_acc.item(),
                             current_lr,
+                        )
+                        self._wandb_log(
+                            {
+                                "train/loss": mean_loss.item(),
+                                "train/accuracy": mean_acc.item(),
+                                "train/lr": current_lr,
+                                "train/grad_norm": float(grad_norm),
+                                "train/epoch": epoch,
+                            },
+                            step=self.runtime.global_step,
                         )
                     running_loss.zero_()
                     running_acc.zero_()
@@ -794,24 +1161,19 @@ class TrainEagle3Recipe(BaseRecipe):
                         val_loss_dict["val_loss"],
                         val_loss_dict["val_accuracy"],
                     )
-            self.save_checkpoint(
-                epoch=epoch + 1,
-                step=self.runtime.global_step,
-                train_loss=None,
-                val_loss=val_loss_dict,
-                best_metric_key="val_loss",
-            )
-            ckpt_cfg = getattr(self, "checkpoint_config", None)
-            if self.dist_env.is_main and ckpt_cfg is not None and ckpt_cfg.enabled:
-                logger.info(
-                    "Saved checkpoint to %s/epoch_%d_step_%d",
-                    ckpt_cfg.checkpoint_dir,
-                    epoch + 1,
-                    self.runtime.global_step,
+                    self._wandb_log(
+                        {"val/loss": val_loss_dict["val_loss"], "val/accuracy": val_loss_dict["val_accuracy"]},
+                        step=self.runtime.global_step,
+                    )
+            if getattr(self, "save_checkpoint_every_epoch", False):
+                self.save_checkpoint(
+                    epoch=epoch + 1,
+                    step=self.runtime.global_step,
+                    train_loss=None,
+                    val_loss=val_loss_dict,
+                    best_metric_key="val_loss",
                 )
-
-        if self.dist_env.is_main:
-            logger.info("Training complete: global_step=%s", self.runtime.global_step)
+                self._log_saved_checkpoint("epoch", epoch + 1, self.runtime.global_step)
 
 
 def main(config_path=None):
