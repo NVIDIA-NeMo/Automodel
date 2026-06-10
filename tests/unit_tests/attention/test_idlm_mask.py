@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from nemo_automodel.components.attention.idlm_mask import create_idlm_block_mask, create_idlm_sdpa_mask
@@ -82,3 +83,24 @@ def test_block_mask_uncompiled_cpu_smoke():
         4, 1, torch.ones(1, 4, dtype=torch.long), device=torch.device("cpu"), use_compile=False
     )
     assert block_mask.shape == (1, 1, 8, 8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention requires CUDA")
+@pytest.mark.parametrize("block_size", [1, 2])
+def test_flex_block_mask_matches_sdpa_outputs(block_size):
+    """flex_attention with the BlockMask and SDPA with the dense mask agree on the same q/k/v."""
+    from torch.nn.attention.flex_attention import flex_attention
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    B, H, L, D = 2, 2, 8, 16
+    q, k, v = (torch.randn(B, H, 2 * L, D, device=device, dtype=torch.float32) for _ in range(3))
+    valid_mask = torch.ones(B, L, dtype=torch.long, device=device)
+
+    dense = create_idlm_sdpa_mask(L, block_size, valid_mask, device=device, dtype=torch.float32)
+    out_sdpa = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=dense)
+
+    block_mask = create_idlm_block_mask(L, block_size, valid_mask, device=device, use_compile=False)
+    out_flex = flex_attention(q, k, v, block_mask=block_mask)
+
+    assert torch.allclose(out_sdpa, out_flex, atol=1e-5), f"max diff {(out_sdpa - out_flex).abs().max().item():.3e}"
