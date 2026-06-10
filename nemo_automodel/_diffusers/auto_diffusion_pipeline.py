@@ -587,7 +587,7 @@ class NeMoAutoDiffusionPipeline:
             peft_cfg: PeftConfig instance or None. When provided, LoRA is injected
                 before _apply_parallelization() (FSDP2 wrapping). Base weights
                 are frozen after FSDP2; LoRA params are collected pre-FSDP2 and stored on pipe.
-            model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
+            model_type: "flux" | "flux2" | "wan" | "hunyuan". Required when peft_cfg is provided.
             active_transformer: For two-transformer pipelines (e.g. Wan2.2 with
                 ``transformer`` + ``transformer_2``), selects which one becomes
                 ``pipe.transformer`` for training. Accepts ``"transformer"`` (default,
@@ -663,7 +663,9 @@ class NeMoAutoDiffusionPipeline:
             # Pre-FSDP2 lora_params refs are stored on pipe and remain valid
             # after wrapping (FSDP2 preserves original Parameter objects).
             if model_type is None:
-                raise ValueError("model_type must be set when peft_cfg is provided. Options: 'flux', 'wan', 'hunyuan'")
+                raise ValueError(
+                    "model_type must be set when peft_cfg is provided. Options: 'flux', 'flux2', 'wan', 'hunyuan'"
+                )
             import dataclasses
 
             from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
