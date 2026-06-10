@@ -7,6 +7,7 @@ NeMo AutoModel integrates with Hugging Face `transformers`. Any LLM or VLM that 
 | Auto Class | Task | Status | Details |
 |------------|------|--------|---------|
 | `AutoModelForCausalLM` | Text Generation (LLM) | Supported | See [LLM model list](llm/index.md). |
+| Block-Diffusion LLMs | Text Generation (Diffusion LLM) | Supported | See [Diffusion LLM model list](dllm/index.md). |
 | `AutoModelForImageTextToText` | Image-Text-to-Text (VLM) | Supported | See [VLM model list](vlm/index.md). |
 | Custom multimodal models | Unified multimodal training | Supported | See [Multimodal model list](multimodal/index.md). |
 | `AutoModelForSequenceClassification` | Sequence Classification | WIP | Early support; interfaces may change. |
