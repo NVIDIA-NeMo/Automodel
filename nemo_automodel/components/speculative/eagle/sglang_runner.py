@@ -52,6 +52,26 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+_SGLANG_DTYPE_STRINGS = {
+    torch.float32: "float32",
+    torch.float16: "float16",
+    torch.bfloat16: "bfloat16",
+}
+
+
+def sglang_dtype_str(dtype: Optional[torch.dtype]) -> str:
+    """Map a torch dtype to the string form SGLang's ``ServerArgs.dtype`` expects.
+
+    SGLang compares ``ServerArgs.dtype`` against string literals (``"auto"``,
+    ``"bfloat16"``, ...), so passing a raw ``torch.dtype`` silently misses every
+    branch. ``None`` means "let SGLang pick" (``"auto"``).
+    """
+    if dtype is None:
+        return "auto"
+    if dtype not in _SGLANG_DTYPE_STRINGS:
+        raise ValueError(f"Unsupported SGLang target dtype {dtype}; expected one of {list(_SGLANG_DTYPE_STRINGS)}.")
+    return _SGLANG_DTYPE_STRINGS[dtype]
+
 
 def _wrap_logits_processors_for_eagle3(model) -> None:  # pragma: no cover - requires GPU + SGLang
     """Replace every SGLang ``LogitsProcessor`` in ``model`` with an EAGLE-3 wrapper.
@@ -186,11 +206,20 @@ class SGLangTargetRunner:
 
         if not torch.cuda.is_available():
             raise RuntimeError("SGLangTargetRunner requires CUDA; run it on a GPU server, not the editing host.")
+        # SGLang's global parallel state must own every rank of an existing
+        # process group (initialize_model_parallel raises unless world_size ==
+        # tp_size * pp_size). Catch the mismatch here with a clear error instead
+        # of failing deep inside ModelRunner.
+        if dist.is_initialized() and dist.get_world_size() != tp_size:
+            raise RuntimeError(
+                f"SGLangTargetRunner.build inside an initialized process group requires "
+                f"world_size == tp_size, got world_size={dist.get_world_size()} and tp_size={tp_size}."
+            )
 
         server_args = ServerArgs(
             model_path=model_path,
             trust_remote_code=trust_remote_code,
-            dtype=dtype if dtype is not None else "auto",
+            dtype=sglang_dtype_str(dtype),
             enable_return_hidden_states=True,
             disable_cuda_graph=True,  # extend-only forward; CUDA graphs add no benefit here
             disable_radix_cache=True,

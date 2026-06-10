@@ -90,9 +90,7 @@ class _FakeSGLangRunner:
     def forward_eagle3(self, input_ids, attention_mask):
         captured = {}
         handles = [
-            self.model.layers[i].register_forward_hook(
-                lambda _m, _i, out, i=i: captured.__setitem__(i, out)
-            )
+            self.model.layers[i].register_forward_hook(lambda _m, _i, out, i=i: captured.__setitem__(i, out))
             for i in self.aux_layer_ids
         ]
         try:
@@ -225,6 +223,7 @@ def test_serve_target_engine_routing(monkeypatch):
     def _record(engine):
         def _builder(*_a, **_k):
             calls["engine"] = engine
+
         return _builder
 
     monkeypatch.setattr(serve_target, "_build_hf_target", _record("hf"))
@@ -312,3 +311,20 @@ def test_runner_forward_stacks_per_row(monkeypatch):
     assert logits.shape == (2, 5, _VOCAB) and aux.shape == (2, 5, 3 * _HIDDEN)
     torch.testing.assert_close(logits, torch.stack(rows_logits))
     torch.testing.assert_close(aux, torch.stack(rows_aux))
+
+
+def test_sglang_dtype_str_mappings():
+    """ServerArgs.dtype is a string in SGLang; torch dtypes must map to it."""
+    from nemo_automodel.components.speculative.eagle.sglang_runner import sglang_dtype_str
+
+    assert sglang_dtype_str(None) == "auto"
+    assert sglang_dtype_str(torch.float32) == "float32"
+    assert sglang_dtype_str(torch.float16) == "float16"
+    assert sglang_dtype_str(torch.bfloat16) == "bfloat16"
+
+
+def test_sglang_dtype_str_rejects_unsupported():
+    from nemo_automodel.components.speculative.eagle.sglang_runner import sglang_dtype_str
+
+    with pytest.raises(ValueError, match="Unsupported SGLang target dtype"):
+        sglang_dtype_str(torch.int8)
