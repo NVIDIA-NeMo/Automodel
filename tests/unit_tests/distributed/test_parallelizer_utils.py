@@ -22,10 +22,22 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     _fully_shard,
     _get_module_from_path,
     _group_params_by_dtype,
+    _make_compute_dtype_fn,
     _mp_policy_with_param_dtype,
     fully_shard_by_dtype,
     iter_maximal_uniform_dtype_subtrees,
 )
+
+
+def _tag_hf_compute_dtype(model: nn.Module) -> None:
+    """Simulate an HF checkpoint load by recording each float tensor's dtype.
+
+    ``_restore_loaded_model_dtype`` does this in production; tagging here lets the
+    compute-dtype grouping mirror storage dtype (as it would for a loaded model).
+    """
+    for tensor in (*model.parameters(), *model.buffers()):
+        if tensor.dtype.is_floating_point:
+            tensor._hf_compute_dtype = tensor.dtype
 
 
 class Block(nn.Module):
@@ -260,18 +272,184 @@ def test_fully_shard_by_dtype_single_dtype(monkeypatch):
         "nemo_automodel.components.distributed.parallelizer_utils._fully_shard", fake__fully_shard, raising=True
     )
 
-    # All parameters are float32
+    # All parameters are float32 storage, but the policy requests bf16 compute
+    # (fp32 master weights). Compute dtype is decoupled from storage: the bulk
+    # computes in mp_policy.param_dtype (bf16), NOT the fp32 storage dtype.
     model = ToyModel(a_dtype=torch.float32, b_dtype_l1=torch.float32, b_dtype_l2=torch.float32)
     mp_policy = _make_mp_policy()
     fully_shard_by_dtype(model, mesh=object(), mp_policy=mp_policy, offload_policy=object())
 
     assert [mod for mod, _ in fully_calls] == [model]  # whole module sharded once
     assert fully_calls[0][1] is not mp_policy
-    assert fully_calls[0][1].param_dtype == torch.float32
+    assert fully_calls[0][1].param_dtype == torch.bfloat16
     assert fully_calls[0][1].reduce_dtype == mp_policy.reduce_dtype
     assert fully_calls[0][1].output_dtype == mp_policy.output_dtype
     assert mp_policy.param_dtype == torch.bfloat16
-    assert sub_calls == []  # no subtree calls
+    assert sub_calls == []  # no fp32-compute carve-outs declared
+
+
+def test_fully_shard_by_dtype_storage_equals_compute_keeps_storage_dtype(monkeypatch):
+    """Uniform storage that matches the requested compute dtype shards as before."""
+    fully_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+        fully_calls.append((mod, mp_policy))
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+    )
+
+    # bf16 storage and bf16 compute -> param_dtype stays bf16 (no decoupling needed).
+    model = ToyModel(a_dtype=torch.bfloat16, b_dtype_l1=torch.bfloat16, b_dtype_l2=torch.bfloat16)
+    mp_policy = _make_mp_policy()
+    fully_shard_by_dtype(model, mesh=object(), mp_policy=mp_policy, offload_policy=object())
+
+    assert [mod for mod, _ in fully_calls] == [model]
+    assert fully_calls[0][1].param_dtype == torch.bfloat16
+
+
+def test_fully_shard_by_dtype_genuine_fp32_compute_unchanged(monkeypatch):
+    """Uniform fp32 storage with an fp32-compute policy keeps fp32 compute."""
+    fully_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+        fully_calls.append((mod, mp_policy))
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+    )
+
+    model = ToyModel(a_dtype=torch.float32, b_dtype_l1=torch.float32, b_dtype_l2=torch.float32)
+    mp_policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32, output_dtype=torch.float32)
+    fully_shard_by_dtype(model, mesh=object(), mp_policy=mp_policy, offload_policy=object())
+
+    assert [mod for mod, _ in fully_calls] == [model]
+    assert fully_calls[0][1].param_dtype == torch.float32
+
+
+def test_make_compute_dtype_fn_precedence():
+    """Resolver precedence: pinned fp32 > HF-recorded > mp_policy.param_dtype."""
+
+    class Holder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(2, dtype=torch.float32))
+
+    class Mixer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.in_proj = nn.Linear(4, 4, bias=False).to(torch.float32)  # master-weight fp32 storage
+            self.recorded_fp32 = nn.Linear(4, 4, bias=False).to(torch.float32)
+            self.recorded_bf16 = nn.Linear(4, 4, bias=False).to(torch.float32)
+            self._fp32_params = Holder()
+
+    mixer = Mixer()
+    # Simulate HF load: in_proj had bf16 in the checkpoint, the others fp32/bf16.
+    mixer.in_proj.weight._hf_compute_dtype = torch.bfloat16
+    mixer.recorded_fp32.weight._hf_compute_dtype = torch.float32
+    mixer.recorded_bf16.weight._hf_compute_dtype = torch.bfloat16
+
+    fn = _make_compute_dtype_fn(mixer, _make_mp_policy(), ("_fp32_params",))
+
+    # Pinned wins even though storage is fp32 and nothing was recorded.
+    assert fn(mixer._fp32_params.weight) == torch.float32
+    # HF-recorded bf16 beats the fp32 master storage.
+    assert fn(mixer.in_proj.weight) == torch.bfloat16
+    assert fn(mixer.recorded_bf16.weight) == torch.bfloat16
+    # HF-recorded fp32 is honored.
+    assert fn(mixer.recorded_fp32.weight) == torch.float32
+
+
+def test_make_compute_dtype_fn_fallback_to_policy_then_storage():
+    model = ToyModel(a_dtype=torch.float32, b_dtype_l1=torch.float32, b_dtype_l2=torch.float32)
+
+    # No record, no pin, bf16 policy -> fall back to policy (bf16) despite fp32 storage.
+    fn = _make_compute_dtype_fn(model, _make_mp_policy(), ())
+    assert fn(model.a.weight) == torch.bfloat16
+
+    # No policy -> fall back to storage dtype.
+    fn_no_policy = _make_compute_dtype_fn(model, None, ())
+    assert fn_no_policy(model.a.weight) == torch.float32
+
+
+def test_fully_shard_by_dtype_fp32_master_pins_compute(monkeypatch):
+    """fp32 master weights (uniform fp32 storage): pinned param keeps fp32, bulk gets bf16."""
+    fully_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+    sub_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+        fully_calls.append((mod, mp_policy))
+
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
+        sub_calls.append((mod, mp_policy))
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils._fully_shard", fake__fully_shard, raising=True
+    )
+
+    class Fp32Holder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(2, dtype=torch.float32))
+
+    class Mixer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # Two bulk linears so the bf16-compute group is the strict majority.
+            self.in_proj = nn.Linear(4, 4, bias=False).to(torch.float32)
+            self.out_proj = nn.Linear(4, 4, bias=False).to(torch.float32)
+            self._fp32_params = Fp32Holder()
+
+    mixer = Mixer()
+    fully_shard_by_dtype(
+        mixer,
+        mesh=object(),
+        mp_policy=_make_mp_policy(),
+        offload_policy=object(),
+        fp32_compute_module_names=("_fp32_params",),
+    )
+
+    # Minority fp32 holder sharded on its own; the bf16 bulk is the parent unit.
+    assert [mod for mod, _ in sub_calls] == [mixer._fp32_params]
+    assert sub_calls[0][1].param_dtype == torch.float32
+    assert [mod for mod, _ in fully_calls] == [mixer]
+    assert fully_calls[0][1].param_dtype == torch.bfloat16
+
+
+def test_fully_shard_by_dtype_fp32_master_hf_recorded_compute(monkeypatch):
+    """fp32 master weights with HF-recorded dtypes: recorded-fp32 param stays fp32, no pin needed."""
+    fully_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+    sub_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+        fully_calls.append((mod, mp_policy))
+
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
+        sub_calls.append((mod, mp_policy))
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils._fully_shard", fake__fully_shard, raising=True
+    )
+
+    # Uniform fp32 storage (master weights), but the checkpoint recorded 'a' as fp32
+    # and the rest as bf16 -> 'a' computes fp32 automatically, bulk computes bf16.
+    model = ToyModel(a_dtype=torch.float32, b_dtype_l1=torch.float32, b_dtype_l2=torch.float32)
+    model.a.weight._hf_compute_dtype = torch.float32
+    model.b.l1.weight._hf_compute_dtype = torch.bfloat16
+    model.b.l2.weight._hf_compute_dtype = torch.bfloat16
+
+    fully_shard_by_dtype(model, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=object())
+
+    assert [mod for mod, _ in sub_calls] == [model.a]
+    assert sub_calls[0][1].param_dtype == torch.float32
+    assert [mod for mod, _ in fully_calls] == [model]
+    assert fully_calls[0][1].param_dtype == torch.bfloat16
 
 
 def test_fully_shard_by_dtype_two_dtypes(monkeypatch):
@@ -293,6 +471,7 @@ def test_fully_shard_by_dtype_two_dtypes(monkeypatch):
 
     # Make float32 the least common (1 param) vs float16 (2 params)
     model = ToyModel(a_dtype=torch.float32, b_dtype_l1=torch.float16, b_dtype_l2=torch.float16)
+    _tag_hf_compute_dtype(model)  # compute dtype mirrors storage (as for a loaded checkpoint)
     fully_shard_by_dtype(model, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=object())
 
     # Expect subtree sharding for the least common dtype subtree(s) and full sharding once
@@ -327,6 +506,7 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
         b_dtype_l2=torch.float16,
         c_dtype=torch.bfloat16,
     )
+    _tag_hf_compute_dtype(model)  # compute dtype mirrors storage (as for a loaded checkpoint)
     fully_shard_by_dtype(model, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=object())
 
     # For >2 dtypes: only subtree sharding, no whole-module sharding

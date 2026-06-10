@@ -28,7 +28,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.mtp import (
     _resolve_block_types_per_sublayer,
@@ -128,6 +128,7 @@ class NemotronV3Model(nn.Module):
             self.backend.rms_norm,
             config.hidden_size,
             eps=config.layer_norm_epsilon,
+            dtype=dtype,
         )
 
     def forward(
@@ -286,6 +287,15 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     # Skip patch_hf_model_for_pp; our forward already handles PP routing.
     _pp_keep_self_forward: bool = True
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = True
+        supports_pp: bool = True
+        supports_ep: bool = True
+
     @classmethod
     def from_config(
         cls,
@@ -431,6 +441,56 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Enable activation checkpointing on each transformer (and MTP) block.
+
+        Wraps every decoder block (and MTP block, when present) with a
+        non-reentrant checkpoint wrapper so that block activations are recomputed
+        during the backward pass instead of being stored. This is the single-GPU
+        entry point: ``FSDP2Manager.parallelize`` calls it when ``world_size == 1``
+        (the expert-parallel path performs the equivalent wrapping inside the MoE
+        parallelizer's ``apply_ac``). Without it, the hybrid Mamba2/Attention MoE
+        keeps every block's activations live, which is what pushes single-GPU LoRA
+        SFT over a single 80GB device. Idempotent.
+
+        Args:
+            gradient_checkpointing_kwargs: Accepted for HF API compatibility;
+                currently unused (NO_REENTRANT wrapping is always used).
+        """
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            checkpoint_wrapper,
+        )
+
+        if getattr(self, "_gradient_checkpointing", False):
+            return
+
+        def _wrap(block):
+            return checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT, preserve_rng_state=True)
+
+        containers = [self.model.layers]
+        if self.mtp is not None and getattr(self.mtp, "layers", None) is not None:
+            containers.append(self.mtp.layers)
+        for layers in containers:
+            for layer_id, block in list(layers.named_children()):
+                layers.register_module(layer_id, _wrap(block))
+        self._gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        """Unwrap any checkpoint-wrapped blocks (inverse of ``gradient_checkpointing_enable``)."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        if not getattr(self, "_gradient_checkpointing", False):
+            return
+        containers = [self.model.layers]
+        if self.mtp is not None and getattr(self.mtp, "layers", None) is not None:
+            containers.append(self.mtp.layers)
+        for layers in containers:
+            for layer_id, block in list(layers.named_children()):
+                if isinstance(block, CheckpointWrapper):
+                    layers.register_module(layer_id, block._checkpoint_wrapped_module)
+        self._gradient_checkpointing = False
 
     def _is_pipeline_parallel_stage(self) -> bool:
         """True when this module instance has been trimmed to a PP stage subset.
@@ -701,18 +761,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         if past_key_values is not None:
             past_key_values.has_previous_state = True
 
-        # lm_head is None on non-last PP stages; return raw hidden_states.
-        if has_lm_head:
-            if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-                logits = self.lm_head(hidden_states)
-            else:
-                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-                if hidden_states.dim() == 2:
-                    logits = self.lm_head(hidden_states[slice_indices, :])
-                else:
-                    logits = self.lm_head(hidden_states[:, slice_indices, :])
-        else:
-            logits = hidden_states
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         # PP path defers loss to PipelineCausalLMLoss; only compute here off-PP.

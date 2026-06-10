@@ -489,7 +489,7 @@ def run_thd_te(model_type, config, rank, world_size, device, attn_no_cp=None, at
 def _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device, attn_no_cp, attn_with_cp, get_freqs_cis):
     """THD test flow for qwen3_moe / deepseek_v3 (preserves original run_test behavior)."""
     try:
-        import transformer_engine.pytorch  # This creates transformer_engine_torch module
+        import transformer_engine.pytorch  # noqa: F401 This creates transformer_engine_torch module
         import transformer_engine_torch as tex
     except ImportError:
         if rank == 0:

@@ -224,7 +224,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Get benchmarking config
         steps = self._bench_steps
         warmup_steps = self._bench_warmup_steps
-        local_batch_size = self.cfg.step_scheduler.local_batch_size
+        local_batch_size = self.cfg.get("step_scheduler.local_batch_size")
         global_batch_size = self.cfg.step_scheduler.global_batch_size
 
         nsys_start = self._bench_nsys_start
@@ -449,7 +449,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "peak_tflops": peak_tflops,
                 "world_size": self.dist_env.world_size,
                 "global_batch_size": self.cfg.step_scheduler.global_batch_size,
-                "local_batch_size": self.cfg.step_scheduler.local_batch_size,
+                "local_batch_size": self.cfg.get("step_scheduler.local_batch_size"),
                 "seq_len": self._bench_seq_len,
             }
 
@@ -473,7 +473,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         ["Peak TFLOPs", peak_tflops],
                         ["World Size", self.dist_env.world_size],
                         ["Global Batch Size", self.cfg.step_scheduler.global_batch_size],
-                        ["Local Batch Size", self.cfg.step_scheduler.local_batch_size],
+                        ["Local Batch Size", self.cfg.get("step_scheduler.local_batch_size")],
                         ["Sequence Length", self._bench_seq_len],
                     ],
                 )

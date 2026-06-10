@@ -450,7 +450,7 @@ class TestForwardShapes:
         batch, seq = 2, 4
         input_ids = torch.randint(0, dense_config.vocab_size, (batch, seq))
         with torch.no_grad():
-            logits = model(input_ids)
+            logits = model(input_ids).logits
         assert logits.shape == (batch, seq, dense_config.vocab_size)
 
     def test_dense_forward_accepts_explicit_position_ids(self, dense_config, backend_config):
@@ -459,7 +459,7 @@ class TestForwardShapes:
         input_ids = torch.randint(0, dense_config.vocab_size, (batch, seq))
         position_ids = torch.arange(seq).unsqueeze(0)
         with torch.no_grad():
-            logits = model(input_ids, position_ids=position_ids)
+            logits = model(input_ids, position_ids=position_ids).logits
         assert logits.shape == (batch, seq, dense_config.vocab_size)
 
     def test_dense_forward_logits_to_keep_int(self, dense_config, backend_config):
@@ -467,24 +467,52 @@ class TestForwardShapes:
         batch, seq = 1, 8
         input_ids = torch.randint(0, dense_config.vocab_size, (batch, seq))
         with torch.no_grad():
-            logits = model(input_ids, logits_to_keep=2)
+            logits = model(input_ids, logits_to_keep=2).logits
         assert logits.shape == (batch, 2, dense_config.vocab_size)
+
+    def test_dense_forward_thd_hidden_states_match_logits_layout(self, dense_config, backend_config):
+        model = self._dense_model(dense_config, backend_config)
+        batch, seq = 1, 5
+        input_ids = torch.randint(0, dense_config.vocab_size, (batch, seq))
+        position_ids = torch.arange(seq).unsqueeze(0)
+        hidden = torch.randn(seq, dense_config.hidden_size)
+        with torch.no_grad(), patch.object(model.model, "forward", return_value=hidden):
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                output_hidden_states=True,
+            )
+        assert out.logits.shape == (batch, seq, dense_config.vocab_size)
+        assert out.hidden_states.shape == (batch, seq, dense_config.hidden_size)
 
     def test_moe_forward_bshd_shape(self, moe_hf_config, backend_config):
         model = self._moe_model(moe_hf_config, backend_config)
         batch, seq = 1, 4
         input_ids = torch.randint(0, moe_hf_config.vocab_size, (batch, seq))
         with torch.no_grad():
-            logits = model(input_ids)
+            logits = model(input_ids).logits
         assert logits.shape == (batch, seq, moe_hf_config.vocab_size)
 
-    # NOTE: thd-format forward tests are deliberately omitted from this CPU
-    # test class. The thd path is implemented for the TransformerEngine
-    # attention backend (which uses cu_seqlens); sdpa cannot consume
-    # variable-length packed sequences without bshd reshaping, so a thd
-    # forward through sdpa raises a tensor-shape mismatch. The dense vs.
-    # MoE 1-D position_ids handling that the bug fix targets is covered
-    # by direct Ernie4_5Model.forward unit tests on the Model class.
+    def test_moe_forward_thd_hidden_states_match_logits_layout(self, moe_hf_config, backend_config):
+        model = self._moe_model(moe_hf_config, backend_config)
+        batch, seq = 1, 5
+        input_ids = torch.randint(0, moe_hf_config.vocab_size, (batch, seq))
+        position_ids = torch.arange(seq).unsqueeze(0)
+        hidden = torch.randn(seq, moe_hf_config.hidden_size)
+        with torch.no_grad(), patch.object(model.model, "forward", return_value=hidden):
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                output_hidden_states=True,
+            )
+        assert out.logits.shape == (batch, seq, moe_hf_config.vocab_size)
+        assert out.hidden_states.shape == (batch, seq, moe_hf_config.hidden_size)
+
+    # NOTE: these thd-format causal-LM wrapper tests mock the inner model. The
+    # real thd attention path is implemented for TransformerEngine; sdpa cannot
+    # consume variable-length packed sequences without bshd reshaping.
 
 
 # ---------------------------------------------------------------------------

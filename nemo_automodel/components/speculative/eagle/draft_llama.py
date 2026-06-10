@@ -97,55 +97,46 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers import PretrainedConfig, PreTrainedModel
 
+from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
 from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
 )
-from nemo_automodel.components.speculative.eagle.peagle_attention import create_peagle_mask_mod
+from nemo_automodel.components.speculative.eagle.peagle_draft import (
+    _PeagleAttentionMixin,
+    _PeagleDecoderLayerMixin,
+    _PeagleDraftMixin,
+    _PeagleVanillaLayerMixin,
+)
 from nemo_automodel.shared.import_utils import safe_import_from
 
 logger = logging.getLogger(__name__)
 
-# flex_attention compiled for the CUDA training path. Inductor's flex backend is
-# not available on CPU (it raises ``InductorError``), so ``_peagle_flex_attention``
-# dispatches to eager ``flex_attention`` there -- correct, just slower -- which
-# keeps the P-EAGLE unit tests and CPU smoke checks runnable. The compiled
-# callable is lazy, so importing this module on CPU costs nothing.
-_peagle_flex_attention_compiled = torch.compile(
-    flex_attention,
-    mode="max-autotune-no-cudagraphs",
-)
 
-
-def _peagle_flex_attention(q, k, v, *, block_mask, scale):
-    """Run the P-EAGLE flex attention, compiling only on CUDA."""
-    flex = _peagle_flex_attention_compiled if q.is_cuda else flex_attention
-    return flex(q, k, v, block_mask=block_mask, scale=scale)
-
-
-def _load_flash_attn_func() -> tuple[bool, object | None]:
+def _load_flash_attn_func() -> tuple[bool, object | None, object | None]:
     """Best-effort load of flash-attn without breaking eager-only users.
 
     ``safe_import_from`` already handles missing modules and missing symbols, but
     some broken ``flash-attn`` installs fail with lower-level loader errors
     (e.g. ABI / shared-library issues) that should not prevent importing this
-    module for the eager path.
+    module for the eager path. Returns the dense ``flash_attn_func`` and the
+    ``flash_attn_varlen_func`` (used by the packed block-causal path).
     """
     try:
         has_fa, flash_attn_func = safe_import_from("flash_attn", "flash_attn_func")
+        _, flash_attn_varlen_func = safe_import_from("flash_attn", "flash_attn_varlen_func")
     except Exception as exc:  # pragma: no cover - depends on local flash-attn loader failures.
         logger.warning("Failed to import flash_attn.flash_attn_func; FlashAttention-2 path will be disabled: %s", exc)
-        return False, None
+        return False, None, None
     if not has_fa:
-        return False, None
-    return True, flash_attn_func
+        return False, None, None
+    return True, flash_attn_func, flash_attn_varlen_func
 
 
-_HAS_FA, _flash_attn_func = _load_flash_attn_func()
+_HAS_FA, _flash_attn_func, _flash_attn_varlen_func = _load_flash_attn_func()
 
 _SUPPORTED_ATTN_IMPLEMENTATIONS = ("eager", "flash_attention_2")
 
@@ -170,7 +161,29 @@ def _is_right_padded_attention_mask(attention_mask: torch.Tensor) -> bool:
     return not bool((mask_bool[:, 1:] & ~mask_bool[:, :-1]).any())
 
 
-class Eagle3LlamaAttention(nn.Module):
+def _seq_lens_to_cu_seqlens(seq_lens: torch.Tensor, seq_length: int) -> tuple[torch.Tensor, int]:
+    """Build FlashAttention varlen ``cu_seqlens`` (int32) from packed ``seq_lens``.
+
+    Documents are flattened row-major to match the varlen attention's
+    ``reshape(B*T, ...)`` token order. Returns ``(cu_seqlens, max_seqlen)``.
+    """
+    doc_lens = seq_lens[seq_lens > 0]
+    cu_seqlens = torch.zeros(doc_lens.numel() + 1, dtype=torch.int32, device=seq_lens.device)
+    cu_seqlens[1:] = torch.cumsum(doc_lens, dim=0).to(torch.int32)
+    expected_total = seq_lens.shape[0] * seq_length
+    if int(cu_seqlens[-1].item()) != expected_total:
+        raise ValueError(
+            f"Packed seq_lens sum to {int(cu_seqlens[-1].item())} but expected B*T={expected_total}; "
+            "each row's document lengths (with trailing padding folded into the last document) "
+            "must sum to the packed sequence length."
+        )
+    # ``doc_lens`` is non-empty here: an all-zero ``seq_lens`` would sum to 0,
+    # which the ``expected_total`` check above already rejects.
+    max_seqlen = int(doc_lens.max().item())
+    return cu_seqlens, max_seqlen
+
+
+class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
     """EAGLE-3 draft attention over ``[input_emb, hidden]`` 2H features.
 
     Driven through a shared ``cache_hidden = [K_list, V_list]`` pair. At
@@ -277,6 +290,8 @@ class Eagle3LlamaAttention(nn.Module):
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         cache_hidden: list[list[torch.Tensor]],
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = combined_states.shape
         q, k, v = self._project_qkv(combined_states)
@@ -298,36 +313,13 @@ class Eagle3LlamaAttention(nn.Module):
         cache_v.append(v)
 
         if self.attn_implementation == "flash_attention_2":
-            attn_output = self._flash_attention_forward(q, cache_k, cache_v, step_idx, batch_size, seq_len)
+            attn_output = self._flash_attention_forward(
+                q, cache_k, cache_v, step_idx, batch_size, seq_len, cu_seqlens, max_seqlen
+            )
         else:
             attn_output = self._eager_attention_forward(
                 q, cache_k, cache_v, attention_mask, step_idx, batch_size, seq_len
             )
-        return self.o_proj(attn_output)
-
-    def forward_peagle(
-        self,
-        combined_states: torch.Tensor,
-        position_ids: torch.Tensor,
-        block_mask,
-    ) -> torch.Tensor:
-        """P-EAGLE single parallel-group attention.
-
-        Unlike the EAGLE-3 ``cache_hidden`` recurrence, P-EAGLE flattens all COD
-        depths into one sequence and attends in a single pass: there is no
-        per-step rotary phase offset (the depth is baked into ``position_ids =
-        anchor_pos + depth``) and no diagonal-extension cache. Cross-depth
-        visibility is enforced entirely by ``block_mask`` (see
-        :func:`create_peagle_mask_mod`), so this is plain scaled-dot-product
-        attention through ``flex_attention``.
-        """
-        batch_size, seq_len, _ = combined_states.shape
-        q, k, v = self._project_qkv(combined_states)
-        cos, sin = self.rotary_emb(combined_states, position_ids)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        k, v = self._repeat_kv(k, v)
-        attn_output = _peagle_flex_attention(q, k, v, block_mask=block_mask, scale=self.scaling)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(attn_output)
 
     def _eager_attention_forward(
@@ -379,52 +371,48 @@ class Eagle3LlamaAttention(nn.Module):
         step_idx: int,
         batch_size: int,
         seq_len: int,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
     ) -> torch.Tensor:
         """EAGLE-3 attention via FlashAttention-2 for the T x T causal block.
 
-        FA2 covers Block 1 (full ``T x T`` causal attention against ``K_0``) and
-        returns the un-normalized log-sum-exp (``softmax_lse``) alongside the
-        per-token output. The diagonal extension columns (Block 2) for cached
-        steps ``i >= 1`` are computed in eager mode, then merged into a single
-        softmax via the log-space identity
-        ``lse_full = logaddexp(lse_fa, logsumexp(diag))``; the FA output is
-        rescaled by ``exp(lse_fa - lse_full)`` and the diagonal contribution
-        is added with weights ``exp(diag - lse_full)``.
+        FA2 covers Block 1 (causal attention against ``K_0``) and returns its
+        log-sum-exp. The diagonal Block 2 (cached steps ``i >= 1``) is computed
+        eagerly and merged via the log-space identity
+        ``lse_full = logaddexp(lse_fa, logsumexp(diag))``: the FA output is scaled
+        by ``exp(lse_fa - lse_full)`` and each diagonal by ``exp(diag - lse_full)``.
 
-        Padding handling: FA2 is invoked with ``causal=True``. For right-padded
-        batches, padding keys always lie strictly above the diagonal relative
-        to any non-padded query position, so causal masking alone yields the
-        same output as the eager additive padding mask at every valid query
-        position. Outputs at padding query positions differ, but those are
-        masked out at loss time.
+        With ``cu_seqlens`` (packing), Block 1 uses ``flash_attn_varlen_func`` for
+        document-level causal attention; the position-wise Block 2 is unchanged.
         """
         # FA2 expects (B, T, H, D); eager cache is (B, H, T, D).
         k0, v0 = cache_k[0], cache_v[0]
         q_fa = q.transpose(1, 2).contiguous()
         k0_fa = k0.transpose(1, 2).contiguous()
         v0_fa = v0.transpose(1, 2).contiguous()
-        # ``softmax_lse`` is fp32 with shape (B, H, T): the log-sum-exp of the
-        # SCALED Block-1 logits (the FA kernel folds in ``softmax_scale``).
-        out_fa, lse_fa, _ = _flash_attn_func(
-            q_fa,
-            k0_fa,
-            v0_fa,
-            softmax_scale=self.scaling,
-            causal=True,
-            return_attn_probs=True,
-        )
-        # FA output is (B, T, H, D); bring back to (B, H, T, D) for downstream merge.
-        attn_output_bhtd = out_fa.transpose(1, 2)
+        if cu_seqlens is not None:
+            attn_output_bhtd, lse_fa = self._flash_block1_varlen(
+                q_fa, k0_fa, v0_fa, cu_seqlens, max_seqlen, batch_size, seq_len
+            )
+        else:
+            # ``softmax_lse`` is fp32 with shape (B, H, T): the log-sum-exp of the
+            # SCALED Block-1 logits (the FA kernel folds in ``softmax_scale``).
+            out_fa, lse_fa, _ = _flash_attn_func(
+                q_fa,
+                k0_fa,
+                v0_fa,
+                softmax_scale=self.scaling,
+                causal=True,
+                return_attn_probs=True,
+            )
+            # FA output is (B, T, H, D); bring back to (B, H, T, D) for the merge.
+            attn_output_bhtd = out_fa.transpose(1, 2)
 
         if step_idx >= 1:
-            # Diagonal logits share the same ``self.scaling`` factor as FA's
-            # internal softmax, so ``lse_fa`` and ``diag_logits`` are commensurate.
+            # Diagonal logits use the same scaling as FA, so the LSEs are commensurate.
             later_k = torch.stack(cache_k[1:], dim=0)  # [step_idx, B, H, T, D]
             diag_logits = torch.einsum("bhtd,sbhtd->bhts", q, later_k) * self.scaling
 
-            # Combine softmax in log-space:
-            #   lse_full = log( exp(lse_fa) + sum_i exp(diag_i) )
-            #            = logaddexp(lse_fa, logsumexp(diag, dim=-1))
             lse_fa_f32 = lse_fa.float()  # [B, H, T]
             diag_f32 = diag_logits.float()  # [B, H, T, step_idx]
             diag_lse = torch.logsumexp(diag_f32, dim=-1)  # [B, H, T]
@@ -438,6 +426,55 @@ class Eagle3LlamaAttention(nn.Module):
             attn_output_bhtd = attn_output_bhtd + torch.einsum("bhts,sbhtd->bhtd", w2, later_v)
 
         return attn_output_bhtd.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+
+    def _flash_block1_varlen(
+        self,
+        q_fa: torch.Tensor,
+        k0_fa: torch.Tensor,
+        v0_fa: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        batch_size: int,
+        seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Document-level causal Block 1 via ``flash_attn_varlen_func``.
+
+        Flattens ``(B, T, H, D)`` to varlen ``(total_tokens, H, D)`` and reshapes
+        outputs back to ``[B, H, T, D]`` / ``[B, H, T]`` for the dense-path merge.
+        Note varlen ``softmax_lse`` is ``[H, total_tokens]`` (head-major), unlike
+        the dense ``[B, H, T]`` -- hence the explicit reshape + shape check.
+        """
+        if _flash_attn_varlen_func is None:
+            raise ImportError(
+                "Eagle3LlamaAttention: packed FlashAttention-2 requires flash_attn.flash_attn_varlen_func."
+            )
+        num_heads, head_dim = q_fa.shape[2], q_fa.shape[3]
+        total_tokens = batch_size * seq_len
+        q_flat = q_fa.reshape(total_tokens, num_heads, head_dim)
+        k0_flat = k0_fa.reshape(total_tokens, num_heads, head_dim)
+        v0_flat = v0_fa.reshape(total_tokens, num_heads, head_dim)
+        out_flat, lse_flat, _ = _flash_attn_varlen_func(
+            q_flat,
+            k0_flat,
+            v0_flat,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.scaling,
+            causal=True,
+            return_attn_probs=True,
+        )
+        # out_flat: [total_tokens, H, D] -> [B, H, T, D]
+        attn_output_bhtd = out_flat.reshape(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+        # lse_flat: [H, total_tokens] -> [B, H, T]
+        if lse_flat.shape != (num_heads, total_tokens):
+            raise RuntimeError(
+                f"Unexpected varlen softmax_lse shape {tuple(lse_flat.shape)}; "
+                f"expected {(num_heads, total_tokens)}. Verify the installed flash-attn version."
+            )
+        lse_fa = lse_flat.transpose(0, 1).reshape(batch_size, seq_len, num_heads).permute(0, 2, 1)
+        return attn_output_bhtd, lse_fa
 
 
 class Eagle3LlamaMLP(nn.Module):
@@ -460,7 +497,7 @@ class Eagle3LlamaMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
 
 
-class Eagle3LlamaDecoderLayer(nn.Module):
+class Eagle3LlamaDecoderLayer(_PeagleDecoderLayerMixin, nn.Module):
     """Single decoder layer used by the minimal EAGLE-3 draft model.
 
     Attribute names mirror SGLang's ``LlamaDecoderLayer`` in
@@ -492,6 +529,8 @@ class Eagle3LlamaDecoderLayer(nn.Module):
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         cache_hidden: list[list[torch.Tensor]],
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         norm_input_embeds = self.input_layernorm(input_embeds)
@@ -502,6 +541,8 @@ class Eagle3LlamaDecoderLayer(nn.Module):
             attention_mask,
             position_ids,
             cache_hidden=cache_hidden,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
 
         residual = hidden_states
@@ -509,33 +550,8 @@ class Eagle3LlamaDecoderLayer(nn.Module):
         hidden_states = residual + self.mlp(hidden_states)
         return hidden_states
 
-    def forward_peagle(
-        self,
-        input_embeds: torch.Tensor,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
-        block_mask,
-    ) -> torch.Tensor:
-        """Decoder-layer variant for the P-EAGLE single parallel forward.
 
-        Mirrors :meth:`forward` (same norms, residuals, MLP and ``[embeds,
-        hidden]`` concatenation) but routes attention through
-        ``self_attn.forward_peagle`` with a COD ``block_mask`` instead of the
-        ``cache_hidden`` recurrence.
-        """
-        residual = hidden_states
-        norm_input_embeds = self.input_layernorm(input_embeds)
-        norm_hidden_states = self.hidden_norm(hidden_states)
-        combined_states = torch.cat((norm_input_embeds, norm_hidden_states), dim=-1)
-        hidden_states = residual + self.self_attn.forward_peagle(combined_states, position_ids, block_mask)
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + self.mlp(hidden_states)
-        return hidden_states
-
-
-class Eagle3LlamaPeagleLayer(nn.Module):
+class Eagle3LlamaPeagleLayer(_PeagleVanillaLayerMixin, nn.Module):
     """Vanilla Llama decoder layer for P-EAGLE depths ``>= 1``.
 
     The EAGLE-3 first layer (:class:`Eagle3LlamaDecoderLayer`) fuses the token
@@ -558,22 +574,6 @@ class Eagle3LlamaPeagleLayer(nn.Module):
         )
         self.self_attn = Eagle3LlamaAttention(config, fuse_input=False)
         self.mlp = Eagle3LlamaMLP(config)
-
-    def forward_peagle(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
-        block_mask,
-    ) -> torch.Tensor:
-        """Standard pre-norm Llama block over ``H`` hidden states with the COD mask."""
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = residual + self.self_attn.forward_peagle(hidden_states, position_ids, block_mask)
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + self.mlp(hidden_states)
-        return hidden_states
 
 
 class Eagle3LlamaModel(nn.Module):
@@ -629,7 +629,7 @@ class Eagle3LlamaModel(nn.Module):
         self.norm = initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps, device=None)
 
 
-class LlamaEagle3DraftModel(PreTrainedModel):
+class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
     """Llama-style dense EAGLE-3 draft model (Llama, Phi-3, Qwen3).
 
     State dict keys match SGLang's ``LlamaForCausalLMEagle3`` so the saved
@@ -665,28 +665,32 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         self.config = config
         self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
         self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
+        # Activation checkpointing for the P-EAGLE draft layers (training-only
+        # memory knob; toggled via ``gradient_checkpointing_enable`` and read by
+        # ``_PeagleDraftMixin.forward_peagle``). Off by default; never serialized.
+        self.gradient_checkpointing = False
 
         self.model = Eagle3LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
 
-        # P-EAGLE (parallel drafting): a single learnable placeholder that
-        # substitutes for the target auxiliary hidden states at every masked
-        # multi-token-prediction position (COD depths >= 1). It lives at the
-        # *pre-``fc``* concatenated-aux dimension
-        # (``num_aux_hidden_states * target_hidden_size`` == ``model.fc.in_features``)
-        # so it flows through ``project_hidden_states`` -- and ``fc_norm`` when
-        # set -- exactly like a real aux-hidden vector. Shape ``[1, 1, 3 * H]``
-        # and the on-disk key ``mask_hidden`` mirror speculators
-        # (https://github.com/vllm-project/speculators/pull/480) so the checkpoint
-        # loads into vLLM's parallel-drafting runtime unchanged. Registered only
-        # when ``parallel_drafting`` is set so EAGLE-3 / EAGLE-3.1 checkpoints
-        # round-trip with no extra keys.
+        # Persistent d2t/t2d vocab-remap buffers, serialized into
+        # ``model.safetensors`` for vLLM/SGLang to consume at inference (see
+        # :meth:`set_vocab_mapping` for the mapping and why it matters). Created
+        # only when the draft vocab is compressed (``draft_vocab_size <
+        # vocab_size``); otherwise the draft logits are already in target space
+        # and inference engines expect no mapping. Populated by
+        # :meth:`set_vocab_mapping` during training, or restored from a
+        # checkpoint on resume / inference.
+        self.has_vocab_compression = self.draft_vocab_size < config.vocab_size
+        if self.has_vocab_compression:
+            self.register_buffer("d2t", torch.zeros(self.draft_vocab_size, dtype=torch.long), persistent=True)
+            self.register_buffer("t2d", torch.zeros(config.vocab_size, dtype=torch.bool), persistent=True)
+
+        # P-EAGLE (parallel drafting): register the learnable ``mask_hidden``
+        # placeholder only when enabled so EAGLE-3 / EAGLE-3.1 checkpoints
+        # round-trip with no extra keys (see ``_PeagleDraftMixin``).
         if getattr(config, "parallel_drafting", False):
-            # Initialized with unit-variance noise to match speculators'
-            # ``torch.randn(1, 1, 3 * hidden_size)`` exactly (NOT the 0.02
-            # ``initializer_range`` used for ordinary weights).
-            self.mask_hidden = nn.Parameter(torch.empty(1, 1, self.model.fc.in_features))
-            nn.init.normal_(self.mask_hidden, mean=0.0, std=1.0)
+            self._init_peagle_parameters(config)
 
         self.post_init()
 
@@ -705,9 +709,57 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         with torch.no_grad():
             self.model.embed_tokens.weight.copy_(target_weight)
 
+    def set_vocab_mapping(self, selected_token_ids: torch.Tensor) -> None:
+        """Populate the ``d2t`` / ``t2d`` vocab-remap buffers from the draft->target id map.
+
+        ``selected_token_ids`` has shape ``[draft_vocab_size]``; entry ``i`` is
+        the *target* vocab id of draft id ``i`` (the frequency-pruned mapping
+        built by ``build_eagle3_token_mapping``). This writes the two buffers
+        inference engines consume:
+
+        - ``d2t[i] = selected_token_ids[i] - i`` -- the offset form vLLM expects
+          (``target_id = draft_id + d2t[draft_id]``);
+        - ``t2d[target_id] = True`` for every selected target id -- the boolean
+          presence mask SGLang consumes.
+
+        These must be in the saved checkpoint: without them vLLM/SGLang find no
+        mapping, silently align draft ids to the first ``draft_vocab_size``
+        target ids, and acceptance rate collapses.
+
+        No-op when the draft vocab is not compressed (the buffers do not exist
+        and the draft logits are already in target space).
+        """
+        if not self.has_vocab_compression:
+            return
+        selected = selected_token_ids.reshape(-1).to(dtype=torch.long, device=self.d2t.device)
+        if selected.numel() != self.draft_vocab_size:
+            raise ValueError(
+                "set_vocab_mapping expected selected_token_ids of length "
+                f"draft_vocab_size={self.draft_vocab_size}, got {selected.numel()}."
+            )
+        base = torch.arange(self.draft_vocab_size, dtype=torch.long, device=selected.device)
+        self.d2t.copy_(selected - base)
+        self.t2d.zero_()
+        self.t2d[selected] = True
+
     def freeze_embeddings(self) -> None:
         """Freeze draft input embeddings."""
         self.model.embed_tokens.weight.requires_grad_(False)
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
+        """Enable activation checkpointing for the P-EAGLE draft layers.
+
+        Training-only memory knob: recomputes each ``forward_peagle`` layer in the
+        backward instead of storing its activations (the EAGLE-3 TTT ``forward``
+        path is unaffected). ``gradient_checkpointing_kwargs`` is accepted for
+        HF-API parity but ignored -- recompute is always non-reentrant, the only
+        mode compatible with the non-tensor ``block_mask``.
+        """
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self) -> None:
+        """Disable activation checkpointing for the P-EAGLE draft layers."""
+        self.gradient_checkpointing = False
 
     def project_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         """Project concatenated target aux states from ``num_aux * H_target`` to draft hidden size.
@@ -728,18 +780,6 @@ class LlamaEagle3DraftModel(PreTrainedModel):
                 dim=-1,
             )
         return self.model.fc(aux_hidden_states)
-
-    def masked_projected_hidden(self) -> torch.Tensor:
-        """Project the learnable P-EAGLE ``mask_hidden`` placeholder to draft hidden size.
-
-        Returns a ``[1, hidden_size]`` tensor obtained by running the
-        ``[1, 1, num_aux_hidden_states * target_hidden_size]`` placeholder through
-        the same ``project_hidden_states`` path (``fc`` plus optional
-        ``fc_norm``) used for real auxiliary hidden states. The P-EAGLE trainer
-        scatters the result into every masked COD depth. Only valid when the
-        draft was built with ``config.parallel_drafting=True``.
-        """
-        return self.project_hidden_states(self.mask_hidden.view(1, -1))
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embed input ids with the draft embedding table."""
@@ -765,6 +805,7 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         attention_mask: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         cache_hidden: Optional[list[list[torch.Tensor]]] = None,
+        seq_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run one full-sequence draft update step.
 
@@ -774,28 +815,48 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         to it. If ``None`` is passed (e.g. from a one-shot evaluation
         call) a fresh ``[[], []]`` is allocated locally -- step 0 of TTT
         is mathematically equivalent to a plain causal forward.
+
+        ``seq_lens`` (packing) makes Block-1 attention document-level block-causal
+        (eager mask / FA2 varlen); callers must pass per-document ``position_ids``.
         """
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long).unsqueeze(0)
             position_ids = position_ids.expand(input_ids.shape[0], -1)
         if cache_hidden is None:
             cache_hidden = [[], []]
-        if self.model.layers[
-            0
-        ].self_attn.attn_implementation == "flash_attention_2" and not _is_right_padded_attention_mask(attention_mask):
-            raise ValueError(
-                "LlamaEagle3DraftModel: attn_implementation='flash_attention_2' requires a right-padded "
-                "attention_mask (each row must be contiguous 1s followed by 0s)."
-            )
+        is_fa2 = self.model.layers[0].self_attn.attn_implementation == "flash_attention_2"
+        cu_seqlens: torch.Tensor | None = None
+        max_seqlen: int | None = None
+        if seq_lens is not None:
+            # Packed: structure comes from seq_lens (cu_seqlens for FA2 / block-causal
+            # mask for eager), so the right-padding check below does not apply.
+            seq_length = input_ids.shape[1]
+            if is_fa2:
+                # FA2 attends document-wise through cu_seqlens and never reads the 4D
+                # additive mask, so skip materializing the [B, 1, T, T] block-causal mask.
+                causal_mask = None
+                cu_seqlens, max_seqlen = _seq_lens_to_cu_seqlens(seq_lens, seq_length)
+            else:
+                causal_mask = build_block_causal_additive_mask(
+                    seq_lens, seq_length=seq_length, dtype=projected_hidden_states.dtype, device=input_ids.device
+                )
+        else:
+            if is_fa2 and not _is_right_padded_attention_mask(attention_mask):
+                raise ValueError(
+                    "LlamaEagle3DraftModel: attn_implementation='flash_attention_2' requires a right-padded "
+                    "attention_mask (each row must be contiguous 1s followed by 0s)."
+                )
+            causal_mask = _build_causal_mask(attention_mask=attention_mask, dtype=projected_hidden_states.dtype)
 
         draft_input_embeds = self.embed_input_ids(input_ids)
-        causal_mask = _build_causal_mask(attention_mask=attention_mask, dtype=projected_hidden_states.dtype)
         hidden_states = self.model.layers[0](
             input_embeds=draft_input_embeds,
             hidden_states=projected_hidden_states,
             attention_mask=causal_mask,
             position_ids=position_ids,
             cache_hidden=cache_hidden,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
         # EAGLE-3.1 ``norm_output``: route the post-norm hidden state to both
         # the next TTT step (fed back via ``cur_hidden_states`` in the trainer
@@ -805,53 +866,3 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         if getattr(self.config, "norm_output", False):
             hidden_states = self.model.norm(hidden_states)
         return hidden_states
-
-    def forward_peagle(
-        self,
-        sampled_input_ids: torch.Tensor,
-        sampled_projected_hidden: torch.Tensor,
-        position_ids: torch.Tensor,
-        block_mask,
-    ) -> torch.Tensor:
-        """Run the P-EAGLE single parallel-group forward.
-
-        All COD depths are already flattened into one ``[1, total_sampled]``
-        sequence by the caller:
-
-        * ``sampled_input_ids`` -- real token ids at depth-0 slots, the masked
-          ``mask_token_id`` at depth >= 1 slots;
-        * ``sampled_projected_hidden`` -- ``fc``-projected target aux states at
-          depth-0 slots, the projected ``mask_hidden`` placeholder elsewhere;
-        * ``position_ids`` -- ``anchor_pos + depth`` (the reference position);
-        * ``block_mask`` -- the COD cross-depth visibility mask.
-
-        Returns the pre-logits hidden states (post-``norm`` when
-        ``config.norm_output`` is set), one row per sampled element.
-        """
-        draft_input_embeds = self.embed_input_ids(sampled_input_ids)
-        # Layer 0 fuses ``[embed, hidden]`` (2H); deeper layers refine plain H.
-        hidden_states = self.model.layers[0].forward_peagle(
-            input_embeds=draft_input_embeds,
-            hidden_states=sampled_projected_hidden,
-            position_ids=position_ids,
-            block_mask=block_mask,
-        )
-        for layer in self.model.layers[1:]:
-            hidden_states = layer.forward_peagle(hidden_states, position_ids, block_mask)
-        if getattr(self.config, "norm_output", False):
-            hidden_states = self.model.norm(hidden_states)
-        return hidden_states
-
-    def build_peagle_block_mask(self, anchor_pos, depth, lengths, total_seq_len):
-        """Construct the COD ``flex_attention`` block mask for one sequence."""
-        mask_mod = create_peagle_mask_mod(
-            anchor_pos=anchor_pos, depth=depth, lengths=lengths, total_seq_len=total_seq_len
-        )
-        return create_block_mask(
-            mask_mod,
-            B=None,
-            H=None,
-            Q_LEN=anchor_pos.shape[0],
-            KV_LEN=anchor_pos.shape[0],
-            device=anchor_pos.device,
-        )

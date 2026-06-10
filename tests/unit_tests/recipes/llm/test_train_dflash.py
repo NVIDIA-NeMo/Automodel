@@ -27,13 +27,14 @@ import pytest
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
 
 
-def _ckpt_self(ckpt_every_steps, save_every_epoch, global_step):
+def _ckpt_self(ckpt_every_steps, save_every_epoch, global_step, total_optim_steps=None):
     calls = []
     return (
         SimpleNamespace(
             ckpt_every_steps=ckpt_every_steps,
             save_checkpoint_every_epoch=save_every_epoch,
             runtime=SimpleNamespace(global_step=global_step),
+            total_optim_steps=total_optim_steps,
             dist_env=SimpleNamespace(is_main=True),
             checkpoint_config=None,
             save_checkpoint=lambda **kw: calls.append(kw),
@@ -53,6 +54,14 @@ def test_maybe_save_step_checkpoint(every, step, should_fire):
     assert len(calls) == (1 if should_fire else 0)
 
 
+def test_maybe_save_step_checkpoint_marks_cadence_save_final_at_last_step():
+    obj, calls = _ckpt_self(ckpt_every_steps=2, save_every_epoch=False, global_step=8, total_optim_steps=8)
+
+    assert TrainDFlashRecipe._maybe_save_step_checkpoint(obj, epoch=3) is True
+
+    assert calls == [{"epoch": 3, "step": 8, "best_metric_key": "val_loss", "is_final_checkpoint": True}]
+
+
 @pytest.mark.parametrize(
     "every,save_epoch,gs,should_fire",
     [
@@ -67,6 +76,8 @@ def test_maybe_save_final_checkpoint(every, save_epoch, gs, should_fire):
     obj, calls = _ckpt_self(every, save_epoch, gs)
     assert TrainDFlashRecipe._maybe_save_final_checkpoint(obj, completed_epochs=3) is should_fire
     assert len(calls) == (1 if should_fire else 0)
+    if should_fire:
+        assert calls[0]["is_final_checkpoint"] is True
 
 
 def test_resolve_mask_token_id_prefers_explicit():

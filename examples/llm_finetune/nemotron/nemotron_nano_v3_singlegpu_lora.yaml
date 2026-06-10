@@ -1,0 +1,81 @@
+# Single-GPU LoRA SFT for NVIDIA-Nemotron-3-Nano-30B-A3B (bf16), matching
+#
+# Key differences vs nemotron_nano_v3_hellaswag_peft.yaml (which targets >=8 GPUs):
+#   * distributed.ep_size: 1            -> all experts local (single GPU)
+#   * distributed.activation_checkpointing: true  -> recompute block activations
+#   * peft.use_memory_efficient_lora: true        -> don't save the LoRA-A activation
+#
+# Run (single GPU):
+#   automodel examples/llm_finetune/nemotron/nemotron_nano_v3_singlegpu_lora.yaml --nproc-per-node 1
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 100000
+  val_every_steps: 100000
+  max_steps: 20
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 5
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    rms_norm: torch_fp32
+    linear: torch
+
+compile:
+  enabled: false
+
+checkpoint:
+  enabled: false
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  exclude_modules: ["*.out_proj"]  # mamba out_proj uses custom kernels; LoRA doesn't apply
+  dim: 8
+  alpha: 16
+  use_triton: True
+  use_memory_efficient_lora: True
+
+distributed:
+  strategy: fsdp2
+  dp_size: 1
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: True
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0

@@ -32,29 +32,19 @@ import pytest
 import torch
 from transformers import LlamaConfig
 
-from nemo_automodel.components.speculative.eagle.core import PEagleTrainerModule
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.peagle_attention import create_peagle_mask_mod
 from nemo_automodel.components.speculative.eagle.peagle_data import (
     assign_cod_segments,
     generate_cod_sample_indices,
 )
+from nemo_automodel.components.speculative.eagle.peagle_trainer import PEagleTrainerModule
 
 # P-EAGLE's draft forward runs flex_attention, whose autograd is not implemented
 # on CPU in the CI torch build (even the forward errors once the inputs require
 # grad). Tests that drive the draft forward therefore run on CUDA and are skipped
 # when it is unavailable; the pure-tensor / mask-mod / plan / config tests stay on
 # CPU.
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-_gpu_only = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="P-EAGLE forward uses flex_attention, which has no CPU autograd support in the CI torch build.",
-)
-
-# P-EAGLE's draft forward runs flex_attention, whose autograd is not implemented
-# on CPU in the CI torch build (even the forward errors once the inputs require
-# grad). Tests that drive the draft forward therefore run on CUDA and are skipped
-# when it is unavailable; the pure-tensor / mask-mod / config tests stay on CPU.
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _gpu_only = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -71,6 +61,12 @@ def _build_tiny_draft_model(
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
+        # P-EAGLE compiles flex_attention on CUDA; Inductor's flex Triton kernel
+        # refuses to lower head_dim < 16. hidden_size // num_attention_heads = 8
+        # here, so set a decoupled head_dim >= 16 (the draft reads it via
+        # getattr(config, "head_dim", ...)). Keeps hidden_size/target_hidden_size
+        # at 32 so the rest of the tiny-config assertions are unchanged.
+        head_dim=16,
         vocab_size=128,
         max_position_embeddings=64,
     )
@@ -597,3 +593,133 @@ def test_peagle_checkpoint_save_round_trip(tmp_path):
     assert mask_keys, f"mask_hidden missing from saved weights: {sorted(sd)}"
     num_aux = getattr(draft.config, "num_aux_hidden_states", 3)
     assert tuple(sd[mask_keys[0]].shape) == (1, 1, num_aux * draft.config.target_hidden_size)
+
+
+# --------------------------------------------------------------------------- #
+# Activation (gradient) checkpointing for the P-EAGLE draft layers
+# --------------------------------------------------------------------------- #
+def test_gradient_checkpointing_default_off_and_toggle():
+    """The draft ships with checkpointing off; enable/disable flip the flag."""
+    draft = _build_tiny_draft_model(parallel_drafting=True, device="cpu")
+    assert draft.gradient_checkpointing is False
+    draft.gradient_checkpointing_enable()
+    assert draft.gradient_checkpointing is True
+    # ``gradient_checkpointing_kwargs`` is accepted for HF-API parity but ignored
+    # (recompute is always non-reentrant); the flag stays on.
+    draft.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+    assert draft.gradient_checkpointing is True
+    draft.gradient_checkpointing_disable()
+    assert draft.gradient_checkpointing is False
+
+
+def test_run_draft_layer_checkpoints_only_when_enabled_and_training():
+    """``_run_draft_layer`` recomputes (calls the layer twice: forward + backward
+    recompute) only when checkpointing is on AND the module is training; otherwise
+    it runs the layer exactly once."""
+    draft = _build_tiny_draft_model(parallel_drafting=True, device="cpu")
+    lin = torch.nn.Linear(4, 4)
+    calls = {"n": 0}
+
+    def fn(x):
+        calls["n"] += 1
+        return lin(x)
+
+    def _count(enabled: bool, training: bool) -> int:
+        draft.gradient_checkpointing = enabled
+        draft.train(training)
+        calls["n"] = 0
+        out = draft._run_draft_layer(fn, torch.randn(2, 4, requires_grad=True))
+        out.sum().backward()
+        return calls["n"]
+
+    assert _count(enabled=False, training=True) == 1  # disabled: forward only
+    assert _count(enabled=True, training=True) == 2  # enabled + train: + recompute
+    assert _count(enabled=True, training=False) == 1  # eval: no recompute
+
+
+def test_run_draft_layer_matches_direct_numerically():
+    """Checkpointed and direct execution of a draft layer are bit-for-bit equal in
+    output and input gradient."""
+    draft = _build_tiny_draft_model(parallel_drafting=True, device="cpu")
+    draft.train()
+    lin = torch.nn.Linear(4, 4)
+    x = torch.randn(2, 4)
+    xa, xb = x.clone().requires_grad_(True), x.clone().requires_grad_(True)
+
+    draft.gradient_checkpointing = False
+    out_direct = draft._run_draft_layer(lin, xa)
+    out_direct.sum().backward()
+    draft.gradient_checkpointing = True
+    out_ckpt = draft._run_draft_layer(lin, xb)
+    out_ckpt.sum().backward()
+
+    torch.testing.assert_close(out_ckpt, out_direct)
+    torch.testing.assert_close(xb.grad, xa.grad)
+
+
+def test_forward_peagle_routes_every_layer_through_checkpoint_helper(monkeypatch):
+    """``forward_peagle`` dispatches every draft layer (the fused layer 0 and the
+    deeper vanilla layers) through ``_run_draft_layer``, so enabling checkpointing
+    recomputes each one. Layer forwards are stubbed with a flex-free CPU op so the
+    routing is exercised without the CUDA-only flex-attention kernel."""
+    draft = _build_tiny_draft_model(parallel_drafting=True, mask_token_id=3, device="cpu")
+    draft.train()
+    draft.gradient_checkpointing_enable()
+
+    hidden_size = draft.config.hidden_size
+    calls: list[int] = []
+
+    def _make_stub(idx, lin):
+        def _fp(*args, **kwargs):
+            calls.append(idx)
+            hidden = kwargs.get("hidden_states", args[0] if args else None)
+            return lin(hidden)
+
+        return _fp
+
+    for i, layer in enumerate(draft.model.layers):
+        monkeypatch.setattr(layer, "forward_peagle", _make_stub(i, torch.nn.Linear(hidden_size, hidden_size)))
+
+    n = 5
+    ids = torch.zeros(1, n, dtype=torch.long)
+    hidden = torch.randn(1, n, hidden_size, requires_grad=True)
+    position_ids = torch.arange(n).unsqueeze(0)
+    out = draft.forward_peagle(ids, hidden, position_ids, block_mask=None)
+    out.sum().backward()
+
+    # Two draft layers, each called twice (forward + checkpoint recompute).
+    assert calls.count(0) == 2
+    assert calls.count(1) == 2
+
+
+@_gpu_only
+def test_gradient_checkpointing_matches_uncheckpointed_forward():
+    """Enabling activation checkpointing on the real flex-attention P-EAGLE forward
+    is numerically exact: identical loss and valid-token count, and (up to float
+    summation order) identical gradients on every draft parameter."""
+    torch.manual_seed(0)
+    mask_id = 20
+    draft = _build_tiny_draft_model(parallel_drafting=True, mask_token_id=mask_id)
+    trainer = _make_trainer(draft, num_depths=6, mask_token_id=mask_id)
+    batch = _random_batch(draft.config, batch_size=2, seq_len=16)
+
+    draft.zero_grad(set_to_none=True)
+    draft.gradient_checkpointing_disable()
+    torch.manual_seed(123)
+    base = trainer(**batch)
+    base.loss.backward()
+    base_grads = {n: p.grad.detach().clone() for n, p in draft.named_parameters() if p.grad is not None}
+
+    draft.zero_grad(set_to_none=True)
+    draft.gradient_checkpointing_enable()
+    torch.manual_seed(123)
+    ckpt = trainer(**batch)
+    ckpt.loss.backward()
+    ckpt_grads = {n: p.grad.detach().clone() for n, p in draft.named_parameters() if p.grad is not None}
+
+    torch.testing.assert_close(ckpt.loss, base.loss, rtol=1e-4, atol=1e-5)
+    assert ckpt.valid_tokens.item() == base.valid_tokens.item()
+    assert set(ckpt_grads) == set(base_grads)
+    assert base_grads, "expected non-empty gradients"
+    for name in base_grads:
+        torch.testing.assert_close(ckpt_grads[name], base_grads[name], rtol=1e-3, atol=1e-4)

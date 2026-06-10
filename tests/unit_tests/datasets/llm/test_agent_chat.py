@@ -846,3 +846,20 @@ def test_format_example_ok_when_some_label_supervised(monkeypatch):
 
     example = {"id": 1, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}]}
     assert agent_chat._format_example(example, Tok(), 0, 0)["labels"] == [-100, 2, 3]
+
+
+def test_reasoning_content_coerced_to_str_via_both_paths():
+    # Non-string reasoning_content is coerced consistently whether it enters
+    # through the sharegpt converter or the chatml message converter.
+    sharegpt = agent_chat._sharegpt_to_chatml([{"from": "gpt", "value": "hi", "reasoning_content": 123}])
+    chatml = agent_chat._convert_messages(
+        [{"role": "assistant", "content": "hi", "reasoning_content": 123}]
+    )
+    assert sharegpt[0]["reasoning_content"] == "123"
+    assert chatml[0]["reasoning_content"] == "123"
+
+
+def test_reasoning_content_helper_treats_empty_as_absent():
+    assert agent_chat._reasoning_content({"reasoning_content": ""}) is None
+    assert agent_chat._reasoning_content({}) is None
+    assert agent_chat._reasoning_content({"reasoning_content": "x"}) == "x"
