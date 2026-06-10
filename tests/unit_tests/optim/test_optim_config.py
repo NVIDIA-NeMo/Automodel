@@ -84,6 +84,15 @@ class TestAdamWConfig:
         assert opt.param_groups[0]["fused"] is True
         assert not opt.param_groups[0]["foreach"]
 
+    def test_build_from_param_groups_preserves_group_options(self):
+        p0, p1 = _params()
+        opt = AdamWConfig(lr=1e-3, weight_decay=0.1).build_from_param_groups(
+            [{"params": [p0]}, {"params": [p1], "weight_decay": 0.0}]
+        )
+        assert isinstance(opt, torch.optim.AdamW)
+        assert opt.param_groups[0]["weight_decay"] == 0.1
+        assert opt.param_groups[1]["weight_decay"] == 0.0
+
 
 class TestOptimizerConfigBase:
     def test_base_build_not_implemented(self):
@@ -161,6 +170,17 @@ class TestOptimizerFromFactoryConfig:
             kwargs={"lr": 1e-3, "master_weight_dtype": "torch.bfloat16"},
         ).build(_model())
         assert captured["master_weight_dtype"] is torch.bfloat16
+
+    def test_build_from_param_groups_constructs_from_factory(self):
+        p0, p1 = _params()
+        cfg = OptimizerFromFactoryConfig(
+            factory=torch.optim.AdamW,
+            kwargs={"lr": 1e-3, "weight_decay": 0.1},
+        )
+        opt = cfg.build_from_param_groups([{"params": [p0]}, {"params": [p1], "weight_decay": 0.0}])
+        assert isinstance(opt, torch.optim.AdamW)
+        assert opt.param_groups[0]["weight_decay"] == 0.1
+        assert opt.param_groups[1]["weight_decay"] == 0.0
 
     def test_build_requires_callable_factory(self):
         with pytest.raises(AssertionError, match="must be a callable"):
