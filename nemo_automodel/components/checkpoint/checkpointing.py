@@ -663,6 +663,12 @@ class Checkpointer:
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
         loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
+        # MoE experts load in-place via strided views into model storage (DCP writes through
+        # them), so they are absent from the returned state_dict but ARE loaded. Count them as
+        # loaded for the diff to avoid false "missing" warnings; genuinely unloaded params are
+        # still flagged.
+        _adapter = getattr(model_state.model[0], "state_dict_adapter", None)
+        loaded_keys_for_diff |= getattr(_adapter, "_view_loaded_native_keys", None) or set()
         key_diff = _summarize_state_dict_key_diff(expected_keys_for_diff, loaded_keys_for_diff)
         if key_diff["missing_count"] or key_diff["unexpected_count"]:
             logging.warning(
@@ -2080,6 +2086,9 @@ def _maybe_adapt_state_dict_from_hf(
     """
     adapter = getattr(model_part, "state_dict_adapter", None)
     if adapter:
+        # Reset the per-load record of in-place (view) loaded keys so the caller's key-diff
+        # reflects only this load; MoE adapters repopulate it during from_hf.
+        adapter._view_loaded_native_keys = set()
         ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
         ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh
         return adapter.from_hf(state_dict, device_mesh=ep_mesh)
