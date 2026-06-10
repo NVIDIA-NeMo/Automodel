@@ -578,8 +578,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         fill()
         while queue:
             batch, handle = queue.popleft()
-            fill()  # refill before blocking on the result to keep the pipe full
-            yield batch, handle.result()
+            target_batch = handle.result()
+            # Refill only after the popped request completed: round-robin makes
+            # its server the next dispatch target, so refilling before the
+            # result would put a second request in flight on a busy server and
+            # break the one-in-flight-per-server invariant that NCCL recv
+            # ordering and the server's hook-based aux capture rely on.
+            fill()
+            yield batch, target_batch
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the standard recipes."""
