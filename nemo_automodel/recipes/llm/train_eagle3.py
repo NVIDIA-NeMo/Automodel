@@ -119,6 +119,15 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
+def _best_effort(label: str, fn) -> None:
+    """Run a teardown step, logging (never raising) on failure so one failed step
+    does not abort the rest of cleanup."""
+    try:
+        fn()
+    except Exception:
+        logger.exception("error %s during cleanup", label)
+
+
 class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
     """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
 
@@ -979,6 +988,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if start_epoch >= self.num_epochs:
             if self.dist_env.is_main:
                 logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
+            self._finalize_training()
             return
         if self.dist_env.is_main:
             logger.info(
@@ -995,6 +1005,36 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 self.min_lr_ratio,
             )
 
+        try:
+            self._train_epochs(start_epoch, batches_per_epoch, is_ddp)
+            self._maybe_save_final_checkpoint(self.num_epochs)
+            if self.dist_env.is_main:
+                logger.info("Training complete: global_step=%s", self.runtime.global_step)
+        finally:
+            self._finalize_training()
+
+    def _finalize_training(self) -> None:
+        """Release training resources on any exit path (normal, early-return, or
+        exception). Best-effort: each step is guarded so a failure in one does not
+        block the others.
+
+        The high-value step is disconnecting the remote target. Without it a
+        mid-training crash leaves the long-lived target server with a stale
+        client-idle state and a half-open NCCL transport, so the next run cannot
+        connect. ``close()`` is a no-op for the co-located backend. The process
+        group is intentionally left alone -- it is a framework-global resource
+        that direct callers (tests, the interactive launcher) reuse after the
+        loop returns, and ``initialize_distributed`` already destroys it at
+        process exit.
+        """
+        if getattr(self, "target_wrapper", None) is not None:
+            _best_effort("closing target backend", self.target_wrapper.close)
+        if getattr(self, "wandb_run", None) is not None:
+            _best_effort("finishing W&B run", self.wandb_run.finish)
+
+    def _train_epochs(self, start_epoch, batches_per_epoch, is_ddp):
+        """Run the epoch loop (extracted so :meth:`run_train_validation_loop` can
+        wrap it in ``try/finally`` and guarantee teardown on any exit path)."""
         for epoch in range(start_epoch, self.num_epochs):
             if hasattr(self.train_dataloader.sampler, "set_epoch"):
                 self.train_dataloader.sampler.set_epoch(epoch)
@@ -1165,19 +1205,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     best_metric_key="val_loss",
                 )
                 self._log_saved_checkpoint("epoch", epoch + 1, self.runtime.global_step)
-
-        self._maybe_save_final_checkpoint(self.num_epochs)
-
-        if self.target_wrapper is not None:
-            # Release remote connections / shut down the target server's
-            # client-idle watchdog. A no-op for the co-located backend.
-            self.target_wrapper.close()
-
-        if getattr(self, "wandb_run", None) is not None:
-            self.wandb_run.finish()
-
-        if self.dist_env.is_main:
-            logger.info("Training complete: global_step=%s", self.runtime.global_step)
 
 
 def main(config_path=None):
