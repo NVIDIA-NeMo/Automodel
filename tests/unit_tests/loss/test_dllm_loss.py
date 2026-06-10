@@ -503,6 +503,123 @@ class TestDFlashDraftAccuracy:
         assert torch.isclose(overall_acc, expected_overall, atol=1e-6)
 
 
+class TestIDLMLoss:
+    """I-DLM block-diffusion loss: two CEs over the ``[x_t | x_0]`` halves.
+
+    The reference is the official combined-loss math (``train/sft/trainer.py``):
+    a decode CE on the noisy half and a verify CE on the clean half, both over
+    the Dream-shifted response (answer) positions.
+    """
+
+    def _reference(self, logits, target, answer_mask, valid_mask, alpha, L):
+        noisy, clean = logits[:, :L, :], logits[:, L : 2 * L, :]
+        shift_target = target[:, 1:]
+        supervise = (answer_mask[:, 1:].bool() & valid_mask[:, 1:].bool()).float()
+        denom = supervise.sum().clamp_min(1)
+
+        def ce(lg):
+            pt = F.cross_entropy(
+                lg[:, :-1, :].reshape(-1, lg.size(-1)).float(),
+                shift_target.reshape(-1),
+                reduction="none",
+            ).view(shift_target.shape)
+            return (pt * supervise).sum() / denom
+
+        ce_noisy, ce_clean = ce(noisy), ce(clean)
+        return ce_noisy + alpha * ce_clean, ce_noisy, ce_clean
+
+    def _inputs(self):
+        torch.manual_seed(0)
+        B, L, V = 2, 12, 32
+        logits = torch.randn(B, 2 * L, V)  # [x_t | x_0]
+        target = torch.randint(0, V, (B, L))
+        valid_mask = torch.ones(B, L, dtype=torch.long)
+        valid_mask[1, 10:] = 0  # pad the tail of sample 1
+        # All-masked: supervised region (after a 4-token prompt) is the response.
+        answer_mask = torch.zeros(B, L, dtype=torch.bool)
+        answer_mask[:, 4:] = True
+        answer_mask = answer_mask & valid_mask.bool()
+        return logits, target, answer_mask, valid_mask, L
+
+    def test_matches_reference_fixed_alpha(self):
+        from nemo_automodel.components.loss.dllm_loss import IDLMLoss
+
+        logits, target, answer_mask, valid_mask, L = self._inputs()
+        out = IDLMLoss(clean_loss_weight=0.2)(logits, target, answer_mask, valid_mask, seq_len=L)
+        ref_total, ref_noisy, _ = self._reference(logits, target, answer_mask, valid_mask, 0.2, L)
+        assert torch.isclose(out.total_loss, ref_total, atol=1e-5)
+        assert torch.isclose(out.dllm_loss, ref_noisy, atol=1e-5)
+
+    def test_auto_balance_scales_clean_to_noisy(self):
+        from nemo_automodel.components.loss.dllm_loss import IDLMLoss
+
+        logits, target, answer_mask, valid_mask, L = self._inputs()
+        out = IDLMLoss(auto_balance=True)(logits, target, answer_mask, valid_mask, seq_len=L)
+        _, ce_noisy, ce_clean = self._reference(logits, target, answer_mask, valid_mask, 0.0, L)
+        alpha = (ce_noisy / ce_clean.clamp_min(1e-6)).detach()
+        expected = ce_noisy + alpha * ce_clean
+        assert torch.isclose(out.total_loss, expected, atol=1e-5)
+
+    def test_excludes_padding_and_finite(self):
+        """Both CEs ignore padded positions and never produce NaN/inf."""
+        from nemo_automodel.components.loss.dllm_loss import IDLMLoss
+
+        logits, target, answer_mask, valid_mask, L = self._inputs()
+        out = IDLMLoss(clean_loss_weight=1.0)(logits, target, answer_mask, valid_mask, seq_len=L)
+        assert torch.isfinite(out.total_loss)
+        assert out.total_loss.item() > 0
+
+
+def _init_single_process_group():
+    """Trivial single-process gloo group for DTensor tests (mirrors test_kd_loss)."""
+    if not torch.distributed.is_available():
+        return None
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend="gloo", init_method="tcp://127.0.0.1:29507", rank=0, world_size=1)
+    return torch.distributed.group.WORLD
+
+
+@pytest.fixture(scope="module")
+def trivial_pg():
+    pg = _init_single_process_group()
+    if pg is None:
+        pytest.skip("torch.distributed not available")
+    return pg
+
+
+class TestIDLMLossDTensor:
+    """IDLMLoss on a vocab-sharded DTensor must match the plain-tensor result.
+
+    Single-process (world_size=1) gloo group: the shard is trivial, but this
+    exercises the DTensor code path (the ``full_tensor()`` materialisation in
+    ``_compute_per_token_nll`` plus the logit-shift slice on a DTensor) that the
+    FSDP2/TP training path hits, deterministically and without a GPU.
+    """
+
+    def test_vocab_sharded_dtensor_matches_plain(self, trivial_pg):
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import Shard, distribute_tensor
+
+        from nemo_automodel.components.loss.dllm_loss import IDLMLoss
+
+        torch.manual_seed(0)
+        B, L, V = 2, 12, 32
+        logits = torch.randn(B, 2 * L, V)  # [x_t | x_0]
+        target = torch.randint(0, V, (B, L))
+        valid_mask = torch.ones(B, L, dtype=torch.long)
+        answer_mask = torch.zeros(B, L, dtype=torch.bool)
+        answer_mask[:, 4:] = True
+
+        loss_fn = IDLMLoss(clean_loss_weight=0.2)
+        plain = loss_fn(logits, target, answer_mask, valid_mask, seq_len=L).total_loss
+
+        mesh = init_device_mesh("cpu", (1,))
+        dlogits = distribute_tensor(logits, mesh, [Shard(-1)])  # vocab-sharded
+        sharded = loss_fn(dlogits, target, answer_mask, valid_mask, seq_len=L).total_loss
+
+        assert torch.allclose(plain, sharded, atol=1e-5), f"plain {plain.item():.6f} != DTensor {sharded.item():.6f}"
+
+
 class TestDFlashNormalizeMean:
     """``normalize="mean"`` divides by the effective weight sum (decay-weighted mean)."""
 

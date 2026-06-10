@@ -38,6 +38,7 @@ NeMo AutoModel currently supports the following dLLM model families:
 | LLaDA / LLaDA2 | `mdlm` | MDLM cross-entropy | Block-by-block, full-forward (no KV cache) | [llada2_sft.yaml](../../../examples/dllm_sft/llada2_sft.yaml) |
 | Nemotron-Labs-Diffusion | `hybrid` | Diffusion + AR (alpha-weighted) | Block diffusion with KV cache | [nemotron_labs_diffusion_sft.yaml](../../../examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) |
 | DFlash | `dflash` | Decay-weighted cross-entropy (Eq. 4) | Speculative block decoding (draft + target) | [dflash_sft.yaml](../../../examples/dllm_sft/dflash_sft.yaml) |
+| I-DLM | `idlm` | Block-diffusion two-CE (`CE_noisy + α·CE_clean`) | Block-by-block diffusion decoding | [qwen3_8b_idlm.yaml](../../../examples/dllm_sft/qwen3_8b_idlm.yaml) |
 
 ## Install NeMo AutoModel
 
@@ -68,6 +69,7 @@ The recipe uses a **strategy pattern** to handle differences between model famil
 | `mdlm` | `MDLMStrategy` | LLaDA-style: model receives corrupted tokens, MDLM cross-entropy loss |
 | `hybrid` | `HybridStrategy` | Nemotron-Labs-Diffusion-style: model receives clean tokens + `masked_indices`, combined diffusion + AR loss |
 | `dflash` | `DFlashStrategy` | DFlash: frozen target LM provides hidden states; draft model trained with decay-weighted loss |
+| `idlm` | `IDLMStrategy` | I-DLM: converts an AR LM to a diffusion LM via an all-masked `[x_t \| x_0]` block-diffusion forward |
 
 ### LLaDA Configuration
 
@@ -115,12 +117,15 @@ dataset:
 
 | Field | Description |
 |-------|-------------|
-| `dllm.mode` | Training strategy (`mdlm`, `hybrid`, or `dflash`) |
+| `dllm.mode` | Training strategy (`mdlm`, `hybrid`, `dflash`, or `idlm`) |
 | `dllm.mask_token_id` | Token ID used for masking (`126336` for LLaDA, `156895` for LLaDA2.1, `100` for Nemotron-Labs-Diffusion) |
 | `dllm.eps` | Minimum corruption ratio to avoid zero-corruption samples |
 | `dllm.block_size` | When set, use block-wise corruption (otherwise uniform). Hybrid mode only. |
 | `dllm.half_life_ratio` | Half-life ratio for block-wise corruption (defaults to 0.25 when unset). Hybrid mode only. |
 | `dllm.ar_loss_alpha` | Weight applied to the diffusion branch in the hybrid loss. Hybrid mode only. |
+| `dllm.block_length` | Diffusion block size for the I-DLM block-diffusion mask (paper curriculum 1→2→3). I-DLM mode only. |
+| `dllm.clean_loss_weight` | Fixed `α` on the clean-copy verify CE (paper `0.2`). I-DLM mode only. |
+| `dllm.auto_balance_clean_loss` | Replace `α` with `(CE_noisy/CE_clean).detach()` (paper Eq. 2, b3 stage). I-DLM mode only. |
 | `dataset.unshifted` | Must be `true` for dLLM — disables the autoregressive input/target shift |
 
 ### DFlash Configuration
@@ -216,6 +221,44 @@ handle a wider target distribution, improving acceptance length.
 Then point the recipe's `dataset.path_or_dataset_id` at the regenerated
 parquet shards (`/data/dflash-train-regen`) instead of the raw HF dataset.
 
+### I-DLM Configuration
+
+I-DLM ([Introspective Diffusion LM](https://arxiv.org/abs/2604.11035), Yu et al., 2026)
+converts a pretrained autoregressive LM into a diffusion LM by all-masked
+fine-tuning. Each step concatenates a fully-masked copy `x_t` and the clean copy
+`x_0` into a length-`2L` sequence run under a block-diffusion attention mask, with
+a Dream-style next-token logit shift. Two cross-entropy terms, both over the
+response tokens, are combined: `CE_noisy` (decode `q`, the masked copy conditioned
+on the clean ground-truth prefix) and `CE_clean` (verify `p`, the clean copy under
+strict causal attention).
+
+See [qwen3_8b_idlm.yaml](../../../examples/dllm_sft/qwen3_8b_idlm.yaml) for the full
+working config. The key I-DLM-specific sections are:
+
+```yaml
+model:
+  pretrained_model_name_or_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+  dtype: bfloat16
+  attn_implementation: sdpa      # honours the 4D block-diffusion mask; use flex_attention at scale
+
+dllm:
+  mode: idlm
+  mask_token_id: 151669          # reserved Qwen3 special token used as the mask
+  block_length: 1                # diffusion block size (paper curriculum 1 -> 2 -> 3)
+  clean_loss_weight: 0.2         # fixed alpha on CE_clean
+  auto_balance_clean_loss: false # set true for the auto-balanced alpha (Eq. 2, b3 stage)
+
+dataset:
+  unshifted: true
+```
+
+The mask is built for `sdpa`/`eager` (dense additive) or `flex_attention` (sparse
+`BlockMask`, preferred at scale). FlashAttention-2 is unsupported (it ignores
+arbitrary masks), as is context parallelism. The paper trains a `block_length`
+1→2→3 curriculum (one epoch each); run the stages as successive fine-tunes,
+enabling `auto_balance_clean_loss` at the b3 stage.
+
 ## Fine-Tune the Model
 
 ### Fine-Tune LLaDA2
@@ -232,6 +275,14 @@ torchrun --nproc-per-node=8 \
 torchrun --nproc-per-node=8 \
     examples/dllm_sft/finetune.py \
     -c examples/dllm_sft/dflash_sft.yaml
+```
+
+### Fine-Tune with I-DLM
+
+```bash
+torchrun --nproc-per-node=8 \
+    nemo_automodel/recipes/dllm/train_ft.py \
+    -c examples/dllm_sft/qwen3_8b_idlm.yaml
 ```
 
 ### Fine-Tune Nemotron-Labs-Diffusion

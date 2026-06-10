@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.datasets.dllm.corruption import (
+    corrupt_all_masked,
     corrupt_blockwise,
     corrupt_uniform,
     gumbel_topk,
@@ -53,6 +54,32 @@ class TestGumbelTopk:
     def test_output_is_bool(self):
         mask = gumbel_topk(torch.zeros(10), 3)
         assert mask.dtype == torch.bool
+
+
+# ---------------------------------------------------------------------------
+# corrupt_all_masked
+# ---------------------------------------------------------------------------
+
+
+class TestCorruptAllMasked:
+    def test_masks_all_supervised_positions(self, inputs):
+        input_ids, loss_mask = inputs
+        noisy, noise_mask, p_mask = corrupt_all_masked(input_ids, loss_mask, MASK_TOKEN_ID)
+        # Every supervised position is masked; no stochasticity.
+        assert torch.equal(noise_mask, loss_mask.bool())
+        assert (noisy[loss_mask.bool()] == MASK_TOKEN_ID).all()
+
+    def test_leaves_prompt_clean(self, inputs):
+        input_ids, loss_mask = inputs
+        noisy, _, _ = corrupt_all_masked(input_ids, loss_mask, MASK_TOKEN_ID)
+        clean = ~loss_mask.bool()
+        assert (noisy[clean] == input_ids[clean]).all()
+
+    def test_p_mask_is_all_ones(self, inputs):
+        input_ids, loss_mask = inputs
+        _, _, p_mask = corrupt_all_masked(input_ids, loss_mask, MASK_TOKEN_ID)
+        assert p_mask.shape == (B, L)
+        assert torch.all(p_mask == 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -114,48 +141,36 @@ class TestCorruptUniform:
 class TestCorruptBlockwise:
     def test_output_shapes(self, inputs):
         input_ids, loss_mask = inputs
-        noisy, noise_mask, p_mask = corrupt_blockwise(
-            input_ids, loss_mask, MASK_TOKEN_ID, block_size=8
-        )
+        noisy, noise_mask, p_mask = corrupt_blockwise(input_ids, loss_mask, MASK_TOKEN_ID, block_size=8)
         assert noisy.shape == (B, L)
         assert noise_mask.shape == (B, L)
         assert p_mask.shape == (B, L)
 
     def test_noise_mask_is_subset_of_loss_mask(self, inputs):
         input_ids, loss_mask = inputs
-        _, noise_mask, _ = corrupt_blockwise(
-            input_ids, loss_mask, MASK_TOKEN_ID, block_size=8
-        )
+        _, noise_mask, _ = corrupt_blockwise(input_ids, loss_mask, MASK_TOKEN_ID, block_size=8)
         assert (noise_mask & ~loss_mask.bool()).sum() == 0
 
     def test_corrupted_positions_have_mask_token(self, inputs):
         input_ids, loss_mask = inputs
-        noisy, noise_mask, _ = corrupt_blockwise(
-            input_ids, loss_mask, MASK_TOKEN_ID, block_size=8
-        )
+        noisy, noise_mask, _ = corrupt_blockwise(input_ids, loss_mask, MASK_TOKEN_ID, block_size=8)
         assert (noisy[noise_mask] == MASK_TOKEN_ID).all()
 
     def test_uncorrupted_positions_unchanged(self, inputs):
         input_ids, loss_mask = inputs
-        noisy, noise_mask, _ = corrupt_blockwise(
-            input_ids, loss_mask, MASK_TOKEN_ID, block_size=8
-        )
+        noisy, noise_mask, _ = corrupt_blockwise(input_ids, loss_mask, MASK_TOKEN_ID, block_size=8)
         assert (noisy[~noise_mask] == input_ids[~noise_mask]).all()
 
     def test_p_mask_in_valid_range(self, inputs):
         input_ids, loss_mask = inputs
-        _, _, p_mask = corrupt_blockwise(
-            input_ids, loss_mask, MASK_TOKEN_ID, block_size=8, eps=0.01
-        )
+        _, _, p_mask = corrupt_blockwise(input_ids, loss_mask, MASK_TOKEN_ID, block_size=8, eps=0.01)
         assert (p_mask >= 0.01 - 1e-6).all()
         assert (p_mask <= 1.0 + 1e-6).all()
 
     def test_sequence_level_when_no_block_size(self, inputs):
         """block_size=None should do per-sequence sampling."""
         input_ids, loss_mask = inputs
-        noisy, noise_mask, p_mask = corrupt_blockwise(
-            input_ids, loss_mask, MASK_TOKEN_ID, block_size=None
-        )
+        noisy, noise_mask, p_mask = corrupt_blockwise(input_ids, loss_mask, MASK_TOKEN_ID, block_size=None)
         # p_mask should be constant per sequence (single m sampled)
         for b in range(B):
             assert (p_mask[b] == p_mask[b, 0]).all()
@@ -164,9 +179,7 @@ class TestCorruptBlockwise:
         """With block_size, different blocks can have different p values."""
         input_ids, loss_mask = inputs
         torch.manual_seed(123)
-        _, _, p_mask = corrupt_blockwise(
-            input_ids, loss_mask, MASK_TOKEN_ID, block_size=8
-        )
+        _, _, p_mask = corrupt_blockwise(input_ids, loss_mask, MASK_TOKEN_ID, block_size=8)
         # With 4 blocks of size 8, p values should differ across blocks
         # (not guaranteed per run, but with seed=123 and 4 blocks it's very likely)
         block_ps = [p_mask[0, i * 8].item() for i in range(4)]
