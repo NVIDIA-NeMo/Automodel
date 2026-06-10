@@ -953,6 +953,72 @@ class TestLoadModelCustomModelGuard:
         mock_dcp_load.assert_not_called()
 
 
+class TestLoadModelCheckpointKeySubset:
+    """Test allow_checkpoint_key_subset support for torch_save exports."""
+
+    def _make_checkpointer(self):
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/test",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="test/model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def test_allow_checkpoint_key_subset_drops_missing_destination_keys(self, caplog):
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Module()
+        initial_state_dict = {
+            "layer.weight": torch.zeros(2, 2),
+            "model.embed_vision.embedding_projection.weight": torch.zeros(2, 2),
+        }
+        captured = {}
+
+        def fake_do_load(state_dict, *args, **kwargs):
+            captured["requested_keys"] = set(state_dict)
+            return {key: torch.ones_like(value) for key, value in state_dict.items()}
+
+        caplog.set_level(logging.WARNING)
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch.object(checkpointer, "_get_storage_reader", return_value=object()),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
+                return_value={"layer.weight"},
+            ),
+            patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = initial_state_dict.copy()
+
+            checkpointer.load_model(
+                model,
+                model_path="/fake/path",
+                allow_checkpoint_key_subset=True,
+            )
+
+        assert captured["requested_keys"] == {"layer.weight"}
+        assert "allow_checkpoint_key_subset=True" in caplog.text
+        assert "model.embed_vision.embedding_projection.weight" in caplog.text
+        mock_model_state.load_state_dict.assert_called_once()
+        assert set(mock_model_state.load_state_dict.call_args.args[0]) == {"layer.weight"}
+        assert mock_model_state.load_state_dict.call_args.kwargs["strict"] is False
+
+
 # =============================================================================
 # Tests for Checkpointer.initialize_model_weights
 # =============================================================================
@@ -1244,11 +1310,17 @@ class TestCheckpointerSaveModelDiffusersRename:
 class TestOfflineConsolidationScriptAndWarnings:
     """Focused tests for offline consolidation helper generation and warnings."""
 
-    def _make_checkpointer(self, tmp_path, save_consolidated=False, diffusers_compatible=False):
+    def _make_checkpointer(
+        self,
+        tmp_path,
+        save_consolidated=False,
+        diffusers_compatible=False,
+        model_save_format="safetensors",
+    ):
         config = CheckpointingConfig(
             enabled=True,
             checkpoint_dir=str(tmp_path),
-            model_save_format="safetensors",
+            model_save_format=model_save_format,
             model_cache_dir=str(tmp_path / "cache"),
             model_repo_id="test/model",
             save_consolidated=save_consolidated,
@@ -1381,6 +1453,26 @@ class TestOfflineConsolidationScriptAndWarnings:
 
         assert _should_write_consolidated_safetensors(checkpointer.config, is_final_checkpoint=False) is False
         assert _should_write_consolidated_safetensors(checkpointer.config, is_final_checkpoint=True) is True
+
+    def test_torch_save_warns_that_save_consolidated_is_ignored(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING)
+
+        self._make_checkpointer(tmp_path, save_consolidated="final", model_save_format="torch_save")
+
+        assert "checkpoint.save_consolidated=final is ignored when checkpoint.model_save_format=torch_save" in (
+            caplog.text
+        )
+        assert "scripts/export_llm_dcp_to_hf.py" in caplog.text
+
+    def test_torch_save_never_writes_consolidated_safetensors(self, tmp_path):
+        checkpointer = self._make_checkpointer(
+            tmp_path,
+            save_consolidated="final",
+            model_save_format="torch_save",
+        )
+
+        assert _should_write_consolidated_safetensors(checkpointer.config, is_final_checkpoint=False) is False
+        assert _should_write_consolidated_safetensors(checkpointer.config, is_final_checkpoint=True) is False
 
     def test_setup_warns_for_inline_consolidation(self, tmp_path, monkeypatch, caplog):
         monkeypatch.setenv("WORLD_SIZE", "1")

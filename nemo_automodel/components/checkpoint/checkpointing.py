@@ -473,6 +473,7 @@ class Checkpointer:
         is_init_step: bool = False,
         use_checkpoint_id: bool = True,
         key_mapping: Optional[dict[str, str]] = None,
+        allow_checkpoint_key_subset: bool = False,
     ) -> None:
         """
         Load model weights from `model_path`.
@@ -489,6 +490,8 @@ class Checkpointer:
             is_init_step: If True, treat load as initialization from a base checkpoint.
             use_checkpoint_id: Pass `checkpoint_id` to DCP if True; disable when using direct HF paths.
             key_mapping: Optional key remapping when reading from HF checkpoints.
+            allow_checkpoint_key_subset: If True, keep the model's current initialization for
+                parameters that are absent from the checkpoint instead of requiring an exact key match.
         """
         # Validate checkpoint directory
         if not os.path.exists(model_path):
@@ -611,6 +614,7 @@ class Checkpointer:
         # renames model keys, producing a mismatch in the DCP planner.
         reader_key_mapping = None if has_state_dict_adapter else key_mapping
         storage_reader = self._get_storage_reader(model_path, reader_key_mapping, is_init_step=is_init_step)
+        checkpoint_metadata_keys: set[str] | None = None
 
         # MoE adapters return views into model storage; DCP writes safetensors
         # data straight through them and from_hf skips the rebuild.
@@ -630,7 +634,8 @@ class Checkpointer:
             and lm_head_param_name in state_dict
         )
         if should_try_tied_lm_head_compat:
-            checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+            if checkpoint_metadata_keys is None:
+                checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
             if lm_head_param_name not in checkpoint_metadata_keys:
                 for source_name in get_tied_lm_head_source_names(model_state.model[0], lm_head_param_name):
                     if source_name not in checkpoint_metadata_keys or source_name in state_dict:
@@ -655,6 +660,22 @@ class Checkpointer:
                     )
                     state_dict.pop(lm_head_param_name, None)
 
+        if allow_checkpoint_key_subset:
+            if checkpoint_metadata_keys is None:
+                checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+            missing_checkpoint_keys = sorted(key for key in state_dict if key not in checkpoint_metadata_keys)
+            if missing_checkpoint_keys:
+                for key in missing_checkpoint_keys:
+                    state_dict.pop(key, None)
+                logging.warning(
+                    "Checkpoint %s is missing %d requested model keys. Keeping the current model "
+                    "initialization for those parameters because allow_checkpoint_key_subset=True "
+                    "(examples=%s).",
+                    model_path,
+                    len(missing_checkpoint_keys),
+                    missing_checkpoint_keys[:10],
+                )
+
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
 
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
@@ -663,6 +684,8 @@ class Checkpointer:
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
         loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
+        if allow_checkpoint_key_subset:
+            expected_keys_for_diff = loaded_keys_for_diff.copy()
         key_diff = _summarize_state_dict_key_diff(expected_keys_for_diff, loaded_keys_for_diff)
         if key_diff["missing_count"] or key_diff["unexpected_count"]:
             logging.warning(
@@ -674,7 +697,10 @@ class Checkpointer:
                 key_diff["missing_examples"],
                 key_diff["unexpected_examples"],
             )
-        model_state.load_state_dict(state_dict, strict=not (len(model_state.model) > 1 or has_state_dict_adapter))
+        model_state.load_state_dict(
+            state_dict,
+            strict=not (len(model_state.model) > 1 or has_state_dict_adapter or allow_checkpoint_key_subset),
+        )
 
         del state_dict
         gc.collect()

@@ -138,6 +138,18 @@ class CheckpointingConfig:
 
         # Normalize legacy bools and string aliases to a consolidated export mode.
         self.save_consolidated = _normalize_save_consolidated(self.save_consolidated)
+        if (
+            self.model_save_format != SerializationFormat.SAFETENSORS
+            and self.save_consolidated != SaveConsolidatedMode.FALSE
+            and not self.is_peft
+        ):
+            logging.warning(
+                "checkpoint.save_consolidated=%s is ignored when checkpoint.model_save_format=%s. "
+                "Export sharded torch_save checkpoints back to Hugging Face safetensors after training with "
+                "scripts/export_llm_dcp_to_hf.py.",
+                self.save_consolidated.value,
+                self.model_save_format.value,
+            )
         if self.save_consolidated != SaveConsolidatedMode.FALSE and not self.is_peft:
             if not self.v4_compatible:
                 logging.warning(
