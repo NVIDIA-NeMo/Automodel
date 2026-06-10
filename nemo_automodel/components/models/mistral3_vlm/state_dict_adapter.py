@@ -94,6 +94,29 @@ def _identity(k: str) -> str:
     return k
 
 
+# The HF ``Mistral3ForConditionalGeneration`` puts the LM head at the top level
+# (model param FQN ``lm_head.weight``), but the on-disk checkpoint nests it under
+# the language model (``language_model.lm_head.weight``). For tied-embedding
+# checkpoints (e.g. Ministral-3) the head is never serialized, so the two names
+# never collide and identity round-trips. For *untied* checkpoints (e.g.
+# Devstral-Small-2-24B, ``tie_word_embeddings=False``) the head IS serialized
+# under the nested name, and DCP fails with "Missing key in checkpoint
+# state_dict: lm_head.weight" unless we bridge the two. These translate only the
+# head key; every other key round-trips via identity.
+_MODEL_LM_HEAD_KEY = "lm_head.weight"
+_HF_LM_HEAD_KEY = "language_model.lm_head.weight"
+
+
+def _lm_head_native_to_hf(model_key: str) -> str:
+    """Map the model's top-level ``lm_head.weight`` to the on-disk nested name."""
+    return _HF_LM_HEAD_KEY if model_key == _MODEL_LM_HEAD_KEY else model_key
+
+
+def _lm_head_hf_to_native(hf_key: str) -> str:
+    """Map the on-disk nested ``language_model.lm_head.weight`` to the model name."""
+    return _MODEL_LM_HEAD_KEY if hf_key == _HF_LM_HEAD_KEY else hf_key
+
+
 class Mistral3FP8StateDictAdapter(StateDictAdapter):
     """FP8 dequant adapter for the Mistral-3.5 128B dawn-ridge VLM.
 
@@ -120,12 +143,18 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
     def for_vlm_full(cls) -> "Mistral3FP8StateDictAdapter":
         """Full-VLM path for Mistral3ForConditionalGeneration checkpoints.
 
-        Keys round-trip identically between HF's VLM ``state_dict()`` and
-        disk for the dawn-ridge-128B checkpoint (both use
-        ``model.language_model.*``, ``model.vision_tower.*``,
-        ``model.multi_modal_projector.*``, ``lm_head.weight``). Only the
-        language_model layer weights are FP8; vision / mm_projector / lm_head
-        are BF16 on disk and must be passed through without a scale_inv
+        The body keys round-trip identically between HF's VLM ``state_dict()``
+        and disk (both use ``model.language_model.*``, ``model.vision_tower.*``,
+        ``model.multi_modal_projector.*``). The **LM head** is the one
+        exception: the model exposes it at the top level (``lm_head.weight``)
+        while the checkpoint nests it (``language_model.lm_head.weight``), so we
+        translate just that key via ``_lm_head_{native_to_hf,hf_to_native}``.
+        Tied checkpoints (Ministral-3) never serialize the head, so the
+        translation is a harmless no-op there; untied checkpoints (Devstral-24B)
+        rely on it to find the head during the DCP load.
+
+        Only the language_model layer weights are FP8; vision / mm_projector /
+        lm_head are BF16 on disk and must be passed through without a scale_inv
         placeholder — otherwise DCP would fail trying to fetch a non-existent
         ``_scale_inv`` key.
         """
@@ -134,7 +163,12 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
             "model.multi_modal_projector",
             # "lm_head" already in _NON_QUANTIZED_SUFFIXES via suffix match.
         )
-        return cls(layout_name="vlm_full", not_fp8_prefixes=not_fp8)
+        return cls(
+            native_to_hf=_lm_head_native_to_hf,
+            hf_to_native=_lm_head_hf_to_native,
+            layout_name="vlm_full",
+            not_fp8_prefixes=not_fp8,
+        )
 
     # --------------------------------------------------------------------- #
     # model → HF                                                            #
