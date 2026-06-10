@@ -463,25 +463,33 @@ def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -
 
     Uses ``nn.Module.to()`` which is safe for both plain tensors and DTensors
     (FSDP2 sharded parameters).  When the model is already FSDP2-sharded
-    (parameters are DTensors), only buffers of matching modules are restored
-    to fp32 (parameters are left as-is since FSDP2 requires uniform dtype).
+    (parameters are DTensors), strict fp32 modules are restored to fp32 because
+    they are expected to be isolated as uniform fp32 FSDP units. Non-strict fp32
+    hints only restore matching buffers, since their parameters may share an
+    FSDP unit with lower-precision parameters.
 
     Args:
         model: The model whose parameters should be cast.
         dtype: Target dtype (e.g. ``torch.bfloat16``).
     """
     fp32_keywords = _get_fp32_module_keywords(model)
+    strict_fp32_keywords = _get_strict_fp32_module_keywords(model)
 
     model.to(dtype)
     if fp32_keywords:
         if _has_dtensor_params(model):
-            logger.warning(
-                "Model parameters are DTensors (FSDP2) — skipping fp32 parameter "
-                "restoration for keywords=%s. Only buffers will be restored to fp32. "
-                "FSDP2 requires uniform dtype within each parameter group.",
-                fp32_keywords,
-            )
-            _restore_fp32_buffers(model, fp32_keywords)
+            if strict_fp32_keywords:
+                _restore_fp32_modules(model, strict_fp32_keywords)
+
+            buffer_only_keywords = [kw for kw in fp32_keywords if kw not in strict_fp32_keywords]
+            if buffer_only_keywords:
+                logger.warning(
+                    "Model parameters are DTensors (FSDP2) — skipping fp32 parameter "
+                    "restoration for non-strict keywords=%s. Only buffers will be restored to fp32. "
+                    "FSDP2 requires uniform dtype within each parameter group.",
+                    buffer_only_keywords,
+                )
+                _restore_fp32_buffers(model, buffer_only_keywords)
         else:
             _restore_fp32_modules(model, fp32_keywords)
 
@@ -511,8 +519,8 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
 
     ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` handling is delegated to
     ``cast_model_to_dtype``: on an unsharded model those modules' params and buffers are restored
-    to fp32 on exit; on a sharded model only their buffers are (sharded fp32 params are pinned at
-    shard time, since FSDP2 forbids mixed dtypes within a group).
+    to fp32 on exit; on a sharded model, strict fp32 modules are restored while non-strict modules
+    only have their buffers restored.
 
     Args:
         model: The model to run in fp32 within the context.
@@ -535,6 +543,13 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
         cast_model_to_dtype(model, restore_dtype)
 
 
+def _get_strict_fp32_module_keywords(model: nn.Module) -> list[str]:
+    val = getattr(model, "_keep_in_fp32_modules_strict", None)
+    if not isinstance(val, (list, tuple)):
+        return []
+    return list(dict.fromkeys(val))
+
+
 def _get_fp32_module_keywords(model: nn.Module) -> list[str]:
     """Collect module name patterns that must remain in fp32.
 
@@ -550,7 +565,7 @@ def _get_fp32_module_keywords(model: nn.Module) -> list[str]:
     keywords: list[str] = []
     for attr in ("_keep_in_fp32_modules_strict", "_keep_in_fp32_modules"):
         val = getattr(model, attr, None)
-        if isinstance(val, list):
+        if isinstance(val, (list, tuple)):
             keywords.extend(val)
 
     # de-duplicate while preserving order

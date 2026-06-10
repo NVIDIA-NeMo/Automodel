@@ -29,6 +29,7 @@ from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
 )
+from nemo_automodel.components.models.common.gated_delta_net_fp32 import force_fp32_gated_delta_net_params
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -48,9 +49,13 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
     unshard/reshard + gradient reduce-scatter fire for that unit -- the gate must be
     computed *inside* the holder's forward. This subclass overrides ``forward`` to route
     the gate through ``self._compute_gate(a)`` while reproducing the rest of HF's forward
-    verbatim. When no holder is present (single device / bf16), it falls back to the
-    inline computation and behaves identically to the base class.
+    verbatim. When no holder is present (single device / before FSDP isolation), it
+    falls back to the inline computation and behaves identically to the base class.
     """
+
+    def __init__(self, config: Qwen3NextConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        force_fp32_gated_delta_net_params(self)
 
     def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
         """Compute the decay gate ``g`` in fp32, via the holder when it exists."""

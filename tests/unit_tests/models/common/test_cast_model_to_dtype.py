@@ -107,6 +107,16 @@ class TestGetFp32ModuleKeywords:
         model = ModelWithStrictFp32()
         assert _get_fp32_module_keywords(model) == ["head"]
 
+    def test_keep_in_fp32_modules_strict_tuple(self):
+        class Model(nn.Module):
+            _keep_in_fp32_modules_strict = ("head",)
+
+            def __init__(self):
+                super().__init__()
+
+        model = Model()
+        assert _get_fp32_module_keywords(model) == ["head"]
+
     def test_both_attributes_deduped(self):
         model = ModelWithBothFp32Attrs()
         keywords = _get_fp32_module_keywords(model)
@@ -198,6 +208,21 @@ class TestCastModelToDtype:
         assert model.head.weight.dtype == torch.float32
         assert model.linear.weight.dtype == torch.bfloat16
 
+    def test_strict_fp32_modules_preserved_from_tuple(self):
+        class Model(nn.Module):
+            _keep_in_fp32_modules_strict = ("head",)
+
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(4, 4)
+                self.head = nn.Linear(4, 2)
+
+        model = Model()
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert model.head.weight.dtype == torch.float32
+        assert model.linear.weight.dtype == torch.bfloat16
+
     def test_strict_fp32_parameters_preserved(self):
         model = ModelWithStrictFp32Parameter()
         cast_model_to_dtype(model, torch.bfloat16)
@@ -248,6 +273,16 @@ class TestDTensorAwareCasting:
         # Parameters should be bf16 — FSDP2 requires uniform dtype
         for p in model.parameters():
             assert p.dtype == torch.bfloat16
+
+    def test_dtensor_strict_fp32_params_restored(self):
+        """Strict fp32 modules are already isolated as their own FSDP units, so they can be restored."""
+        model = ModelWithStrictFp32()
+
+        with patch("nemo_automodel.components.models.common.utils._has_dtensor_params", return_value=True):
+            cast_model_to_dtype(model, torch.bfloat16)
+
+        assert model.head.weight.dtype == torch.float32
+        assert model.linear.weight.dtype == torch.bfloat16
 
     def test_dtensor_buffers_in_matching_modules_restored(self):
         """Buffers in fp32-keyword-matching modules are cast to fp32 even with DTensor params."""

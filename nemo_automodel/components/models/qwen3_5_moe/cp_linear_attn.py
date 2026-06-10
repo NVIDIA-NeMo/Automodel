@@ -35,6 +35,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGated
 
 from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     Fp32GateParamHolder,
+    force_fp32_gated_delta_net_params,
     isolate_fp32_params,
     make_fp32_getattr,
     mark_keep_in_fp32_modules_strict,
@@ -102,6 +103,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
 
     def __init__(self, config, layer_idx: int):
         super().__init__(config, layer_idx)
+        force_fp32_gated_delta_net_params(self)
         self._cp_mesh = None
 
     def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
@@ -659,10 +661,12 @@ def patch_hf_model(model, cp_enabled=False):
         mod.__class__ = CPAwareGatedDeltaNet
         mod._cp_mesh = None
 
-        # Move float32 bare params (A_log, dt_bias) into a ``_fp32_params`` holder
-        # submodule for FSDP. The CPAwareGatedDeltaNet forward calls
-        # ``self._fp32_params()`` to trigger FSDP unshard; __getattr__ redirects
-        # ``self.A_log`` to the holder so it returns the unsharded plain tensor.
+        # Class-swapping bypasses CPAwareGatedDeltaNet.__init__, so first enforce
+        # the GDN fp32 dtype contract, then move those params into a holder for FSDP.
+        # The CPAwareGatedDeltaNet forward calls ``self._fp32_params()`` to trigger
+        # FSDP unshard; __getattr__ redirects ``self.A_log`` to the holder so it
+        # returns the unsharded plain tensor.
+        force_fp32_gated_delta_net_params(mod)
         isolate_fp32_params(mod)
         patched += 1
 
@@ -680,9 +684,9 @@ def patch_hf_model(model, cp_enabled=False):
         mark_keep_in_fp32_modules_strict(model)
 
         # Attach a Qwen3.5 state_dict_adapter so saved checkpoints hide the
-        # ``_fp32_params`` wrapping and remain HF-loadable directly.  Keep
-        # ``from_hf`` in bare-key mode: adapter-mediated DCP loads operate in
-        # the HF key namespace even when physical params live in ``_fp32_params``.
+        # ``_fp32_params`` wrapping and remain HF-loadable directly. After this
+        # runtime patch, physical params live in ``_fp32_params``, so HF loads
+        # must route bare ``linear_attn.A_log`` / ``dt_bias`` keys into the holder.
         # Use dynamic import to avoid pulling ``components.checkpoint`` into
         # this file's static import graph: ``cp_linear_attn`` is reached from
         # ``components.distributed.parallelizer`` and the adapter inherits
@@ -692,6 +696,9 @@ def patch_hf_model(model, cp_enabled=False):
         import importlib
 
         adapter_module = importlib.import_module("nemo_automodel.components.models.qwen3_5.state_dict_adapter")
+        adapter_cls = adapter_module.Qwen3_5DenseStateDictAdapter
         adapter = getattr(model, "state_dict_adapter", None)
         if adapter is None:
-            model.state_dict_adapter = adapter_module.Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=False)
+            model.state_dict_adapter = adapter_cls()
+        elif isinstance(adapter, adapter_cls):
+            adapter.route_linear_attn_fp32_params = True

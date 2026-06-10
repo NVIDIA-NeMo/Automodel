@@ -23,10 +23,11 @@ that the recurrence compounds across the sequence.
 
 ``fully_shard_by_dtype`` groups parameters into FSDP units by *module subtree*, so
 a bare fp32 parameter sitting next to bf16 ones cannot earn its own fp32 unit. To
-make it shardable, ``isolate_fp32_params`` moves the fp32 bare params into a
-``_fp32_params`` submodule (``Fp32GateParamHolder``) whose ``forward`` computes the
-gate. Because the gate is computed *inside* the holder's forward, FSDP2's
-unshard/reshard lifecycle and post-backward gradient reduce-scatter work naturally.
+make it shardable, ``isolate_fp32_params`` first forces the intrinsic GDN params
+to fp32, then moves those bare params into a ``_fp32_params`` submodule
+(``Fp32GateParamHolder``) whose ``forward`` computes the gate. Because the gate is
+computed *inside* the holder's forward, FSDP2's unshard/reshard lifecycle and
+post-backward gradient reduce-scatter work naturally.
 
 This module is shared by the dense Qwen3.5 path (``qwen3_5_moe.cp_linear_attn``),
 the native Qwen3.5-MoE path, and the Qwen3-Next path.
@@ -73,6 +74,30 @@ def route_fp32_holder_key(key: str, param_names: tuple[str, ...] = FP32_GDN_PARA
     return f"{head}.linear_attn._fp32_params.{tail}"
 
 
+def is_gated_delta_net_fp32_param_key(key: str, param_names: tuple[str, ...] = FP32_GDN_PARAM_NAMES) -> bool:
+    """Return whether ``key`` names an intrinsically-fp32 GDN parameter."""
+    return key.endswith(param_names) and ".linear_attn." in key
+
+
+def upcast_gated_delta_net_fp32_state_tensor(
+    key: str, tensor: object, param_names: tuple[str, ...] = FP32_GDN_PARAM_NAMES
+) -> object:
+    """Cast loaded GDN fp32-param tensors to fp32 while leaving other state untouched.
+
+    Construction-time upcasting is not enough for checkpoint and HF load paths that
+    replace or carry tensor values from disk. This helper preserves the fp32 GDN
+    contract at adapter boundaries before tensors enter the live model state dict.
+    """
+    if not is_gated_delta_net_fp32_param_key(key, param_names):
+        return tensor
+    if getattr(tensor, "dtype", None) == torch.float32:
+        return tensor
+    is_floating_point = getattr(tensor, "is_floating_point", None)
+    if callable(is_floating_point) and is_floating_point():
+        return tensor.to(dtype=torch.float32)
+    return tensor
+
+
 class Fp32GateParamHolder(torch.nn.Module):
     """Holds fp32 GDN params (``A_log``, optionally ``dt_bias``) in their own module.
 
@@ -81,9 +106,9 @@ class Fp32GateParamHolder(torch.nn.Module):
     lifecycle natural -- the params are unsharded for the computation and the
     holder's forward output participates in autograd so gradients are reduced.
 
-    ``dt_bias`` may live either here (when it is intrinsically fp32 and was moved
-    in by ``isolate_fp32_params``) or remain a bare param on the parent module
-    (e.g. when it is bf16). The forward prefers the holder-owned ``dt_bias`` so
+    ``dt_bias`` may live either here (when it is available and was moved in by
+    ``isolate_fp32_params``) or remain a bare param on the parent module in legacy
+    / partial-holder cases. The forward prefers the holder-owned ``dt_bias`` so
     the value used in compute is the unsharded fp32 parameter; otherwise it falls
     back to the ``dt_bias`` passed in by the caller.
     """
@@ -114,6 +139,32 @@ def make_fp32_getattr(orig_getattr):
     return _getattr_with_fp32
 
 
+def force_fp32_gated_delta_net_params(
+    module: torch.nn.Module, param_names: tuple[str, ...] = FP32_GDN_PARAM_NAMES
+) -> bool:
+    """Force intrinsically-fp32 GDN params to fp32 before holder isolation.
+
+    ``from_config`` and custom construction can create ``A_log`` / ``dt_bias`` under
+    a bf16 default dtype. Upcasting here records the architecture contract on the
+    live parameters themselves; optimizer fp32 master weights alone cannot recover
+    precision after the forward parameter has already been rounded to bf16.
+
+    Returns ``True`` when at least one parameter was converted.
+    """
+    forced_any = False
+
+    for owner in (module, module._modules.get(HOLDER_NAME)):
+        if owner is None:
+            continue
+        for pname in param_names:
+            param = owner._parameters.get(pname)
+            if param is not None and param.dtype != torch.float32 and param.is_floating_point():
+                param.data = param.data.to(dtype=torch.float32)
+                forced_any = True
+
+    return forced_any
+
+
 def isolate_fp32_params(module: torch.nn.Module) -> Fp32GateParamHolder | None:
     """Move ``module``'s fp32 bare params into a ``_fp32_params`` holder submodule.
 
@@ -122,9 +173,12 @@ def isolate_fp32_params(module: torch.nn.Module) -> Fp32GateParamHolder | None:
     them in their own fp32 FSDP unit. The parent class's ``__getattr__`` is patched
     so ``module.A_log`` still resolves to the moved parameter.
 
-    Idempotent: if a holder already exists the existing one is returned and nothing
-    is moved. Returns the holder, or ``None`` when the module has no fp32 bare params.
+    Idempotent: if a holder already exists the existing one is returned after
+    re-asserting fp32 dtype on holder-owned GDN params. Returns the holder, or
+    ``None`` when the module has no fp32 bare params.
     """
+    force_fp32_gated_delta_net_params(module)
+
     existing = module._modules.get(HOLDER_NAME)
     if existing is not None:
         return existing

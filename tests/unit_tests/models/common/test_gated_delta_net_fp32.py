@@ -14,11 +14,14 @@ from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     FP32_GDN_PARAM_NAMES,
     HOLDER_NAME,
     Fp32GateParamHolder,
+    force_fp32_gated_delta_net_params,
+    is_gated_delta_net_fp32_param_key,
     isolate_fp32_params,
     isolate_gated_delta_net_fp32_params,
     mark_keep_in_fp32_modules_strict,
     route_fp32_holder_key,
     strip_fp32_holder_key,
+    upcast_gated_delta_net_fp32_state_tensor,
 )
 
 
@@ -57,20 +60,34 @@ class TestIsolateFp32Params:
         # The bf16 submodule weight stays put.
         assert gdn.in_proj.weight is not None
 
-    def test_bf16_param_stays_bare(self):
+    def test_forces_bf16_tracked_params_to_fp32_before_isolation(self):
         gdn = _FakeGatedDeltaNet(a_dtype=torch.float32, dt_dtype=torch.bfloat16)
         holder = isolate_fp32_params(gdn)
 
         assert holder is not None
         assert "A_log" not in gdn._parameters
-        # bf16 dt_bias is not fp32, so it remains a bare parameter.
-        assert "dt_bias" in gdn._parameters
+        assert "dt_bias" not in gdn._parameters
         assert gdn.A_log.dtype == torch.float32
+        assert gdn.dt_bias.dtype == torch.float32
+        assert holder.A_log.dtype == torch.float32
+        assert holder.dt_bias.dtype == torch.float32
 
-    def test_no_fp32_params_returns_none(self):
+    def test_all_bf16_tracked_params_are_forced_and_isolated(self):
         gdn = _FakeGatedDeltaNet(a_dtype=torch.bfloat16, dt_dtype=torch.bfloat16)
-        assert isolate_fp32_params(gdn) is None
+        holder = isolate_fp32_params(gdn)
+        assert holder is not None
+        assert HOLDER_NAME in gdn._modules
+        assert "A_log" not in gdn._parameters
+        assert "dt_bias" not in gdn._parameters
+        assert holder.A_log.dtype == torch.float32
+        assert holder.dt_bias.dtype == torch.float32
+
+    def test_force_fp32_gated_delta_net_params_without_isolation(self):
+        gdn = _FakeGatedDeltaNet(a_dtype=torch.bfloat16, dt_dtype=torch.bfloat16)
+        assert force_fp32_gated_delta_net_params(gdn) is True
         assert HOLDER_NAME not in gdn._modules
+        assert gdn.A_log.dtype == torch.float32
+        assert gdn.dt_bias.dtype == torch.float32
 
     def test_idempotent_no_nested_holder(self):
         gdn = _FakeGatedDeltaNet()
@@ -142,10 +159,13 @@ class TestIsolateAcrossModel:
         holder = model.layers[0].linear_attn._fp32_params
         assert HOLDER_NAME not in holder._modules
 
-    def test_bf16_model_not_marked(self):
+    def test_bf16_gdn_params_are_forced_and_marked(self):
         model = _wrap_in_model(_FakeGatedDeltaNet(a_dtype=torch.bfloat16, dt_dtype=torch.bfloat16))
-        assert isolate_gated_delta_net_fp32_params(model) is False
-        assert not hasattr(model, "_keep_in_fp32_modules_strict")
+        assert isolate_gated_delta_net_fp32_params(model) is True
+        assert model._keep_in_fp32_modules_strict == (HOLDER_NAME,)
+        holder = model.layers[0].linear_attn._fp32_params
+        assert holder.A_log.dtype == torch.float32
+        assert holder.dt_bias.dtype == torch.float32
 
     def test_no_gdn_is_noop(self):
         model = nn.Module()
@@ -165,8 +185,7 @@ class TestMarkKeepInFp32:
 class TestKeyHelpers:
     def test_strip_fp32_holder_key(self):
         assert (
-            strip_fp32_holder_key("model.layers.0.linear_attn._fp32_params.A_log")
-            == "model.layers.0.linear_attn.A_log"
+            strip_fp32_holder_key("model.layers.0.linear_attn._fp32_params.A_log") == "model.layers.0.linear_attn.A_log"
         )
         assert (
             strip_fp32_holder_key("model.layers.0.linear_attn._fp32_params.dt_bias")
@@ -200,3 +219,35 @@ class TestKeyHelpers:
         routed = route_fp32_holder_key(bare)
         assert routed == "model.layers.3.linear_attn._fp32_params.A_log"
         assert strip_fp32_holder_key(routed) == bare
+
+    def test_identifies_bare_and_routed_gdn_fp32_param_keys(self):
+        assert is_gated_delta_net_fp32_param_key("model.layers.0.linear_attn.A_log")
+        assert is_gated_delta_net_fp32_param_key("model.layers.0.linear_attn._fp32_params.dt_bias")
+        assert not is_gated_delta_net_fp32_param_key("model.layers.0.self_attn.A_log")
+        assert not is_gated_delta_net_fp32_param_key("model.layers.0.linear_attn.conv1d.weight")
+
+
+class TestStateTensorUpcast:
+    def test_upcasts_bf16_gdn_state_tensor(self):
+        tensor = torch.ones(4, dtype=torch.bfloat16)
+
+        out = upcast_gated_delta_net_fp32_state_tensor("model.layers.0.linear_attn._fp32_params.dt_bias", tensor)
+
+        assert out.dtype == torch.float32
+        torch.testing.assert_close(out, tensor.float())
+
+    def test_leaves_unrelated_bf16_tensor_by_reference(self):
+        tensor = torch.ones(4, dtype=torch.bfloat16)
+
+        out = upcast_gated_delta_net_fp32_state_tensor("model.layers.0.self_attn.q_proj.weight", tensor)
+
+        assert out is tensor
+        assert out.dtype == torch.bfloat16
+
+    def test_leaves_non_floating_gdn_tensor_by_reference(self):
+        tensor = torch.ones(4, dtype=torch.int64)
+
+        out = upcast_gated_delta_net_fp32_state_tensor("model.layers.0.linear_attn.A_log", tensor)
+
+        assert out is tensor
+        assert out.dtype == torch.int64
