@@ -57,7 +57,7 @@ from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_
 from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
@@ -117,6 +117,15 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
         value = value / dist.get_world_size()
     return value
+
+
+def _best_effort(label: str, fn) -> None:
+    """Run a teardown step, logging (never raising) on failure so one failed step
+    does not abort the rest of cleanup."""
+    try:
+        fn()
+    except Exception:
+        logger.exception("error %s during cleanup", label)
 
 
 class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
@@ -225,6 +234,12 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         freeze_embeddings_default = not parallel_drafting
         if recipe_cfg.get("freeze_embeddings", freeze_embeddings_default):
             self.draft_model.freeze_embeddings()
+        # P-EAGLE memory knob: recompute the draft layers' activations in the
+        # backward instead of storing them, lowering the activation peak of the
+        # long flattened COD sequence (complements ``sequence_partitions``).
+        # Off by default; only affects the parallel-drafting forward.
+        if recipe_cfg.get("draft_gradient_checkpointing", False):
+            self.draft_model.gradient_checkpointing_enable()
         # The target's "Model summary" is logged by apply_model_infrastructure when it
         # loads; the draft is built directly, so log its (trainable) summary here too.
         print_trainable_parameters(self.draft_model, name="Draft")
@@ -433,16 +448,12 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if target_attn_implementation is not None:
             target_kwargs["attn_implementation"] = target_attn_implementation
         if self.cfg.get("distributed", None) is not None:
-            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+            self.dist_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
             self.distributed_config = self.dist_setup.strategy_config
-            self.device_mesh = self.dist_setup.device_mesh
-            self.moe_mesh = self.dist_setup.moe_mesh
+            self.device_mesh = self.dist_setup.mesh_context.device_mesh
+            self.moe_mesh = self.dist_setup.mesh_context.moe_mesh
             target_kwargs.update(
-                distributed_config=self.distributed_config,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                moe_config=self.dist_setup.moe_config,
-                activation_checkpointing=self.dist_setup.activation_checkpointing,
+                distributed_setup=self.dist_setup,
             )
         self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         # ``nn.Module.to`` is in-place; reassigning ``self.target_model`` would
@@ -934,6 +945,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if start_epoch >= self.num_epochs:
             if self.dist_env.is_main:
                 logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
+            self._finalize_training()
             return
         if self.dist_env.is_main:
             logger.info(
@@ -950,6 +962,36 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 self.min_lr_ratio,
             )
 
+        try:
+            self._train_epochs(start_epoch, batches_per_epoch, is_ddp)
+            self._maybe_save_final_checkpoint(self.num_epochs)
+            if self.dist_env.is_main:
+                logger.info("Training complete: global_step=%s", self.runtime.global_step)
+        finally:
+            self._finalize_training()
+
+    def _finalize_training(self) -> None:
+        """Release training resources on any exit path (normal, early-return, or
+        exception). Best-effort: each step is guarded so a failure in one does not
+        block the others.
+
+        The high-value step is disconnecting the remote target. Without it a
+        mid-training crash leaves the long-lived target server with a stale
+        client-idle state and a half-open NCCL transport, so the next run cannot
+        connect. ``close()`` is a no-op for the co-located backend. The process
+        group is intentionally left alone -- it is a framework-global resource
+        that direct callers (tests, the interactive launcher) reuse after the
+        loop returns, and ``initialize_distributed`` already destroys it at
+        process exit.
+        """
+        if getattr(self, "target_wrapper", None) is not None:
+            _best_effort("closing target backend", self.target_wrapper.close)
+        if getattr(self, "wandb_run", None) is not None:
+            _best_effort("finishing W&B run", self.wandb_run.finish)
+
+    def _train_epochs(self, start_epoch, batches_per_epoch, is_ddp):
+        """Run the epoch loop (extracted so :meth:`run_train_validation_loop` can
+        wrap it in ``try/finally`` and guarantee teardown on any exit path)."""
         for epoch in range(start_epoch, self.num_epochs):
             if hasattr(self.train_dataloader.sampler, "set_epoch"):
                 self.train_dataloader.sampler.set_epoch(epoch)
@@ -1120,19 +1162,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     best_metric_key="val_loss",
                 )
                 self._log_saved_checkpoint("epoch", epoch + 1, self.runtime.global_step)
-
-        self._maybe_save_final_checkpoint(self.num_epochs)
-
-        if self.target_wrapper is not None:
-            # Release remote connections / shut down the target server's
-            # client-idle watchdog. A no-op for the co-located backend.
-            self.target_wrapper.close()
-
-        if getattr(self, "wandb_run", None) is not None:
-            self.wandb_run.finish()
-
-        if self.dist_env.is_main:
-            logger.info("Training complete: global_step=%s", self.runtime.global_step)
 
 
 def main(config_path=None):

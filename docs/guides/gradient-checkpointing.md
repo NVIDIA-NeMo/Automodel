@@ -42,15 +42,21 @@ Use `true` or `full` for full activation checkpointing. Use `selective` for PyTo
 > **Note (MoE/expert parallelism):** Selective AC is designed for dense transformers and generally does **not** help Mixture-of-Experts models with expert parallelism. In an MoE block the experts dominate the cost (they are cheap to recompute but expensive to store), and the expert-parallel dispatch/communication is opaque to the selective policy, so it is recomputed regardless. As a result, selective AC tends to add activation memory without a corresponding speedup for MoE, matching what reference implementations such as TorchTitan observe. Prefer **full** activation checkpointing (`true`/`full`) for MoE; selective remains supported for MoE and FSDP2 as an opt-in.
 
 ### Configure Programmatically
-```python
-from nemo_automodel.components.distributed.config import FSDP2Config
-from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 
-config = FSDP2Config(activation_checkpointing=True)
+```python
+from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel.components.distributed.config import DistributedSetup
+
 # Use activation_checkpointing="selective" for FSDP2 selective checkpointing.
-# device_mesh is created elsewhere (e.g. by the recipe via setup_distributed)
-manager = FSDP2Manager(config, device_mesh=device_mesh, moe_mesh=moe_mesh)
-model = manager.parallelize(model)
+distributed_setup = DistributedSetup.build(
+    strategy="fsdp2",
+    activation_checkpointing=True,
+)
+
+model = NeMoAutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B",
+    distributed_setup=distributed_setup,
+)
 ```
 
 ## Combine with Linear-Cut Cross-Entropy (LC-CE)
