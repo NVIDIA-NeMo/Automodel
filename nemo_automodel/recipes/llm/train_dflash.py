@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import pathlib
 from contextlib import nullcontext
@@ -61,15 +60,13 @@ from nemo_automodel.recipes.base_recipe import (
     _is_checkpoint_model_config_compatible,
     _resolve_restore_from_to_ckpt_dir,
 )
+from nemo_automodel.recipes.llm._spec_train_utils import (
+    make_warmup_cosine_schedule,
+    optim_steps_per_epoch,
+    should_sync_grads,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _optim_steps_per_epoch(num_batches_per_epoch: int, grad_accumulation_steps: int) -> int:
-    """Return ceil(num_batches / accum), the actual number of optimizer steps per epoch."""
-    if num_batches_per_epoch <= 0 or grad_accumulation_steps <= 0:
-        return 0
-    return -(-num_batches_per_epoch // grad_accumulation_steps)
 
 
 def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
@@ -152,7 +149,7 @@ class TrainDFlashRecipe(BaseRecipe):
         self.target_wrapper = HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids)
 
         self.block_size = int(recipe_cfg.get("block_size", 16))
-        self.mask_token_id = self._resolve_mask_token_id(recipe_cfg)
+        self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_config.vocab_size)
 
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
@@ -250,21 +247,14 @@ class TrainDFlashRecipe(BaseRecipe):
         except TypeError:
             num_batches_per_epoch = 0
         total_optim_steps = max(
-            1, self.num_epochs * _optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps)
+            1, self.num_epochs * optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps)
         )
         warmup_ratio = float(opt_cfg.get("warmup_ratio", 0.05))
         min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
         warmup_steps = max(1, int(warmup_ratio * total_optim_steps))
-
-        def _lr_lambda(step: int) -> float:
-            if step < warmup_steps:
-                return float(step + 1) / float(warmup_steps)
-            progress = (step - warmup_steps) / max(1, total_optim_steps - warmup_steps)
-            progress = min(max(progress, 0.0), 1.0)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, _lr_lambda)
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, make_warmup_cosine_schedule(warmup_steps, total_optim_steps, min_lr_ratio)
+        )
         self.total_optim_steps = total_optim_steps
         self.runtime = SimpleNamespace(global_step=0)
         self._resume_epoch = 0
@@ -274,23 +264,36 @@ class TrainDFlashRecipe(BaseRecipe):
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
-    def _resolve_mask_token_id(self, recipe_cfg) -> int:
-        """Resolve the MASK token id used to fill non-anchor block positions."""
+    @staticmethod
+    def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
+        """Resolve and validate the MASK token id that fills non-anchor block positions.
+
+        DFlash fills every non-anchor slot of a ``[anchor, MASK, MASK, ...]`` block
+        with this id, and the draft's ``embed_tokens`` row at that id becomes the
+        learned "predict here" signal. It must be chosen deliberately (a reserved /
+        unused token), exactly like P-EAGLE's ``mask_token_id``: the previous silent
+        fallback to ``tokenizer.pad_token_id`` was unsafe because ``pad`` is commonly
+        aliased to ``eos`` (or another meaningful token), which conflates the mask
+        signal with real content and quietly degrades acceptance without erroring.
+        Require it explicitly and range-check it; the inference runtime must fill the
+        block slots with the same id.
+        """
         mask_token_id = recipe_cfg.get("mask_token_id", None)
         if mask_token_id is None:
-            mask_token_id = getattr(self.tokenizer, "pad_token_id", None)
-            if mask_token_id is not None:
-                logger.warning(
-                    "recipe_args.mask_token_id not set; falling back to tokenizer.pad_token_id=%d. "
-                    "Set it explicitly (e.g. a dedicated reserved token) if this is not intended.",
-                    mask_token_id,
-                )
-        if mask_token_id is None:
             raise ValueError(
-                "DFlash requires a mask_token_id: set recipe_args.mask_token_id (the token used for "
-                "non-anchor block positions), or ensure the tokenizer defines a pad_token_id."
+                "DFlash requires recipe_args.mask_token_id to be set explicitly (the token used for "
+                "non-anchor block positions). Pick a reserved / rarely-used token id -- e.g. a model-specific "
+                "reserved special token -- so the mask-slot embedding does not collide with real content, and "
+                "use the same id in the inference runtime. (The previous fallback to tokenizer.pad_token_id was "
+                "removed: pad is frequently aliased to eos, which silently degrades quality.)"
             )
-        return int(mask_token_id)
+        mask_token_id = int(mask_token_id)
+        if not 0 <= mask_token_id < vocab_size:
+            raise ValueError(
+                f"mask_token_id={mask_token_id} is out of range for the vocab [0, {vocab_size}); "
+                "it indexes the draft embed_tokens table."
+            )
+        return mask_token_id
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the EAGLE recipes."""
@@ -334,6 +337,7 @@ class TrainDFlashRecipe(BaseRecipe):
         train_loss: float | None = None,
         val_loss: dict[str, float] | None = None,
         best_metric_key: str = "default",
+        is_final_checkpoint: bool = False,
     ) -> None:
         """Persist the DFlash draft model, optimizer, scheduler, RNG, and meta."""
         checkpointer = getattr(self, "checkpointer", None)
@@ -382,7 +386,12 @@ class TrainDFlashRecipe(BaseRecipe):
             dist.barrier()
 
         draft_model = self._module().draft_model
-        self.checkpointer.save_model(draft_model, path, tokenizer=self.tokenizer, is_final_checkpoint=False)
+        self.checkpointer.save_model(
+            draft_model,
+            path,
+            tokenizer=self.tokenizer,
+            is_final_checkpoint=is_final_checkpoint,
+        )
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
         self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
@@ -481,7 +490,14 @@ class TrainDFlashRecipe(BaseRecipe):
         every = getattr(self, "ckpt_every_steps", None)
         if every is None or every <= 0 or self.runtime.global_step % every != 0:
             return False
-        self.save_checkpoint(epoch=epoch, step=self.runtime.global_step, best_metric_key="val_loss")
+        total_optim_steps = getattr(self, "total_optim_steps", None)
+        is_final_checkpoint = total_optim_steps is not None and self.runtime.global_step >= total_optim_steps
+        self.save_checkpoint(
+            epoch=epoch,
+            step=self.runtime.global_step,
+            best_metric_key="val_loss",
+            is_final_checkpoint=is_final_checkpoint,
+        )
         self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
         return True
 
@@ -495,7 +511,7 @@ class TrainDFlashRecipe(BaseRecipe):
         saved_by_epoch = bool(getattr(self, "save_checkpoint_every_epoch", False))
         if saved_by_step or saved_by_epoch:
             return False
-        self.save_checkpoint(epoch=completed_epochs, step=gs, best_metric_key="val_loss")
+        self.save_checkpoint(epoch=completed_epochs, step=gs, best_metric_key="val_loss", is_final_checkpoint=True)
         self._log_saved_checkpoint("final", completed_epochs, gs)
         return True
 
@@ -562,10 +578,14 @@ class TrainDFlashRecipe(BaseRecipe):
                     attention_mask=batch["attention_mask"],
                     loss_mask=batch["loss_mask"],
                 )
-                is_window_close = (pending_micro_batches + 1 == self.grad_accumulation_steps) or (
-                    batch_idx + 1 == num_batches
+                sync_grads = should_sync_grads(
+                    pending_micro_batches=pending_micro_batches,
+                    grad_accumulation_steps=self.grad_accumulation_steps,
+                    batch_idx=batch_idx,
+                    batches_per_epoch=num_batches,
+                    is_ddp=is_ddp,
                 )
-                sync_ctx = nullcontext() if (not is_ddp or is_window_close) else self.trainer_module.no_sync()
+                sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
                 with sync_ctx:
                     local_has_valid = 1
                     try:
@@ -658,6 +678,7 @@ class TrainDFlashRecipe(BaseRecipe):
                     train_loss=avg_loss,
                     val_loss=eval_metrics,
                     best_metric_key="val_loss",
+                    is_final_checkpoint=epoch_idx + 1 >= self.num_epochs,
                 )
                 self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
 

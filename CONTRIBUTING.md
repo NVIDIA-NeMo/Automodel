@@ -168,22 +168,22 @@ ruff format .
 
 ## Pre-commit
 
-We recommand to use [perk](https://github.com/j178/prek) to ensure code quality. It is a faster and more modern alternative to [pre-commit](https://github.com/pre-commit/pre-commit).
+We recommand to use [prek](https://github.com/j178/prek) to ensure code quality. It is a faster and more modern alternative to [pre-commit](https://github.com/pre-commit/pre-commit).
 
 Installation:
 
 ```bash
-uv tool install perk
+uv tool install prek
 ```
 
 Usage:
 
 ```bash
 # Install git hooks
-perk install
+prek install
 
 # Run manually on all files
-perk run --all-files
+prek run --all-files
 ```
 
 After installing the git hooks, `git commit` will automatically run incremental checks.

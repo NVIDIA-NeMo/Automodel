@@ -21,7 +21,7 @@ import torch
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.llm.train_ft import build_dataloader
 
 """
@@ -36,8 +36,8 @@ def test_megatron_dataset_checkpointing():
         backend=cfg.get("dist_env", {}).get("backend", "nccl"),
         timeout_minutes=cfg.get("dist_env", {}).get("timeout_minutes", 1),
     )
-    dist_setup = setup_distributed(cfg, world_size=dist_env.world_size)
-    device_mesh = dist_setup.device_mesh
+    mesh_context = create_distributed_setup_from_config(cfg, world_size=dist_env.world_size).mesh_context
+    device_mesh = mesh_context.device_mesh
     dp_rank = device_mesh["dp"].get_local_rank()
     dp_world_size = device_mesh["dp"].size()
     tp_rank = device_mesh["tp"].get_local_rank()
