@@ -66,6 +66,12 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v4.cp import (
+    dsv4_cp_all_gather,
+    dsv4_cp_enabled,
+    dsv4_cp_rank,
+    dsv4_cp_size,
+)
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     build_dsv4_sparse_topk_indices,
     dsv4_indexer_scores,
@@ -374,6 +380,34 @@ def _overlap_transform(tensor: torch.Tensor, head_dim: int, fill_value: float) -
     return new
 
 
+def _query_positions(
+    position_ids: torch.Tensor | None,
+    *,
+    batch: int,
+    seq_len: int,
+    device: torch.device,
+    cp_group=None,
+) -> torch.Tensor:
+    if position_ids is not None:
+        if position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+        return position_ids.to(device=device, dtype=torch.long)
+
+    start = dsv4_cp_rank(cp_group) * seq_len if dsv4_cp_enabled(cp_group) else 0
+    return torch.arange(start, start + seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+
+
+def _overlap_transform_with_cp(tensor: torch.Tensor, head_dim: int, fill_value: float, cp_group) -> torch.Tensor:
+    if not dsv4_cp_enabled(cp_group):
+        return _overlap_transform(tensor, head_dim, fill_value)
+
+    local_windows = tensor.shape[1]
+    full = dsv4_cp_all_gather(tensor, dim=1, cp_group=cp_group)
+    full = _overlap_transform(full, head_dim, fill_value)
+    start = dsv4_cp_rank(cp_group) * local_windows
+    return full[:, start : start + local_windows, :, :]
+
+
 def _pool_windows(
     kv: torch.Tensor,
     gate: torch.Tensor,
@@ -381,6 +415,7 @@ def _pool_windows(
     ratio: int,
     head_dim: int,
     overlap: bool = False,
+    cp_group=None,
 ) -> torch.Tensor:
     """Softmax-gated sum-pool over ``ratio`` consecutive tokens.
 
@@ -411,8 +446,8 @@ def _pool_windows(
     kv_w = kv.view(batch, n_windows, ratio, feat)
     gate_w = gate.view(batch, n_windows, ratio, feat) + ape
     if overlap:
-        kv_w = _overlap_transform(kv_w, head_dim, fill_value=0.0)
-        gate_w = _overlap_transform(gate_w, head_dim, fill_value=float("-inf"))
+        kv_w = _overlap_transform_with_cp(kv_w, head_dim, fill_value=0.0, cp_group=cp_group)
+        gate_w = _overlap_transform_with_cp(gate_w, head_dim, fill_value=float("-inf"), cp_group=cp_group)
     return (kv_w * gate_w.softmax(dim=2)).sum(dim=2)
 
 
@@ -618,9 +653,12 @@ class DeepseekV4Indexer(nn.Module):
         cache: DeepseekV4TrainCache,
         layer_idx: int,
         start_pos: int,
+        position_ids: torch.Tensor | None = None,
+        cp_group=None,
     ) -> torch.LongTensor:
         input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
+        cp_active = dsv4_cp_enabled(cp_group)
         hidden_states_fp32 = hidden_states.float()
         kv = self.wkv(hidden_states_fp32)
         gate = self.wgate(hidden_states_fp32)
@@ -635,6 +673,7 @@ class DeepseekV4Indexer(nn.Module):
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
+                cp_group=cp_group,
             ).to(input_dtype)
         )
         if new_pooled.shape[1] > 0:
@@ -644,11 +683,15 @@ class DeepseekV4Indexer(nn.Module):
             cos, sin = rotary(new_pooled, positions)
             new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
         pooled_kv = cache.update_pool(new_pooled, layer_idx, "indexer_state")
+        if cp_active:
+            pooled_kv = dsv4_cp_all_gather(pooled_kv, dim=1, cp_group=cp_group)
 
         cos, sin = position_embeddings
         q = self.wq_b(q_residual).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim).transpose(1, 2)
         weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
+        query_start = dsv4_cp_rank(cp_group) * seq_len if cp_active else 0
+        query_total_len = dsv4_cp_size(cp_group) * seq_len if cp_active else None
         index_scores = dsv4_indexer_scores(
             q,
             pooled_kv,
@@ -656,6 +699,16 @@ class DeepseekV4Indexer(nn.Module):
             compress_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
             backend=_dsv4_kernel_backend(self.backend),
+            query_start=query_start,
+            query_total_len=query_total_len,
+        )
+        q_positions = _query_positions(position_ids, batch=batch, seq_len=seq_len, device=hidden_states.device, cp_group=cp_group)
+        valid_end = ((q_positions + 1) // self.compress_ratio).unsqueeze(-1)
+        pooled_pos = torch.arange(pooled_kv.shape[1], device=hidden_states.device).view(1, 1, -1)
+        index_scores = torch.where(
+            pooled_pos < valid_end,
+            index_scores,
+            torch.full((), float("-inf"), dtype=index_scores.dtype, device=index_scores.device),
         )
         topk = min(self.index_topk, pooled_kv.shape[1])
         return index_scores.topk(topk, dim=-1).indices
@@ -731,9 +784,12 @@ class DeepseekV4Compressor(nn.Module):
         layer_idx: int,
         start_pos: int,
         enable_hca_fsdp_graph_alignment: bool = False,
+        position_ids: torch.Tensor | None = None,
+        cp_group=None,
     ) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
+        cp_active = dsv4_cp_enabled(cp_group)
         hidden_states_fp32 = hidden_states.float()
         kv = self.wkv(hidden_states_fp32)
         gate = self.wgate(hidden_states_fp32)
@@ -772,12 +828,15 @@ class DeepseekV4Compressor(nn.Module):
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
+                cp_group=cp_group,
             ).to(input_dtype)
         )
         positions = _rope_pool_positions(new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, batch)
         cos, sin = rotary(new_pooled, positions)
         new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
         pooled = cache.update_pool(new_pooled, layer_idx, "compressor_state").unsqueeze(1)
+        if cp_active:
+            pooled = dsv4_cp_all_gather(pooled, dim=2, cp_group=cp_group)
 
         # Indexer narrows the attended compressed positions per query.  The
         # caller (DSV4Attention) is responsible for turning ``indexer_topk``
@@ -796,8 +855,19 @@ class DeepseekV4Compressor(nn.Module):
         # or ``-1`` for "do not attend" (masked by causality).
         indexer_topk: torch.LongTensor | None = None
         if self.indexer is not None:
-            raw_topk = self.indexer(hidden_states, q_residual, rotary, position_embeddings, cache, layer_idx, start_pos)
-            threshold = (torch.arange(1, seq_len + 1, device=raw_topk.device) // self.compress_ratio).unsqueeze(1)
+            raw_topk = self.indexer(
+                hidden_states,
+                q_residual,
+                rotary,
+                position_embeddings,
+                cache,
+                layer_idx,
+                start_pos,
+                position_ids=position_ids,
+                cp_group=cp_group,
+            )
+            q_positions = _query_positions(position_ids, batch=batch, seq_len=seq_len, device=raw_topk.device, cp_group=cp_group)
+            threshold = ((q_positions + 1) // self.compress_ratio).unsqueeze(-1)
             causal_invalid = raw_topk >= threshold
             indexer_topk = torch.where(causal_invalid, torch.full_like(raw_topk, -1), raw_topk)
         return pooled, indexer_topk
@@ -993,10 +1063,22 @@ class DeepseekV4Attention(nn.Module):
         position_embeddings_compress: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         rotary_compress: nn.Module | None = None,
         start_pos: int = 0,
+        position_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        del kwargs
+        cp_group = kwargs.get("_dsv4_cp_group")
+        cp_active = dsv4_cp_enabled(cp_group)
         batch, seq_len = hidden_states.shape[:2]
+        effective_start_pos = start_pos
+        if cp_active:
+            effective_start_pos = start_pos + dsv4_cp_rank(cp_group) * seq_len
+        query_positions = _query_positions(
+            position_ids,
+            batch=batch,
+            seq_len=seq_len,
+            device=hidden_states.device,
+            cp_group=cp_group,
+        )
         # IMPORTANT: for compress_ratio>0 layers the released DSV4-Flash uses
         # the compress-rope (theta=160000 + YaRN) for the MAIN attention Q/KV
         # too, NOT just for the compressor sub-module.  Reference at
@@ -1021,7 +1103,8 @@ class DeepseekV4Attention(nn.Module):
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = _apply_partial_rope(kv, cos, sin, self.rope_head_dim)
 
-        full_kv = kv
+        full_kv = dsv4_cp_all_gather(kv, dim=2, cp_group=cp_group) if cp_active else kv
+        vanilla_key_len = full_kv.shape[2]
         n_pooled = 0
         indexer_topk: torch.LongTensor | None = None
 
@@ -1038,7 +1121,7 @@ class DeepseekV4Attention(nn.Module):
                 position_embeddings=position_embeddings_compress,
                 cache=cache,
                 layer_idx=self.layer_idx,
-                start_pos=start_pos,
+                start_pos=effective_start_pos,
                 # Only DeepSeek-V4 HCA (ratio 128) needs this FSDP graph alignment.
                 # Ratio 4 uses the Indexer/SCA path and is outside this fix.
                 # Direct attention calls without an explicit mask keep the
@@ -1047,6 +1130,8 @@ class DeepseekV4Attention(nn.Module):
                 enable_hca_fsdp_graph_alignment=(
                     self.training and attention_mask is not None and self.compress_ratio == 128
                 ),
+                position_ids=position_ids,
+                cp_group=cp_group,
             )
             n_pooled = pooled.shape[2]
             full_kv = torch.cat([full_kv, pooled], dim=2)
@@ -1072,15 +1157,14 @@ class DeepseekV4Attention(nn.Module):
                     # is unspecified, so use count-then-threshold instead.
                     compressed_mask = _build_indexer_topk_compressed_mask(attention_mask, indexer_topk, n_pooled)
                 else:
-                    q_pos = torch.arange(seq_len, device=full_kv.device)
                     p_pos = torch.arange(n_pooled, device=full_kv.device)
-                    threshold = (q_pos + 1) // self.compress_ratio
-                    allowed = p_pos.unsqueeze(0) < threshold.unsqueeze(1)  # [S, P]
+                    threshold = (query_positions + 1) // self.compress_ratio
+                    allowed = p_pos.view(1, 1, n_pooled) < threshold.unsqueeze(-1)  # [B, S, P]
                     compressed_mask = torch.where(
                         allowed,
                         torch.zeros((), dtype=attention_mask.dtype, device=full_kv.device),
                         torch.full((), min_val, dtype=attention_mask.dtype, device=full_kv.device),
-                    ).expand(batch, seq_len, n_pooled)
+                    )
                 compressed_mask = compressed_mask.unsqueeze(1)  # [B, 1, S, P]
                 attention_mask = torch.cat([attention_mask, compressed_mask], dim=-1)
 
@@ -1101,6 +1185,8 @@ class DeepseekV4Attention(nn.Module):
                 compress_ratio=self.compress_ratio,
                 compressed_topk=indexer_topk,
                 n_pooled=n_pooled,
+                vanilla_key_len=vanilla_key_len,
+                q_positions=query_positions,
             )
             attn_output = dsv4_sparse_attention(
                 q.transpose(1, 2).contiguous(),

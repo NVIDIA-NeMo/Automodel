@@ -79,6 +79,16 @@ class _WithKwargs(nn.Module):
         return input_ids
 
 
+class _DeepseekV4Like(nn.Module):
+    def __init__(self, backend_attn="tilelang"):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="deepseek_v4")
+        self.backend = SimpleNamespace(attn=backend_attn)
+
+    def forward(self, input_ids, seq_lens=None, **kwargs):
+        return input_ids
+
+
 def _mesh(tp=1, pp=1, cp=1, ep=1):
     return SimpleNamespace(tp_size=tp, pp_size=pp, cp_size=cp, ep_size=ep)
 
@@ -257,6 +267,22 @@ class TestModelSupportsCP:
         _attach(model)
         assert model.supports.supports_cp is False
 
+    def test_deepseek_v4_true_with_tilelang(self):
+        model = _DeepseekV4Like(backend_attn="tilelang")
+        _attach(model)
+        assert model.supports.supports_cp is True
+
+    def test_deepseek_v4_false_with_te(self):
+        model = _DeepseekV4Like(backend_attn="te")
+        _attach(model)
+        assert model.supports.supports_cp is False
+
+    @pytest.mark.parametrize("backend_attn", ["torch", "sdpa"])
+    def test_deepseek_v4_false_without_tilelang(self, backend_attn):
+        model = _DeepseekV4Like(backend_attn=backend_attn)
+        _attach(model)
+        assert model.supports.supports_cp is False
+
 
 class TestModelSupportsEP:
     def test_ep_true_for_moe(self):
@@ -348,6 +374,12 @@ class TestModelSupportsCPWithSequencePacking:
 
     def test_cp_gt1_no_seq_lens(self):
         model = _Bare()
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is False
+
+    def test_deepseek_v4_cp_gt1_sequence_packing_unsupported(self):
+        model = _DeepseekV4Like()
         _attach(model)
         model._mesh = _mesh(cp=2)
         assert model.supports.supports_cp_with_sequence_packing is False
