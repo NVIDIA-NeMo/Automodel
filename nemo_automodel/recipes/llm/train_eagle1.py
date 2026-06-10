@@ -179,6 +179,8 @@ class TrainEagle1Recipe(BaseRecipe):
             target_lm_head=self.target_wrapper.get_lm_head(),
             hidden_loss_weight=float(recipe_cfg.get("hidden_loss_weight", 1.0)),
             token_loss_weight=float(recipe_cfg.get("token_loss_weight", 0.1)),
+            # EAGLE feature-noise augmentation U(-0.1, 0.1); paper default, set 0 to disable.
+            feature_noise=float(recipe_cfg.get("feature_noise", 0.1)),
         ).to(self.device)
         if self.dist_env.world_size > 1:
             trainer_module = DistributedDataParallel(
@@ -734,6 +736,7 @@ class TrainEagle1Recipe(BaseRecipe):
                 )
 
         self._maybe_save_final_checkpoint(self.num_epochs)
+        self._finalize_pending_checkpoint()
 
         if getattr(self, "wandb_run", None) is not None:
             self.wandb_run.finish()

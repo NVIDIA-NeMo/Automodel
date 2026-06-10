@@ -156,6 +156,29 @@ def test_cod_filters_unsupervised_positions_from_deeper_depths():
     assert torch.all(orig[depth >= 1] < 8)
 
 
+def test_cod_supervised_position_zero_does_not_leak_negative_anchor():
+    """A supervised position 0 must not produce ``anchor_pos == -1``.
+
+    The depth-1 pool is seeded straight from ``all_valid_indices``; if position 0
+    is supervised it could be sampled, and its chain start ``anchor_pos = 0 - 1``
+    is negative. The mask then indexes ``document_ids[-1]`` via Python's negative
+    wraparound, silently breaking cross-document isolation. ``filter_position_zero``
+    (default) must drop it from every depth>=1 pool, not just the deeper ones.
+    """
+    seq_len, num_depths = 16, 8
+    loss_mask = torch.ones(1, seq_len, dtype=torch.long)  # position 0 IS supervised
+    # Stress several seeds: with the bug, any draw that picks position 0 at
+    # depth 1 leaks anchor_pos == -1. The fix makes min >= 0 a hard invariant.
+    for seed in range(8):
+        torch.manual_seed(seed)
+        anchor_pos, depth = generate_cod_sample_indices(
+            seq_length=seq_len, loss_mask=loss_mask, num_depths=num_depths, down_sample_ratio=0.9
+        )
+        assert int(anchor_pos.min()) >= 0
+        # Depth 0 still spans the full sequence (the filter only touches depth>=1).
+        assert int((depth == 0).sum()) == seq_len
+
+
 # --------------------------------------------------------------------------- #
 # Sequence partitioning (Algorithm 1)
 # --------------------------------------------------------------------------- #

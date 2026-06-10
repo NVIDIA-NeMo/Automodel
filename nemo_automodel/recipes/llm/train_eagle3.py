@@ -578,8 +578,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         fill()
         while queue:
             batch, handle = queue.popleft()
-            fill()  # refill before blocking on the result to keep the pipe full
-            yield batch, handle.result()
+            target_batch = handle.result()
+            # Refill only after the popped request completed: round-robin makes
+            # its server the next dispatch target, so refilling before the
+            # result would put a second request in flight on a busy server and
+            # break the one-in-flight-per-server invariant that NCCL recv
+            # ordering and the server's hook-based aux capture rely on.
+            fill()
+            yield batch, target_batch
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the standard recipes."""
@@ -861,6 +867,16 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 module = self._module()
                 module.selected_token_ids.copy_(ids.to(module.selected_token_ids.device))
                 module.selected_token_mask.copy_(mask.to(module.selected_token_mask.device))
+                # set_vocab_mapping was already called at setup() with the
+                # freshly-scanned mapping, but resume can restore a different one
+                # (the checkpoint's, e.g. when the data / split / cache changed).
+                # Re-apply it so the draft's d2t/t2d tables and -- the actual bug
+                # -- the remote target server (which projects to the draft vocab
+                # itself) match the checkpoint, not the setup-time scan. Colocated
+                # set_vocab_mapping is a no-op; the cached path has no target.
+                self.draft_model.set_vocab_mapping(module.selected_token_ids)
+                if getattr(self, "target_wrapper", None) is not None:
+                    self.target_wrapper.set_vocab_mapping(module.selected_token_ids, module.selected_token_mask)
 
     def _run_eval(self):
         if self.val_dataloader is None:
@@ -919,6 +935,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         try:
             self._train_epochs(start_epoch, batches_per_epoch, is_ddp)
             self._maybe_save_final_checkpoint(self.num_epochs)
+            self._finalize_pending_checkpoint()
             if self.dist_env.is_main:
                 logger.info("Training complete: global_step=%s", self.runtime.global_step)
         finally:
