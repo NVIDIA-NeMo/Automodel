@@ -72,6 +72,7 @@ except (ModuleNotFoundError, ImportError):
     DiffusionGemmaTextConfig = _make_missing("DiffusionGemmaTextConfig")
     ScaledWordEmbedding = _make_missing("ScaledWordEmbedding")
 
+from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.moe.config import MoEConfig
@@ -350,6 +351,21 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
     supports_gradient_checkpointing = True
     _no_split_modules = ["DiffusionGemmaMoEDecoderLayer"]
     _tied_weights_keys = ["lm_head.weight"]
+
+    @classmethod
+    def get_capabilities(cls, config: "DiffusionGemmaConfig") -> "ModelCapabilities":
+        """Parallelism support for the DiffusionGemma block-diffusion MoE.
+
+        Single variant: FSDP2 + Expert Parallelism are supported (validated at
+        EP=8). TP is unsupported for the custom MoE; CP/PP are not supported for
+        this encoder-decoder block-diffusion path.
+        """
+        return ModelCapabilities(
+            supports_tp=False,
+            supports_cp=False,
+            supports_pp=False,
+            supports_ep=True,
+        )
 
     @classmethod
     def from_config(
