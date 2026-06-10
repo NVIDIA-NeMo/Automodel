@@ -225,6 +225,12 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         freeze_embeddings_default = not parallel_drafting
         if recipe_cfg.get("freeze_embeddings", freeze_embeddings_default):
             self.draft_model.freeze_embeddings()
+        # P-EAGLE memory knob: recompute the draft layers' activations in the
+        # backward instead of storing them, lowering the activation peak of the
+        # long flattened COD sequence (complements ``sequence_partitions``).
+        # Off by default; only affects the parallel-drafting forward.
+        if recipe_cfg.get("draft_gradient_checkpointing", False):
+            self.draft_model.gradient_checkpointing_enable()
         # The target's "Model summary" is logged by apply_model_infrastructure when it
         # loads; the draft is built directly, so log its (trainable) summary here too.
         print_trainable_parameters(self.draft_model, name="Draft")
