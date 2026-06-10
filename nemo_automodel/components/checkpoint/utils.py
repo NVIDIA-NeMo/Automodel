@@ -248,11 +248,12 @@ def has_local_tied_lm_head(model: nn.Module) -> bool:
         model: Model or pipeline stage to inspect.
 
     Returns:
-        ``True`` when the model is configured with tied word embeddings AND
-        both the local ``lm_head`` and the input embedding live on this
-        partition. ``False`` when the config isn't tied, or when the local
-        partition is missing one of the two (typical for PP non-last / non-first
-        stages).
+        ``True`` when the model is configured with tied word embeddings, both
+        the local ``lm_head`` and the input embedding live on this partition,
+        and the two tensors share local storage. ``False`` when the config
+        isn't tied, the local partition is missing one of the two (typical for
+        PP non-last / non-first stages), or the tensors are separate despite
+        matching shapes.
     """
     if not is_tied_word_embeddings(model):
         return False
