@@ -66,6 +66,10 @@ class _ServerClient:
         self._nccl: Optional[NCCLTransport] = None
         self._nccl_attempted = False
         self._nccl_lock = threading.Lock()
+        # Serializes generate() per server; see its docstring. The executor in
+        # RemoteEagle3TargetModel has more workers than servers, so this lock,
+        # not the pool size, enforces the one-in-flight invariant.
+        self._generate_lock = threading.Lock()
 
     def _host(self) -> str:
         return self.url.split("://", 1)[-1].split(":", 1)[0].split("/", 1)[0]
@@ -140,21 +144,31 @@ class _ServerClient:
         data-plane group (the client's one recv vs the server's two sends would
         hang). Recovering the NCCL path needs a transport resync (tear down +
         re-init, or fall back to wire) and is tracked separately.
+
+        Serialized on ``_generate_lock`` so this process never has two
+        /generate requests in flight against the same server: the NCCL recv
+        posted here must pair with this request's send, and the server's
+        hook-based aux capture is not reentrant.
         """
-        if self._nccl_enabled and not self._nccl_attempted:
-            self._init_nccl()
-        use_nccl = self._nccl is not None and self._nccl.is_initialized
-        if not use_nccl:
-            return wire.decode(self.request(protocol.EP_GENERATE, payload), map_location="cpu")
-        url = f"{self.url}/{protocol.EP_GENERATE}"
-        headers = {"Content-Type": "application/octet-stream", protocol.NCCL_HEADER: "1"}
-        resp = self._session.post(url, data=payload, timeout=self.timeout, headers=headers)
-        resp.raise_for_status()
-        if resp.headers.get(protocol.NCCL_HEADER) == "1":
-            keys_order, metadata = protocol.decode_nccl_metadata(resp.content)
-            return self._nccl.recv_tensors(metadata, keys_order)
-        # Server fell back to wire despite the client offering NCCL.
-        return wire.decode(resp.content, map_location="cpu")
+        with self._generate_lock:
+            if self._nccl_enabled and not self._nccl_attempted:
+                self._init_nccl()
+            use_nccl = self._nccl is not None and self._nccl.is_initialized
+            if not use_nccl:
+                # Wire path: an idempotent HTTP round-trip, so reuse request()'s
+                # exponential-backoff retry.
+                return wire.decode(self.request(protocol.EP_GENERATE, payload), map_location="cpu")
+            # NCCL path: a single attempt (a blind retry would desync the 2-process
+            # data-plane group), held under the same lock as the wire path.
+            headers = {"Content-Type": "application/octet-stream", protocol.NCCL_HEADER: "1"}
+            url = f"{self.url}/{protocol.EP_GENERATE}"
+            resp = self._session.post(url, data=payload, timeout=self.timeout, headers=headers)
+            resp.raise_for_status()
+            if resp.headers.get(protocol.NCCL_HEADER) == "1":
+                keys_order, metadata = protocol.decode_nccl_metadata(resp.content)
+                return self._nccl.recv_tensors(metadata, keys_order)
+            # Server fell back to wire despite the client offering NCCL.
+            return wire.decode(resp.content, map_location="cpu")
 
     def close(self) -> None:
         try:

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
@@ -201,6 +202,15 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     HFCheckpointingMixin, HFQwen3OmniMoeThinkerForConditionalGeneration, MoEFSDPSyncMixin
 ):
     """Qwen3OmniMoe Thinker for Conditional Generation with multimodal support."""
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = True
 
     @classmethod
     def from_config(
