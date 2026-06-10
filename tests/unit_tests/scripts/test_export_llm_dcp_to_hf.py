@@ -243,7 +243,7 @@ def test_main_exports_checkpoint_end_to_end(monkeypatch, tmp_path):
     model = object()
     exported_yaml = {"checkpoint": {"model_save_format": "safetensors"}}
     monkeypatch.setattr(script, "build_export_config", lambda args: MagicMock(to_yaml_dict=lambda: exported_yaml))
-    monkeypatch.setattr(script, "TrainFinetuneRecipeForNextTokenPrediction", lambda cfg: trainer)
+    monkeypatch.setattr(script, "build_recipe", lambda cfg: trainer)
     monkeypatch.setattr(script, "resolve_model_for_export", lambda t: model)
     save_config_calls = {}
     monkeypatch.setattr(
@@ -301,9 +301,66 @@ def test_main_closes_trainer_even_when_setup_fails(monkeypatch, tmp_path):
     trainer = MagicMock()
     trainer.setup.side_effect = RuntimeError("boom")
     monkeypatch.setattr(script, "build_export_config", lambda args: MagicMock(to_yaml_dict=lambda: {}))
-    monkeypatch.setattr(script, "TrainFinetuneRecipeForNextTokenPrediction", lambda cfg: trainer)
+    monkeypatch.setattr(script, "build_recipe", lambda cfg: trainer)
 
     with pytest.raises(RuntimeError, match="boom"):
         script.main(["--checkpoint-dir", str(checkpoint_dir), "--output-dir", str(output_dir)])
 
+    trainer.checkpointer.close.assert_called_once()
+
+
+def test_build_recipe_dispatches_on_config_recipe_field(monkeypatch):
+    from scripts import export_llm_dcp_to_hf as script
+
+    captured = {}
+
+    class _FakeVLMRecipe:
+        def __init__(self, cfg):
+            captured["cfg"] = cfg
+
+    monkeypatch.setattr(script, "resolve_recipe_name", lambda raw: "pkg.mod.FinetuneRecipeForVLM")
+    monkeypatch.setattr(script.importlib, "import_module", lambda name: Namespace(FinetuneRecipeForVLM=_FakeVLMRecipe))
+    cfg = MagicMock()
+    cfg.get.return_value = "FinetuneRecipeForVLM"
+
+    recipe = script.build_recipe(cfg)
+
+    assert isinstance(recipe, _FakeVLMRecipe)
+    assert captured["cfg"] is cfg
+
+
+def test_build_recipe_requires_recipe_field():
+    from scripts.export_llm_dcp_to_hf import build_recipe
+
+    cfg = MagicMock()
+    cfg.get.return_value = None
+    with pytest.raises(ValueError, match="no 'recipe' field"):
+        build_recipe(cfg)
+
+
+def test_resolve_export_tokenizer_prefers_tokenizer_then_processor():
+    from scripts.export_llm_dcp_to_hf import resolve_export_tokenizer
+
+    tok, proc = object(), object()
+    assert resolve_export_tokenizer(Namespace(tokenizer=tok, processor=proc)) is tok
+    # VLM recipe exposes ``processor`` and no ``tokenizer``.
+    assert resolve_export_tokenizer(Namespace(processor=proc)) is proc
+    assert resolve_export_tokenizer(Namespace()) is None
+
+
+def test_close_trainer_handles_single_metric_logger():
+    from scripts.export_llm_dcp_to_hf import close_trainer
+
+    train_logger, valid_logger = MagicMock(), MagicMock()
+    # VLM recipe keeps a single validation logger rather than a dict.
+    trainer = Namespace(
+        metric_logger_train=train_logger,
+        metric_logger_valid=valid_logger,
+        checkpointer=MagicMock(),
+    )
+
+    close_trainer(trainer)
+
+    train_logger.close.assert_called_once()
+    valid_logger.close.assert_called_once()
     trainer.checkpointer.close.assert_called_once()

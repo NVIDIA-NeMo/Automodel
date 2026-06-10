@@ -1050,6 +1050,37 @@ class TestLoadModelCheckpointKeySubset:
                     allow_checkpoint_key_subset=True,
                 )
 
+    def test_allow_checkpoint_key_subset_raises_on_keys_absent_from_model(self):
+        """A checkpoint carrying keys the built model lacks (e.g. a VLM checkpoint
+        loaded into an LLM model) must raise instead of silently dropping them."""
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Module()
+        initial_state_dict = {"language_model.layer.weight": torch.zeros(2, 2)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch.object(checkpointer, "_get_storage_reader", return_value=object()),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
+                return_value={"language_model.layer.weight", "vision_tower.block.weight"},
+            ),
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = initial_state_dict.copy()
+
+            with pytest.raises(RuntimeError, match="keys absent from the built model"):
+                checkpointer.load_model(
+                    model,
+                    model_path="/fake/path",
+                    allow_checkpoint_key_subset=True,
+                )
+
     def test_allow_checkpoint_key_subset_still_warns_on_unexpected_keys(self, caplog):
         checkpointer = self._make_checkpointer()
         model = torch.nn.Module()

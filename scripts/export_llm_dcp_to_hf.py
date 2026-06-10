@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Export an LLM DCP checkpoint to consolidated Hugging Face safetensors.
+"""Export an LLM or VLM DCP checkpoint to consolidated Hugging Face safetensors.
 
-This tool rebuilds the original distributed model topology from ``config.yaml``,
-loads only the model weights from a sharded ``torch_save`` checkpoint, and saves
-them back out as Hugging Face-compatible safetensors.
+This tool rebuilds the original distributed model topology from ``config.yaml``
+using the recipe recorded in that config (LLM or VLM), loads only the model
+weights from a sharded ``torch_save`` checkpoint, and saves them back out as
+Hugging Face-compatible safetensors. Because the model is rebuilt with the same
+recipe that produced the checkpoint, a VLM checkpoint keeps its vision tower
+instead of being silently exported as a text-only model.
 
 Example:
     torchrun --nproc-per-node=8 scripts/export_llm_dcp_to_hf.py \
@@ -27,6 +30,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import importlib
 import re
 from pathlib import Path
 from typing import Sequence
@@ -34,11 +38,12 @@ from typing import Sequence
 import torch
 from torch.nn.parallel import DistributedDataParallel
 
+from nemo_automodel.cli.utils import resolve_recipe_name
 from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.checkpoint.utils import is_rank_0
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 _CHECKPOINT_DIR_RE = re.compile(r"epoch_(\d+)_step_(\d+)$")
 
@@ -140,8 +145,29 @@ def build_export_config(args: argparse.Namespace) -> ConfigNode:
     return cfg
 
 
+def build_recipe(cfg: ConfigNode) -> BaseRecipe:
+    """Instantiate the recipe class recorded in ``cfg.recipe`` (LLM or VLM).
+
+    The model topology must be rebuilt with the same recipe that wrote the
+    checkpoint; otherwise an LLM recipe would construct a text-only model for a
+    VLM checkpoint and drop its vision tower. ``allow_checkpoint_key_subset`` then
+    raises on the unmatched keys instead of silently exporting a partial model.
+    """
+    raw = cfg.get("recipe", None)
+    if raw is None:
+        raise ValueError("config.yaml has no 'recipe' field, so the model architecture cannot be rebuilt for export.")
+    module_name, _, class_name = resolve_recipe_name(raw).rpartition(".")
+    recipe_cls = getattr(importlib.import_module(module_name), class_name)
+    return recipe_cls(cfg)
+
+
+def resolve_export_tokenizer(trainer: BaseRecipe):
+    """Return the tokenizer (LLM) or processor (VLM) to persist with the export."""
+    return getattr(trainer, "tokenizer", None) or getattr(trainer, "processor", None)
+
+
 def resolve_model_for_export(
-    trainer: TrainFinetuneRecipeForNextTokenPrediction,
+    trainer: BaseRecipe,
 ) -> torch.nn.Module | list[torch.nn.Module]:
     """Return the model object that should be passed to the checkpointer."""
     model_parts = trainer.model_parts
@@ -159,15 +185,21 @@ def barrier() -> None:
         torch.distributed.barrier()
 
 
-def close_trainer(trainer: TrainFinetuneRecipeForNextTokenPrediction | None) -> None:
+def close_trainer(trainer: BaseRecipe | None) -> None:
     """Best-effort cleanup for recipe-owned resources."""
     if trainer is None:
         return
-    if hasattr(trainer, "metric_logger_train"):
-        trainer.metric_logger_train.close()
-    if hasattr(trainer, "metric_logger_valid"):
-        for logger in trainer.metric_logger_valid.values():
-            logger.close()
+    # The LLM recipe keeps validation loggers in a dict (one per val set); the VLM
+    # recipe keeps a single logger. Handle both without assuming the shape.
+    for attr in ("metric_logger_train", "metric_logger_valid"):
+        logger_obj = getattr(trainer, attr, None)
+        if logger_obj is None:
+            continue
+        loggers = logger_obj.values() if isinstance(logger_obj, dict) else [logger_obj]
+        for logger in loggers:
+            close = getattr(logger, "close", None)
+            if close is not None:
+                close()
     if hasattr(trainer, "checkpointer"):
         trainer.checkpointer.close()
 
@@ -183,9 +215,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise FileExistsError(f"Export directory already exists: {export_root}")
     cfg = build_export_config(args)
 
-    trainer: TrainFinetuneRecipeForNextTokenPrediction | None = None
+    trainer: BaseRecipe | None = None
     try:
-        trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+        trainer = build_recipe(cfg)
         trainer.setup()
         export_model = resolve_model_for_export(trainer)
         # Idempotent on every rank, so a filesystem failure raises everywhere
@@ -205,7 +237,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         trainer.checkpointer.save_model(
             model=export_model,
             weights_path=str(export_root),
-            tokenizer=trainer.tokenizer,
+            tokenizer=resolve_export_tokenizer(trainer),
             is_final_checkpoint=True,
         )
     finally:

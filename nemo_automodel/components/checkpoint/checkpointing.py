@@ -664,17 +664,33 @@ class Checkpointer:
 
         if allow_checkpoint_key_subset:
             missing_checkpoint_keys = sorted(key for key in state_dict if key not in checkpoint_metadata_keys)
+            # A subset load tolerates a few absent keys (e.g. heads excluded at save time);
+            # a checkpoint sharing NO keys with the model is a wrong or unreadable checkpoint
+            # and must not become a silent no-op load.
+            if missing_checkpoint_keys and len(missing_checkpoint_keys) == len(state_dict):
+                raise RuntimeError(
+                    f"Checkpoint {model_path} contains none of the {len(state_dict)} requested model keys "
+                    f"(checkpoint has {len(checkpoint_metadata_keys)} keys, examples="
+                    f"{sorted(checkpoint_metadata_keys)[:5]}). Refusing to continue with "
+                    "allow_checkpoint_key_subset=True because the load would be a no-op."
+                )
+            # Subset loading means the checkpoint keys must be a SUBSET of the model keys
+            # (the model may carry extra heads kept at init). Keys the checkpoint has but the
+            # model lacks signal that the wrong architecture was built (e.g. a VLM checkpoint
+            # loaded into an LLM model would drop the vision tower), so refuse rather than
+            # silently export a partial model. lm_head is never a false positive here: it is
+            # only popped from state_dict when it is also absent from the checkpoint.
+            unmatched_checkpoint_keys = sorted(
+                key for key in checkpoint_metadata_keys if key not in state_dict and not key.endswith("_extra_state")
+            )
+            if unmatched_checkpoint_keys:
+                raise RuntimeError(
+                    f"Checkpoint {model_path} has {len(unmatched_checkpoint_keys)} keys absent from the built "
+                    f"model (examples={unmatched_checkpoint_keys[:5]}). The model was likely constructed with the "
+                    "wrong architecture for this checkpoint (e.g. exporting a VLM checkpoint with an LLM recipe). "
+                    "Rebuild the model with the recipe that produced the checkpoint."
+                )
             if missing_checkpoint_keys:
-                # A subset load tolerates a few absent keys (e.g. heads excluded at save
-                # time); a checkpoint sharing NO keys with the model is a wrong or
-                # unreadable checkpoint and must not become a silent no-op load.
-                if len(missing_checkpoint_keys) == len(state_dict):
-                    raise RuntimeError(
-                        f"Checkpoint {model_path} contains none of the {len(state_dict)} requested model keys "
-                        f"(checkpoint has {len(checkpoint_metadata_keys)} keys, examples="
-                        f"{sorted(checkpoint_metadata_keys)[:5]}). Refusing to continue with "
-                        "allow_checkpoint_key_subset=True because the load would be a no-op."
-                    )
                 for key in missing_checkpoint_keys:
                     state_dict.pop(key, None)
                 logging.warning(
