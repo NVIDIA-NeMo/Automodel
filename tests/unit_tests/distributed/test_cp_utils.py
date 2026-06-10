@@ -229,6 +229,15 @@ def test_make_cp_batch_and_ctx_pads_and_slices_packed_seq_ids(monkeypatch):
 
 def test_make_cp_batch_and_ctx_includes_padding_mask(monkeypatch):
     """Verify that padding_mask is included in CP buffers when present in batch."""
+    captured_kwargs = {}
+
+    def _fake_create_ctx(**kwargs):
+        captured_kwargs.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
+    monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
+
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     # seq_len=4 is divisible by cp_size*2=4 (no padding triggered).
     padding_mask = torch.tensor([[True, False, True, True]])
@@ -236,12 +245,13 @@ def test_make_cp_batch_and_ctx_includes_padding_mask(monkeypatch):
         "input_ids": torch.tensor([[10, 20, 30, 40]]),
         "labels": torch.tensor([[10, 20, 30, 40]]),
         "padding_mask": padding_mask,
-        "_cp_manual_allgather": True,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=None)
 
-    assert torch.equal(batch["padding_mask"], torch.tensor([[True, False]]))
+    # padding_mask should be in cp_buffers
+    assert any(t is padding_mask for t in captured_kwargs["cp_buffers"]), "padding_mask must be included in cp_buffers"
+    assert padding_mask in captured_kwargs["cp_no_restore_buffers"]
 
 
 def test_make_cp_batch_and_ctx_3d_mrope_position_ids(monkeypatch):

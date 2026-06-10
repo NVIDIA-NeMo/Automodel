@@ -18,7 +18,6 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -32,7 +31,6 @@ try:
 except ImportError:
     HF_HUB_CACHE = None
 
-from packaging.version import parse
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
@@ -72,39 +70,28 @@ if TYPE_CHECKING:
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig, SaveConsolidatedMode, _is_geq_torch_2_9
+
 _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 
 logger = logging.getLogger(__name__)
 
 
-class SaveConsolidatedMode(str, Enum):
-    """Controls when consolidated HF safetensors are exported."""
-
-    FALSE = "false"
-    FINAL = "final"
-    EVERY = "every"
-
-
-def _normalize_save_consolidated(value: bool | str | SaveConsolidatedMode) -> SaveConsolidatedMode:
-    """Normalize legacy bools and string aliases to a consolidated export mode."""
-    if isinstance(value, SaveConsolidatedMode):
-        return value
-    if isinstance(value, bool):
-        return SaveConsolidatedMode.EVERY if value else SaveConsolidatedMode.FALSE
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"true", "every"}:
-            return SaveConsolidatedMode.EVERY
-        if normalized == "final":
-            return SaveConsolidatedMode.FINAL
-        if normalized == "false":
-            return SaveConsolidatedMode.FALSE
-    raise ValueError(
-        "Unsupported save_consolidated value: {}. Supported values are false, final, every, and legacy booleans.".format(
-            value
-        )
-    )
+# NOTE [nemotron-singlegpu-lora]: the branches tagged with this marker below exist to make
+# single-GPU LoRA SFT of merged-expert Nemotron-H MoE (30B-class) fit on one 80GB GPU.  The
+# default DCP / set_model_state_dict load path transiently materializes a second on-device
+# copy of the (merged) expert weights, which OOMs when the whole model lives on one device.
+# The affected sites are:
+#   * Checkpointer.load                -- route single-device custom safetensors through the
+#                                         frugal full-state path instead of DCP
+#   * _load_full_state_dict_into_model -- normalize stray real (CPU) buffers onto the param
+#                                         device, and use plain load_state_dict when the model
+#                                         is not DTensor-sharded
+# Exercised by: examples/llm_finetune/nemotron/nemotron_nano_v3_singlegpu_lora.yaml
+# These are point fixes bolted onto an already-overloaded load path; a future checkpoint
+# refactor should consolidate the single-device vs. sharded loading logic into one place.
+# `grep -n nemotron-singlegpu-lora` finds every affected site.
 
 
 def _normalize_dtype_mapping_to_state_dict_keys(
@@ -126,13 +113,6 @@ def _normalize_dtype_mapping_to_state_dict_keys(
                 normalized[prefixed_fqn] = dtype_str
 
     return normalized
-
-
-def _is_geq_torch_2_9() -> bool:
-    """
-    Check if the current torch version is greater than or equal to 2.9.0.
-    """
-    return parse(torch.__version__).base_version >= "2.9.0"
 
 
 def _is_safetensors_checkpoint(path: str) -> bool:
@@ -205,65 +185,6 @@ class _AsyncSaveContext:
     process_group: Any | None  # torch.distributed.ProcessGroup
     future: Any | None  # AsyncSaveResponse
     staging_active: bool = False
-
-
-@dataclass
-class CheckpointingConfig:
-    """
-    Configuration for checkpointing.
-    """
-
-    enabled: bool
-    checkpoint_dir: str | Path
-    model_save_format: str
-    model_cache_dir: str | Path
-    model_repo_id: str
-    save_consolidated: bool | str | SaveConsolidatedMode
-    is_peft: bool
-    model_state_dict_keys: list[str] = (
-        None  # copy of the model state dict keys before any parallelization. Kept for BW compatibility.
-    )
-    is_async: bool = False
-    dequantize_base_checkpoint: bool | None = None
-    original_model_root_dir: str | None = None
-    skip_task_head_prefixes_for_base_model: list[str] | None = (
-        None  # Parameter prefixes to skip when loading base model
-    )
-    single_rank_consolidation: bool = False  # If True, only rank 0 performs consolidation.
-    # This should be used for remote storage systems that don't support direct-append or non-sequential writes.
-    staging_dir: str | None = None  # Optional directory for staging files during consolidation.
-    # If provided, temp files will be created here instead of system temp. Useful when system temp has limited space.
-    v4_compatible: bool = False  # If True, save the original pretrained config.json (with quantization_config removed)
-    # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
-    diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
-    # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
-    best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
-
-    def __post_init__(self):
-        """
-        Convert a raw string such as "safetensors" into the right Enum.
-        """
-        formats = [v.value for v in SerializationFormat]
-        assert self.model_save_format in formats, (
-            f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}"
-        )
-        self.model_save_format = SerializationFormat[self.model_save_format.upper()]
-        self.save_consolidated = _normalize_save_consolidated(self.save_consolidated)
-        if self.save_consolidated != SaveConsolidatedMode.FALSE and not self.is_peft:
-            if not self.v4_compatible:
-                logger.warning(
-                    "save_consolidated=%s but v4_compatible=False; "
-                    "checkpoint assets may be not compatible with transformers v4; "
-                    "[experimental] set --checkpoint.v4_compatible=True to enable",
-                    self.save_consolidated.value,
-                )
-            else:
-                logger.warning("[experimental] v4_compatible=True enables transformers v4 compatibility")
-
-        # Async is only enabled for torch >= 2.9.0 currently because of large API changes in async DCP from 2.8.0 to 2.9.0
-        if self.is_async and not _is_geq_torch_2_9():
-            logging.error("Async mode is only supported for torch >= 2.9.0, disabling async mode")
-            self.is_async = False
 
 
 def _should_write_hf_metadata(config: CheckpointingConfig) -> bool:
@@ -447,7 +368,7 @@ class Checkpointer:
         model_state = ModelState(model, self.config.is_peft)
         state_dict = model_state.state_dict()
 
-        # Convert to HF format if using custom model implementations
+        # Convert to HF format if using custom model implementations.
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
@@ -455,6 +376,8 @@ class Checkpointer:
             device_mesh=self.moe_mesh,
             v4_compatible=self.config.v4_compatible,
         )
+        # MoE adapters return non-contiguous views; safetensors.save rejects those.
+        _materialize_to_hf_views_for_save(state_dict)
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
         fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, state_dict)
@@ -606,10 +529,28 @@ class Checkpointer:
         # the broadcast_from_rank0 hang where rank 0's synchronous CPU→GPU copies
         # fall behind other ranks' async allocations.
         is_safetensors = _is_safetensors_checkpoint(model_path)
+        # [nemotron-singlegpu-lora] (see module note at top of file)
+        # Custom models (e.g. NemotronH) normally take the DCP path below, which converts the
+        # model's state dict to_hf to build load destinations.  For merged-expert MoE models that
+        # transiently materializes a second copy of the expert weights on-device, which OOMs when
+        # the whole model lives on one GPU.  On a single device there is no DTensor sharding, so the
+        # frugal full-state path (load to CPU, from_hf-merge on CPU, copy into the model) is correct
+        # and keeps device memory at ~model size — letting 30B-class MoE LoRA SFT fit on one 80GB GPU.
+        # World size inline (not via components.distributed) so the checkpoint component stays
+        # independent per the import-linter contract.
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+        else:
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        single_device_custom_safetensors = is_safetensors and _is_custom_model(model_state.model[0]) and world_size == 1
         if (
             is_init_step
             and len(model_state.model) == 1
-            and (_is_bin_checkpoint(model_path) or (is_safetensors and not _is_custom_model(model_state.model[0])))
+            and (
+                _is_bin_checkpoint(model_path)
+                or (is_safetensors and not _is_custom_model(model_state.model[0]))
+                or single_device_custom_safetensors
+            )
         ):
             t0 = time.monotonic()
             weights_only = not _is_remote_code_model(model_state.model[0])
@@ -671,6 +612,8 @@ class Checkpointer:
         reader_key_mapping = None if has_state_dict_adapter else key_mapping
         storage_reader = self._get_storage_reader(model_path, reader_key_mapping, is_init_step=is_init_step)
 
+        # MoE adapters return views into model storage; DCP writes safetensors
+        # data straight through them and from_hf skips the rebuild.
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
@@ -718,7 +661,9 @@ class Checkpointer:
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
-        key_diff = _summarize_state_dict_key_diff(expected_keys, set(state_dict.keys()))
+        expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
+        loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
+        key_diff = _summarize_state_dict_key_diff(expected_keys_for_diff, loaded_keys_for_diff)
         if key_diff["missing_count"] or key_diff["unexpected_count"]:
             logging.warning(
                 "Checkpoint key mismatch for %s: missing=%d unexpected=%d "
@@ -829,7 +774,23 @@ class Checkpointer:
                     module._is_hf_initialized = False
 
             if hasattr(model, "initialize_weights"):
-                model.initialize_weights()
+                # Infer the target dtype from existing (floating-point)
+                # parameters so that a model constructed in fp32 (e.g. for fp32
+                # master weights under FSDP2) is not silently cast back to
+                # bf16 inside model.initialize_weights() -> cast_model_to_dtype().
+                param_dtype = None
+                for p in model.parameters():
+                    if p.is_floating_point():
+                        param_dtype = p.dtype
+                        break
+                try:
+                    if param_dtype is not None:
+                        model.initialize_weights(dtype=param_dtype)
+                    else:
+                        model.initialize_weights()
+                except TypeError:
+                    # Model's initialize_weights() does not accept a dtype kwarg.
+                    model.initialize_weights()
             else:
                 logging.warning(
                     "Warning: Model does not have initialize_weights method."
@@ -942,6 +903,27 @@ class Checkpointer:
         state.load_state_dict(
             torch.load(os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"), weights_only=False)
         )
+
+    def save_distributed_state(self, state: Any, state_name: str, path: str) -> None:
+        """Save a custom stateful object through DCP on all ranks.
+
+        This is intended for auxiliary objects whose state dict contains
+        sharded tensors, for example BAGEL EMA shadows under FSDP2. Rank-0
+        ``torch.save`` would only persist rank 0's local shard; DCP sees the
+        DTensor metadata and writes all shards correctly.
+        """
+        state_dir = os.path.join(path, state_name)
+        _ensure_dirs(state_dir)
+        state_dict = state.state_dict()
+        planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
+        dcp.save(state_dict, checkpoint_id=state_dir, planner=planner)
+
+    def load_distributed_state(self, state: Any, state_name: str, path: str) -> None:
+        """Load a custom stateful object previously saved with DCP."""
+        state_dir = os.path.join(path, state_name)
+        state_dict = state.state_dict()
+        dcp.load(state_dict, checkpoint_id=state_dir)
+        state.load_state_dict(state_dict)
 
     def close(self) -> None:
         """
@@ -1704,6 +1686,22 @@ def _load_full_state_dict_into_model(
                 if key not in state_dict:
                     state_dict[key] = torch.tensor([], dtype=torch.uint8)
 
+    # [nemotron-singlegpu-lora] (see module note at top of file)
+    # set_model_state_dict(full_state_dict=True) requires every parameter/buffer of a
+    # part to live on a single device.  Custom models (e.g. NemotronH/Mamba) can leave a
+    # concrete CPU buffer behind after meta materialization (initialize_model_weights only
+    # relocates *meta* buffers), which would trip "Multiple devices found".  Normalize any
+    # stray real buffer onto the part's single (non-meta) parameter device.  This is a no-op
+    # for HF models, which are already device-uniform.
+    for part in model_parts:
+        param_devices = {p.device for p in part.parameters() if p.device.type != "meta"}
+        if len(param_devices) == 1:
+            target_device = next(iter(param_devices))
+            for module in part.modules():
+                for buf_name, buf in list(module._buffers.items()):
+                    if buf is not None and buf.device.type != "meta" and buf.device != target_device:
+                        module._buffers[buf_name] = buf.to(target_device)
+
     # full_state_dict=True WITHOUT broadcast_from_rank0: every rank already
     # has the full checkpoint, so _distribute_state_dict slices each rank's
     # local DTensor shard independently -- zero NCCL collectives.
@@ -1712,8 +1710,23 @@ def _load_full_state_dict_into_model(
         full_state_dict=True,
     )
 
+    try:
+        from torch.distributed.tensor import DTensor
+    except ImportError:  # pragma: no cover - older torch
+        from torch.distributed._tensor import DTensor
+
+    # [nemotron-singlegpu-lora] (see module note at top of file)
     for part in model_parts:
-        set_model_state_dict(part, model_state_dict=state_dict, options=options)
+        if any(isinstance(p, DTensor) for p in part.parameters()):
+            # Sharded model (FSDP/TP): set_model_state_dict slices each rank's local
+            # DTensor shard from the full state dict.
+            set_model_state_dict(part, model_state_dict=state_dict, options=options)
+        else:
+            # Single-device (non-sharded) model: copy tensor-by-tensor with plain
+            # load_state_dict so device memory stays at ~model size.  set_model_state_dict's
+            # _distribute_state_dict would instead move the *entire* state dict onto the
+            # device (a second full copy), OOMing a 30B model on one 80GB GPU.
+            part.load_state_dict(state_dict, strict=False)
 
 
 def _convert_checkpoint_with_transformers(
@@ -1851,6 +1864,27 @@ def _maybe_adapt_state_dict_to_hf(
     if adapter:
         return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
+
+
+def _materialize_to_hf_views_for_save(state_dict: dict[str, torch.Tensor]) -> None:
+    """Replace non-contiguous tensor values in ``state_dict`` with contiguous copies in place.
+
+    MoE adapters return non-contiguous strided views into the model's grouped
+    expert storage for the optimized load path; ``safetensors.torch.save``
+    (which the DCP HF storage writer calls) rejects non-contiguous tensors,
+    so we materialize one tensor at a time here with ``empty_cache`` between
+    iterations. Per-tensor transient is bounded to a single expert weight
+    instead of allocating the full grouped set up front.
+    """
+    if not state_dict:
+        return
+    cuda_available = torch.cuda.is_available()
+    for key, value in list(state_dict.items()):
+        if isinstance(value, torch.Tensor) and not value.is_contiguous():
+            state_dict[key] = value.contiguous()
+            del value
+            if cuda_available:
+                torch.cuda.empty_cache()
 
 
 def _equally_divide_layers(num_shards: int, keys: list[str]) -> dict[str, int]:

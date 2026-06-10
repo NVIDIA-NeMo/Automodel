@@ -25,6 +25,7 @@ Architecture name: "NemotronH_Nano_Omni_Reasoning_V3" (from config.json)
 
 import logging
 import warnings
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -238,6 +239,15 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
     The LLM part reuses the nemotron_v3 implementation (NemotronHForCausalLM) which
     has custom DTensor parallelism for the Mamba+Attention hybrid MoE architecture.
     """
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = True
+        supports_pp: bool = False
+        supports_ep: bool = True
 
     @classmethod
     def from_config(
@@ -869,6 +879,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         *,
         _pre_embed_only: bool = False,
         **kwargs,
@@ -891,12 +902,25 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             labels: Token IDs for loss computation [batch, seq_len]
             inputs_embeds: Pre-computed input embeddings (optional)
             use_cache: Whether to use caching (not used in training)
+            output_hidden_states: Whether the returned output should carry the
+                final decoder hidden states (required for fused linear
+                cross-entropy / cut-CE). Defaults to the text sub-config's
+                ``output_hidden_states`` when ``None``.
+            logits_to_keep: If 0 (default), compute logits for all positions;
+                if > 0, only compute logits for the last ``logits_to_keep``
+                positions (used by fused linear cross-entropy to avoid the full
+                logit matrix). Forwarded to the language-model lm_head gating.
             **kwargs: Additional arguments
 
         Returns:
             CausalLMOutputWithPast with loss and logits
         """
         return_dict = return_dict if return_dict is not None else True
+        # Resolve from the text/decoder sub-config (the top-level NemotronOmni
+        # config has no output_hidden_states; the recipe toggles it on llm_config).
+        if output_hidden_states is None:
+            llm_config = getattr(getattr(self, "config", None), "llm_config", None)
+            output_hidden_states = getattr(llm_config, "output_hidden_states", False)
 
         # CP path: caller wants the multimodal scatter to run inside __call__
         # so FSDP2's forward pre-hook all-gathers the vision tower's sharded
@@ -1064,7 +1088,10 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
 
             inputs_embeds = inputs_embeds.reshape(B_s, N_s, C_s)
 
-        # Forward through the LLM
+        # Forward through the LLM. ``logits_to_keep`` gates the lm_head projection
+        # (0 -> all positions; N -> last N) and ``output_hidden_states`` makes the
+        # returned NemotronHCausalLMOutputWithPast carry the final, full-sequence
+        # decoder hidden states (consumed by fused linear cross-entropy / cut-CE).
         outputs = self.language_model(
             input_ids=None,  # We pass inputs_embeds instead
             inputs_embeds=inputs_embeds,
@@ -1073,6 +1100,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             return_dict=True,
+            logits_to_keep=logits_to_keep,
             **kwargs,
         )
 

@@ -33,34 +33,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
 
-from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe, _optim_steps_per_epoch
-
-
-@pytest.mark.parametrize(
-    "num_batches,accum,expected",
-    [
-        (10, 1, 10),
-        (10, 2, 5),
-        (10, 3, 4),  # 3 full windows + 1 trailing micro-batch -> 4 steps
-        (10, 4, 3),  # 2 full windows + 2 trailing -> 3 steps
-        (1, 4, 1),  # entire epoch is one trailing flush
-        (4, 4, 1),
-        (5, 4, 2),
-        (0, 4, 0),  # iterable dataloader / no length
-    ],
-)
-def test_optim_steps_per_epoch_uses_ceil_division(num_batches, accum, expected):
-    assert _optim_steps_per_epoch(num_batches, accum) == expected
-
-
-def test_optim_steps_per_epoch_handles_invalid_inputs():
-    assert _optim_steps_per_epoch(0, 1) == 0
-    assert _optim_steps_per_epoch(-1, 4) == 0
-    assert _optim_steps_per_epoch(10, 0) == 0
-    assert _optim_steps_per_epoch(10, -1) == 0
-
+from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
 
 # ---------------------------------------------------------------------------
 # Trailing-flush gradient rescale
@@ -83,7 +60,15 @@ class _ConstantGradModule(nn.Module):
         self.w = nn.Parameter(torch.zeros(n))
 
     def forward(self, **kwargs):
-        return SimpleNamespace(loss=self.w.sum(), accuracy=torch.tensor(0.5))
+        loss = self.w.sum()
+        # Mirror EagleStepMetrics: the recipe loop reads hidden_loss/token_loss
+        # for per-step logging in addition to the combined loss.
+        return SimpleNamespace(
+            loss=loss,
+            hidden_loss=loss.detach(),
+            token_loss=torch.zeros((), device=self.w.device),
+            accuracy=torch.tensor(0.5),
+        )
 
 
 class _FakeTargetWrapper:
@@ -115,11 +100,14 @@ class _ListLoader:
         return len(self._batches)
 
 
-def _build_recipe(num_batches: int, grad_accum: int) -> TrainEagle1Recipe:
+def _build_recipe(num_batches: int, grad_accum: int, trainer_module: nn.Module | None = None) -> TrainEagle1Recipe:
     recipe = TrainEagle1Recipe.__new__(TrainEagle1Recipe)
     recipe.device = torch.device("cpu")
     recipe.dist_env = SimpleNamespace(is_main=True, world_size=1)
-    recipe.trainer_module = _ConstantGradModule()
+    # Assign trainer_module exactly once: BaseRecipe.__setattr__ tracks model
+    # attributes and rejects re-assignment, so a DDP-wrapped module must be
+    # passed in here rather than swapped in after construction.
+    recipe.trainer_module = trainer_module if trainer_module is not None else _ConstantGradModule()
     recipe.target_wrapper = _FakeTargetWrapper()
     recipe.train_dataloader = _ListLoader(num_batches)
     recipe.val_dataloader = None
@@ -165,3 +153,40 @@ def test_trailing_flush_rescales_gradient_to_full_window_scale(num_batches, accu
     assert len(captured) == expected_steps
     for grad in captured:
         torch.testing.assert_close(grad, torch.ones_like(grad))
+
+
+# ---------------------------------------------------------------------------
+# Real (single-process, gloo) DDP: the loop enters no_sync() on interior steps
+# ---------------------------------------------------------------------------
+
+
+def test_no_sync_entered_for_interior_microbatches_under_ddp(tmp_path):
+    """Wrap the trainer module in a real DDP (1 rank, gloo) and confirm the loop
+    enters ``no_sync()`` exactly on the micro-batches that defer their
+    all-reduce: interior steps of a window, but neither the window closer nor
+    the epoch's final batch. 4 batches with accum=3 => batch 0,1 deferred,
+    batch 2 closes the window (sync), batch 3 is the last batch (sync) => 2
+    no_sync entries."""
+    if dist.is_initialized():
+        pytest.skip("a process group is already initialized in this session")
+
+    dist.init_process_group(backend="gloo", init_method=f"file://{tmp_path / 'pg'}", world_size=1, rank=0)
+    try:
+        ddp = DistributedDataParallel(_ConstantGradModule())  # CPU => no device_ids
+        recipe = _build_recipe(num_batches=4, grad_accum=3, trainer_module=ddp)
+
+        no_sync_entries = 0
+        real_no_sync = ddp.no_sync
+
+        def _spy_no_sync():
+            nonlocal no_sync_entries
+            no_sync_entries += 1
+            return real_no_sync()
+
+        ddp.no_sync = _spy_no_sync
+        recipe.run_train_validation_loop()
+
+        assert no_sync_entries == 2
+        assert recipe.runtime.global_step == 2
+    finally:
+        dist.destroy_process_group()

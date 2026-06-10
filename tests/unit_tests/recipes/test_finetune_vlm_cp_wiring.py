@@ -410,49 +410,57 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     monkeypatch.setattr(vlm_finetune, "AutoPipeline", _FakePPModel)
     monkeypatch.setattr(
         vlm_finetune,
-        "build_distributed",
-        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+        "initialize_distributed",
+        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
     monkeypatch.setattr(vlm_finetune, "setup_logging", lambda: None)
     monkeypatch.setattr(vlm_finetune, "apply_cache_compatibility_patches", lambda: None)
     monkeypatch.setattr(vlm_finetune, "StatefulRNG", lambda *args, **kwargs: "rng")
-    monkeypatch.setattr(vlm_finetune, "build_loss_fn", lambda cfg: "loss_fn")
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.loss_fn",
+        property(lambda self: SimpleNamespace(build=lambda: "loss_fn")),
+    )
     monkeypatch.setattr(vlm_finetune, "_supports_logits_to_keep", lambda model: True)
     monkeypatch.setattr(
         vlm_finetune,
-        "setup_distributed",
+        "create_distributed_setup_from_config",
         lambda cfg, world_size: SimpleNamespace(
+            mesh_context=SimpleNamespace(
+                pp_enabled=True,
+                device_mesh=None,
+                moe_mesh=None,
+                cp_size=cp_size,
+                pp_size=2,
+            ),
             strategy_config=SimpleNamespace(),
             pipeline_config=SimpleNamespace(),
-            moe_config=None,
+            moe_parallel_config=None,
             activation_checkpointing=False,
-            pp_enabled=True,
-            device_mesh=None,
-            moe_mesh=None,
-            cp_size=cp_size,
-            pp_size=2,
         ),
     )
-    monkeypatch.setattr(
-        vlm_finetune,
-        "build_checkpoint_config",
-        lambda *args, **kwargs: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
-    )
-    monkeypatch.setattr(
-        vlm_finetune,
-        "Checkpointer",
-        lambda **kwargs: SimpleNamespace(
-            config=kwargs["config"],
+
+    def _stub_build_checkpoint_config(*args, **kwargs):
+        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+        cfg.build = lambda **kw: SimpleNamespace(
+            config=cfg,
             load_base_model=lambda *args, **kwargs: None,
             maybe_wait_for_staging=lambda: None,
             close=lambda: None,
-        ),
+        )
+        return cfg
+
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.checkpoint",
+        property(lambda self: _stub_build_checkpoint_config()),
     )
     monkeypatch.setattr(vlm_finetune, "build_model", lambda *args, **kwargs: _FakePPModel(stage0))
     monkeypatch.setattr(
-        vlm_finetune,
-        "build_optimizer",
-        lambda *args, **kwargs: [SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None)],
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(
+            lambda self: SimpleNamespace(
+                build=lambda *args, **kwargs: [SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None)]
+            )
+        ),
     )
 
     def _build_dataloader(*args, **kwargs):
@@ -461,11 +469,12 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
 
     monkeypatch.setattr(vlm_finetune, "build_dataloader", _build_dataloader)
     monkeypatch.setattr(
-        vlm_finetune,
-        "build_step_scheduler",
-        lambda *args, **kwargs: SimpleNamespace(step=0, epoch=0, epochs=[]),
+        "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
+        lambda self, *args, **kwargs: SimpleNamespace(step=0, epoch=0, epochs=[]),
     )
-    monkeypatch.setattr(vlm_finetune, "build_lr_scheduler", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "nemo_automodel.components.optim.optimizer.LRSchedulerConfig.build", lambda self, *args, **kwargs: []
+    )
     monkeypatch.setattr(
         vlm_finetune,
         "build_metric_logger",
@@ -583,3 +592,57 @@ def test_val_pos_ids_uses_dist_env_device_not_model_device():
     # The buggy line would have raised:
     with pytest.raises(AttributeError, match="no attribute 'device'"):
         _ = torch.arange(0, 4).unsqueeze(0).to(model.device)
+
+
+def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
+    """``total_loss`` is all-reduced with include_cp=True, but ``total_tokens``
+    (measured pre-CP-shard) must NOT include CP — otherwise val_loss is scaled
+    down by cp_size. Guards the fix at finetune.py:_run_validation_epoch."""
+    from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
+
+    # No-op replacements for the heavy collaborators.
+    monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(vlm_finetune, "make_cp_batch_and_ctx", lambda mesh, batch: (nullcontext, batch))
+    monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
+    monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
+
+    class _Model(torch.nn.Module):
+        def eval(self):  # noqa: D401
+            return self
+
+        def forward(self, **batch):
+            return SimpleNamespace(logits=torch.zeros(1, 4, 8), hidden_states=None)
+
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.model_parts = [_Model()]
+    recipe.loss_fn = object()  # not a FusedLinearCrossEntropy
+    recipe.device_mesh = None  # CP inactive -> skip pre-embed branch
+    recipe.pp_enabled = False
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
+    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.001}])]
+    recipe._maybe_add_drafter_loss = lambda *, out, base_loss, labels, model, num_label_tokens: base_loss
+
+    allreduce_calls = []
+
+    def _fake_allreduce(tensor, include_cp=False):
+        allreduce_calls.append((tensor.tolist(), include_cp))
+        return tensor
+
+    recipe._dp_allreduce = _fake_allreduce
+
+    # One batch, 3 supervised tokens (-100 ignored).
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": torch.tensor([[1, 2, -100, 4]]),
+    }
+
+    result = recipe._run_validation_epoch([batch])
+
+    # total_loss all-reduced WITH cp; total_tokens and num_label_tokens WITHOUT.
+    loss_call = allreduce_calls[0]
+    tokens_call = allreduce_calls[1]
+    assert loss_call[1] is True, "total_loss must include CP ranks"
+    assert tokens_call[1] is False, "total_tokens must NOT be summed over CP ranks"
+    # val_loss = (2.0 * 3 tokens) / 3 tokens == 2.0
+    assert result.metrics["val_loss"] == pytest.approx(2.0)
