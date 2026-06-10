@@ -62,6 +62,7 @@ from nemo_automodel.components.utils.model_utils import (
     count_model_parameters,
     enable_radio_vit_fused_attn,
     freeze_deepseek_v4_indexer_params,
+    freeze_minimax_m3_indexer_params,
     freeze_unused_kv_sharing_params,
     init_empty_weights,
     print_trainable_parameters,
@@ -498,6 +499,7 @@ def apply_model_infrastructure(
     # so the optimizer never tracks them and checkpoint save/resume stay consistent.
     freeze_unused_kv_sharing_params(model)
     freeze_deepseek_v4_indexer_params(model)
+    freeze_minimax_m3_indexer_params(model)
 
     # NemotronOmni RADIO: opt into the fused SDPA path on ViT attention blocks.
     enable_radio_vit_fused_attn(model)
