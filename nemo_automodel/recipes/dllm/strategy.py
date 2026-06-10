@@ -263,11 +263,20 @@ class IDLMStrategy(DLLMStrategy):
     def setup_extra(self, recipe) -> None:
         if getattr(recipe.distributed_config, "cp_size", 1) > 1:
             raise ValueError("I-DLM does not support context parallelism (cp_size must be 1).")
-        attn_impl = getattr(getattr(recipe.model_parts[0], "config", None), "_attn_implementation", None)
+        model_config = getattr(recipe.model_parts[0], "config", None)
+        attn_impl = getattr(model_config, "_attn_implementation", None)
         if attn_impl == "flash_attention_2":
             raise ValueError(
                 "I-DLM needs the block-diffusion attention mask; set the model's "
                 "attn_implementation to 'sdpa' (FlashAttention-2 ignores 4D masks)."
+            )
+        # A wrong id silently masks with a real token and trains garbage.
+        vocab_size = getattr(model_config, "vocab_size", None)
+        if recipe.mask_token_id is None:
+            raise ValueError("I-DLM requires dllm.mask_token_id to be set explicitly.")
+        if vocab_size is not None and not 0 <= int(recipe.mask_token_id) < int(vocab_size):
+            raise ValueError(
+                f"dllm.mask_token_id={recipe.mask_token_id} is outside the model vocab (size {vocab_size})."
             )
 
     def apply_corruption(self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio):

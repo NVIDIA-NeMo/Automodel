@@ -290,6 +290,22 @@ class TestIDLMStrategy:
         strategy.create_loss_fn({})
         assert strategy.block_size == 1  # b1 default
 
+    def test_setup_extra_validates_mask_token_id(self, strategy):
+        recipe = types.SimpleNamespace(
+            distributed_config=types.SimpleNamespace(cp_size=1),
+            model_parts=[
+                types.SimpleNamespace(config=types.SimpleNamespace(_attn_implementation="sdpa", vocab_size=1000))
+            ],
+            mask_token_id=None,
+        )
+        with pytest.raises(ValueError, match="mask_token_id"):
+            strategy.setup_extra(recipe)
+        recipe.mask_token_id = 1000  # == vocab_size, out of range
+        with pytest.raises(ValueError, match="outside the model vocab"):
+            strategy.setup_extra(recipe)
+        recipe.mask_token_id = 999
+        strategy.setup_extra(recipe)
+
     def test_apply_corruption_masks_all_supervised(self, strategy):
         input_ids = torch.randint(0, 100, (2, 16))
         loss_mask = torch.zeros(2, 16, dtype=torch.long)
