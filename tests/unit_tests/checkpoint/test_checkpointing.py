@@ -517,6 +517,48 @@ def test_has_local_tied_lm_head_is_false_for_pp_last_stage_like_partition():
     assert has_local_tied_lm_head(model) is False
 
 
+class _LocalUntiedButConfiguredModel(torch.nn.Module):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(tie_word_embeddings=True)
+        self.model = torch.nn.Module()
+        self.model.embed_tokens = torch.nn.Embedding(4, 4)
+        self.lm_head = torch.nn.Linear(4, 4, bias=False)
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+
+def test_has_local_tied_lm_head_is_false_when_config_tied_but_storage_untied():
+    model = _LocalUntiedButConfiguredModel()
+
+    assert has_local_tied_lm_head(model) is False
+
+
+def test_model_state_keeps_lm_head_when_config_tied_but_storage_untied():
+    model = _LocalUntiedButConfiguredModel()
+
+    model_state = ModelState(model, is_peft=False, is_init_step=False)
+    saved_state_dict = model_state.state_dict()
+
+    assert "lm_head.weight" in saved_state_dict
+    assert "model.embed_tokens.weight" in saved_state_dict
+
+
+def test_model_state_drops_lm_head_when_storage_is_actually_tied():
+    model = _LocalUntiedButConfiguredModel()
+    model.lm_head.weight = model.model.embed_tokens.weight
+
+    model_state = ModelState(model, is_peft=False, is_init_step=False)
+    saved_state_dict = model_state.state_dict()
+
+    assert has_local_tied_lm_head(model) is True
+    assert "lm_head.weight" not in saved_state_dict
+    assert "model.embed_tokens.weight" in saved_state_dict
+
+
 def test_materialize_missing_tied_lm_head_uses_embedding_tensor_from_checkpoint():
     model = _PipelineLastStageLikeModel()
     embed_weight = torch.full_like(model.lm_head.weight, 3.0)
@@ -1008,6 +1050,40 @@ class TestInitializeModelWeights:
         Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
         model.initialize_weights.assert_called_once()
+
+    def test_retie_weights_after_meta_initialization(self):
+        """Tied embeddings should be re-applied after materializing and initializing meta params."""
+
+        class FakeTiedModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                with torch.device("meta"):
+                    self.model = torch.nn.Module()
+                    self.model.embed_tokens = torch.nn.Embedding(4, 4)
+                    self.lm_head = torch.nn.Linear(4, 4, bias=False)
+                self.config = SimpleNamespace(architectures=["FakeTiedModel"], tie_word_embeddings=True)
+                self.tie_weights_called = False
+
+            def get_input_embeddings(self):
+                return self.model.embed_tokens
+
+            def tie_weights(self):
+                self.lm_head.weight = self.model.embed_tokens.weight
+                self.tie_weights_called = True
+
+            def initialize_weights(self):
+                with torch.no_grad():
+                    self.model.embed_tokens.weight.fill_(1.0)
+                    self.lm_head.weight.fill_(2.0)
+
+        model = FakeTiedModel()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        assert model.tie_weights_called is True
+        assert model.lm_head.weight is model.model.embed_tokens.weight
+        assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+        assert torch.all(model.lm_head.weight == 1.0)
 
     def test_warns_when_no_initialize_weights_method(self):
         """Should log a warning when model lacks initialize_weights."""

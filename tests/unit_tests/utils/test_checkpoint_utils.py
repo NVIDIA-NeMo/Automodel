@@ -98,27 +98,44 @@ class _DraftLikeModel(nn.Module):
     look for so the tests exercise the same code paths as the real model.
     """
 
-    def __init__(self, embed_vocab: int, lm_head_vocab: int, hidden: int, tied: bool) -> None:
+    def __init__(
+        self,
+        embed_vocab: int,
+        lm_head_vocab: int,
+        hidden: int,
+        tie_word_embeddings: bool,
+        tie_storage: bool = False,
+    ) -> None:
         super().__init__()
-        self.config = SimpleNamespace(tie_word_embeddings=tied)
+        self.config = SimpleNamespace(tie_word_embeddings=tie_word_embeddings)
         self.model = nn.Module()
         self.model.embed_tokens = nn.Embedding(embed_vocab, hidden)
         self.lm_head = nn.Linear(hidden, lm_head_vocab, bias=False)
+        if tie_storage:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
 
 def test_has_local_tied_lm_head_false_when_shapes_disagree():
     """Vocab-shrunk EAGLE-3 draft: embed_tokens [V_t,H] != lm_head [V_d,H]."""
-    model = _DraftLikeModel(embed_vocab=128256, lm_head_vocab=8192, hidden=2048, tied=True)
+    model = _DraftLikeModel(embed_vocab=128256, lm_head_vocab=8192, hidden=2048, tie_word_embeddings=True)
     assert checkpoint_utils.has_local_tied_lm_head(model) is False
 
 
 def test_has_local_tied_lm_head_true_when_shapes_match_and_tied():
-    """Standard tied-embeddings case: shapes match, flag set -> tied."""
-    model = _DraftLikeModel(embed_vocab=32000, lm_head_vocab=32000, hidden=128, tied=True)
+    """Standard tied-embeddings case: shapes match, flag set, storage aliases."""
+    model = _DraftLikeModel(
+        embed_vocab=32000, lm_head_vocab=32000, hidden=128, tie_word_embeddings=True, tie_storage=True
+    )
     assert checkpoint_utils.has_local_tied_lm_head(model) is True
+
+
+def test_has_local_tied_lm_head_false_when_shapes_match_but_storage_is_untied():
+    """Matching shapes and config are not enough; the tensors must alias."""
+    model = _DraftLikeModel(embed_vocab=32000, lm_head_vocab=32000, hidden=128, tie_word_embeddings=True)
+    assert checkpoint_utils.has_local_tied_lm_head(model) is False
 
 
 def test_has_local_tied_lm_head_false_when_flag_unset():
     """Even with matching shapes, untied config means not locally tied."""
-    model = _DraftLikeModel(embed_vocab=32000, lm_head_vocab=32000, hidden=128, tied=False)
+    model = _DraftLikeModel(embed_vocab=32000, lm_head_vocab=32000, hidden=128, tie_word_embeddings=False)
     assert checkpoint_utils.has_local_tied_lm_head(model) is False

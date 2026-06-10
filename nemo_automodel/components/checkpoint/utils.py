@@ -235,19 +235,14 @@ def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | No
 
 
 def has_local_tied_lm_head(model: nn.Module) -> bool:
-    """Return whether the current model partition can locally satisfy a tied LM head.
+    """Return whether the current model partition has an actual tied LM head.
 
-    This is intentionally stricter than ``is_tied_word_embeddings()``: pipeline
-    stages often keep the config flag set to ``True`` even though ``lm_head`` and
-    ``embed_tokens`` live on different partitions and therefore cannot be
-    reconstructed from each other locally.
-
-    Note: we purposefully do NOT check ``lm_head.weight is embed_tokens.weight``.
-    After FSDP/TP sharding both are wrapped into separate ``DTensor``s and the
-    ``is``-identity is broken, but HF's ``tie_weights()`` can still relink them
-    locally on load. The only case we actually need to distinguish is "is the
-    embedding source present on this partition at all?", which answers "can we
-    safely omit ``lm_head.weight`` during save and rematerialize on load?".
+    This is stricter than ``is_tied_word_embeddings()``: pipeline stages often
+    keep the config flag set to ``True`` even when ``lm_head`` and
+    ``embed_tokens`` live on different partitions. Some custom models can also
+    declare tied embeddings in config without actually aliasing the parameters.
+    In that case omitting ``lm_head.weight`` from a checkpoint loses trained
+    state, so only treat it as safely tied when the local tensors share storage.
 
     Args:
         model: Model or pipeline stage to inspect.
@@ -275,7 +270,37 @@ def has_local_tied_lm_head(model: nn.Module) -> bool:
     # producing a strict-load shape mismatch on resume.
     if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
         return False
-    return True
+    return _same_tensor_storage(lm_head_weight, input_embeddings_weight)
+
+
+def _same_tensor_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Return whether two tensors are aliases of the same local storage."""
+    if left is right:
+        return True
+
+    def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        to_local = getattr(tensor, "to_local", None)
+        if callable(to_local):
+            try:
+                return to_local()
+            except RuntimeError:
+                return tensor
+        return tensor
+
+    left_local = _local_tensor(left)
+    right_local = _local_tensor(right)
+    if left_local is right_local:
+        return True
+    if left_local.device.type == "meta" or right_local.device.type == "meta":
+        return False
+
+    try:
+        return (
+            left_local.untyped_storage().data_ptr() == right_local.untyped_storage().data_ptr()
+            and left_local.storage_offset() == right_local.storage_offset()
+        )
+    except RuntimeError:
+        return False
 
 
 def materialize_missing_tied_lm_head(

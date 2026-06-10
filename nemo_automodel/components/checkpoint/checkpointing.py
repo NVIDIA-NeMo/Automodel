@@ -797,6 +797,17 @@ class Checkpointer:
                     " Requires custom initialization to be implemented."
                 )
 
+        # Custom models constructed on meta tensors are materialized and
+        # initialized here, after __init__ has already returned. Re-apply tied
+        # embeddings at this point so random from-config initialization does not
+        # leave lm_head.weight split from embed_tokens.weight.
+        if hasattr(model, "tie_weights") and is_tied_word_embeddings(model):
+            try:
+                model.tie_weights()
+            except AttributeError:
+                # Pipeline stages may not own both sides of the tied pair.
+                pass
+
         if peft_init_method is not None:
             _init_peft_adapters(model, peft_init_method)
 
