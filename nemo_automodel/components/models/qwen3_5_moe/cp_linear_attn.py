@@ -107,12 +107,17 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
     def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
         """Compute the gating value ``g`` using fp32 params.
 
-        When ``_fp32_params`` exists (FSDP mixed-dtype), delegates to
-        the holder's forward so FSDP unshard/reshard lifecycle is natural.
-        Otherwise falls back to the inline computation.
+        When ``_fp32_params`` exists (FSDP mixed-dtype), delegates to the holder's
+        forward so the FSDP unshard/reshard lifecycle is natural. ``self.dt_bias``
+        is read only when the holder does *not* own it; otherwise it would touch the
+        holder-owned (still-sharded) parameter outside the holder forward, defeating
+        the isolation. Falls back to the inline computation when no holder exists.
         """
-        if hasattr(self, "_fp32_params"):
-            return self._fp32_params(a, self.dt_bias)
+        holder = self._modules.get("_fp32_params")
+        if holder is not None:
+            if "dt_bias" in holder._parameters:
+                return holder(a)
+            return holder(a, self.dt_bias)
         return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
     def _forward_no_cp(

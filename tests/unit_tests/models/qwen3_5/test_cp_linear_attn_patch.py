@@ -251,6 +251,24 @@ class TestComputeGate:
         assert g.dtype == torch.float32
         assert g.shape == (4,)
 
+    def test_compute_gate_does_not_pre_read_holder_dt_bias(self, fake_model, monkeypatch):
+        """When dt_bias is fp32 (moved into the holder), _compute_gate must call
+        ``holder(a)`` without reading ``self.dt_bias`` -- a pre-read would touch the
+        still-sharded holder param outside the holder forward."""
+        CPAwareGatedDeltaNet, _Fp32ParamHolder, patch_hf_model = self._stub_and_import(monkeypatch)
+        # Make dt_bias intrinsically fp32 so isolation moves it into the holder.
+        for layer in fake_model.layers:
+            mod = layer.linear_attn
+            mod.dt_bias = nn.Parameter(torch.zeros(mod.dt_bias.shape, dtype=torch.float32))
+        patch_hf_model(fake_model, cp_enabled=False)
+        la = fake_model.layers[0].linear_attn
+        assert "dt_bias" in la._fp32_params._parameters
+        a = torch.zeros(4)
+        with patch.object(la._fp32_params, "forward", return_value=torch.zeros(4)) as mock_fwd:
+            la._compute_gate(a)
+            # Only ``a`` is passed -- self.dt_bias is never read.
+            mock_fwd.assert_called_once_with(a)
+
 
 class TestPatchHfModelSentinel:
     """Test that __getattr__ patching is idempotent."""
