@@ -17,46 +17,103 @@
 from __future__ import annotations
 
 from copy import copy
-from typing import Callable, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from transformers.cache_utils import Cache, DynamicCache
-from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, can_return_tuple, logging
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import (
+    _has_dtensor_params,
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+)
 from nemo_automodel.components.models.mimo_v25.config import MiMoV2Config
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
-logger = logging.get_logger(__name__)
+def _convert_bool_4d_mask_to_additive(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if mask.ndim != 4 or mask.dtype != torch.bool:
+        return mask
+    additive = torch.zeros(mask.shape, dtype=dtype, device=mask.device)
+    return additive.masked_fill(~mask, torch.finfo(dtype).min)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
+def _fallback_additive_mask(
+    batch_size: int,
+    seq_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    attention_mask: torch.Tensor | None = None,
+    sliding_window: int | None = None,
+) -> torch.Tensor:
+    min_val = torch.finfo(dtype).min
+    idx = torch.arange(seq_len, device=device)
+    masked = idx.unsqueeze(0) > idx.unsqueeze(1)
+    if sliding_window is not None and sliding_window > 0:
+        masked = masked | ((idx.unsqueeze(1) - idx.unsqueeze(0)) >= sliding_window)
+    additive = torch.zeros((seq_len, seq_len), dtype=dtype, device=device).masked_fill(masked, min_val)
+    additive = additive.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len).contiguous()
+    if attention_mask is not None and attention_mask.ndim == 2:
+        pad = (1.0 - attention_mask.to(dtype=dtype, device=device)).unsqueeze(1).unsqueeze(2) * min_val
+        additive = additive + pad
+    return additive
+
+
+def _ensure_additive_mask(
+    mask: torch.Tensor | None,
+    *,
+    batch_size: int,
+    seq_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    attention_mask: torch.Tensor | None,
+    sliding_window: int | None,
+) -> torch.Tensor:
+    if mask is None or not isinstance(mask, torch.Tensor):
+        return _fallback_additive_mask(batch_size, seq_len, dtype, device, attention_mask, sliding_window)
+    return _convert_bool_4d_mask_to_additive(mask, dtype)
+
+
+def _derive_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    if attention_mask.ndim == 2:
+        return attention_mask == 0
+    if attention_mask.ndim == 4:
+        diagonal = torch.diagonal(attention_mask[:, 0], dim1=-2, dim2=-1)
+        return diagonal.logical_not() if attention_mask.dtype == torch.bool else diagonal != 0
+    return attention_mask.bool().logical_not()
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """Applies rotary position embedding to query and key tensors."""
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: Optional[torch.Tensor] = None,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -76,18 +133,17 @@ def eager_attention_forward(
     scaling: float,
     dropout: float = 0.0,
     sinks: Optional[torch.Tensor] = None,
-    **kwargs,
-):
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
+        attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
 
     if sinks is not None:
-        sinks = module.attention_sink_bias.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
-        attn_weights = torch.cat([attn_weights, sinks], dim=-1)
+        sink_bias = module.attention_sink_bias.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+        attn_weights = torch.cat([attn_weights, sink_bias.to(attn_weights.dtype)], dim=-1)
 
     attn_weights = attn_weights - attn_weights.max(dim=-1, keepdim=True).values
     probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
@@ -95,41 +151,27 @@ def eager_attention_forward(
     if sinks is not None:
         probs = probs[..., :-1]
 
-    attn_weights = nn.functional.dropout(probs, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output, attn_weights
-
-
-@use_kernel_forward_from_hub("RMSNorm")
-class MiMoV2RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+    probs = F.dropout(probs, p=dropout, training=module.training)
+    attn_output = torch.matmul(probs, value_states)
+    return attn_output.transpose(1, 2).contiguous(), probs
 
 
 class MiMoV2Attention(nn.Module):
-    """MiMoV2 attention.
+    """MiMoV2 hybrid attention (full or sliding-window)."""
 
-    `projection_layout` only controls how checkpoint weights are named and
-    stored: Flash uses separate q/k/v projections, while Pro uses fused qkv.
-    The attention computation after projection is shared.
-    """
-
-    def __init__(self, config, is_swa: bool, layer_idx: int, projection_layout: str = "split"):
+    def __init__(
+        self,
+        config: MiMoV2Config,
+        is_swa: bool,
+        layer_idx: int,
+        projection_layout: str,
+        backend: BackendConfig,
+        dtype: torch.dtype,
+    ):
         super().__init__()
         if projection_layout not in {"split", "fused_qkv"}:
             raise ValueError(f"Unsupported MiMoV2 attention projection layout: {projection_layout}")
 
-        self.config = config
         self.layer_idx = layer_idx
         self.is_swa = is_swa
         self.is_causal = True
@@ -155,15 +197,18 @@ class MiMoV2Attention(nn.Module):
                 f"MiMoV2 rotary dimension must be even, got {self.rope_dim} from "
                 f"head_dim={self.head_dim} and partial_rotary_factor={getattr(config, 'partial_rotary_factor', 1.0)}"
             )
+
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.attention_dropout = getattr(config, "attention_dropout", 0.0)
         self.scaling = self.head_dim**-0.5
         self.sliding_window = getattr(config, "sliding_window", None) if is_swa else None
+
         self.q_size = self.num_attention_heads * self.head_dim
         self.k_size = self.num_key_value_heads * self.head_dim
         self.v_size = self.num_key_value_heads * self.v_head_dim
         self.o_hidden_size = self.num_attention_heads * self.v_head_dim
         self.v_scale = getattr(config, "attention_value_scale", None)
+
         self.attention_sink_bias = (
             nn.Parameter(torch.empty(self.num_attention_heads), requires_grad=False)
             if (
@@ -175,16 +220,26 @@ class MiMoV2Attention(nn.Module):
 
         attention_bias = getattr(config, "attention_bias", False)
         if self.projection_layout == "fused_qkv":
-            self.qkv_proj = nn.Linear(
+            self.qkv_proj = initialize_linear_module(
+                backend.linear,
                 config.hidden_size,
                 self.q_size + self.k_size + self.v_size,
                 bias=attention_bias,
+                dtype=dtype,
             )
         else:
-            self.q_proj = nn.Linear(config.hidden_size, self.q_size, bias=attention_bias)
-            self.k_proj = nn.Linear(config.hidden_size, self.k_size, bias=attention_bias)
-            self.v_proj = nn.Linear(config.hidden_size, self.v_size, bias=attention_bias)
-        self.o_proj = nn.Linear(self.o_hidden_size, config.hidden_size, bias=False)
+            self.q_proj = initialize_linear_module(
+                backend.linear, config.hidden_size, self.q_size, bias=attention_bias, dtype=dtype
+            )
+            self.k_proj = initialize_linear_module(
+                backend.linear, config.hidden_size, self.k_size, bias=attention_bias, dtype=dtype
+            )
+            self.v_proj = initialize_linear_module(
+                backend.linear, config.hidden_size, self.v_size, bias=attention_bias, dtype=dtype
+            )
+        self.o_proj = initialize_linear_module(
+            backend.linear, self.o_hidden_size, config.hidden_size, bias=False, dtype=dtype
+        )
 
     def _forward_attention(
         self,
@@ -194,10 +249,7 @@ class MiMoV2Attention(nn.Module):
         input_shape: torch.Size,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         if self.v_scale is not None:
             value_states = value_states * self.v_scale
 
@@ -208,67 +260,32 @@ class MiMoV2Attention(nn.Module):
         query_states = torch.cat([query_rope, query_nope], dim=-1)
         key_states = torch.cat([key_rope, key_nope], dim=-1)
 
-        if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        attn_implementation = self.config._attn_implementation
-        if attn_implementation is not None and attn_implementation.startswith("paged|"):
-            raise ValueError(
-                "MiMoV2 remote code does not support paged attention cache. "
-                "Please use eager, sdpa, flex_attention, or flash_attention_2."
-            )
-
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            attn_implementation, eager_attention_forward
-        )
-        if self.attention_sink_bias is not None and attn_implementation == "sdpa":
-            logger.warning_once(
-                "MiMoV2 attention sink bias is not supported by SDPA; falling back to eager attention for correctness."
-            )
-            attention_interface = eager_attention_forward
-
-        attention_kwargs = {
-            "dropout": 0.0 if not self.training else self.attention_dropout,
-            "scaling": self.scaling,
-            "position_ids": position_ids,
-            "is_causal": self.is_causal,
-        }
-        if attention_interface is eager_attention_forward:
-            attention_kwargs["sinks"] = self.attention_sink_bias
-        else:
-            if self.attention_sink_bias is not None:
-                attention_kwargs["s_aux"] = self.attention_sink_bias
-            if self.sliding_window is not None:
-                attention_kwargs["sliding_window"] = self.sliding_window
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, _ = eager_attention_forward(
             self,
             query_states,
             key_states,
             value_states,
             attention_mask,
-            **attention_kwargs,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            sinks=self.attention_sink_bias,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return self.o_proj(attn_output)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del kwargs
         input_shape = hidden_states.shape[:-1]
 
         if self.projection_layout == "fused_qkv":
-            qkv_states = self.qkv_proj(hidden_states)
-            query_states, key_states, value_states = qkv_states.split([self.q_size, self.k_size, self.v_size], dim=-1)
+            qkv = self.qkv_proj(hidden_states)
+            query_states, key_states, value_states = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
         else:
             query_states = self.q_proj(hidden_states)
             key_states = self.k_proj(hidden_states)
@@ -278,87 +295,20 @@ class MiMoV2Attention(nn.Module):
         key_states = key_states.view(*input_shape, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(*input_shape, self.num_key_value_heads, self.v_head_dim).transpose(1, 2)
         return self._forward_attention(
-            query_states,
-            key_states,
-            value_states,
-            input_shape,
-            position_embeddings,
-            attention_mask,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
-            position_ids=position_ids,
+            query_states, key_states, value_states, input_shape, position_embeddings, attention_mask
         )
-
-
-class MiMoV2DecoderLayer(nn.Module):
-    def __init__(
-        self,
-        config: MiMoV2Config,
-        layer_idx: int,
-        moe_config: MoEConfig,
-        backend: BackendConfig,
-    ):
-        super().__init__()
-        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
-        is_swa_layer = config.hybrid_layer_pattern[layer_idx] == 1
-        self.attention_type = "sliding_window_attention" if is_swa_layer else "full_attention"
-        self.self_attn = MiMoV2Attention(
-            config, is_swa_layer, layer_idx, projection_layout=config.attention_projection_layout
-        )
-        is_moe_layer = getattr(config, "n_routed_experts", None) is not None and config.moe_layer_freq[layer_idx]
-        self.mlp = (
-            MoE(moe_config, backend)
-            if is_moe_layer
-            else MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
-        )
-        self.input_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.layernorm_epsilon, dtype=dtype
-        )
-        self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.layernorm_epsilon, dtype=dtype
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
 
 
 class MiMoV2RotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor
 
-    def __init__(self, config, is_swa: bool, device=None):
+    def __init__(self, config: MiMoV2Config, is_swa: bool, device: Optional[torch.device] = None):
         super().__init__()
-        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
-        else:
-            self.rope_type = "default"
+        self.rope_type = (
+            config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
+            if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict)
+            else "default"
+        )
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
@@ -369,18 +319,21 @@ class MiMoV2RotaryEmbedding(nn.Module):
             self.config.head_dim = getattr(config, "swa_head_dim", getattr(config, "head_dim", None))
             if self.config.rope_parameters:
                 self.config.rope_parameters["rope_theta"] = self.config.rope_theta
-        self.rope_init_fn = (
-            self.compute_default_rope_parameters
-            if self.rope_type == "default"
-            else ROPE_INIT_FUNCTIONS[self.rope_type]
-        )
 
+        self.rope_init_fn = (
+            self.compute_default_rope_parameters if self.rope_type == "default" else ROPE_INIT_FUNCTIONS[self.rope_type]
+        )
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
     @staticmethod
-    def compute_default_rope_parameters(config, device=None, seq_len=None, layer_type=None):
+    def compute_default_rope_parameters(
+        config: MiMoV2Config,
+        device: Optional[torch.device] = None,
+        seq_len: Optional[int] = None,
+        layer_type: Optional[str] = None,
+    ) -> tuple[torch.Tensor, float]:
         config.standardize_rope_params()
         rope_parameters = config.rope_parameters[layer_type] if layer_type is not None else config.rope_parameters
         base = rope_parameters["rope_theta"]
@@ -399,212 +352,389 @@ class MiMoV2RotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     @dynamic_rope_update
-    def forward(self, x, position_ids):
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
-
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
-
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-class MiMoV2Model(PreTrainedModel):
-    config_class = MiMoV2Config
-    attention_projection_layout = "split"
+class MiMoV2DecoderLayer(nn.Module):
+    def __init__(
+        self,
+        config: MiMoV2Config,
+        layer_idx: int,
+        moe_config: MoEConfig,
+        backend: BackendConfig,
+    ):
+        super().__init__()
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
+        is_swa_layer = config.hybrid_layer_pattern[layer_idx] == 1
+        self.attention_type = "sliding_attention" if is_swa_layer else "full_attention"
+        self.self_attn = MiMoV2Attention(
+            config,
+            is_swa=is_swa_layer,
+            layer_idx=layer_idx,
+            projection_layout=config.attention_projection_layout,
+            backend=backend,
+            dtype=dtype,
+        )
+        is_moe_layer = getattr(config, "n_routed_experts", None) is not None and config.moe_layer_freq[layer_idx]
+        self.mlp = (
+            MoE(moe_config, backend)
+            if is_moe_layer
+            else MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
+        )
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.layernorm_epsilon, dtype=dtype
+        )
+        self.post_attention_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.layernorm_epsilon, dtype=dtype
+        )
 
-    def __init__(self, config):
-        super().__init__(config)
-        self.attention_projection_layout = getattr(
-            config, "attention_projection_layout", self.attention_projection_layout
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
         )
-        self.vocab_size = config.vocab_size
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(
-            [
-                MiMoV2DecoderLayer(
-                    config,
-                    layer_idx,
-                    attention_projection_layout=self.attention_projection_layout,
-                )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+class MiMoV2Model(nn.Module):
+    def __init__(self, config: MiMoV2Config, moe_config: MoEConfig, backend: BackendConfig):
+        super().__init__()
+        self.config = config
+        self.backend = backend
+
+        if backend.gate_precision is None:
+            backend.gate_precision = torch.float32
+
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
+        self.layers = nn.ModuleDict(
+            {str(i): MiMoV2DecoderLayer(config, i, moe_config, backend) for i in range(config.num_hidden_layers)}
         )
-        self.norm = MiMoV2RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.layernorm_epsilon, dtype=dtype
+        )
         self.rotary_emb = MiMoV2RotaryEmbedding(config=config, is_swa=False)
         self.swa_rotary_emb = MiMoV2RotaryEmbedding(config=config, is_swa=True)
-        self.has_sliding_layers = any(pattern == 1 for pattern in config.hybrid_layer_pattern)
-        self.config.layer_types = [
-            "sliding_attention" if config.hybrid_layer_pattern[i] == 1 else "full_attention"
-            for i in range(config.num_hidden_layers)
-        ]
-        self.post_init()
+        self.has_sliding_layers = any(p == 1 for p in config.hybrid_layer_pattern)
 
-    def get_input_embeddings(self):
-        return self.embed_tokens
+    def _build_causal_mask_mapping(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | dict[str, torch.Tensor] | None,
+        position_ids: torch.Tensor,
+        cache_position: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        batch_size, seq_len = inputs_embeds.shape[:2]
+        dtype = inputs_embeds.dtype
+        device = inputs_embeds.device
 
-    def set_input_embeddings(self, value):
-        self.embed_tokens = value
+        if isinstance(attention_mask, dict):
+            return {
+                "full_attention": _ensure_additive_mask(
+                    attention_mask.get("full_attention"),
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    dtype=dtype,
+                    device=device,
+                    attention_mask=None,
+                    sliding_window=None,
+                ),
+                "sliding_attention": _ensure_additive_mask(
+                    attention_mask.get("sliding_attention", attention_mask.get("sliding_window_attention")),
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    dtype=dtype,
+                    device=device,
+                    attention_mask=None,
+                    sliding_window=self.config.sliding_window,
+                ),
+            }
+
+        mask_kwargs = dict(
+            config=self.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=None,
+            position_ids=position_ids,
+        )
+        pad_mask = attention_mask if isinstance(attention_mask, torch.Tensor) else None
+        return {
+            "full_attention": _ensure_additive_mask(
+                create_causal_mask(**mask_kwargs),
+                batch_size=batch_size,
+                seq_len=seq_len,
+                dtype=dtype,
+                device=device,
+                attention_mask=pad_mask,
+                sliding_window=None,
+            ),
+            "sliding_attention": _ensure_additive_mask(
+                create_sliding_window_causal_mask(**mask_kwargs) if self.has_sliding_layers else None,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                dtype=dtype,
+                device=device,
+                attention_mask=pad_mask,
+                sliding_window=self.config.sliding_window,
+            ),
+        }
 
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        *,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPast:
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del kwargs
         if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("input_ids or inputs_embeds must be provided")
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
-
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
-
+            cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-            }
-            if self.has_sliding_layers:
-                if getattr(self.config, "sliding_window", None) is None:
-                    raise ValueError("MiMoV2 config `sliding_window` must be set when hybrid_layer_pattern uses SWA.")
-                causal_mask_mapping["sliding_window_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        if padding_mask is None and isinstance(attention_mask, torch.Tensor):
+            padding_mask = _derive_padding_mask(attention_mask)
+
+        causal_mask_mapping = self._build_causal_mask_mapping(
+            inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            cache_position=cache_position,
+        )
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         swa_position_embeddings = self.swa_rotary_emb(hidden_states, position_ids)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
+        for layer in self.layers.values():
+            layer_position_embeddings = (
+                swa_position_embeddings if layer.attention_type == "sliding_attention" else position_embeddings
+            )
+            hidden_states = layer(
                 hidden_states,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                position_embeddings=position_embeddings
-                if decoder_layer.attention_type == "full_attention"
-                else swa_position_embeddings,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                **kwargs,
+                attention_mask=causal_mask_mapping[layer.attention_type],
+                position_embeddings=layer_position_embeddings,
+                padding_mask=padding_mask,
             )
 
-        hidden_states = self.norm(hidden_states)
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=past_key_values if use_cache else None,
+        return self.norm(hidden_states)
+
+    @torch.no_grad()
+    def init_weights(self, buffer_device: Optional[torch.device] = None) -> None:
+        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        with buffer_device:
+            nn.init.normal_(self.embed_tokens.weight)
+            self.norm.reset_parameters()
+        for layer in self.layers.values():
+            layer.init_weights(buffer_device)
+
+
+class MiMoV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    """NeMo AutoModel causal LM wrapper for MiMo-V2.5-Pro."""
+
+    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "attention_sink_bias"]
+    _pp_keep_self_forward = True
+    _skip_init_weights_on_load = True
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = True
+
+    @classmethod
+    def from_config(
+        cls,
+        config: MiMoV2Config,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        **kwargs,
+    ) -> MiMoV2ForCausalLM:
+        return cls(config, moe_config, backend, **kwargs)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args,
+        **kwargs,
+    ) -> MiMoV2ForCausalLM:
+        config = MiMoV2Config.from_pretrained(pretrained_model_name_or_path)
+        return cls.from_config(config, *model_args, **kwargs)
+
+    def __init__(
+        self,
+        config: MiMoV2Config,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.config = config
+        self.backend = backend or BackendConfig()
+        moe_overrides = kwargs.pop("moe_overrides", None)
+
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
+        moe_defaults = dict(
+            dim=config.hidden_size,
+            inter_dim=config.intermediate_size,
+            moe_inter_dim=config.moe_intermediate_size,
+            n_routed_experts=int(config.n_routed_experts or 0),
+            n_shared_experts=int(config.n_shared_experts or 0),
+            n_activated_experts=config.num_experts_per_tok,
+            n_expert_groups=config.n_group,
+            n_limited_groups=config.topk_group,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            score_func="sigmoid_with_bias" if config.scoring_func == "sigmoid" else config.scoring_func,
+            route_scale=config.routed_scaling_factor if config.routed_scaling_factor is not None else 1.0,
+            aux_loss_coeff=0.0,
+            norm_topk_prob=config.norm_topk_prob,
+            router_bias=False,
+            expert_bias=False,
+            expert_activation="swiglu",
+            softmax_before_topk=False,
+            force_e_score_correction_bias=True,
+            dtype=dtype,
+        )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        resolved_moe_config = moe_config or MoEConfig(**moe_defaults)
+
+        self.model = MiMoV2Model(config, resolved_moe_config, self.backend)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear,
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            dtype=dtype,
         )
 
+        if self.backend.enable_hf_state_dict_adapter:
+            from nemo_automodel.components.models.mimo_v25.state_dict_adapter import MiMoV2StateDictAdapter
 
-class MiMoV2ForCausalLM(PreTrainedModel, GenerationMixin):
-    config_class = MiMoV2Config
-    model_class = MiMoV2Model
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-    _tp_plan = {"lm_head": "colwise_rep"}
-    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
-    _keys_to_ignore_on_load_unexpected = [
-        r"model\.(swa_)?rotary_emb\.inv_freq",
-        r"model\.layers\.\d+\.self_attn\.rotary_emb\.inv_freq",
-        r"model\.layers\.\d+\.self_attn\.rotary_emb\.(cos_cached|sin_cached)",
-        r"model\.mtp\..*",
-    ]
+            self.state_dict_adapter = MiMoV2StateDictAdapter(
+                self.config,
+                self.model.moe_config if hasattr(self.model, "moe_config") else resolved_moe_config,
+                self.backend,
+                dtype=dtype,
+            )
 
-    def __init__(self, config):
-        super().__init__(config)
-        self.model = self.model_class(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.post_init()
-
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    def set_input_embeddings(self, value):
+    def set_input_embeddings(self, value: nn.Embedding) -> None:
         self.model.embed_tokens = value
 
-    def get_output_embeddings(self):
+    def get_output_embeddings(self) -> nn.Linear:
         return self.lm_head
 
-    def set_output_embeddings(self, new_embeddings):
+    def set_output_embeddings(self, new_embeddings: nn.Linear) -> None:
         self.lm_head = new_embeddings
 
-    @can_return_tuple
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        *,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[TransformersKwargs],
+        output_hidden_states: Optional[bool] = None,
+        **kwargs: Any,
     ) -> CausalLMOutputWithPast:
-        outputs: BaseModelOutputWithPast = self.model(
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+        hidden = self.model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            cache_position=cache_position,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
             **kwargs,
         )
+        return compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
-        hidden_states = outputs.last_hidden_state
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+    def customize_pipeline_stage_modules(
+        self,
+        module_names_per_stage: list[list[str]],
+        *,
+        layers_prefix: str,
+        text_model: Optional[nn.Module] = None,
+    ) -> list[list[str]]:
+        """Keep the SWA rotary embedding on every PP stage."""
+        text_model = text_model or self.model
+        stage_modules = [list(modules) for modules in module_names_per_stage]
+        if getattr(text_model, "swa_rotary_emb", None) is not None:
+            fqn = f"{layers_prefix}swa_rotary_emb"
+            for modules in stage_modules:
+                if fqn not in modules:
+                    modules.append(fqn)
+        return stage_modules
 
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+    @torch.no_grad()
+    def initialize_weights(
+        self,
+        buffer_device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        with buffer_device:
+            self.model.init_weights(buffer_device)
+            final_out_std = self.config.hidden_size**-0.5
+            cutoff_factor = 3
+            nn.init.trunc_normal_(
+                self.lm_head.weight,
+                mean=0.0,
+                std=final_out_std,
+                a=-cutoff_factor * final_out_std,
+                b=cutoff_factor * final_out_std,
+            )
+        if _has_dtensor_params(self):
+            return
+        cast_model_to_dtype(self, dtype)
 
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
 
-
-__all__ = [
-    "MiMoV2Attention",
-    "MiMoV2DecoderLayer",
-    "MiMoV2ForCausalLM",
-    "MiMoV2MLP",
-    "MiMoV2MoE",
-    "MiMoV2MoEGate",
-    "MiMoV2Model",
-    "MiMoV2RMSNorm",
-    "MiMoV2RotaryEmbedding",
-]
+ModelClass = MiMoV2ForCausalLM
