@@ -77,7 +77,9 @@ AUTO_DISCOVER_SCOPES = {
 def _discover_via_glob(automodel_dir: str, examples_subpath: str) -> list[Path]:
     """Discover every recipe YAML under examples/<examples_subpath>/."""
     automodel_path = Path(automodel_dir)
-    return sorted(p.relative_to(automodel_path) for p in (automodel_path / "examples" / examples_subpath).rglob("*.yaml"))
+    return sorted(
+        p.relative_to(automodel_path) for p in (automodel_path / "examples" / examples_subpath).rglob("*.yaml")
+    )
 
 
 def _discover_via_recipe_list(automodel_dir: str, scope: str, test_folder: str) -> list[Path]:
@@ -229,7 +231,8 @@ def generate_job(
     base_allow_failure = recipe_allow_failure or config.stem in (config_override.get("known_issue") or [])
 
     base_job = _build_job(
-        config, scope,
+        config,
+        scope,
         extends=".llm_benchmark_test" if "benchmark" in config.stem else f".{test_folder}_test",
         stage=_compute_base_stage(test_folder, config, has_robustness),
         allow_failure=base_allow_failure,
@@ -241,33 +244,39 @@ def generate_job(
     # vLLM deploy variant. `ci.vllm_deploy_known_issue_id` suppresses just this
     # variant (base job still runs) -- use for bugs that only manifest in vllm deploy.
     if ci_config.get("vllm_deploy") and not ci_config.get("vllm_deploy_known_issue_id"):
-        variants.append((
-            "_vllm_deploy",
-            _build_job(
-                config, scope,
-                extends=".vllm_deploy_test",
-                stage="peft_vllm_deploy" if "peft" in config.stem else "sft_vllm_deploy",
-                allow_failure=recipe_allow_failure,
-                known_issue_id=known_issue_id,
-            ),
-        ))
+        variants.append(
+            (
+                "_vllm_deploy",
+                _build_job(
+                    config,
+                    scope,
+                    extends=".vllm_deploy_test",
+                    stage="peft_vllm_deploy" if "peft" in config.stem else "sft_vllm_deploy",
+                    allow_failure=recipe_allow_failure,
+                    known_issue_id=known_issue_id,
+                ),
+            )
+        )
 
     # Retrieval eval variants. Bi-encoders opt into embed_eval, cross-encoders
     # into rerank_eval. Both extend the same per-folder eval template.
     for ci_key, suffix in (("embed_eval", "_embed_eval"), ("rerank_eval", "_rerank_eval")):
         if not ci_config.get(ci_key):
             continue
-        variants.append((
-            suffix,
-            _build_job(
-                config, scope,
-                extends=f".{test_folder}_eval_test",
-                stage="retrieval_eval",
-                extra_vars={"FINETUNE_TEST_NAME": f"{config.stem}"},
-                allow_failure=recipe_allow_failure,
-                known_issue_id=known_issue_id,
-            ),
-        ))
+        variants.append(
+            (
+                suffix,
+                _build_job(
+                    config,
+                    scope,
+                    extends=f".{test_folder}_eval_test",
+                    stage="retrieval_eval",
+                    extra_vars={"FINETUNE_TEST_NAME": f"{config.stem}"},
+                    allow_failure=recipe_allow_failure,
+                    known_issue_id=known_issue_id,
+                ),
+            )
+        )
 
     return variants
 
@@ -322,9 +331,7 @@ def _normalize_scope(value: str) -> str:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--automodel-dir", type=str, required=True, help="Path to Automodel directory")
-    parser.add_argument(
-        "--scope", type=_normalize_scope, required=True, help="Scope of the tests (nightly, release)"
-    )
+    parser.add_argument("--scope", type=_normalize_scope, required=True, help="Scope of the tests (nightly, release)")
     parser.add_argument("--test-folder", type=str, required=True, help="Target folder to search")
     args = parser.parse_args()
 

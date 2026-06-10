@@ -50,7 +50,6 @@ class DDPManager:
 
         # Extract config fields for easy access
         self.activation_checkpointing = config.activation_checkpointing
-        self.backend = config.backend
         self.find_unused_parameters = config.find_unused_parameters
 
         # Setup distributed environment
@@ -60,7 +59,7 @@ class DDPManager:
         """
         Initialize device configuration for DDP.
 
-        Sets the rank, world_size, and device based on the backend.
+        Sets the rank, world_size, and device based on the process group backend.
         """
         if not dist.is_available():
             raise RuntimeError("torch.distributed not available")
@@ -71,8 +70,8 @@ class DDPManager:
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
 
-        # Pin GPU if using NCCL
-        if self.backend == "nccl":
+        backend = str(dist.get_backend()).lower()
+        if "nccl" in backend and torch.cuda.is_available():
             local_gpu = self.rank % torch.cuda.device_count()
             torch.cuda.set_device(local_gpu)
             self.device = torch.device("cuda", index=local_gpu)
@@ -94,7 +93,9 @@ class DDPManager:
         """
         if dist.get_world_size() == 1:
             logger.info("World size is 1, skipping parallelization.")
-            model = model.to("cuda").to(torch.bfloat16)
+            model = model.to(self.device)
+            if self.device.type == "cuda":
+                model = model.to(torch.bfloat16)
             if self.activation_checkpointing:
                 if hasattr(model, "gradient_checkpointing_enable"):
                     model.gradient_checkpointing_enable()

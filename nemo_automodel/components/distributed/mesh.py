@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Typed MeshContext dataclass, validation, and strategy map.
+"""MeshContext dataclass, construction, and validation.
 
-``MeshContext`` is the single source of truth for everything related to
-distributed training: strategy config, device meshes, and axis names.
+``MeshContext`` is the single source of truth for distributed topology:
+device meshes, parallelism sizes, and axis names.
 
 Parallelism sizes (``tp_size``, ``pp_size``, etc.) are derived at runtime
 from the attached ``DeviceMesh`` objects via ``@property``.  When no mesh
@@ -24,37 +24,22 @@ dp / hsdp).
 
 All inputs and outputs are typed Python objects (dataclasses, enums, etc.).
 YAML / dict parsing belongs in the recipe layer — see
-``nemo_automodel.recipes._dist_setup``.
+``nemo_automodel.recipes._dist_utils``.
 """
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
-from nemo_automodel.components.distributed.config import (
-    ActivationCheckpointingMode,
-    DDPConfig,
-    FSDP2Config,
-    MegatronFSDPConfig,
-)
+from nemo_automodel.components.distributed.config import DistributedStrategyConfig
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
-    from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
-    from nemo_automodel.components.moe.config import MoEParallelizerConfig
-
-
-#: Maps strategy name (from YAML) → strategy dataclass.
-STRATEGY_MAP: Dict[str, type] = {
-    "fsdp2": FSDP2Config,
-    "megatron_fsdp": MegatronFSDPConfig,
-    "ddp": DDPConfig,
-}
-
 
 class MeshAxisName(str, Enum):
-    """Canonical mesh-dimension names used by ``DeviceMesh`` and helpers.
+    """Canonical mesh axis names used by ``DeviceMesh`` and helpers.
 
     Inherits from ``str`` so each member compares equal to (and can be
     used wherever) a plain string — e.g. ``MeshAxisName.TP == "tp"``.
@@ -72,57 +57,61 @@ class MeshAxisName(str, Enum):
     EP_SHARD = "ep_shard"
 
 
-#: All values accepted as ``DeviceMesh`` dimension names.
+#: All values accepted as ``DeviceMesh`` axis names.
 _VALID_AXIS_NAMES: frozenset = frozenset(MeshAxisName)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ParallelismSizes:
+    """Build-time requested parallelism sizes.
+
+    This is durable user intent, not runtime topology. ``MeshContext`` derives
+    its size properties from live ``DeviceMesh`` objects after build.
+    """
+
+    dp_size: int | None = None
+    dp_replicate_size: int | None = None
+    tp_size: int = 1
+    pp_size: int = 1
+    cp_size: int = 1
+    ep_size: int = 1
 
 
 @dataclass
 class MeshContext:
-    """Runtime distributed training context: configs + device meshes.
+    """Runtime distributed topology context.
 
     Parallelism sizes (``tp_size``, ``pp_size``, etc.) are **not** stored as
     fields; they are ``@property`` accessors that read directly from the
     attached ``DeviceMesh`` / ``moe_mesh``.  When no mesh is present the
     properties return safe defaults (``1`` for sizes, ``None`` for dp / hsdp).
 
-    All ``DeviceMesh`` objects passed in must use dimension names from
+    All ``DeviceMesh`` objects passed in must use axis names from
     :class:`MeshAxisName`; a ``ValueError`` is raised on construction if
     any unknown name is encountered.
 
     Lifecycle
     ---------
     1. Recipes parse YAML to obtain sizes and strategy configs.
-    2. Sizes are passed to ``create_device_mesh`` to build ``DeviceMesh``
+    2. Sizes are passed to :meth:`build` to build ``DeviceMesh``
        objects.
-    3. ``MeshContext`` is created with those meshes; dimension names are
+    3. ``MeshContext`` is created with those meshes; axis names are
        validated automatically in ``__post_init__``.
 
     Alternatively, :meth:`from_meshes` constructs an instance directly from
     ``DeviceMesh`` objects (used by ``NeMoAutoModel.from_pretrained``).
 
     Attributes:
-        strategy_config: Strategy-specific config (FSDP2, MegatronFSDP, or DDP).
         device_mesh: Device mesh for distributed training.
         moe_mesh: MoE-specific device mesh.
-        pipeline_config: Pipeline-parallel schedule/splitting config.
-        moe_config: MoE parallelizer settings.
-        activation_checkpointing: Activation checkpointing mode. ``True`` means full checkpointing;
-            ``"selective"`` means PyTorch selective activation checkpointing.
     """
-
-    # config fields
-    strategy_config: Optional[Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]] = None
-    pipeline_config: Optional["PipelineConfig"] = None
-    moe_config: Optional["MoEParallelizerConfig"] = None
-    activation_checkpointing: ActivationCheckpointingMode = False
 
     # runtime mesh references
     device_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
     moe_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        _validate_mesh_dim_names(self)
-        _validate_distributed_setup(self)
+        _validate_mesh_axis_names(self)
 
     # Parallelism sizes — derived from the attached meshes
     @property
@@ -194,17 +183,44 @@ class MeshContext:
             else None,
         }
 
+    @classmethod
+    def build(
+        cls,
+        strategy_config: DistributedStrategyConfig,
+        parallelism_sizes: ParallelismSizes | None = None,
+        *,
+        world_size: int | None = None,
+    ) -> "MeshContext":
+        """Build a topology-only :class:`MeshContext` from parallelism sizes.
+
+        Args:
+            strategy_config: Already-instantiated distributed strategy config.
+            parallelism_sizes: Requested data, tensor, pipeline, context, and expert
+                parallelism sizes. If ``None``, defaults to no parallelism with
+                DP inferred from ``world_size``.
+            world_size: Total process count. If ``None``, inferred from the
+                distributed environment.
+        """
+        if world_size is None:
+            world_size = get_world_size_safe()
+        if parallelism_sizes is None:
+            parallelism_sizes = ParallelismSizes()
+
+        from nemo_automodel.components.distributed.mesh_utils import _create_device_meshes
+
+        device_mesh, moe_mesh = _create_device_meshes(
+            strategy_config,
+            parallelism_sizes,
+            world_size=world_size,
+        )
+        return cls.from_meshes(device_mesh, moe_mesh)
+
     # Convenience constructor
     @classmethod
     def from_meshes(
         cls,
         device_mesh: Optional["DeviceMesh"],
         moe_mesh: Optional["DeviceMesh"] = None,
-        *,
-        strategy_config: Optional[Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]] = None,
-        pipeline_config: Optional["PipelineConfig"] = None,
-        moe_config: Optional["MoEParallelizerConfig"] = None,
-        activation_checkpointing: ActivationCheckpointingMode = False,
     ) -> "MeshContext":
         """Build a :class:`MeshContext` from ``DeviceMesh`` objects.
 
@@ -213,10 +229,6 @@ class MeshContext:
         YAML config.
         """
         return cls(
-            strategy_config=strategy_config,
-            pipeline_config=pipeline_config,
-            moe_config=moe_config,
-            activation_checkpointing=activation_checkpointing,
             device_mesh=device_mesh,
             moe_mesh=moe_mesh,
         )
@@ -227,7 +239,7 @@ def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName, default=1) 
     """Return the size of *axis* if present in *mesh*, else *default*."""
     if mesh is None:
         return default
-    # Check mesh dims and _flatten() results on root mesh
+    # Check mesh axes and _flatten() results on root mesh.
     if axis in mesh.mesh_dim_names:
         return mesh[axis].size()
     if hasattr(mesh, "_get_root_mesh"):
@@ -247,8 +259,8 @@ def _optional_axis(mesh: Optional["DeviceMesh"], axis: MeshAxisName) -> Optional
 
 
 # Validation utils
-def _validate_mesh_dim_names(mesh_context: "MeshContext") -> None:
-    """Ensure every dimension name in the attached meshes is a :class:`MeshAxisName`."""
+def _validate_mesh_axis_names(mesh_context: "MeshContext") -> None:
+    """Ensure every axis name in the attached meshes is a :class:`MeshAxisName`."""
     for label in ("device_mesh", "moe_mesh"):
         mesh = getattr(mesh_context, label)
         if mesh is None:
@@ -256,45 +268,12 @@ def _validate_mesh_dim_names(mesh_context: "MeshContext") -> None:
         bad = {n for n in mesh.mesh_dim_names if n not in _VALID_AXIS_NAMES}
         if bad:
             raise ValueError(
-                f"{label} contains unknown dimension names {bad}; allowed names are {sorted(_VALID_AXIS_NAMES)}"
+                f"{label} contains unknown axis names {bad}; allowed names are {sorted(_VALID_AXIS_NAMES)}"
             )
 
 
-def _validate_distributed_setup(mesh_context: "MeshContext") -> None:
-    """Validate cross-field constraints on a :class:`MeshContext`.
-
-    Called automatically by ``MeshContext.__post_init__`` when a
-    ``strategy_config`` is present.  Can also be invoked explicitly
-    after mutating a context.
-
-    Raises:
-        ValueError: If any constraint is violated.
-    """
-    if mesh_context.strategy_config is None:
-        return
-
-    if isinstance(mesh_context.strategy_config, MegatronFSDPConfig):
-        if mesh_context.pp_size > 1:
-            raise ValueError("megatron_fsdp does not support pipeline parallelism")
-        if mesh_context.ep_size > 1:
-            raise ValueError("megatron_fsdp does not support expert parallelism")
-        if mesh_context.strategy_config.sequence_parallel:
-            raise ValueError("megatron_fsdp does not yet support sequence_parallel")
-
-    if isinstance(mesh_context.strategy_config, DDPConfig):
-        if mesh_context.tp_size > 1:
-            raise ValueError("ddp does not support tensor parallelism")
-        if mesh_context.pp_size > 1:
-            raise ValueError("ddp does not support pipeline parallelism")
-        if mesh_context.cp_size > 1:
-            raise ValueError("ddp does not support context parallelism")
-        if mesh_context.ep_size > 1:
-            raise ValueError("ddp does not support expert parallelism")
-        if mesh_context.dp_replicate_size is not None and mesh_context.dp_replicate_size > 1:
-            raise ValueError("ddp does not support HSDP (dp_replicate_size)")
-
-    if mesh_context.pipeline_config is not None and mesh_context.pp_size <= 1:
-        raise ValueError("pipeline config requires pp_size > 1")
-
-    if mesh_context.moe_config is not None and mesh_context.ep_size <= 1:
-        raise ValueError("moe config requires ep_size > 1")
+__all__ = [
+    "MeshAxisName",
+    "MeshContext",
+    "ParallelismSizes",
+]

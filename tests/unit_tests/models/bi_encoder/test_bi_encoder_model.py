@@ -103,7 +103,7 @@ def test_from_pretrained_happy_path(monkeypatch):
     # Patches applied
     assert "liger" in model.marker and "sdpa" in model.marker
     # Ensure HF kwargs injected + passthrough of parameters to build
-    assert last_kwargs["attn_implementation"] == "flash_attention_2"
+    assert last_kwargs["attn_implementation"] == am.DEFAULT_ATTN_IMPLEMENTATION
     assert last_kwargs["do_distributed_inbatch_negative"] is True
     assert last_kwargs["detach_distributed_inbatch_negatives"] is False
     assert last_kwargs["some_other_kwarg"] == "x"

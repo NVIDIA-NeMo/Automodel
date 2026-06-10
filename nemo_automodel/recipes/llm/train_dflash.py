@@ -108,11 +108,16 @@ class TrainDFlashRecipe(BaseRecipe):
         )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
+        target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
+        target_kwargs = {}
+        if target_attn_implementation is not None:
+            target_kwargs["attn_implementation"] = target_attn_implementation
         self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
             target_path,
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
             force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            **target_kwargs,
         )
         self.target_model.to(self.device)
         self.target_model.requires_grad_(False)
@@ -324,6 +329,7 @@ class TrainDFlashRecipe(BaseRecipe):
         train_loss: float | None = None,
         val_loss: dict[str, float] | None = None,
         best_metric_key: str = "default",
+        is_final_checkpoint: bool = False,
     ) -> None:
         """Persist the DFlash draft model, optimizer, scheduler, RNG, and meta."""
         checkpointer = getattr(self, "checkpointer", None)
@@ -372,7 +378,12 @@ class TrainDFlashRecipe(BaseRecipe):
             dist.barrier()
 
         draft_model = self._module().draft_model
-        self.checkpointer.save_model(draft_model, path, tokenizer=self.tokenizer, is_final_checkpoint=False)
+        self.checkpointer.save_model(
+            draft_model,
+            path,
+            tokenizer=self.tokenizer,
+            is_final_checkpoint=is_final_checkpoint,
+        )
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
         self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
@@ -471,7 +482,14 @@ class TrainDFlashRecipe(BaseRecipe):
         every = getattr(self, "ckpt_every_steps", None)
         if every is None or every <= 0 or self.runtime.global_step % every != 0:
             return False
-        self.save_checkpoint(epoch=epoch, step=self.runtime.global_step, best_metric_key="val_loss")
+        total_optim_steps = getattr(self, "total_optim_steps", None)
+        is_final_checkpoint = total_optim_steps is not None and self.runtime.global_step >= total_optim_steps
+        self.save_checkpoint(
+            epoch=epoch,
+            step=self.runtime.global_step,
+            best_metric_key="val_loss",
+            is_final_checkpoint=is_final_checkpoint,
+        )
         self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
         return True
 
@@ -485,7 +503,7 @@ class TrainDFlashRecipe(BaseRecipe):
         saved_by_epoch = bool(getattr(self, "save_checkpoint_every_epoch", False))
         if saved_by_step or saved_by_epoch:
             return False
-        self.save_checkpoint(epoch=completed_epochs, step=gs, best_metric_key="val_loss")
+        self.save_checkpoint(epoch=completed_epochs, step=gs, best_metric_key="val_loss", is_final_checkpoint=True)
         self._log_saved_checkpoint("final", completed_epochs, gs)
         return True
 
@@ -642,6 +660,7 @@ class TrainDFlashRecipe(BaseRecipe):
                     train_loss=avg_loss,
                     val_loss=eval_metrics,
                     best_metric_key="val_loss",
+                    is_final_checkpoint=epoch_idx + 1 >= self.num_epochs,
                 )
                 self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
 

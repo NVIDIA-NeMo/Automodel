@@ -212,6 +212,22 @@ class BaseRecipe:
     BaseRecipe provides checkpoint load/save functionality for recipes.
     """
 
+    @staticmethod
+    def _distributed_setup_attributes(distributed_setup):
+        """Return common recipe attributes derived from a distributed setup."""
+        mesh_context = distributed_setup.mesh_context
+        return (
+            distributed_setup,
+            mesh_context,
+            distributed_setup.strategy_config,
+            mesh_context.device_mesh,
+            mesh_context.moe_mesh,
+            mesh_context.pp_enabled,
+            distributed_setup.pipeline_config,
+            distributed_setup.moe_parallel_config,
+            distributed_setup.activation_checkpointing,
+        )
+
     def __setattr__(self, key, value):
         """
         Overriden __setattr__ to keep track of stateful classes.
