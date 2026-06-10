@@ -613,8 +613,9 @@ class Checkpointer:
         # keys: the storage reader renames checkpoint keys in metadata, and then to_hf also
         # renames model keys, producing a mismatch in the DCP planner.
         reader_key_mapping = None if has_state_dict_adapter else key_mapping
-        storage_reader = self._get_storage_reader(model_path, reader_key_mapping, is_init_step=is_init_step)
-        checkpoint_metadata_keys: set[str] | None = None
+        storage_reader = self._get_storage_reader(
+            model_path, reader_key_mapping, is_init_step=is_init_step, is_safetensors=is_safetensors
+        )
 
         # MoE adapters return views into model storage; DCP writes safetensors
         # data straight through them and from_hf skips the rebuild.
@@ -633,9 +634,10 @@ class Checkpointer:
             and isinstance(lm_head_param_name, str)
             and lm_head_param_name in state_dict
         )
+        checkpoint_metadata_keys: set[str] = set()
+        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset:
+            checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
         if should_try_tied_lm_head_compat:
-            if checkpoint_metadata_keys is None:
-                checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
             if lm_head_param_name not in checkpoint_metadata_keys:
                 for source_name in get_tied_lm_head_source_names(model_state.model[0], lm_head_param_name):
                     if source_name not in checkpoint_metadata_keys or source_name in state_dict:
@@ -661,10 +663,18 @@ class Checkpointer:
                     state_dict.pop(lm_head_param_name, None)
 
         if allow_checkpoint_key_subset:
-            if checkpoint_metadata_keys is None:
-                checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
             missing_checkpoint_keys = sorted(key for key in state_dict if key not in checkpoint_metadata_keys)
             if missing_checkpoint_keys:
+                # A subset load tolerates a few absent keys (e.g. heads excluded at save
+                # time); a checkpoint sharing NO keys with the model is a wrong or
+                # unreadable checkpoint and must not become a silent no-op load.
+                if len(missing_checkpoint_keys) == len(state_dict):
+                    raise RuntimeError(
+                        f"Checkpoint {model_path} contains none of the {len(state_dict)} requested model keys "
+                        f"(checkpoint has {len(checkpoint_metadata_keys)} keys, examples="
+                        f"{sorted(checkpoint_metadata_keys)[:5]}). Refusing to continue with "
+                        "allow_checkpoint_key_subset=True because the load would be a no-op."
+                    )
                 for key in missing_checkpoint_keys:
                     state_dict.pop(key, None)
                 logging.warning(
@@ -685,7 +695,9 @@ class Checkpointer:
         expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
         loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
         if allow_checkpoint_key_subset:
-            expected_keys_for_diff = loaded_keys_for_diff.copy()
+            # Keys deliberately kept at init were already warned about above; keep
+            # reporting unexpected keys, which nothing else surfaces.
+            expected_keys_for_diff &= loaded_keys_for_diff
         key_diff = _summarize_state_dict_key_diff(expected_keys_for_diff, loaded_keys_for_diff)
         if key_diff["missing_count"] or key_diff["unexpected_count"]:
             logging.warning(
@@ -1260,7 +1272,11 @@ fi
             )
 
     def _get_storage_reader(
-        self, model_path: str, key_mapping: Optional[dict[str, str]], is_init_step: bool = False
+        self,
+        model_path: str,
+        key_mapping: Optional[dict[str, str]],
+        is_init_step: bool = False,
+        is_safetensors: bool | None = None,
     ) -> Optional[_HuggingFaceStorageReader]:
         """
         Construct a Hugging Face storage reader when loading safetensors or during init.
@@ -1275,29 +1291,38 @@ fi
             model_path: Path to the model checkpoint directory or HF snapshot.
             key_mapping: Optional key remapping for conversion.
             is_init_step: If True, always produce a reader for base HF load.
+            is_safetensors: Whether `model_path` holds a safetensors checkpoint; computed
+                from the directory contents when not supplied.
 
         Returns:
-            Configured storage reader or None for other formats.
+            Configured storage reader, or None for the default DCP FileSystemReader.
         """
-        if self.config.model_save_format == SerializationFormat.SAFETENSORS or is_init_step:
-            # The upstream HuggingFaceStorageReader delegates dtype decoding to
-            # safetensors.torch._TYPES, which does not yet recognize the FP8
-            # scale dtypes emitted by some quantized HF checkpoints (e.g.
-            # DeepSeek V4's F8_E8M0 scales → KeyError('F8_E8M0') inside
-            # read_metadata → DCP ends up with metadata=None on every rank).
-            # The in-tree backport's DTYPE_MAP was extended for F8_E8M0/F8_E5M2,
-            # so prefer it for base-model HF loads. Mid-training DCP loads may
-            # still use the faster upstream reader.
-            if key_mapping is None and not is_init_step:
-                try:
-                    from torch.distributed.checkpoint.hf_storage import (
-                        HuggingFaceStorageReader as _UpstreamHFReader,
-                    )
+        # The configured save format does not always match what is on disk at `model_path`
+        # (e.g. exporting a torch_save DCP checkpoint with a safetensors-configured
+        # checkpointer). A safetensors reader on a non-safetensors directory returns EMPTY
+        # metadata instead of raising, so trust the directory contents for non-init loads.
+        if is_safetensors is None:
+            is_safetensors = _is_safetensors_checkpoint(model_path)
+        if not is_init_step and not is_safetensors:
+            return None
+        # The upstream HuggingFaceStorageReader delegates dtype decoding to
+        # safetensors.torch._TYPES, which does not yet recognize the FP8
+        # scale dtypes emitted by some quantized HF checkpoints (e.g.
+        # DeepSeek V4's F8_E8M0 scales → KeyError('F8_E8M0') inside
+        # read_metadata → DCP ends up with metadata=None on every rank).
+        # The in-tree backport's DTYPE_MAP was extended for F8_E8M0/F8_E5M2,
+        # so prefer it for base-model HF loads. Mid-training DCP loads may
+        # still use the faster upstream reader.
+        if key_mapping is None and not is_init_step:
+            try:
+                from torch.distributed.checkpoint.hf_storage import (
+                    HuggingFaceStorageReader as _UpstreamHFReader,
+                )
 
-                    return _UpstreamHFReader(path=model_path)
-                except ImportError:
-                    pass
-            return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
+                return _UpstreamHFReader(path=model_path)
+            except ImportError:
+                pass
+        return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
     def _get_original_model_path(self, model_state: ModelState) -> str | None:
         """

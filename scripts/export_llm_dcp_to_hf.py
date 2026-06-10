@@ -35,13 +35,12 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint.checkpointing import save_config
+from nemo_automodel.components.checkpoint.utils import is_rank_0
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 _CHECKPOINT_DIR_RE = re.compile(r"epoch_(\d+)_step_(\d+)$")
-_TRACKING_KEYS = ("wandb", "mlflow", "comet")
-_EXPORT_WORKDIR_NAME = ".export_workdir"
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -82,18 +81,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Explicit step number for the exported checkpoint directory name. Defaults to the source checkpoint.",
     )
-    parser.add_argument(
-        "--save-consolidated",
-        choices=("every", "final"),
-        default="final",
-        help="Consolidated export mode to record in the saved config. Default: final.",
-    )
     return parser.parse_args(argv)
-
-
-def infer_config_path(checkpoint_dir: str) -> Path:
-    """Return the default config.yaml path for a checkpoint directory."""
-    return Path(checkpoint_dir) / "config.yaml"
 
 
 def infer_epoch_step(checkpoint_dir: str) -> tuple[int, int]:
@@ -108,6 +96,8 @@ def infer_epoch_step(checkpoint_dir: str) -> tuple[int, int]:
 
 def resolve_epoch_step(checkpoint_dir: str, epoch: int | None, step: int | None) -> tuple[int, int]:
     """Resolve exported epoch and step from explicit flags or the source checkpoint name."""
+    if epoch is not None and step is not None:
+        return epoch, step
     inferred_epoch, inferred_step = infer_epoch_step(checkpoint_dir)
     return (
         inferred_epoch if epoch is None else epoch,
@@ -115,42 +105,38 @@ def resolve_epoch_step(checkpoint_dir: str, epoch: int | None, step: int | None)
     )
 
 
-def infer_export_root(output_dir: str, epoch: int, step: int) -> Path:
-    """Return the final exported checkpoint directory."""
-    return Path(output_dir) / f"epoch_{epoch}_step_{step}"
-
-
-def infer_export_workdir(output_dir: str) -> Path:
-    """Return a hidden work directory used only for recipe setup side effects."""
-    return Path(output_dir) / _EXPORT_WORKDIR_NAME
-
-
-def disable_tracking_loggers(cfg: ConfigNode) -> None:
-    """Remove remote experiment trackers from the loaded config."""
-    for key in _TRACKING_KEYS:
-        cfg.__dict__.pop(key, None)
-
-
 def build_export_config(args: argparse.Namespace) -> ConfigNode:
     """Load config.yaml and apply export-specific overrides."""
-    config_path = Path(args.config) if args.config is not None else infer_config_path(args.checkpoint_dir)
-    export_workdir = infer_export_workdir(args.output_dir)
+    config_path = Path(args.config) if args.config is not None else Path(args.checkpoint_dir) / "config.yaml"
     cfg = parse_args_and_load_config(
         str(config_path),
         argv=[
             "--checkpoint.restore_from",
             "None",
+            # Hidden directory that absorbs recipe-setup side effects (metric JSONL
+            # logs, auto-resume scan) without touching the user-facing export root.
             "--checkpoint.checkpoint_dir",
-            str(export_workdir),
+            str(Path(args.output_dir) / ".export_workdir"),
             "--checkpoint.model_save_format",
             "safetensors",
             "--checkpoint.save_consolidated",
-            args.save_consolidated,
+            "final",
+            # An offline export must not log to remote experiment trackers.
+            "--wandb",
+            "None",
+            "--mlflow",
+            "None",
+            "--comet",
+            "None",
         ],
     )
+    if cfg.get("peft", None) is not None:
+        raise ValueError(
+            "PEFT checkpoints are saved as a single consolidated adapter_model.safetensors already; "
+            "this exporter only supports full-model torch_save checkpoints."
+        )
     if args.model_name_or_path is not None:
         cfg.set_by_dotted("model.pretrained_model_name_or_path", args.model_name_or_path)
-    disable_tracking_loggers(cfg)
     return cfg
 
 
@@ -158,40 +144,19 @@ def resolve_model_for_export(
     trainer: TrainFinetuneRecipeForNextTokenPrediction,
 ) -> torch.nn.Module | list[torch.nn.Module]:
     """Return the model object that should be passed to the checkpointer."""
-    model = getattr(trainer, "model_parts", None)
-    if model is None:
-        model = getattr(trainer, "model", None)
-    if model is None:
-        raise ValueError("Trainer did not expose a model for export.")
-    if isinstance(model, list):
-        if len(model) == 0:
-            raise ValueError("Trainer exposed an empty model_parts list.")
-        if len(model) > 1:
-            return model
-        model = model[0]
+    model_parts = trainer.model_parts
+    if len(model_parts) > 1:
+        return model_parts
+    model = model_parts[0]
     if isinstance(model, DistributedDataParallel):
         model = model.module
     return model
-
-
-def is_main_process() -> bool:
-    """Return True for rank 0 or when torch.distributed is not initialized."""
-    return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
 
 
 def barrier() -> None:
     """Synchronize across ranks when torch.distributed is initialized."""
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
-
-
-def prepare_export_root(export_root: Path) -> None:
-    """Create the export directory once and fail fast on accidental overwrite."""
-    if is_main_process():
-        if export_root.exists():
-            raise FileExistsError(f"Export directory already exists: {export_root}")
-        export_root.mkdir(parents=True, exist_ok=False)
-    barrier()
 
 
 def close_trainer(trainer: TrainFinetuneRecipeForNextTokenPrediction | None) -> None:
@@ -211,7 +176,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     """Restore a DCP checkpoint and re-save it as Hugging Face safetensors."""
     args = parse_args(argv)
     export_epoch, export_step = resolve_epoch_step(args.checkpoint_dir, args.epoch, args.step)
-    export_root = infer_export_root(args.output_dir, export_epoch, export_step)
+    export_root = Path(args.output_dir) / f"epoch_{export_epoch}_step_{export_step}"
+    # Fail fast on every rank, before the expensive recipe setup and before
+    # torch.distributed is initialized.
+    if export_root.exists():
+        raise FileExistsError(f"Export directory already exists: {export_root}")
     cfg = build_export_config(args)
 
     trainer: TrainFinetuneRecipeForNextTokenPrediction | None = None
@@ -219,14 +188,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
         trainer.setup()
         export_model = resolve_model_for_export(trainer)
-        prepare_export_root(export_root)
+        # Idempotent on every rank, so a filesystem failure raises everywhere
+        # instead of stranding the other ranks in a collective.
+        export_root.mkdir(parents=True, exist_ok=True)
         trainer.checkpointer.load_model(
             export_model,
             model_path=str(Path(args.checkpoint_dir) / "model"),
             allow_checkpoint_key_subset=True,
         )
-        if is_main_process():
-            save_config(cfg.to_dict(), str(export_root))
+        if is_rank_0():
+            # to_yaml_dict() keeps _target_/*_fn entries as dotted-path strings so the
+            # exported config.yaml stays loadable; to_dict() would serialize the
+            # resolved Python objects as !!python/name tags that safe_load rejects.
+            save_config(cfg.to_yaml_dict(), str(export_root))
         barrier()
         trainer.checkpointer.save_model(
             model=export_model,
@@ -237,7 +211,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     finally:
         close_trainer(trainer)
 
-    if is_main_process():
+    if is_rank_0():
         output_dir = export_root / "model" / "consolidated"
         print(f"HF export is ready under: {output_dir}")
 

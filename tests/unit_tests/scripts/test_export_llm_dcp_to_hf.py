@@ -29,15 +29,6 @@ def test_parse_args_uses_defaults_for_optional_flags():
     assert args.model_name_or_path is None
     assert args.epoch is None
     assert args.step is None
-    assert args.save_consolidated == "final"
-
-
-def test_infer_config_path_uses_checkpoint_dir():
-    from scripts.export_llm_dcp_to_hf import infer_config_path
-
-    config_path = infer_config_path("/tmp/run/checkpoints/epoch_1_step_23")
-
-    assert str(config_path) == "/tmp/run/checkpoints/epoch_1_step_23/config.yaml"
 
 
 def test_infer_epoch_step_parses_checkpoint_name():
@@ -59,46 +50,19 @@ def test_resolve_epoch_step_prefers_explicit_values():
     assert resolve_epoch_step("/tmp/run/checkpoints/epoch_3_step_456", 9, 10) == (9, 10)
 
 
+def test_resolve_epoch_step_with_explicit_values_skips_name_parsing():
+    from scripts.export_llm_dcp_to_hf import resolve_epoch_step
+
+    # A non-standard directory name must be fine when both flags are given,
+    # which is exactly the workaround the infer_epoch_step error suggests.
+    assert resolve_epoch_step("/tmp/run/checkpoints/latest", 0, 500) == (0, 500)
+
+
 def test_resolve_epoch_step_falls_back_to_inferred_values():
     from scripts.export_llm_dcp_to_hf import resolve_epoch_step
 
     assert resolve_epoch_step("/tmp/run/checkpoints/epoch_3_step_456", None, None) == (3, 456)
     assert resolve_epoch_step("/tmp/run/checkpoints/epoch_3_step_456", 9, None) == (9, 456)
-
-
-def test_infer_export_workdir_uses_hidden_directory():
-    from scripts.export_llm_dcp_to_hf import infer_export_workdir
-
-    assert str(infer_export_workdir("/tmp/export")) == "/tmp/export/.export_workdir"
-
-
-def test_infer_export_root_uses_epoch_and_step():
-    from scripts.export_llm_dcp_to_hf import infer_export_root
-
-    export_root = infer_export_root("/tmp/export", 7, 99)
-
-    assert str(export_root) == "/tmp/export/epoch_7_step_99"
-
-
-def test_disable_tracking_loggers_strips_remote_logger_sections():
-    from nemo_automodel.components.config.loader import ConfigNode
-    from scripts.export_llm_dcp_to_hf import disable_tracking_loggers
-
-    cfg = ConfigNode(
-        {
-            "wandb": {"project": "demo"},
-            "mlflow": {"experiment": "demo"},
-            "comet": {"project": "demo"},
-            "checkpoint": {"enabled": True},
-        }
-    )
-
-    disable_tracking_loggers(cfg)
-
-    assert not hasattr(cfg, "wandb")
-    assert not hasattr(cfg, "mlflow")
-    assert not hasattr(cfg, "comet")
-    assert cfg.checkpoint.enabled is True
 
 
 def test_build_export_config_applies_export_overrides(monkeypatch):
@@ -120,7 +84,6 @@ def test_build_export_config_applies_export_overrides(monkeypatch):
             output_dir="/tmp/export",
             config=None,
             model_name_or_path="/models/gemma4",
-            save_consolidated="final",
             epoch=None,
             step=None,
         )
@@ -136,9 +99,14 @@ def test_build_export_config_applies_export_overrides(monkeypatch):
         "safetensors",
         "--checkpoint.save_consolidated",
         "final",
+        "--wandb",
+        "None",
+        "--mlflow",
+        "None",
+        "--comet",
+        "None",
     ]
     assert cfg.model.pretrained_model_name_or_path == "/models/gemma4"
-    assert not hasattr(cfg, "wandb")
 
 
 def test_build_export_config_uses_explicit_config_path_without_model_override(monkeypatch):
@@ -159,7 +127,6 @@ def test_build_export_config_uses_explicit_config_path_without_model_override(mo
             output_dir="/tmp/export",
             config="/custom/config.yaml",
             model_name_or_path=None,
-            save_consolidated="every",
             epoch=None,
             step=None,
         )
@@ -168,6 +135,29 @@ def test_build_export_config_uses_explicit_config_path_without_model_override(mo
     assert captured["config_path"] == "/custom/config.yaml"
     # No --model-name-or-path override, so the recorded base model path is untouched.
     assert cfg.model.pretrained_model_name_or_path == "/orig"
+
+
+def test_build_export_config_rejects_peft_configs(monkeypatch):
+    from nemo_automodel.components.config.loader import ConfigNode
+    from scripts import export_llm_dcp_to_hf as script
+
+    monkeypatch.setattr(
+        script,
+        "parse_args_and_load_config",
+        lambda config_path, argv: ConfigNode({"checkpoint": {"enabled": True}, "peft": {"match_all_linear": True}}),
+    )
+
+    with pytest.raises(ValueError, match="PEFT checkpoints"):
+        script.build_export_config(
+            Namespace(
+                checkpoint_dir="/tmp/run/checkpoints/epoch_0_step_42",
+                output_dir="/tmp/export",
+                config=None,
+                model_name_or_path=None,
+                epoch=None,
+                step=None,
+            )
+        )
 
 
 def test_resolve_model_for_export_unwraps_single_ddp(monkeypatch):
@@ -204,56 +194,6 @@ def test_resolve_model_for_export_returns_multipart_list_unchanged():
     assert script.resolve_model_for_export(trainer) is parts
 
 
-def test_resolve_model_for_export_falls_back_to_model_attribute():
-    from scripts import export_llm_dcp_to_hf as script
-
-    model = object()
-    trainer = Namespace(model_parts=None, model=model)
-
-    assert script.resolve_model_for_export(trainer) is model
-
-
-def test_resolve_model_for_export_raises_when_no_model():
-    from scripts import export_llm_dcp_to_hf as script
-
-    trainer = Namespace(model_parts=None, model=None)
-
-    with pytest.raises(ValueError, match="did not expose a model"):
-        script.resolve_model_for_export(trainer)
-
-
-def test_resolve_model_for_export_raises_on_empty_model_parts():
-    from scripts import export_llm_dcp_to_hf as script
-
-    trainer = Namespace(model_parts=[])
-
-    with pytest.raises(ValueError, match="empty model_parts"):
-        script.resolve_model_for_export(trainer)
-
-
-def test_is_main_process_true_when_distributed_not_initialized(monkeypatch):
-    import torch.distributed as dist
-
-    from scripts import export_llm_dcp_to_hf as script
-
-    monkeypatch.setattr(dist, "is_initialized", lambda: False)
-
-    assert script.is_main_process() is True
-
-
-def test_is_main_process_respects_rank_when_distributed(monkeypatch):
-    import torch.distributed as dist
-
-    from scripts import export_llm_dcp_to_hf as script
-
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_rank", lambda: 0)
-    assert script.is_main_process() is True
-
-    monkeypatch.setattr(dist, "get_rank", lambda: 1)
-    assert script.is_main_process() is False
-
-
 def test_barrier_invokes_distributed_barrier_only_when_initialized(monkeypatch):
     import torch.distributed as dist
 
@@ -269,42 +209,6 @@ def test_barrier_invokes_distributed_barrier_only_when_initialized(monkeypatch):
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
     script.barrier()
     assert mock_barrier.call_count == 1
-
-
-def test_prepare_export_root_creates_directory_on_main(monkeypatch, tmp_path):
-    from scripts import export_llm_dcp_to_hf as script
-
-    monkeypatch.setattr(script, "is_main_process", lambda: True)
-    monkeypatch.setattr(script, "barrier", lambda: None)
-    export_root = tmp_path / "epoch_0_step_1"
-
-    script.prepare_export_root(export_root)
-
-    assert export_root.is_dir()
-
-
-def test_prepare_export_root_raises_when_directory_exists(monkeypatch, tmp_path):
-    from scripts import export_llm_dcp_to_hf as script
-
-    monkeypatch.setattr(script, "is_main_process", lambda: True)
-    monkeypatch.setattr(script, "barrier", lambda: None)
-    export_root = tmp_path / "epoch_0_step_1"
-    export_root.mkdir()
-
-    with pytest.raises(FileExistsError):
-        script.prepare_export_root(export_root)
-
-
-def test_prepare_export_root_skips_creation_on_non_main(monkeypatch, tmp_path):
-    from scripts import export_llm_dcp_to_hf as script
-
-    monkeypatch.setattr(script, "is_main_process", lambda: False)
-    monkeypatch.setattr(script, "barrier", lambda: None)
-    export_root = tmp_path / "epoch_0_step_1"
-
-    script.prepare_export_root(export_root)
-
-    assert not export_root.exists()
 
 
 def test_close_trainer_is_noop_for_none():
@@ -337,7 +241,8 @@ def test_main_exports_checkpoint_end_to_end(monkeypatch, tmp_path):
 
     trainer = MagicMock()
     model = object()
-    monkeypatch.setattr(script, "build_export_config", lambda args: MagicMock(to_dict=lambda: {"checkpoint": {}}))
+    exported_yaml = {"checkpoint": {"model_save_format": "safetensors"}}
+    monkeypatch.setattr(script, "build_export_config", lambda args: MagicMock(to_yaml_dict=lambda: exported_yaml))
     monkeypatch.setattr(script, "TrainFinetuneRecipeForNextTokenPrediction", lambda cfg: trainer)
     monkeypatch.setattr(script, "resolve_model_for_export", lambda t: model)
     save_config_calls = {}
@@ -361,8 +266,29 @@ def test_main_exports_checkpoint_end_to_end(monkeypatch, tmp_path):
     assert save_kwargs["is_final_checkpoint"] is True
     assert save_kwargs["tokenizer"] is trainer.tokenizer
 
+    # The exported config must come from to_yaml_dict(): to_dict() would serialize
+    # resolved _target_ objects as !!python tags that yaml.safe_load rejects.
+    assert save_config_calls["config"] is exported_yaml
     assert save_config_calls["path"] == str(export_root)
     trainer.checkpointer.close.assert_called_once()
+
+
+def test_main_fails_fast_when_export_root_exists(monkeypatch, tmp_path):
+    from scripts import export_llm_dcp_to_hf as script
+
+    checkpoint_dir = tmp_path / "checkpoints" / "epoch_2_step_7"
+    checkpoint_dir.mkdir(parents=True)
+    export_root = tmp_path / "export" / "epoch_2_step_7"
+    export_root.mkdir(parents=True)
+
+    build_config = MagicMock()
+    monkeypatch.setattr(script, "build_export_config", build_config)
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        script.main(["--checkpoint-dir", str(checkpoint_dir), "--output-dir", str(tmp_path / "export")])
+
+    # The check runs before any expensive recipe construction.
+    build_config.assert_not_called()
 
 
 def test_main_closes_trainer_even_when_setup_fails(monkeypatch, tmp_path):
@@ -374,7 +300,7 @@ def test_main_closes_trainer_even_when_setup_fails(monkeypatch, tmp_path):
 
     trainer = MagicMock()
     trainer.setup.side_effect = RuntimeError("boom")
-    monkeypatch.setattr(script, "build_export_config", lambda args: MagicMock(to_dict=lambda: {}))
+    monkeypatch.setattr(script, "build_export_config", lambda args: MagicMock(to_yaml_dict=lambda: {}))
     monkeypatch.setattr(script, "TrainFinetuneRecipeForNextTokenPrediction", lambda cfg: trainer)
 
     with pytest.raises(RuntimeError, match="boom"):
