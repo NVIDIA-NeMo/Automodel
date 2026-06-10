@@ -212,6 +212,14 @@ navigation:
             slug: overview
           - page: "BAGEL"
             path: ../../model-coverage/multimodal/bytedance-seed/bagel.mdx
+      - section: "Diffusion Language Models (dLLMs)"
+        slug: dllm
+        contents:
+          - page: "Overview"
+            path: ../../model-coverage/dllm/index.mdx
+            slug: overview
+          - page: "DiffusionGemma"
+            path: ../../model-coverage/dllm/google/diffusiongemma.mdx
       - section: "Omni Models"
         slug: omni
         contents:
@@ -335,6 +343,9 @@ navigation:
       - page: "dLLM Fine-Tuning"
         path: ../../guides/dllm/finetune.mdx
         slug: dllm-fine-tuning
+      - page: "Fine-Tuning DiffusionGemma with NeMo AutoModel"
+        path: ../../guides/dllm/diffusiongemma.mdx
+        slug: diffusiongemma
       - page: "Quantization-Aware Training (QAT) in NeMo Automodel"
         path: ../../guides/quantization-aware-training.mdx
         slug: qat
