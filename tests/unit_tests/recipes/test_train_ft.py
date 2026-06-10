@@ -553,18 +553,21 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         "nemo_automodel.recipes._typed_config.RecipeConfig.checkpoint",
         property(lambda self: _stub_build_checkpoint_config()),
     )
-    # Stub setup_distributed to avoid requiring torch.distributed init
+    # Stub create_distributed_setup_from_config to avoid requiring torch.distributed init
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.setup_distributed",
+        "nemo_automodel.recipes.llm.train_ft.create_distributed_setup_from_config",
         lambda cfg, world_size: SimpleNamespace(
+            mesh_context=SimpleNamespace(
+                pp_enabled=False,
+                device_mesh=None,
+                moe_mesh=None,
+                cp_size=1,
+                pp_size=1,
+            ),
             strategy_config=None,
             pipeline_config=None,
-            moe_config=None,
+            moe_parallel_config=None,
             activation_checkpointing=False,
-            pp_enabled=False,
-            device_mesh=None,
-            moe_mesh=None,
-            cp_size=1,
         ),
     )
 
@@ -1818,18 +1821,21 @@ def _minimal_cfg_with_rope_fusion(cp_size: int, rope_fusion: bool):
 def _patch_setup_minimals_with_cp(monkeypatch, cp_size):
     """Variant of _patch_setup_minimals that lets us control cp_size."""
     _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
-    # Override setup_distributed to expose the desired cp_size
+    # Override create_distributed_setup_from_config to expose the desired cp_size
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.setup_distributed",
+        "nemo_automodel.recipes.llm.train_ft.create_distributed_setup_from_config",
         lambda cfg, world_size: SimpleNamespace(
+            mesh_context=SimpleNamespace(
+                pp_enabled=False,
+                device_mesh=None,
+                moe_mesh=None,
+                cp_size=cp_size,
+                pp_size=1,
+            ),
             strategy_config=None,
             pipeline_config=None,
-            moe_config=None,
+            moe_parallel_config=None,
             activation_checkpointing=False,
-            pp_enabled=False,
-            device_mesh=None,
-            moe_mesh=None,
-            cp_size=cp_size,
         ),
     )
 
