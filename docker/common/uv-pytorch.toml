@@ -25,4 +25,6 @@ override-dependencies = [
     "transformer-engine-cu13; sys_platform == 'never'",
     "transformer-engine-torch; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
+    # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin
+    "urllib3>=2.6.3",
 ]

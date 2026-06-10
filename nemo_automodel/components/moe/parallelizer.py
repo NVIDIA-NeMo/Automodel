@@ -40,6 +40,30 @@ logger = logging.getLogger(__name__)
 _CP_STREAM = None
 
 
+def _moe_shard_placement(param):
+    """FSDP shard placement for grouped-expert params.
+
+    Shard on dim=1 for the (>=2D) expert weights since there may be more shards than
+    experts (dim=0). A 1D param (e.g. the per-expert bias of the experts="te"
+    GroupedLinear path, shape [out_features]) has no dim 1, so shard it on dim 0
+    instead. FSDP all-gathers before use, so the shard dim is a storage detail and does
+    not change compute.
+    """
+    return Shard(0) if param.ndim < 2 else Shard(1)
+
+
+def _is_selective_ac(activation_checkpointing: object) -> bool:
+    """Return True when the AC mode requests selective checkpointing.
+
+    Kept inline (rather than imported from the dense FSDP2 parallelizer) so that
+    threading the mode does not pull the heavy ``distributed.parallelizer`` module
+    into the lightweight call path.
+    """
+    return (
+        isinstance(activation_checkpointing, str) and activation_checkpointing.lower().replace("-", "_") == "selective"
+    )
+
+
 def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
     config = getattr(model, "config", None)
     if getattr(config, "model_type", None) == "deepseek_v4":
@@ -161,6 +185,7 @@ def apply_ac(
     ignore_router: bool = False,
     hidden_size: int | None = None,
     num_experts: int | None = None,
+    selective: bool = False,
 ):
     """Apply activation checkpointing to the model.
 
@@ -170,7 +195,31 @@ def apply_ac(
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
         num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
             first, then falls back to model.config attributes.
+        selective: If True, applies TorchTitan-style per-op selective activation checkpointing
+            (shared with the dense FSDP2 path) to each block. Takes precedence over
+            ``ignore_router``; the shared policy already saves expert-parallel communication
+            collectives and ``topk``, so it composes with expert parallelism.
     """
+    if selective:
+        # Reuse the dense FSDP2 selective policy so the save-op set (attention,
+        # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
+        from nemo_automodel.components.distributed.activation_checkpointing import (
+            SELECTIVE_AC_WRAPPER_FLAG,
+            make_selective_checkpoint_context_fn,
+        )
+
+        selective_context_fn = make_selective_checkpoint_context_fn()
+        for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+            block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, context_fn=selective_context_fn)
+            # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
+            # selective policy visible to the partitioner) instead of unwrapping and
+            # compiling the block inner, which would collapse selective AC into full
+            # recompute. The flag is only read when per-layer torch.compile is
+            # enabled, so it is a no-op for every other mode.
+            setattr(block, SELECTIVE_AC_WRAPPER_FLAG, True)
+            parent_layers.register_module(layer_id, block)
+        return
+
     # Derive hidden_size and num_experts from model.config if not provided
     if hidden_size is None:
         cfg = getattr(model, "config", None)
@@ -291,7 +340,7 @@ def apply_fsdp(
             fully_shard(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
-                shard_placement_fn=lambda _: Shard(1),
+                shard_placement_fn=_moe_shard_placement,
                 reshard_after_forward=reshard_after_forward,
                 mp_policy=mp_policy,
             )
@@ -422,7 +471,7 @@ def parallelize_model(
     tp_axis_name: str | None = None,
     ep_axis_name: str | None = None,
     ep_shard_axis_names: tuple[str, ...] | None = None,
-    activation_checkpointing: bool = False,
+    activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = False,
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
@@ -449,7 +498,11 @@ def parallelize_model(
         apply_ep(model, moe_mesh[ep_axis_name], moe_mesh=moe_mesh)
 
     if activation_checkpointing:
-        apply_ac(model, ignore_router=ignore_router_for_ac)
+        apply_ac(
+            model,
+            ignore_router=ignore_router_for_ac,
+            selective=_is_selective_ac(activation_checkpointing),
+        )
 
     if ep_shard_axis_names is not None:
         ep_shard_mesh = moe_mesh[ep_shard_axis_names]

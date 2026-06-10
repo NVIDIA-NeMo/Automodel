@@ -24,6 +24,7 @@ from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.diffusion import train as diffusion_train
 from nemo_automodel.recipes.diffusion.train import (
     TrainDiffusionRecipe,
+    _build_diffusion_parallel_manager_args,
     _calculate_throughput_metrics,
     _count_local_batch_group_samples,
     _get_diffusion_microbatch_size,
@@ -406,6 +407,61 @@ class _TinyTransformer(nn.Module):
 
     def set_attention_backend(self, attention_backend):
         self.attention_backend = attention_backend
+
+
+def test_build_diffusion_parallel_manager_args_uses_shared_fsdp_defaults():
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=None,
+        ddp_cfg=None,
+        world_size=8,
+        dtype=torch.float16,
+        lora_enabled=False,
+    )
+
+    assert manager_args["_manager_type"] == "fsdp2"
+    assert manager_args["world_size"] == 8
+    assert manager_args["dp_size"] is None
+    assert manager_args["tp_size"] == 1
+    assert manager_args["pp_size"] == 1
+    assert manager_args["cp_size"] == 1
+    assert manager_args["ep_size"] == 1
+    assert manager_args["activation_checkpointing"] is True
+    assert manager_args["defer_fsdp_grad_sync"] is True
+    assert manager_args["enable_fsdp2_prefetch"] is True
+    assert manager_args["use_hf_tp_plan"] is False
+    assert manager_args["mp_policy"].param_dtype == torch.float16
+    assert manager_args["mp_policy"].reduce_dtype == torch.float32
+    assert manager_args["mp_policy"].output_dtype == torch.float16
+
+
+def test_build_diffusion_parallel_manager_args_keeps_lora_param_dtype_uncast():
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg={},
+        ddp_cfg=None,
+        world_size=1,
+        dtype=torch.bfloat16,
+        lora_enabled=True,
+    )
+
+    assert manager_args["mp_policy"].param_dtype is None
+    assert manager_args["mp_policy"].output_dtype == torch.bfloat16
+
+
+def test_build_diffusion_parallel_manager_args_parses_ddp_config():
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=None,
+        ddp_cfg={"activation_checkpointing": True},
+        world_size=4,
+        dtype=torch.bfloat16,
+        lora_enabled=False,
+    )
+
+    assert manager_args == {
+        "_manager_type": "ddp",
+        "world_size": 4,
+        "activation_checkpointing": True,
+        "find_unused_parameters": False,
+    }
 
 
 def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(monkeypatch):

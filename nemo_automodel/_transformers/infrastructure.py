@@ -25,6 +25,7 @@ for device meshes, parallelism sizes, and axis names.
 
 import logging
 from contextlib import nullcontext
+from dataclasses import is_dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -40,9 +41,10 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 )
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
-    DistributedConfig,
+    DistributedStrategyConfig,
     FSDP2Config,
     MegatronFSDPConfig,
+    MoEParallelizerConfig,
 )
 from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
@@ -52,7 +54,7 @@ from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.moe.config import MoEParallelizerConfig
+from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
 from nemo_automodel.components.utils.compile_utils import compile_model
@@ -68,7 +70,6 @@ from nemo_automodel.components.utils.model_utils import (
 )
 
 if TYPE_CHECKING:
-    from torch.distributed.device_mesh import DeviceMesh
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
 
 logger = logging.getLogger(__name__)
@@ -150,7 +151,7 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext):
 
 #  Infrastructure instantiation (config -> runtime objects)
 def _instantiate_distributed(
-    config: DistributedConfig,
+    config: DistributedStrategyConfig | None,
     mesh: MeshContext,
 ) -> Union[FSDP2Manager, MegatronFSDPManager, DDPManager, None]:
     """Instantiate the appropriate distributed manager from config.
@@ -182,6 +183,20 @@ def _instantiate_distributed(
         raise ValueError(f"Unknown distributed config type: {type(config)}")
 
 
+def _with_activation_checkpointing(
+    config: Optional[DistributedStrategyConfig],
+    activation_checkpointing: bool,
+) -> Optional[DistributedStrategyConfig]:
+    """Return a strategy config whose AC flag matches the resolved setup."""
+    if config is None or not hasattr(config, "activation_checkpointing"):
+        return config
+    if getattr(config, "activation_checkpointing") is activation_checkpointing:
+        return config
+    if not is_dataclass(config):
+        return config
+    return replace(config, activation_checkpointing=activation_checkpointing)
+
+
 def _instantiate_pipeline(
     config: Optional[PipelineConfig],
     mesh: MeshContext,
@@ -194,8 +209,8 @@ def _instantiate_pipeline(
         config: Pipeline config. If None or pp_size <= 1, returns None.
         mesh: MeshContext holding device_mesh, moe_mesh, and axis names.
         device: Target device for pipeline computation.
-        strategy_config: Strategy config fallback when ``mesh`` was rebuilt from
-            raw device meshes and no longer carries the recipe-level config.
+        strategy_config: Strategy config used to route distributed policy into
+            pipeline setup.
 
     Returns:
         AutoPipeline instance, or None if pipeline parallelism is not enabled.
@@ -208,7 +223,6 @@ def _instantiate_pipeline(
 
     # Route the existing FSDP2Config.defer_fsdp_grad_sync into the pipeline so
     # the same knob controls grad-sync behavior under PP.
-    strategy_config = getattr(mesh, "strategy_config", None) or strategy_config
     if strategy_config is not None and hasattr(strategy_config, "defer_fsdp_grad_sync"):
         config_dict.setdefault("defer_fsdp_grad_sync", strategy_config.defer_fsdp_grad_sync)
 
@@ -257,17 +271,13 @@ def parallelize_for_pp(
 
 def instantiate_infrastructure(
     *,
-    distributed_config: Optional[DistributedConfig] = None,
+    distributed_config: Optional[DistributedStrategyConfig] = None,
     pipeline_config: Optional[PipelineConfig] = None,
     qat_config: Optional[QATConfig] = None,
-    moe_config: Optional[MoEParallelizerConfig] = None,
-    activation_checkpointing: bool = False,
+    moe_parallel_config: Optional[MoEParallelizerConfig] = None,
+    activation_checkpointing: bool | str | None = None,
     device: Optional[torch.device] = None,
     mesh: Optional[MeshContext] = None,
-    # Deprecated -- prefer passing ``mesh`` directly
-    device_mesh: Optional["DeviceMesh"] = None,
-    moe_mesh: Optional["DeviceMesh"] = None,
-    ep_size: int = 1,
 ) -> tuple:
     """Instantiate infrastructure objects from config classes.
 
@@ -280,15 +290,11 @@ def instantiate_infrastructure(
             or DDPConfig).
         pipeline_config: Pipeline parallelism config.
         qat_config: Quantization-aware training config.
-        moe_config: MoE parallelizer config (for expert parallel models).
+        moe_parallel_config: MoE parallelizer config (for expert parallel models).
         activation_checkpointing: Enable activation checkpointing for transformer blocks.
-            Defaults to False.
+            If ``None``, inferred from ``distributed_config.activation_checkpointing``.
         device: Target device for model.
         mesh: MeshContext holding device meshes, sizes, and axis names.
-            If None, built from the legacy ``device_mesh`` / ``moe_mesh`` params.
-        device_mesh: (deprecated) Device mesh for distributed operations.
-        moe_mesh: (deprecated) Optional MOE mesh for expert parallelism.
-        ep_size: (deprecated) Expert parallelism size. Ignored when ``mesh`` is provided.
 
     Returns:
         tuple: (model_wrapper, autopipeline, parallelize_fn, qat_quantizer)
@@ -299,22 +305,32 @@ def instantiate_infrastructure(
             - qat_quantizer: QAT quantizer instance (or None)
     """
     if mesh is None:
-        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+        mesh = MeshContext()
 
-    ep_size = mesh.ep_size if mesh.ep_size > 1 else ep_size
+    if activation_checkpointing is None:
+        activation_checkpointing = bool(getattr(distributed_config, "activation_checkpointing", False))
+    distributed_config = _with_activation_checkpointing(distributed_config, activation_checkpointing)
 
     model_wrapper = _instantiate_distributed(distributed_config, mesh)
     autopipeline = _instantiate_pipeline(pipeline_config, mesh, device, distributed_config)
 
     parallelize_fn = None
-    if ep_size > 1:
+    if mesh.ep_size > 1:
         from nemo_automodel.components.moe.parallelizer import parallelize_model
 
-        moe_kwargs = moe_config.to_dict()
-        # Forward mp_policy from distributed config if not explicitly set in MoE config
+        if moe_parallel_config is None:
+            moe_parallel_config = MoEParallelizerConfig()
+        # Forward the model wrapper's mp_policy (from FSDP2Config) to expert
+        # sharding when the MoE config doesn't set its own, so a custom precision
+        # policy isn't silently dropped for EP models.
+        moe_kwargs = moe_parallel_config.to_dict()
         if moe_kwargs.get("mp_policy") is None and model_wrapper is not None:
             moe_kwargs["mp_policy"] = getattr(model_wrapper, "mp_policy", None)
-        parallelize_fn = partial(parallelize_model, activation_checkpointing=activation_checkpointing, **moe_kwargs)
+        parallelize_fn = partial(
+            parallelize_model,
+            activation_checkpointing=activation_checkpointing,
+            **moe_kwargs,
+        )
     elif autopipeline is not None and model_wrapper is not None:
         parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
 
@@ -625,6 +641,19 @@ def apply_model_infrastructure(
             attach_context_parallel_hooks(mp)
             if is_compile_enabled:
                 attach_cp_sdpa_hooks(mp, cp_mesh)
+
+    # Frozen submodules (e.g. a frozen vision tower) either land in the root FSDP unit
+    # (sharded) or are excluded from wrapping, depending on the model/parallelizer. In
+    # both cases FSDP mixed precision never casts their buffers, and an excluded frozen
+    # module also keeps its storage-dtype params. Under fp32 master weights + bf16 compute
+    # that leaves frozen fp32 tensors feeding bf16 trainable modules -> dtype-mismatch
+    # matmul at the seam. Cast frozen params/buffers to the compute dtype so the whole
+    # forward runs uniformly. No-op for pure-fp32 / pure-bf16 runs and when no mp_policy
+    # is available (DDP/PP).
+    compute_dtype = getattr(getattr(model_wrapper, "mp_policy", None), "param_dtype", None)
+    if compute_dtype is not None:
+        for mp in model.parts if hasattr(model, "parts") else [model]:
+            cast_frozen_modules_to_compute_dtype(mp, compute_dtype)
 
     model = _apply_runtime_compatibility_fixes(model)
     return model

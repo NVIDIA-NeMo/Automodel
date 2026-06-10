@@ -273,16 +273,37 @@ class DFlashDecayLoss(nn.Module):
             The chunked path is plain autograd, so FSDP2 handles it correctly.
         chunk_size: Number of predicted positions per chunk in the chunked
             linear-CE path. Smaller = lower peak memory, more recompute.
+        normalize: Loss denominator. ``"tokens"`` (default) divides the
+            decay-weighted sum by ``num_tokens``, a global all-reduced count
+            that keeps the loss consistent across DP replicas and grad-accum.
+            ``"mean"`` divides by the effective weight sum
+            ``(w_k * block_mask).sum()`` for a per-call decay-weighted mean.
+        loss_gamma: Decay parameter γ. ``None`` disables decay (all predicted
+            positions weighted equally).
     """
 
-    def __init__(self, loss_gamma: float = 7.0, use_fused_linear_ce: bool = False, chunk_size: int = 1024):
+    def __init__(
+        self,
+        loss_gamma: Optional[float] = 7.0,
+        use_fused_linear_ce: bool = False,
+        chunk_size: int = 1024,
+        normalize: str = "tokens",
+    ):
         super().__init__()
-        self.loss_gamma = float(loss_gamma)
+        if normalize not in ("tokens", "mean"):
+            raise ValueError(f"normalize must be 'tokens' or 'mean', got {normalize!r}")
+        self.loss_gamma = None if loss_gamma is None else float(loss_gamma)
         self.use_fused_linear_ce = bool(use_fused_linear_ce)
         self.chunk_size = int(chunk_size)
+        self.normalize = normalize
 
     def _decay_weights(self, T: int, block_size: Optional[int], device, dtype) -> torch.Tensor:
-        """Eq. 4 weights for ``T`` predicted positions, resetting per block."""
+        """Eq. 4 weights for ``T`` predicted positions, resetting per block.
+
+        Returns all-ones (uniform) when ``loss_gamma is None`` (decay disabled).
+        """
+        if self.loss_gamma is None:
+            return torch.ones(T, device=device, dtype=dtype)
         if block_size is not None:
             T_per = block_size - 1
             n_blocks = T // T_per if T_per > 0 else 1
@@ -304,7 +325,9 @@ class DFlashDecayLoss(nn.Module):
         w = self._decay_weights(T, block_size, token_nll.device, token_nll.dtype)
         weights = w.unsqueeze(0) * block_mask.to(token_nll.dtype)  # [B, T]
         loss = (token_nll * weights).sum()
-        if num_tokens is not None:
+        if self.normalize == "mean":
+            loss = loss / (weights.sum() + 1e-6)
+        elif num_tokens is not None:
             loss = loss / max(float(num_tokens), 1.0)
         return DLLMLossOutput(
             total_loss=loss,

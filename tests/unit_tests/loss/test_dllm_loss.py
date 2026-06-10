@@ -618,3 +618,41 @@ class TestIDLMLossDTensor:
         sharded = loss_fn(dlogits, target, answer_mask, valid_mask, seq_len=L).total_loss
 
         assert torch.allclose(plain, sharded, atol=1e-5), f"plain {plain.item():.6f} != DTensor {sharded.item():.6f}"
+class TestDFlashNormalizeMean:
+    """``normalize="mean"`` divides by the effective weight sum (decay-weighted mean)."""
+
+    def _weighted_mean(self, logits_full, target_full, block_mask_full, gamma):
+        bsz, n, bs, _ = logits_full.shape
+        offsets = torch.arange(bs).view(1, 1, -1)
+        weight = block_mask_full * (offsets > 0).float()
+        if gamma is not None:
+            decay = torch.exp(-(torch.arange(bs).float() - 1).clamp(min=0) / gamma).view(1, 1, -1)
+            weight = weight * decay
+        nll = F.cross_entropy(logits_full.reshape(-1, logits_full.size(-1)), target_full.reshape(-1), reduction="none")
+        flat_w = weight.reshape(-1)
+        return (nll * flat_w).sum() / (flat_w.sum() + 1e-6)
+
+    @pytest.mark.parametrize("gamma", [7.0, None])
+    def test_mean_matches_reference(self, gamma):
+        torch.manual_seed(0)
+        bsz, n, bs, V = 2, 3, 5, 16
+        logits_full = torch.randn(bsz, n, bs, V)
+        target_full = torch.randint(0, V, (bsz, n, bs))
+        block_mask_full = (torch.rand(bsz, n, bs) > 0.3).float()
+
+        expected = self._weighted_mean(logits_full, target_full, block_mask_full, gamma)
+
+        loss_fn = DFlashDecayLoss(loss_gamma=gamma, normalize="mean")
+        pred_logits = logits_full[:, :, 1:, :].reshape(bsz, n * (bs - 1), V)
+        pred_targets = target_full[:, :, 1:].reshape(bsz, n * (bs - 1))
+        pred_mask = block_mask_full[:, :, 1:].reshape(bsz, n * (bs - 1))
+        got = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, block_size=bs).total_loss
+
+        assert torch.isclose(expected, got, atol=1e-6)
+
+    def test_default_normalize_is_tokens(self):
+        assert DFlashDecayLoss().normalize == "tokens"
+
+    def test_invalid_normalize_raises(self):
+        with pytest.raises(ValueError, match="normalize must be"):
+            DFlashDecayLoss(normalize="bogus")

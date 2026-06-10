@@ -35,7 +35,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
@@ -209,12 +209,19 @@ class TrainBiEncoderRecipe(BaseRecipe):
         apply_te_patches()
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-        self.distributed_config = self.dist_setup.strategy_config
-        self.device_mesh = self.dist_setup.device_mesh
-        self.moe_mesh = self.dist_setup.moe_mesh
-        self.pp_enabled = self.dist_setup.pp_enabled
-        self.pipeline_config = self.dist_setup.pipeline_config
+        (
+            self.distributed_setup,
+            self.mesh_context,
+            self.distributed_config,
+            self.device_mesh,
+            self.moe_mesh,
+            self.pp_enabled,
+            self.pipeline_config,
+            self.moe_parallel_config,
+            self.activation_checkpointing,
+        ) = self._distributed_setup_attributes(
+            create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+        )
 
         if self.pp_enabled:
             raise NotImplementedError("Encoder does not support pipeline parallelism")
@@ -233,6 +240,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
 
+        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
+
         checkpoint_config = self.cfg.checkpoint
 
         if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
@@ -250,9 +259,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             model = self.cfg.model.instantiate(
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                distributed_config=self.distributed_config,
+                distributed_setup=self.distributed_setup,
                 peft_config=self.peft_config,
             )
 

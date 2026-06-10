@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 import wandb
 from huggingface_hub.constants import HF_HUB_CACHE
-from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
@@ -45,6 +45,7 @@ from nemo_automodel.components.training.utils import (
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
+from nemo_automodel.recipes._dist_utils import parse_distributed_section
 from nemo_automodel.recipes._typed_config import RecipeConfig, _model_name_from_cfg
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.import_utils import safe_import_from
@@ -218,6 +219,76 @@ def _calculate_throughput_metrics(
     }
 
 
+def _build_diffusion_parallel_manager_args(
+    *,
+    fsdp_cfg: Optional[Dict[str, Any]],
+    ddp_cfg: Optional[Dict[str, Any]],
+    world_size: int,
+    dtype: torch.dtype,
+    compute_dtype: Optional[torch.dtype] = None,
+    lora_enabled: bool,
+) -> Dict[str, Any]:
+    """Build diffusion transformer manager args through the shared distributed parser."""
+    if compute_dtype is None:
+        compute_dtype = dtype
+
+    if fsdp_cfg is not None and ddp_cfg is not None:
+        raise ValueError(
+            "Cannot specify both 'fsdp' and 'ddp' configurations. "
+            "Please provide only one distributed training strategy."
+        )
+
+    if ddp_cfg is not None:
+        ddp_options = dict(ddp_cfg)
+        ddp_options.pop("backend", None)
+        parsed = parse_distributed_section({"strategy": "ddp", **ddp_options})
+        return {
+            "_manager_type": "ddp",
+            "world_size": world_size,
+            **parsed["strategy_config"].to_dict(),
+            "activation_checkpointing": parsed["activation_checkpointing"],
+        }
+
+    fsdp_options = dict(fsdp_cfg or {})
+    ignored_options = {"use_hf_tp_plan": fsdp_options.pop("use_hf_tp_plan", False)}
+    fsdp_options.pop("backend", None)
+    cpu_offload = bool(fsdp_options.pop("cpu_offload", False))
+    reduce_dtype = dtype_from_str(fsdp_options.pop("reduce_dtype", None), default=torch.float32)
+
+    param_dtype = None if lora_enabled else compute_dtype
+    parsed = parse_distributed_section(
+        {
+            "strategy": "fsdp2",
+            "activation_checkpointing": True,
+            "defer_fsdp_grad_sync": True,
+            "enable_fsdp2_prefetch": True,
+            **fsdp_options,
+            "mp_policy": MixedPrecisionPolicy(
+                param_dtype=param_dtype,
+                reduce_dtype=reduce_dtype,
+                output_dtype=compute_dtype,
+            ),
+            # CPU offload: sharded params + optimizer state live on host RAM and are
+            # paged to GPU per-block during forward/backward (saves GPU memory, adds H2D).
+            "offload_policy": CPUOffloadPolicy(pin_memory=True) if cpu_offload else None,
+        }
+    )
+
+    return {
+        "_manager_type": "fsdp2",
+        "world_size": world_size,
+        "dp_size": parsed["dp_size"],
+        "dp_replicate_size": parsed["dp_replicate_size"],
+        "tp_size": parsed["tp_size"],
+        "cp_size": parsed["cp_size"],
+        "pp_size": parsed["pp_size"],
+        "ep_size": parsed["ep_size"],
+        **parsed["strategy_config"].to_dict(),
+        "activation_checkpointing": parsed["activation_checkpointing"],
+        **ignored_options,
+    }
+
+
 def _normalize_optimizer_value(value: Any) -> Any:
     """Convert CLI-friendly optimizer scalar values into Python objects."""
     if isinstance(value, str):
@@ -365,6 +436,7 @@ def build_model_and_optimizer(
     pipeline_spec: Optional[Dict[str, Any]] = None,
     peft_cfg=None,
     model_type=None,
+    active_transformer: Optional[str] = None,
 ) -> tuple[NeMoAutoDiffusionPipeline, torch.optim.Optimizer, Any]:
     """Build the diffusion model, parallel scheme, and optimizer.
 
@@ -392,6 +464,10 @@ def build_model_and_optimizer(
         peft_cfg: PeftConfig instance or None. When provided, only LoRA params
             are trained; base weights are frozen and sharded by FSDP2 for memory.
         model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
+        active_transformer: For two-transformer pipelines (Wan2.2), select which
+            transformer to finetune. ``"transformer"`` (default for Wan2.2 = high-noise)
+            or ``"transformer_2"`` (low-noise). The unused transformer is dropped
+            before device placement so only one transformer lives on GPU.
 
     Returns:
         Tuple of (pipeline, optimizer, device_mesh or None).
@@ -400,13 +476,6 @@ def build_model_and_optimizer(
         ValueError: If both fsdp_cfg and ddp_cfg are provided.
         ValueError: If finetune_mode is False and pipeline_spec is not provided.
     """
-    # Validate mutually exclusive configs
-    if fsdp_cfg is not None and ddp_cfg is not None:
-        raise ValueError(
-            "Cannot specify both 'fsdp' and 'ddp' configurations. "
-            "Please provide only one distributed training strategy."
-        )
-
     logging.info("[INFO] Building NeMoAutoDiffusionPipeline with transformer parallel scheme...")
 
     if not dist.is_initialized():
@@ -419,74 +488,26 @@ def build_model_and_optimizer(
     lora_enabled = peft_cfg is not None
     _validate_precision_configuration(dtype, compute_dtype, ddp_cfg=ddp_cfg, peft_cfg=peft_cfg)
 
-    # param_dtype=None when LoRA: FSDP2 does not cast any parameter.
-    # In full training, FSDP2 casts gathered params to compute_dtype while
-    # the model can still be initialized in a different storage dtype.
-    param_dtype = None if lora_enabled else compute_dtype
-
-    # Build manager args based on which config is provided
     if ddp_cfg is not None:
-        # DDP configuration
         logging.info("[INFO] Using DDP (DistributedDataParallel) for training")
-        manager_args: Dict[str, Any] = {
-            "_manager_type": "ddp",
-            "backend": ddp_cfg.get("backend", "nccl"),
-            "world_size": world_size,
-            "activation_checkpointing": ddp_cfg.get("activation_checkpointing", False),
-        }
     else:
-        # FSDP configuration (default)
-        fsdp_cfg = fsdp_cfg or {}
         logging.info("[INFO] Using FSDP2 (Fully Sharded Data Parallel) for training")
-
-        dp_size = fsdp_cfg.get("dp_size")
-        tp_size = fsdp_cfg.get("tp_size", 1)
-        cp_size = fsdp_cfg.get("cp_size", 1)
-        pp_size = fsdp_cfg.get("pp_size", 1)
-
-        if dp_size is None:
-            denom = tp_size * cp_size * pp_size
-            if world_size % denom != 0:
-                raise ValueError(
-                    f"world_size ({world_size}) must be divisible by "
-                    f"tp_size*cp_size*pp_size ({tp_size}*{cp_size}*{pp_size}={denom})"
-                )
-            dp_size = world_size // denom
-
-        reduce_dtype = dtype_from_str(fsdp_cfg.get("reduce_dtype", None), default=torch.float32)
-
-        manager_args: Dict[str, Any] = {
-            "_manager_type": "fsdp2",
-            "dp_size": dp_size,
-            "dp_replicate_size": fsdp_cfg.get("dp_replicate_size", None),
-            "tp_size": tp_size,
-            "cp_size": cp_size,
-            "pp_size": pp_size,
-            "backend": "nccl",
-            "world_size": world_size,
-            "use_hf_tp_plan": fsdp_cfg.get("use_hf_tp_plan", False),
-            "sequence_parallel": fsdp_cfg.get("sequence_parallel", False),
-            "tp_plan": fsdp_cfg.get("tp_plan", None),
-            "patch_is_packed_sequence": fsdp_cfg.get("patch_is_packed_sequence", False),
-            "activation_checkpointing": fsdp_cfg.get("activation_checkpointing", True),
-            "defer_fsdp_grad_sync": fsdp_cfg.get("defer_fsdp_grad_sync", True),
-            "enable_async_tensor_parallel": fsdp_cfg.get("enable_async_tensor_parallel", False),
-            "enable_compile": fsdp_cfg.get("enable_compile", False),
-            "enable_fsdp2_prefetch": fsdp_cfg.get("enable_fsdp2_prefetch", True),
-            "fsdp2_backward_prefetch_depth": fsdp_cfg.get("fsdp2_backward_prefetch_depth", 2),
-            "fsdp2_forward_prefetch_depth": fsdp_cfg.get("fsdp2_forward_prefetch_depth", 1),
-            "mp_policy": MixedPrecisionPolicy(
-                param_dtype=param_dtype,
-                reduce_dtype=reduce_dtype,
-                output_dtype=compute_dtype,
-            ),
-        }
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=fsdp_cfg,
+        ddp_cfg=ddp_cfg,
+        world_size=world_size,
+        dtype=dtype,
+        compute_dtype=compute_dtype,
+        lora_enabled=lora_enabled,
+    )
 
     parallel_scheme = {"transformer": manager_args}
 
     if finetune_mode:
         # Finetuning: load from pretrained weights
         logging.info("[INFO] Loading pretrained model for finetuning")
+        if active_transformer is not None:
+            logging.info("[INFO] Active transformer: %s", active_transformer)
         pipe, created_managers = NeMoAutoDiffusionPipeline.from_pretrained(
             model_id,
             torch_dtype=dtype,
@@ -497,6 +518,7 @@ def build_model_and_optimizer(
             low_cpu_mem_usage=True,
             peft_cfg=peft_cfg,
             model_type=model_type,
+            active_transformer=active_transformer,
             transformer_engine_linear=transformer_engine_linear,
             transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
             fuse_qkv_projections=fuse_qkv_projections,
@@ -681,6 +703,17 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
+            # For two-stage Wan2.2 finetuning, suffix the wandb run name with the
+            # active stage so high-noise and low-noise runs are distinguishable.
+            # Normalize to lowercase to match self.stage so the wandb suffix and the
+            # internal stage name stay consistent. Mutating the cached WandbConfig
+            # before build() makes the suffix take effect (build() uses self.name).
+            stage_for_wandb = self.cfg.get("model.stage", None)
+            if stage_for_wandb is not None:
+                stage_for_wandb = str(stage_for_wandb).lower()
+                current_name = self.cfg.get("wandb.name", None)
+                if current_name is not None and not str(current_name).endswith(f"_{stage_for_wandb}"):
+                    self.cfg.wandb.name = f"{current_name}_{stage_for_wandb}"
             model_name = _model_name_from_cfg(self.cfg.model) if "model" in self.cfg else None
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=model_name)
             if run is not None:
@@ -808,6 +841,20 @@ class TrainDiffusionRecipe(BaseRecipe):
                     "model.optimize_hunyuan_flash_varlen_mask=true requires model.attention_backend=flash_varlen"
                 )
 
+        # Two-stage finetuning (Wan2.2 T2V-A14B): each stage trains only one
+        # transformer against a restricted timestep range. The stage knob both
+        # selects the active transformer and clamps the sigma sampling window so
+        # this run only sees noise levels its transformer is responsible for.
+        self.stage = self.cfg.get("model.stage", None)
+        self.boundary_ratio = self.cfg.get("model.boundary_ratio", None)
+        self.active_transformer = None
+        if self.stage is not None:
+            stage = str(self.stage).lower()
+            if stage not in ("high_noise", "low_noise"):
+                raise ValueError(f"model.stage must be 'high_noise' or 'low_noise', got {self.stage!r}")
+            self.stage = stage
+            self.active_transformer = "transformer" if stage == "high_noise" else "transformer_2"
+
         logging.info("[INFO] Flow Matching V2 Pipeline")
         logging.info(f"[INFO]   - Adapter type: {self.adapter_type}")
         logging.info(f"[INFO]   - Timestep sampling: {self.timestep_sampling}")
@@ -817,6 +864,8 @@ class TrainDiffusionRecipe(BaseRecipe):
         logging.info(f"[INFO]   - CFG dropout prob: {self.cfg_dropout_prob}")
         logging.info(f"[INFO]   - Use loss weighting: {self.use_loss_weighting}")
         logging.info(f"[INFO]   - Loss weighting scheme: {self.loss_weighting_scheme}")
+        if self.stage is not None:
+            logging.info(f"[INFO]   - Two-stage finetune: stage={self.stage}, active={self.active_transformer}")
 
         # Get pipeline_spec for pretraining mode (required when mode != "finetune")
         pipeline_spec_cfg = self.cfg.get("model.pipeline_spec", None)
@@ -834,7 +883,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.model_type = self.cfg.get("model.model_type", None)
         if self.peft_cfg is not None and not self.model_type:
             raise ValueError(
-                "model.model_type must be set when peft config is provided. Options: 'flux', 'wan', 'hunyuan'"
+                "model.model_type must be set when peft config is provided. Options: 'flux', 'flux2', 'wan', 'hunyuan'"
             )
 
         lora_status = (
@@ -863,6 +912,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             pipeline_spec=pipeline_spec,
             peft_cfg=self.peft_cfg,
             model_type=self.model_type,
+            active_transformer=self.active_transformer,
         )
 
         self.model = self.pipe.transformer
@@ -876,6 +926,37 @@ class TrainDiffusionRecipe(BaseRecipe):
             logging.info("[INFO] Enabled Hunyuan flash-varlen 2D mask optimization")
 
         self.peft_config = getattr(self.pipe, "_peft_config", None)
+
+        # Resolve sigma range for two-stage finetuning now that the pipeline
+        # is loaded and we can read its boundary_ratio config.
+        if self.stage is not None:
+            if self.boundary_ratio is None:
+                pipe_cfg = getattr(self.pipe, "config", None)
+                self.boundary_ratio = pipe_cfg.get("boundary_ratio") if pipe_cfg is not None else None
+            if self.boundary_ratio is None:
+                raise ValueError(
+                    "model.stage is set but no boundary_ratio could be resolved. "
+                    "Set model.boundary_ratio in YAML, or use a pipeline whose config "
+                    "carries boundary_ratio (e.g. Wan-AI/Wan2.2-T2V-A14B-Diffusers)."
+                )
+            self.boundary_ratio = float(self.boundary_ratio)
+            # A boundary outside (0, 1) collapses the stage sigma window to an empty
+            # or degenerate range (e.g. boundary_ratio=0.0 with stage=low_noise gives
+            # sigma_min=sigma_max=0.0), silently yielding a useless model.
+            if not (0.0 < self.boundary_ratio < 1.0):
+                raise ValueError(f"model.boundary_ratio must be in (0, 1), got {self.boundary_ratio}")
+            if self.stage == "high_noise":
+                self.sigma_min = self.boundary_ratio
+                self.sigma_max = 1.0
+            else:
+                self.sigma_min = 0.0
+                self.sigma_max = self.boundary_ratio
+            logging.info(
+                "[INFO]   - Stage sigma range: [%.4f, %.4f] (boundary_ratio=%.4f)",
+                self.sigma_min,
+                self.sigma_max,
+                self.boundary_ratio,
+            )
 
         checkpoint_cfg = self.cfg.get("checkpoint", None)
 
