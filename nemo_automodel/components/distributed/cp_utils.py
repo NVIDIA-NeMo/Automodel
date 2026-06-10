@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import contextlib
-from typing import List, Optional, Set
+from dataclasses import dataclass
+from typing import Any, List, Optional, Set
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -193,18 +194,39 @@ def _cp_sdpa(
     return out.to_local() if isinstance(out, DTensor) else out
 
 
+@dataclass(frozen=True)
+class CPAllGatherAttentionContext:
+    """Inputs for model-owned manual all-gather CP attention."""
+
+    module: torch.nn.Module
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    key_full: torch.Tensor
+    value_full: torch.Tensor
+    cp_mesh: Any
+    cp_group: Any
+    cp_size: int
+    cp_rank: int
+    seq_local: int
+    seq_full: int
+    seq_global_start: int
+    attn_mask: Any
+    dropout_p: float
+    is_causal: bool
+    scale: Any
+    enable_gqa: bool
+    kwargs: dict[str, Any]
+    metadata: dict[str, torch.Tensor | None]
+
+
 class _ManualAllGatherAttention:
-    """Manual contiguous-shard CP attention for masks PyTorch CP cannot express."""
+    """Manual contiguous-shard CP transport for model-owned attention."""
 
     def __init__(self, cp_mesh):
-        import logging
-
         self.cp_mesh = cp_mesh
         self.group = cp_mesh.get_group()
         self.size = cp_mesh.size()
-        self.log = logging.getLogger(__name__)
-        self._compiled_flex_attn = None
-        self._flex_ok_logged = False
 
         try:
             from torch.distributed.nn.functional import all_gather as dist_all_gather
@@ -212,13 +234,6 @@ class _ManualAllGatherAttention:
             self.dist_all_gather = dist_all_gather
         except (ImportError, AttributeError):
             self.dist_all_gather = None
-
-    def _get_compiled_flex_attn(self):
-        if self._compiled_flex_attn is None:
-            from torch.nn.attention.flex_attention import flex_attention
-
-            self._compiled_flex_attn = torch.compile(flex_attention, dynamic=True)
-        return self._compiled_flex_attn
 
     def _all_gather_seq(self, tensor: torch.Tensor) -> torch.Tensor:
         tensor = tensor.contiguous()
@@ -229,24 +244,13 @@ class _ManualAllGatherAttention:
             torch.distributed.all_gather(parts, tensor, group=self.group)
         return torch.cat(tuple(parts), dim=2)
 
-    def _all_gather_seq_metadata(self, metadata: torch.Tensor | None) -> torch.Tensor | None:
+    def _all_gather_seq_metadata(self, metadata: torch.Tensor | None, seq_dim: int = 1) -> torch.Tensor | None:
         if metadata is None:
             return None
         local = metadata.contiguous()
         parts = [torch.empty_like(local) for _ in range(self.size)]
         torch.distributed.all_gather(parts, local, group=self.group)
-        return torch.cat(parts, dim=1)
-
-    @staticmethod
-    def _vision_group_ids(mm_token_type_ids: torch.Tensor | None) -> torch.Tensor | None:
-        if mm_token_type_ids is None:
-            return None
-        is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
-        prev_is_vision = torch.roll(is_vision, shifts=1, dims=-1)
-        prev_is_vision[..., 0] = False
-        new_vision_starts = is_vision & ~prev_is_vision
-        group_ids = torch.cumsum(new_vision_starts.int(), dim=1) - 1
-        return torch.where(is_vision, group_ids, torch.full_like(group_ids, -1))
+        return torch.cat(parts, dim=seq_dim)
 
     def __call__(
         self,
@@ -262,6 +266,13 @@ class _ManualAllGatherAttention:
         enable_gqa,
         kwargs,
     ):
+        run_cp_allgather_attention = getattr(module, "run_cp_allgather_attention", None)
+        if run_cp_allgather_attention is None:
+            raise RuntimeError(
+                f"{type(module).__name__} requested manual all-gather CP attention but does not implement "
+                "run_cp_allgather_attention(ctx)."
+            )
+
         cp_rank = torch.distributed.get_rank(group=self.group)
         seq_local = key.shape[2]
         seq_global_start = cp_rank * seq_local
@@ -270,196 +281,39 @@ class _ManualAllGatherAttention:
         value_full = self._all_gather_seq(value)
         seq_full = key_full.shape[2]
 
-        orig_head_dim = query.shape[-1]
         if query.shape[1] != key_full.shape[1]:
             enable_gqa = True
 
-        mm_token_type_ids = getattr(module, "_cp_mm_token_type_ids", None)
-        mm_token_type_ids_full = self._all_gather_seq_metadata(mm_token_type_ids)
-        packed_seq_ids = getattr(module, "_cp_packed_seq_ids", None)
-        packed_seq_ids_full = self._all_gather_seq_metadata(packed_seq_ids)
-        padding_mask = getattr(module, "_cp_padding_mask", None)
-        padding_mask_full = self._all_gather_seq_metadata(padding_mask)
-        vision_group_ids = self._vision_group_ids(mm_token_type_ids_full)
+        local_metadata = getattr(module, "_cp_allgather_metadata", {})
+        metadata_seq_dims = getattr(module, "_cp_allgather_metadata_seq_dims", {})
+        metadata_full = {
+            name: self._all_gather_seq_metadata(value, metadata_seq_dims.get(name, 1))
+            for name, value in local_metadata.items()
+        }
 
-        # Some HF attention modules mark sliding layers by setting sliding_window
-        # instead of exposing a separate is_sliding flag.
-        sliding_window = getattr(module, "sliding_window", None)
-        is_sliding = sliding_window is not None
-        config_uses_vision_bidir = (
-            getattr(getattr(module, "config", None), "use_bidirectional_attention", None) == "vision"
-        )
-        has_vision_tokens = vision_group_ids is not None and bool((vision_group_ids >= 0).any().item())
-        use_vision_bidirectional = is_sliding and config_uses_vision_bidir and has_vision_tokens
-
-        def base_mask(q_idx, kv_idx):
-            q_global_idx = q_idx + seq_global_start
-            if not is_causal:
-                allowed = torch.ones_like(q_global_idx >= kv_idx)
-            else:
-                allowed = kv_idx <= q_global_idx
-            if sliding_window is not None:
-                allowed = allowed & ((q_global_idx - kv_idx) < sliding_window)
-            return allowed
-
-        q_indices = torch.arange(seq_local, device=query.device) + seq_global_start
-        empty_query_rows = None
-        if packed_seq_ids_full is not None:
-            empty_query_rows = packed_seq_ids_full[:, q_indices] <= 0
-        if padding_mask_full is not None:
-            padding_query_rows = padding_mask_full[:, q_indices]
-            empty_query_rows = padding_query_rows if empty_query_rows is None else empty_query_rows | padding_query_rows
-
-        return self._run_flex_allgather_attention(
-            query,
-            key_full,
-            value_full,
-            base_mask=base_mask,
-            vision_group_ids=vision_group_ids,
-            packed_seq_ids_full=packed_seq_ids_full,
-            padding_mask_full=padding_mask_full,
-            empty_query_rows=empty_query_rows,
-            use_vision_bidirectional=use_vision_bidirectional,
-            seq_global_start=seq_global_start,
+        ctx = CPAllGatherAttentionContext(
+            module=module,
+            query=query,
+            key=key,
+            value=value,
+            key_full=key_full,
+            value_full=value_full,
+            cp_mesh=self.cp_mesh,
+            cp_group=self.group,
+            cp_size=self.size,
+            cp_rank=cp_rank,
             seq_local=seq_local,
             seq_full=seq_full,
-            orig_head_dim=orig_head_dim,
-            cp_rank=cp_rank,
+            seq_global_start=seq_global_start,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
             scale=scale,
             enable_gqa=enable_gqa,
+            kwargs=kwargs,
+            metadata=metadata_full,
         )
-
-    def _run_flex_allgather_attention(
-        self,
-        query,
-        key_full,
-        value_full,
-        *,
-        base_mask,
-        vision_group_ids,
-        packed_seq_ids_full,
-        padding_mask_full,
-        empty_query_rows,
-        use_vision_bidirectional,
-        seq_global_start,
-        seq_local,
-        seq_full,
-        orig_head_dim,
-        cp_rank,
-        scale,
-        enable_gqa,
-    ):
-        import math
-
-        import torch.nn.functional as F_module
-
-        try:
-            from torch.nn.attention.flex_attention import create_block_mask
-
-            padded_head_dim = 1 << (orig_head_dim - 1).bit_length()
-            use_small_flex_blocks = padded_head_dim > 256
-            flex_block_size = (32, 32) if use_small_flex_blocks else 128
-
-            if use_vision_bidirectional or packed_seq_ids_full is not None or padding_mask_full is not None:
-
-                def cp_mask(batch_idx, head_idx, q_idx, kv_idx):
-                    q_global_idx = q_idx + seq_global_start
-                    allowed = base_mask(q_idx, kv_idx)
-                    if use_vision_bidirectional:
-                        q_group = vision_group_ids[batch_idx, q_global_idx]
-                        kv_group = vision_group_ids[batch_idx, kv_idx]
-                        same_vision_group = (q_group == kv_group) & (q_group >= 0)
-                        allowed = allowed | same_vision_group
-                    if packed_seq_ids_full is not None:
-                        q_pack_id = packed_seq_ids_full[batch_idx, q_global_idx]
-                        kv_pack_id = packed_seq_ids_full[batch_idx, kv_idx]
-                        allowed = allowed & (q_pack_id == kv_pack_id) & (q_pack_id > 0)
-                        # Padding query rows have no semantic attention target, but
-                        # kernels need at least one valid key. Point them at a dummy
-                        # key and zero the output after attention.
-                        allowed = torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
-                    if padding_mask_full is not None:
-                        q_is_padding = padding_mask_full[batch_idx, q_global_idx]
-                        kv_is_padding = padding_mask_full[batch_idx, kv_idx]
-                        allowed = allowed & ~kv_is_padding
-                        allowed = torch.where(q_is_padding, kv_idx == 0, allowed)
-                    return allowed
-
-                block_mask_batch = query.shape[0]
-            else:
-
-                def cp_mask(batch_idx, head_idx, q_idx, kv_idx):
-                    return base_mask(q_idx, kv_idx)
-
-                block_mask_batch = None
-
-            block_mask = create_block_mask(
-                cp_mask,
-                B=block_mask_batch,
-                H=None,
-                Q_LEN=seq_local,
-                KV_LEN=seq_full,
-                device=query.device,
-                BLOCK_SIZE=flex_block_size,
-            )
-            query_for_flex = query
-            key_for_flex = key_full
-            value_for_flex = value_full
-            flex_scale = scale
-            if padded_head_dim != orig_head_dim:
-                pad_len = padded_head_dim - orig_head_dim
-                query_for_flex = F_module.pad(query_for_flex, (0, pad_len))
-                key_for_flex = F_module.pad(key_for_flex, (0, pad_len))
-                value_for_flex = F_module.pad(value_for_flex, (0, pad_len))
-                if flex_scale is None:
-                    flex_scale = 1.0 / math.sqrt(orig_head_dim)
-
-            flex_kwargs = {"block_mask": block_mask, "scale": flex_scale, "enable_gqa": enable_gqa}
-            if use_small_flex_blocks:
-                flex_kwargs["kernel_options"] = {
-                    "BLOCK_M": 32,
-                    "BLOCK_N": 32,
-                    "BLOCK_M1": 32,
-                    "BLOCK_N1": 32,
-                    "BLOCK_M2": 32,
-                    "BLOCK_N2": 32,
-                    "num_stages": 1,
-                    "num_warps": 4,
-                }
-            try:
-                out = self._get_compiled_flex_attn()(
-                    query_for_flex.contiguous(), key_for_flex, value_for_flex, **flex_kwargs
-                )
-            except TypeError as exc:
-                if "kernel_options" in str(exc) and "kernel_options" in flex_kwargs:
-                    flex_kwargs.pop("kernel_options")
-                    out = self._get_compiled_flex_attn()(
-                        query_for_flex.contiguous(), key_for_flex, value_for_flex, **flex_kwargs
-                    )
-                else:
-                    raise
-
-            if empty_query_rows is not None and empty_query_rows.any():
-                out = out.masked_fill(empty_query_rows[:, None, :, None], 0)
-            if padded_head_dim != orig_head_dim:
-                out = out[..., :orig_head_dim]
-            if not self._flex_ok_logged:
-                self.log.info(
-                    "CP using compiled flex_attention all-gather. Q=%s K=%s head_dim=%s->%s cp_rank=%s",
-                    tuple(query.shape),
-                    tuple(key_full.shape),
-                    orig_head_dim,
-                    padded_head_dim,
-                    cp_rank,
-                )
-                self._flex_ok_logged = True
-            return out
-        except Exception as flex_err:
-            raise RuntimeError(
-                "Manual CP all-gather requires FlexAttention for local-query/global-key attention. "
-                f"FlexAttention failed for Q={tuple(query.shape)} K={tuple(key_full.shape)} "
-                f"V={tuple(value_full.shape)} cp_rank={cp_rank} seq_local={seq_local} seq_full={seq_full}."
-            ) from flex_err
+        return run_cp_allgather_attention(ctx)
 
 
 def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
@@ -527,23 +381,19 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
         )
 
     def _pre_hook(module, args, kwargs):
-        mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
-        packed_seq_ids = kwargs.pop("_packed_seq_ids", None)
-        padding_mask = kwargs.pop("padding_mask", None)
-        module._cp_mm_token_type_ids = mm_token_type_ids
-        module._cp_packed_seq_ids = packed_seq_ids
-        module._cp_padding_mask = padding_mask
-        module._cp_manual_allgather_active = (
-            mm_token_type_ids is not None or packed_seq_ids is not None or padding_mask is not None
-        )
+        has_manual_allgather_impl = hasattr(module, "run_cp_allgather_attention")
+        metadata = {}
+        if has_manual_allgather_impl:
+            for name in getattr(module, "_cp_allgather_metadata_keys", ()):
+                metadata[name] = kwargs.pop(name, None)
+        module._cp_allgather_metadata = metadata
+        module._cp_manual_allgather_active = has_manual_allgather_impl
         active_module["module"] = module
         F_module.scaled_dot_product_attention = cp_attention
         return args, kwargs
 
     def _post_hook(module, inputs, output):
-        module._cp_mm_token_type_ids = None
-        module._cp_packed_seq_ids = None
-        module._cp_padding_mask = None
+        module._cp_allgather_metadata = {}
         module._cp_manual_allgather_active = False
         active_module["module"] = None
         F_module.scaled_dot_product_attention = original_sdpa
