@@ -13,5 +13,6 @@
 # limitations under the License.
 
 from nemo_automodel.components.models.mimo_v25.config import MiMoV2Config
+from nemo_automodel.components.models.mimo_v25.model import MiMoV2ForCausalLM, MiMoV2Model
 
-__all__ = ["MiMoV2Config"]
+__all__ = ["MiMoV2Config", "MiMoV2ForCausalLM", "MiMoV2Model"]
