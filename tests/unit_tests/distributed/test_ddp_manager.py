@@ -31,7 +31,6 @@ def test_ddp_manager_forwards_ddp_constructor_flags(monkeypatch):
 
     manager = ddp_mod.DDPManager(
         DDPConfig(
-            backend="gloo",
             broadcast_buffers=True,
             find_unused_parameters=True,
             static_graph=True,

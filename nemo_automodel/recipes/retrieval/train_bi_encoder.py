@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import logging
 import pathlib
 import time
@@ -294,7 +295,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
 
         logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
-        optimizer = self.cfg.get("optimizer").instantiate(params=param_groups)
+        optimizer = self.cfg.optimizer.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
         self.optimizer = shard_optimizers_for_megatron_fsdp(
             self.model_parts[0],
@@ -359,6 +360,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.metric_logger_valid = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
         )
+        self.loss_average_window = deque(maxlen=self.step_scheduler.loss_average_window_steps)
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.load_checkpoint(restore_from)
@@ -541,12 +543,15 @@ class TrainBiEncoderRecipe(BaseRecipe):
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
             reporting_loss = reporting_loss / self._get_dp_group_size(include_cp=True)
         reporting_loss = reporting_loss.cpu().item()
+        self.loss_average_window.append(reporting_loss)
+        average_loss = sum(self.loss_average_window) / len(self.loss_average_window)
         elapsed = time.perf_counter() - self.timestamp
         self.timestamp = time.perf_counter()
         mem_allocated = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
 
         metrics = {
             "loss": reporting_loss,
+            "loss_avg_window": average_loss,
             "grad_norm": grad_norm,
             "lr": lr,
             "mem": mem_allocated,
@@ -650,10 +655,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.metric_logger_train.log(log_data)
 
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s".format(
+            "step {} | epoch {} | loss {:.4f} | loss_avg_window {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
+                log_data.metrics["loss_avg_window"],
                 log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],

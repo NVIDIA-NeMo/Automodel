@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import types
 import logging
+import types
 from typing import TYPE_CHECKING
 
 import torch
@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 
 try:
     from megatron_fsdp import MegatronFSDP
-    from megatron_fsdp.fully_shard import fully_shard_optimizer as megatron_fsdp_fully_shard_optimizer
     from megatron_fsdp.param_and_grad_buffer import ParamAndGradBuffer, make_fsdp_dtensor
 
     HAS_MEGATRON_FSDP = True
@@ -42,7 +41,6 @@ except (ImportError, FileNotFoundError, OSError):
     MegatronFSDP = None
     ParamAndGradBuffer = None
     make_fsdp_dtensor = None
-    megatron_fsdp_fully_shard_optimizer = None
     HAS_MEGATRON_FSDP = False
 
 

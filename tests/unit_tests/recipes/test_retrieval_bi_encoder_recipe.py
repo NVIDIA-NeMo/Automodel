@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import deque
+
 import torch
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
@@ -87,6 +89,7 @@ def _make_recipe_for_optim_step(distributed_config):
     recipe.optimizer = [_FakeOptimizer()]
     recipe.lr_scheduler = None
     recipe.step_scheduler = _FakeStepScheduler()
+    recipe.loss_average_window = deque(maxlen=50)
     recipe.timestamp = 0.0
     recipe._get_dp_group_size = lambda include_cp=True: 1
 
