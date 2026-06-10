@@ -44,6 +44,40 @@ def _compute_per_token_nll(
     ).reshape(target_ids.shape)
 
 
+def encoder_ar_loss(
+    encoder_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    valid_mask: Optional[torch.Tensor] = None,
+    num_tokens: Optional[int] = None,
+) -> torch.Tensor:
+    """Autoregressive next-token CE on the encoder's causal logits.
+
+    The co-trained encoder loss for ``diffusion_gemma`` SFT: a standard causal
+    LM cross-entropy over the clean full sequence, scored where both the current
+    and next position are valid (non-pad).
+
+    Args:
+        encoder_logits: Encoder logits over the clean sequence, ``[B, S, V]``.
+        input_ids: Clean token IDs, ``[B, S]``.
+        valid_mask: Boolean non-pad mask ``[B, S]``. If ``None``, all positions count.
+        num_tokens: Optional global denominator (summed across grad-acc microbatches);
+            defaults to the local valid next-token count.
+
+    Returns:
+        Scalar AR loss (mean CE over valid next-token positions).
+    """
+    logits = encoder_logits[:, :-1, :]
+    targets = input_ids[:, 1:]
+    nll = _compute_per_token_nll(logits, targets)  # [B, S-1]
+    if valid_mask is not None:
+        mask = (valid_mask[:, :-1] & valid_mask[:, 1:]).to(nll.dtype)
+    else:
+        mask = torch.ones_like(nll)
+    loss = (nll * mask).sum()
+    denom = num_tokens if num_tokens is not None else int(mask.sum().item())
+    return loss / max(denom, 1)
+
+
 class DLLMLossOutput(NamedTuple):
     """Unified return type for all dLLM loss functions.
 
@@ -123,6 +157,78 @@ class MDLMCrossEntropyLoss(nn.Module):
         # Normalize by total supervised tokens
         if num_diffusion_tokens is not None:
             loss = loss / max(num_diffusion_tokens, 1)
+
+        return DLLMLossOutput(total_loss=loss, dllm_loss=loss.detach().clone())
+
+
+class BlockDiffusionCrossEntropyLoss(nn.Module):
+    """Flat cross-entropy loss for block-diffusion (``diffusion_gemma``) training.
+
+    The ``diffusion_gemma`` checkpoint uses uniform random-token (D3PM-uniform)
+    corruption, not absorbing ``[MASK]``. Its loss is plain mean cross-entropy
+    over **all supervised canvas positions** (corrupted AND uncorrupted): the loss
+    support is the full selected canvas (``target_mask = canvas_mask``), which is
+    NOT noise-gated. ``noise_mask`` is accepted (for diagnostics) but does NOT
+    gate the loss support:
+
+    .. math::
+        \\text{loss} = \\frac{\\sum_{i \\in \\text{supervised (canvas)}} \\text{CE}_i}{N}
+
+    where ``N`` is the supervised canvas-token count. There is **no** ``1/p`` (``1/t``)
+    reweighting (that is the absorbing-kernel ELBO weight, which does not apply
+    to the uniform kernel) and **no** autoregressive term. Flatness is a
+    property of this class, not of a caller passing ``p_mask = 1``.
+
+    The signature matches :class:`MDLMCrossEntropyLoss` /
+    :class:`HybridDiffusionLLMLoss` so the recipe can call it uniformly; the
+    ``p_mask`` / ``causal_logits`` / ``loss_mask_ar`` / ``num_ar_tokens``
+    arguments are accepted but ignored.
+    """
+
+    def __init__(self, fp32_upcast: bool = True):
+        super().__init__()
+        self.fp32_upcast = fp32_upcast
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        noise_mask: torch.Tensor,
+        p_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        loss_mask_ar: Optional[torch.Tensor] = None,
+        num_diffusion_tokens: Optional[int] = None,
+        num_ar_tokens: Optional[int] = None,
+        causal_logits: Optional[torch.Tensor] = None,
+    ) -> DLLMLossOutput:
+        """Compute the flat block-diffusion cross-entropy loss.
+
+        Args:
+            logits: Model output logits over the canvas, shape ``[B, L, V]``.
+            target_ids: Clean (uncorrupted) canvas token IDs, shape ``[B, L]``.
+            noise_mask: Boolean mask of corrupted positions, shape ``[B, L]``.
+            p_mask: Ignored (flat loss has no per-token weight).
+            loss_mask: Supervised positions mask, shape ``[B, L]``.
+            num_diffusion_tokens: If provided, the global corrupted-token count
+                used as the normalization denominator (summed across grad-acc
+                microbatches). If ``None``, normalizes by the local corrupted
+                count in this microbatch.
+
+        Returns:
+            :class:`DLLMLossOutput` where ``total_loss == dllm_loss`` (no AR).
+        """
+        token_nll = _compute_per_token_nll(logits, target_ids)  # [B, L]
+        del logits
+
+        # ALL supervised canvas positions (corrupted AND uncorrupted) — matches
+        # Google's decoder target_mask = canvas_mask (NOT noise-gated). noise_mask
+        # is intentionally unused here; the loss support is the full canvas.
+        del noise_mask
+        mask = loss_mask.bool().to(token_nll.dtype)
+        loss = (token_nll * mask).sum()
+
+        denom = num_diffusion_tokens if num_diffusion_tokens is not None else int(mask.sum().item())
+        loss = loss / max(denom, 1)
 
         return DLLMLossOutput(total_loss=loss, dllm_loss=loss.detach().clone())
 
