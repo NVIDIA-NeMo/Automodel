@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import pathlib
 from contextlib import nullcontext
@@ -61,15 +60,13 @@ from nemo_automodel.recipes.base_recipe import (
     _is_checkpoint_model_config_compatible,
     _resolve_restore_from_to_ckpt_dir,
 )
+from nemo_automodel.recipes.llm._spec_train_utils import (
+    make_warmup_cosine_schedule,
+    optim_steps_per_epoch,
+    should_sync_grads,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _optim_steps_per_epoch(num_batches_per_epoch: int, grad_accumulation_steps: int) -> int:
-    """Return ceil(num_batches / accum), the actual number of optimizer steps per epoch."""
-    if num_batches_per_epoch <= 0 or grad_accumulation_steps <= 0:
-        return 0
-    return -(-num_batches_per_epoch // grad_accumulation_steps)
 
 
 def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
@@ -232,21 +229,14 @@ class TrainDFlashRecipe(BaseRecipe):
         except TypeError:
             num_batches_per_epoch = 0
         total_optim_steps = max(
-            1, self.num_epochs * _optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps)
+            1, self.num_epochs * optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps)
         )
         warmup_ratio = float(opt_cfg.get("warmup_ratio", 0.05))
         min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
         warmup_steps = max(1, int(warmup_ratio * total_optim_steps))
-
-        def _lr_lambda(step: int) -> float:
-            if step < warmup_steps:
-                return float(step + 1) / float(warmup_steps)
-            progress = (step - warmup_steps) / max(1, total_optim_steps - warmup_steps)
-            progress = min(max(progress, 0.0), 1.0)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, _lr_lambda)
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, make_warmup_cosine_schedule(warmup_steps, total_optim_steps, min_lr_ratio)
+        )
         self.total_optim_steps = total_optim_steps
         self.runtime = SimpleNamespace(global_step=0)
         self._resume_epoch = 0
@@ -557,10 +547,14 @@ class TrainDFlashRecipe(BaseRecipe):
                     attention_mask=batch["attention_mask"],
                     loss_mask=batch["loss_mask"],
                 )
-                is_window_close = (pending_micro_batches + 1 == self.grad_accumulation_steps) or (
-                    batch_idx + 1 == num_batches
+                sync_grads = should_sync_grads(
+                    pending_micro_batches=pending_micro_batches,
+                    grad_accumulation_steps=self.grad_accumulation_steps,
+                    batch_idx=batch_idx,
+                    batches_per_epoch=num_batches,
+                    is_ddp=is_ddp,
                 )
-                sync_ctx = nullcontext() if (not is_ddp or is_window_close) else self.trainer_module.no_sync()
+                sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
                 try:
                     with sync_ctx:
                         metrics = self.trainer_module(

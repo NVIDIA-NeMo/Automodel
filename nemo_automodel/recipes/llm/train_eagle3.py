@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import pathlib
 from collections import deque
@@ -64,52 +63,14 @@ from nemo_automodel.recipes.base_recipe import (
     _is_checkpoint_model_config_compatible,
     _resolve_restore_from_to_ckpt_dir,
 )
+from nemo_automodel.recipes.llm._spec_train_utils import (
+    make_warmup_cosine_schedule,
+    optim_steps_per_epoch,
+    should_sync_grads,
+)
 from nemo_automodel.recipes.llm.peagle_recipe import PeagleRecipeMixin
 
 logger = logging.getLogger(__name__)
-
-
-def _optim_steps_per_epoch(num_batches_per_epoch: int, grad_accumulation_steps: int) -> int:
-    """Return ceil(num_batches / accum), the actual number of optimizer steps per epoch.
-
-    Floor division silently drops the trailing partial accumulation window
-    (up to ``grad_accumulation_steps - 1`` micro-batches) from the LR
-    scheduler's view of training, even though the trainer now flushes those
-    gradients with an explicit step. Ceil keeps the scheduler aligned with
-    the actual number of ``optimizer.step()`` calls.
-    """
-    if num_batches_per_epoch <= 0 or grad_accumulation_steps <= 0:
-        return 0
-    return -(-num_batches_per_epoch // grad_accumulation_steps)
-
-
-def _should_sync_grads(
-    *,
-    pending_micro_batches: int,
-    grad_accumulation_steps: int,
-    batch_idx: int,
-    batches_per_epoch: int | None,
-    is_ddp: bool,
-) -> bool:
-    """Return True when this micro-batch's backward should all-reduce gradients.
-
-    Under DDP with gradient accumulation only the micro-batch immediately
-    followed by an ``optimizer.step()`` needs to synchronize: at that point the
-    locally-accumulated ``.grad`` already holds the whole window's contribution,
-    so a single all-reduce averages the complete window and the intervening
-    micro-batches can run under ``no_sync()`` -- saving ``grad_accumulation_steps - 1``
-    all-reduces per window. That step is either the window closer
-    (``pending_micro_batches + 1 == grad_accumulation_steps``) or the epoch's
-    final batch (which the trailing-flush step consumes). When the dataloader
-    length is unknown we cannot identify the final batch, so we sync every step
-    (correct, just no speedup). With a single process (no DDP) there is nothing
-    to synchronize, so this is always True.
-    """
-    if not is_ddp or batches_per_epoch is None:
-        return True
-    closes_window = pending_micro_batches + 1 == grad_accumulation_steps
-    is_last_batch = batch_idx == batches_per_epoch - 1
-    return closes_window or is_last_batch
 
 
 def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
@@ -308,21 +269,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # final epoch trains at ``min_lr_ratio`` instead of the intended decay.
         total_optim_steps = max(
             1,
-            self.num_epochs * _optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps),
+            self.num_epochs * optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps),
         )
         warmup_ratio = float(opt_cfg.get("warmup_ratio", 0.05))
         min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
         warmup_steps = max(1, int(warmup_ratio * total_optim_steps))
-
-        def _lr_lambda(step: int) -> float:
-            if step < warmup_steps:
-                return float(step + 1) / float(warmup_steps)
-            progress = (step - warmup_steps) / max(1, total_optim_steps - warmup_steps)
-            progress = min(max(progress, 0.0), 1.0)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, _lr_lambda)
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, make_warmup_cosine_schedule(warmup_steps, total_optim_steps, min_lr_ratio)
+        )
         self.total_optim_steps = total_optim_steps
         self.warmup_steps = warmup_steps
         self.min_lr_ratio = min_lr_ratio
@@ -1019,7 +973,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     # Skip DDP's per-micro-batch all-reduce on every micro-batch
                     # except the one an optimizer step immediately follows; that
                     # step's all-reduce covers the whole locally-accumulated window.
-                    sync_grads = _should_sync_grads(
+                    sync_grads = should_sync_grads(
                         pending_micro_batches=pending_micro_batches,
                         grad_accumulation_steps=self.grad_accumulation_steps,
                         batch_idx=batch_idx,
