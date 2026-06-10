@@ -52,9 +52,7 @@ def _reference_idlm_mask(seq_len, block_size, valid_mask, use_regular_causal=Tru
 
 
 def _check_matches(seq_len, block_size, valid_mask):
-    sdpa = create_idlm_sdpa_mask(
-        seq_len, block_size, valid_mask, device=torch.device("cpu"), dtype=torch.float32
-    )
+    sdpa = create_idlm_sdpa_mask(seq_len, block_size, valid_mask, device=torch.device("cpu"), dtype=torch.float32)
     ref = _reference_idlm_mask(seq_len, block_size, valid_mask)
     assert sdpa.shape == (valid_mask.shape[0], 1, 2 * seq_len, 2 * seq_len)
     assert torch.equal(sdpa == 0.0, ref)

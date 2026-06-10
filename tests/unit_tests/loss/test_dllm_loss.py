@@ -618,6 +618,8 @@ class TestIDLMLossDTensor:
         sharded = loss_fn(dlogits, target, answer_mask, valid_mask, seq_len=L).total_loss
 
         assert torch.allclose(plain, sharded, atol=1e-5), f"plain {plain.item():.6f} != DTensor {sharded.item():.6f}"
+
+
 class TestDFlashNormalizeMean:
     """``normalize="mean"`` divides by the effective weight sum (decay-weighted mean)."""
 
