@@ -683,6 +683,54 @@ def test_shard_fp32_gdn_holders_shards_each_holder(monkeypatch):
     assert kwargs["reshard_after_forward"] is False
 
 
+def test_apply_fsdp_shards_fp32_gdn_holders_when_isolated(monkeypatch):
+    """apply_fsdp builds an fp32 holder policy and shards each holder per block when
+    ``isolate_gated_delta_net_fp32_params`` reports intrinsically-fp32 GDN params."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="FP32_MP"))
+
+    # Force the lazily-imported isolation helper to report fp32 GDN params so the
+    # fp32 branch (policy build + per-block holder shard) runs.
+    gdn_stub = sys.modules["nemo_automodel.components.models.common.gated_delta_net_fp32"]
+    monkeypatch.setattr(gdn_stub, "isolate_gated_delta_net_fp32_params", lambda model: True)
+
+    holder = type("Holder", (), {"_modules": {}})()
+    gdn = type("GDN", (), {"_modules": {"_fp32_params": holder}})()
+
+    class BlockWithHolder:
+        def __init__(self):
+            self._modules = {}
+            self.mlp = DummyMoE()
+            self._gdn = gdn
+
+        def modules(self):
+            return iter([self, self._gdn, holder])
+
+    block = BlockWithHolder()
+    model = DummyModel([block])
+    fsdp_mesh = object()
+    mp_policy = MagicMock()  # provides reduce_dtype / cast_forward_inputs for the fp32 policy
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        ep_shard_mesh=None,
+        mp_policy=mp_policy,
+    )
+
+    # The holder is sharded as its own fp32 unit before the block-level shard.
+    holder_call = _find_call_by_first_arg(fully_shard_mock, holder)
+    assert holder_call is not None
+    _, holder_kwargs = holder_call
+    assert holder_kwargs["mesh"] is fsdp_mesh
+    assert holder_kwargs["mp_policy"] == "FP32_MP"
+
+
 def test_apply_fsdp_without_ep_enabled_has_no_ignored_params(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)

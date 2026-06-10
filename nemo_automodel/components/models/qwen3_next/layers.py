@@ -59,7 +59,7 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
             return holder(a)
         return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-    def forward(
+    def forward(  # pragma: no cover - verbatim HF GDN forward; needs CUDA conv1d/FLA kernels (GPU/functional only)
         self,
         hidden_states: torch.Tensor,
         cache_params: Any | None = None,
