@@ -23,7 +23,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from nemo_automodel.components.speculative.dflash.core import NoValidAnchorsError
 from nemo_automodel.recipes.llm import train_dflash
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
 
@@ -102,6 +104,78 @@ def test_resolve_mask_token_id_range_checks():
         cfg = SimpleNamespace(get=lambda k, d=None, _v=bad: _v if k == "mask_token_id" else d)
         with pytest.raises(ValueError, match="out of range"):
             TrainDFlashRecipe._resolve_mask_token_id(cfg, vocab_size=1000)
+
+
+class _StubTrainerModule:
+    """Callable trainer stub: yields one queued result (or raises it) per batch."""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.mode_calls = []
+
+    def eval(self):
+        self.mode_calls.append("eval")
+
+    def train(self):
+        self.mode_calls.append("train")
+
+    def __call__(self, **kwargs):
+        result = self._results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _eval_self(trainer, num_batches):
+    batch = {
+        "input_ids": torch.zeros(1, 4, dtype=torch.long),
+        "attention_mask": torch.ones(1, 4, dtype=torch.long),
+        "loss_mask": torch.ones(1, 4, dtype=torch.long),
+    }
+    return SimpleNamespace(
+        val_dataloader=[dict(batch) for _ in range(num_batches)],
+        device=torch.device("cpu"),
+        trainer_module=trainer,
+        target_wrapper=SimpleNamespace(
+            generate_batch=lambda **kw: SimpleNamespace(
+                input_ids=kw["input_ids"],
+                hidden_states=kw["input_ids"],
+                loss_mask=kw["loss_mask"],
+            )
+        ),
+    )
+
+
+def test_run_eval_returns_none_without_val_dataloader():
+    obj = SimpleNamespace(val_dataloader=None)
+    assert TrainDFlashRecipe._run_eval(obj) is None
+
+
+def test_run_eval_skips_short_micro_batches():
+    trainer = _StubTrainerModule(
+        [
+            SimpleNamespace(loss=torch.tensor(1.0), accuracy=torch.tensor(0.5)),
+            NoValidAnchorsError("all samples too short"),
+            SimpleNamespace(loss=torch.tensor(3.0), accuracy=torch.tensor(1.0)),
+        ]
+    )
+    obj = _eval_self(trainer, num_batches=3)
+
+    metrics = TrainDFlashRecipe._run_eval(obj)
+
+    # The short batch is skipped without counting: averages are over 2 batches.
+    assert metrics == {"val_loss": 2.0, "val_accuracy": 0.75}
+    assert trainer.mode_calls == ["eval", "train"]
+
+
+def test_run_eval_all_batches_short_returns_zero_metrics():
+    trainer = _StubTrainerModule([NoValidAnchorsError("short"), NoValidAnchorsError("short")])
+    obj = _eval_self(trainer, num_batches=2)
+
+    metrics = TrainDFlashRecipe._run_eval(obj)
+
+    assert metrics == {"val_loss": 0.0, "val_accuracy": 0.0}
+    assert trainer.mode_calls == ["eval", "train"]
 
 
 def test_all_ranks_have_valid_single_process_passes_local_flag():

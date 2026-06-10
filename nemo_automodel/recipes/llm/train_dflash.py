@@ -530,11 +530,16 @@ class TrainDFlashRecipe(BaseRecipe):
                     attention_mask=batch["attention_mask"],
                     loss_mask=batch["loss_mask"],
                 )
-                metrics = self.trainer_module(
-                    input_ids=target_batch.input_ids,
-                    hidden_states=target_batch.hidden_states,
-                    loss_mask=target_batch.loss_mask,
-                )
+                try:
+                    metrics = self.trainer_module(
+                        input_ids=target_batch.input_ids,
+                        hidden_states=target_batch.hidden_states,
+                        loss_mask=target_batch.loss_mask,
+                    )
+                except NoValidAnchorsError:
+                    # Every sample in this micro-batch is too short to form a block;
+                    # skip it without counting, mirroring the training loop.
+                    continue
                 total_loss += metrics.loss.detach()
                 total_acc += metrics.accuracy.detach()
                 total_batches += 1
