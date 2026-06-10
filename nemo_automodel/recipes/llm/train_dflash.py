@@ -76,6 +76,24 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
+def _all_ranks_have_valid(local_has_valid: int, is_ddp: bool, device) -> bool:
+    """Min-reduce a per-rank "this micro-batch has valid anchors" flag.
+
+    Under DDP a data-dependent ``NoValidAnchorsError`` skip is per-rank: if one
+    rank skips its backward (and its gradient all-reduce) while another runs its,
+    the collective mismatches (hang) and the accumulation windows desync. Taking
+    the MIN across ranks makes the skip decision unanimous -- every rank skips the
+    micro-batch unless all of them have something to learn from it. The reduce is
+    a tiny independent collective, safe inside ``no_sync`` (which only gates the
+    DDP backward all-reduce). Single-process runs return the local flag unchanged.
+    """
+    if not is_ddp or not (dist.is_available() and dist.is_initialized()):
+        return bool(local_has_valid)
+    flag = torch.tensor([local_has_valid], device=device, dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
+
+
 class TrainDFlashRecipe(BaseRecipe):
     """Recipe for DFlash draft-model training on Qwen3-style dense / MoE targets."""
 
@@ -568,21 +586,27 @@ class TrainDFlashRecipe(BaseRecipe):
                     is_ddp=is_ddp,
                 )
                 sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
-                try:
-                    with sync_ctx:
+                with sync_ctx:
+                    local_has_valid = 1
+                    try:
                         metrics = self.trainer_module(
                             input_ids=target_batch.input_ids,
                             hidden_states=target_batch.hidden_states,
                             loss_mask=target_batch.loss_mask,
                         )
                         loss = metrics.loss / self.grad_accumulation_steps
+                    except NoValidAnchorsError:
+                        # Every sample in this micro-batch is too short to form a
+                        # block; nothing to learn from it on this rank.
+                        local_has_valid = 0
+                    # Decide skip-vs-backward in lockstep so a per-rank skip never
+                    # leaves one rank issuing its gradient all-reduce alone (DDP
+                    # hang) or desyncs the accumulation windows: if ANY rank has no
+                    # valid anchors, ALL ranks skip this micro-batch together.
+                    all_have_valid = _all_ranks_have_valid(local_has_valid, is_ddp, self.device)
+                    if all_have_valid:
                         loss.backward()
-                except NoValidAnchorsError:
-                    # Every sample in this micro-batch is too short to form a block;
-                    # nothing to learn from it. Skip without touching the
-                    # accumulation counters. (No backward ran, so grads are intact.)
-                    # NOTE: under DDP this skip is per-rank and data-dependent; pre-filter
-                    # short samples for multi-rank runs to keep optimizer steps in lockstep.
+                if not all_have_valid:
                     self._skipped_micro_batches += 1
                     continue
 
