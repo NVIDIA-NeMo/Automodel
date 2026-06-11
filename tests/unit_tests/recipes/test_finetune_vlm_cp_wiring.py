@@ -594,10 +594,12 @@ def test_val_pos_ids_uses_dist_env_device_not_model_device():
         _ = torch.arange(0, 4).unsqueeze(0).to(model.device)
 
 
-def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
-    """``total_loss`` is all-reduced with include_cp=True, but ``total_tokens``
-    (measured pre-CP-shard) must NOT include CP — otherwise val_loss is scaled
-    down by cp_size. Guards the fix at finetune.py:_run_validation_epoch."""
+def test_run_validation_epoch_reduces_tokens_over_cp(monkeypatch):
+    """The VLM recipe shards labels *before* counting (``local_num_label_tokens``
+    is the per-CP-shard count), so ``total_tokens`` / ``total_num_label_tokens``
+    must be all-reduced WITH include_cp=True — matching the CP-summed
+    ``total_loss`` — so ``val_loss = total_loss / total_num_label_tokens`` divides
+    like-for-like. Guards finetune.py:_run_validation_epoch."""
     from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
     # No-op replacements for the heavy collaborators.
@@ -647,6 +649,6 @@ def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
     loss_call = allreduce_calls[loss_idx]
     tokens_call = allreduce_calls[loss_idx + 1]
     assert loss_call[2] is True, "total_loss must include CP ranks"
-    assert tokens_call[2] is False, "total_tokens must NOT be summed over CP ranks"
+    assert tokens_call[2] is True, "total_tokens must be summed over CP ranks (counts are per-shard)"
     # val_loss = (2.0 * 3 tokens) / 3 tokens == 2.0
     assert result.metrics["val_loss"] == pytest.approx(2.0)
