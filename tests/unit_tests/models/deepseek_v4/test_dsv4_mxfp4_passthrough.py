@@ -14,15 +14,21 @@
 
 """mxfp4 passthrough load path for DeepSeek-V4: experts load packed, never bf16."""
 
+import json
+import os
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.fp4_utils import dequantize_mxfp4, quantize_mxfp4
+from nemo_automodel.components.quantization.mxfp4 import dequantize_mxfp4, quantize_mxfp4
+
+# Real DeepSeek-V4-Flash checkpoint (fp4 experts). Tests using it self-skip when absent.
+_REAL_CKPT = "/raid0/data/models/DeepSeek-V4-Flash"
 
 HIDDEN = 64
 MOE_INTER = 32
@@ -123,3 +129,62 @@ def test_passthrough_decodes_to_same_weights_as_bf16_path():
 
     assert torch.equal(gu_unpacked, gu_bf16)
     assert torch.equal(dn_unpacked, dn_bf16)
+
+
+@pytest.mark.skipif(
+    not os.path.isdir(_REAL_CKPT) or not os.path.isfile(f"{_REAL_CKPT}/model.safetensors.index.json"),
+    reason=f"real DeepSeek-V4-Flash checkpoint not present at {_REAL_CKPT}",
+)
+def test_passthrough_against_real_checkpoint():
+    """Validate passthrough on real fp4 expert tensors: correct dtypes/shapes and
+    bit-exact decode vs the bf16 dequant path on actual checkpoint bytes."""
+    from safetensors import safe_open
+
+    layer, n_exp = 3, 8
+    weight_map = json.load(open(f"{_REAL_CKPT}/model.safetensors.index.json"))["weight_map"]
+    needed = [
+        f"layers.{layer}.ffn.experts.{e}.{w}.{suffix}"
+        for e in range(n_exp)
+        for w in ("w1", "w2", "w3")
+        for suffix in ("weight", "scale")
+    ]
+    by_file: dict[str, list[str]] = {}
+    for k in needed:
+        by_file.setdefault(weight_map[k], []).append(k)
+    sd = {}
+    for fname, keys in by_file.items():
+        with safe_open(f"{_REAL_CKPT}/{fname}", framework="pt") as h:
+            for k in keys:
+                sd[k] = h.get_tensor(k)
+
+    # Real layout: int8 packed weights + float8_e8m0fnu scales.
+    w1 = sd[f"layers.{layer}.ffn.experts.0.w1.weight"]
+    assert w1.dtype == torch.int8
+    assert sd[f"layers.{layer}.ffn.experts.0.w1.scale"].dtype == torch.float8_e8m0fnu
+
+    cfg = DeepseekV4Config.from_pretrained(_REAL_CKPT)
+    moe_config = Mock(spec=MoEConfig)
+    moe_config.n_routed_experts = n_exp
+    moe_config.moe_inter_dim = cfg.moe_intermediate_size
+
+    def adapter(fmt):
+        return DeepSeekV4StateDictAdapter(
+            cfg, moe_config, BackendConfig(), dtype=torch.bfloat16, expert_storage_format=fmt
+        )
+
+    out_mx = adapter("mxfp4").from_hf(dict(sd))
+    out_bf16 = adapter("bf16").from_hf({k: v.clone() for k, v in sd.items()})
+
+    base = f"model.layers.{layer}.mlp.experts"
+    assert out_mx[f"{base}.gate_and_up_projs_packed"].dtype == torch.int8
+    assert out_mx[f"{base}.gate_and_up_projs_packed"].shape == (
+        n_exp,
+        2 * cfg.moe_intermediate_size,
+        cfg.hidden_size // 2,
+    )
+
+    for proj in ("gate_and_up_projs", "down_projs"):
+        unpacked = dequantize_mxfp4(
+            out_mx[f"{base}.{proj}_packed"], out_mx[f"{base}.{proj}_scales"], torch.bfloat16
+        ).transpose(-2, -1)
+        assert torch.equal(unpacked, out_bf16[f"{base}.{proj}"]), f"{proj} decode mismatch vs bf16 path"
