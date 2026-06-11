@@ -36,6 +36,15 @@ class _FakeGatedDeltaNet(nn.Module):
         self.in_proj = nn.Linear(8, 8, bias=False)
 
 
+class _FakeSsmMixer(nn.Module):
+    """Minimal non-GDN SSM-like module with A_log/dt_bias params."""
+
+    def __init__(self, a_dtype: torch.dtype = torch.bfloat16, dt_dtype: torch.dtype = torch.bfloat16, num_v: int = 4):
+        super().__init__()
+        self.A_log = nn.Parameter(torch.zeros(num_v, dtype=a_dtype))
+        self.dt_bias = nn.Parameter(torch.ones(num_v, dtype=dt_dtype))
+
+
 def _wrap_in_model(gdn: nn.Module) -> nn.Module:
     """Build a tiny model with ``layers.0.linear_attn = gdn``."""
     model = nn.Module()
@@ -171,6 +180,16 @@ class TestIsolateAcrossModel:
         model = nn.Module()
         model.mlp = nn.Linear(4, 4)
         assert isolate_gated_delta_net_fp32_params(model) is False
+
+    def test_non_linear_attn_a_log_module_is_noop(self):
+        model = nn.Module()
+        model.mixer = _FakeSsmMixer()
+
+        assert isolate_gated_delta_net_fp32_params(model) is False
+        assert HOLDER_NAME not in model.mixer._modules
+        assert model.mixer.A_log.dtype == torch.bfloat16
+        assert model.mixer.dt_bias.dtype == torch.bfloat16
+        assert not hasattr(model, "_keep_in_fp32_modules_strict")
 
 
 class TestMarkKeepInFp32:

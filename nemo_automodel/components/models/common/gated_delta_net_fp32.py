@@ -219,24 +219,30 @@ def mark_keep_in_fp32_modules_strict(model: torch.nn.Module) -> None:
 def isolate_gated_delta_net_fp32_params(model: torch.nn.Module) -> bool:
     """Isolate fp32 GatedDeltaNet params across ``model`` for fp32 FSDP compute.
 
-    Walks the model, and for every GatedDeltaNet-like module (identified by a bare
-    ``A_log`` parameter, or an already-created ``_fp32_params`` holder) moves its
-    fp32 bare params into a ``_fp32_params`` holder. When at least one holder
-    exists, declares ``_fp32_params`` on ``model._keep_in_fp32_modules_strict`` so
-    the custom-MoE FSDP path shards those params in their own fp32 unit.
+    Walks the model, and for every GatedDeltaNet linear-attention module
+    (identified by a ``linear_attn`` qualified module name plus a bare ``A_log``
+    parameter, or an already-created ``_fp32_params`` holder) moves its fp32 bare
+    params into a ``_fp32_params`` holder. When at least one holder exists,
+    declares ``_fp32_params`` on ``model._keep_in_fp32_modules_strict`` so the
+    custom-MoE FSDP path shards those params in their own fp32 unit.
 
     Idempotent and safe to call on models without GatedDeltaNet layers (no-op).
+    The ``linear_attn`` name guard is intentional: other architectures such as
+    Mamba also have ``A_log`` parameters, but they do not call the fp32 holder's
+    ``forward`` and therefore must not be wrapped by this GDN-specific helper.
     Returns ``True`` if any fp32 holder is present after the walk.
     """
-    modules_fn = getattr(model, "modules", None)
-    if not callable(modules_fn):
+    named_modules_fn = getattr(model, "named_modules", None)
+    if not callable(named_modules_fn):
         return False
 
     isolated_any = False
     # Materialize the module list first: isolate_fp32_params adds a ``_fp32_params``
     # child, mutating the module tree mid-walk.
-    for module in list(modules_fn()):
+    for name, module in list(named_modules_fn()):
         if isinstance(module, Fp32GateParamHolder):
+            continue
+        if name != "linear_attn" and not name.endswith(".linear_attn"):
             continue
         params = getattr(module, "_parameters", None)
         mods = getattr(module, "_modules", None)
