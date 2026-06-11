@@ -274,6 +274,71 @@ def has_local_tied_lm_head(model: nn.Module) -> bool:
     return _same_tensor_storage(lm_head_weight, input_embeddings_weight)
 
 
+def _get_module_by_normalized_name(model: nn.Module, normalized_module_name: str) -> nn.Module | None:
+    """Return a module by FQN after applying wrapper-prefix normalization."""
+    if normalized_module_name == "":
+        return model
+    for name, module in model.named_modules():
+        if _normalize_param_name(name) == normalized_module_name:
+            return module
+    return None
+
+
+def ensure_tied_lm_head(model: nn.Module) -> bool:
+    """Ensure a local tied LM head actually aliases the input embedding.
+
+    Hugging Face ``tie_weights()`` is the first choice because model classes can
+    have custom tying rules. The direct assignment fallback handles wrapped
+    models whose generic ``tie_weights()`` no longer reaches the local
+    ``lm_head``/embedding pair after sharding.
+
+    Args:
+        model: Model or pipeline stage to inspect and update.
+
+    Returns:
+        ``True`` if the local ``lm_head`` and input embedding are tied after the
+        call, otherwise ``False``.
+    """
+    if not is_tied_word_embeddings(model):
+        return False
+    if has_local_tied_lm_head(model):
+        return True
+
+    lm_head_weight, lm_head_param_name = get_lm_head_weight_and_name(model)
+    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
+    if lm_head_weight is not None and input_embeddings_weight is not None:
+        if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
+            return False
+
+    tie_weights = getattr(model, "tie_weights", None)
+    if callable(tie_weights):
+        try:
+            tie_weights()
+        except AttributeError:
+            pass
+        if has_local_tied_lm_head(model):
+            return True
+
+    lm_head_weight, lm_head_param_name = get_lm_head_weight_and_name(model)
+    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
+    if lm_head_weight is None or lm_head_param_name is None or input_embeddings_weight is None:
+        return False
+    if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
+        return False
+
+    lm_head_module_name = lm_head_param_name.rsplit(".", 1)[0]
+    lm_head_module = _get_module_by_normalized_name(model, lm_head_module_name)
+    if lm_head_module is None or not hasattr(lm_head_module, "weight"):
+        return False
+
+    try:
+        lm_head_module.weight = input_embeddings_weight
+    except (AttributeError, TypeError, RuntimeError):
+        return False
+
+    return has_local_tied_lm_head(model)
+
+
 def _same_tensor_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
     """Return whether two tensors are aliases of the same local storage."""
     if left is right:

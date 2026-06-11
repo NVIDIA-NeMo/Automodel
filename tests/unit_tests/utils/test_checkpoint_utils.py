@@ -135,6 +135,24 @@ def test_has_local_tied_lm_head_false_when_shapes_match_but_storage_is_untied():
     assert checkpoint_utils.has_local_tied_lm_head(model) is False
 
 
+def test_ensure_tied_lm_head_aliases_matching_local_weights():
+    """Configured tied embeddings should become an actual local alias."""
+    model = _DraftLikeModel(embed_vocab=32000, lm_head_vocab=32000, hidden=128, tie_word_embeddings=True)
+
+    assert checkpoint_utils.ensure_tied_lm_head(model) is True
+
+    assert model.lm_head.weight is model.model.embed_tokens.weight
+    assert checkpoint_utils.has_local_tied_lm_head(model) is True
+
+
+def test_ensure_tied_lm_head_false_when_shapes_disagree():
+    """Do not alias intentionally asymmetric heads, even when the config flag is set."""
+    model = _DraftLikeModel(embed_vocab=128256, lm_head_vocab=8192, hidden=2048, tie_word_embeddings=True)
+
+    assert checkpoint_utils.ensure_tied_lm_head(model) is False
+    assert checkpoint_utils.has_local_tied_lm_head(model) is False
+
+
 def test_has_local_tied_lm_head_false_when_flag_unset():
     """Even with matching shapes, untied config means not locally tied."""
     model = _DraftLikeModel(embed_vocab=32000, lm_head_vocab=32000, hidden=128, tie_word_embeddings=False)
