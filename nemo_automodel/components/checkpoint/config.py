@@ -138,6 +138,15 @@ class CheckpointingConfig:
 
         # Normalize legacy bools and string aliases to a consolidated export mode.
         self.save_consolidated = _normalize_save_consolidated(self.save_consolidated)
+
+        # Consolidated HF safetensors export needs local filesystem semantics and is not
+        # supported on msc:// cloud storage paths; use DCP (save_consolidated=false) instead.
+        if self.save_consolidated != SaveConsolidatedMode.FALSE and str(self.checkpoint_dir).startswith("msc://"):
+            raise ValueError(
+                f"Consolidated safetensors export (save_consolidated={self.save_consolidated.value}) is not "
+                f"compatible with remote cloud storage paths ('{self.checkpoint_dir}'). Set save_consolidated=false "
+                f"to use DCP format with MSC cloud storage instead."
+            )
         if self.save_consolidated != SaveConsolidatedMode.FALSE and not self.is_peft:
             if not self.v4_compatible:
                 logging.warning(
