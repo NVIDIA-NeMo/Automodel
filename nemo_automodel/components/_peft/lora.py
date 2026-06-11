@@ -632,13 +632,22 @@ def apply_lora_to_linear_modules(
     return num_modules_matched
 
 
-def convert_frozen_experts_to_mxfp4(model: nn.Module) -> int:
+def convert_frozen_experts_to_mxfp4(model: nn.Module, passthrough: bool = False) -> int:
     """Swap frozen ``GroupedExperts`` modules to mxfp4-resident ``GroupedExpertsMXFP4``.
 
     Applies to routed experts that are NOT LoRA-targeted (those that received a
     LoRA adapter are already ``GroupedExpertsLoRAMXFP4``). This is the path that
     delivers the storage win for the common case of LoRA on attention with frozen
     experts. Must be called with the base weights frozen.
+
+    Args:
+        model: Model to convert in place.
+        passthrough: When True, build the new modules in packed-storage mode at
+            init (no bf16 weights) so a packed fp4 checkpoint loads straight in,
+            capping the load-time peak. The state-dict adapter must also be put in
+            ``expert_storage_format='mxfp4'`` so it emits packed keys. When False
+            (default), weights load as bf16 and pack after load (higher load peak,
+            but works with any checkpoint and is the validated path).
 
     Returns:
         Number of expert modules converted.
@@ -656,7 +665,7 @@ def convert_frozen_experts_to_mxfp4(model: nn.Module) -> int:
             unsupported += 1
             continue
         if type(module) is GroupedExperts:
-            new_module = GroupedExpertsMXFP4(module)
+            new_module = GroupedExpertsMXFP4(module, passthrough=passthrough)
             parent_name, _, child_name = name.rpartition(".")
             parent = model.get_submodule(parent_name) if parent_name else model
             setattr(parent, child_name, new_module)
