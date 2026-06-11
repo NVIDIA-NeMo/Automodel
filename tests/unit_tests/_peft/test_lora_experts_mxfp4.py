@@ -15,11 +15,12 @@
 import pytest
 import torch
 
-from nemo_automodel.components._peft.lora import patch_moe_module
+from nemo_automodel.components._peft.lora import convert_frozen_experts_to_mxfp4, patch_moe_module
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA, GroupedExpertsLoRAMXFP4
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fp4_utils import dequantize_mxfp4, quantize_mxfp4
 from nemo_automodel.components.moe.layers import GroupedExperts
+from nemo_automodel.components.moe.quantized_experts import GroupedExpertsMXFP4
 
 
 @pytest.fixture
@@ -213,3 +214,61 @@ def test_patch_moe_module_mxfp4(moe_config, device):
     patched_bf16 = patch_moe_module(orig, dim=4, alpha=8)
     assert isinstance(patched_bf16, GroupedExpertsLoRA)
     assert not isinstance(patched_bf16, GroupedExpertsLoRAMXFP4)
+
+
+# --- frozen experts (no adapter) ---------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_frozen_mxfp4_packs_and_freezes(moe_config, device):
+    orig = GroupedExperts(moe_config).to(device)
+    orig.use_torch_mm = True
+    with torch.no_grad():
+        orig.init_weights(buffer_device=device)
+
+    mx = GroupedExpertsMXFP4(orig)
+    assert mx._mxfp4_resident
+    assert not hasattr(mx, "gate_and_up_projs")
+    assert mx.gate_and_up_projs_packed.dtype == torch.int8
+    assert mx.down_projs_scales.dtype == torch.float8_e8m0fnu
+    # Nothing trainable: experts are fully frozen.
+    assert [n for n, p in mx.named_parameters() if p.requires_grad] == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_frozen_mxfp4_forward_matches_bf16(moe_config, device):
+    orig = GroupedExperts(moe_config).to(device)
+    orig.use_torch_mm = True
+    with torch.no_grad():
+        orig.init_weights(buffer_device=device)
+    _make_representable_(orig)
+
+    mx = GroupedExpertsMXFP4(orig)
+    x, token_mask, weights, indices = _routing_inputs(moe_config, 32, device, torch.bfloat16)
+
+    # Reference: bf16 grouped_mm path on the same (fp4-representable) weights.
+    y_ref = orig(x.detach(), token_mask, weights, indices)
+    y_mx = mx(x.detach(), token_mask, weights, indices)
+    torch.testing.assert_close(y_mx, y_ref, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_convert_frozen_experts_to_mxfp4(moe_config, device):
+    import torch.nn as nn
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            e = GroupedExperts(moe_config)
+            e.use_torch_mm = True
+            self.experts = e
+
+    model = TinyModel().to(device)
+    with torch.no_grad():
+        model.experts.init_weights(buffer_device=device)
+
+    n = convert_frozen_experts_to_mxfp4(model)
+    assert n == 1
+    assert isinstance(model.experts, GroupedExpertsMXFP4)
+    # Idempotent: an already-converted module is not re-wrapped.
+    assert convert_frozen_experts_to_mxfp4(model) == 0

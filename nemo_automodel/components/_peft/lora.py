@@ -35,6 +35,7 @@ from nemo_automodel.components._peft.lora_kernel import (
 )
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
+from nemo_automodel.components.moe.quantized_experts import GroupedExpertsMXFP4, MXFP4ExpertStorageMixin
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -631,20 +632,60 @@ def apply_lora_to_linear_modules(
     return num_modules_matched
 
 
+def convert_frozen_experts_to_mxfp4(model: nn.Module) -> int:
+    """Swap frozen ``GroupedExperts`` modules to mxfp4-resident ``GroupedExpertsMXFP4``.
+
+    Applies to routed experts that are NOT LoRA-targeted (those that received a
+    LoRA adapter are already ``GroupedExpertsLoRAMXFP4``). This is the path that
+    delivers the storage win for the common case of LoRA on attention with frozen
+    experts. Must be called with the base weights frozen.
+
+    Returns:
+        Number of expert modules converted.
+    """
+    # Import here to avoid a hard dependency at module import time.
+    from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
+
+    num_converted = 0
+    unsupported = 0
+    for name, module in list(model.named_modules()):
+        # Already mxfp4-resident (frozen or LoRA-targeted) — skip.
+        if isinstance(module, MXFP4ExpertStorageMixin):
+            continue
+        if isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsTE)):
+            unsupported += 1
+            continue
+        if type(module) is GroupedExperts:
+            new_module = GroupedExpertsMXFP4(module)
+            parent_name, _, child_name = name.rpartition(".")
+            parent = model.get_submodule(parent_name) if parent_name else model
+            setattr(parent, child_name, new_module)
+            num_converted += 1
+
+    if unsupported:
+        logger.warning(
+            "expert_weight_format='mxfp4' skipped %d DeepEP/TE expert module(s); only the torch_mm "
+            "GroupedExperts backend is supported. Set backend.dispatcher='torch' and backend.experts='torch_mm'.",
+            unsupported,
+        )
+    return num_converted
+
+
 def pack_mxfp4_expert_base_weights(model: nn.Module) -> int:
     """Pack any deferred mxfp4-resident expert modules after base weights are loaded.
 
-    GroupedExpertsLoRAMXFP4 modules created on the meta device defer packing until
-    their base weights are materialized from the checkpoint. Call this after
-    checkpoint load to convert them; modules pack one at a time so the bf16
-    weights of at most one layer coexist with their packed copy.
+    Both ``GroupedExpertsLoRAMXFP4`` and frozen ``GroupedExpertsMXFP4`` modules
+    created on the meta device defer packing until their base weights are
+    materialized from the checkpoint. Call this after checkpoint load to convert
+    them; modules pack one at a time so the bf16 weights of at most one expert
+    module coexist with their packed copy.
 
     Returns:
         Number of modules packed.
     """
     num_packed = 0
     for module in model.modules():
-        if isinstance(module, GroupedExpertsLoRAMXFP4) and not module._mxfp4_resident:
+        if isinstance(module, MXFP4ExpertStorageMixin) and not module._mxfp4_resident:
             module.pack_base_weights()
             num_packed += 1
     return num_packed
