@@ -576,6 +576,15 @@ def apply_model_infrastructure(
                 if "lora_" not in name and param.requires_grad:
                     param.requires_grad_(False)
 
+    # Pack deferred mxfp4-resident expert base weights now that the checkpoint is loaded.
+    if peft_config is not None and getattr(peft_config, "expert_weight_format", "bf16") == "mxfp4":
+        from nemo_automodel.components._peft.lora import pack_mxfp4_expert_base_weights
+
+        for mp in model.parts if hasattr(model, "parts") else [model]:
+            num_packed = pack_mxfp4_expert_base_weights(mp)
+            if num_packed:
+                logger.info("Packed %d MoE expert modules to mxfp4-resident storage", num_packed)
+
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
         # Ensure model is on the correct device.
