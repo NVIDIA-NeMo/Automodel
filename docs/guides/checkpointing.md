@@ -384,7 +384,7 @@ NeMo AutoModel can write checkpoints asynchronously to reduce training stalls ca
 - **Behavior**: At most one checkpoint uploads at a time; the next save waits for the previous upload to finish. The `LATEST` symlink is updated after the async save completes (may be deferred until the next save call). During PEFT, adapter model files are written synchronously on rank 0; optimizer states can still use async.
 
 ## Advanced Usage: Save Additional States
-You can also save additional states in NeMo AutoModel. By default, we also automatically checkpoint the `dataloader`, `rng`, and `step_scheduler` states which are necessary to resume training accurately. In full, a Safetensors consolidated checkpoint will look like this:
+You can also save additional states in NeMo AutoModel. By default, NeMo AutoModel also automatically checkpoints the `dataloader`, `rng`, and `step_scheduler` states, which are necessary to resume training accurately. In full, a Safetensors consolidated checkpoint will look like this:
 
 ```
 checkpoints/
