@@ -27,7 +27,6 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.gemma4_moe import model as gm
 from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4Config,
     Gemma4ForConditionalGeneration,
@@ -67,8 +66,13 @@ def _cfg(**text_overrides):
 
 def _backend():
     return BackendConfig(
-        linear="torch", attn="sdpa", rms_norm="torch", experts="torch",
-        dispatcher="torch", fake_balanced_gate=False, enable_hf_state_dict_adapter=False,
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
     )
 
 
@@ -101,24 +105,32 @@ def test_force_repeat_kv_import_error_is_silent(monkeypatch):
 def test_packed_mask_rejects_non_2d_packed_ids():
     with pytest.raises(ValueError, match="2D"):
         _build_packed_gemma4_causal_mask_mapping(
-            torch.ones(4, dtype=torch.long), torch.zeros(4, dtype=torch.long),
-            dtype=torch.float32, sliding_window=None,
+            torch.ones(4, dtype=torch.long),
+            torch.zeros(4, dtype=torch.long),
+            dtype=torch.float32,
+            sliding_window=None,
         )
 
 
 def test_packed_mask_rejects_shape_mismatch():
     with pytest.raises(ValueError, match="same shape"):
         _build_packed_gemma4_causal_mask_mapping(
-            torch.ones(1, 4, dtype=torch.long), torch.zeros(1, 3, dtype=torch.long),
-            dtype=torch.float32, sliding_window=None,
+            torch.ones(1, 4, dtype=torch.long),
+            torch.zeros(1, 3, dtype=torch.long),
+            dtype=torch.float32,
+            sliding_window=None,
         )
 
 
 def test_packed_mask_rejects_both_additive_and_block():
     with pytest.raises(ValueError, match="Only one of"):
         _build_packed_gemma4_causal_mask_mapping(
-            torch.ones(1, 4, dtype=torch.long), torch.zeros(1, 4, dtype=torch.long),
-            dtype=torch.float32, sliding_window=None, as_additive=True, as_block_mask=True,
+            torch.ones(1, 4, dtype=torch.long),
+            torch.zeros(1, 4, dtype=torch.long),
+            dtype=torch.float32,
+            sliding_window=None,
+            as_additive=True,
+            as_block_mask=True,
         )
 
 
@@ -126,7 +138,11 @@ def test_packed_mask_additive_form_has_zero_and_neg_inf():
     packed = torch.tensor([[1, 1, 1, 1]])
     mm = torch.tensor([[0, 1, 1, 0]])
     out = _build_packed_gemma4_causal_mask_mapping(
-        packed, mm, dtype=torch.float32, sliding_window=2, as_additive=True,
+        packed,
+        mm,
+        dtype=torch.float32,
+        sliding_window=2,
+        as_additive=True,
     )
     full = out["full_attention"]
     assert full.shape == (1, 1, 4, 4)
@@ -138,7 +154,11 @@ def test_packed_mask_block_mask_form_returns_block_masks():
     packed = torch.tensor([[1, 1, 1, 1]])
     mm = torch.tensor([[0, 1, 1, 0]])
     out = _build_packed_gemma4_causal_mask_mapping(
-        packed, mm, dtype=torch.float32, sliding_window=2, as_block_mask=True,
+        packed,
+        mm,
+        dtype=torch.float32,
+        sliding_window=2,
+        as_block_mask=True,
     )
     # create_block_mask returns BlockMask objects for both layer types
     assert set(out) == {"full_attention", "sliding_attention"}
@@ -275,8 +295,11 @@ def test_forward_dense_cp_embeds_from_ids_with_softcapping():
     batch, seq = 1, 4
     hidden = torch.randn(batch, seq, cfg.text_config.hidden_size, dtype=torch.bfloat16)
     with mock.patch.object(
-        model.model.language_model, "forward",
-        return_value=SimpleNamespace(last_hidden_state=hidden, past_key_values=None, hidden_states=None, attentions=None),
+        model.model.language_model,
+        "forward",
+        return_value=SimpleNamespace(
+            last_hidden_state=hidden, past_key_values=None, hidden_states=None, attentions=None
+        ),
     ) as fwd:
         out = model(input_ids=torch.tensor([[1, 2, 3, 4]]))
     # input_ids were embedded before being passed to the text model
@@ -381,11 +404,22 @@ def test_decoder_forward_flex_kernel_options_and_padding_branches():
 
     tc = _text_config()
     mc = MoEConfig(
-        dim=tc.hidden_size, inter_dim=tc.intermediate_size, moe_inter_dim=tc.moe_intermediate_size,
-        n_routed_experts=tc.num_experts, n_shared_experts=0, n_activated_experts=tc.top_k_experts,
-        n_expert_groups=0, n_limited_groups=0, train_gate=True, gate_bias_update_factor=0.0,
-        score_func="softmax", route_scale=1.0, aux_loss_coeff=0.0, norm_topk_prob=True,
-        expert_activation="geglu", softmax_before_topk=False,
+        dim=tc.hidden_size,
+        inter_dim=tc.intermediate_size,
+        moe_inter_dim=tc.moe_intermediate_size,
+        n_routed_experts=tc.num_experts,
+        n_shared_experts=0,
+        n_activated_experts=tc.top_k_experts,
+        n_expert_groups=0,
+        n_limited_groups=0,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        aux_loss_coeff=0.0,
+        norm_topk_prob=True,
+        expert_activation="geglu",
+        softmax_before_topk=False,
     )
     layer = Gemma4MoEDecoderLayer(tc, layer_idx=0, moe_config=mc, backend=_backend()).to(torch.bfloat16)
     # Drive the flex_attention + head_dim>256 + CP-hook branches in the layer forward.

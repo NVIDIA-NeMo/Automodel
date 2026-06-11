@@ -20,7 +20,7 @@ the manual all-gather batch builder branches that the broader suite leaves
 uncovered. No GPU or real process group is required.
 """
 
-from types import MethodType, SimpleNamespace
+from types import MethodType
 from unittest import mock
 
 import pytest
@@ -135,8 +135,10 @@ def test_cp_attention_hooks_dtensor_sdpa_path():
         def from_local(t, device_mesh=None, placements=None):
             return t  # identity: treat local tensor as already-distributed
 
-    with mock.patch("torch.distributed.tensor.DTensor", _FakeDTensor), \
-         mock.patch("torch.distributed.tensor.Shard", lambda d: ("shard", d)):
+    with (
+        mock.patch("torch.distributed.tensor.DTensor", _FakeDTensor),
+        mock.patch("torch.distributed.tensor.Shard", lambda d: ("shard", d)),
+    ):
         out = attn(q, k, v)
     ref = F.scaled_dot_product_attention(q, k, v)
     assert torch.allclose(out, ref)
@@ -175,12 +177,23 @@ def test_cp_sdpa_skips_rewrap_and_unwraps_dtensor_output():
         captured["q"] = query
         return _FakeDTensor()  # DTensor output -> _cp_sdpa must call .to_local()
 
-    with mock.patch("torch.distributed.tensor.DTensor", _FakeDTensor), \
-         mock.patch("torch.distributed.tensor.Shard", lambda d: d):
+    with (
+        mock.patch("torch.distributed.tensor.DTensor", _FakeDTensor),
+        mock.patch("torch.distributed.tensor.Shard", lambda d: d),
+    ):
         dt = _FakeDTensor()
         out = cu._cp_sdpa(
-            dt, dt, dt, cp_mesh=_FakeMesh(), original_sdpa=fake_sdpa, attn_mask=None,
-            dropout_p=0.0, is_causal=True, scale=None, enable_gqa=False, kwargs={},
+            dt,
+            dt,
+            dt,
+            cp_mesh=_FakeMesh(),
+            original_sdpa=fake_sdpa,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=None,
+            enable_gqa=False,
+            kwargs={},
         )
     assert captured["q"] is dt  # already a DTensor -> not re-wrapped
     assert out is _local_marker  # DTensor output unwrapped via to_local()
@@ -240,8 +253,11 @@ def test_pad_position_ids_extends_monotonically():
 # ---------------------------------------------------------------------------
 def test_prepare_cp_batch_common_builds_padding_mask_from_4d_mask():
     mask = torch.ones(1, 1, 4, 4, dtype=torch.bool)
-    batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long), "labels": torch.zeros(1, 4, dtype=torch.long),
-             "attention_mask": mask}
+    batch = {
+        "input_ids": torch.zeros(1, 4, dtype=torch.long),
+        "labels": torch.zeros(1, 4, dtype=torch.long),
+        "attention_mask": mask,
+    }
     cu._prepare_cp_batch_common(_FakeMesh(size=2), None, batch, None)
     assert "padding_mask" in batch and batch["padding_mask"].shape == (1, 4)
 
@@ -282,8 +298,15 @@ def test_make_manual_allgather_pads_and_slices_all_keys():
     loss_mask = torch.ones(1, seq, dtype=torch.long)
 
     _ctx, out = cu._make_manual_allgather_cp_batch(
-        _FakeMesh(size=cp_size, rank=0), batch, primary_key="inputs_embeds", seq_len=seq,
-        labels=labels, position_ids=position_ids, pos_seq_dim=1, loss_mask=loss_mask, padding_token_id=0,
+        _FakeMesh(size=cp_size, rank=0),
+        batch,
+        primary_key="inputs_embeds",
+        seq_len=seq,
+        labels=labels,
+        position_ids=position_ids,
+        pos_seq_dim=1,
+        loss_mask=loss_mask,
+        padding_token_id=0,
     )
     # rank 0 keeps the first local_seq_len=4 positions
     assert out["inputs_embeds"].shape == (1, 4, d)
@@ -299,12 +322,21 @@ def test_make_manual_allgather_uses_dist_rank_when_initialized():
     batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
     labels = torch.zeros(1, 4, dtype=torch.long)
     position_ids = torch.arange(4).unsqueeze(0)
-    with mock.patch("torch.distributed.is_available", return_value=True), \
-         mock.patch("torch.distributed.is_initialized", return_value=True), \
-         mock.patch("torch.distributed.get_rank", return_value=0):
+    with (
+        mock.patch("torch.distributed.is_available", return_value=True),
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch("torch.distributed.get_rank", return_value=0),
+    ):
         _ctx, out = cu._make_manual_allgather_cp_batch(
-            _FakeMesh(size=2, rank=0), batch, primary_key="input_ids", seq_len=4,
-            labels=labels, position_ids=position_ids, pos_seq_dim=1, loss_mask=None, padding_token_id=0,
+            _FakeMesh(size=2, rank=0),
+            batch,
+            primary_key="input_ids",
+            seq_len=4,
+            labels=labels,
+            position_ids=position_ids,
+            pos_seq_dim=1,
+            loss_mask=None,
+            padding_token_id=0,
         )
     assert out["input_ids"].shape == (1, 2)
 
@@ -318,8 +350,15 @@ def test_make_manual_allgather_raises_when_not_divisible(monkeypatch):
     position_ids = torch.arange(6).unsqueeze(0)
     with pytest.raises(ValueError, match="divisible by cp_size"):
         cu._make_manual_allgather_cp_batch(
-            _FakeMesh(size=4, rank=0), batch, primary_key="input_ids", seq_len=6,
-            labels=labels, position_ids=position_ids, pos_seq_dim=1, loss_mask=None, padding_token_id=0,
+            _FakeMesh(size=4, rank=0),
+            batch,
+            primary_key="input_ids",
+            seq_len=6,
+            labels=labels,
+            position_ids=position_ids,
+            pos_seq_dim=1,
+            loss_mask=None,
+            padding_token_id=0,
         )
 
 

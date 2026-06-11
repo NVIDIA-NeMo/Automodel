@@ -20,7 +20,7 @@ be covered without a GPU or a real process group.
 """
 
 import math
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -277,9 +277,7 @@ def test_ring_exchange_issues_send_and_recv(cp_rank):
         irecv=mock.MagicMock(),
         batch_isend_irecv=mock.MagicMock(return_value=[mock.Mock()]),
     ):
-        cpa._ring_exchange(
-            [(send_t, recv_t)], cp_group=object(), cp_rank=cp_rank, cp_size=2
-        )
+        cpa._ring_exchange([(send_t, recv_t)], cp_group=object(), cp_rank=cp_rank, cp_size=2)
         # one send + one recv op constructed
         assert torch.distributed.P2POp.call_count == 2
         torch.distributed.batch_isend_irecv.assert_called_once()
@@ -300,9 +298,7 @@ def test_direct_exchange_issues_ops():
         irecv=mock.MagicMock(),
         batch_isend_irecv=mock.MagicMock(return_value=[mock.Mock()]),
     ):
-        cpa._direct_exchange(
-            [(send_t, recv_t)], cp_group=object(), cp_rank=1, send_cp_rank=0, recv_cp_rank=0
-        )
+        cpa._direct_exchange([(send_t, recv_t)], cp_group=object(), cp_rank=1, send_cp_rank=0, recv_cp_rank=0)
         assert torch.distributed.P2POp.call_count == 2
         torch.distributed.batch_isend_irecv.assert_called_once()
 
@@ -403,8 +399,12 @@ def test_flex_chunk_padding_mask_zeros_empty_query_rows():
     padding_mask = torch.tensor([[False, False, True, True]])  # last two rows are padding
     ctx = _make_ctx(module, seq=4, head_dim=8, metadata={"padding_mask": padding_mask})
     out, _, empty_rows, _ = cpa._run_gemma4_flex_chunk(
-        module, ctx, key_chunk=ctx.key, value_chunk=ctx.value,
-        metadata_chunk={"padding_mask": padding_mask}, kv_global_start=0,
+        module,
+        ctx,
+        key_chunk=ctx.key,
+        value_chunk=ctx.value,
+        metadata_chunk={"padding_mask": padding_mask},
+        kv_global_start=0,
     )
     assert empty_rows is not None and bool(empty_rows.any())
     # padded query rows must be zeroed in the output
@@ -416,8 +416,12 @@ def test_flex_chunk_packed_seq_ids_branch():
     packed = torch.tensor([[1, 1, 2, 2]])
     ctx = _make_ctx(module, seq=4, head_dim=8, metadata={"_packed_seq_ids": packed})
     out, _, empty_rows, _ = cpa._run_gemma4_flex_chunk(
-        module, ctx, key_chunk=ctx.key, value_chunk=ctx.value,
-        metadata_chunk={"_packed_seq_ids": packed}, kv_global_start=0,
+        module,
+        ctx,
+        key_chunk=ctx.key,
+        value_chunk=ctx.value,
+        metadata_chunk={"_packed_seq_ids": packed},
+        kv_global_start=0,
     )
     assert out.shape == ctx.query.shape
 
@@ -427,8 +431,12 @@ def test_flex_chunk_vision_bidirectional_branch():
     mm = torch.tensor([[0, 1, 1, 0]])  # one vision block
     ctx = _make_ctx(module, seq=4, head_dim=8, metadata={"mm_token_type_ids": mm})
     out, _, _, _ = cpa._run_gemma4_flex_chunk(
-        module, ctx, key_chunk=ctx.key, value_chunk=ctx.value,
-        metadata_chunk={"mm_token_type_ids": mm}, kv_global_start=0,
+        module,
+        ctx,
+        key_chunk=ctx.key,
+        value_chunk=ctx.value,
+        metadata_chunk={"mm_token_type_ids": mm},
+        kv_global_start=0,
     )
     assert out.shape == ctx.query.shape
 
@@ -445,8 +453,11 @@ def test_flex_chunk_kernel_options_typeerror_falls_back():
         b, h, s, d = q.shape
         return torch.zeros(b, h, s, d), torch.zeros(b, h, s)
 
-    module = SimpleNamespace(sliding_window=None, config=SimpleNamespace(use_bidirectional_attention=None),
-                             _gemma4_cp_compiled_flex_attn=stub)
+    module = SimpleNamespace(
+        sliding_window=None,
+        config=SimpleNamespace(use_bidirectional_attention=None),
+        _gemma4_cp_compiled_flex_attn=stub,
+    )
     ctx = _make_ctx(module, seq=4, head_dim=300)  # padded 512 > 256
     out, _, _, padded = cpa._run_gemma4_flex_chunk(
         module, ctx, key_chunk=ctx.key, value_chunk=ctx.value, metadata_chunk={}, kv_global_start=0
@@ -460,8 +471,11 @@ def test_flex_chunk_wraps_unexpected_error_in_runtimeerror():
     def boom(*a, **k):
         raise ValueError("kaboom")
 
-    module = SimpleNamespace(sliding_window=None, config=SimpleNamespace(use_bidirectional_attention=None),
-                             _gemma4_cp_compiled_flex_attn=boom)
+    module = SimpleNamespace(
+        sliding_window=None,
+        config=SimpleNamespace(use_bidirectional_attention=None),
+        _gemma4_cp_compiled_flex_attn=boom,
+    )
     ctx = _make_ctx(module, seq=4, head_dim=8)
     with pytest.raises(RuntimeError, match="Gemma4 CP ring requires FlexAttention"):
         cpa._run_gemma4_flex_chunk(
@@ -588,8 +602,11 @@ def test_flex_chunk_typeerror_without_kernel_options_reraised():
     def stub(q, k, v, return_lse=True, **kw):
         raise TypeError("totally unrelated")
 
-    module = SimpleNamespace(sliding_window=None, config=SimpleNamespace(use_bidirectional_attention=None),
-                             _gemma4_cp_compiled_flex_attn=stub)
+    module = SimpleNamespace(
+        sliding_window=None,
+        config=SimpleNamespace(use_bidirectional_attention=None),
+        _gemma4_cp_compiled_flex_attn=stub,
+    )
     ctx = _make_ctx(module, seq=4, head_dim=300)  # small-blocks path adds kernel_options
     with pytest.raises(RuntimeError, match="Gemma4 CP ring requires FlexAttention"):
         cpa._run_gemma4_flex_chunk(
@@ -610,8 +627,12 @@ def test_ring_backward_masks_empty_query_rows(monkeypatch):
     # surrogate that reports empty query rows -> backward masked_fill (line 448)
     def surrogate_empty(module, ctx, *, key_chunk, value_chunk, metadata_chunk, kv_global_start):
         out, lse, _, padded = _sdpa_flex_surrogate(
-            module, ctx, key_chunk=key_chunk, value_chunk=value_chunk,
-            metadata_chunk=metadata_chunk, kv_global_start=kv_global_start,
+            module,
+            ctx,
+            key_chunk=key_chunk,
+            value_chunk=value_chunk,
+            metadata_chunk=metadata_chunk,
+            kv_global_start=kv_global_start,
         )
         empty = torch.zeros(ctx.query.shape[0], ctx.seq_local, dtype=torch.bool)
         empty[:, -1] = True
@@ -635,8 +656,17 @@ def test_manual_attention_entry_single_rank(monkeypatch):
     cp_mesh = SimpleNamespace(get_group=lambda: object(), size=lambda: 1)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
     out = cpa._gemma4_cp_manual_attention(
-        module, q, k, v, cp_mesh=cp_mesh, attn_mask=None, dropout_p=0.0,
-        is_causal=True, scale=None, enable_gqa=False, kwargs={},
+        module,
+        q,
+        k,
+        v,
+        cp_mesh=cp_mesh,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=True,
+        scale=None,
+        enable_gqa=False,
+        kwargs={},
     )
     assert out.shape == q.shape
 
@@ -649,7 +679,16 @@ def test_manual_attention_entry_sets_gqa_when_head_counts_differ(monkeypatch):
     cp_mesh = SimpleNamespace(get_group=lambda: object(), size=lambda: 1)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
     out = cpa._gemma4_cp_manual_attention(
-        module, q, k, v, cp_mesh=cp_mesh, attn_mask=None, dropout_p=0.0,
-        is_causal=True, scale=None, enable_gqa=False, kwargs={},
+        module,
+        q,
+        k,
+        v,
+        cp_mesh=cp_mesh,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=True,
+        scale=None,
+        enable_gqa=False,
+        kwargs={},
     )
     assert out.shape == q.shape

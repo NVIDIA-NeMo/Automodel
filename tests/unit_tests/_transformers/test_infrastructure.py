@@ -578,9 +578,15 @@ def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
 
     model = _DummyModel()
     mesh = SimpleNamespace(
-        cp_size=2, pp_size=1, tp_size=1, ep_size=1, dp_size=1,
-        dp_shard_size=1, dp_replicate_size=1,
-        device_mesh={"cp": SimpleNamespace(size=lambda: 2)}, moe_mesh=None,
+        cp_size=2,
+        pp_size=1,
+        tp_size=1,
+        ep_size=1,
+        dp_size=1,
+        dp_shard_size=1,
+        dp_replicate_size=1,
+        device_mesh={"cp": SimpleNamespace(size=lambda: 2)},
+        moe_mesh=None,
     )
 
     attached = {"ctx": 0, "attn": 0, "linpos": 0}
