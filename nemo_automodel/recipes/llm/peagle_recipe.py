@@ -154,7 +154,8 @@ class PeagleRecipeMixin:
             defer_sync = is_ddp and i < num_units - 1
             sync_ctx = self.trainer_module.no_sync() if defer_sync else nullcontext()
             with sync_ctx:
-                seg = self.trainer_module(**sup, peagle_segment=(plan, i))
+                with self._compute_autocast():
+                    seg = self.trainer_module(**sup, peagle_segment=(plan, i))
                 (seg.loss / accum).backward()
             loss_sum = loss_sum + seg.loss.detach()
             valid_sum = valid_sum + seg.valid_tokens

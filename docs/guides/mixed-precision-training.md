@@ -2,7 +2,7 @@
 
 NeMo AutoModel uses FSDP2's [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) to control compute precision during forward and backward, and the model's storage dtype (`model.torch_dtype`) to control the precision of the *resident* sharded parameter. Together, these decide what numeric precision the optimizer state ends up in, which is the part that determines whether long full-parameter training runs converge cleanly.
 
-This page describes the precision patterns we recommend, and the trap that sits between them. For any long full-parameter training run (pre-training or extended fine-tuning), the key rule is: do not combine `torch.optim.AdamW` with bf16 resident parameters unless you have explicitly accepted bf16 Adam state.
+This page describes the precision patterns we recommend, and the trap that sits between them. For any long full-parameter training run (pre-training or extended fine-tuning), the key rule is: do not combine `torch.optim.AdamW` with bf16 resident parameters unless you have explicitly accepted bf16 master weights and Adam state. AutoModel applies this rule for you by default — see [Default Behavior](#default-behavior) below.
 
 ## Storage Dtype vs. Compute Dtype
 
@@ -63,6 +63,21 @@ It is a common misconception that TE costs extra memory for a second fp32 master
 
 Where the two *can* differ is the gradient buffer: TE keeps the resident parameter in bf16, so its gradients are bf16, whereas torch AdamW with fp32 storage keeps parameters and gradients in fp32 (~2 bytes/param more on the gradient buffer). In practice, what we measure is *peak* memory, which is usually dominated by activations rather than the optimizer step, so depending on the model (fraction of intrinsically-fp32 params, fragmentation, where the peak falls), TE can come out lower, equal, or higher. Validate memory per model before making it the default.
 
+#### Lower Optimizer Memory: bf16 Adam States
+
+When optimizer-state memory is the bottleneck — large models, and MoE in particular — TE FusedAdam can keep **fp32 master weights** while storing the Adam EMA buffers in **bf16**, which roughly halves optimizer-state memory. Set `exp_avg_dtype` and `exp_avg_sq_dtype` to `torch.bfloat16`:
+
+```yaml
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  master_weights: true              # fp32 master weights preserved
+  store_param_remainders: true      # keep bf16 param + 16-bit remainder instead of a separate fp32 copy
+  exp_avg_dtype: torch.bfloat16     # bf16 first moment
+  exp_avg_sq_dtype: torch.bfloat16  # bf16 second moment
+```
+
+This is the scheme [DeepSeek-V3](https://arxiv.org/abs/2412.19437) used to train its 671B-parameter MoE: an fp32 master plus bf16 moments converged without issues, especially for MoE where expert gradients are small in magnitude. It trades a little moment-estimate precision for memory, so verify loss convergence for your model. Note that `torch.optim.AdamW` **cannot** do this — torch initializes Adam state from the parameter dtype, so fp32 parameters force fp32 state; bf16 states require the TE fused kernel.
+
 ### Pattern B: torch AdamW and fp32 Model Storage
 
 ```yaml
@@ -96,13 +111,25 @@ Both patterns keep the master weights and Adam EMA in fp32, so for most models t
 
 This is usually negligible. When bringing up a new model, fp32 storage (Pattern B) is a robust starting point because every part of the update path is fp32; move to TE (Pattern A) after it is validated for that model and you want bf16 checkpoints.
 
+## Default Behavior
+
+You usually do not have to configure Pattern B by hand. When you run **full-parameter** training (not PEFT/LoRA) with a `torch.optim` optimizer (such as `torch.optim.Adam` or `torch.optim.AdamW`) and leave `model.torch_dtype` unset (or `auto`), NeMo AutoModel automatically resolves it to `float32` — applying **Pattern B** for you: the resident sharded parameters act as the fp32 master copy, the AdamW EMA buffers stay fp32, and forward/backward still run in bf16 through FSDP2 mixed precision.
+
+The auto-default never overrides an explicit choice. It is a no-op when:
+
+- the run is **PEFT/LoRA** (the base weights are frozen; only the small adapters train),
+- the optimizer is **not** a `torch.optim` optimizer (for example TE `FusedAdam`, which keeps its own fp32 master), or
+- `model.torch_dtype` is **already set** to a concrete value (including `bfloat16`, if you deliberately want bf16 storage — see [Risky Pattern](#risky-pattern-torch-adamw-with-bf16-model-storage) below).
+
+This default is wired into the LLM and VLM training recipes (fine-tuning, pre-training, sequence classification, and retrieval). Diffusion recipes instead expose explicit `model.torch_dtype` (storage) and `model.compute_dtype` (FSDP compute) knobs; their full-parameter finetune configs set `torch_dtype: float32` + `compute_dtype: bfloat16` for the same effect.
+
 ## Risky Pattern: torch AdamW with bf16 Model Storage
 
-This pattern is easy to enter accidentally. In several AutoModel paths, leaving `model.torch_dtype` unset, or setting it to `auto`, resolves the resident model parameter dtype to bf16. If that is paired with `torch.optim.AdamW`, the AdamW EMA buffers are also bf16 because the optimizer initializes state from the parameter dtype.
+As of this release this pattern is no longer entered *accidentally* for full-parameter `torch.optim` training — the default resolves an unset / `auto` `model.torch_dtype` to fp32 (see [Default Behavior](#default-behavior) above). You land here only when you **explicitly** set `model.torch_dtype: bfloat16` for a full-parameter torch-Adam run. When you do, the AdamW EMA buffers (`exp_avg`, `exp_avg_sq`) are also bf16, because the optimizer initializes state from the parameter dtype.
 
 ```yaml
 model:
-  # torch_dtype omitted, or torch_dtype: auto / bfloat16
+  torch_dtype: bfloat16   # explicit bf16 storage opts out of the fp32 default
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -111,7 +138,7 @@ distributed:
   strategy: fsdp2
 ```
 
-This keeps the resident model parameters in bf16 instead of fp32, so it can reduce memory usage compared with the torch AdamW and `model.torch_dtype: float32` pattern. It is common in existing fine-tuning example configs and is probably acceptable for short fine-tuning runs or LoRA/PEFT. It is **not** recommended for long full-parameter training (pre-training or extended fine-tuning): bf16 EMA quantization can quietly slow convergence (higher final loss at the same step count) and, in worse cases, produce unstable `grad_norm`, loss bumps, loss spikes, or divergence.
+This keeps the resident model parameters in bf16 instead of fp32, so it can reduce memory usage compared with the torch AdamW and `model.torch_dtype: float32` pattern. It is probably acceptable for short fine-tuning runs or LoRA/PEFT. It is **not** recommended for long full-parameter training (pre-training or extended fine-tuning): bf16 EMA quantization can quietly slow convergence (higher final loss at the same step count) and, in worse cases, produce unstable `grad_norm`, loss bumps, loss spikes, or divergence.
 
 ## Example Configs
 

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -100,7 +101,14 @@ class TrainEagle1Recipe(BaseRecipe):
             target_path,
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
         )
+        # Forward/backward run in bf16 on GPU (``compute_dtype``) via autocast, but the
+        # trainable draft is stored in fp32 (``storage_dtype``) so ``torch.optim.AdamW``
+        # keeps an fp32 master copy. The draft is not FSDP-sharded, so there is no
+        # ``MixedPrecisionPolicy`` to decouple storage from compute; autocast plays that
+        # role (matching the reference EAGLE setup). On CPU everything stays fp32.
+        # See docs/guides/mixed-precision-training.md.
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        self.storage_dtype = torch.float32
 
         # Optional ``distributed:`` YAML section. Required for targets that
         # do not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). Absent =>
@@ -166,7 +174,7 @@ class TrainEagle1Recipe(BaseRecipe):
         # so architecture-specific defaults like attention_bias and head_dim
         # flow into the draft.
         draft_config_obj = type(target_config).from_dict(draft_config)
-        self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.storage_dtype)
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
@@ -543,14 +551,15 @@ class TrainEagle1Recipe(BaseRecipe):
                     attention_mask=batch["attention_mask"],
                     loss_mask=batch["loss_mask"],
                 )
-                metrics = self.trainer_module(
-                    input_ids=target_batch.input_ids,
-                    attention_mask=target_batch.attention_mask,
-                    loss_mask=target_batch.loss_mask,
-                    input_hidden_states=target_batch.input_hidden_states,
-                    target_hidden_states=target_batch.target_hidden_states,
-                    target_logits=target_batch.target_logits,
-                )
+                with self._compute_autocast():
+                    metrics = self.trainer_module(
+                        input_ids=target_batch.input_ids,
+                        attention_mask=target_batch.attention_mask,
+                        loss_mask=target_batch.loss_mask,
+                        input_hidden_states=target_batch.input_hidden_states,
+                        target_hidden_states=target_batch.target_hidden_states,
+                        target_logits=target_batch.target_logits,
+                    )
                 total_loss += metrics.loss.detach()
                 total_acc += metrics.accuracy.detach()
                 total_batches += 1
@@ -569,6 +578,17 @@ class TrainEagle1Recipe(BaseRecipe):
         run = getattr(self, "wandb_run", None)
         if run is not None:
             run.log(data, step=step)
+
+    def _compute_autocast(self):
+        """bf16 autocast context for the draft forward.
+
+        Keeps the fp32 master weights resident while running matmuls in
+        ``compute_dtype`` (bf16 on GPU). No-op on CPU, where parameters and
+        compute are already fp32.
+        """
+        if self.device.type == "cuda":
+            return torch.autocast(device_type="cuda", dtype=self.compute_dtype)
+        return contextlib.nullcontext()
 
     def run_train_validation_loop(self):
         """Run the training loop."""
@@ -616,14 +636,15 @@ class TrainEagle1Recipe(BaseRecipe):
                 )
                 sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
                 with sync_ctx:
-                    metrics = self.trainer_module(
-                        input_ids=target_batch.input_ids,
-                        attention_mask=target_batch.attention_mask,
-                        loss_mask=target_batch.loss_mask,
-                        input_hidden_states=target_batch.input_hidden_states,
-                        target_hidden_states=target_batch.target_hidden_states,
-                        target_logits=target_batch.target_logits,
-                    )
+                    with self._compute_autocast():
+                        metrics = self.trainer_module(
+                            input_ids=target_batch.input_ids,
+                            attention_mask=target_batch.attention_mask,
+                            loss_mask=target_batch.loss_mask,
+                            input_hidden_states=target_batch.input_hidden_states,
+                            target_hidden_states=target_batch.target_hidden_states,
+                            target_logits=target_batch.target_logits,
+                        )
                     loss = metrics.loss / self.grad_accumulation_steps
                     loss.backward()
 

@@ -7,6 +7,8 @@ model:
   transformer_engine_fp8_recipe: "delayed"
   transformer_engine_fp8_amax_history_len: 1024
   transformer_engine_fp8_amax_compute_algo: "max"
+  torch_dtype: float32
+  compute_dtype: bfloat16
 
 optim:
   learning_rate: 2e-5
