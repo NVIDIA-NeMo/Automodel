@@ -42,10 +42,13 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 32
+  # Single node, 8x H200: ep_size must divide dp_size*cp_size (= world_size here).
+  ep_size: 8
 
   sequence_parallel: false
-  activation_checkpointing: false
+  # Recommended on: the 43-layer activation footprint, not the (now-packed) expert
+  # weights, is the steady-state pressure once experts are mxfp4.
+  activation_checkpointing: true
 
   moe:
     reshard_after_forward: false
