@@ -34,7 +34,12 @@ from nemo_automodel.components.moe.experts import (
     _apply_bias,
     _permute_tokens_for_grouped_mm,
 )
-from nemo_automodel.components.moe.fp4_utils import MXFP4_BLOCK_SIZE, MXFP4GroupedMM, dequantize_mxfp4, quantize_mxfp4
+from nemo_automodel.components.quantization.mxfp4 import (
+    MXFP4_BLOCK_SIZE,
+    MXFP4GroupedMM,
+    dequantize_mxfp4,
+    quantize_mxfp4,
+)
 
 
 def _to_local(t):
