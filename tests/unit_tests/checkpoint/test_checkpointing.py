@@ -2780,10 +2780,28 @@ class TestFormatLoad:
             return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
 
     def test_safetensors_format_produces_hf_reader(self):
-        """safetensors format: _get_storage_reader returns an HF reader."""
+        """safetensors checkpoint: _get_storage_reader returns an HF reader.
+
+        Reader selection is driven by whether the checkpoint is safetensors
+        (``is_safetensors``), which the production caller passes explicitly, so the
+        path need not exist on disk.
+        """
         ckptr = self._make_checkpointer("safetensors")
-        reader = ckptr._get_storage_reader("/tmp/model", key_mapping=None)
+        reader = ckptr._get_storage_reader("/tmp/model", key_mapping=None, is_safetensors=True)
         assert reader is not None
+
+    def test_get_storage_reader_infers_safetensors_from_directory(self, tmp_path):
+        """When ``is_safetensors`` is not supplied, reader choice follows the on-disk
+        contents (regression for #2487): a safetensors directory yields a reader, a
+        non-safetensors directory yields None for a non-init load."""
+        ckptr = self._make_checkpointer("safetensors")
+        st_dir = tmp_path / "st"
+        st_dir.mkdir()
+        (st_dir / "model.safetensors.index.json").write_text("{}")
+        assert ckptr._get_storage_reader(str(st_dir), key_mapping=None) is not None
+        other = tmp_path / "dcp"
+        other.mkdir()
+        assert ckptr._get_storage_reader(str(other), key_mapping=None) is None
 
     def test_dcp_format_produces_no_reader(self):
         """torch_save (DCP) format: _get_storage_reader returns None."""
@@ -2795,7 +2813,7 @@ class TestFormatLoad:
         """safetensors + cloud: HF reader passed to dcp.load, MSC reader never created."""
         ckptr = self._make_checkpointer("safetensors")
         sd = {"w": torch.zeros(4)}
-        hf_reader = ckptr._get_storage_reader("/tmp/model", key_mapping=None)
+        hf_reader = ckptr._get_storage_reader("/tmp/model", key_mapping=None, is_safetensors=True)
         assert hf_reader is not None
 
         with _cloud_patches():
@@ -2831,7 +2849,7 @@ class TestFormatLoad:
         """safetensors + local: HF reader used, MSC never involved."""
         ckptr = self._make_checkpointer("safetensors")
         sd = {"w": torch.zeros(4)}
-        hf_reader = ckptr._get_storage_reader("/tmp/model", key_mapping=None)
+        hf_reader = ckptr._get_storage_reader("/tmp/model", key_mapping=None, is_safetensors=True)
 
         with (
             patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
