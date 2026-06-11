@@ -6,6 +6,12 @@ from .fp8 import (
     create_fp8_config_from_dict,
     verify_fp8_conversion,
 )
+from .mxfp4 import (
+    MXFP4_BLOCK_SIZE,
+    MXFP4GroupedMM,
+    dequantize_mxfp4,
+    quantize_mxfp4,
+)
 from .qlora import (
     HAS_BNB,
     create_bnb_config,
@@ -27,6 +33,10 @@ __all__ = [
     "HAS_BNB",
     "create_bnb_config",
     "verify_qlora_quantization",
+    "MXFP4_BLOCK_SIZE",
+    "MXFP4GroupedMM",
+    "dequantize_mxfp4",
+    "quantize_mxfp4",
 ]
 
 if HAVE_TORCHAO:
