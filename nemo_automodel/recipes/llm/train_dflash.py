@@ -561,6 +561,7 @@ class TrainDFlashRecipe(BaseRecipe):
                 logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
             return
 
+        pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
         for epoch_idx in range(start_epoch, self.num_epochs):
             if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
                 self.train_dataloader.sampler.set_epoch(epoch_idx)
@@ -628,6 +629,8 @@ class TrainDFlashRecipe(BaseRecipe):
                     self.optimizer.zero_grad(set_to_none=True)
                     self.lr_scheduler.step()
                     self.runtime.global_step += 1
+                    if pbar is not None:
+                        pbar.update(1)
                     completed_steps += 1
                     pending_micro_batches = 0
                     self._maybe_save_step_checkpoint(epoch_idx)
@@ -637,13 +640,22 @@ class TrainDFlashRecipe(BaseRecipe):
                         # log, not over optimizer steps: with grad_accumulation_steps>1
                         # (or skipped short micro-batches) the two differ, and dividing
                         # by log_every_steps would inflate the reported loss/acc.
+                        avg_loss = running_loss / max(1, running_micro)
+                        avg_acc = running_acc / max(1, running_micro)
+                        current_lr = self.lr_scheduler.get_last_lr()[0]
+                        if pbar is not None:
+                            pbar.set_postfix(
+                                loss=f"{avg_loss:.4f}",
+                                acc=f"{avg_acc:.4f}",
+                                lr=f"{current_lr:.2e}",
+                            )
                         logger.info(
                             "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
                             epoch_idx,
                             self.runtime.global_step,
-                            running_loss / max(1, running_micro),
-                            running_acc / max(1, running_micro),
-                            self.lr_scheduler.get_last_lr()[0],
+                            avg_loss,
+                            avg_acc,
+                            current_lr,
                         )
                         running_loss = 0.0
                         running_acc = 0.0
@@ -661,6 +673,8 @@ class TrainDFlashRecipe(BaseRecipe):
                 self.optimizer.zero_grad(set_to_none=True)
                 self.lr_scheduler.step()
                 self.runtime.global_step += 1
+                if pbar is not None:
+                    pbar.update(1)
                 completed_steps += 1
                 pending_micro_batches = 0
                 self._maybe_save_step_checkpoint(epoch_idx)
@@ -687,6 +701,8 @@ class TrainDFlashRecipe(BaseRecipe):
                 )
                 self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
 
+        if pbar is not None:
+            pbar.close()
         self._maybe_save_final_checkpoint(self.num_epochs)
         self._finalize_pending_checkpoint()
 
