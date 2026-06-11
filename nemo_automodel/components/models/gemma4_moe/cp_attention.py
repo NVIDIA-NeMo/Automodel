@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MethodType
 from typing import Any
 
@@ -26,7 +26,32 @@ import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
-_GEMMA4_CP_FLEX_OK_LOGGED = False
+_GEMMA4_CP_FLEX_RING_OK_LOGGED = False
+
+
+@dataclass(frozen=True)
+class CPRingAttentionContext:
+    """Inputs for Gemma4 manual ring CP attention (built by the run_cp_manual_attention seam)."""
+
+    module: torch.nn.Module
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    cp_mesh: Any
+    cp_group: Any
+    cp_size: int
+    cp_rank: int
+    seq_local: int
+    seq_full: int
+    seq_global_start: int
+    attn_mask: Any
+    dropout_p: float
+    is_causal: bool
+    scale: Any
+    enable_gqa: bool
+    kwargs: dict[str, Any]
+    metadata: dict[str, torch.Tensor | None]
+    metadata_seq_dims: dict[str, int]
 
 
 def gemma4_vision_group_ids(mm_token_type_ids: torch.Tensor) -> torch.Tensor:
@@ -49,71 +74,167 @@ def _compiled_flex_attention(attention_module: torch.nn.Module):
     return compiled
 
 
-def _base_gemma4_cp_mask(attention_module: torch.nn.Module, ctx: Any, q_idx, kv_idx):
+def _base_gemma4_cp_mask(attention_module: torch.nn.Module, ctx: Any, q_idx, kv_idx, kv_global_start: int = 0):
     q_global_idx = q_idx + ctx.seq_global_start
+    kv_global_idx = kv_idx + kv_global_start
     if not ctx.is_causal:
-        allowed = torch.ones_like(q_global_idx >= kv_idx)
+        allowed = torch.ones_like(q_global_idx >= kv_global_idx)
     else:
-        allowed = kv_idx <= q_global_idx
+        allowed = kv_global_idx <= q_global_idx
 
     sliding_window = getattr(attention_module, "sliding_window", None)
     if sliding_window is not None:
-        allowed = allowed & ((q_global_idx - kv_idx) < sliding_window)
+        allowed = allowed & ((q_global_idx - kv_global_idx) < sliding_window)
     return allowed
 
 
-def _run_gemma4_cp_allgather_attention(attention_module: torch.nn.Module, ctx: Any) -> torch.Tensor:
-    """Run Gemma4 local-query/global-key CP attention with FlexAttention."""
+def _metadata_like(metadata: dict[str, torch.Tensor | None]) -> dict[str, torch.Tensor | None]:
+    return {name: torch.empty_like(value) if value is not None else None for name, value in metadata.items()}
+
+
+def _detach_metadata(metadata: dict[str, torch.Tensor | None]) -> dict[str, torch.Tensor | None]:
+    return {name: value.detach().contiguous() if value is not None else None for name, value in metadata.items()}
+
+
+def _ring_exchange(
+    tensors: list[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    cp_group: Any,
+    cp_rank: int,
+    cp_size: int,
+) -> None:
+    if not tensors:
+        return
+
+    ranks = torch.distributed.get_process_group_ranks(cp_group)
+    send_dst = ranks[(cp_rank + 1) % cp_size]
+    recv_src = ranks[(cp_rank - 1) % cp_size]
+
+    send_ops = [
+        torch.distributed.P2POp(torch.distributed.isend, send_tensor.contiguous(), send_dst, cp_group)
+        for send_tensor, _ in tensors
+    ]
+    recv_ops = [
+        torch.distributed.P2POp(torch.distributed.irecv, recv_tensor, recv_src, cp_group) for _, recv_tensor in tensors
+    ]
+    ops = send_ops + recv_ops if cp_rank % 2 == 0 else recv_ops + send_ops
+    for req in torch.distributed.batch_isend_irecv(ops):
+        req.wait()
+
+
+def _direct_exchange(
+    tensors: list[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    cp_group: Any,
+    cp_rank: int,
+    send_cp_rank: int,
+    recv_cp_rank: int,
+) -> None:
+    if not tensors:
+        return
+
+    ranks = torch.distributed.get_process_group_ranks(cp_group)
+    send_dst = ranks[send_cp_rank]
+    recv_src = ranks[recv_cp_rank]
+
+    send_ops = [
+        torch.distributed.P2POp(torch.distributed.isend, send_tensor.contiguous(), send_dst, cp_group)
+        for send_tensor, _ in tensors
+    ]
+    recv_ops = [
+        torch.distributed.P2POp(torch.distributed.irecv, recv_tensor, recv_src, cp_group) for _, recv_tensor in tensors
+    ]
+    ops = send_ops + recv_ops if cp_rank % 2 == 0 else recv_ops + send_ops
+    for req in torch.distributed.batch_isend_irecv(ops):
+        req.wait()
+
+
+def _merge_flex_chunk(
+    out_acc: torch.Tensor | None,
+    lse_acc: torch.Tensor | None,
+    out_step: torch.Tensor,
+    lse_step: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if out_acc is None or lse_acc is None:
+        return out_step, lse_step
+    lse_next = torch.logaddexp(lse_acc, lse_step)
+    old_scale = torch.exp(lse_acc - lse_next).unsqueeze(-1)
+    new_scale = torch.exp(lse_step - lse_next).unsqueeze(-1)
+    return out_acc * old_scale + out_step * new_scale, lse_next
+
+
+def _run_gemma4_flex_chunk(
+    attention_module: torch.nn.Module,
+    ctx: Any,
+    *,
+    key_chunk: torch.Tensor,
+    value_chunk: torch.Tensor,
+    metadata_chunk: dict[str, torch.Tensor | None],
+    kv_global_start: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int]:
     query = ctx.query
-    key_full = ctx.key_full
-    value_full = ctx.value_full
     orig_head_dim = query.shape[-1]
     padded_head_dim = 1 << (orig_head_dim - 1).bit_length()
     use_small_flex_blocks = padded_head_dim > 256
     flex_block_size = (32, 32) if use_small_flex_blocks else 128
 
-    mm_token_type_ids_full = ctx.metadata.get("mm_token_type_ids")
-    packed_seq_ids_full = ctx.metadata.get("_packed_seq_ids")
-    padding_mask_full = ctx.metadata.get("padding_mask")
-    vision_group_ids = gemma4_vision_group_ids(mm_token_type_ids_full) if mm_token_type_ids_full is not None else None
+    packed_seq_ids_q = ctx.metadata.get("_packed_seq_ids")
+    packed_seq_ids_kv = metadata_chunk.get("_packed_seq_ids")
+    padding_mask_q = ctx.metadata.get("padding_mask")
+    padding_mask_kv = metadata_chunk.get("padding_mask")
+    vision_group_ids_q = ctx.metadata.get("_gemma4_vision_group_ids")
+    vision_group_ids_kv = metadata_chunk.get("_gemma4_vision_group_ids")
+    if vision_group_ids_q is None and ctx.metadata.get("mm_token_type_ids") is not None:
+        vision_group_ids_q = gemma4_vision_group_ids(ctx.metadata["mm_token_type_ids"])
+    if vision_group_ids_kv is None and metadata_chunk.get("mm_token_type_ids") is not None:
+        vision_group_ids_kv = gemma4_vision_group_ids(metadata_chunk["mm_token_type_ids"])
 
     sliding_window = getattr(attention_module, "sliding_window", None)
     config_uses_vision_bidir = (
         getattr(getattr(attention_module, "config", None), "use_bidirectional_attention", None) == "vision"
     )
-    has_vision_tokens = vision_group_ids is not None and bool((vision_group_ids >= 0).any().item())
-    use_vision_bidirectional = sliding_window is not None and config_uses_vision_bidir and has_vision_tokens
+    use_vision_bidirectional = (
+        sliding_window is not None
+        and config_uses_vision_bidir
+        and vision_group_ids_q is not None
+        and vision_group_ids_kv is not None
+    )
 
-    q_indices = torch.arange(ctx.seq_local, device=query.device) + ctx.seq_global_start
     empty_query_rows = None
-    if packed_seq_ids_full is not None:
-        empty_query_rows = packed_seq_ids_full[:, q_indices] <= 0
-    if padding_mask_full is not None:
-        padding_query_rows = padding_mask_full[:, q_indices]
+    if packed_seq_ids_q is not None:
+        empty_query_rows = packed_seq_ids_q <= 0
+    if padding_mask_q is not None:
+        padding_query_rows = padding_mask_q
         empty_query_rows = padding_query_rows if empty_query_rows is None else empty_query_rows | padding_query_rows
 
     try:
         from torch.nn.attention.flex_attention import create_block_mask
 
-        if use_vision_bidirectional or packed_seq_ids_full is not None or padding_mask_full is not None:
+        if (
+            use_vision_bidirectional
+            or packed_seq_ids_q is not None
+            or packed_seq_ids_kv is not None
+            or padding_mask_q is not None
+            or padding_mask_kv is not None
+        ):
 
             def cp_mask(batch_idx, head_idx, q_idx, kv_idx):
-                q_global_idx = q_idx + ctx.seq_global_start
-                allowed = _base_gemma4_cp_mask(attention_module, ctx, q_idx, kv_idx)
+                allowed = _base_gemma4_cp_mask(attention_module, ctx, q_idx, kv_idx, kv_global_start)
                 if use_vision_bidirectional:
-                    q_group = vision_group_ids[batch_idx, q_global_idx]
-                    kv_group = vision_group_ids[batch_idx, kv_idx]
+                    q_group = vision_group_ids_q[batch_idx, q_idx]
+                    kv_group = vision_group_ids_kv[batch_idx, kv_idx]
                     same_vision_group = (q_group == kv_group) & (q_group >= 0)
                     allowed = allowed | same_vision_group
-                if packed_seq_ids_full is not None:
-                    q_pack_id = packed_seq_ids_full[batch_idx, q_global_idx]
-                    kv_pack_id = packed_seq_ids_full[batch_idx, kv_idx]
+                if packed_seq_ids_q is not None and packed_seq_ids_kv is not None:
+                    q_pack_id = packed_seq_ids_q[batch_idx, q_idx]
+                    kv_pack_id = packed_seq_ids_kv[batch_idx, kv_idx]
                     allowed = allowed & (q_pack_id == kv_pack_id) & (q_pack_id > 0)
                     allowed = torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
-                if padding_mask_full is not None:
-                    q_is_padding = padding_mask_full[batch_idx, q_global_idx]
-                    kv_is_padding = padding_mask_full[batch_idx, kv_idx]
+                if padding_mask_kv is not None:
+                    kv_is_padding = padding_mask_kv[batch_idx, kv_idx]
                     allowed = allowed & ~kv_is_padding
+                if padding_mask_q is not None:
+                    q_is_padding = padding_mask_q[batch_idx, q_idx]
                     allowed = torch.where(q_is_padding, kv_idx == 0, allowed)
                 return allowed
 
@@ -121,7 +242,7 @@ def _run_gemma4_cp_allgather_attention(attention_module: torch.nn.Module, ctx: A
         else:
 
             def cp_mask(batch_idx, head_idx, q_idx, kv_idx):
-                return _base_gemma4_cp_mask(attention_module, ctx, q_idx, kv_idx)
+                return _base_gemma4_cp_mask(attention_module, ctx, q_idx, kv_idx, kv_global_start)
 
             block_mask_batch = None
 
@@ -130,14 +251,14 @@ def _run_gemma4_cp_allgather_attention(attention_module: torch.nn.Module, ctx: A
             B=block_mask_batch,
             H=None,
             Q_LEN=ctx.seq_local,
-            KV_LEN=ctx.seq_full,
+            KV_LEN=key_chunk.shape[2],
             device=query.device,
             BLOCK_SIZE=flex_block_size,
         )
 
         query_for_flex = query
-        key_for_flex = key_full
-        value_for_flex = value_full
+        key_for_flex = key_chunk
+        value_for_flex = value_chunk
         flex_scale = ctx.scale
         if padded_head_dim != orig_head_dim:
             pad_len = padded_head_dim - orig_head_dim
@@ -161,14 +282,14 @@ def _run_gemma4_cp_allgather_attention(attention_module: torch.nn.Module, ctx: A
             }
 
         try:
-            out = _compiled_flex_attention(attention_module)(
-                query_for_flex.contiguous(), key_for_flex, value_for_flex, **flex_kwargs
+            out, lse = _compiled_flex_attention(attention_module)(
+                query_for_flex.contiguous(), key_for_flex, value_for_flex, return_lse=True, **flex_kwargs
             )
         except TypeError as exc:
             if "kernel_options" in str(exc) and "kernel_options" in flex_kwargs:
                 flex_kwargs.pop("kernel_options")
-                out = _compiled_flex_attention(attention_module)(
-                    query_for_flex.contiguous(), key_for_flex, value_for_flex, **flex_kwargs
+                out, lse = _compiled_flex_attention(attention_module)(
+                    query_for_flex.contiguous(), key_for_flex, value_for_flex, return_lse=True, **flex_kwargs
                 )
             else:
                 raise
@@ -178,75 +299,190 @@ def _run_gemma4_cp_allgather_attention(attention_module: torch.nn.Module, ctx: A
         if padded_head_dim != orig_head_dim:
             out = out[..., :orig_head_dim]
 
-        global _GEMMA4_CP_FLEX_OK_LOGGED
-        if not _GEMMA4_CP_FLEX_OK_LOGGED:
-            logger.info(
-                "Gemma4 CP using compiled flex_attention all-gather. Q=%s K=%s head_dim=%s->%s cp_rank=%s",
-                tuple(query.shape),
-                tuple(key_full.shape),
-                orig_head_dim,
-                padded_head_dim,
-                ctx.cp_rank,
-            )
-            _GEMMA4_CP_FLEX_OK_LOGGED = True
-        return out
+        return out, lse, empty_query_rows, padded_head_dim
     except Exception as flex_err:
         raise RuntimeError(
-            "Gemma4 CP all-gather requires FlexAttention for local-query/global-key attention. "
-            f"FlexAttention failed for Q={tuple(query.shape)} K={tuple(key_full.shape)} "
-            f"V={tuple(value_full.shape)} cp_rank={ctx.cp_rank} seq_local={ctx.seq_local} seq_full={ctx.seq_full}."
+            "Gemma4 CP ring requires FlexAttention for local-query/ring-KV attention. "
+            f"FlexAttention failed for Q={tuple(query.shape)} K={tuple(key_chunk.shape)} "
+            f"V={tuple(value_chunk.shape)} cp_rank={ctx.cp_rank} seq_local={ctx.seq_local} "
+            f"kv_global_start={kv_global_start}."
         ) from flex_err
 
 
-@dataclass(frozen=True)
-class CPAllGatherAttentionContext:
-    """Inputs for Gemma4 manual all-gather CP attention."""
+def _collect_ring_kv_chunks(ctx: Any) -> list[tuple[int, torch.Tensor, torch.Tensor, dict[str, torch.Tensor | None]]]:
+    current_key = ctx.key.contiguous()
+    current_value = ctx.value.contiguous()
+    current_metadata = {name: value.contiguous() if value is not None else None for name, value in ctx.metadata.items()}
+    current_owner = ctx.cp_rank
+    chunks = []
 
-    module: torch.nn.Module
-    query: torch.Tensor
-    key: torch.Tensor
-    value: torch.Tensor
-    key_full: torch.Tensor
-    value_full: torch.Tensor
-    cp_mesh: Any
-    cp_group: Any
-    cp_size: int
-    cp_rank: int
-    seq_local: int
-    seq_full: int
-    seq_global_start: int
-    attn_mask: Any
-    dropout_p: float
-    is_causal: bool
-    scale: Any
-    enable_gqa: bool
-    kwargs: dict[str, Any]
-    metadata: dict[str, torch.Tensor | None]
+    for step in range(ctx.cp_size):
+        chunks.append((current_owner, current_key, current_value, current_metadata))
 
+        if step == ctx.cp_size - 1:
+            break
 
-def _cp_all_gather_seq(tensor: torch.Tensor, group, size: int) -> torch.Tensor:
-    """All-gather an attention tensor along the sequence dim (dim=2), autograd-aware when available."""
-    tensor = tensor.contiguous()
-    try:
-        from torch.distributed.nn.functional import all_gather as dist_all_gather
+        recv_key = torch.empty_like(current_key)
+        recv_value = torch.empty_like(current_value)
+        recv_metadata = _metadata_like(current_metadata)
+        exchange_tensors = [(current_key, recv_key), (current_value, recv_value)]
+        exchange_tensors.extend(
+            (current_metadata[name], recv_metadata[name])
+            for name in sorted(current_metadata)
+            if current_metadata[name] is not None
+        )
+        _ring_exchange(exchange_tensors, cp_group=ctx.cp_group, cp_rank=ctx.cp_rank, cp_size=ctx.cp_size)
+        current_key = recv_key
+        current_value = recv_value
+        current_metadata = recv_metadata
+        current_owner = (current_owner - 1) % ctx.cp_size
 
-        parts = dist_all_gather(tensor, group=group)
-    except (ImportError, AttributeError):
-        parts = [torch.empty_like(tensor) for _ in range(size)]
-        torch.distributed.all_gather(parts, tensor, group=group)
-    return torch.cat(tuple(parts), dim=2)
+    return chunks
 
 
-def _cp_all_gather_seq_metadata(
-    metadata: torch.Tensor | None, group, size: int, seq_dim: int = 1
-) -> torch.Tensor | None:
-    """All-gather non-differentiable per-token metadata (masks / packed ids) along ``seq_dim``."""
-    if metadata is None:
-        return None
-    local = metadata.contiguous()
-    parts = [torch.empty_like(local) for _ in range(size)]
-    torch.distributed.all_gather(parts, local, group=group)
-    return torch.cat(parts, dim=seq_dim)
+def _run_gemma4_cp_ring_attention_forward(attention_module: torch.nn.Module, ctx: Any) -> torch.Tensor:
+    """Run Gemma4 local-query/ring-key CP attention forward with FlexAttention."""
+    if ctx.dropout_p:
+        raise NotImplementedError("Gemma4 FlexAttention ring CP does not support attention dropout.")
+
+    out_acc = None
+    lse_acc = None
+    empty_query_rows = None
+    padded_head_dim = ctx.query.shape[-1]
+
+    for current_owner, current_key, current_value, current_metadata in _collect_ring_kv_chunks(ctx):
+        kv_global_start = current_owner * ctx.seq_local
+        out_step, lse_step, empty_query_rows, padded_head_dim = _run_gemma4_flex_chunk(
+            attention_module,
+            ctx,
+            key_chunk=current_key,
+            value_chunk=current_value,
+            metadata_chunk=current_metadata,
+            kv_global_start=kv_global_start,
+        )
+        out_acc, lse_acc = _merge_flex_chunk(out_acc, lse_acc, out_step, lse_step)
+
+    if out_acc is None:
+        raise RuntimeError("Gemma4 CP ring attention produced no output chunks.")
+    if empty_query_rows is not None and empty_query_rows.any():
+        out_acc = out_acc.masked_fill(empty_query_rows[:, None, :, None], 0)
+
+    global _GEMMA4_CP_FLEX_RING_OK_LOGGED
+    if not _GEMMA4_CP_FLEX_RING_OK_LOGGED:
+        logger.info(
+            "Gemma4 CP using compiled flex_attention p2p ring. Q=%s K_local=%s head_dim=%s->%s cp_rank=%s cp_size=%s",
+            tuple(ctx.query.shape),
+            tuple(ctx.key.shape),
+            ctx.query.shape[-1],
+            padded_head_dim,
+            ctx.cp_rank,
+            ctx.cp_size,
+        )
+        _GEMMA4_CP_FLEX_RING_OK_LOGGED = True
+    return out_acc.to(ctx.query.dtype)
+
+
+def _zero_if_none(grad: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor:
+    return torch.zeros_like(like) if grad is None else grad
+
+
+class _Gemma4FlexRingAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(autograd_ctx, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, ring_ctx: Any):
+        runtime_ctx = replace(ring_ctx, query=query, key=key, value=value)
+        out = _run_gemma4_cp_ring_attention_forward(ring_ctx.module, runtime_ctx)
+        autograd_ctx.save_for_backward(query, key, value)
+        autograd_ctx.ring_ctx = replace(
+            ring_ctx,
+            query=None,
+            key=None,
+            value=None,
+            metadata=_detach_metadata(ring_ctx.metadata),
+        )
+        return out
+
+    @staticmethod
+    def backward(autograd_ctx, grad_output: torch.Tensor):
+        query, key, value = autograd_ctx.saved_tensors
+        ring_ctx = autograd_ctx.ring_ctx
+
+        with torch.enable_grad():
+            query_req = query.detach().requires_grad_(True)
+            collect_ctx = replace(
+                ring_ctx,
+                query=query_req,
+                key=key.detach(),
+                value=value.detach(),
+                metadata=_detach_metadata(ring_ctx.metadata),
+            )
+            chunks = _collect_ring_kv_chunks(collect_ctx)
+
+            runtime_ctx = replace(collect_ctx, query=query_req)
+            key_reqs = []
+            value_reqs = []
+            owners = []
+            out_acc = None
+            lse_acc = None
+            empty_query_rows = None
+
+            for owner, key_chunk, value_chunk, metadata_chunk in chunks:
+                key_req = key_chunk.detach().requires_grad_(True)
+                value_req = value_chunk.detach().requires_grad_(True)
+                key_reqs.append(key_req)
+                value_reqs.append(value_req)
+                owners.append(owner)
+
+                out_step, lse_step, empty_query_rows, _ = _run_gemma4_flex_chunk(
+                    ring_ctx.module,
+                    runtime_ctx,
+                    key_chunk=key_req,
+                    value_chunk=value_req,
+                    metadata_chunk=metadata_chunk,
+                    kv_global_start=owner * ring_ctx.seq_local,
+                )
+                out_acc, lse_acc = _merge_flex_chunk(out_acc, lse_acc, out_step, lse_step)
+
+            if out_acc is None:
+                raise RuntimeError("Gemma4 CP ring attention backward produced no output chunks.")
+            if empty_query_rows is not None and empty_query_rows.any():
+                out_acc = out_acc.masked_fill(empty_query_rows[:, None, :, None], 0)
+
+            grad_targets = [query_req, *key_reqs, *value_reqs]
+            grads = torch.autograd.grad(out_acc, grad_targets, grad_output, allow_unused=True)
+
+        grad_query = _zero_if_none(grads[0], query)
+        num_chunks = len(chunks)
+        grad_key_by_owner = {owner: _zero_if_none(grads[1 + idx], key_reqs[idx]) for idx, owner in enumerate(owners)}
+        grad_value_by_owner = {
+            owner: _zero_if_none(grads[1 + num_chunks + idx], value_reqs[idx]) for idx, owner in enumerate(owners)
+        }
+
+        grad_key = grad_key_by_owner[ring_ctx.cp_rank].contiguous()
+        grad_value = grad_value_by_owner[ring_ctx.cp_rank].contiguous()
+        for distance in range(1, ring_ctx.cp_size):
+            send_owner = (ring_ctx.cp_rank - distance) % ring_ctx.cp_size
+            recv_query_rank = (ring_ctx.cp_rank + distance) % ring_ctx.cp_size
+            recv_grad_key = torch.empty_like(grad_key)
+            recv_grad_value = torch.empty_like(grad_value)
+            _direct_exchange(
+                [
+                    (grad_key_by_owner[send_owner], recv_grad_key),
+                    (grad_value_by_owner[send_owner], recv_grad_value),
+                ],
+                cp_group=ring_ctx.cp_group,
+                cp_rank=ring_ctx.cp_rank,
+                send_cp_rank=send_owner,
+                recv_cp_rank=recv_query_rank,
+            )
+            grad_key = grad_key + recv_grad_key
+            grad_value = grad_value + recv_grad_value
+
+        return grad_query, grad_key, grad_value, None
+
+
+def _run_gemma4_cp_ring_attention(attention_module: torch.nn.Module, ctx: Any) -> torch.Tensor:
+    """Run Gemma4 local-query/ring-key CP attention with FlexAttention."""
+    return _Gemma4FlexRingAttention.apply(ctx.query, ctx.key, ctx.value, ctx)
 
 
 def _gemma4_cp_manual_attention(
@@ -263,40 +499,29 @@ def _gemma4_cp_manual_attention(
     enable_gqa,
     kwargs,
 ) -> torch.Tensor:
-    """Gemma4-owned manual all-gather CP transport.
+    """Gemma4-owned manual ring CP attention entry.
 
-    Each CP rank keeps its local query shard; K/V (and per-token metadata) are
-    all-gathered to the full sequence, then the local-query/global-key FlexAttention
-    in :func:`_run_gemma4_cp_allgather_attention` consumes them. This is the transport
-    that ``cp_utils.attach_cp_attention_hooks`` invokes via the generic
-    ``module.run_cp_manual_attention`` seam, so ``cp_utils`` stays model-agnostic.
+    Plugs into cp_utils' generic ``run_cp_manual_attention`` seam: receives the
+    raw local (un-gathered) Q/K/V plus ``cp_mesh``, builds the ring context, and
+    runs the p2p ring FlexAttention. K/V are rotated across CP ranks inside the
+    ring autograd function -- they are never all-gathered.
     """
     group = cp_mesh.get_group()
     size = cp_mesh.size()
     cp_rank = torch.distributed.get_rank(group=group)
     seq_local = key.shape[2]
     seq_global_start = cp_rank * seq_local
-
-    key_full = _cp_all_gather_seq(key, group, size)
-    value_full = _cp_all_gather_seq(value, group, size)
-    seq_full = key_full.shape[2]
-    if query.shape[1] != key_full.shape[1]:
+    seq_full = seq_local * size
+    if query.shape[1] != key.shape[1]:
         enable_gqa = True
 
     local_metadata = getattr(attention_module, "_cp_allgather_metadata", {})
     metadata_seq_dims = getattr(attention_module, "_cp_allgather_metadata_seq_dims", {})
-    metadata_full = {
-        name: _cp_all_gather_seq_metadata(value_, group, size, metadata_seq_dims.get(name, 1))
-        for name, value_ in local_metadata.items()
-    }
-
-    ctx = CPAllGatherAttentionContext(
+    ctx = CPRingAttentionContext(
         module=attention_module,
         query=query,
         key=key,
         value=value,
-        key_full=key_full,
-        value_full=value_full,
         cp_mesh=cp_mesh,
         cp_group=group,
         cp_size=size,
@@ -310,22 +535,24 @@ def _gemma4_cp_manual_attention(
         scale=scale,
         enable_gqa=enable_gqa,
         kwargs=kwargs,
-        metadata=metadata_full,
+        metadata=local_metadata,
+        metadata_seq_dims=metadata_seq_dims,
     )
-    return _run_gemma4_cp_allgather_attention(attention_module, ctx)
+    return _run_gemma4_cp_ring_attention(attention_module, ctx)
 
 
-def attach_gemma4_cp_allgather_attention(attention_module: torch.nn.Module) -> None:
-    """Register Gemma4's model-specific manual all-gather CP attention handler.
-
-    Gemma4 owns the whole CP attention (transport + FlexAttention compute). It plugs
-    into the generic ``cp_utils`` SDPA-swap via the ``run_cp_manual_attention`` seam,
-    so ``cp_utils`` carries no all-gather-specific code.
-    """
-    attention_module._cp_allgather_metadata_keys = ("mm_token_type_ids", "_packed_seq_ids", "padding_mask")
+def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module) -> None:
+    """Register Gemma4's model-specific manual p2p ring CP attention handler."""
+    attention_module._cp_allgather_metadata_keys = (
+        "mm_token_type_ids",
+        "_packed_seq_ids",
+        "padding_mask",
+        "_gemma4_vision_group_ids",
+    )
     attention_module._cp_allgather_metadata_seq_dims = {
         "mm_token_type_ids": 1,
         "_packed_seq_ids": 1,
         "padding_mask": 1,
+        "_gemma4_vision_group_ids": 1,
     }
     attention_module.run_cp_manual_attention = MethodType(_gemma4_cp_manual_attention, attention_module)

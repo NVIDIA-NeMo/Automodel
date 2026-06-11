@@ -82,13 +82,13 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
-from .cp_attention import attach_gemma4_cp_allgather_attention, gemma4_vision_group_ids
+from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
 from .state_dict_adapter import Gemma4MoEStateDictAdapter
 
 
 @contextlib.contextmanager
 def _force_repeat_kv_for_sdpa():
-    """Disable native SDPA GQA so CP can use fused all-gather attention kernels."""
+    """Disable native SDPA GQA so the CP hook can own grouped-query handling."""
     try:
         from transformers.integrations import sdpa_attention
     except ImportError:
@@ -210,7 +210,7 @@ class Gemma4MoEDecoderLayer(nn.Module):
 
         # Reuse HF modules
         self.self_attn = Gemma4Attention(config=config, layer_idx=layer_idx)
-        attach_gemma4_cp_allgather_attention(self.self_attn)
+        attach_gemma4_cp_ring_attention(self.self_attn)
         self.mlp = Gemma4MLP(config, layer_idx)
 
         # Norms
@@ -550,14 +550,13 @@ class Gemma4MoETextModelBackend(nn.Module):
             mm_token_type_ids = torch.zeros(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
 
         if cp_enabled:
-            # The CP hook replaces HF's SDPA call with Gemma4's Flex all-gather
+            # The CP hook replaces HF's SDPA call with Gemma4's Flex ring
             # attention. Force the HF attention dispatcher through SDPA so
             # configs that default to eager attention still enter the hook.
             self.config._attn_implementation = "sdpa"
-            # CP uses Gemma4's model-owned all-gather attention hook. The hook
-            # sees local Q and all-gathered global K/V, so HF's local 4D masks
-            # have the wrong key length. Pass no mask here; the hook rebuilds
-            # the local-query/global-key Gemma4 mask from model metadata.
+            # CP uses Gemma4's model-owned attention hook. HF's local 4D masks
+            # have the wrong key range for CP, so the hook rebuilds the
+            # local-query/global-key Gemma4 mask from model metadata.
             causal_mask_mapping = {"full_attention": None, "sliding_attention": None}
         elif use_vision_bidirectional_mask and packed_seq_ids is not None:
             causal_mask_mapping = _build_packed_gemma4_causal_mask_mapping(
@@ -959,6 +958,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             if mm_token_type_ids is not None
             else special_image_mask.to(torch.long),
             "_cp_manual_allgather": True,
+            "_gemma4_vision_group_ids": gemma4_vision_group_ids(
+                mm_token_type_ids if mm_token_type_ids is not None else special_image_mask.to(torch.long)
+            ),
+            "_cp_metadata_seq_dims": {"_gemma4_vision_group_ids": 1},
+            "_cp_metadata_pad_values": {"_gemma4_vision_group_ids": -1},
         }
 
         per_layer_inputs = self._prepare_per_layer_inputs_for_cp(input_ids, special_image_mask)

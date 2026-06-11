@@ -404,6 +404,22 @@ def _make_manual_allgather_cp_batch(
     padding_token_id,
 ):
     cp_size = cp_mesh.size()
+    # Extra per-token metadata (e.g. Gemma4 vision group ids) is sharded like the
+    # known sequence tensors, using model-provided seq dims / pad values.
+    metadata_seq_dims = batch.pop("_cp_metadata_seq_dims", {})
+    metadata_pad_values = batch.pop("_cp_metadata_pad_values", {})
+    known_sequence_keys = {
+        "input_ids",
+        "inputs_embeds",
+        "labels",
+        "position_ids",
+        "mm_token_type_ids",
+        "_packed_seq_ids",
+        "per_layer_inputs",
+        "padding_mask",
+        "loss_mask",
+    }
+    extra_metadata_keys = [key for key in metadata_seq_dims if key in batch and key not in known_sequence_keys]
     pad_len = (-seq_len) % (2 * cp_size)
     if pad_len:
         if "input_ids" in batch:
@@ -423,6 +439,13 @@ def _make_manual_allgather_cp_batch(
             loss_mask = _pad_tensor_seq_dim_(loss_mask, 1, pad_len, 0)
         if "padding_mask" in batch:
             batch["padding_mask"] = _pad_tensor_seq_dim_(batch["padding_mask"], 1, pad_len, True)
+        for key in extra_metadata_keys:
+            batch[key] = _pad_tensor_seq_dim_(
+                batch[key],
+                metadata_seq_dims[key],
+                pad_len,
+                metadata_pad_values.get(key, 0),
+            )
 
     # Manual sequence slicing. Every CP rank in the same CP group starts from
     # the same full batch, then keeps one contiguous sequence shard.
@@ -454,6 +477,8 @@ def _make_manual_allgather_cp_batch(
     _slice_seq("_packed_seq_ids", 1)
     _slice_seq("per_layer_inputs", 1)
     _slice_seq("padding_mask", 1)
+    for key in extra_metadata_keys:
+        _slice_seq(key, metadata_seq_dims[key])
     if loss_mask is not None:
         batch["loss_mask"] = loss_mask[:, seq_start:seq_end].contiguous()
 
