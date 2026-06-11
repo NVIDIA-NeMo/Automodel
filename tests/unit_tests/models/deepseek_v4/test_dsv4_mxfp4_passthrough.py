@@ -131,6 +131,27 @@ def test_passthrough_decodes_to_same_weights_as_bf16_path():
     assert torch.equal(dn_unpacked, dn_bf16)
 
 
+def test_passthrough_roundtrip_to_hf_recovers_checkpoint_keys():
+    """from_hf (aggregate) -> to_hf (split) must reproduce the per-expert packed
+    checkpoint keys with matching dtypes and bit-exact values — this is the path
+    the DCP loader uses to enumerate destination tensors."""
+    sd, _ = _synthetic_fp4_checkpoint()
+    adapter = _make_adapter("mxfp4")
+    model_sd = adapter.from_hf(dict(sd))
+    hf = adapter.to_hf(model_sd, quantization=True)
+
+    for e in range(N_EXPERTS):
+        for w in ("w1", "w2", "w3"):
+            wk = f"layers.0.ffn.experts.{e}.{w}.weight"
+            sk = f"layers.0.ffn.experts.{e}.{w}.scale"
+            assert wk in hf and sk in hf, f"missing {wk}/{sk}"
+            assert hf[wk].dtype == torch.int8
+            assert hf[sk].dtype == torch.float8_e8m0fnu
+            # cat-then-split is identity: recovered packed bytes equal the original.
+            assert torch.equal(hf[wk], sd[wk]), f"{wk} value mismatch"
+            assert torch.equal(hf[sk].view(torch.uint8), sd[sk].view(torch.uint8)), f"{sk} value mismatch"
+
+
 @pytest.mark.skipif(
     not os.path.isdir(_REAL_CKPT) or not os.path.isfile(f"{_REAL_CKPT}/model.safetensors.index.json"),
     reason=f"real DeepSeek-V4-Flash checkpoint not present at {_REAL_CKPT}",
