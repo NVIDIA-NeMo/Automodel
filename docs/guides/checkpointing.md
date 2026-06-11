@@ -71,7 +71,7 @@ automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 ```
 
 ::: {note}
-In the above command we used the [`llama3_2_1b_squad.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/492add84a2b9d495946fe211c28973cd00051f3e/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) config as a running example, adjust as necessary to your case.
+In the above command, we used the [`llama3_2_1b_squad.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/492add84a2b9d495946fe211c28973cd00051f3e/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) config as a running example; adjust as necessary to your case.
 More config examples can be found in our [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
 :::
 
@@ -116,7 +116,7 @@ bash checkpoints/epoch_0_step_20/model/consolidate.sh
 
 Run the helper from the AutoModel repo root so it can find `tools/offline_hf_consolidation.py`, or set `CONSOLIDATION_TOOL=/path/to/tools/offline_hf_consolidation.py`.
 
-The helper defaults to one CPU worker process with five writer threads so it is safe on small machines. For large checkpoints, run it on a CPU compute node and increase parallelism:
+The helper defaults to one CPU worker process with five writer threads, so it is safe on small machines. For large checkpoints, run it on a CPU compute node and increase parallelism:
 
 ```bash
 NPROC_PER_NODE=16 NUM_THREADS=5 bash checkpoints/epoch_0_step_20/model/consolidate.sh
@@ -138,7 +138,7 @@ CAST_DTYPE=bf16 bash checkpoints/epoch_0_step_20/model/consolidate.sh
 
 Use `CAST_DTYPE` when the consolidated Hugging Face bundle should override the default per-tensor dtype behavior, such as `CAST_DTYPE=bf16` to export ordinary floating-point tensors as BF16 for serving. Supported values include `bf16`, `fp16`, `fp32`, and `fp64`. Only ordinary floating-point tensors with a different source dtype are cast; tensors already in the cast dtype, FP8 tensors, and non-floating tensors are left unchanged.
 
-The helper writes `checkpoints/epoch_0_step_20/model/consolidated/`. We can load and run that consolidated checkpoint using the Hugging Face Transformers API directly:
+The helper writes `checkpoints/epoch_0_step_20/model/consolidated/`. You can load and run that consolidated checkpoint using the Hugging Face Transformers API directly:
 ```python
 import torch
 from transformers import pipeline
@@ -160,7 +160,7 @@ Although this example uses the Hugging Face Transformers API, the `consolidated/
 
 
 ## PEFT
-When training with Parameter-Efficient Fine-Tuning (PEFT) techniques, only a small subset of model weights are updated — the rest of the model remains frozen. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
+When training with Parameter-Efficient Fine-Tuning (PEFT) techniques, only a small subset of model weights are updated; the rest of the model remains frozen. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
 
 PEFT checkpoints save adapter files directly under `model/` and do not generate or need `model/consolidate.sh`.
 
@@ -230,7 +230,7 @@ print(tokenizer.batch_decode(outputs.detach().cpu().numpy(), skip_special_tokens
 ## PyTorch DCP
 NeMo AutoModel also offers native PyTorch DCP checkpointing support (`.distcp` extension). Similar to Safetensors, it also provides the same features of load-time resharding and parallel saving.
 
-As a simple example, we can run the following command to launch the training recipe on two GPUs.
+As a simple example, run the following command to launch the training recipe on two GPUs.
 ```bash
 automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --step_scheduler.ckpt_every_steps 20 \
@@ -272,6 +272,76 @@ automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 ...
 ```
 
+## Cloud Checkpointing with MSC (S3)
+
+NeMo AutoModel can read and write checkpoints directly to S3 (and other object stores) through the [NVIDIA Multi-Storage Client (MSC)](https://github.com/NVIDIA/multi-storage-client). Any `checkpoint_dir` beginning with `msc://` is routed to MSC instead of the local filesystem.
+
+### 1. Install the S3 extra
+
+```bash
+pip install nemo_automodel[s3]
+```
+
+This pulls in `multi-storage-client` together with the `boto3` backend it needs for S3 (`botocore` comes in transitively).
+
+### 2. Configure an MSC profile
+
+MSC reads its configuration from (in order of precedence):
+
+1. The path in the `MSC_CONFIG` environment variable, if set.
+2. The standard search paths, including `~/.config/msc/config.yaml`.
+
+Create `~/.config/msc/config.yaml` (or point `MSC_CONFIG` at a file of your choice) with an S3 profile:
+
+```yaml
+profiles:
+  my-checkpoints:
+    storage_provider:
+      type: s3
+      options:
+        base_path: my-bucket          # S3 bucket (optionally bucket/prefix)
+        region_name: us-east-1
+        # endpoint_url: https://...   # only for non-AWS S3-compatible endpoints
+```
+
+The profile name (`my-checkpoints`) becomes the authority in the `msc://` URI, and `base_path` is the bucket that keys are written under.
+
+### Provide Credentials
+
+If you omit `credentials_provider` (as above), MSC uses the standard boto3 credential chain, so the usual AWS environment variables apply:
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...   # only for temporary credentials
+export AWS_REGION=us-east-1    # or rely on region_name in the profile
+```
+
+Alternatively, reference a named profile from `~/.aws/credentials` with `profile_name: <name>` under `options`.
+
+### Point the Recipe at the Bucket
+
+Set `checkpoint_dir` to an `msc://<profile>/<path>` URI. Cloud paths must use DCP, so set `model_save_format: torch_save` and `save_consolidated: false`:
+
+```yaml
+checkpoint:
+  checkpoint_dir: msc://my-checkpoints/llama-peft
+  model_save_format: torch_save
+  save_consolidated: false
+```
+
+You can also set these values using the CLI override:
+
+```bash
+automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+    --checkpoint.checkpoint_dir msc://my-checkpoints/llama-peft \
+    --checkpoint.model_save_format torch_save \
+    --checkpoint.save_consolidated false
+```
+
+> **Note:** Consolidated HF safetensors export (`save_consolidated` set to anything other than `false`) is **not** supported on `msc://` paths and will raise a `ValueError`. Use DCP (`save_consolidated: false`) for cloud storage. PEFT adapter checkpoints are streamed to the cloud path automatically.
+
+
 ## Save Checkpoints When Using Docker
 
 When training inside a Docker container (see [Installation Guide](installation.md)), any files written to the container's filesystem are lost when the container exits (especially with `--rm`). To keep your checkpoints, you must **bind-mount a host directory** to the checkpoint path before starting the container:
@@ -311,10 +381,10 @@ NeMo AutoModel can write checkpoints asynchronously to reduce training stalls ca
   ```
 - **Enable** (CLI): add `--checkpoint.is_async True` to your run command.
 - **Requirements**: PyTorch ≥ 2.9.0. If an older version is detected, async mode is automatically disabled.
-- **Behavior**: At most one checkpoint uploads at a time; the next save waits for the previous upload to finish. The `LATEST` symlink is updated after the async save completes (may be deferred until the next save call). During PEFT, adapter model files are written synchronously on rank 0; optimizer states can still use async.
+- **Behavior**: At most one checkpoint uploads at a time; the next save waits for the previous upload to finish. The `LATEST` symlink is updated after the async save completes (might be deferred until the next save call). During PEFT, adapter model files are written synchronously on rank 0; optimizer states can still use async.
 
 ## Advanced Usage: Save Additional States
-You can also save additional states in NeMo AutoModel. By default, we also automatically checkpoint the `dataloader`, `rng`, and `step_scheduler` states which are necessary to resume training accurately. In full, a Safetensors consolidated checkpoint will look like this:
+You can also save additional states in NeMo AutoModel. By default, NeMo AutoModel also automatically checkpoints the `dataloader`, `rng`, and `step_scheduler` states, which are necessary to resume training accurately. In full, a Safetensors consolidated checkpoint will look like this:
 
 ```
 checkpoints/
