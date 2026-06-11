@@ -753,6 +753,12 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         if quantization:
             quantized = []
             for key, value in result:
+                # mxfp4 passthrough: experts are already split into packed int8
+                # weight + e8m0 scale by _split_merged_expert; do not rebuild
+                # placeholders (the bf16->fp4 path assumes a bf16 input).
+                if self.expert_storage_format == "mxfp4" and self._is_expert_weight_key(key):
+                    quantized.append((key, value))
+                    continue
                 if key.endswith(".weight") and not self._is_non_quantized(key):
                     base = key[: -len(".weight")]
                     if self._is_expert_weight_key(key):
@@ -1026,6 +1032,40 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         Handles DTensor inputs (EP-sharded) by working on the local shard only,
         emitting keys only for the experts owned by the current rank.
         """
+        # mxfp4 passthrough: packed params are already in checkpoint orientation
+        # [E, out, in//{2,block}]; split per-expert (dim 0) then gate||up along the
+        # output dim (dim 0 of the per-expert tensor). No transpose — unlike the
+        # bf16 path which stores compute layout and must transpose.
+        gate_up_packed_pat = re.compile(r"^(model\.layers\.(\d+)\.mlp\.experts)\.gate_and_up_projs_(packed|scales)$")
+        down_packed_pat = re.compile(r"^(model\.layers\.(\d+)\.mlp\.experts)\.down_projs_(packed|scales)$")
+
+        m = gate_up_packed_pat.match(fqn)
+        if m:
+            layer_num, suffix = m.group(2), m.group(3)
+            disk_suffix = "weight" if suffix == "packed" else "scale"
+            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(
+                tensor, self.moe_config.n_routed_experts
+            )
+            result = []
+            for t, eid in zip(expert_tensors, expert_ids):
+                out_dim = t.shape[0] // 2
+                gate_t, up_t = t.split(out_dim, dim=0)
+                result.append((f"layers.{layer_num}.ffn.experts.{eid}.w1.{disk_suffix}", gate_t))
+                result.append((f"layers.{layer_num}.ffn.experts.{eid}.w3.{disk_suffix}", up_t))
+            return result
+
+        m = down_packed_pat.match(fqn)
+        if m:
+            layer_num, suffix = m.group(2), m.group(3)
+            disk_suffix = "weight" if suffix == "packed" else "scale"
+            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(
+                tensor, self.moe_config.n_routed_experts
+            )
+            return [
+                (f"layers.{layer_num}.ffn.experts.{eid}.w2.{disk_suffix}", t)
+                for t, eid in zip(expert_tensors, expert_ids)
+            ]
+
         gate_up_pat = re.compile(r"^(model\.layers\.(\d+)\.mlp\.experts)\.gate_and_up_projs$")
         down_pat = re.compile(r"^(model\.layers\.(\d+)\.mlp\.experts)\.down_projs$")
 

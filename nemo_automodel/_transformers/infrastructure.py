@@ -91,12 +91,22 @@ def _apply_peft_and_lower_precision(
 
         # Convert frozen (non-LoRA-targeted) routed experts to mxfp4-resident storage.
         # LoRA-targeted experts are already GroupedExpertsLoRAMXFP4 from the call above.
-        # Packing of both is deferred until after the checkpoint is loaded.
+        # Passthrough mode (packed-at-init + adapter emits packed keys) loads the
+        # fp4 checkpoint straight into packed params, never materializing bf16
+        # experts — capping the load-time peak.
         if getattr(peft_config, "expert_weight_format", "bf16") == "mxfp4":
             from nemo_automodel.components._peft.lora import convert_frozen_experts_to_mxfp4
 
-            num_converted = convert_frozen_experts_to_mxfp4(model)
-            logger.info("Converted %d frozen expert module(s) to mxfp4-resident storage", num_converted)
+            # Put the state-dict adapter(s) in passthrough mode BEFORE the checkpoint
+            # load so both to_hf (destination keys) and from_hf (aggregation) keep
+            # experts packed.
+            for part in getattr(model, "parts", [model]):
+                adapter = getattr(part, "state_dict_adapter", None)
+                if adapter is not None and hasattr(adapter, "expert_storage_format"):
+                    adapter.expert_storage_format = "mxfp4"
+
+            num_converted = convert_frozen_experts_to_mxfp4(model, passthrough=True)
+            logger.info("Converted %d frozen expert module(s) to mxfp4-resident storage (passthrough)", num_converted)
 
     # FP8
     if fp8_config is not None:
