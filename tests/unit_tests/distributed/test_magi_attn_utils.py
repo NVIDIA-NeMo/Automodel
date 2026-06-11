@@ -269,6 +269,38 @@ class TestMagiStateVlmBatch:
         assert not hasattr(model.language_model.self_attn, "_magi_self_key")
 
 
+class TestPackedCpDocSeqlens:
+    """Regression for the packed-CP key spanning the padded THD layout.
+
+    The custom-model CP packed path must build its dist key from
+    ``cu_seqlens_padded`` (spans the flat input) not ``cu_seqlens`` (real tokens
+    only); otherwise the dispatched shard length disagrees with get_position_ids
+    and the model hits a RoPE q vs cos/sin length mismatch.
+    """
+
+    def test_prefers_cu_seqlens_padded(self):
+        # padded layout sums to 1024 (matches input); real cu_seqlens sums to 944.
+        batch = {
+            "cu_seqlens": torch.tensor([0, 400, 944]),
+            "cu_seqlens_padded": torch.tensor([0, 440, 1024]),
+        }
+        assert mu._packed_cp_doc_seqlens(batch, 1024) == [440, 584]
+
+    def test_falls_back_to_cu_seqlens(self):
+        batch = {"cu_seqlens": torch.tensor([0, 300, 1024])}
+        assert mu._packed_cp_doc_seqlens(batch, 1024) == [300, 724]
+
+    def test_drops_padding_sentinels(self):
+        batch = {"cu_seqlens_padded": torch.tensor([0, 512, 1024, -1000, -1000])}
+        assert mu._packed_cp_doc_seqlens(batch, 1024) == [512, 512]
+
+    def test_raises_when_layout_mismatches_input(self):
+        # cu_seqlens (944) would not span the 1024 flat input -> guard fires.
+        batch = {"cu_seqlens": torch.tensor([0, 400, 944])}
+        with pytest.raises(ValueError, match="!= flat input length 1024"):
+            mu._packed_cp_doc_seqlens(batch, 1024)
+
+
 class TestActiveStateAccessors:
     def test_attn_spec_roundtrip(self):
         spec = AttnMaskSpec.causal(4)

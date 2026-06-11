@@ -561,6 +561,36 @@ def magi_prepare_batch(
     return new_batch, key
 
 
+def _packed_cp_doc_seqlens(batch: dict, total_len: int) -> list:
+    """Resolve per-document lengths spanning the *padded* THD layout of length ``total_len``.
+
+    The TE collater pads each document for the THD layout, so ``cu_seqlens_padded``
+    spans the full flat ``input_ids`` while ``cu_seqlens`` covers only the real
+    tokens. magi dispatches the whole flat sequence, so the dist key must be built
+    over the padded layout — otherwise the dispatched shard length (from
+    ``input_ids``) won't match ``get_position_ids`` (built from the key), which
+    surfaces downstream as a RoPE q vs cos/sin length mismatch. Causal masking keeps
+    real tokens from attending the trailing per-document pad, and pad-token rows are
+    dropped by the loss (labels == ignore_index), so this is numerically equivalent
+    to attending only the real tokens.
+
+    Raises:
+        ValueError: if the resolved document layout does not span ``total_len``.
+    """
+    cu = batch.get("cu_seqlens_padded")
+    if cu is None:
+        cu = batch["cu_seqlens"]
+    cu = cu.reshape(-1)
+    cu = cu[cu >= 0]  # drop -1000 padding sentinels if present
+    seqlens = (cu[1:] - cu[:-1]).tolist()
+    if sum(seqlens) != total_len:
+        raise ValueError(
+            f"magi packed-CP: document layout total {sum(seqlens)} != flat input length {total_len}; "
+            "expected cu_seqlens_padded to span the padded THD layout."
+        )
+    return seqlens
+
+
 def magi_prepare_packed_cp(model, batch: dict, cp_group):
     """Context-parallel prep for a packed (THD) batch on the custom-model path.
 
@@ -578,8 +608,8 @@ def magi_prepare_packed_cp(model, batch: dict, cp_group):
     """
     from magi_attention.api import dispatch, get_position_ids
 
-    cu = batch["cu_seqlens"]
-    seqlens = (cu[1:] - cu[:-1]).tolist()
+    input_ids = batch["input_ids"].reshape(-1)  # global flat (padded THD) [T]
+    seqlens = _packed_cp_doc_seqlens(batch, int(input_ids.numel()))
     spec = AttnMaskSpec.varlen(seqlens, causal=True)
     num_heads_q, num_heads_kv, head_dim = _get_head_config(model.module if hasattr(model, "module") else model)
     key = build_flex_key(
@@ -589,7 +619,6 @@ def magi_prepare_packed_cp(model, batch: dict, cp_group):
         head_dim=head_dim,
         cp_group=cp_group,
     )
-    input_ids = batch["input_ids"].reshape(-1)  # global flat [T]
     local_input = dispatch(input_ids, key=key)
     local_pos = get_position_ids(key).to(local_input.device)
     # Shard labels the same way as the input (like TE-CP): each rank computes the
