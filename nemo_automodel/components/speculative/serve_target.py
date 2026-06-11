@@ -39,8 +39,12 @@ The frozen target runs under one of two inference engines (``--engine``):
 - ``hf`` (default): HuggingFace forward with aux-layer hooks
   (:class:`HFEagle3TargetModel`); works for any AutoModel target.
 - ``sglang``: SGLang forward (:class:`SGLangEagle3TargetModel`); faster for
-  mainstream architectures. SGLang is pinned in a separate speculative-decoding
-  environment, so it is imported only when this engine is selected.
+  mainstream architectures. SGLang is **not** a NeMo-AutoModel dependency -- it
+  pins ``transformers==4.57.1``, which conflicts with the training stack -- so it
+  is imported only when this engine is selected. Install it yourself in a
+  separate, dedicated speculative-decoding venv/container on the server::
+
+      uv pip install sglang==0.5.9
 
 Both engines emit the identical supervision contract, so the training client is
 unchanged regardless of which one serves the target.
