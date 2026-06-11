@@ -443,6 +443,52 @@ def test_producer_main_resume_skips_existing_shards(monkeypatch, tmp_path):
     assert os.path.getmtime(shard0) == mtime_before
 
 
+def test_producer_main_resume_rejects_changed_config(monkeypatch, tmp_path):
+    """--resume with a config that no longer matches the recorded manifest must
+    refuse: old shards encode the old selected_token_ids / seq_length and would
+    be silently mixed with shards from the new configuration."""
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+    assert pe.main(_producer_argv(tmp_path)) == 0
+    manifest_before = read_manifest(str(tmp_path))
+
+    # Same data, different seq_length: shard contents would no longer line up.
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2, seq_len=8)
+    argv = [a if a != "6" else "8" for a in _producer_argv(tmp_path, extra=["--resume"])]
+    with pytest.raises(ValueError, match="mismatched fields.*seq_length"):
+        pe.main(argv)
+
+    # The recorded manifest must be untouched by the refused run.
+    assert read_manifest(str(tmp_path)) == manifest_before
+
+
+def test_producer_main_resume_rejects_shards_without_manifest(monkeypatch, tmp_path):
+    """--resume against shards whose manifest is gone cannot verify compatibility."""
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+    assert pe.main(_producer_argv(tmp_path)) == 0
+    os.remove(os.path.join(str(tmp_path), "manifest.json"))
+
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+    with pytest.raises(ValueError, match="manifest is missing"):
+        pe.main(_producer_argv(tmp_path, extra=["--resume"]))
+
+
+def test_producer_writes_manifest_before_shards(monkeypatch, tmp_path):
+    """The manifest must exist before the first shard is written, so a crashed
+    run can be resumed with the compatibility check above."""
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+
+    real_write_shard = pe.write_shard
+    seen = []
+
+    def _spy_write_shard(cache_dir, shard_index, samples):
+        seen.append(os.path.exists(os.path.join(cache_dir, "manifest.json")))
+        return real_write_shard(cache_dir, shard_index, samples)
+
+    monkeypatch.setattr(pe, "write_shard", _spy_write_shard)
+    assert pe.main(_producer_argv(tmp_path)) == 0
+    assert seen and all(seen)
+
+
 # ---------------------------------------------------------------------------
 # Error / edge branches in eagle3_cache and the trainer module.
 # ---------------------------------------------------------------------------

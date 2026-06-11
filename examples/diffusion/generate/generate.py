@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 # Pipeline class name -> output type mapping
 _PIPELINE_OUTPUT_TYPES = {
     "FluxPipeline": "image",
+    "Flux2Pipeline": "image",
     "QwenImagePipeline": "image",
     "WanPipeline": "video",
     "HunyuanVideoPipeline": "video",
@@ -350,7 +351,7 @@ def load_lora_weights_into_pipeline(pipe, cfg):
 
 
 def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bfloat16):
-    """Load sharded FSDP/DCP checkpoint into a transformer module.
+    """Load sharded FSDP1 .distcp checkpoint into a transformer module.
 
     Creates a temporary gloo process group for single-GPU loading if
     torch.distributed is not already initialized.
@@ -379,18 +380,14 @@ def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bf
     try:
         transformer.to(device="cuda", dtype=torch_dtype)
         fsdp_transformer = FSDP(transformer, use_orig_params=True)
-
         FSDP.set_state_dict_type(
             fsdp_transformer,
             StateDictType.SHARDED_STATE_DICT,
             state_dict_config=ShardedStateDictConfig(offload_to_cpu=True),
         )
-
         model_state = fsdp_transformer.state_dict()
         dist_load(state_dict=model_state, storage_reader=FileSystemReader(sharded_dir))
         fsdp_transformer.load_state_dict(model_state)
-
-        # Unwrap back to the original module for inference
         return fsdp_transformer.module
     finally:
         if init_dist:
