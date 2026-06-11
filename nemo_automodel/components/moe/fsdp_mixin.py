@@ -24,9 +24,12 @@ from nemo_automodel.components.models.common.utils import get_is_optim_step
 
 
 def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
+    if isinstance(module, FSDPModule):
+        yield module
+
     # Check main model
     _model = module.model if hasattr(module, "model") else module
-    if isinstance(_model, FSDPModule):
+    if _model is not module and isinstance(_model, FSDPModule):
         yield _model
 
     # Check embeddings

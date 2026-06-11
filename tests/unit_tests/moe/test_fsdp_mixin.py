@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
+from nemo_automodel.components.models.common.utils import get_is_optim_step, set_is_optim_step
 from nemo_automodel.components.moe.fsdp_mixin import (
     MoEFSDPSyncMixin,
     _configure_fsdp_module,
@@ -23,8 +24,6 @@ from nemo_automodel.components.moe.fsdp_mixin import (
     _run_post_backward_hooks,
     patched_backward_maybe_with_nosync,
 )
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import get_is_optim_step, set_is_optim_step
 
 
 class MockFSDPModule:
@@ -79,6 +78,15 @@ class MockMoEModel(MoEFSDPSyncMixin):
             model.embed_tokens = MockFSDPModule()
 
 
+class MockOuterFSDPMoEModel(MockFSDPModule, MoEFSDPSyncMixin):
+    """Mock MoE model whose FSDP root is the outer wrapper."""
+
+    def __init__(self, backend, model):
+        MockFSDPModule.__init__(self)
+        self.backend = backend
+        self.model = model
+
+
 class TestConfigureFSDPModule:
     """Test _configure_fsdp_module helper function."""
 
@@ -108,13 +116,14 @@ class TestConfigureFSDPModule:
 class TestIterFSDPModules:
     """Test _iter_fsdp_modules helper function."""
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
     def test_iterates_model_only(self, mock_isinstance):
         # Mock isinstance to return True only for the model
         def isinstance_side_effect(obj, cls):
-            if cls.__name__ == 'FSDPModule':
+            if cls.__name__ == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return isinstance(obj, cls)
+
         mock_isinstance.side_effect = isinstance_side_effect
 
         model = MockFSDPModule()
@@ -125,12 +134,29 @@ class TestIterFSDPModules:
         assert len(modules) == 1
         assert modules[0] is model
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
-    def test_iterates_model_and_lm_head(self, mock_isinstance):
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
+    def test_iterates_outer_fsdp_root(self, mock_isinstance):
         def isinstance_side_effect(obj, cls):
-            if cls.__name__ == 'FSDPModule':
+            if cls.__name__ == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return isinstance(obj, cls)
+
+        mock_isinstance.side_effect = isinstance_side_effect
+
+        inner_model = object()
+        moe_model = MockOuterFSDPMoEModel(MockBackend(), inner_model)
+
+        modules = list(_iter_fsdp_modules(moe_model))
+
+        assert modules == [moe_model]
+
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
+    def test_iterates_model_and_lm_head(self, mock_isinstance):
+        def isinstance_side_effect(obj, cls):
+            if cls.__name__ == "FSDPModule":
+                return isinstance(obj, MockFSDPModule)
+            return isinstance(obj, cls)
+
         mock_isinstance.side_effect = isinstance_side_effect
 
         model = MockFSDPModule()
@@ -142,12 +168,13 @@ class TestIterFSDPModules:
         assert model in modules
         assert moe_model.lm_head in modules
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
     def test_iterates_model_embeddings_lm_head(self, mock_isinstance):
         def isinstance_side_effect(obj, cls):
-            if cls.__name__ == 'FSDPModule':
+            if cls.__name__ == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return isinstance(obj, cls)
+
         mock_isinstance.side_effect = isinstance_side_effect
 
         model = MockFSDPModule()
@@ -160,12 +187,13 @@ class TestIterFSDPModules:
         assert model.embed_tokens in modules
         assert moe_model.lm_head in modules
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
     def test_iterates_with_experts(self, mock_isinstance):
         def isinstance_side_effect(obj, cls):
-            if cls.__name__ == 'FSDPModule':
+            if cls.__name__ == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return isinstance(obj, cls)
+
         mock_isinstance.side_effect = isinstance_side_effect
 
         model = MockFSDPModule()
@@ -186,10 +214,10 @@ class TestIterFSDPModules:
         assert len(modules) == 3
         assert model in modules
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
     def test_iterates_multimodal_components(self, mock_isinstance):
         def isinstance_side_effect(obj, cls):
-            if cls.__name__ == 'FSDPModule':
+            if cls.__name__ == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return isinstance(obj, cls)
 
@@ -205,10 +233,10 @@ class TestIterFSDPModules:
         assert moe_model.audio_tower in modules
         assert moe_model.visual in modules
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
     def test_iterates_outer_mtp_blocks_and_experts(self, mock_isinstance):
         def isinstance_side_effect(obj, cls):
-            if cls.__name__ == 'FSDPModule':
+            if cls.__name__ == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return isinstance(obj, cls)
 
@@ -266,12 +294,13 @@ class TestPrepareForGradAccumulation:
         assert model._reshard_after_backward is False
         assert model._requires_gradient_sync is False
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
     def test_defers_sync_and_resharding(self, mock_isinstance):
         def isinstance_side_effect(obj, cls):
-            if cls.__name__ == 'FSDPModule':
+            if cls.__name__ == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return isinstance(obj, cls)
+
         mock_isinstance.side_effect = isinstance_side_effect
 
         backend = MockBackend(enable_fsdp_optimizations=True)
@@ -324,12 +353,13 @@ class TestPrepareForFinalBackward:
         assert model._reshard_after_backward is False
         assert model._requires_gradient_sync is False
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
     def test_enables_sync_and_resharding(self, mock_isinstance):
         def isinstance_side_effect(obj, cls):
-            if cls.__name__ == 'FSDPModule':
+            if cls.__name__ == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return isinstance(obj, cls)
+
         mock_isinstance.side_effect = isinstance_side_effect
 
         backend = MockBackend(enable_fsdp_optimizations=True)
@@ -361,12 +391,13 @@ class TestPrepareForFinalBackward:
 class TestFullWorkflow:
     """Test complete workflow with both methods."""
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
     def test_grad_accumulation_workflow(self, mock_isinstance):
         def isinstance_side_effect(obj, cls):
-            if cls.__name__ == 'FSDPModule':
+            if cls.__name__ == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return isinstance(obj, cls)
+
         mock_isinstance.side_effect = isinstance_side_effect
 
         backend = MockBackend(enable_fsdp_optimizations=True)
@@ -417,7 +448,7 @@ class TestGlobalOptimStepFlag:
 class TestRunPostBackwardHooks:
     """Test _run_post_backward_hooks helper function."""
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.fully_shard')
+    @patch("nemo_automodel.components.moe.fsdp_mixin.fully_shard")
     def test_runs_post_backward_and_returns_callback(self, mock_fully_shard):
         fsdp_module = MockFSDPModule()
 
@@ -449,12 +480,13 @@ class TestRunPostBackwardHooks:
 class TestDisableFsdpForMoeModule:
     """Test _disable_fsdp_for_moe_module helper function."""
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
     def test_disables_all_fsdp_modules(self, mock_isinstance):
         def isinstance_side_effect(obj, cls):
-            if cls.__name__ == 'FSDPModule':
+            if cls.__name__ == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return isinstance(obj, cls)
+
         mock_isinstance.side_effect = isinstance_side_effect
 
         model = MockFSDPModule()
@@ -485,13 +517,14 @@ class TestDisableFsdpForMoeModule:
 class TestRunPostBackwardForMoeModule:
     """Test _run_post_backward_for_moe_module helper function."""
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.fully_shard')
-    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
+    @patch("nemo_automodel.components.moe.fsdp_mixin.fully_shard")
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
     def test_enables_and_runs_post_backward(self, mock_isinstance, mock_fully_shard):
         def isinstance_side_effect(obj, cls):
-            if cls.__name__ == 'FSDPModule':
+            if cls.__name__ == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return isinstance(obj, cls)
+
         mock_isinstance.side_effect = isinstance_side_effect
 
         model = MockFSDPModule()
@@ -555,17 +588,14 @@ class TestPatchedBackwardMaybeWithNosync:
             "input_values": Mock(),
         }
 
-        with patch('nemo_automodel.components.moe.fsdp_mixin.stage_backward') as mock_stage_backward:
-            with patch('nemo_automodel.components.moe.fsdp_mixin.torch.nn.parallel.distributed._find_tensors') as mock_find_tensors:
+        with patch("nemo_automodel.components.moe.fsdp_mixin.stage_backward") as mock_stage_backward:
+            with patch(
+                "nemo_automodel.components.moe.fsdp_mixin.torch.nn.parallel.distributed._find_tensors"
+            ) as mock_find_tensors:
                 mock_find_tensors.return_value = []
                 mock_stage_backward.return_value = ((), None)
 
-                result = patched_backward_maybe_with_nosync(
-                    mock_stage,
-                    "full",
-                    bwd_kwargs,
-                    last_backward=True
-                )
+                result = patched_backward_maybe_with_nosync(mock_stage, "full", bwd_kwargs, last_backward=True)
 
                 # Verify prepare_for_backward was called
                 mock_reducer.prepare_for_backward.assert_called_once()
@@ -575,8 +605,9 @@ class TestPatchedBackwardMaybeWithNosync:
 
     def test_ddp_not_last_backward(self):
         """Test DDP path with last_backward=False."""
-        from torch.nn.parallel import DistributedDataParallel
         from unittest.mock import MagicMock
+
+        from torch.nn.parallel import DistributedDataParallel
 
         mock_stage = Mock()
         mock_ddp_module = Mock(spec=DistributedDataParallel)
@@ -592,15 +623,10 @@ class TestPatchedBackwardMaybeWithNosync:
             "input_values": Mock(),
         }
 
-        with patch('nemo_automodel.components.moe.fsdp_mixin.stage_backward') as mock_stage_backward:
+        with patch("nemo_automodel.components.moe.fsdp_mixin.stage_backward") as mock_stage_backward:
             mock_stage_backward.return_value = ((), None)
 
-            result = patched_backward_maybe_with_nosync(
-                mock_stage,
-                "full",
-                bwd_kwargs,
-                last_backward=False
-            )
+            result = patched_backward_maybe_with_nosync(mock_stage, "full", bwd_kwargs, last_backward=False)
 
             # Verify no_sync was used
             mock_ddp_module.no_sync.assert_called_once()
@@ -608,7 +634,7 @@ class TestPatchedBackwardMaybeWithNosync:
             assert grads == ((), None)
             assert param_groups is None
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.fully_shard')
+    @patch("nemo_automodel.components.moe.fsdp_mixin.fully_shard")
     def test_fsdp_module_last_backward(self, mock_fully_shard):
         """Test FSDP module path with last_backward=True."""
         mock_stage = Mock()
@@ -631,18 +657,13 @@ class TestPatchedBackwardMaybeWithNosync:
         mock_fsdp_state._root_post_backward_final_callback = Mock()
         mock_fully_shard.state.return_value = mock_fsdp_state
 
-        with patch('nemo_automodel.components.moe.fsdp_mixin.stage_backward') as mock_stage_backward:
-            with patch('nemo_automodel.components.moe.fsdp_mixin.isinstance') as mock_isinstance:
+        with patch("nemo_automodel.components.moe.fsdp_mixin.stage_backward") as mock_stage_backward:
+            with patch("nemo_automodel.components.moe.fsdp_mixin.isinstance") as mock_isinstance:
                 # Make isinstance return True for FSDPModule check
-                mock_isinstance.side_effect = lambda obj, cls: cls.__name__ == 'FSDPModule'
+                mock_isinstance.side_effect = lambda obj, cls: cls.__name__ == "FSDPModule"
                 mock_stage_backward.return_value = ((), None)
 
-                result = patched_backward_maybe_with_nosync(
-                    mock_stage,
-                    "full",
-                    bwd_kwargs,
-                    last_backward=True
-                )
+                result = patched_backward_maybe_with_nosync(mock_stage, "full", bwd_kwargs, last_backward=True)
 
                 # Verify post_backward was called
                 mock_state._fsdp_param_group.post_backward.assert_called_once()
@@ -651,16 +672,18 @@ class TestPatchedBackwardMaybeWithNosync:
                 assert grads == ((), None)
                 assert param_groups is None
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.get_is_optim_step')
-    @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
+    @patch("nemo_automodel.components.moe.fsdp_mixin.get_is_optim_step")
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
     def test_moe_fsdp_mixin_last_backward_with_optim_step(self, mock_isinstance, mock_get_optim):
         """Test MoEFSDPSyncMixin path with last_backward=True and IS_OPTIM_STEP=True."""
+
         def isinstance_side_effect(obj, cls):
             if cls == MoEFSDPSyncMixin:
                 return True
-            if cls.__name__ == 'FSDPModule':
+            if cls.__name__ == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return False
+
         mock_isinstance.side_effect = isinstance_side_effect
         mock_get_optim.return_value = True
 
@@ -675,16 +698,11 @@ class TestPatchedBackwardMaybeWithNosync:
             "input_values": Mock(),
         }
 
-        with patch('nemo_automodel.components.moe.fsdp_mixin.stage_backward') as mock_stage_backward:
-            with patch('nemo_automodel.components.moe.fsdp_mixin._run_post_backward_for_moe_module') as mock_run_post:
+        with patch("nemo_automodel.components.moe.fsdp_mixin.stage_backward") as mock_stage_backward:
+            with patch("nemo_automodel.components.moe.fsdp_mixin._run_post_backward_for_moe_module") as mock_run_post:
                 mock_stage_backward.return_value = ((), None)
 
-                result = patched_backward_maybe_with_nosync(
-                    mock_stage,
-                    "full",
-                    bwd_kwargs,
-                    last_backward=True
-                )
+                result = patched_backward_maybe_with_nosync(mock_stage, "full", bwd_kwargs, last_backward=True)
 
                 # Verify post backward was called
                 mock_run_post.assert_called_once_with(moe_model)
@@ -704,17 +722,12 @@ class TestPatchedBackwardMaybeWithNosync:
             "input_values": Mock(),
         }
 
-        with patch('nemo_automodel.components.moe.fsdp_mixin.stage_backward_input') as mock_backward_input:
-            with patch('nemo_automodel.components.moe.fsdp_mixin.isinstance') as mock_isinstance:
+        with patch("nemo_automodel.components.moe.fsdp_mixin.stage_backward_input") as mock_backward_input:
+            with patch("nemo_automodel.components.moe.fsdp_mixin.isinstance") as mock_isinstance:
                 mock_isinstance.return_value = False
                 mock_backward_input.return_value = ((), [])
 
-                result = patched_backward_maybe_with_nosync(
-                    mock_stage,
-                    "input",
-                    bwd_kwargs,
-                    last_backward=False
-                )
+                result = patched_backward_maybe_with_nosync(mock_stage, "input", bwd_kwargs, last_backward=False)
 
                 mock_backward_input.assert_called_once()
                 grads, param_groups = result
@@ -731,17 +744,12 @@ class TestPatchedBackwardMaybeWithNosync:
             "param_groups": [],
         }
 
-        with patch('nemo_automodel.components.moe.fsdp_mixin.stage_backward_weight') as mock_backward_weight:
-            with patch('nemo_automodel.components.moe.fsdp_mixin.isinstance') as mock_isinstance:
+        with patch("nemo_automodel.components.moe.fsdp_mixin.stage_backward_weight") as mock_backward_weight:
+            with patch("nemo_automodel.components.moe.fsdp_mixin.isinstance") as mock_isinstance:
                 mock_isinstance.return_value = False
                 mock_backward_weight.return_value = ()
 
-                result = patched_backward_maybe_with_nosync(
-                    mock_stage,
-                    "weight",
-                    bwd_kwargs,
-                    last_backward=False
-                )
+                result = patched_backward_maybe_with_nosync(mock_stage, "weight", bwd_kwargs, last_backward=False)
 
                 mock_backward_weight.assert_called_once()
                 grads, param_groups = result
@@ -755,16 +763,11 @@ class TestPatchedBackwardMaybeWithNosync:
 
         bwd_kwargs = {}
 
-        with patch('nemo_automodel.components.moe.fsdp_mixin.isinstance') as mock_isinstance:
+        with patch("nemo_automodel.components.moe.fsdp_mixin.isinstance") as mock_isinstance:
             mock_isinstance.return_value = False
 
             try:
-                patched_backward_maybe_with_nosync(
-                    mock_stage,
-                    "invalid_type",
-                    bwd_kwargs,
-                    last_backward=False
-                )
+                patched_backward_maybe_with_nosync(mock_stage, "invalid_type", bwd_kwargs, last_backward=False)
                 assert False, "Should have raised RuntimeError"
             except RuntimeError as e:
                 assert "Unknown backward type" in str(e)

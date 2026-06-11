@@ -253,6 +253,7 @@ Large Language Models <model-coverage/llm/index.md>
 Vision Language Models <model-coverage/vlm/index.md>
 Multimodal <model-coverage/multimodal/index.md>
 Omni <model-coverage/omni/index.md>
+Diffusion LLMs <model-coverage/dllm/index.md>
 Diffusion <model-coverage/diffusion/index.md>
 Embedding Models <model-coverage/embedding/index.md>
 Reranking Models <model-coverage/reranker/index.md>
@@ -281,6 +282,7 @@ Mistral Medium 3.5 VL <guides/vlm/mistral-medium-3-5.md>
 Qwen3-Omni ASR <guides/audio/qwen3-omni-asr.md>
 Diffusion Fine-Tuning <guides/diffusion/finetune.md>
 dLLM Fine-Tuning <guides/dllm/finetune.md>
+DiffusionGemma SFT <guides/dllm/diffusiongemma.md>
 QAT <guides/quantization-aware-training.md>
 Databricks <guides/llm/databricks.md>
 SGLang EAGLE Serving <guides/speculative/serve_with_sglang.md>
