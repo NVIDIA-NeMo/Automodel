@@ -13,8 +13,7 @@
 # limitations under the License.
 
 import contextlib
-from dataclasses import dataclass
-from typing import Any, List, Optional, Set
+from typing import List, Optional, Set
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -194,128 +193,6 @@ def _cp_sdpa(
     return out.to_local() if isinstance(out, DTensor) else out
 
 
-@dataclass(frozen=True)
-class CPAllGatherAttentionContext:
-    """Inputs for model-owned manual all-gather CP attention."""
-
-    module: torch.nn.Module
-    query: torch.Tensor
-    key: torch.Tensor
-    value: torch.Tensor
-    key_full: torch.Tensor
-    value_full: torch.Tensor
-    cp_mesh: Any
-    cp_group: Any
-    cp_size: int
-    cp_rank: int
-    seq_local: int
-    seq_full: int
-    seq_global_start: int
-    attn_mask: Any
-    dropout_p: float
-    is_causal: bool
-    scale: Any
-    enable_gqa: bool
-    kwargs: dict[str, Any]
-    metadata: dict[str, torch.Tensor | None]
-
-
-class _ManualAllGatherAttention:
-    """Manual contiguous-shard CP transport for model-owned attention."""
-
-    def __init__(self, cp_mesh):
-        self.cp_mesh = cp_mesh
-        self.group = cp_mesh.get_group()
-        self.size = cp_mesh.size()
-
-        try:
-            from torch.distributed.nn.functional import all_gather as dist_all_gather
-
-            self.dist_all_gather = dist_all_gather
-        except (ImportError, AttributeError):
-            self.dist_all_gather = None
-
-    def _all_gather_seq(self, tensor: torch.Tensor) -> torch.Tensor:
-        tensor = tensor.contiguous()
-        if self.dist_all_gather is not None:
-            parts = self.dist_all_gather(tensor, group=self.group)
-        else:
-            parts = [torch.empty_like(tensor) for _ in range(self.size)]
-            torch.distributed.all_gather(parts, tensor, group=self.group)
-        return torch.cat(tuple(parts), dim=2)
-
-    def _all_gather_seq_metadata(self, metadata: torch.Tensor | None, seq_dim: int = 1) -> torch.Tensor | None:
-        if metadata is None:
-            return None
-        local = metadata.contiguous()
-        parts = [torch.empty_like(local) for _ in range(self.size)]
-        torch.distributed.all_gather(parts, local, group=self.group)
-        return torch.cat(parts, dim=seq_dim)
-
-    def __call__(
-        self,
-        module,
-        query,
-        key,
-        value,
-        *,
-        attn_mask,
-        dropout_p,
-        is_causal,
-        scale,
-        enable_gqa,
-        kwargs,
-    ):
-        run_cp_allgather_attention = getattr(module, "run_cp_allgather_attention", None)
-        if run_cp_allgather_attention is None:
-            raise RuntimeError(
-                f"{type(module).__name__} requested manual all-gather CP attention but does not implement "
-                "run_cp_allgather_attention(ctx)."
-            )
-
-        cp_rank = torch.distributed.get_rank(group=self.group)
-        seq_local = key.shape[2]
-        seq_global_start = cp_rank * seq_local
-
-        key_full = self._all_gather_seq(key)
-        value_full = self._all_gather_seq(value)
-        seq_full = key_full.shape[2]
-
-        if query.shape[1] != key_full.shape[1]:
-            enable_gqa = True
-
-        local_metadata = getattr(module, "_cp_allgather_metadata", {})
-        metadata_seq_dims = getattr(module, "_cp_allgather_metadata_seq_dims", {})
-        metadata_full = {
-            name: self._all_gather_seq_metadata(value, metadata_seq_dims.get(name, 1))
-            for name, value in local_metadata.items()
-        }
-
-        ctx = CPAllGatherAttentionContext(
-            module=module,
-            query=query,
-            key=key,
-            value=value,
-            key_full=key_full,
-            value_full=value_full,
-            cp_mesh=self.cp_mesh,
-            cp_group=self.group,
-            cp_size=self.size,
-            cp_rank=cp_rank,
-            seq_local=seq_local,
-            seq_full=seq_full,
-            seq_global_start=seq_global_start,
-            attn_mask=attn_mask,
-            dropout_p=dropout_p,
-            is_causal=is_causal,
-            scale=scale,
-            enable_gqa=enable_gqa,
-            kwargs=kwargs,
-            metadata=metadata_full,
-        )
-        return run_cp_allgather_attention(ctx)
-
-
 def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
     """Inject CP-aware attention into self-attention modules.
 
@@ -332,7 +209,6 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
     original_sdpa = F_module.scaled_dot_product_attention
     cp_size = cp_mesh.size()
     active_module = {"module": None}
-    manual_allgather_attention = _ManualAllGatherAttention(cp_mesh)
 
     @torch._dynamo.disable
     def cp_attention(
@@ -353,11 +229,13 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
 
         module = active_module["module"]
         if bool(getattr(module, "_cp_manual_allgather_active", False)):
-            return manual_allgather_attention(
-                module,
+            # The model owns its CP attention transport + compute via this seam;
+            # cp_utils stays model-agnostic (no all-gather / mask specifics here).
+            return module.run_cp_manual_attention(
                 query,
                 key,
                 value,
+                cp_mesh=cp_mesh,
                 attn_mask=attn_mask,
                 dropout_p=dropout_p,
                 is_causal=is_causal,
@@ -381,7 +259,7 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
         )
 
     def _pre_hook(module, args, kwargs):
-        has_manual_allgather_impl = hasattr(module, "run_cp_allgather_attention")
+        has_manual_allgather_impl = hasattr(module, "run_cp_manual_attention")
         metadata = {}
         if has_manual_allgather_impl:
             for name in getattr(module, "_cp_allgather_metadata_keys", ()):

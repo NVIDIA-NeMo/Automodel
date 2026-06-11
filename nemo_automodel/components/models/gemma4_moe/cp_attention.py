@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from types import MethodType
 from typing import Any
 
@@ -197,12 +198,134 @@ def _run_gemma4_cp_allgather_attention(attention_module: torch.nn.Module, ctx: A
         ) from flex_err
 
 
+@dataclass(frozen=True)
+class CPAllGatherAttentionContext:
+    """Inputs for Gemma4 manual all-gather CP attention."""
+
+    module: torch.nn.Module
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    key_full: torch.Tensor
+    value_full: torch.Tensor
+    cp_mesh: Any
+    cp_group: Any
+    cp_size: int
+    cp_rank: int
+    seq_local: int
+    seq_full: int
+    seq_global_start: int
+    attn_mask: Any
+    dropout_p: float
+    is_causal: bool
+    scale: Any
+    enable_gqa: bool
+    kwargs: dict[str, Any]
+    metadata: dict[str, torch.Tensor | None]
+
+
+def _cp_all_gather_seq(tensor: torch.Tensor, group, size: int) -> torch.Tensor:
+    """All-gather an attention tensor along the sequence dim (dim=2), autograd-aware when available."""
+    tensor = tensor.contiguous()
+    try:
+        from torch.distributed.nn.functional import all_gather as dist_all_gather
+
+        parts = dist_all_gather(tensor, group=group)
+    except (ImportError, AttributeError):
+        parts = [torch.empty_like(tensor) for _ in range(size)]
+        torch.distributed.all_gather(parts, tensor, group=group)
+    return torch.cat(tuple(parts), dim=2)
+
+
+def _cp_all_gather_seq_metadata(
+    metadata: torch.Tensor | None, group, size: int, seq_dim: int = 1
+) -> torch.Tensor | None:
+    """All-gather non-differentiable per-token metadata (masks / packed ids) along ``seq_dim``."""
+    if metadata is None:
+        return None
+    local = metadata.contiguous()
+    parts = [torch.empty_like(local) for _ in range(size)]
+    torch.distributed.all_gather(parts, local, group=group)
+    return torch.cat(parts, dim=seq_dim)
+
+
+def _gemma4_cp_manual_attention(
+    attention_module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    cp_mesh,
+    attn_mask,
+    dropout_p,
+    is_causal,
+    scale,
+    enable_gqa,
+    kwargs,
+) -> torch.Tensor:
+    """Gemma4-owned manual all-gather CP transport.
+
+    Each CP rank keeps its local query shard; K/V (and per-token metadata) are
+    all-gathered to the full sequence, then the local-query/global-key FlexAttention
+    in :func:`_run_gemma4_cp_allgather_attention` consumes them. This is the transport
+    that ``cp_utils.attach_cp_attention_hooks`` invokes via the generic
+    ``module.run_cp_manual_attention`` seam, so ``cp_utils`` stays model-agnostic.
+    """
+    group = cp_mesh.get_group()
+    size = cp_mesh.size()
+    cp_rank = torch.distributed.get_rank(group=group)
+    seq_local = key.shape[2]
+    seq_global_start = cp_rank * seq_local
+
+    key_full = _cp_all_gather_seq(key, group, size)
+    value_full = _cp_all_gather_seq(value, group, size)
+    seq_full = key_full.shape[2]
+    if query.shape[1] != key_full.shape[1]:
+        enable_gqa = True
+
+    local_metadata = getattr(attention_module, "_cp_allgather_metadata", {})
+    metadata_seq_dims = getattr(attention_module, "_cp_allgather_metadata_seq_dims", {})
+    metadata_full = {
+        name: _cp_all_gather_seq_metadata(value_, group, size, metadata_seq_dims.get(name, 1))
+        for name, value_ in local_metadata.items()
+    }
+
+    ctx = CPAllGatherAttentionContext(
+        module=attention_module,
+        query=query,
+        key=key,
+        value=value,
+        key_full=key_full,
+        value_full=value_full,
+        cp_mesh=cp_mesh,
+        cp_group=group,
+        cp_size=size,
+        cp_rank=cp_rank,
+        seq_local=seq_local,
+        seq_full=seq_full,
+        seq_global_start=seq_global_start,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
+        kwargs=kwargs,
+        metadata=metadata_full,
+    )
+    return _run_gemma4_cp_allgather_attention(attention_module, ctx)
+
+
 def attach_gemma4_cp_allgather_attention(attention_module: torch.nn.Module) -> None:
-    """Register Gemma4's model-specific manual all-gather CP attention handler."""
+    """Register Gemma4's model-specific manual all-gather CP attention handler.
+
+    Gemma4 owns the whole CP attention (transport + FlexAttention compute). It plugs
+    into the generic ``cp_utils`` SDPA-swap via the ``run_cp_manual_attention`` seam,
+    so ``cp_utils`` carries no all-gather-specific code.
+    """
     attention_module._cp_allgather_metadata_keys = ("mm_token_type_ids", "_packed_seq_ids", "padding_mask")
     attention_module._cp_allgather_metadata_seq_dims = {
         "mm_token_type_ids": 1,
         "_packed_seq_ids": 1,
         "padding_mask": 1,
     }
-    attention_module.run_cp_allgather_attention = MethodType(_run_gemma4_cp_allgather_attention, attention_module)
+    attention_module.run_cp_manual_attention = MethodType(_gemma4_cp_manual_attention, attention_module)
