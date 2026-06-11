@@ -57,6 +57,9 @@ class MXFP4ExpertStorageMixin:
     """
 
     _MXFP4_BASE_NAMES: tuple[str, ...] = ("gate_and_up_projs", "down_projs")
+    # Storage-parameter suffixes, in pack/unpack order; kept here so the
+    # registration helper is format-driven rather than hardcoding two names.
+    _PACKED_SUFFIXES: tuple[str, ...] = ("_packed", "_scales")
 
     def _init_mxfp4_storage(self) -> None:
         """Validate the backend and pack immediately if base weights are materialized."""
@@ -67,6 +70,33 @@ class MXFP4ExpertStorageMixin:
         self._mxfp4_resident = False
         if not _to_local(getattr(self, self._MXFP4_BASE_NAMES[0])).is_meta:
             self.pack_base_weights()
+
+    @torch.no_grad()
+    def register_packed_base_weight(self, name: str, tensors: tuple[torch.Tensor, ...], reference=None) -> None:
+        """Register packed storage params for base projection ``name``.
+
+        Decoupled from quantization so it can run either as a post-load conversion
+        (``pack_base_weights`` passes freshly quantized tensors) or at module init
+        (a chunk-loader passes meta placeholders, then loads the quantized
+        checkpoint straight into them — the path that avoids ever materializing
+        bf16 experts at GLM-744B scale). Replaces the bf16 parameter ``name`` if
+        present.
+
+        Args:
+            name: Base projection name (e.g. ``"gate_and_up_projs"``).
+            tensors: Storage tensors in ``_PACKED_SUFFIXES`` order.
+            reference: Optional DTensor whose mesh/placements the storage tensors
+                inherit (use the pre-pack bf16 param, or a meta DTensor at init).
+        """
+        assert len(tensors) == len(self._PACKED_SUFFIXES), (
+            f"expected {len(self._PACKED_SUFFIXES)} tensors {self._PACKED_SUFFIXES}, got {len(tensors)}"
+        )
+        if isinstance(reference, DTensor):
+            tensors = tuple(DTensor.from_local(t, reference.device_mesh, reference.placements) for t in tensors)
+        if name in self._parameters:
+            del self._parameters[name]
+        for suffix, tensor in zip(self._PACKED_SUFFIXES, tensors):
+            self.register_parameter(name + suffix, nn.Parameter(tensor, requires_grad=False))
 
     @torch.no_grad()
     def pack_base_weights(self) -> None:
@@ -82,13 +112,8 @@ class MXFP4ExpertStorageMixin:
             assert not local.is_meta, f"pack_base_weights requires materialized '{name}'"
             # [E, in, out] (compute layout) -> [E, out, in] (checkpoint layout) so the
             # mx block scales run along the contraction dim.
-            packed, scales = quantize_mxfp4(local.transpose(-2, -1).contiguous())
-            if isinstance(param, DTensor):
-                packed = DTensor.from_local(packed, param.device_mesh, param.placements)
-                scales = DTensor.from_local(scales, param.device_mesh, param.placements)
-            del self._parameters[name]
-            self.register_parameter(name + "_packed", nn.Parameter(packed, requires_grad=False))
-            self.register_parameter(name + "_scales", nn.Parameter(scales, requires_grad=False))
+            tensors = quantize_mxfp4(local.transpose(-2, -1).contiguous())
+            self.register_packed_base_weight(name, tensors, reference=param)
         self._mxfp4_resident = True
 
     def _mxfp4_base_mm(self, x: torch.Tensor, name: str, offs: torch.Tensor) -> torch.Tensor:
