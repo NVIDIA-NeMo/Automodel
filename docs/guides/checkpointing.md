@@ -272,6 +272,76 @@ automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 ...
 ```
 
+## Cloud Checkpointing with MSC (S3)
+
+NeMo AutoModel can read and write checkpoints directly to S3 (and other object stores) through the [NVIDIA Multi-Storage Client (MSC)](https://github.com/NVIDIA/multi-storage-client). Any `checkpoint_dir` beginning with `msc://` is routed to MSC instead of the local filesystem.
+
+### 1. Install the S3 extra
+
+```bash
+pip install nemo_automodel[s3]
+```
+
+This pulls in `multi-storage-client` together with the `boto3` backend it needs for S3 (`botocore` comes in transitively).
+
+### 2. Configure an MSC profile
+
+MSC reads its configuration from (in order of precedence):
+
+1. The path in the `MSC_CONFIG` environment variable, if set.
+2. The standard search paths, including `~/.config/msc/config.yaml`.
+
+Create `~/.config/msc/config.yaml` (or point `MSC_CONFIG` at a file of your choice) with an S3 profile:
+
+```yaml
+profiles:
+  my-checkpoints:
+    storage_provider:
+      type: s3
+      options:
+        base_path: my-bucket          # S3 bucket (optionally bucket/prefix)
+        region_name: us-east-1
+        # endpoint_url: https://...   # only for non-AWS S3-compatible endpoints
+```
+
+The profile name (`my-checkpoints`) becomes the authority in the `msc://` URI, and `base_path` is the bucket that keys are written under.
+
+### 3. Provide credentials
+
+If you omit `credentials_provider` (as above), MSC uses the standard boto3 credential chain, so the usual AWS environment variables apply:
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...   # only for temporary credentials
+export AWS_REGION=us-east-1    # or rely on region_name in the profile
+```
+
+Alternatively, reference a named profile from `~/.aws/credentials` with `profile_name: <name>` under `options`.
+
+### 4. Point the recipe at the bucket
+
+Set `checkpoint_dir` to an `msc://<profile>/<path>` URI. Cloud paths must use DCP, so set `model_save_format: torch_save` and `save_consolidated: false`:
+
+```yaml
+checkpoint:
+  checkpoint_dir: msc://my-checkpoints/llama-peft
+  model_save_format: torch_save
+  save_consolidated: false
+```
+
+Or via CLI override:
+
+```bash
+automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+    --checkpoint.checkpoint_dir msc://my-checkpoints/llama-peft \
+    --checkpoint.model_save_format torch_save \
+    --checkpoint.save_consolidated false
+```
+
+> **Note:** Consolidated HF safetensors export (`save_consolidated` set to anything other than `false`) is **not** supported on `msc://` paths and will raise a `ValueError`. Use DCP (`save_consolidated: false`) for cloud storage. PEFT adapter checkpoints are streamed to the cloud path automatically.
+
+
 ## Save Checkpoints When Using Docker
 
 When training inside a Docker container (see [Installation Guide](installation.md)), any files written to the container's filesystem are lost when the container exits (especially with `--rm`). To keep your checkpoints, you must **bind-mount a host directory** to the checkpoint path before starting the container:
