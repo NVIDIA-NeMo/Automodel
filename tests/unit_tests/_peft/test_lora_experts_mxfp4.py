@@ -287,6 +287,30 @@ def test_register_packed_base_weight_is_init_capable(moe_config):
     assert not mx.gate_and_up_projs_packed.requires_grad
 
 
+def test_passthrough_init_registers_packed_params_on_meta(moe_config):
+    """Phase-B packed-at-init: build in packed mode from meta weights, no bf16."""
+    with torch.device("meta"):
+        orig = GroupedExperts(moe_config)
+    orig.use_torch_mm = True
+
+    mx = GroupedExpertsMXFP4(orig, passthrough=True)
+
+    assert mx._mxfp4_resident
+    assert not hasattr(mx, "gate_and_up_projs")  # never created bf16 storage
+    up_proj_dim = 2 * moe_config.moe_inter_dim  # gated
+    assert tuple(mx.gate_and_up_projs_packed.shape) == (moe_config.n_routed_experts, up_proj_dim, moe_config.dim // 2)
+    assert tuple(mx.gate_and_up_projs_scales.shape) == (moe_config.n_routed_experts, up_proj_dim, moe_config.dim // 32)
+    assert tuple(mx.down_projs_packed.shape) == (
+        moe_config.n_routed_experts,
+        moe_config.dim,
+        moe_config.moe_inter_dim // 2,
+    )
+    assert mx.gate_and_up_projs_packed.is_meta
+    assert mx.gate_and_up_projs_packed.dtype == torch.int8
+    assert mx.down_projs_scales.dtype == torch.float8_e8m0fnu
+    assert [n for n, p in mx.named_parameters() if p.requires_grad] == []
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_convert_frozen_experts_to_mxfp4(moe_config, device):
     import torch.nn as nn
