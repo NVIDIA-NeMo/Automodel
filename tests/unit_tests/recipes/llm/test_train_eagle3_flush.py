@@ -26,10 +26,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
+from nemo_automodel.recipes.llm._spec_train_utils import optim_steps_per_epoch as _optim_steps_per_epoch
 from nemo_automodel.recipes.llm.train_eagle3 import (
     TrainEagle3Recipe,
     _all_reduce_mean,
-    _optim_steps_per_epoch,
 )
 
 # ---------------------------------------------------------------------------

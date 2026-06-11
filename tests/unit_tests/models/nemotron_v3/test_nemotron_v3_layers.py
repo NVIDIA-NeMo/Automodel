@@ -26,7 +26,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
 try:
-    import mamba_ssm
+    import mamba_ssm  # noqa: F401
 
     _has_mamba_ssm = True
 except ImportError:
