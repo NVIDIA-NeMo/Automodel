@@ -357,6 +357,10 @@ Where to declare it:
 - **HF model you only patch** (e.g. Qwen3.5): set it on the instance inside `patch_hf_model`,
   e.g. `model._keep_in_fp32_modules_strict = existing + ("_fp32_params",)`.
 
+For GatedDeltaNet layers that move `A_log` / `dt_bias` into an `_fp32_params` holder,
+mark the actual layer with `mark_gated_delta_net_fp32_params()`; do not infer this
+contract from a module path such as `linear_attn` or from an `A_log` parameter name alone.
+
 Always declare the pin for these params. A normal checkpoint load also auto-records each
 param's original HF dtype and uses it as a fallback, but that recording is skipped on the
 quantized, from-scratch, and odd-checkpoint paths — so the explicit pin is the only signal
