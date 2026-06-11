@@ -485,7 +485,16 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     model._cp_enabled = True
     _model._cp_enabled = True
 
-    has_non_te_attention = False
+    # CP attention routing (model-agnostic):
+    #   * TE DotProductAttention -> TE's own context-parallel group (set here);
+    #   * any other attention     -> the generic CP SDPA hooks (attached after the
+    #     loop). Those hooks route by capability at attention time: a module that
+    #     exposes `run_cp_manual_attention` (e.g. Gemma4 flex ring) runs its
+    #     model-owned CP, otherwise the classic DTensor SDPA CP path is used. No
+    #     model names here -- only the TE-vs-not split; the strategy choice lives
+    #     in cp_utils via the capability check.
+    needs_cp_attention_hooks = False
+    model_owned_cp_attention = False
     for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
@@ -500,7 +509,9 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                     cp_comm_type=attn_cp_comm_type,
                 )
             else:
-                has_non_te_attention = True
+                needs_cp_attention_hooks = True
+                if hasattr(block.self_attn, "run_cp_manual_attention"):
+                    model_owned_cp_attention = True
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
 
@@ -529,7 +540,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         if isinstance(moe_module, MoE):
             moe_module.cp_mesh = cp_mesh
 
-    if has_non_te_attention:
+    if needs_cp_attention_hooks:
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
             attach_cp_attention_hooks,
@@ -539,6 +550,11 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         attach_context_parallel_hooks(_model)
         attach_linear_attn_position_hooks(_model)
         attach_cp_attention_hooks(_model, cp_mesh)
+        logger.info(
+            "Attached CP attention hooks for %s (%s).",
+            type(_model).__name__,
+            "model-owned run_cp_manual_attention" if model_owned_cp_attention else "generic DTensor SDPA",
+        )
 
 
 def parallelize_model(
