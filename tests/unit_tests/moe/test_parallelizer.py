@@ -480,6 +480,30 @@ def test_apply_ep_parallelizes_moe_experts(monkeypatch):
     assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
 
 
+def test_apply_ep_parallelizes_diffusion_style_block_moe(monkeypatch):
+    """Diffusion Gemma exposes the MoE branch as block.moe, not block.mlp."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    parallelize_module_mock = MagicMock()
+    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+
+    class DiffusionBlock:
+        def __init__(self):
+            self.moe = DummyMoE()
+
+    block = DiffusionBlock()
+    model = type("Outer", (), {"model": DummyModel([block])})()
+    ep_mesh = type("Mesh", (), {"size": lambda self: 2})()
+
+    P.apply_ep(model, ep_mesh)
+
+    assert parallelize_module_mock.call_count == 1
+    _, kwargs = parallelize_module_mock.call_args
+    assert kwargs["module"] is block.moe.experts
+    assert kwargs["device_mesh"] is ep_mesh
+    assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
+
+
 def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     wrapper_returns = [object(), object()]
@@ -731,6 +755,39 @@ def test_apply_fsdp_shards_fp32_gdn_holders_when_isolated(monkeypatch):
     assert holder_kwargs["mp_policy"] == "FP32_MP"
 
 
+def test_apply_fsdp_skips_separate_wrapping_for_tied_embeddings(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    block = DummyBlock(mlp=DummyMoE())
+    shared_weight = object()
+    embed = types.SimpleNamespace(weight=shared_weight)
+    lm_head = types.SimpleNamespace(weight=shared_weight)
+    inner_model = DummyModel([block], embed_tokens=embed)
+    outer_model = types.SimpleNamespace(model=inner_model, lm_head=lm_head)
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=outer_model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=True,
+        ep_shard_enabled=False,
+        ep_shard_mesh=None,
+        wrap_outer_model=True,
+    )
+
+    assert _find_call_by_first_arg(fully_shard_mock, embed) is None
+    assert _find_call_by_first_arg(fully_shard_mock, lm_head) is None
+    assert _find_call_by_first_arg(fully_shard_mock, inner_model) is None
+
+    outer_call = _find_call_by_first_arg(fully_shard_mock, outer_model)
+    assert outer_call is not None and outer_call[1]["mesh"] is fsdp_mesh
+
+
 def test_apply_fsdp_without_ep_enabled_has_no_ignored_params(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
@@ -890,6 +947,35 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     assert ep_enabled is True
     assert ep_shard_enabled is True
     assert ep_shard_mesh_arg.size() == 2
+
+
+def test_parallelize_model_accepts_top_level_moe_config(monkeypatch):
+    """Custom MoE models may expose moe_config on the outer model itself."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_ep_mock = MagicMock()
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_ep", apply_ep_mock)
+    monkeypatch.setattr(P, "apply_ac", MagicMock())
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+
+    world_mesh = FakeWorldMesh({"dp": 1, ("dp",): 1}, mesh_dim_names=["dp"])
+    moe_mesh = FakeMoeMesh({"ep": 2})
+    model = type("Outer", (), {"moe_config": type("MC", (), {"n_routed_experts": 4})()})()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=moe_mesh,
+        dp_axis_names=("dp",),
+        cp_axis_name=None,
+        tp_axis_name=None,
+        ep_axis_name="ep",
+        ep_shard_axis_names=None,
+        activation_checkpointing=False,
+    )
+
+    apply_ep_mock.assert_called_once()
+    apply_fsdp_mock.assert_not_called()
 
 
 def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypatch):

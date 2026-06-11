@@ -137,6 +137,34 @@ def _shard_fp32_gdn_holders(
     return count
 
 
+def _get_model_moe_config(model: nn.Module):
+    """Return the model-level MoE config exposed by custom MoE architectures."""
+    candidates = []
+    inner = getattr(model, "model", None)
+    if inner is not None:
+        candidates.append(inner)
+        text_model = get_text_module(inner)
+        if text_model is not inner:
+            candidates.append(text_model)
+    candidates.append(model)
+
+    for candidate in candidates:
+        moe_config = getattr(candidate, "moe_config", None)
+        if moe_config is not None:
+            return moe_config
+
+    raise AttributeError("MoE models must expose moe_config on the inner, text, or top-level model.")
+
+
+def _module_weights_are_tied(left: nn.Module | None, right: nn.Module | None) -> bool:
+    """Return True when two modules expose the same ``weight`` parameter object."""
+    if left is None or right is None:
+        return False
+    left_weight = getattr(left, "weight", None)
+    right_weight = getattr(right, "weight", None)
+    return left_weight is not None and left_weight is right_weight
+
+
 class ExpertParallel(ParallelStyle):
     """
     ExpertParallel class is used to shard the MoE parameters on the EP mesh.
@@ -418,11 +446,35 @@ def apply_fsdp(
             ignored_params = set(moe_module.experts.parameters())
         fully_shard_default(block, ignored_params=ignored_params)
 
-    if hasattr(_model, "embed_tokens") and _model.embed_tokens is not None:
-        fully_shard_default(_model.embed_tokens)
+    # Re-establish weight tying before detecting it: a device/dtype move during
+    # from_pretrained (HF replaces param tensors) can silently break a tie set in
+    # __init__ (lm_head.weight = embed_tokens.weight), so the identity check below
+    # would miss it and shard embed and lm_head as two INDEPENDENT FSDP params.
+    # For tie_word_embeddings models those two then drift apart during full
+    # fine-tuning, diverging from the tied architecture and breaking checkpoint
+    # resume (the checkpoint drops lm_head and reconstructs it from embed on load,
+    # silently discarding the drifted lm_head). Re-tying here keeps them in one
+    # FSDP root so they remain a single shared parameter.
+    # NB: re-point output->input embedding directly (model.__init__'s own tie);
+    # HF's tie_weights() is incompatible with this model's _tied_weights_keys
+    # format ('list' object has no attribute 'keys').
+    if getattr(getattr(model, "config", None), "tie_word_embeddings", False):
+        _out = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
+        _inp = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+        if _out is not None and _inp is not None and hasattr(_out, "weight") and hasattr(_inp, "weight"):
+            _out.weight = _inp.weight
 
-    lm_head = getattr(_model, "lm_head", None) or getattr(model, "lm_head", None)
-    if lm_head is not None:
+    embed_tokens = getattr(_model, "embed_tokens", None)
+    inner_lm_head = getattr(_model, "lm_head", None)
+    outer_lm_head = getattr(model, "lm_head", None) if model is not _model else None
+    lm_head = inner_lm_head or outer_lm_head
+    tied_input_output_embeddings = _module_weights_are_tied(embed_tokens, lm_head)
+    tied_embeddings_cross_fsdp_roots = tied_input_output_embeddings and lm_head is outer_lm_head
+
+    if embed_tokens is not None and not tied_input_output_embeddings:
+        fully_shard_default(embed_tokens)
+
+    if lm_head is not None and not tied_input_output_embeddings:
         # Use custom mixed precision policy for lm_head if lm_head_precision is specified
         if lm_head_precision == torch.float32:
             lm_head_mp_policy = MixedPrecisionPolicy(
@@ -439,6 +491,12 @@ def apply_fsdp(
             )
         else:
             fully_shard_default(lm_head)
+    elif tied_input_output_embeddings and lm_head_precision is not None:
+        logger.warning(
+            "Skipping separate lm_head FSDP wrapping because lm_head.weight is tied to embed_tokens.weight; "
+            "lm_head_precision=%s will not be applied independently.",
+            lm_head_precision,
+        )
 
     # TODO: properly handle all possible multimodal component names
     if hasattr(model, "audio_tower") and model.audio_tower is not None:
@@ -453,7 +511,18 @@ def apply_fsdp(
         else:
             logging.info("Skipping FSDP wrap for frozen visual tower")
 
-    fully_shard_default(_model)
+    if tied_embeddings_cross_fsdp_roots and wrap_outer_model and model is not _model:
+        logger.info(
+            "Skipping separate inner-model FSDP root because lm_head.weight is tied to embed_tokens.weight "
+            "across the outer model boundary; the outer FSDP root will own the tied parameter."
+        )
+    else:
+        if tied_embeddings_cross_fsdp_roots and not wrap_outer_model:
+            logger.warning(
+                "lm_head.weight is tied to embed_tokens.weight across the outer model boundary, but "
+                "wrap_outer_model=False prevents preserving the tie in one FSDP root."
+            )
+        fully_shard_default(_model)
 
     # If model has a nested structure (outer model wrapping inner _model), wrap the outer model if requested
     if wrap_outer_model and model is not _model:
@@ -553,8 +622,9 @@ def parallelize_model(
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1
     if ep_enabled:
-        assert model.model.moe_config.n_routed_experts % moe_mesh[ep_axis_name].size() == 0, (
-            f"n_routed_experts {model.model.moe_config.n_routed_experts} must be divisible by "
+        moe_config = _get_model_moe_config(model)
+        assert moe_config.n_routed_experts % moe_mesh[ep_axis_name].size() == 0, (
+            f"n_routed_experts {moe_config.n_routed_experts} must be divisible by "
             f"expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
         )
 
