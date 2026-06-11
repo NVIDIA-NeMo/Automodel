@@ -66,6 +66,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
         ),
         (
+            "DiffusionGemmaForBlockDiffusion",
+            ("nemo_automodel.components.models.diffusion_gemma.model", "DiffusionGemmaForBlockDiffusion"),
+        ),
+        (
             "Ernie4_5_MoeForCausalLM",
             ("nemo_automodel.components.models.ernie4_5.model", "Ernie4_5_MoeForCausalLM"),
         ),

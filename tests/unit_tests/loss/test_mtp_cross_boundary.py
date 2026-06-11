@@ -52,7 +52,6 @@ def _hand_masked_labels(
     """
     shift = depth + 1
     if labels.dim() == 1:
-        L = labels.shape[0]
         rolled = torch.cat([labels[shift:], torch.zeros(shift, dtype=labels.dtype)])
         out = rolled.clone()
         out[-shift:] = IGNORE
