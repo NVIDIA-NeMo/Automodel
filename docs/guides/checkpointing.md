@@ -160,7 +160,7 @@ Although this example uses the Hugging Face Transformers API, the `consolidated/
 
 
 ## PEFT
-When training with Parameter-Efficient Fine-Tuning (PEFT) techniques, only a small subset of model weights are updated — the rest of the model remains frozen. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
+When training with Parameter-Efficient Fine-Tuning (PEFT) techniques, only a small subset of model weights are updated; the rest of the model remains frozen. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
 
 PEFT checkpoints save adapter files directly under `model/` and do not generate or need `model/consolidate.sh`.
 
