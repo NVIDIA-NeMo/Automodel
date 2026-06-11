@@ -116,7 +116,7 @@ bash checkpoints/epoch_0_step_20/model/consolidate.sh
 
 Run the helper from the AutoModel repo root so it can find `tools/offline_hf_consolidation.py`, or set `CONSOLIDATION_TOOL=/path/to/tools/offline_hf_consolidation.py`.
 
-The helper defaults to one CPU worker process with five writer threads so it is safe on small machines. For large checkpoints, run it on a CPU compute node and increase parallelism:
+The helper defaults to one CPU worker process with five writer threads, so it is safe on small machines. For large checkpoints, run it on a CPU compute node and increase parallelism:
 
 ```bash
 NPROC_PER_NODE=16 NUM_THREADS=5 bash checkpoints/epoch_0_step_20/model/consolidate.sh
