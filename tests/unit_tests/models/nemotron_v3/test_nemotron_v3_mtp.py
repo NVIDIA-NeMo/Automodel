@@ -500,9 +500,11 @@ class TestMTPInputEmbeds:
 
         H = 64
         B, S = 2, 10
-        config = MockNemotronV3Config(num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*E")
-        mtp_config = MTPConfig(num_layers=1, layer_pattern="*E")
-        mtp = build_nemotron_v3_mtp(config, mtp_config=mtp_config).to(torch.bfloat16)
+        config = MockNemotronV3Config(num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*")
+        mtp_config = MTPConfig(num_layers=1, layer_pattern="*")
+        mtp = build_nemotron_v3_mtp(
+            config, mtp_config=mtp_config, backend=backend, moe_config=None, dtype=torch.bfloat16
+        ).to(torch.bfloat16)
 
         hidden_states = torch.randn(B, S, H, dtype=torch.bfloat16)
         # Pre-fused embeddings (e.g. SALM audio+text): fill with a recognizable value.
@@ -536,9 +538,11 @@ class TestMTPInputEmbeds:
 
         H = 64
         B, S = 2, 10
-        config = MockNemotronV3Config(num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*E")
-        mtp_config = MTPConfig(num_layers=1, layer_pattern="*E")
-        mtp = build_nemotron_v3_mtp(config, mtp_config=mtp_config).to(torch.bfloat16)
+        config = MockNemotronV3Config(num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*")
+        mtp_config = MTPConfig(num_layers=1, layer_pattern="*")
+        mtp = build_nemotron_v3_mtp(
+            config, mtp_config=mtp_config, backend=backend, moe_config=None, dtype=torch.bfloat16
+        ).to(torch.bfloat16)
 
         hidden_states = torch.randn(B, S, H, dtype=torch.bfloat16)
         input_ids = torch.randint(0, 64, (B, S))
