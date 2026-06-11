@@ -230,7 +230,7 @@ print(tokenizer.batch_decode(outputs.detach().cpu().numpy(), skip_special_tokens
 ## PyTorch DCP
 NeMo AutoModel also offers native PyTorch DCP checkpointing support (`.distcp` extension). Similar to Safetensors, it also provides the same features of load-time resharding and parallel saving.
 
-As a simple example, we can run the following command to launch the training recipe on two GPUs.
+As a simple example, run the following command to launch the training recipe on two GPUs.
 ```bash
 automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --step_scheduler.ckpt_every_steps 20 \
