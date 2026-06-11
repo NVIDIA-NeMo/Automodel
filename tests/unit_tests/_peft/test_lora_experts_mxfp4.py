@@ -252,6 +252,41 @@ def test_frozen_mxfp4_forward_matches_bf16(moe_config, device):
     torch.testing.assert_close(y_mx, y_ref, atol=1e-6, rtol=1e-6)
 
 
+def test_register_packed_base_weight_is_init_capable(moe_config):
+    """Lock the API the GLM chunk-loader depends on: packed params can be registered
+    decoupled from quantization (here, with meta placeholders), replacing the bf16
+    param without ever materializing it."""
+    orig = GroupedExperts(moe_config)
+    orig.use_torch_mm = True  # avoid the post-init pack; weights are still on meta
+
+    mx = GroupedExpertsMXFP4.__new__(GroupedExpertsMXFP4)
+    GroupedExperts.__init__(mx, moe_config, backend=None)
+    mx.use_torch_mm = True
+    mx._mxfp4_resident = False
+
+    # Register meta placeholders of the packed shapes, as a chunk-loader would at init.
+    e = moe_config.n_routed_experts
+    gate_up_out = 2 * moe_config.moe_inter_dim
+    placeholders = {
+        "gate_and_up_projs": (
+            torch.empty(e, gate_up_out, moe_config.dim // 2, dtype=torch.int8, device="meta"),
+            torch.empty(e, gate_up_out, moe_config.dim // 32, dtype=torch.float8_e8m0fnu, device="meta"),
+        ),
+        "down_projs": (
+            torch.empty(e, moe_config.dim, moe_config.moe_inter_dim // 2, dtype=torch.int8, device="meta"),
+            torch.empty(e, moe_config.dim, moe_config.moe_inter_dim // 32, dtype=torch.float8_e8m0fnu, device="meta"),
+        ),
+    }
+    for name, tensors in placeholders.items():
+        mx.register_packed_base_weight(name, tensors)
+
+    assert not hasattr(mx, "gate_and_up_projs")
+    assert mx.gate_and_up_projs_packed.dtype == torch.int8
+    assert mx.gate_and_up_projs_packed.is_meta
+    assert mx.down_projs_scales.dtype == torch.float8_e8m0fnu
+    assert not mx.gate_and_up_projs_packed.requires_grad
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_convert_frozen_experts_to_mxfp4(moe_config, device):
     import torch.nn as nn
