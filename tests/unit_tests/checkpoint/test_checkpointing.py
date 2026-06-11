@@ -1194,7 +1194,7 @@ class TestLmHeadWeightTying:
         model = FakeModel()
         assert model.lm_head.weight.data_ptr() != model.embed_tokens.weight.data_ptr()
 
-        from nemo_automodel.components.checkpoint.checkpointing import is_tied_word_embeddings
+        from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 
         is_tied = is_tied_word_embeddings(model)
         if hasattr(model, "tie_weights") and is_tied:
@@ -1219,7 +1219,7 @@ class TestLmHeadWeightTying:
 
         model = FakeModel()
 
-        from nemo_automodel.components.checkpoint.checkpointing import is_tied_word_embeddings
+        from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 
         is_tied = is_tied_word_embeddings(model)
         if hasattr(model, "tie_weights") and is_tied:
