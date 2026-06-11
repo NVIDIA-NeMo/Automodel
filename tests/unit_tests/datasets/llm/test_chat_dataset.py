@@ -604,6 +604,7 @@ def test_getitem_auto_converts_conversations(monkeypatch):
     ds.padding = False
     ds.truncation = False
     ds.mask_reasoning_content = False
+    ds.mask_history = False
     ds.unshifted = False
 
     out = ds[0]
