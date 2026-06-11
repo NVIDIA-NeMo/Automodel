@@ -1124,7 +1124,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         _thd_collater = _uses_thd_collater(self.cfg.dataloader)
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
         if self.magi.enabled:
-            train_ctx, batch = self.magi.prepare_llm_batch(
+            train_ctx, batch = self.magi.prepare_llm_batch(  # pragma: no cover - requires GPU + magi_attention
                 self.model_parts[0] if hasattr(self, "model_parts") else None,
                 batch,
                 device_mesh=self.device_mesh,

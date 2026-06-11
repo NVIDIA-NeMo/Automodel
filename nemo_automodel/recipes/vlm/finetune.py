@@ -881,7 +881,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.magi.enabled:
             # magi manages the language-backbone attention itself (vision stays on
             # SDPA); skip the torch-native DTensor CP context.
-            train_ctx, batch = self.magi.prepare_vlm_batch(self.model_parts[0], batch)
+            train_ctx, batch = self.magi.prepare_vlm_batch(
+                self.model_parts[0], batch
+            )  # pragma: no cover - requires GPU + magi_attention
         else:
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")

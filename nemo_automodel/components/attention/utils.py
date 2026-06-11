@@ -106,10 +106,14 @@ def initialize_attn_module_and_func(
                 f"attn_impl='magi' supports head_dim <= 128, got {num_qk_channels} "
                 "(e.g. Gemma3 / Qwen3.5 full-attention layers use 256)."
             )
-        from nemo_automodel.components.distributed.magi_attn_utils import make_magi_attn_func
+        # requires magi_attention; the guards above are exercised on CPU but the
+        # kernel build is not, so exclude it from coverage.
+        from nemo_automodel.components.distributed.magi_attn_utils import (  # pragma: no cover - requires magi_attention
+            make_magi_attn_func,
+        )
 
-        attn_func = make_magi_attn_func(softmax_scale=softmax_scale)
-        return None, attn_func
+        attn_func = make_magi_attn_func(softmax_scale=softmax_scale)  # pragma: no cover - requires magi_attention
+        return None, attn_func  # pragma: no cover - requires magi_attention
     else:
         raise ValueError(f"Unsupported attention implementation: {attn_impl}")
 
@@ -189,7 +193,7 @@ def preprocess_args_and_kwargs_for_attn(
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
-    elif attn_impl == "magi":
+    elif attn_impl == "magi":  # pragma: no cover - requires magi_attention
         # magi's attn_func consumes the native [b, s, nh, hd] / [t, nh, hd] layout
         # directly (no transpose). Forward the genuine mask metadata so the FFA key
         # matches what the other backends would build: an explicit ``magi_attn_spec``

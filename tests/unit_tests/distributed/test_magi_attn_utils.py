@@ -156,8 +156,14 @@ class TestSetupMagi:
         st = setup_magi(_FakeCfg({}), device_mesh=None)
         assert st.enabled is False and st.custom is False and st.cp_size == 1
 
+    def test_raises_when_magi_unavailable(self, monkeypatch):
+        monkeypatch.setattr(mu, "is_magi_available", lambda: False)
+        with pytest.raises(RuntimeError, match="not importable"):
+            setup_magi(_FakeCfg({"model.attn_implementation": "magi"}), device_mesh=object())
+
     def test_hf_backend_enabled(self, monkeypatch):
         calls = {"register": 0, "active": []}
+        monkeypatch.setattr(mu, "is_magi_available", lambda: True)
         monkeypatch.setattr(mu, "register_magi_attention", lambda: calls.__setitem__("register", calls["register"] + 1))
         monkeypatch.setattr(mu, "get_cp_group", lambda mesh: _FakeGroup(1))
         monkeypatch.setattr(mu, "set_active_cp_group", lambda g: calls["active"].append(g))
@@ -171,6 +177,7 @@ class TestSetupMagi:
     def test_custom_backend_enabled_sets_active_group(self, monkeypatch):
         grp = _FakeGroup(2)
         active = []
+        monkeypatch.setattr(mu, "is_magi_available", lambda: True)
         monkeypatch.setattr(mu, "register_magi_attention", lambda: None)
         monkeypatch.setattr(mu, "get_cp_group", lambda mesh: grp)
         monkeypatch.setattr(mu, "set_active_cp_group", lambda g: active.append(g))

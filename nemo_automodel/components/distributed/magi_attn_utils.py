@@ -195,7 +195,9 @@ def get_active_attn_spec() -> Optional["AttnMaskSpec"]:
     return _ACTIVE_ATTN_SPEC
 
 
-def build_flex_key(spec: "AttnMaskSpec", *, num_heads_q, num_heads_kv, head_dim, cp_group):
+def build_flex_key(
+    spec: "AttnMaskSpec", *, num_heads_q, num_heads_kv, head_dim, cp_group
+):  # pragma: no cover - requires GPU + magi_attention
     """Build a magi dist-attn key for an arbitrary AttnSlice mask (no extra padding)."""
     from magi_attention.api import magi_attn_flex_key
     from magi_attention.common import AttnRanges
@@ -215,7 +217,9 @@ def build_flex_key(spec: "AttnMaskSpec", *, num_heads_q, num_heads_kv, head_dim,
     )
 
 
-def _flex_key_for(cp_group, spec, *, num_heads_q, num_heads_kv, head_dim):
+def _flex_key_for(
+    cp_group, spec, *, num_heads_q, num_heads_kv, head_dim
+):  # pragma: no cover - requires GPU + magi_attention
     """Return the flex key for ``spec``, rebuilding only when the mask changes."""
     fp = spec.fingerprint()
     cached = _FLEX_KEY_CACHE.get(id(cp_group))
@@ -232,7 +236,9 @@ def _flex_key_for(cp_group, spec, *, num_heads_q, num_heads_kv, head_dim):
     return key
 
 
-def _build_self_key(cp_group, *, seqlen, num_heads_q, num_heads_kv, head_dim, device):
+def _build_self_key(
+    cp_group, *, seqlen, num_heads_q, num_heads_kv, head_dim, device
+):  # pragma: no cover - requires GPU + magi_attention
     """Build a cp=1 causal varlen key matching the actual q length (no dispatch)."""
     from magi_attention.api import magi_attn_varlen_key
 
@@ -250,7 +256,9 @@ def _build_self_key(cp_group, *, seqlen, num_heads_q, num_heads_kv, head_dim, de
     )
 
 
-def _self_key_for(cp_group, *, seqlen, num_heads_q, num_heads_kv, head_dim, device):
+def _self_key_for(
+    cp_group, *, seqlen, num_heads_q, num_heads_kv, head_dim, device
+):  # pragma: no cover - requires GPU + magi_attention
     """Return a causal self-key for ``seqlen``, (re)building only when it changes.
 
     All attention layers in one forward share the same sequence length, so the
@@ -275,7 +283,7 @@ def _self_key_for(cp_group, *, seqlen, num_heads_q, num_heads_kv, head_dim, devi
     return key
 
 
-def make_magi_attn_func(softmax_scale: Optional[float] = None):
+def make_magi_attn_func(softmax_scale: Optional[float] = None):  # pragma: no cover - requires GPU + magi_attention
     """Build the attn_func used by the custom-model attention factory.
 
     The returned callable accepts q/k/v in either THD ``[t, nh, hd]`` or BSHD
@@ -382,7 +390,7 @@ def is_magi_available() -> bool:
         return False
 
 
-def register_magi_attention() -> None:
+def register_magi_attention() -> None:  # pragma: no cover - requires GPU + magi_attention
     """Register the ``"magi"`` attention backend in HF transformers (idempotent)."""
     global _MAGI_REGISTERED
     if _MAGI_REGISTERED:
@@ -491,7 +499,7 @@ def _set_cp_group_on_attention(model, cp_group) -> None:
             module.cp_group = cp_group
 
 
-def magi_prepare_batch(
+def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
     model,
     batch: dict,
     cp_group: Optional[dist.ProcessGroup],
@@ -591,7 +599,7 @@ def _packed_cp_doc_seqlens(batch: dict, total_len: int) -> list:
     return seqlens
 
 
-def magi_prepare_packed_cp(model, batch: dict, cp_group):
+def magi_prepare_packed_cp(model, batch: dict, cp_group):  # pragma: no cover - requires GPU + magi_attention
     """Context-parallel prep for a packed (THD) batch on the custom-model path.
 
     Takes a *global* THD batch (flat ``input_ids``/``labels``/``position_ids`` plus
@@ -694,7 +702,9 @@ def magi_prepare_vlm(
     return batch, None
 
 
-def magi_undispatch_logits(logits: torch.Tensor, cp_group: Optional[dist.ProcessGroup]) -> torch.Tensor:
+def magi_undispatch_logits(
+    logits: torch.Tensor, cp_group: Optional[dist.ProcessGroup]
+) -> torch.Tensor:  # pragma: no cover - requires GPU + magi_attention
     """Gather sharded/padded logits back to the global, unpadded sequence.
 
     Args:
@@ -744,7 +754,9 @@ class MagiState:
         """Undispatch logits to the global sequence on the HF dispatch path; else identity."""
         return magi_undispatch_logits(logits, self.cp_group) if self.hf_dispatch else logits
 
-    def prepare_llm_batch(self, model, batch, *, device_mesh, is_thd, pad_id, num_chunks):
+    def prepare_llm_batch(
+        self, model, batch, *, device_mesh, is_thd, pad_id, num_chunks
+    ):  # pragma: no cover - requires GPU + magi_attention
         """Per-step batch prep for the LLM recipe (assumes ``enabled``).
 
         Returns ``(train_ctx, batch)``. magi does its own CP, so ``train_ctx`` is
@@ -790,6 +802,15 @@ def setup_magi(cfg, device_mesh, *, label: str = "") -> MagiState:
     enabled = custom or str(cfg.get("model.attn_implementation", "")) == "magi"
     if not enabled:
         return MagiState()
+
+    if not is_magi_available():
+        raise RuntimeError(
+            "The 'magi' attention backend is configured (model.attn_implementation='magi' or "
+            "model.backend.attn='magi') but the 'magi_attention' package is not importable. "
+            "It is a source-only CUDA build (not published on PyPI): build it from source per "
+            "https://github.com/SandAI-org/MagiAttention (see its install docs) and make it "
+            "importable (a `pip install -e .` editable install, or on PYTHONPATH)."
+        )
 
     register_magi_attention()
     cp_group = get_cp_group(device_mesh)
