@@ -232,6 +232,12 @@ def _build_diffusion_parallel_manager_args(
     if compute_dtype is None:
         compute_dtype = dtype
 
+    # The recipe passes ConfigNode sections, which support .to_dict() but not dict().
+    if hasattr(fsdp_cfg, "to_dict"):
+        fsdp_cfg = fsdp_cfg.to_dict()
+    if hasattr(ddp_cfg, "to_dict"):
+        ddp_cfg = ddp_cfg.to_dict()
+
     if fsdp_cfg is not None and ddp_cfg is not None:
         raise ValueError(
             "Cannot specify both 'fsdp' and 'ddp' configurations. "
