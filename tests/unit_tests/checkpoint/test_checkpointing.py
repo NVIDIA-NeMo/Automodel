@@ -559,6 +559,29 @@ def test_model_state_drops_lm_head_when_storage_is_actually_tied():
     assert "model.embed_tokens.weight" in saved_state_dict
 
 
+def test_model_state_refreshes_tied_lm_head_before_dropping_key():
+    model = _LocalUntiedButConfiguredModel()
+    model_state = ModelState(model, is_peft=False, is_init_step=False)
+    assert model_state.has_local_tied_lm_head is False
+
+    def fake_get_model_state_dict(model_part, options=None):
+        model_part.lm_head.weight = model_part.model.embed_tokens.weight
+        return {
+            "lm_head.weight": model_part.lm_head.weight,
+            "model.embed_tokens.weight": model_part.model.embed_tokens.weight,
+        }
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_model_state_dict",
+        side_effect=fake_get_model_state_dict,
+    ):
+        saved_state_dict = model_state.state_dict()
+
+    assert model_state.has_local_tied_lm_head is True
+    assert "lm_head.weight" not in saved_state_dict
+    assert "model.embed_tokens.weight" in saved_state_dict
+
+
 def test_materialize_missing_tied_lm_head_uses_embedding_tensor_from_checkpoint():
     model = _PipelineLastStageLikeModel()
     embed_weight = torch.full_like(model.lm_head.weight, 3.0)
@@ -570,6 +593,31 @@ def test_materialize_missing_tied_lm_head_uses_embedding_tensor_from_checkpoint(
     assert "lm_head.weight" in state_dict
     assert torch.equal(state_dict["lm_head.weight"], embed_weight)
     assert not torch.equal(state_dict["lm_head.weight"], model.lm_head.weight.detach())
+
+
+def test_model_state_retie_lm_head_after_load_state_dict():
+    model = _LocalUntiedButConfiguredModel()
+    model.lm_head.weight = model.model.embed_tokens.weight
+    checkpoint_weight = torch.full_like(model.model.embed_tokens.weight, 5.0)
+    state_dict = {"model.embed_tokens.weight": checkpoint_weight}
+    model_state = ModelState(model, is_peft=False, is_init_step=False)
+
+    def fake_set_model_state_dict(model_part, state_dict, options):
+        model_part.model.embed_tokens.weight = torch.nn.Parameter(torch.empty_like(checkpoint_weight))
+        model_part.lm_head.weight = torch.nn.Parameter(torch.empty_like(checkpoint_weight))
+        model_part.model.embed_tokens.weight.data.copy_(state_dict["model.embed_tokens.weight"])
+        model_part.lm_head.weight.data.copy_(state_dict["lm_head.weight"])
+        assert model_part.lm_head.weight.data_ptr() != model_part.model.embed_tokens.weight.data_ptr()
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.set_model_state_dict",
+        side_effect=fake_set_model_state_dict,
+    ):
+        model_state.load_state_dict(state_dict, strict=False)
+
+    assert has_local_tied_lm_head(model) is True
+    assert model.lm_head.weight is model.model.embed_tokens.weight
+    assert torch.equal(model.model.embed_tokens.weight, checkpoint_weight)
 
 
 def test_model_state_keeps_pp_last_stage_lm_head_in_saved_state_dict():

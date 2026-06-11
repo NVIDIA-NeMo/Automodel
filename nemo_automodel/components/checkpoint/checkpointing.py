@@ -1726,6 +1726,7 @@ def _load_full_state_dict_into_model(
             # _distribute_state_dict would instead move the *entire* state dict onto the
             # device (a second full copy), OOMing a 30B model on one 80GB GPU.
             part.load_state_dict(state_dict, strict=False)
+        ensure_tied_lm_head(part)
 
 
 def _convert_checkpoint_with_transformers(
