@@ -330,7 +330,7 @@ checkpoint:
   save_consolidated: false
 ```
 
-Or via CLI override:
+You can also set these values using the CLI override:
 
 ```bash
 automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
