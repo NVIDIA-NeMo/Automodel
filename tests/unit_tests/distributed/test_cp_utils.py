@@ -783,3 +783,30 @@ def test_make_manual_allgather_cp_batch_second_rank_inputs_embeds():
     assert out["inputs_embeds"].shape == (1, 2, 2)
     assert torch.equal(out["labels"], torch.tensor([[7, 8]]))
     assert torch.equal(out["position_ids"], torch.tensor([[2, 3]]))
+
+
+def test_synthesize_single_document_seq_ids_from_padding_mask():
+    # A single sequence has no collate-emitted `_packed_seq_ids`; the manual CP
+    # path synthesizes the trivial one-document map (1 = real token, 0 = pad)
+    # from `padding_mask` so the all-gather attention mask builder has boundaries.
+    batch = {
+        "input_ids": torch.zeros(1, 6, dtype=torch.long),
+        "padding_mask": torch.tensor([[False, False, False, False, True, True]]),
+    }
+    _cu._synthesize_single_document_seq_ids(batch, "input_ids", 6)
+    assert torch.equal(batch["_packed_seq_ids"], torch.tensor([[1, 1, 1, 1, 0, 0]]))
+
+
+def test_synthesize_single_document_seq_ids_all_ones_without_padding_mask():
+    # No padding info -> single document spanning the whole sequence.
+    batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
+    _cu._synthesize_single_document_seq_ids(batch, "input_ids", 4)
+    assert torch.equal(batch["_packed_seq_ids"], torch.tensor([[1, 1, 1, 1]]))
+
+
+def test_synthesize_single_document_seq_ids_noop_when_present():
+    # Genuinely packed input already carries `_packed_seq_ids`; leave it untouched.
+    existing = torch.tensor([[1, 1, 2, 2, 0, 0]])
+    batch = {"input_ids": torch.zeros(1, 6, dtype=torch.long), "_packed_seq_ids": existing}
+    _cu._synthesize_single_document_seq_ids(batch, "input_ids", 6)
+    assert torch.equal(batch["_packed_seq_ids"], existing)

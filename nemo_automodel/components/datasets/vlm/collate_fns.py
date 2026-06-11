@@ -1544,10 +1544,12 @@ def neat_packed_vlm_collater(
         "mm_token_type_ids": mm_token_type_ids,
     }
 
-    # Store indexed attention mask for loss functions and CP attention paths
-    # that need per-sample boundaries. Keep this even for a single sequence so
-    # packed and standalone forwards use the same document-aware path.
-    if attention_mask.max() > 0:
+    # Store indexed attention mask for loss functions that need per-sample
+    # boundaries (e.g. SqrtCrossEntropy). The indexed mask [B, S] uses values
+    # 1,2,3,... per original sample and 0 for padding. Only emitted when 2+
+    # documents are packed; single-sequence all-gather CP forwards synthesize the
+    # trivial one-document map in cp_utils._make_manual_allgather_cp_batch.
+    if attention_mask.max() > 1:
         result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)
