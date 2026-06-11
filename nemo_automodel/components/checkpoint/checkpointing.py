@@ -25,13 +25,23 @@ import torch
 import torch.distributed.checkpoint as dcp
 import yaml
 
+try:
+    import multistorageclient as msc
+
+    MSC_AVAILABLE = True
+except ImportError:
+    msc = None
+    MSC_AVAILABLE = False
+
 # Safe import of HF_HUB_CACHE from huggingface_hub.constants
 try:
     from huggingface_hub.constants import HF_HUB_CACHE
 except ImportError:
     HF_HUB_CACHE = None
 
+from safetensors.torch import load as safetensors_load
 from safetensors.torch import load_file, save_file
+from safetensors.torch import save as safetensors_save
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -113,6 +123,71 @@ def _normalize_dtype_mapping_to_state_dict_keys(
                 normalized[prefixed_fqn] = dtype_str
 
     return normalized
+
+
+def is_cloud_path(path: str) -> bool:
+    """Check if path is a cloud storage path (MSC)."""
+    return path.startswith("msc://")
+
+
+def _ensure_msc_available() -> None:
+    """Raise an error if MSC is not installed but a cloud path is used."""
+    if not MSC_AVAILABLE:
+        raise ImportError(
+            "multistorageclient is required for cloud storage paths. "
+            "Install it with: pip install multi-storage-client "
+            "--index-url https://pypi.nvidia.com"
+        )
+
+
+def _adapter_path(checkpoint_dir: str) -> str:
+    """Return the PEFT adapter safetensors path inside a checkpoint dir (local or ``msc://``)."""
+    if is_cloud_path(checkpoint_dir):
+        return checkpoint_dir.rstrip("/") + "/adapter_model.safetensors"
+    return os.path.join(checkpoint_dir, "adapter_model.safetensors")
+
+
+def _save_safetensors(state_dict: dict[str, torch.Tensor], path: str) -> None:
+    """Write a safetensors file to a local path or an ``msc://`` cloud path.
+
+    For cloud paths the tensors are serialized to bytes and streamed to the MSC
+    file handle, since ``save_file`` only accepts a local filesystem path.
+    """
+    if is_cloud_path(path):
+        _ensure_msc_available()
+        with msc.open(path, "wb") as f:
+            f.write(safetensors_save(state_dict))
+    else:
+        save_file(state_dict, path)
+
+
+def _load_safetensors(path: str) -> dict[str, torch.Tensor]:
+    """Read a safetensors file from a local path or an ``msc://`` cloud path."""
+    if is_cloud_path(path):
+        _ensure_msc_available()
+        with msc.open(path, "rb") as f:
+            return safetensors_load(f.read())
+    return load_file(path)
+
+
+def _maybe_msc_reader(
+    path: str, storage_reader: Optional[_HuggingFaceStorageReader]
+) -> Optional[_HuggingFaceStorageReader]:
+    """Return an MSC filesystem reader for ``msc://`` paths, else the given reader."""
+    if storage_reader is None and is_cloud_path(path):
+        _ensure_msc_available()
+        return msc.torch.MultiStorageFileSystemReader(path)
+    return storage_reader
+
+
+def _maybe_msc_writer(
+    path: str, storage_writer: Optional[_HuggingFaceStorageWriter]
+) -> Optional[_HuggingFaceStorageWriter]:
+    """Return an MSC filesystem writer for ``msc://`` paths, else the given writer."""
+    if storage_writer is None and is_cloud_path(path):
+        _ensure_msc_available()
+        return msc.torch.MultiStorageFileSystemWriter(path)
+    return storage_writer
 
 
 def _is_safetensors_checkpoint(path: str) -> bool:
@@ -491,7 +566,7 @@ class Checkpointer:
             key_mapping: Optional key remapping when reading from HF checkpoints.
         """
         # Validate checkpoint directory
-        if not os.path.exists(model_path):
+        if not os.path.exists(model_path) and not is_cloud_path(model_path):
             raise FileNotFoundError(f"Model path {model_path} does not exist")
         model_state = ModelState(
             model,
@@ -959,8 +1034,9 @@ class Checkpointer:
         is_model = True if "/model" in path else False
         # PEFT loading is broadcasted from rank0 so it is a special case
         if self.config.is_peft and is_model and (not is_init_step):
-            state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
+            state_dict = _load_safetensors(_adapter_path(path))
         else:
+            storage_reader = _maybe_msc_reader(path, storage_reader)
             dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
         return state_dict
 
@@ -986,13 +1062,17 @@ class Checkpointer:
         # PEFT saving is done on rank0 so it is a special case
         if self.config.is_peft and is_model:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                save_file(state_dict, os.path.join(path, "adapter_model.safetensors"))
+                _save_safetensors(state_dict, _adapter_path(path))
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
             return
 
         ret = None
         planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
+
+        # Routes to MSC storage write for cloud paths
+        storage_writer = _maybe_msc_writer(path, storage_writer)
+
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx
             ret = dcp.async_save(
@@ -1384,8 +1464,14 @@ def save_config(config: dict[str, Any], weights_path: str) -> None:
         config: Config to save
         weights_path: Path to save config
     """
-    with open(os.path.join(weights_path, "config.yaml"), "w") as f:
-        yaml.dump(config, f, sort_keys=False, default_flow_style=False)
+    config_path = os.path.join(weights_path, "config.yaml")
+    if is_cloud_path(weights_path):
+        _ensure_msc_available()
+        with msc.open(config_path, "w") as f:
+            yaml.dump(config, f, sort_keys=False, default_flow_style=False)
+    else:
+        with open(config_path, "w") as f:
+            yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
 
 def _ensure_dirs(*dirs: Optional[str]) -> None:
@@ -1397,7 +1483,8 @@ def _ensure_dirs(*dirs: Optional[str]) -> None:
     """
     for d in dirs:
         if d:
-            os.makedirs(d, exist_ok=True)
+            if not is_cloud_path(d):
+                os.makedirs(d, exist_ok=True)
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
