@@ -652,3 +652,55 @@ def test_run_validation_epoch_reduces_tokens_over_cp(monkeypatch):
     assert tokens_call[2] is True, "total_tokens must be summed over CP ranks (counts are per-shard)"
     # val_loss = (2.0 * 3 tokens) / 3 tokens == 2.0
     assert result.metrics["val_loss"] == pytest.approx(2.0)
+
+
+def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
+    """With CP active and a model exposing prepare_model_inputs_for_cp, the
+    validation loop must run the model's _pre_embed_only pass before sharding.
+    Guards finetune.py:_run_validation_epoch CP pre-embed branch."""
+    from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
+
+    monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(vlm_finetune, "make_cp_batch_and_ctx", lambda mesh, batch: (nullcontext, batch))
+    monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
+    monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
+
+    pre_embed_calls = []
+
+    class _Model(torch.nn.Module):
+        def eval(self):
+            return self
+
+        def prepare_model_inputs_for_cp(self, **kwargs):  # marker presence matters
+            return {"inputs_embeds": torch.zeros(1, 4, 8)}
+
+        def forward(self, _pre_embed_only=False, **batch):
+            if _pre_embed_only:
+                pre_embed_calls.append(set(batch))
+                return self.prepare_model_inputs_for_cp(**batch)
+            return SimpleNamespace(logits=torch.zeros(1, 4, 8), hidden_states=None)
+
+    class _DM(dict):
+        mesh_dim_names = ["cp"]
+
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.model_parts = [_Model()]
+    recipe.loss_fn = object()
+    recipe.device_mesh = _DM(cp=SimpleNamespace(size=lambda: 2))
+    recipe.pp_enabled = False
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
+    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.001}])]
+    recipe._maybe_add_drafter_loss = lambda *, out, base_loss, labels, model, num_label_tokens: base_loss
+    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "pixel_values": torch.randn(1, 3, 8, 8),
+        "labels": torch.tensor([[1, 2, -100, 4]]),
+    }
+
+    result = recipe._run_validation_epoch([batch])
+
+    assert pre_embed_calls, "the _pre_embed_only pass must run when CP is active"
+    assert result.metrics["val_loss"] == pytest.approx(2.0)
