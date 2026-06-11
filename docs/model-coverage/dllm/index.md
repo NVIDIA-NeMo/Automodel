@@ -11,3 +11,9 @@ Diffusion language models (dLLMs) generate text by **denoising** rather than lef
 ## Fine-Tuning
 
 See the [DiffusionGemma Fine-Tuning Guide](../../guides/dllm/diffusiongemma.md) for the block-diffusion training objective (uniform-random token corruption, no `[MASK]`), self-conditioning, and the supported feature set (SFT, LoRA, Expert Parallelism, activation checkpointing).
+
+```{toctree}
+:hidden:
+
+google/diffusiongemma
+```
