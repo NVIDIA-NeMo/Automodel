@@ -306,7 +306,7 @@ profiles:
 
 The profile name (`my-checkpoints`) becomes the authority in the `msc://` URI, and `base_path` is the bucket that keys are written under.
 
-### 3. Provide credentials
+### Provide Credentials
 
 If you omit `credentials_provider` (as above), MSC uses the standard boto3 credential chain, so the usual AWS environment variables apply:
 
