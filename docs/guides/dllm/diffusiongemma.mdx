@@ -96,3 +96,10 @@ The SFT and LoRA training curves on GSM8K (first 200 steps) are shown below.
 
 ![DiffusionGemma LoRA training curves](./diffusiongemma_lora.png)
 
+
+## Requirements
+
+> **Note:** This recipe requires `transformers >= 5.11.0` — the `DiffusionGemma`
+> model was only added to `transformers` in 5.11, so earlier versions can't load
+> the checkpoint. Please install a compatible `transformers` version in your
+> environment before running this recipe.
