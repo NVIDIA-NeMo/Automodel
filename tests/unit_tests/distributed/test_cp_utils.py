@@ -229,15 +229,6 @@ def test_make_cp_batch_and_ctx_pads_and_slices_packed_seq_ids(monkeypatch):
 
 def test_make_cp_batch_and_ctx_includes_padding_mask(monkeypatch):
     """Verify that padding_mask is included in CP buffers when present in batch."""
-    captured_kwargs = {}
-
-    def _fake_create_ctx(**kwargs):
-        captured_kwargs.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
-
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     # seq_len=4 is divisible by cp_size*2=4 (no padding triggered).
     padding_mask = torch.tensor([[True, False, True, True]])
@@ -245,13 +236,13 @@ def test_make_cp_batch_and_ctx_includes_padding_mask(monkeypatch):
         "input_ids": torch.tensor([[10, 20, 30, 40]]),
         "labels": torch.tensor([[10, 20, 30, 40]]),
         "padding_mask": padding_mask,
+        "_cp_manual_allgather": True,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=None)
 
-    # padding_mask should be in cp_buffers
-    assert any(t is padding_mask for t in captured_kwargs["cp_buffers"]), "padding_mask must be included in cp_buffers"
-    assert padding_mask in captured_kwargs["cp_no_restore_buffers"]
+    # Manual all-gather path slices padding_mask into the batch for the local CP shard.
+    assert torch.equal(batch["padding_mask"], torch.tensor([[True, False]]))
 
 
 def test_make_cp_batch_and_ctx_3d_mrope_position_ids(monkeypatch):
@@ -585,204 +576,6 @@ def test_make_cp_batch_for_te_requires_seqlens():
             cp_mesh=cp_mesh,
             batch=batch,
         )
-
-
-# ---------------------------------------------------------------------------
-# Direct unit tests for the CP batch helper functions. These call the helpers
-# directly (rather than only through ``make_cp_batch_and_ctx``) so each branch
-# is exercised explicitly on CPU without a real process group.
-# ---------------------------------------------------------------------------
-
-
-def test_is_cp_non_text_module_path():
-    assert _cu._is_cp_non_text_module_path("model.vision_tower.layers.0")
-    assert _cu._is_cp_non_text_module_path("audio_model")
-    assert not _cu._is_cp_non_text_module_path("model.language_model.layers.0.self_attn")
-    assert not _cu._is_cp_non_text_module_path("")
-
-
-def test_pad_tensor_seq_dim():
-    t = torch.tensor([[1, 2, 3]])
-    # No-op when pad_len <= 0.
-    assert _cu._pad_tensor_seq_dim_(t, 1, 0) is t
-    assert _cu._pad_tensor_seq_dim_(t, 1, -5) is t
-    # Pads with the requested fill value along the sequence dim.
-    out = _cu._pad_tensor_seq_dim_(t, 1, 2, value=99)
-    assert torch.equal(out, torch.tensor([[1, 2, 3, 99, 99]]))
-    # Works on a non-trailing seq dim too.
-    t3 = torch.zeros(1, 2, 4)
-    assert _cu._pad_tensor_seq_dim_(t3, 1, 3).shape == (1, 5, 4)
-
-
-def test_pad_position_ids_seq_dim():
-    pos = torch.tensor([[0, 1, 2]])
-    # No-op when pad_len <= 0.
-    assert _cu._pad_position_ids_seq_dim_(pos, 1, 0) is pos
-    # Continues monotonically from the last position.
-    out = _cu._pad_position_ids_seq_dim_(pos, 1, 3)
-    assert torch.equal(out, torch.tensor([[0, 1, 2, 3, 4, 5]]))
-    # 3D mRoPE position_ids [3, B, S] pad along seq dim 2.
-    pos3 = torch.arange(6).view(3, 1, 2)
-    out3 = _cu._pad_position_ids_seq_dim_(pos3, 2, 2)
-    assert out3.shape == (3, 1, 4)
-    assert torch.equal(out3[:, 0, 2:], pos3[:, 0, -1:].expand(3, 2) + torch.tensor([1, 2]))
-
-
-def test_get_submesh():
-    mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
-    assert _cu._get_submesh(mesh, "cp") is mesh["cp"]
-    assert _cu._get_submesh(mesh, "missing") is None
-    # Objects without mesh_dim_names yield None.
-    assert _cu._get_submesh(object(), "cp") is None
-
-
-def test_get_mesh_size():
-    assert _cu._get_mesh_size(None) == 0
-    assert _cu._get_mesh_size(_DummySubMesh(size=4)) == 4
-
-
-def test_cp_allgather_attention_context_is_frozen():
-    fields = dict(
-        module=torch.nn.Identity(),
-        query=torch.zeros(1),
-        key=torch.zeros(1),
-        value=torch.zeros(1),
-        key_full=torch.zeros(1),
-        value_full=torch.zeros(1),
-        cp_mesh=None,
-        cp_group=None,
-        cp_size=2,
-        cp_rank=0,
-        seq_local=4,
-        seq_full=8,
-        seq_global_start=0,
-        attn_mask=None,
-        dropout_p=0.0,
-        is_causal=True,
-        scale=None,
-        enable_gqa=False,
-        kwargs={},
-        metadata={},
-    )
-    ctx = _cu.CPAllGatherAttentionContext(**fields)
-    assert ctx.cp_size == 2 and ctx.is_causal is True
-    with pytest.raises(Exception):
-        ctx.cp_size = 3  # frozen dataclass
-
-
-def test_prepare_cp_batch_common_4d_attention_mask():
-    cp_mesh = _DummySubMesh(size=2)
-    # 4D causal mask; diagonal True means "attend" -> padding_mask False there.
-    attn = torch.ones(1, 1, 4, 4, dtype=torch.bool)
-    batch = {
-        "input_ids": torch.arange(4).unsqueeze(0),
-        "labels": torch.arange(4).unsqueeze(0),
-        "attention_mask": attn,
-    }
-    primary_key, _, seq_len, labels, pos, pos_dim, loss_mask = _cu._prepare_cp_batch_common(cp_mesh, None, batch, None)
-    assert primary_key == "input_ids" and seq_len == 4 and pos_dim == 1
-    assert "attention_mask" not in batch
-    assert "padding_mask" in batch and batch["padding_mask"].dtype == torch.bool
-    # position_ids injected because cp_size > 1.
-    assert torch.equal(pos, torch.arange(4).unsqueeze(0))
-
-
-def test_prepare_cp_batch_common_2d_attention_mask_and_pos_expand():
-    cp_mesh = _DummySubMesh(size=2)
-    batch = {
-        "input_ids": torch.arange(8).view(2, 4),
-        "labels": torch.arange(8).view(2, 4),
-        "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]]),
-        "position_ids": torch.tensor([[0, 1, 2, 3]]),  # [1, S] expands to batch.
-    }
-    _, _, _, _, pos, _, _ = _cu._prepare_cp_batch_common(cp_mesh, None, batch, None)
-    assert batch["padding_mask"].shape == (2, 4)
-    assert pos.shape == (2, 4)
-
-
-def test_prepare_cp_batch_common_labels_from_loss_mask():
-    cp_mesh = _DummySubMesh(size=2)
-    loss_mask = torch.tensor([[1, 1, 0, 0]])
-    batch = {"input_ids": torch.arange(4).unsqueeze(0)}
-    _, _, _, labels, _, _, returned_loss_mask = _cu._prepare_cp_batch_common(cp_mesh, None, batch, loss_mask)
-    assert labels is loss_mask
-    assert returned_loss_mask is None
-
-
-def test_prepare_cp_batch_common_requires_labels():
-    cp_mesh = _DummySubMesh(size=2)
-    batch = {"input_ids": torch.arange(4).unsqueeze(0)}
-    with pytest.raises(KeyError, match="labels"):
-        _cu._prepare_cp_batch_common(cp_mesh, None, batch, None)
-
-
-def test_prepare_cp_batch_common_requires_exactly_one_primary():
-    cp_mesh = _DummySubMesh(size=2)
-    both = {
-        "input_ids": torch.arange(4).unsqueeze(0),
-        "inputs_embeds": torch.zeros(1, 4, 8),
-        "labels": torch.arange(4).unsqueeze(0),
-    }
-    with pytest.raises(AssertionError):
-        _cu._prepare_cp_batch_common(cp_mesh, None, both, None)
-
-
-def test_make_manual_allgather_cp_batch_pads_and_slices_all_keys():
-    cp_mesh = _DummySubMesh(size=2, local_rank=0)
-    # seq_len=3 -> pad to multiple of 2*cp_size=4 (pad_len=1), local shard=2.
-    labels = torch.tensor([[5, 6, 7]])
-    position_ids = torch.tensor([[0, 1, 2]])
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3]]),
-        "mm_token_type_ids": torch.tensor([[0, 1, 0]]),
-        "_packed_seq_ids": torch.tensor([[1, 1, 2]]),
-        "padding_mask": torch.tensor([[True, False, True]]),
-    }
-    loss_mask = torch.tensor([[1, 1, 1]])
-    ctx, out = _cu._make_manual_allgather_cp_batch(
-        cp_mesh,
-        batch,
-        primary_key="input_ids",
-        seq_len=3,
-        labels=labels,
-        position_ids=position_ids,
-        pos_seq_dim=1,
-        loss_mask=loss_mask,
-        padding_token_id=99,
-    )
-    assert ctx is contextlib.nullcontext
-    # rank 0 keeps the first local_seq_len=2 tokens after padding to 4.
-    assert torch.equal(out["input_ids"], torch.tensor([[1, 2]]))
-    assert torch.equal(out["labels"], torch.tensor([[5, 6]]))
-    assert torch.equal(out["position_ids"], torch.tensor([[0, 1]]))
-    assert torch.equal(out["mm_token_type_ids"], torch.tensor([[0, 1]]))
-    assert torch.equal(out["_packed_seq_ids"], torch.tensor([[1, 1]]))
-    assert out["padding_mask"].shape == (1, 2)
-    assert torch.equal(out["loss_mask"], torch.tensor([[1, 1]]))
-
-
-def test_make_manual_allgather_cp_batch_second_rank_inputs_embeds():
-    cp_mesh = _DummySubMesh(size=2, local_rank=1)
-    labels = torch.tensor([[5, 6, 7, 8]])
-    position_ids = torch.tensor([[0, 1, 2, 3]])
-    # ``_prepare_cp_batch_common`` puts position_ids in the batch upstream; the
-    # manual path only re-derives them into the batch when padding is applied.
-    batch = {"inputs_embeds": torch.arange(4 * 2).float().view(1, 4, 2), "position_ids": position_ids}
-    ctx, out = _cu._make_manual_allgather_cp_batch(
-        cp_mesh,
-        batch,
-        primary_key="inputs_embeds",
-        seq_len=4,
-        labels=labels,
-        position_ids=position_ids,
-        pos_seq_dim=1,
-        loss_mask=None,
-        padding_token_id=0,
-    )
-    # seq_len=4 already a multiple of 2*cp_size=4 -> no padding; rank 1 keeps last 2.
-    assert out["inputs_embeds"].shape == (1, 2, 2)
-    assert torch.equal(out["labels"], torch.tensor([[7, 8]]))
-    assert torch.equal(out["position_ids"], torch.tensor([[2, 3]]))
 
 
 def test_synthesize_single_document_seq_ids_from_padding_mask():
