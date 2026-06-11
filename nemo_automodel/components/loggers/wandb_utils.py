@@ -15,6 +15,31 @@ import logging
 from typing import Any
 
 
+def init_wandb_run(wandb_cfg: dict, full_config: dict, default_name: str = ""):
+    """Initialize a W&B run from a config dict.
+
+    A recipe-agnostic counterpart to recipe-local ``build_wandb`` helpers: it
+    takes the already-resolved ``wandb`` kwargs (project, entity, name, ...) and
+    the full run config to record, and falls back to ``default_name`` when no
+    run name is given.
+
+    Args:
+        wandb_cfg: Keyword args forwarded to ``wandb.init`` (e.g. project, entity, name).
+        full_config: The full resolved config to store as the run's ``config``.
+        default_name: Run name to use when ``wandb_cfg`` does not set one.
+
+    Returns:
+        The initialized ``wandb.Run``.
+    """
+    import wandb
+    from wandb import Settings
+
+    kwargs = dict(wandb_cfg)
+    if not kwargs.get("name"):
+        kwargs["name"] = default_name
+    return wandb.init(**kwargs, config=full_config, settings=Settings(silent=True))
+
+
 def suppress_wandb_log_messages() -> None:
     """
     Patches wandb logger to suppress upload messages.

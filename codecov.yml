@@ -14,6 +14,12 @@ coverage:
           - "!nemo_automodel/recipes/retrieval/**"
           - "!nemo_automodel/components/datasets/llm/retrieval_*.py"
           - "!nemo_automodel/components/models/common/inbatch_neg_utils.py"
+          - "!nemo_automodel/components/datasets/multimodal/**"
+          - "!nemo_automodel/components/models/bagel/**"
+          - "!nemo_automodel/recipes/multimodal/**"
+          - "!nemo_automodel/components/training/ema.py"
+          - "!examples/multimodal_finetune/**"
+          - "!examples/multimodal_pretrain/**"
       retrieval:
         target: 60%
         threshold: 30%
@@ -25,6 +31,20 @@ coverage:
           - "nemo_automodel/recipes/retrieval/**"
           - "nemo_automodel/components/datasets/llm/retrieval_*.py"
           - "nemo_automodel/components/models/common/inbatch_neg_utils.py"
+      bagel:
+        target: 0%
+        threshold: 100%
+        base: auto
+        if_ci_failed: error
+        if_not_found: success
+        informational: true
+        paths:
+          - "nemo_automodel/components/datasets/multimodal/**"
+          - "nemo_automodel/components/models/bagel/**"
+          - "nemo_automodel/recipes/multimodal/**"
+          - "nemo_automodel/components/training/ema.py"
+          - "examples/multimodal_finetune/**"
+          - "examples/multimodal_pretrain/**"
 
 fixes:
   - "/opt/Automodel/::"

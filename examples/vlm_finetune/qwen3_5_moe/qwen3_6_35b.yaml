@@ -38,6 +38,10 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
+  text_config:
+    # Set to 0 to disable Qwen3.6 MoE VLM MTP.
+    num_nextn_predict_layers: 1
+  mtp_loss_scaling_factor: 0.1
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa

@@ -36,6 +36,13 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAda
 
 _FP32_PARAMS_TO_BARE = re.compile(r"(\.linear_attn)\._fp32_params\.")
 _BARE_FP32_PARAM_NAMES = ("A_log",)
+_MTP_HF_TO_NATIVE = {
+    "mtp.fc.weight": "mtp.layers.0.eh_proj.weight",
+    "mtp.pre_fc_norm_embedding.weight": "mtp.layers.0.enorm.weight",
+    "mtp.pre_fc_norm_hidden.weight": "mtp.layers.0.hnorm.weight",
+    "mtp.norm.weight": "mtp.layers.0.final_layernorm.weight",
+}
+_MTP_NATIVE_TO_HF = {v: k for k, v in _MTP_HF_TO_NATIVE.items()}
 
 
 def _strip_fp32_prefix(key: str) -> str:
@@ -53,11 +60,24 @@ def _route_to_fp32_holder(key: str) -> str:
     return f"{head}.linear_attn._fp32_params.{tail}"
 
 
+def map_qwen3_5_mtp_from_hf_key(key: str) -> str:
+    """Map HF Qwen3.5 MTP keys to Automodel's Megatron-style MTP module."""
+    return _MTP_HF_TO_NATIVE.get(key, key)
+
+
+def map_qwen3_5_mtp_to_hf_key(key: str) -> str:
+    """Map Automodel Qwen3.5 MTP keys back to HF checkpoint keys."""
+    return _MTP_NATIVE_TO_HF.get(key, key)
+
+
 class Qwen3_5DenseStateDictAdapter(StateDictAdapter):
     """Adapter that hides the ``_fp32_params`` wrapping in saved checkpoints."""
 
+    def __init__(self, *, route_linear_attn_fp32_params: bool = True) -> None:
+        self.route_linear_attn_fp32_params = route_linear_attn_fp32_params
+
     def to_hf(self, state_dict: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-        return {_strip_fp32_prefix(k): v for k, v in state_dict.items()}
+        return {map_qwen3_5_mtp_to_hf_key(_strip_fp32_prefix(k)): v for k, v in state_dict.items()}
 
     def from_hf(
         self,
@@ -65,7 +85,14 @@ class Qwen3_5DenseStateDictAdapter(StateDictAdapter):
         device_mesh: Optional[Any] = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        return {_route_to_fp32_holder(k): v for k, v in hf_state_dict.items()}
+        del device_mesh, kwargs
+        return {self._map_from_hf_key(k): v for k, v in hf_state_dict.items()}
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
-        return [(_strip_fp32_prefix(fqn), tensor)]
+        return [(map_qwen3_5_mtp_to_hf_key(_strip_fp32_prefix(fqn)), tensor)]
+
+    def _map_from_hf_key(self, key: str) -> str:
+        key = map_qwen3_5_mtp_from_hf_key(key)
+        if self.route_linear_attn_fp32_params:
+            key = _route_to_fp32_holder(key)
+        return key

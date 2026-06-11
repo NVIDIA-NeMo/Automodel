@@ -24,9 +24,12 @@ from nemo_automodel.components.models.common.utils import get_is_optim_step
 
 
 def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
+    if isinstance(module, FSDPModule):
+        yield module
+
     # Check main model
     _model = module.model if hasattr(module, "model") else module
-    if isinstance(_model, FSDPModule):
+    if _model is not module and isinstance(_model, FSDPModule):
         yield _model
 
     # Check embeddings
@@ -47,6 +50,22 @@ def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
     # Check experts in each layer (Qwen-style: block.mlp.experts; Gemma4-style: block.moe.experts)
     if hasattr(_model, "layers"):
         for _, block in _model.layers.named_children():
+            for attr in ("mlp", "moe"):
+                mod = getattr(block, attr, None)
+                if mod is not None and hasattr(mod, "experts"):
+                    experts = mod.experts
+                    if isinstance(experts, FSDPModule):
+                        yield experts
+
+    # Check MTP blocks. They are registered on the outer model rather than the
+    # text backbone but participate in the same backward pass and FSDP state
+    # transitions.
+    mtp = getattr(module, "mtp", None)
+    mtp_layers = getattr(mtp, "layers", None)
+    if mtp_layers is not None:
+        for _, block in mtp_layers.named_children():
+            if isinstance(block, FSDPModule):
+                yield block
             for attr in ("mlp", "moe"):
                 mod = getattr(block, attr, None)
                 if mod is not None and hasattr(mod, "experts"):

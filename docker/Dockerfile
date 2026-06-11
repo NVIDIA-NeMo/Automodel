@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04
 ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.04-py3
 ARG BASE_IMAGE=cuda
 
@@ -62,8 +62,8 @@ RUN if [ -f /usr/local/bin/torchrun ]; then \
 FROM update_base_container AS automodel_dep
 
 # Install TE
-ARG INSTALL_TE=False
-ARG TE_COMMIT=release_v2.11
+ARG INSTALL_TE=True
+ARG TE_COMMIT=release_v2.14
 RUN if [ "$INSTALL_TE" = "True" ]; then \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \
@@ -159,6 +159,35 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
 RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
     pip install --no-build-isolation --force-reinstall --no-deps \
         git+https://github.com/pytorch/torchcodec.git@v0.8.0
+
+# MXFP8 MoE training (experts="torch_mm_mxfp8"): the NGC PyTorch base does not bundle
+# torchao and uv-pytorch.toml gates it off (sys_platform=='never'), so `uv sync` skips
+# it. Install explicitly AFTER the sync so it is not pruned.
+#
+# Build FROM SOURCE (not `pip install torchao==0.14.0`): the MXFP8 grouped-GEMM path
+# needs the compiled mxfp8 CUDA kernels (torchao/csrc/cuda/mx_kernels), but PyPI ships
+# only a kernel-less `py3-none-any` wheel and an x86_64-only compiled wheel — no
+# aarch64 wheel and no sdist. On the sbsa/aarch64 build the pip wheel would silently
+# omit the kernels and MXFP8 would fall back to bf16 at runtime. setup.py has no
+# x86-only gate and cross-compiles the sm_100a kernels from the CUDA toolkit version
+# (build_for_sm100a = CUDA>=12.8; base is CUDA 13.x), so source builds on both arches.
+# --no-build-isolation reuses the container's torch ABI (same as the torchcodec rebuild).
+# Pin v0.17.0 (NOT v0.14.1): v0.14.1's forward quantizes via EAGER unfused to_mx (no CUDA
+# kernel, ~49ms/iter) — a ~2.5x regression vs bf16. v0.17.0's forward is fully kernelized
+# (triton_to_mxfp8_dim0 for both activation and weight + device-side scale swizzle); it is
+# the torchao blog version (~1.43x MoE-layer speedup). NOT main: main's forward additionally
+# needs the nvidia-cutlass-dsl runtime for its CuTeDSL activation kernel, which this image
+# does not install (and _SM100_KERNELS_AVAILABLE doesn't gate it -> runtime crash); v0.17.0
+# is triton-only with no extra dep. CUTLASS is a git submodule the mxfp8 kernels need, so
+# clone with --recurse-submodules (pip's git+ submodule handling is unreliable). setup.py
+# self-gates the mxfp8/cutlass sm_100a kernels on CUDA>=12.8 and hardcodes their gencode
+# flags; TORCH_CUDA_ARCH_LIST + MAX_JOBS mirror the in-image DeepEP source build (above) to
+# cover torchao's other CUDAExtensions and bound the heavy CUTLASS sm_100 compile.
+RUN git clone --depth 1 --branch v0.17.0 --recurse-submodules --shallow-submodules \
+        https://github.com/pytorch/ao.git /tmp/torchao && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 \
+        pip install --no-cache-dir --no-build-isolation /tmp/torchao && \
+    rm -rf /tmp/torchao
 
 COPY . /opt/Automodel
 

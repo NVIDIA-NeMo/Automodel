@@ -28,7 +28,7 @@ content_type: index
 
 PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training; no checkpoint conversion and no boilerplate.
 
-**Quick links:** [🤗 HF Compatible](guides/huggingface-api-compatibility.md) | [🚀 Performance](performance-summary.md) | [📐 Scalability](about/key-features.md) | [🎯 SFT & PEFT](guides/llm/finetune.md) | [🎨 Diffusion](guides/diffusion/finetune.md) | [👁️ VLM](guides/vlm/gemma4.md) | [🌐 Omni](guides/omni/gemma3-3n.md) | [🌊 dLLM](guides/dllm/finetune.md)
+**Quick links:** [🤗 HF Compatible](guides/huggingface-api-compatibility.md) | [🚀 Performance](performance-summary.md) | [📐 Scalability](about/key-features.md) | [🎯 SFT and PEFT](guides/llm/finetune.md) | [🎨 Diffusion](guides/diffusion/finetune.md) | [👁️ VLM](guides/vlm/gemma4.md) | [🔀 dLLM](guides/dllm/finetune.md) | [🔊 Audio](guides/audio/qwen3-omni-asr.md) | [🧩 Omni](guides/omni/gemma3-3n.md) | [⚡ Speculative](guides/speculative/serve_with_sglang.md)
 
 ::::{grid} 2 2 2 2
 :gutter: 1 1 1 2
@@ -87,7 +87,7 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 | 2026-03-11 | LLM | [Nemotron Super v3](https://github.com/NVIDIA-NeMo/Automodel/discussions/976) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml)) |
 | 2026-03-03 | Diffusion | FLUX.1-dev ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml)) |
 
-## Recipes & Guides
+## Recipes and Guides
 
 Find the right guide for your task: fine-tuning, pretraining, distillation, diffusion, and more.
 
@@ -107,6 +107,7 @@ Find the right guide for your task: fine-tuning, pretraining, distillation, diff
 | **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](guides/llm/large-moe-finetune.md)         |
 | **Fine-tune DeepSeek V4 Flash** | You want to fine-tune the DeepSeek V4 Flash hybrid-attention MoE (SWA / CSA / HCA + hash-routing) | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune DeepSeek V4 Flash](guides/llm/dsv4-flash.md)   |
 | **Fine-tune Hy3-preview**       | You want to fine-tune Tencent's 295B MoE with sigmoid routing and per-head QK RMSNorm              | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune Hy3-preview](guides/llm/hy3.md)                |
+| **Fine-tune Nemotron-3 Ultra** | You want to fine-tune NVIDIA's 550B-A55B hybrid Mamba-2 / LatentMoE model with MTP                 | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune Nemotron-3 Ultra](guides/llm/nemotron-3-ultra.md) |
 | **Sequence classification** | You need to classify text into categories (sentiment, topic, NLI)                   | Text + labels (e.g., GLUE MRPC)                   | LLM       | [Train classifier](guides/llm/sequence-classification.md) |
 | **QAT fine-tune**           | You want a quantized model that keeps accuracy for efficient deployment             | Text dataset                                      | LLM       | [Enable QAT](guides/quantization-aware-training.md)       |
 | **Knowledge distillation**  | You want a smaller, faster model that retains most of the teacher's quality         | Instruction dataset + teacher model               | LLM       | [Distill a model](guides/llm/knowledge-distillation.md)   |
@@ -250,7 +251,9 @@ Overview <model-coverage/overview.md>
 Release Log <model-coverage/latest-models.md>
 Large Language Models <model-coverage/llm/index.md>
 Vision Language Models <model-coverage/vlm/index.md>
+Multimodal <model-coverage/multimodal/index.md>
 Omni <model-coverage/omni/index.md>
+Diffusion LLMs <model-coverage/dllm/index.md>
 Diffusion <model-coverage/diffusion/index.md>
 Embedding Models <model-coverage/embedding/index.md>
 Reranking Models <model-coverage/reranker/index.md>
@@ -266,6 +269,7 @@ guides/llm/knowledge-distillation.md
 Large MoE Fine-Tuning <guides/llm/large-moe-finetune.md>
 DeepSeek V4 Flash <guides/llm/dsv4-flash.md>
 Hy3-preview <guides/llm/hy3.md>
+Nemotron-3 Ultra <guides/llm/nemotron-3-ultra.md>
 Pretraining <guides/llm/pretraining.md>
 NanoGPT Pretraining <guides/llm/nanogpt-pretraining.md>
 Sequence Classification <guides/llm/sequence-classification.md>
@@ -278,6 +282,7 @@ Mistral Medium 3.5 VL <guides/vlm/mistral-medium-3-5.md>
 Qwen3-Omni ASR <guides/audio/qwen3-omni-asr.md>
 Diffusion Fine-Tuning <guides/diffusion/finetune.md>
 dLLM Fine-Tuning <guides/dllm/finetune.md>
+DiffusionGemma SFT <guides/dllm/diffusiongemma.md>
 QAT <guides/quantization-aware-training.md>
 Databricks <guides/llm/databricks.md>
 SGLang EAGLE Serving <guides/speculative/serve_with_sglang.md>

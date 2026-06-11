@@ -27,16 +27,15 @@ import torch.distributed.tensor
 import torch.nn as nn
 import yaml
 from safetensors import safe_open
+from transformers import AutoModelForCausalLM
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction, calculate_loss
-from transformers import AutoModelForCausalLM
+from nemo_automodel.components.loss.utils import calculate_loss
+from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 datasets.disable_caching()
-
-
 
 
 def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
@@ -312,7 +311,6 @@ def _get_test_consolidated_llm_checkpoint_expected_keys_v5():
         return v5_model_keys, v5_optim_keys
 
     return _convert_v4_keys_to_v5(*_get_test_consolidated_llm_checkpoint_expected_keys_v4())
-
 
 
 def _get_test_consolidated_llm_checkpoint_expected_keys_v4():

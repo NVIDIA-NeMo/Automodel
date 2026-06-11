@@ -59,7 +59,11 @@ from typing import Any, Dict, List, Optional, Union
 from datasets import load_dataset
 
 from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
-from nemo_automodel.components.datasets.llm.formatting_utils import _add_pad_token, format_chat_template
+from nemo_automodel.components.datasets.llm.formatting_utils import (
+    _add_pad_token,
+    _tokenized_chat_length,
+    format_chat_template,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +92,18 @@ def _json_load_if_str(value: Any) -> Any:
     return value
 
 
+def _reasoning_content(turn: Dict[str, Any]) -> Optional[str]:
+    """Return a turn's reasoning/thinking trace as a string, or ``None`` if absent.
+
+    Shared by every conversion path so the ``reasoning_content`` field is read
+    and coerced identically (a falsy/empty trace is treated as absent).
+    """
+    reasoning = turn.get("reasoning_content")
+    if not reasoning:
+        return None
+    return reasoning if isinstance(reasoning, str) else str(reasoning)
+
+
 def _sharegpt_to_chatml(conversations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert ShareGPT ``{from, value}`` turns to chatml ``{role, content}``."""
     out: List[Dict[str, Any]] = []
@@ -98,8 +114,9 @@ def _sharegpt_to_chatml(conversations: List[Dict[str, Any]]) -> List[Dict[str, A
         chatml_turn = {"role": _SHAREGPT_ROLE_MAP[src_role], "content": turn.get("value", "")}
         # Carry an explicit reasoning/thinking field through if the export
         # stores it alongside the turn (e.g. ``reasoning_content``).
-        if turn.get("reasoning_content"):
-            chatml_turn["reasoning_content"] = turn["reasoning_content"]
+        reasoning = _reasoning_content(turn)
+        if reasoning is not None:
+            chatml_turn["reasoning_content"] = reasoning
         out.append(chatml_turn)
     return out
 
@@ -198,9 +215,9 @@ def _convert_messages(
             # a warning by ``format_chat_template``). Carried through here so a
             # following tool_call group can merge onto this same turn.
             if role == "assistant":
-                reasoning = messages[i].get("reasoning_content")
-                if reasoning:
-                    msg["reasoning_content"] = reasoning if isinstance(reasoning, str) else str(reasoning)
+                reasoning = _reasoning_content(messages[i])
+                if reasoning is not None:
+                    msg["reasoning_content"] = reasoning
             out.append(msg)
             i += 1
 
@@ -216,36 +233,59 @@ def _convert_messages(
     return out
 
 
-def _mask_labels_to_last_turn(labels: List[int], ignore_index: int = -100) -> List[int]:
-    """Restrict the loss to the final assistant turn (``mask_history``).
+def _truncate_messages_to_fit(
+    tokenizer,
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]],
+    seq_length: int,
+) -> List[Dict[str, Any]]:
+    """Drop the oldest conversation exchanges until the dialogue fits ``seq_length``.
 
-    ``labels`` come from :func:`format_chat_template` with every assistant
-    turn supervised; non-assistant tokens are already ``ignore_index``.
-    Because the chat template renders each assistant message as a single
-    contiguous span, supervised tokens form one maximal run per assistant
-    turn separated by ``ignore_index`` runs. This keeps only the last such
-    run and masks every earlier supervised token in place.
+    Unlike token-level ``truncation`` (which clips from the tokenizer's
+    ``truncation_side`` and so typically drops the final assistant answer — the
+    supervised target), this drops whole oldest *exchanges* while keeping any
+    leading ``system`` message, the tool definitions, and the final exchange
+    (the user turn that produces the last assistant answer). Tool-call/response
+    pairing among the survivors is preserved because exchanges are cut only at
+    ``user`` boundaries.
 
     Args:
-        labels: per-token labels (``ignore_index`` marks unsupervised tokens).
-        ignore_index: the value marking unsupervised tokens.
+        tokenizer: tokenizer with a chat template.
+        messages: OpenAI-format messages from :func:`_convert_messages`.
+        tools: tool definitions rendered alongside the messages.
+        seq_length: the token budget the rendered dialogue must fit.
 
     Returns:
-        The same list, mutated so only the final supervised run is kept.
+        ``messages`` unchanged when it already fits or has no ``user`` boundary
+        to cut at; otherwise the largest suffix of exchanges (leading ``system``
+        messages prepended) that fits. When even ``system`` + the final exchange
+        overflows, that minimal suffix is returned and the caller's token-level
+        ``truncation`` (if enabled) clips the remainder.
     """
-    last = -1
-    for i in range(len(labels) - 1, -1, -1):
-        if labels[i] != ignore_index:
-            last = i
-            break
-    if last < 0:
-        return labels
-    start = last
-    while start - 1 >= 0 and labels[start - 1] != ignore_index:
-        start -= 1
-    for i in range(start):
-        labels[i] = ignore_index
-    return labels
+    if _tokenized_chat_length(tokenizer, messages, tools=tools) <= seq_length:
+        return messages
+
+    n_system = 0
+    while n_system < len(messages) and messages[n_system].get("role") == "system":
+        n_system += 1
+    system = messages[:n_system]
+    history = messages[n_system:]
+
+    # Each ``user`` message starts a new exchange. Re-add exchanges newest-first
+    # (drop oldest) and keep the largest suffix that fits; the rendered length is
+    # monotonic in the number of exchanges kept.
+    boundaries = [i for i, m in enumerate(history) if m.get("role") == "user"]
+    if not boundaries:
+        return messages
+
+    for b in boundaries:
+        candidate = system + history[b:]
+        if _tokenized_chat_length(tokenizer, candidate, tools=tools) <= seq_length:
+            return candidate
+
+    # Even the final exchange alone overflows; return it and let token-level
+    # truncation (if enabled) clip the remainder.
+    return system + history[boundaries[-1] :]
 
 
 def _format_example(
@@ -259,6 +299,7 @@ def _format_example(
     mask_reasoning_content: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
+    truncate_history: bool = False,
 ) -> Dict[str, List[int]]:
     """Render one agent example into tokenized ``input_ids`` / ``labels``.
 
@@ -280,6 +321,7 @@ def _format_example(
             mask_reasoning_content=mask_reasoning_content,
             train_on_last_turn_only=train_on_last_turn_only,
             drop_history_reasoning_content=drop_history_reasoning_content,
+            truncate_history=truncate_history,
         )
     except Exception as e:
         raise ValueError(f"Failed to format agent SFT example (id={example.get('id')!r}): {e}") from e
@@ -296,6 +338,7 @@ def _format_example_impl(
     mask_reasoning_content: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
+    truncate_history: bool = False,
 ) -> Dict[str, List[int]]:
     """Render one agent example into tokenized ``input_ids`` / ``labels``."""
     raw_tools = example.get("tools")
@@ -324,6 +367,9 @@ def _format_example_impl(
         drop_history_reasoning_content=drop_history_reasoning_content,
     )
 
+    if truncate_history and seq_length is not None:
+        formatted = _truncate_messages_to_fit(tokenizer, formatted, tools, seq_length)
+
     tokenized = format_chat_template(
         tokenizer=tokenizer,
         formatted_text=formatted,
@@ -335,9 +381,24 @@ def _format_example_impl(
         truncation=truncation,
         answer_only_loss_mask=True,
         mask_reasoning_content=mask_reasoning_content,
+        train_on_last_turn_only=train_on_last_turn_only,
     )
-    if train_on_last_turn_only:
-        _mask_labels_to_last_turn(tokenized["labels"])
+    # Truncation (or over-aggressive last-turn masking) can leave a sample with no
+    # supervised tokens at all — every label is ``ignore_index`` (-100). A single
+    # such sample is harmless: the loss normalizes by the batch's supervised-token
+    # count, so it just contributes nothing (a NaN only arises if a *whole* step is
+    # empty, which signals a misconfigured seq_length/truncation). Rather than
+    # hard-failing the run on one example, warn (with the id) and let it through — it
+    # is already effectively skipped from the gradient, and the map-style
+    # dataset/collator cannot drop a row in place at this stage.
+    labels = tokenized.get("labels")
+    if labels is not None and all(label == -100 for label in labels):
+        logger.warning(
+            "Agent SFT example (id=%r) has no supervised tokens (all labels masked); it "
+            "contributes nothing to the loss. This usually means truncation dropped every "
+            "assistant turn — increase seq_length or disable truncation.",
+            example.get("id"),
+        )
     return tokenized
 
 
@@ -502,6 +563,7 @@ def make_agent_chat_dataset(
     mask_reasoning_content: bool = False,
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
+    truncate_history: bool = False,
 ) -> LazyMappedDataset:
     """Load a multi-turn function-calling SFT dataset.
 
@@ -535,6 +597,12 @@ def make_agent_chat_dataset(
             this controls whether history thinking appears in the prompt at all,
             the latter controls whether rendered thinking contributes to loss.
             Defaults to False, which keeps every turn's reasoning_content.
+        truncate_history: If True and ``seq_length`` is set, drop the oldest
+            conversation exchanges (keeping any leading system message, the tool
+            definitions, and the final exchange) until the dialogue fits
+            ``seq_length``. Unlike token-level ``truncation``, which clips from
+            the tokenizer side and usually drops the final assistant answer,
+            this preserves the supervised target. Defaults to False.
 
     Returns:
         A ``LazyMappedDataset`` yielding dicts with ``input_ids``, ``labels``
@@ -588,5 +656,6 @@ def make_agent_chat_dataset(
         mask_reasoning_content=mask_reasoning_content,
         train_on_last_turn_only=train_on_last_turn_only,
         drop_history_reasoning_content=drop_history_reasoning_content,
+        truncate_history=truncate_history,
     )
     return LazyMappedDataset(dataset, fmt_fn)

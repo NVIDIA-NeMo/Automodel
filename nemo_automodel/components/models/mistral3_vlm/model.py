@@ -31,13 +31,19 @@ Custom wrapper around HF's ``Mistral3ForConditionalGeneration`` that:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from typing import Optional, Union
 
 import torch
 from transformers import PretrainedConfig
 from transformers.models.mistral3.modeling_mistral3 import (
+    Mistral3CausalLMOutputWithPast,
+)
+from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration as _HFMistral3ForConditionalGeneration,
 )
 
+from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
     Mistral3FP8StateDictAdapter,
 )
@@ -114,6 +120,15 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
     # smoke never reaches the adapter load stage within 300s).
     _skip_init_weights_on_load = True
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
+
     def __init__(self, config: PretrainedConfig):
         # HF's Mistral3ForConditionalGeneration.__init__ consults
         # ``config.quantization_config`` and swaps nn.Linear → FP8Linear for
@@ -158,6 +173,93 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
             if "inv_freq" in getattr(sub, "_buffers", {}):
                 sub._mistral3_fp8_rotary_reinit_done = False
                 sub.register_forward_pre_hook(_rotary_reinit_self_hook, with_kwargs=True, prepend=True)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values=None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        image_sizes: Optional[torch.Tensor] = None,
+        output_hidden_states: Optional[bool] = None,
+        **kwargs,
+    ) -> Mistral3CausalLMOutputWithPast:
+        """Forward pass with memory-efficient fused cross-entropy (cut-CE) support.
+
+        Overrides HF's ``Mistral3ForConditionalGeneration.forward`` so the
+        ``train_ft`` recipe can enable ``FusedLinearCrossEntropy``. The recipe
+        only does so when (a) ``forward`` exposes a ``logits_to_keep`` parameter
+        and (b) calling the model returns an output that carries the FINAL hidden
+        states (full sequence) while ``logits`` cover only the kept positions.
+
+        HF's stock forward gates ``hidden_states`` on a per-call
+        ``output_hidden_states`` kwarg (which the recipe does not pass) and emits
+        the full per-layer tuple. Here we instead resolve ``output_hidden_states``
+        from the text sub-config and surface the inner model's ``last_hidden_state``
+        (the single ``[B, S, H]`` tensor fed to ``lm_head``) directly, which is
+        what ``get_final_hidden_states`` consumes.
+
+        Args:
+            input_ids: Input token IDs ``[B, S]``.
+            pixel_values: Optional image pixel values for the vision tower.
+            attention_mask: Optional attention mask.
+            position_ids: Optional position indices.
+            past_key_values: Optional cached key/values.
+            inputs_embeds: Optional pre-computed embeddings.
+            labels: Optional labels for loss computation.
+            use_cache: Whether to use KV caching.
+            logits_to_keep: Number of final logits to compute (0=all, N=last N tokens).
+            image_sizes: Optional image sizes for the vision tower.
+            output_hidden_states: Whether to surface the final hidden states on the
+                output (defaults to the text sub-config's ``output_hidden_states``).
+            **kwargs: Additional arguments forwarded to the base model.
+
+        Returns:
+            :class:`~transformers.models.mistral3.modeling_mistral3.Mistral3CausalLMOutputWithPast`
+            with ``logits``, optional ``loss``, ``past_key_values``, and (when
+            ``output_hidden_states`` is set) the final ``hidden_states`` tensor.
+        """
+        text_config = getattr(self.config, "text_config", self.config)
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(text_config, "output_hidden_states", False)
+        )
+
+        outputs = self.model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            image_sizes=image_sizes,
+            **kwargs,
+        )
+
+        # Final hidden states fed to lm_head (single [B, S, H] tensor).
+        hidden_states = outputs[0]
+
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=text_config.vocab_size, **kwargs)
+
+        return Mistral3CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=hidden_states if output_hidden_states else None,
+            attentions=outputs.attentions,
+            image_hidden_states=outputs.image_hidden_states,
+        )
 
     @classmethod
     def supports_config(cls, config: PretrainedConfig) -> bool:
