@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, patch, MagicMock
-import re
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
@@ -330,7 +330,7 @@ class TestToHfWSplitExperts:
             "model.layers.0.mlp.experts.gate_and_up_projs": mock_dtensor,
         }
 
-        result = mixin._to_hf_w_split_experts(state_dict)
+        mixin._to_hf_w_split_experts(state_dict)
 
         mock_validate.assert_called_once_with(mock_dtensor, 4, "gate_and_up_projs layer 0")
 
@@ -419,7 +419,7 @@ class TestToHfWSplitExperts:
             "model.layers.0.mlp.experts.gate_and_up_projs": mock_dtensor,
         }
 
-        result = mixin._to_hf_w_split_experts(state_dict)
+        mixin._to_hf_w_split_experts(state_dict)
 
         mock_validate.assert_called_once_with(mock_dtensor, 2, "gate_and_up_projs layer 0")
 
@@ -645,7 +645,7 @@ class TestFromHfWMergedExperts:
                     "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
                     side_effect=lambda x, *args: x,
                 ):
-                    result = mixin._from_hf_w_merged_experts(hf_state_dict)
+                    mixin._from_hf_w_merged_experts(hf_state_dict)
 
         # Verify to_local was called on DTensor inputs
         mock_gate_dtensor.to_local.assert_called_once()

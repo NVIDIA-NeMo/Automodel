@@ -74,6 +74,7 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     BaseModelOutputWithPast = _make_missing("BaseModelOutputWithPast")
     CausalLMOutputWithPast = _make_missing("CausalLMOutputWithPast")
 
+from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -508,6 +509,47 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     replaces the HF-native language model with ``Gemma4MoETextModelBackend``
     (NeMo GroupedExperts + Gemma4Gate).  Otherwise falls through to vanilla HF.
     """
+
+    @classmethod
+    def get_capabilities(cls, config: "Gemma4Config") -> ModelCapabilities:
+        """Return the capabilities for a specific config (no model instance needed).
+
+        Dispatches in two layers so the same class can serve every Gemma4
+        checkpoint honestly:
+
+        1. If ``config.text_config.enable_moe_block`` is True → MoE variant
+           (e.g. ``google/gemma-4-26B-A4B-it``).
+        2. Else if ``config.audio_config`` is not ``None`` → dense + audio
+           variant (e.g. ``google/gemma-4-E2B-it``, ``google/gemma-4-E4B-it``).
+        3. Else → plain dense variant (e.g. ``google/gemma-4-31B-it``).
+
+        Args:
+            config: The model's ``Gemma4Config`` (or anything exposing a
+                ``text_config`` with ``enable_moe_block`` and an
+                ``audio_config`` attribute).
+
+        Returns:
+            A populated :class:`ModelCapabilities` for this specific config.
+        """
+        text_config = getattr(config, "text_config", config)
+        if bool(getattr(text_config, "enable_moe_block", False)):
+            # MoE variant: gemma-4-26B-A4B-it
+            return ModelCapabilities(
+                supports_tp=False,
+                supports_cp=True,
+                supports_pp=False,
+                supports_ep=True,
+            )
+        if getattr(config, "audio_config", None) is not None:
+            # Dense + audio variant: gemma-4-E2B-it, gemma-4-E4B-it
+            return ModelCapabilities()
+        # Plain dense variant: gemma-4-31B-it
+        return ModelCapabilities(
+            supports_tp=True,
+            supports_cp=False,
+            supports_pp=True,
+            supports_ep=False,
+        )
 
     @classmethod
     def from_config(

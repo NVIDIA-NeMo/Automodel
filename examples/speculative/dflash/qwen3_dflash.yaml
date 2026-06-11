@@ -31,13 +31,15 @@ recipe_args:
   block_size: 16                      # tokens drafted in parallel per block
   num_anchors: 512                    # blocks sampled per sequence per step
   loss_decay_gamma: 7.0               # block-position loss decay: exp(-(k-1)/gamma)
-  # mask_token_id: 151669             # token used for non-anchor block positions
-  #                                   # (defaults to the tokenizer pad token if unset)
+  mask_token_id: 151669               # REQUIRED: token used for non-anchor block positions.
+  #                                   # Pick a reserved / unused token id (do NOT rely on pad:
+  #                                   # pad often aliases eos, which silently degrades quality).
   # target_layer_ids: [1, 9, 17, 25, 33]   # target layers captured as draft context
   #                                   # (defaults to an even spread across the target)
   attention_backend: flex_attention   # "flex_attention" (GPU main path) or "sdpa" (portable fallback)
 
   trust_remote_code: false
+  # target_attn_implementation: sdpa   # frozen target's attention backend (unset = HF auto-select)
   shuffle_seed: 42
   log_every_steps: 10
   max_grad_norm: 1.0

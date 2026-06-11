@@ -100,6 +100,16 @@ class TargetModelServer:
         self._nccl_enabled = os.environ.get("NEMO_EAGLE_ENABLE_NCCL", "1") == "1"
         self._nccl: Optional[NCCLTransport] = None
         self._pending_nccl_send: Optional[tuple[dict, list[str]]] = None
+        # ``ThreadingHTTPServer`` handles requests concurrently, but /generate
+        # is not reentrant: the supervision forward captures aux hidden states
+        # through hooks registered on the shared model, and the NCCL path
+        # stages tensors in the single ``_pending_nccl_send`` slot above.
+        # Concurrent requests (multiple training ranks, or a client whose
+        # prefetcher overlaps) would silently receive each other's tensors,
+        # so the HTTP handler serializes the whole generate-and-flush sequence
+        # on this lock. ``set_vocab_mapping`` shares it because it swaps the
+        # tensors the generate forward reads.
+        self._generate_lock = threading.Lock()
         # Lifecycle: a watchdog shuts the server down once the client goes away
         # so a finished training run does not leave a GPU-pinned server process.
         self._shutdown_event = threading.Event()
@@ -114,6 +124,10 @@ class TargetModelServer:
     @property
     def shutdown_event(self) -> threading.Event:
         return self._shutdown_event
+
+    @property
+    def generate_lock(self) -> threading.Lock:
+        return self._generate_lock
 
     # -- handlers (return the HTTP response body as bytes) --
 
@@ -239,17 +253,30 @@ def _make_request_handler(server_logic: TargetModelServer):
             try:
                 if endpoint == protocol.EP_GENERATE:
                     wants_nccl = self.headers.get(protocol.NCCL_HEADER) == "1"
-                    body, used_nccl = server_logic.handle_generate(raw, client_wants_nccl=wants_nccl)
-                    headers = {protocol.NCCL_HEADER: "1"} if used_nccl else None
-                    ctype = "application/json" if used_nccl else "application/octet-stream"
-                    self._send(body, content_type=ctype, extra_headers=headers)
-                    if used_nccl:
-                        # Send tensors only after the HTTP response is flushed so
-                        # the client has the metadata and can post its recv.
-                        self.wfile.flush()
-                        server_logic.flush_nccl_send()
+                    # Exclusive end-to-end: see the ``_generate_lock`` comment in
+                    # ``TargetModelServer.__init__``.
+                    with server_logic.generate_lock:
+                        body, used_nccl = server_logic.handle_generate(raw, client_wants_nccl=wants_nccl)
+                        headers = {protocol.NCCL_HEADER: "1"} if used_nccl else None
+                        ctype = "application/json" if used_nccl else "application/octet-stream"
+                        self._send(body, content_type=ctype, extra_headers=headers)
+                        if used_nccl:
+                            # Send tensors only after the HTTP response is flushed so
+                            # the client has the metadata and can post its recv.
+                            self.wfile.flush()
+                            try:
+                                server_logic.flush_nccl_send()
+                            except Exception:
+                                # The 200 response is already on the wire; writing a
+                                # 500 now would be parsed as the response to the NEXT
+                                # request on this keep-alive connection. Drop the
+                                # connection instead (flush_nccl_send already logged
+                                # and disabled NCCL for subsequent requests).
+                                self.close_connection = True
                 elif endpoint == protocol.EP_SET_VOCAB_MAPPING:
-                    self._send(server_logic.handle_set_vocab_mapping(raw), content_type="application/json")
+                    with server_logic.generate_lock:
+                        body = server_logic.handle_set_vocab_mapping(raw)
+                    self._send(body, content_type="application/json")
                 elif endpoint == protocol.EP_MODEL_INFO:
                     self._send(server_logic.handle_model_info(raw), content_type="application/json")
                 elif endpoint == protocol.EP_INPUT_EMBEDDINGS:

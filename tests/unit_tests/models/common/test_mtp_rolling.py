@@ -122,8 +122,7 @@ def test_cumulative_rolling_2d_batch():
     """Per-row cumulative rolling in 2D ``[B, S]`` mode."""
     mtp = _build_module(num_depths=2, pattern_length=1)
     input_ids = torch.tensor(
-        [[10, 11, 12, 13, 14, 15, 16, 17],
-         [20, 21, 22, 23, 24, 25, 26, 27]],
+        [[10, 11, 12, 13, 14, 15, 16, 17], [20, 21, 22, 23, 24, 25, 26, 27]],
         dtype=torch.long,
     )
     position_ids = torch.arange(8, dtype=torch.long).unsqueeze(0).expand(2, -1).contiguous()
@@ -134,15 +133,11 @@ def test_cumulative_rolling_2d_batch():
     for depth in range(2):
         expected_ids = roll_tensor(input_ids, shifts=-(depth + 1), dim=-1)
         got_ids = mtp.layers[depth].calls[0]["embed_input"].squeeze(-1).to(torch.long)
-        assert torch.equal(got_ids, expected_ids), (
-            f"depth {depth}: input_ids rolling mismatch in 2D batch"
-        )
+        assert torch.equal(got_ids, expected_ids), f"depth {depth}: input_ids rolling mismatch in 2D batch"
 
         expected_pos = roll_tensor(position_ids, shifts=-(depth + 1), dim=-1)
         got_pos = mtp.layers[depth].calls[0]["position_ids"]
-        assert torch.equal(got_pos, expected_pos), (
-            f"depth {depth}: position_ids rolling mismatch in 2D batch"
-        )
+        assert torch.equal(got_pos, expected_pos), f"depth {depth}: position_ids rolling mismatch in 2D batch"
 
 
 def test_multi_sublayer_per_depth_sees_same_rolled_inputs():
@@ -163,9 +158,7 @@ def test_multi_sublayer_per_depth_sees_same_rolled_inputs():
             flat = depth * 2 + sub_in_depth
             got_pos = mtp.layers[flat].calls[0]["position_ids"].tolist()
             expected_pos = roll_tensor(position_ids, shifts=-(depth + 1), dim=-1).tolist()
-            assert got_pos == expected_pos, (
-                f"depth {depth} sublayer {sub_in_depth}: position_ids mismatch"
-            )
+            assert got_pos == expected_pos, f"depth {depth} sublayer {sub_in_depth}: position_ids mismatch"
     # Only sublayer 0 of each depth gets embed_input.
     assert "embed_input" in mtp.layers[0].calls[0]
     assert "embed_input" not in mtp.layers[1].calls[0]
