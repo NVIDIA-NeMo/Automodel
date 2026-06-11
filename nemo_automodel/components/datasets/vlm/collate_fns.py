@@ -1545,10 +1545,9 @@ def neat_packed_vlm_collater(
     }
 
     # Store indexed attention mask for loss functions that need per-sample
-    # boundaries (e.g. SqrtCrossEntropy). The indexed mask [B, S] uses values
-    # 1,2,3,... per original sample and 0 for padding. Only emitted when 2+
-    # documents are packed; single-sequence all-gather CP forwards synthesize the
-    # trivial one-document map in cp_utils._make_manual_allgather_cp_batch.
+    # boundaries (e.g. SqrtCrossEntropy).  The indexed mask [B, S] uses
+    # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
+    # ``attention_mask_out`` is already converted to 4D, so keep a copy.
     if attention_mask.max() > 1:
         result["_packed_seq_ids"] = attention_mask
 
