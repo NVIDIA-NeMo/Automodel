@@ -2353,6 +2353,37 @@ def test_apply_cp_attaches_dense_hooks_for_non_te_attention(monkeypatch):
     cp_utils_stub.attach_linear_attn_position_hooks.assert_called_once_with(model)
 
 
+def test_apply_cp_flags_model_owned_attention_when_run_cp_manual_present(monkeypatch):
+    """A self_attn exposing run_cp_manual_attention marks the model-owned CP path."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    cp_utils_stub = _stub_dense_cp_hooks(monkeypatch)
+
+    te_attn_stub = types.ModuleType("transformer_engine.pytorch.attention")
+
+    class DotProductAttention:
+        pass
+
+    te_attn_stub.DotProductAttention = DotProductAttention
+    monkeypatch.setitem(sys.modules, "transformer_engine", types.ModuleType("transformer_engine"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", types.ModuleType("transformer_engine.pytorch"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", te_attn_stub)
+
+    non_te_attn = _FakeAttnModule()  # not a DotProductAttention
+    block = _FakeBlockWithAttn(non_te_attn)
+    # The model owns its CP attention transport (e.g. Gemma4 flex ring).
+    block.self_attn.run_cp_manual_attention = lambda *a, **k: None
+    model = DummyModel([block])
+
+    cp_mesh = MagicMock()
+    cp_mesh.get_group.return_value = MagicMock()
+    sys.modules["torch.distributed"].get_process_group_ranks = MagicMock(return_value=[0, 1])
+
+    P.apply_cp(model, cp_mesh)
+
+    # hooks still attached; this run exercises the model_owned_cp_attention=True branch
+    cp_utils_stub.attach_cp_attention_hooks.assert_called_once_with(model, cp_mesh)
+
+
 def test_apply_cp_skips_attention_without_attn_module(monkeypatch):
     """HF attention without attn_module uses dense CP hooks, not TE CP setup."""
     P = _import_parallelizer_with_stubs(monkeypatch)

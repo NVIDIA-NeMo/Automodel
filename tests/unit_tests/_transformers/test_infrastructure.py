@@ -568,3 +568,55 @@ class TestFromConfigLoadBaseModelKwarg:
 
         _, build_kwargs = mock_build.call_args
         assert build_kwargs["load_base_model"] is True
+
+
+def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
+    """When mesh.cp_size>1 and attention is non-TE, apply_model_infrastructure
+    attaches the dense CP hooks to every model part and flags _cp_enabled.
+    Guards infrastructure.py:apply_model_infrastructure CP branch."""
+    from nemo_automodel._transformers import infrastructure as infra
+
+    model = _DummyModel()
+    mesh = SimpleNamespace(
+        cp_size=2, pp_size=1, tp_size=1, ep_size=1, dp_size=1,
+        dp_shard_size=1, dp_replicate_size=1,
+        device_mesh={"cp": SimpleNamespace(size=lambda: 2)}, moe_mesh=None,
+    )
+
+    attached = {"ctx": 0, "attn": 0, "linpos": 0}
+
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._uses_te_attention", return_value=False),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+        patch(
+            "nemo_automodel.components.distributed.cp_utils.attach_context_parallel_hooks",
+            side_effect=lambda mp: attached.__setitem__("ctx", attached["ctx"] + 1),
+        ),
+        patch(
+            "nemo_automodel.components.distributed.cp_utils.attach_cp_attention_hooks",
+            side_effect=lambda mp, cp_mesh: attached.__setitem__("attn", attached["attn"] + 1),
+        ),
+        patch(
+            "nemo_automodel.components.distributed.cp_utils.attach_linear_attn_position_hooks",
+            side_effect=lambda mp: attached.__setitem__("linpos", attached["linpos"] + 1),
+        ),
+    ):
+        mock_ckpt = MockCheckpointer.return_value
+        mock_ckpt.config = MagicMock()
+        mock_ckpt.config.dequantize_base_checkpoint = False
+        infra.apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=None,
+            mesh=mesh,
+            pretrained_model_name_or_path="",
+        )
+
+    assert model._cp_enabled is True
+    assert attached == {"ctx": 1, "attn": 1, "linpos": 1}
