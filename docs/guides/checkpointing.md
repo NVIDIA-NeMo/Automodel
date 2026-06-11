@@ -319,7 +319,7 @@ export AWS_REGION=us-east-1    # or rely on region_name in the profile
 
 Alternatively, reference a named profile from `~/.aws/credentials` with `profile_name: <name>` under `options`.
 
-### 4. Point the recipe at the bucket
+### Point the Recipe at the Bucket
 
 Set `checkpoint_dir` to an `msc://<profile>/<path>` URI. Cloud paths must use DCP, so set `model_save_format: torch_save` and `save_consolidated: false`:
 
