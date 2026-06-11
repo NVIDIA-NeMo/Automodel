@@ -365,6 +365,35 @@ class ModelState:
         list(map(func, self.model))
 
 
+def _ensure_full_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
+    """Seed zero-valued state for trainable params the optimizer has not stepped.
+
+    This keeps saved optimizer state symmetric with load-time DCP requests.
+
+    Args:
+        optimizer: Optimizer whose ``state`` is completed in place.
+    """
+    # Borrow the layout from an initialized parameter.
+    template = next((state for state in optimizer.state.values() if state), None)
+    if template is None:
+        return
+
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if not param.requires_grad or optimizer.state.get(param):
+                continue
+            seeded: dict[str, Any] = {}
+            for key, value in template.items():
+                if not torch.is_tensor(value):
+                    seeded[key] = value
+                elif key == "step":
+                    seeded[key] = torch.zeros_like(value)
+                else:
+                    # Match the parameter shape and optimizer state dtype.
+                    seeded[key] = torch.zeros_like(param, dtype=value.dtype)
+            optimizer.state[param] = seeded
+
+
 class OptimizerState:
     """
     Helper class for tracking optimizer state in distributed checkpointing.
@@ -424,6 +453,9 @@ class OptimizerState:
         if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             optimizer_state_dict = self.optimizer[0].state_dict()
         else:
+            # Seed state for trainable params that Adam/AdamW has not stepped yet.
+            for optimizer in self.optimizer:
+                _ensure_full_optimizer_state(optimizer)
             # this line automatically manages FSDP FQN's, as well as sets the default state dict type
             # to FSDP.SHARDED_STATE_DICT
             func = partial(

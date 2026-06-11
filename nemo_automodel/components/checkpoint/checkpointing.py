@@ -34,6 +34,7 @@ except ImportError:
 from packaging.version import parse
 from safetensors.torch import load_file, save_file
 from torch import nn
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
@@ -119,6 +120,23 @@ def _get_checkpoint_metadata_keys(
     reader = storage_reader if storage_reader is not None else FileSystemReader(path)
     metadata = reader.read_metadata()
     return set(metadata.state_dict_metadata.keys())
+
+
+def _missing_optimizer_param_names(requested_keys: set[str], available_keys: set[str]) -> list[str]:
+    """Return optimizer parameter FQNs requested by DCP but missing on disk."""
+    prefix = "optim.state."
+    suffixes = (".exp_avg_sq", ".max_exp_avg_sq", ".exp_avg", ".step")
+    names: set[str] = set()
+    for key in requested_keys - available_keys:
+        if not key.startswith(prefix):
+            continue
+        name = key[len(prefix) :]
+        for suffix in suffixes:
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+                break
+        names.add(name)
+    return sorted(names)
 
 
 if _is_geq_torch_2_9():
@@ -375,7 +393,27 @@ class Checkpointer:
         """
         optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
         state_dict = optimizer_state.state_dict()
-        self._do_load(state_dict, os.path.join(weights_path, "optim"))
+        optim_path = os.path.join(weights_path, "optim")
+
+        # Parameters that never received gradients may be absent from older
+        # optimizer checkpoints. Allow partial load and warn with examples.
+        try:
+            requested_keys = {f"optim.{key}" for key in state_dict.get("optim", {})}
+            missing_params = _missing_optimizer_param_names(requested_keys, _get_checkpoint_metadata_keys(optim_path))
+        except (FileNotFoundError, OSError, RuntimeError):
+            # Diagnostics are best-effort; never block the actual load.
+            missing_params = []
+        if missing_params:
+            logging.warning(
+                "Optimizer checkpoint %s has no saved state for %d parameter(s); loading "
+                "partially and leaving them zero-initialized: %s%s",
+                optim_path,
+                len(missing_params),
+                missing_params[:10],
+                " ..." if len(missing_params) > 10 else "",
+            )
+
+        self._do_load(state_dict, optim_path, allow_partial_load=True)
         optimizer_state.load_state_dict(state_dict)
 
     @torch.no_grad()
@@ -796,6 +834,7 @@ class Checkpointer:
         path: str,
         storage_reader: Optional[_HuggingFaceStorageReader] = None,
         is_init_step: bool = False,
+        allow_partial_load: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Load a state dictionary from `path` using DCP or PEFT special-case logic.
@@ -805,6 +844,8 @@ class Checkpointer:
             path: Checkpoint directory path.
             storage_reader: Optional HF storage reader for safetensors.
             is_init_step: True if loading from a base checkpoint during initialization.
+            allow_partial_load: If True, tolerate keys requested by ``state_dict``
+                but absent from the checkpoint.
 
         Returns:
             The populated state dictionary (may be replaced for PEFT).
@@ -815,7 +856,8 @@ class Checkpointer:
         if self.config.is_peft and is_model and (not is_init_step):
             state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
-            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
+            planner = DefaultLoadPlanner(allow_partial_load=True) if allow_partial_load else None
+            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader, planner=planner)
         return state_dict
 
     def _do_save(
