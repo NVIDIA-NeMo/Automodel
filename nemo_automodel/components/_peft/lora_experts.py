@@ -24,7 +24,7 @@ from nemo_automodel.components.moe.experts import (
     _apply_bias,
     _permute_tokens_for_grouped_mm,
 )
-from nemo_automodel.components.moe.fp4_utils import MXFP4GroupedMM, dequantize_mxfp4, quantize_mxfp4
+from nemo_automodel.components.moe.quantized_experts import MXFP4ExpertStorageMixin
 from nemo_automodel.shared.utils import dtype_from_str
 
 try:
@@ -353,15 +353,14 @@ class GroupedExpertsLoRA(GroupedExperts):
         return y
 
 
-class GroupedExpertsLoRAMXFP4(GroupedExpertsLoRA):
+class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
     """GroupedExperts + LoRA with the frozen base weights resident in packed mxfp4.
 
-    The base gate/up and down projections are stored transposed relative to the
-    compute layout (``[n_experts, out_dim, in_dim]``, matching the DeepSeek V4 Flash
-    checkpoint orientation) as packed fp4-e2m1 int8 plus ``float8_e8m0fnu`` block
-    scales, and are dequantized on the fly inside ``MXFP4GroupedMM`` during forward
-    and backward. Only the LoRA adapters (and optional expert biases) remain in
-    floating point.
+    The base gate/up and down projections are stored as packed fp4-e2m1 int8 plus
+    ``float8_e8m0fnu`` block scales (checkpoint orientation ``[n_experts, out_dim,
+    in_dim]``) and dequantized on the fly inside ``MXFP4GroupedMM`` during forward
+    and backward (see ``MXFP4ExpertStorageMixin``). Only the LoRA adapters (and
+    optional expert biases) remain in floating point.
 
     When constructed from a module whose weights are still on the meta device,
     packing is deferred: the module behaves exactly like ``GroupedExpertsLoRA``
@@ -376,37 +375,7 @@ class GroupedExpertsLoRAMXFP4(GroupedExpertsLoRA):
             lora_A_init_method=lora_A_init_method,
             lora_dtype=lora_dtype,
         )
-        if not self.use_torch_mm:
-            raise NotImplementedError(
-                "mxfp4-resident expert weights require the torch_mm experts backend (backend.experts='torch_mm')."
-            )
-        self._mxfp4_resident = False
-        if not _to_local(self.gate_and_up_projs).is_meta:
-            self.pack_base_weights()
-
-    @torch.no_grad()
-    def pack_base_weights(self) -> None:
-        """Pack the frozen base weights to mxfp4 and free the floating-point tensors.
-
-        No-op when already packed. Must be called after the base weights are
-        materialized (i.e. after checkpoint load in the deferred-packing flow).
-        """
-        if self._mxfp4_resident:
-            return
-        for name in ("gate_and_up_projs", "down_projs"):
-            param = getattr(self, name)
-            local = _to_local(param)
-            assert not local.is_meta, "pack_base_weights requires materialized base weights"
-            # [E, in, out] -> [E, out, in] so the mx block scales run along the
-            # contraction dim, matching the checkpoint orientation.
-            packed, scales = quantize_mxfp4(local.transpose(-2, -1).contiguous())
-            if isinstance(param, DTensor):
-                packed = DTensor.from_local(packed, param.device_mesh, param.placements)
-                scales = DTensor.from_local(scales, param.device_mesh, param.placements)
-            del self._parameters[name]
-            self.register_parameter(name + "_packed", nn.Parameter(packed, requires_grad=False))
-            self.register_parameter(name + "_scales", nn.Parameter(scales, requires_grad=False))
-        self._mxfp4_resident = True
+        self._init_mxfp4_storage()
 
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
         """Forward pass with mxfp4 base weights and LoRA injection.
@@ -434,15 +403,6 @@ class GroupedExpertsLoRAMXFP4(GroupedExpertsLoRA):
 
         assert self.n_routed_experts % ep_size == 0
 
-        gate_and_up_packed = _to_local(self.gate_and_up_projs_packed)
-        gate_and_up_scales = _to_local(self.gate_and_up_projs_scales)
-        down_packed = _to_local(self.down_projs_packed)
-        down_scales = _to_local(self.down_projs_scales)
-        lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A)
-        lora_gate_and_up_B = _to_local(self.lora_gate_and_up_B)
-        lora_down_A = _to_local(self.lora_down_A)
-        lora_down_B = _to_local(self.lora_down_B)
-
         if ep_size > 1:
             x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
                 grad_placements=[Partial()]
@@ -456,22 +416,7 @@ class GroupedExpertsLoRAMXFP4(GroupedExpertsLoRA):
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
 
-        y = self._forward_grouped_mm_mxfp4(
-            x,
-            token_mask,
-            weights,
-            indices,
-            gate_and_up_packed,
-            gate_and_up_scales,
-            down_packed,
-            down_scales,
-            lora_gate_and_up_A,
-            lora_gate_and_up_B,
-            lora_down_A,
-            lora_down_B,
-            n_local_experts,
-            experts_start_idx,
-        )
+        y = self._forward_grouped_mm_mxfp4(x, token_mask, weights, indices, n_local_experts, experts_start_idx)
 
         if ep_size > 1:
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
@@ -479,23 +424,7 @@ class GroupedExpertsLoRAMXFP4(GroupedExpertsLoRA):
 
         return y.to(input_dtype)
 
-    def _forward_grouped_mm_mxfp4(
-        self,
-        x,
-        token_mask,
-        weights,
-        indices,
-        gate_and_up_packed,
-        gate_and_up_scales,
-        down_packed,
-        down_scales,
-        lora_gate_and_up_A,
-        lora_gate_and_up_B,
-        lora_down_A,
-        lora_down_B,
-        n_local_experts,
-        experts_start_idx,
-    ):
+    def _forward_grouped_mm_mxfp4(self, x, token_mask, weights, indices, n_local_experts, experts_start_idx):
         """Grouped GEMM forward path over packed mxfp4 base weights with LoRA injection."""
         sorted_token_ids, sorted_weights, tokens_per_expert, offs = _permute_tokens_for_grouped_mm(
             indices,
@@ -504,6 +433,11 @@ class GroupedExpertsLoRAMXFP4(GroupedExpertsLoRA):
             n_local_experts,
             experts_start_idx,
         )
+
+        lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A)
+        lora_gate_and_up_B = _to_local(self.lora_gate_and_up_B)
+        lora_down_A = _to_local(self.lora_down_A)
+        lora_down_B = _to_local(self.lora_down_B)
 
         y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
 
@@ -516,7 +450,7 @@ class GroupedExpertsLoRAMXFP4(GroupedExpertsLoRA):
                 down_proj_bias = _to_local(self.down_proj_bias)
 
             # Gate+Up projection + LoRA
-            output1 = MXFP4GroupedMM.apply(permuted_x, gate_and_up_packed, gate_and_up_scales, offs)
+            output1 = self._mxfp4_base_mm(permuted_x, "gate_and_up_projs", offs)
             lora_out1_A = torch._grouped_mm(permuted_x, lora_gate_and_up_A, offs=offs)
             lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
             output1 = output1 + lora_out1 * self.scale
@@ -527,7 +461,7 @@ class GroupedExpertsLoRAMXFP4(GroupedExpertsLoRA):
             output1 = self.expert_activation_grouped(output1, permuted_probs)
 
             # Down projection + LoRA
-            output2 = MXFP4GroupedMM.apply(output1, down_packed, down_scales, offs)
+            output2 = self._mxfp4_base_mm(output1, "down_projs", offs)
             lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
             lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
             output2 = output2 + lora_out2 * self.scale
@@ -539,8 +473,8 @@ class GroupedExpertsLoRAMXFP4(GroupedExpertsLoRA):
             y.scatter_add_(0, scatter_ids, output2.float())
         else:
             # Dummy computation for gradient flow; dequantize only expert 0.
-            gate_up_w0 = dequantize_mxfp4(gate_and_up_packed[0], gate_and_up_scales[0], x.dtype).transpose(-2, -1)
-            down_w0 = dequantize_mxfp4(down_packed[0], down_scales[0], x.dtype).transpose(-2, -1)
+            gate_up_w0 = self._mxfp4_dequant_expert0("gate_and_up_projs", x.dtype)
+            down_w0 = self._mxfp4_dequant_expert0("down_projs", x.dtype)
             output1 = torch.matmul(x[0] * 0, gate_up_w0)
             output1 = (
                 output1
