@@ -41,9 +41,18 @@ import torch
 
 HOLDER_NAME = "_fp32_params"
 _GETATTR_PATCHED_FLAG = "_fp32_getattr_patched"
+_FP32_GDN_PARAM_NAMES_ATTR = "_automodel_fp32_gdn_param_names"
 
 # Intrinsically-fp32 GatedDeltaNet bare params routed through the holder.
 FP32_GDN_PARAM_NAMES = ("A_log", "dt_bias")
+GDN_FP32_CHECKPOINT_ARCHITECTURES = frozenset(
+    (
+        "Qwen3NextForCausalLM",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    )
+)
 
 _FP32_HOLDER_KEY_RE = re.compile(r"(\.linear_attn)\._fp32_params\.")
 
@@ -77,6 +86,12 @@ def route_fp32_holder_key(key: str, param_names: tuple[str, ...] = FP32_GDN_PARA
 def is_gated_delta_net_fp32_param_key(key: str, param_names: tuple[str, ...] = FP32_GDN_PARAM_NAMES) -> bool:
     """Return whether ``key`` names an intrinsically-fp32 GDN parameter."""
     return key.endswith(param_names) and ".linear_attn." in key
+
+
+def has_gated_delta_net_fp32_checkpoint_contract(hf_config: object) -> bool:
+    """Return whether ``hf_config`` belongs to an architecture with fp32 GDN params."""
+    architectures = getattr(hf_config, "architectures", None) or ()
+    return any(arch in GDN_FP32_CHECKPOINT_ARCHITECTURES for arch in architectures)
 
 
 def upcast_gated_delta_net_fp32_state_tensor(
@@ -139,6 +154,18 @@ def make_fp32_getattr(orig_getattr):
     return _getattr_with_fp32
 
 
+def mark_gated_delta_net_fp32_params(
+    module: torch.nn.Module, param_names: tuple[str, ...] = FP32_GDN_PARAM_NAMES
+) -> None:
+    """Mark ``module`` as a GDN layer whose named params are intrinsically fp32."""
+    setattr(module, _FP32_GDN_PARAM_NAMES_ATTR, tuple(param_names))
+
+
+def get_gated_delta_net_fp32_param_names(module: torch.nn.Module) -> tuple[str, ...]:
+    """Return marked fp32 GDN param names for ``module``, or an empty tuple."""
+    return tuple(getattr(module, _FP32_GDN_PARAM_NAMES_ATTR, ()) or ())
+
+
 def force_fp32_gated_delta_net_params(
     module: torch.nn.Module, param_names: tuple[str, ...] = FP32_GDN_PARAM_NAMES
 ) -> bool:
@@ -165,7 +192,9 @@ def force_fp32_gated_delta_net_params(
     return forced_any
 
 
-def isolate_fp32_params(module: torch.nn.Module) -> Fp32GateParamHolder | None:
+def isolate_fp32_params(
+    module: torch.nn.Module, param_names: tuple[str, ...] = FP32_GDN_PARAM_NAMES
+) -> Fp32GateParamHolder | None:
     """Move ``module``'s fp32 bare params into a ``_fp32_params`` holder submodule.
 
     For FSDP mixed-dtype compatibility: bare fp32 params (``A_log``, ``dt_bias``)
@@ -177,14 +206,16 @@ def isolate_fp32_params(module: torch.nn.Module) -> Fp32GateParamHolder | None:
     re-asserting fp32 dtype on holder-owned GDN params. Returns the holder, or
     ``None`` when the module has no fp32 bare params.
     """
-    force_fp32_gated_delta_net_params(module)
+    force_fp32_gated_delta_net_params(module, param_names=param_names)
 
     existing = module._modules.get(HOLDER_NAME)
     if existing is not None:
         return existing
 
     holder: Fp32GateParamHolder | None = None
-    for pname in list(module._parameters.keys()):
+    for pname in param_names:
+        if pname not in module._parameters:
+            continue
         param = module._parameters[pname]
         if param is not None and param.dtype == torch.float32:
             if holder is None:
@@ -219,17 +250,16 @@ def mark_keep_in_fp32_modules_strict(model: torch.nn.Module) -> None:
 def isolate_gated_delta_net_fp32_params(model: torch.nn.Module) -> bool:
     """Isolate fp32 GatedDeltaNet params across ``model`` for fp32 FSDP compute.
 
-    Walks the model, and for every GatedDeltaNet linear-attention module
-    (identified by a ``linear_attn`` qualified module name plus a bare ``A_log``
-    parameter, or an already-created ``_fp32_params`` holder) moves its fp32 bare
-    params into a ``_fp32_params`` holder. When at least one holder exists,
-    declares ``_fp32_params`` on ``model._keep_in_fp32_modules_strict`` so the
-    custom-MoE FSDP path shards those params in their own fp32 unit.
+    Walks the model, and for every module explicitly marked with
+    ``mark_gated_delta_net_fp32_params`` moves its fp32 bare params into a
+    ``_fp32_params`` holder. When at least one holder exists, declares
+    ``_fp32_params`` on ``model._keep_in_fp32_modules_strict`` so the custom-MoE
+    FSDP path shards those params in their own fp32 unit.
 
     Idempotent and safe to call on models without GatedDeltaNet layers (no-op).
-    The ``linear_attn`` name guard is intentional: other architectures such as
-    Mamba also have ``A_log`` parameters, but they do not call the fp32 holder's
-    ``forward`` and therefore must not be wrapped by this GDN-specific helper.
+    The explicit marker is intentional: other architectures can also have
+    ``A_log`` parameters, but they must not be wrapped unless their forward calls
+    the fp32 holder.
     Returns ``True`` if any fp32 holder is present after the walk.
     """
     named_modules_fn = getattr(model, "named_modules", None)
@@ -239,17 +269,18 @@ def isolate_gated_delta_net_fp32_params(model: torch.nn.Module) -> bool:
     isolated_any = False
     # Materialize the module list first: isolate_fp32_params adds a ``_fp32_params``
     # child, mutating the module tree mid-walk.
-    for name, module in list(named_modules_fn()):
+    for _, module in list(named_modules_fn()):
         if isinstance(module, Fp32GateParamHolder):
             continue
-        if name != "linear_attn" and not name.endswith(".linear_attn"):
+        param_names = get_gated_delta_net_fp32_param_names(module)
+        if not param_names:
             continue
         params = getattr(module, "_parameters", None)
         mods = getattr(module, "_modules", None)
         if params is None or mods is None:
             continue
-        if "A_log" in params or mods.get(HOLDER_NAME) is not None:
-            holder = isolate_fp32_params(module)
+        if any(pname in params for pname in param_names) or mods.get(HOLDER_NAME) is not None:
+            holder = isolate_fp32_params(module, param_names=param_names)
             if holder is not None:
                 isolated_any = True
     if isolated_any:

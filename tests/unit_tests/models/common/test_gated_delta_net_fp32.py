@@ -15,9 +15,11 @@ from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     HOLDER_NAME,
     Fp32GateParamHolder,
     force_fp32_gated_delta_net_params,
+    has_gated_delta_net_fp32_checkpoint_contract,
     is_gated_delta_net_fp32_param_key,
     isolate_fp32_params,
     isolate_gated_delta_net_fp32_params,
+    mark_gated_delta_net_fp32_params,
     mark_keep_in_fp32_modules_strict,
     route_fp32_holder_key,
     strip_fp32_holder_key,
@@ -32,8 +34,10 @@ class _FakeGatedDeltaNet(nn.Module):
         super().__init__()
         self.A_log = nn.Parameter(torch.zeros(num_v, dtype=a_dtype))
         self.dt_bias = nn.Parameter(torch.ones(num_v, dtype=dt_dtype))
+        self.other = nn.Parameter(torch.ones(num_v, dtype=torch.float32))
         # A bf16 submodule param (must NOT be moved into the holder).
         self.in_proj = nn.Linear(8, 8, bias=False)
+        mark_gated_delta_net_fp32_params(self)
 
 
 class _FakeSsmMixer(nn.Module):
@@ -62,6 +66,7 @@ class TestIsolateFp32Params:
         assert isinstance(holder, Fp32GateParamHolder)
         assert "A_log" not in gdn._parameters
         assert "dt_bias" not in gdn._parameters
+        assert "other" in gdn._parameters
         assert HOLDER_NAME in gdn._modules
         # __getattr__ redirect resolves to the holder-owned params.
         assert gdn.A_log is holder._parameters["A_log"]
@@ -191,6 +196,25 @@ class TestIsolateAcrossModel:
         assert model.mixer.dt_bias.dtype == torch.bfloat16
         assert not hasattr(model, "_keep_in_fp32_modules_strict")
 
+    def test_unmarked_linear_attn_a_log_module_is_noop(self):
+        model = _wrap_in_model(_FakeSsmMixer())
+
+        assert isolate_gated_delta_net_fp32_params(model) is False
+        assert HOLDER_NAME not in model.layers[0].linear_attn._modules
+        assert model.layers[0].linear_attn.A_log.dtype == torch.bfloat16
+        assert model.layers[0].linear_attn.dt_bias.dtype == torch.bfloat16
+        assert not hasattr(model, "_keep_in_fp32_modules_strict")
+
+    def test_marked_module_name_does_not_need_to_be_linear_attn(self):
+        model = nn.Module()
+        model.mixer = _FakeGatedDeltaNet(a_dtype=torch.bfloat16, dt_dtype=torch.bfloat16)
+
+        assert isolate_gated_delta_net_fp32_params(model) is True
+        assert HOLDER_NAME in model.mixer._modules
+        assert model.mixer.A_log.dtype == torch.float32
+        assert model.mixer.dt_bias.dtype == torch.float32
+        assert model._keep_in_fp32_modules_strict == (HOLDER_NAME,)
+
 
 class TestMarkKeepInFp32:
     def test_idempotent_and_preserves_existing(self):
@@ -244,6 +268,17 @@ class TestKeyHelpers:
         assert is_gated_delta_net_fp32_param_key("model.layers.0.linear_attn._fp32_params.dt_bias")
         assert not is_gated_delta_net_fp32_param_key("model.layers.0.self_attn.A_log")
         assert not is_gated_delta_net_fp32_param_key("model.layers.0.linear_attn.conv1d.weight")
+
+    def test_identifies_gdn_fp32_checkpoint_architectures(self):
+        assert has_gated_delta_net_fp32_checkpoint_contract(
+            type("Config", (), {"architectures": ["Qwen3NextForCausalLM"]})
+        )
+        assert has_gated_delta_net_fp32_checkpoint_contract(
+            type("Config", (), {"architectures": ["Qwen3_5MoeForConditionalGeneration"]})
+        )
+        assert not has_gated_delta_net_fp32_checkpoint_contract(
+            type("Config", (), {"architectures": ["FutureLinearAttentionForCausalLM"]})
+        )
 
 
 class TestStateTensorUpcast:

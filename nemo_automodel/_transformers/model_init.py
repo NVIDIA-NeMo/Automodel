@@ -60,7 +60,10 @@ import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
-from nemo_automodel.components.models.common.gated_delta_net_fp32 import is_gated_delta_net_fp32_param_key
+from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
+    has_gated_delta_net_fp32_checkpoint_contract,
+    is_gated_delta_net_fp32_param_key,
+)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
 from nemo_automodel.shared.utils import dtype_from_str
@@ -663,6 +666,7 @@ def _restore_loaded_model_dtype(
     if not checkpoint_dtypes:
         return
 
+    preserve_gdn_fp32_params = has_gated_delta_net_fp32_checkpoint_contract(hf_config)
     restored_dtype_by_tensor_id: dict[int, torch.dtype] = {}
     restored_count = 0
     for name, checkpoint_dtype in checkpoint_dtypes.items():
@@ -672,7 +676,9 @@ def _restore_loaded_model_dtype(
 
         effective_checkpoint_dtype = (
             torch.float32
-            if checkpoint_dtype.is_floating_point and is_gated_delta_net_fp32_param_key(name)
+            if checkpoint_dtype.is_floating_point
+            and preserve_gdn_fp32_params
+            and is_gated_delta_net_fp32_param_key(name)
             else checkpoint_dtype
         )
 

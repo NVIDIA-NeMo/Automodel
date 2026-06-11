@@ -38,6 +38,7 @@ from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     force_fp32_gated_delta_net_params,
     isolate_fp32_params,
     make_fp32_getattr,
+    mark_gated_delta_net_fp32_params,
     mark_keep_in_fp32_modules_strict,
 )
 from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
@@ -103,6 +104,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
 
     def __init__(self, config, layer_idx: int):
         super().__init__(config, layer_idx)
+        mark_gated_delta_net_fp32_params(self)
         force_fp32_gated_delta_net_params(self)
         self._cp_mesh = None
 
@@ -666,6 +668,7 @@ def patch_hf_model(model, cp_enabled=False):
         # The CPAwareGatedDeltaNet forward calls ``self._fp32_params()`` to trigger
         # FSDP unshard; __getattr__ redirects ``self.A_log`` to the holder so it
         # returns the unsharded plain tensor.
+        mark_gated_delta_net_fp32_params(mod)
         force_fp32_gated_delta_net_params(mod)
         isolate_fp32_params(mod)
         patched += 1
