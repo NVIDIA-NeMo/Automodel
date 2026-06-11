@@ -513,6 +513,37 @@ def _prepare_cp_batch_common(cp_mesh, tp_mesh, batch, loss_mask):
     return primary_key, primary_seq_tensor, seq_len, labels, position_ids, pos_seq_dim, loss_mask
 
 
+def _synthesize_single_document_seq_ids(batch: dict, primary_key: str, seq_len: int) -> None:
+    """Materialize the trivial single-document ``_packed_seq_ids`` map for the all-gather CP path.
+
+    The VLM/LLM collates emit ``_packed_seq_ids`` only when 2+ documents are
+    packed (``attention_mask.max() > 1``), so a single, unpacked sequence arrives
+    without it. The all-gather CP attention mask builder needs document boundaries
+    even for one document, so synthesize the trivial map here (1 = real token, 0 =
+    pad) instead of lowering each collate's threshold -- which would change
+    behavior for every non-CP ``_packed_seq_ids`` consumer (e.g. SqrtCrossEntropy).
+    Derived from ``padding_mask`` when present, else all-ones.
+
+    A no-op when ``_packed_seq_ids`` is already present (genuinely packed input).
+    Models that key CP masks on something else (e.g. DeepSeek V4 uses
+    ``position_ids``) never read the synthesized tensor and simply ignore it.
+
+    Args:
+        batch: The CP batch dict; mutated in place to add ``_packed_seq_ids``.
+        primary_key: ``"input_ids"`` or ``"inputs_embeds"`` (selects batch / device).
+        seq_len: The pre-pad sequence length.
+    """
+    if "_packed_seq_ids" in batch:
+        return
+    primary = batch[primary_key]
+    padding_mask = batch.get("padding_mask")
+    if padding_mask is not None:
+        # padding_mask is [B, S], True == pad -> real-token map is its inverse.
+        batch["_packed_seq_ids"] = (~padding_mask.bool()).to(torch.long)
+    else:
+        batch["_packed_seq_ids"] = torch.ones((primary.shape[0], seq_len), dtype=torch.long, device=primary.device)
+
+
 def _make_manual_allgather_cp_batch(
     cp_mesh,
     batch,
@@ -526,6 +557,13 @@ def _make_manual_allgather_cp_batch(
     padding_token_id,
 ):
     cp_size = cp_mesh.size()
+    # The all-gather CP attention mask builder needs per-document boundaries
+    # (`_packed_seq_ids`) even for a single sequence. The collates emit it only
+    # when 2+ documents are packed, so synthesize the trivial one-document map
+    # here -- keeping the requirement in the CP mechanism rather than forcing the
+    # VLM/LLM collates to lower their `attention_mask.max() > 1` guard (which would
+    # perturb non-CP `_packed_seq_ids` consumers such as SqrtCrossEntropy).
+    _synthesize_single_document_seq_ids(batch, primary_key, seq_len)
     pad_len = (-seq_len) % (2 * cp_size)
     if pad_len:
         if "input_ids" in batch:
