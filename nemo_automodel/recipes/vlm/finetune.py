@@ -1200,13 +1200,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 total_loss += local_loss.item() * num_label_tokens
                 total_tokens += local_num_label_tokens
 
-        # Aggregate across ranks if distributed is initialized
+        # Aggregate across ranks if distributed is initialized. The VLM recipe
+        # shards the batch (and labels) *before* counting, so `total_tokens` /
+        # `total_num_label_tokens` hold per-CP-shard counts -- reduce them over CP
+        # too (include_cp=True), matching the CP-summed `total_loss`, so
+        # `val_loss = total_loss / total_num_label_tokens` divides like-for-like.
         total_loss = self._dp_allreduce(torch.FloatTensor([total_loss]), include_cp=True).item()
-        # `num_label_tokens` is measured before CP sharding, so each CP rank
-        # contributes the full sequence token count while `total_loss` is
-        # reconstructed from CP-sharded loss sums. Do not sum tokens over CP.
-        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens])).item()
-        total_num_label_tokens = self._dp_allreduce(torch.LongTensor([total_num_label_tokens])).item()
+        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens]), include_cp=True).item()
+        total_num_label_tokens = self._dp_allreduce(torch.LongTensor([total_num_label_tokens]), include_cp=True).item()
 
         val_loss = total_loss / max(total_tokens, 1e-8)
 
