@@ -583,6 +583,7 @@ class TrainEagle1Recipe(BaseRecipe):
         except TypeError:
             batches_per_epoch = None
         is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
+        pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
         for epoch_idx in range(start_epoch, self.num_epochs):
             if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
                 self.train_dataloader.sampler.set_epoch(epoch_idx)
@@ -641,6 +642,8 @@ class TrainEagle1Recipe(BaseRecipe):
                     self.optimizer.zero_grad(set_to_none=True)
                     self.lr_scheduler.step()
                     self.runtime.global_step += 1
+                    if pbar is not None:
+                        pbar.update(1)
                     completed_steps += 1
                     pending_micro_batches = 0
                     self._maybe_save_step_checkpoint(epoch_idx)
@@ -650,6 +653,12 @@ class TrainEagle1Recipe(BaseRecipe):
                         avg_loss = running_loss / n
                         avg_acc = running_acc / n
                         current_lr = self.lr_scheduler.get_last_lr()[0]
+                        if pbar is not None:
+                            pbar.set_postfix(
+                                loss=f"{avg_loss:.4f}",
+                                acc=f"{avg_acc:.4f}",
+                                lr=f"{current_lr:.2e}",
+                            )
                         logger.info(
                             "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
                             epoch_idx,
@@ -709,6 +718,8 @@ class TrainEagle1Recipe(BaseRecipe):
                 self.optimizer.zero_grad(set_to_none=True)
                 self.lr_scheduler.step()
                 self.runtime.global_step += 1
+                if pbar is not None:
+                    pbar.update(1)
                 completed_steps += 1
                 pending_micro_batches = 0
                 self._maybe_save_step_checkpoint(epoch_idx)
@@ -735,6 +746,8 @@ class TrainEagle1Recipe(BaseRecipe):
                     best_metric_key="val_loss",
                 )
 
+        if pbar is not None:
+            pbar.close()
         self._maybe_save_final_checkpoint(self.num_epochs)
         self._finalize_pending_checkpoint()
 
