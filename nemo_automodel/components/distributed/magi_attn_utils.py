@@ -456,7 +456,10 @@ def register_magi_attention() -> None:  # pragma: no cover - requires GPU + magi
         q, k, v = (
             rearrange(e, "b nh s hd -> (b s) nh hd").to(torch.bfloat16).contiguous() for e in (query, key, value)
         )
-        o = calc_attn(q, k, v, magi_attn_key)[0]
+        # Forward the HF attention scale to FFA. For the standard 1/sqrt(head_dim)
+        # scale (Llama, Qwen, ...) ``scaling`` matches FFA's default, but models with a
+        # non-default scale (e.g. Cohere) would otherwise be computed with the wrong one.
+        o = calc_attn(q, k, v, magi_attn_key, softmax_scale=scaling)[0]
         # ((b s), nh, hd) -> (b, s, nh*hd)
         o = rearrange(o, "(b s) nh hd -> b s (nh hd)", b=b).to(dtype)
         return o, None
@@ -607,12 +610,13 @@ def magi_prepare_packed_cp(model, batch: dict, cp_group):  # pragma: no cover - 
     key over ``cp_group`` and dispatches the sequence with MagiAttention's own
     load-balancing solver (not TE's THD sharding). Each rank then runs the model on
     its local shard; the attn_func uses this pre-built key so the FFA kernel does
-    the cross-rank KV exchange. Logits are undispatched back to the global sequence
-    before the loss (see :func:`magi_undispatch_logits`), so ``labels`` stay global.
+    the cross-rank KV exchange. Labels are dispatched the same way as the input, so
+    each rank computes a per-shard loss that the recipe's cross-CP reduction sums
+    into the global loss (like TE-CP).
 
     Returns:
         (new_batch, key): ``new_batch`` has the local ``input_ids``/``position_ids``
-        and the global ``labels``; ``key`` is the dist-attn runtime key.
+        and local ``labels``; ``key`` is the dist-attn runtime key.
     """
     from magi_attention.api import dispatch, get_position_ids
 
