@@ -40,6 +40,205 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
 
 _MOE_SCATTER_CHUNK_ROWS_ENV = "NEMO_AUTOMODEL_MOE_SCATTER_CHUNK_ROWS"
+_DSV4_MOE_FP8_FAKE_QUANT_CHUNK_ROWS_ENV = "NEMO_AUTOMODEL_DSV4_MOE_FAKE_QUANT_CHUNK_ROWS"
+_DSV4_MOE_FP8_FAKE_QUANT_DEBUG_PRINTS: dict[tuple[str, bool, bool], int] = {}
+
+
+def _dsv4_moe_fp8_fake_quant_debug_enabled() -> bool:
+    value = os.environ.get("NEMO_AUTOMODEL_DSV4_FAKE_QUANT_DEBUG", "0").lower()
+    if value in ("", "0", "false", "no", "off"):
+        return False
+
+    rank = os.environ.get("RANK") or os.environ.get("GLOBAL_RANK") or os.environ.get("LOCAL_RANK") or "0"
+    return rank == "0"
+
+
+def _maybe_print_dsv4_moe_fp8_fake_quant_debug(
+    *,
+    tag: str,
+    original: torch.Tensor,
+    dequantized: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    global _DSV4_MOE_FP8_FAKE_QUANT_DEBUG_PRINTS
+    if not _dsv4_moe_fp8_fake_quant_debug_enabled():
+        return
+    if original.numel() == 0 or scale.numel() == 0:
+        return
+
+    max_prints = int(os.environ.get("NEMO_AUTOMODEL_DSV4_FAKE_QUANT_DEBUG_MAX_PRINTS", "24"))
+    print_key = ("moe", torch.is_grad_enabled(), bool(original.requires_grad))
+    if _DSV4_MOE_FP8_FAKE_QUANT_DEBUG_PRINTS.get(print_key, 0) >= max_prints:
+        return
+    _DSV4_MOE_FP8_FAKE_QUANT_DEBUG_PRINTS[print_key] = (
+        _DSV4_MOE_FP8_FAKE_QUANT_DEBUG_PRINTS.get(print_key, 0) + 1
+    )
+
+    with torch.no_grad():
+        max_debug_elements = int(os.environ.get("NEMO_AUTOMODEL_DSV4_FAKE_QUANT_DEBUG_MAX_ELEMENTS", "1048576"))
+        original_flat = original.detach().reshape(-1)
+        dequantized_flat = dequantized.detach().reshape(-1)
+        if original_flat.numel() > max_debug_elements:
+            stride = max(original_flat.numel() // max_debug_elements, 1)
+            original_flat = original_flat[::stride][:max_debug_elements]
+            dequantized_flat = dequantized_flat[::stride][:max_debug_elements]
+        diff = (dequantized_flat.float() - original_flat.float()).abs()
+        print(
+            "[DSV4 MoE fp8 fake_quant]"
+            f" tag={tag}"
+            f" shape={tuple(original.shape)}"
+            f" dtype={original.dtype}"
+            f" requires_grad={original.requires_grad}"
+            f" grad_enabled={print_key[1]}"
+            f" mean_abs_diff={diff.mean().item():.6e}"
+            f" max_abs_diff={diff.max().item():.6e}"
+            f" scale_min={scale.detach().float().min().item():.6e}"
+            f" scale_max={scale.detach().float().max().item():.6e}",
+            flush=True,
+        )
+
+
+def _dsv4_moe_fp8_fake_quant_chunk_rows() -> int:
+    return int(os.environ.get(_DSV4_MOE_FP8_FAKE_QUANT_CHUNK_ROWS_ENV, "2048"))
+
+
+def _ceil_block_scale_to_ue8m0(scale: torch.Tensor) -> torch.Tensor:
+    """Round per-block dequant scales up to the next power of two (UE8M0).
+
+    vLLM-0.21 runs DeepGEMM block-FP8 with ``VLLM_USE_DEEP_GEMM_E8M0`` enabled
+    (the env default, and DSV4 Flash-Base's ``scale_fmt='ue8m0'`` auto-enables
+    it), so both weights and activations are quantized with power-of-two scales
+    ``2 ** ceil(log2(absmax / 448))`` rather than plain float ``absmax / 448``.
+    This mirrors vLLM's ``_ceil_to_ue8m0`` (``vllm/utils/deep_gemm.py``) for
+    weights and the DeepGEMM ``per_token_group_quant_fp8`` kernel for
+    activations.
+
+    Args:
+        scale: Positive per-block float dequant scale (``absmax / 448``).
+
+    Returns:
+        The scale rounded up to the nearest power of two.
+    """
+    return torch.exp2(torch.ceil(torch.log2(scale)))
+
+
+def _fp8_activation_fake_quant_ste(
+    x: torch.Tensor,
+    *,
+    block_size: int = 128,
+    debug_tag: str | None = None,
+    straight_through: bool = True,
+) -> torch.Tensor:
+    """Approximate vLLM dynamic FP8 activation quantization for fp8 block GEMMs.
+
+    vLLM-0.21's generic block-FP8 GEMMs quantize activations with per-token,
+    per-128 group scales. Under DeepGEMM with ``VLLM_USE_DEEP_GEMM_E8M0`` on
+    (the default; DSV4 Flash-Base's ``scale_fmt='ue8m0'`` also auto-enables it)
+    those scales are rounded up to powers of two (UE8M0), which this reproduces
+    via :func:`_ceil_block_scale_to_ue8m0`. ``straight_through=False`` returns
+    the dequantized tensor directly (no STE identity-gradient), for frozen /
+    non-differentiable paths (e.g. the indexer).
+    """
+    if x.shape[-1] % block_size != 0:
+        raise ValueError(
+            "DSV4 MoE FP8 activation fake quant expects the last dimension "
+            f"to be divisible by {block_size}, got {x.shape[-1]}"
+        )
+
+    with torch.no_grad():
+        fp8_max = 448.0
+        chunk_rows = _dsv4_moe_fp8_fake_quant_chunk_rows()
+        if x.ndim == 2 and chunk_rows > 0 and x.shape[0] > chunk_rows:
+            dequantized = torch.empty_like(x)
+            scale_min: torch.Tensor | None = None
+            scale_max: torch.Tensor | None = None
+            for start in range(0, x.shape[0], chunk_rows):
+                end = min(start + chunk_rows, x.shape[0])
+                quant_input = x.detach()[start:end].to(torch.float32)
+                quant_blocks = quant_input.reshape(-1, x.shape[-1] // block_size, block_size)
+                scale_chunk = quant_blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10) / fp8_max
+                scale_chunk = _ceil_block_scale_to_ue8m0(scale_chunk)
+                quantized = torch.clamp(quant_blocks / scale_chunk, -fp8_max, fp8_max).to(torch.float8_e4m3fn)
+                dequantized[start:end].copy_((quantized.to(x.dtype) * scale_chunk.to(x.dtype)).reshape_as(x[start:end]))
+                if debug_tag is not None:
+                    chunk_min = scale_chunk.min()
+                    chunk_max = scale_chunk.max()
+                    scale_min = chunk_min if scale_min is None else torch.minimum(scale_min, chunk_min)
+                    scale_max = chunk_max if scale_max is None else torch.maximum(scale_max, chunk_max)
+            scale = (
+                torch.stack((scale_min, scale_max))
+                if scale_min is not None and scale_max is not None
+                else x.new_ones(1)
+            )
+        else:
+            quant_input = x.detach().to(torch.float32)
+            quant_blocks = quant_input.reshape(*quant_input.shape[:-1], x.shape[-1] // block_size, block_size)
+            scale = quant_blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10) / fp8_max
+            scale = _ceil_block_scale_to_ue8m0(scale)
+            quantized = torch.clamp(quant_blocks / scale, -fp8_max, fp8_max).to(torch.float8_e4m3fn)
+            dequantized = (quantized.to(x.dtype) * scale.to(x.dtype)).reshape_as(x)
+    if debug_tag is not None:
+        _maybe_print_dsv4_moe_fp8_fake_quant_debug(
+            tag=debug_tag,
+            original=x,
+            dequantized=dequantized,
+            scale=scale,
+        )
+    if not straight_through:
+        return dequantized.to(x.dtype)
+    return x + (dequantized - x).detach()
+
+
+def _fp8_weight_fake_quant_ste(
+    weight: torch.Tensor,
+    *,
+    block_size: int = 128,
+    debug_tag: str | None = None,
+    straight_through: bool = True,
+) -> torch.Tensor:
+    """Approximate vLLM 128x128 block FP8 weight quantization.
+
+    Matches vLLM-0.21's generic block-FP8 weight path. Under DeepGEMM with
+    ``VLLM_USE_DEEP_GEMM_E8M0`` on (the default; DSV4 Flash-Base's
+    ``scale_fmt='ue8m0'`` also auto-enables it) vLLM requantizes each 128x128
+    block to a power-of-two (UE8M0) scale, reproduced here via
+    :func:`_ceil_block_scale_to_ue8m0`. ``straight_through=False`` returns the
+    dequantized weight directly (frozen / no-gradient paths).
+    """
+    rows, cols = weight.shape[-2:]
+    if rows % block_size != 0 or cols % block_size != 0:
+        raise ValueError(
+            "DSV4 MoE FP8 weight fake quant expects both matrix dimensions "
+            f"to be divisible by {block_size}, got {rows}x{cols}"
+        )
+
+    with torch.no_grad():
+        fp8_max = 448.0
+        quant_input = weight.detach().to(torch.float32)
+        quant_blocks = quant_input.reshape(
+            *quant_input.shape[:-2],
+            rows // block_size,
+            block_size,
+            cols // block_size,
+            block_size,
+        )
+        # vLLM's per_block_cast_to_fp8 floors the block absmax at 1e-4 before
+        # dividing by fp8_max; the per-token activation path floors at 1e-10
+        # (per_token_group_quant_fp8), so the two eps values intentionally differ.
+        scale = quant_blocks.abs().amax(dim=(-3, -1), keepdim=True).clamp_min(1e-4) / fp8_max
+        scale = _ceil_block_scale_to_ue8m0(scale)
+        quantized = torch.clamp(quant_blocks / scale, -fp8_max, fp8_max).to(torch.float8_e4m3fn)
+        dequantized = (quantized.to(weight.dtype) * scale.to(weight.dtype)).reshape_as(weight)
+    if debug_tag is not None:
+        _maybe_print_dsv4_moe_fp8_fake_quant_debug(
+            tag=debug_tag,
+            original=weight,
+            dequantized=dequantized,
+            scale=scale,
+        )
+    if not straight_through:
+        return dequantized.to(weight.dtype)
+    return weight + (dequantized - weight).detach()
 
 # ── EP variable-length collective helpers ──
 
@@ -351,6 +550,16 @@ class GroupedExperts(nn.Module):
         # MixedPrecisionPolicy does not reach EP DTensors.
         gate_and_up_projs = gate_and_up_projs.to(x.dtype)
         down_projs = down_projs.to(x.dtype)
+        fp8_fake_quant_moe = bool(getattr(self.config, "fp8_fake_quant_moe", False))
+        if fp8_fake_quant_moe:
+            gate_and_up_projs = _fp8_weight_fake_quant_ste(
+                gate_and_up_projs,
+                debug_tag="routed.gate_up.weight",
+            )
+            down_projs = _fp8_weight_fake_quant_ste(
+                down_projs,
+                debug_tag="routed.down.weight",
+            )
 
         # EP variable-length all-gather
         if ep_size > 1:
@@ -445,6 +654,7 @@ class GroupedExperts(nn.Module):
     ):
         """Per-expert loop forward path using gather/scatter."""
         y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        fp8_fake_quant_moe = bool(getattr(self.config, "fp8_fake_quant_moe", False))
 
         active_local_experts = 0
         for i in range(experts_start_idx, experts_end_idx):
@@ -461,6 +671,11 @@ class GroupedExperts(nn.Module):
 
             idx_b = idx[:, None].expand(-1, x.size(1))
             x_idx = x.gather(dim=0, index=idx_b)
+            if fp8_fake_quant_moe:
+                x_idx = _fp8_activation_fake_quant_ste(
+                    x_idx,
+                    debug_tag="routed.gate_up.activation",
+                )
 
             gate_and_up_proj = gate_and_up_projs[local_idx]
             expert_gate_up_proj_bias = gate_up_proj_bias[local_idx] if gate_up_proj_bias is not None else None
@@ -474,6 +689,11 @@ class GroupedExperts(nn.Module):
             # Uses WeightedSwiGLUFunction with float32 backward precision
             w = weights[idx, top, None]
             activated = self.expert_activation_grouped(gate_and_up_out, w)
+            if fp8_fake_quant_moe:
+                activated = _fp8_activation_fake_quant_ste(
+                    activated,
+                    debug_tag="routed.down.activation",
+                )
 
             # Down projection
             expert_out = activated @ down_proj
@@ -485,8 +705,18 @@ class GroupedExperts(nn.Module):
         # Dummy computation for gradient flow when no tokens routed locally
         if active_local_experts == 0:
             dummy_x = torch.zeros_like(x[0]).unsqueeze(0)
+            if fp8_fake_quant_moe:
+                dummy_x = _fp8_activation_fake_quant_ste(
+                    dummy_x,
+                    debug_tag="routed.gate_up.activation.dummy",
+                )
             gate_and_up_out = dummy_x @ gate_and_up_projs[0]
             activated = self.expert_activation_grouped(gate_and_up_out, weights[0, 0, None].unsqueeze(0))
+            if fp8_fake_quant_moe:
+                activated = _fp8_activation_fake_quant_ste(
+                    activated,
+                    debug_tag="routed.down.activation.dummy",
+                )
             expert_out = activated @ down_projs[0]
             y[0] += expert_out[0]
 
@@ -515,10 +745,16 @@ class GroupedExperts(nn.Module):
         )
 
         y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        fp8_fake_quant_moe = bool(getattr(self.config, "fp8_fake_quant_moe", False))
 
         if tokens_per_expert.sum() > 0:
             permuted_x = x[sorted_token_ids]
             permuted_probs = sorted_weights.unsqueeze(-1)
+            if fp8_fake_quant_moe:
+                permuted_x = _fp8_activation_fake_quant_ste(
+                    permuted_x,
+                    debug_tag="routed.gate_up.activation",
+                )
 
             if self.expert_bias:
                 # torch._grouped_mm does not support bias yet (raises
@@ -527,6 +763,11 @@ class GroupedExperts(nn.Module):
                 output1 = torch._grouped_mm(permuted_x, gate_and_up_projs, offs=offs)
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                 output1 = self.expert_activation_grouped(output1, permuted_probs)
+                if fp8_fake_quant_moe:
+                    output1 = _fp8_activation_fake_quant_ste(
+                        output1,
+                        debug_tag="routed.down.activation",
+                    )
                 output2 = torch._grouped_mm(output1, down_projs, offs=offs)
                 output2 = _apply_bias(output2, down_proj_bias, tokens_per_expert, permuted_probs)
             else:
@@ -537,14 +778,26 @@ class GroupedExperts(nn.Module):
                     tokens_per_expert,
                     permuted_probs,
                     self.expert_activation_grouped,
+                    fp8_fake_quant_moe=fp8_fake_quant_moe,
                 )
 
             scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
             _scatter_add_fp32(y, scatter_ids, output2, self.scatter_chunk_rows)
         else:
             # Dummy computation for gradient flow
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
+            dummy_x = x[0] * 0
+            if fp8_fake_quant_moe:
+                dummy_x = _fp8_activation_fake_quant_ste(
+                    dummy_x.unsqueeze(0),
+                    debug_tag="routed.gate_up.activation.dummy",
+                ).squeeze(0)
+            output1 = torch.matmul(dummy_x, gate_and_up_projs[0])
             output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
+            if fp8_fake_quant_moe:
+                output1_ = _fp8_activation_fake_quant_ste(
+                    output1_,
+                    debug_tag="routed.down.activation.dummy",
+                )
             output2 = torch.matmul(output1_, down_projs[0])
             y[0] += output2[0]
 
@@ -783,6 +1036,20 @@ class GroupedExpertsDeepEP(nn.Module):
         # Match activation dtype for grouped_mm; see GroupedExperts.forward.
         gate_and_up_projs = gate_and_up_projs.to(permuted_local_hidden_states.dtype)
         down_projs = down_projs.to(permuted_local_hidden_states.dtype)
+        fp8_fake_quant_moe = bool(getattr(self.config, "fp8_fake_quant_moe", False))
+        if fp8_fake_quant_moe:
+            permuted_local_hidden_states = _fp8_activation_fake_quant_ste(
+                permuted_local_hidden_states,
+                debug_tag="routed.gate_up.activation",
+            )
+            gate_and_up_projs = _fp8_weight_fake_quant_ste(
+                gate_and_up_projs,
+                debug_tag="routed.gate_up.weight",
+            )
+            down_projs = _fp8_weight_fake_quant_ste(
+                down_projs,
+                debug_tag="routed.down.weight",
+            )
 
         if torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
@@ -799,6 +1066,11 @@ class GroupedExpertsDeepEP(nn.Module):
                     gate_up_proj_bias = self.gate_up_proj_bias.to_local()
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                     output1 = self.expert_activation(output1, permuted_probs)
+                    if fp8_fake_quant_moe:
+                        output1 = _fp8_activation_fake_quant_ste(
+                            output1,
+                            debug_tag="routed.down.activation",
+                        )
                     output2 = torch._grouped_mm(output1, down_projs, offs=offs)
                     down_bias = self.down_proj_bias.to_local()
                     output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
@@ -810,6 +1082,7 @@ class GroupedExpertsDeepEP(nn.Module):
                         tokens_per_expert_gpu,
                         permuted_probs,
                         self.expert_activation,
+                        fp8_fake_quant_moe=fp8_fake_quant_moe,
                     )
             else:
                 tokens_per_expert = tokens_per_expert.to("cpu")
@@ -825,6 +1098,11 @@ class GroupedExpertsDeepEP(nn.Module):
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
                 output1 = self.expert_activation(output1, permuted_probs)
+                if fp8_fake_quant_moe:
+                    output1 = _fp8_activation_fake_quant_ste(
+                        output1,
+                        debug_tag="routed.down.activation",
+                    )
                 output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
 
                 if self.expert_bias:
@@ -833,6 +1111,11 @@ class GroupedExpertsDeepEP(nn.Module):
         else:
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
             output1_ = self.expert_activation(output1, permuted_probs)
+            if fp8_fake_quant_moe:
+                output1_ = _fp8_activation_fake_quant_ste(
+                    output1_,
+                    debug_tag="routed.down.activation.dummy",
+                )
             output2 = torch.matmul(output1_, down_projs[0])
 
         y = self.token_dispatcher.token_unpermutation(output2)
@@ -843,11 +1126,23 @@ class GroupedExpertsDeepEP(nn.Module):
 
 
 def _torch_mm_experts_fwd(
-    hidden_states, gate_and_up_projs, down_projs, tokens_per_expert, permuted_probs, activation_fn
+    hidden_states,
+    gate_and_up_projs,
+    down_projs,
+    tokens_per_expert,
+    permuted_probs,
+    activation_fn,
+    *,
+    fp8_fake_quant_moe: bool = False,
 ):
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
     output1 = torch._grouped_mm(hidden_states, gate_and_up_projs, offs=offs)
     output1 = activation_fn(output1, permuted_probs)
+    if fp8_fake_quant_moe:
+        output1 = _fp8_activation_fake_quant_ste(
+            output1,
+            debug_tag="routed.down.activation",
+        )
     output2 = torch._grouped_mm(output1, down_projs, offs=offs)
     return output2
 

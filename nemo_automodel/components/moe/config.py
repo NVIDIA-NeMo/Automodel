@@ -72,6 +72,10 @@ class MoEConfig:
     shared_expert_activation: str = "swiglu"  # Activation for shared experts ("swiglu" or "relu2")
     force_e_score_correction_bias: bool = False  # Force creation of e_score_correction_bias buffer
     moe_latent_size: int | None = None
+    # Training-only numerical alignment with vLLM's DeepSeek V4 fp8 MoE path.
+    # When True, routed + shared expert GEMM inputs/weights run a straight-
+    # through FP8 quant/dequant (float scales) during the Automodel forward.
+    fp8_fake_quant_moe: bool = False
 
     @property
     def expert_dim(self) -> int:

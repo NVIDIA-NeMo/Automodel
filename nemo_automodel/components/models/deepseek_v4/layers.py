@@ -54,6 +54,7 @@ All layers share the same sliding-window causal mask on the local KV path.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 import torch
@@ -66,6 +67,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.moe.experts import (
+    _fp8_activation_fake_quant_ste,
+    _fp8_weight_fake_quant_ste,
+)
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     build_dsv4_sparse_topk_indices,
     dsv4_indexer_scores,
@@ -338,13 +343,23 @@ class DeepseekV4GroupedLinear(nn.Linear):
     def __init__(self, in_features_per_group: int, out_features: int, n_groups: int, bias: bool = False):
         super().__init__(in_features_per_group, out_features, bias=bias)
         self.n_groups = n_groups
+        # Toggled on by DeepseekV4Attention when fp8_ds_mla_fake_quant_attn_proj
+        # is enabled. vLLM's wo_a is a block-FP8 weight (UE8M0 power-of-two
+        # scales under DeepGEMM); the activation feeding wo_a is quantized
+        # separately on the o_proj path (fp8_ds_mla_fake_quant_o_proj).
+        self.fp8_fake_quant = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [..., n_groups, in_features_per_group]
         batch_shape = x.shape[:-2]
         d_in = x.shape[-1]
         out_per_group = self.out_features // self.n_groups
-        w = self.weight.view(self.n_groups, out_per_group, d_in)
+        weight = (
+            _fp8_weight_fake_quant_ste(self.weight, debug_tag="attn.wo_a.weight")
+            if self.fp8_fake_quant
+            else self.weight
+        )
+        w = weight.view(self.n_groups, out_per_group, d_in)
         x = x.reshape(-1, self.n_groups, d_in).permute(1, 0, 2)
         y = torch.bmm(x, w.transpose(-1, -2)).permute(1, 0, 2)
         return y.reshape(*batch_shape, self.n_groups, out_per_group)
@@ -421,6 +436,171 @@ def _apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, r
     after one block under Llama-style; matches at >0.999 under interleaved).
     """
     return _apply_partial_rope_interleaved(x, cos, sin, rope_head_dim)
+
+
+_DSV4_FP8_FAKE_QUANT_DEBUG_PRINTS: dict[tuple[bool, bool], int] = {}
+
+
+def _dsv4_fp8_fake_quant_debug_enabled() -> bool:
+    value = os.environ.get("NEMO_AUTOMODEL_DSV4_FAKE_QUANT_DEBUG", "0").lower()
+    if value in ("", "0", "false", "no", "off"):
+        return False
+
+    rank = os.environ.get("RANK") or os.environ.get("GLOBAL_RANK") or os.environ.get("LOCAL_RANK") or "0"
+    return rank == "0"
+
+
+def _maybe_print_fp8_ds_mla_fake_quant_debug(
+    *,
+    tag: str,
+    original: torch.Tensor,
+    dequantized: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    global _DSV4_FP8_FAKE_QUANT_DEBUG_PRINTS
+    if not _dsv4_fp8_fake_quant_debug_enabled():
+        return
+
+    max_prints = int(os.environ.get("NEMO_AUTOMODEL_DSV4_FAKE_QUANT_DEBUG_MAX_PRINTS", "24"))
+    print_key = (torch.is_grad_enabled(), bool(original.requires_grad))
+    if _DSV4_FP8_FAKE_QUANT_DEBUG_PRINTS.get(print_key, 0) >= max_prints:
+        return
+    _DSV4_FP8_FAKE_QUANT_DEBUG_PRINTS[print_key] = _DSV4_FP8_FAKE_QUANT_DEBUG_PRINTS.get(print_key, 0) + 1
+
+    with torch.no_grad():
+        diff = (dequantized.detach().float() - original.detach().float()).abs()
+        print(
+            "[DSV4 fp8_ds_mla fake_quant]"
+            f" tag={tag}"
+            f" shape={tuple(original.shape)}"
+            f" dtype={original.dtype}"
+            f" requires_grad={original.requires_grad}"
+            f" grad_enabled={print_key[0]}"
+            f" mean_abs_diff={diff.mean().item():.6e}"
+            f" max_abs_diff={diff.max().item():.6e}"
+            f" scale_min={scale.detach().float().min().item():.6e}"
+            f" scale_max={scale.detach().float().max().item():.6e}",
+            flush=True,
+        )
+
+
+def _fp8_ds_mla_fake_quant_kv_ste(
+    x: torch.Tensor,
+    rope_head_dim: int,
+    debug_tag: str | None = None,
+) -> torch.Tensor:
+    """Approximate vLLM DeepSeek V4 ``fp8_ds_mla`` KV cache quantization.
+
+    vLLM stores each DSV4 latent as FP8 NoPE values plus BF16 RoPE values. The
+    NoPE slice uses per-token, per-64-dim UE8M0 power-of-two scales (hardcoded
+    in the compressor / qnorm-rope kernels, independent of VLLM_USE_DEEP_GEMM_E8M0).
+    The straight-through form keeps backward gradients as identity.
+    """
+    if rope_head_dim <= 0:
+        return x
+
+    nope_dim = x.shape[-1] - rope_head_dim
+    if nope_dim <= 0 or nope_dim % 64 != 0:
+        raise ValueError(
+            "fp8_ds_mla fake quant expects a positive NoPE dimension divisible "
+            f"by 64, got hidden={x.shape[-1]} rope_head_dim={rope_head_dim}"
+        )
+
+    # Compute the quant/dequant under no_grad: the STE below already discards
+    # this subgraph via ``.detach()``, so tracking it only adds throwaway
+    # autograd graph (CPU recording + memory) in the training forward — which
+    # widens rank-arrival skew at the next DeepEP all-to-all. Mirrors the MoE
+    # STE helpers in moe/experts.py.
+    with torch.no_grad():
+        nope, rope = torch.split(x, [nope_dim, rope_head_dim], dim=-1)
+        quant_input = nope.to(torch.bfloat16).to(torch.float32)
+        quant_blocks = quant_input.reshape(*quant_input.shape[:-1], nope_dim // 64, 64)
+
+        fp8_max = 448.0
+        block_absmax = quant_blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+        exponent = torch.ceil(torch.log2(block_absmax / fp8_max))
+        scale = torch.exp2(exponent)
+
+        quantized = torch.clamp(quant_blocks / scale, -fp8_max, fp8_max).to(torch.float8_e4m3fn)
+        dequantized_nope = (quantized.to(torch.float32) * scale).reshape_as(nope).to(x.dtype)
+        dequantized_rope = rope.to(torch.bfloat16).to(x.dtype)
+        dequantized = torch.cat([dequantized_nope, dequantized_rope], dim=-1)
+    if debug_tag is not None:
+        _maybe_print_fp8_ds_mla_fake_quant_debug(
+            tag=debug_tag,
+            original=x,
+            dequantized=dequantized,
+            scale=scale,
+        )
+    return x + (dequantized - x).detach()
+
+
+def _fp8_ds_mla_fake_quant_o_proj_ste(
+    x: torch.Tensor,
+    debug_tag: str | None = None,
+) -> torch.Tensor:
+    """Approximate vLLM DSV4 output quantization before the grouped ``wo_a``.
+
+    vLLM's ``fused_inv_rope_fp8_quant`` stores attention outputs as FP8 in
+    128-wide head-dim blocks with UE8M0 power-of-two scales (hardcoded, env-
+    independent), then feeds those values into the FP8 ``wo_a`` einsum. We keep
+    the straight-through gradient and only inject the quant/dequant noise.
+    """
+    block_size = 128
+    if x.shape[-1] % block_size != 0:
+        raise ValueError(
+            "fp8_ds_mla output fake quant expects the head dimension to be "
+            f"divisible by {block_size}, got {x.shape[-1]}"
+        )
+
+    # See _fp8_ds_mla_fake_quant_kv_ste: compute under no_grad; the STE discards
+    # this subgraph via ``.detach()`` so tracking it only adds throwaway graph.
+    with torch.no_grad():
+        fp8_max = 448.0
+        quant_input = x.to(torch.float32)
+        quant_blocks = quant_input.reshape(*quant_input.shape[:-1], x.shape[-1] // block_size, block_size)
+        block_absmax = quant_blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+        exponent = torch.ceil(torch.log2(block_absmax / fp8_max))
+        scale = torch.exp2(exponent)
+
+        quantized = torch.clamp(quant_blocks / scale, -fp8_max, fp8_max).to(torch.float8_e4m3fn)
+        dequantized = (quantized.to(torch.float32) * scale).reshape_as(x).to(x.dtype)
+    if debug_tag is not None:
+        _maybe_print_fp8_ds_mla_fake_quant_debug(
+            tag=debug_tag,
+            original=x,
+            dequantized=dequantized,
+            scale=scale,
+        )
+    return x + (dequantized - x).detach()
+
+
+def _fp8_linear_fake_quant(
+    linear: nn.Module,
+    x: torch.Tensor,
+    debug_prefix: str,
+    *,
+    straight_through: bool = True,
+) -> torch.Tensor:
+    """FP8 fake quant for a plain ``nn.Linear`` on the attention projection path.
+
+    Matches vLLM's generic block-FP8 linear under DeepGEMM: per-token activation
+    quant + 128x128 weight quant, both with UE8M0 power-of-two scales (reuses the
+    MoE helpers). ``straight_through=False`` is used for the frozen indexer query
+    projection, where the output feeds a discrete top-k so no identity gradient
+    needs to be injected.
+    """
+    act = _fp8_activation_fake_quant_ste(
+        x,
+        debug_tag=f"{debug_prefix}.activation",
+        straight_through=straight_through,
+    )
+    weight = _fp8_weight_fake_quant_ste(
+        linear.weight,
+        debug_tag=f"{debug_prefix}.weight",
+        straight_through=straight_through,
+    )
+    return F.linear(act, weight, linear.bias)
 
 
 def _overlap_transform(tensor: torch.Tensor, head_dim: int, fill_value: float) -> torch.Tensor:
@@ -677,6 +857,17 @@ class DeepseekV4Indexer(nn.Module):
         )
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
+        # vLLM keeps indexer.wq_b in FP8 (generic block FP8 with UE8M0
+        # power-of-two scales under DeepGEMM); weights_proj/compressor stay BF16. The
+        # indexer is frozen and its output only feeds a discrete top-k, so we
+        # fake-quant wq_b without a straight-through gradient (see forward).
+        # A dedicated ``fp8_ds_mla_fake_quant_indexer`` flag lets this be ablated
+        # independently (the discrete top-k is a prime suspect for large
+        # train/infer logprob divergence); when unset it follows attn_proj.
+        _idx_flag = getattr(config, "fp8_ds_mla_fake_quant_indexer", None)
+        if _idx_flag is None:
+            _idx_flag = getattr(config, "fp8_ds_mla_fake_quant_attn_proj", False)
+        self.fp8_fake_quant_attn_proj = bool(_idx_flag)
         # The current training path uses hard top-k indices only to build a sparse
         # attention mask, so gradients do not flow back into the indexer scores.
         for param in self.parameters():
@@ -723,7 +914,13 @@ class DeepseekV4Indexer(nn.Module):
         pooled_kv = cache.update_pool(new_pooled, layer_idx, "indexer_state")
 
         cos, sin = position_embeddings
-        q = self.wq_b(q_residual).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        if self.fp8_fake_quant_attn_proj:
+            # No STE: frozen indexer + discrete top-k downstream, so identity
+            # gradient is unnecessary (plain quant/dequant in the forward).
+            q = _fp8_linear_fake_quant(self.wq_b, q_residual, "attn.indexer.wq_b", straight_through=False)
+        else:
+            q = self.wq_b(q_residual)
+        q = q.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim).transpose(1, 2)
         weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
         index_scores = dsv4_indexer_scores(
@@ -1041,6 +1238,13 @@ class DeepseekV4Attention(nn.Module):
         self.attention_dropout = float(getattr(config, "attention_dropout", 0.0) or 0.0)
         self.is_causal = True
         self.scaling = self.head_dim**-0.5
+        # FP8 fake-quant toggles (training-only vLLM numerical alignment).
+        # kv / o_proj use the hardcoded ue8m0 fp8_ds_mla format; attn_proj
+        # covers the generic block-FP8 input/output projections (also UE8M0
+        # power-of-two scales under DeepGEMM).
+        self.fp8_ds_mla_fake_quant_kv = bool(getattr(config, "fp8_ds_mla_fake_quant_kv", False))
+        self.fp8_ds_mla_fake_quant_o_proj = bool(getattr(config, "fp8_ds_mla_fake_quant_o_proj", False))
+        self.fp8_ds_mla_fake_quant_attn_proj = bool(getattr(config, "fp8_ds_mla_fake_quant_attn_proj", False))
 
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = initialize_rms_norm_module(
@@ -1056,6 +1260,9 @@ class DeepseekV4Attention(nn.Module):
             config.o_groups * config.o_lora_rank,
             config.o_groups,
         )
+        # wo_a weight rides the generic block-FP8 path; its activation input is
+        # quantized on the o_proj path (fp8_ds_mla_fake_quant_o_proj).
+        self.wo_a.fp8_fake_quant = self.fp8_ds_mla_fake_quant_attn_proj
         self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
         self.sinks_param = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
 
@@ -1094,9 +1301,16 @@ class DeepseekV4Attention(nn.Module):
         else:
             cos, sin = position_embeddings
 
-        q_residual = self.q_norm(self.wq_a(hidden_states))
-        q = self.wq_b(q_residual).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        kv = self.kv_norm(self.wkv(hidden_states)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
+        if self.fp8_ds_mla_fake_quant_attn_proj:
+            q_residual = self.q_norm(_fp8_linear_fake_quant(self.wq_a, hidden_states, "attn.wq_a"))
+            q_proj = _fp8_linear_fake_quant(self.wq_b, q_residual, "attn.wq_b")
+            kv_proj = _fp8_linear_fake_quant(self.wkv, hidden_states, "attn.wkv")
+        else:
+            q_residual = self.q_norm(self.wq_a(hidden_states))
+            q_proj = self.wq_b(q_residual)
+            kv_proj = self.wkv(hidden_states)
+        q = q_proj.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        kv = self.kv_norm(kv_proj).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
 
         # Per-head, non-learnable rsqrt on Q before RoPE (matches reference
         # ``dsv4flash/inference/model.py:498``; missing from HF PR 45616).
@@ -1104,6 +1318,12 @@ class DeepseekV4Attention(nn.Module):
 
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = _apply_partial_rope(kv, cos, sin, self.rope_head_dim)
+        if self.fp8_ds_mla_fake_quant_kv:
+            kv = _fp8_ds_mla_fake_quant_kv_ste(
+                kv,
+                self.rope_head_dim,
+                debug_tag=f"layer={self.layer_idx},kind=kv",
+            )
 
         full_kv = kv
         n_pooled = 0
@@ -1132,6 +1352,12 @@ class DeepseekV4Attention(nn.Module):
                     self.training and attention_mask is not None and self.compress_ratio == 128
                 ),
             )
+            if self.fp8_ds_mla_fake_quant_kv:
+                pooled = _fp8_ds_mla_fake_quant_kv_ste(
+                    pooled,
+                    self.rope_head_dim,
+                    debug_tag=f"layer={self.layer_idx},kind=pooled",
+                )
             n_pooled = pooled.shape[2]
             full_kv = torch.cat([full_kv, pooled], dim=2)
 
@@ -1210,9 +1436,17 @@ class DeepseekV4Attention(nn.Module):
         # Inverse RoPE on the attention output (same (cos, -sin) conjugate pattern
         # HF uses).  Reference: modular_deepseek_v4.py:607.
         attn_output = _apply_partial_rope(attn_output.transpose(1, 2), cos, -sin, self.rope_head_dim).transpose(1, 2)
+        if self.fp8_ds_mla_fake_quant_o_proj:
+            attn_output = _fp8_ds_mla_fake_quant_o_proj_ste(
+                attn_output,
+                debug_tag=f"layer={self.layer_idx},kind=o_proj",
+            )
 
         grouped = attn_output.reshape(batch, seq_len, -1).view(batch, seq_len, self.config.o_groups, -1)
-        return self.wo_b(self.wo_a(grouped).flatten(2)), attn_weights
+        z = self.wo_a(grouped).flatten(2)
+        if self.fp8_ds_mla_fake_quant_attn_proj:
+            return _fp8_linear_fake_quant(self.wo_b, z, "attn.wo_b"), attn_weights
+        return self.wo_b(z), attn_weights
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         for linear in (self.wq_a, self.wq_b, self.wkv, self.wo_b, self.wo_a):

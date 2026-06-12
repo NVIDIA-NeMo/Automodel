@@ -29,6 +29,8 @@ from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
     GroupedExpertsTE,
+    _fp8_activation_fake_quant_ste,
+    _fp8_weight_fake_quant_ste,
     is_gated_activation,
 )
 from nemo_automodel.components.moe.experts import (
@@ -62,6 +64,7 @@ class MLP(nn.Module):
         activation: str = "swiglu",
         bias: bool = False,
         swiglu_limit: float = 0.0,
+        fp8_fake_quant: bool = False,
     ):
         """
         Initializes the MLP layer.
@@ -84,6 +87,7 @@ class MLP(nn.Module):
         self.activation = activation
         self.is_gated = is_gated_activation(activation)
         self.swiglu_limit = float(swiglu_limit)
+        self.fp8_fake_quant = fp8_fake_quant
 
         self.up_proj = initialize_linear_module(
             linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
@@ -99,6 +103,26 @@ class MLP(nn.Module):
             linear_impl=backend, in_features=inter_dim, out_features=dim, bias=bias, dtype=dtype
         )
 
+    def _linear(self, linear: nn.Module, x: torch.Tensor, debug_prefix: str) -> torch.Tensor:
+        """Apply a linear layer, optionally injecting vLLM-matching FP8 fake quant.
+
+        Shared experts ride the same generic block-FP8 path as the routed
+        experts (UE8M0 power-of-two scales under DeepGEMM), so both the
+        per-token activation and the 128x128 weight blocks are fake-quantized.
+        """
+        if not self.fp8_fake_quant:
+            return linear(x)
+
+        x = _fp8_activation_fake_quant_ste(
+            x,
+            debug_tag=f"shared.{debug_prefix}.activation",
+        )
+        weight = _fp8_weight_fake_quant_ste(
+            linear.weight,
+            debug_tag=f"shared.{debug_prefix}.weight",
+        )
+        return F.linear(x, weight, linear.bias)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for the MLP layer.
@@ -110,15 +134,18 @@ class MLP(nn.Module):
             torch.Tensor: Output tensor after MLP computation.
         """
         if not self.is_gated:
-            return self.down_proj(F.relu(self.up_proj(x)).pow(2))
+            up = F.relu(self._linear(self.up_proj, x, "up")).pow(2)
+            return self._linear(self.down_proj, up, "down")
         if self.swiglu_limit > 0.0:
             # Mirror DSV4 reference Expert.forward: fp32 SwiGLU with one-sided
             # gate clamp and symmetric up clamp; cast back before down_proj.
             dtype = x.dtype
-            gate = self.gate_proj(x).float().clamp(max=self.swiglu_limit)
-            up = self.up_proj(x).float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-            return self.down_proj((F.silu(gate) * up).to(dtype))
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+            gate = self._linear(self.gate_proj, x, "gate").float().clamp(max=self.swiglu_limit)
+            up = self._linear(self.up_proj, x, "up").float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            activated = (F.silu(gate) * up).to(dtype)
+            return self._linear(self.down_proj, activated, "down")
+        activated = F.silu(self._linear(self.gate_proj, x, "gate")) * self._linear(self.up_proj, x, "up")
+        return self._linear(self.down_proj, activated, "down")
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
@@ -665,6 +692,7 @@ class MoE(nn.Module):
                 activation=config.shared_expert_activation,
                 bias=config.expert_bias,
                 swiglu_limit=config.swiglu_limit,
+                fp8_fake_quant=config.fp8_fake_quant_moe,
             )
             if config.shared_expert_gate:
                 self.shared_expert_gate = initialize_linear_module(backend.linear, config.dim, 1, False)

@@ -43,6 +43,7 @@ Compress-ratio sliding-window attention is not yet implemented.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,6 +60,7 @@ from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFChe
 from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4.config import (
     DeepseekV4Config,
+    deepseek_v4_compress_rope_scaling,
     deepseek_v4_is_hash_routing_layer,
 )
 from nemo_automodel.components.models.deepseek_v4.layers import (
@@ -346,10 +348,35 @@ class DeepseekV4Model(nn.Module):
             # V4 Flash routed experts use clamped SwiGLU (gate.max=limit,
             # up.±limit) in FP32 — see reference model.py Expert.forward.
             swiglu_limit=float(getattr(config, "swiglu_limit", 0.0) or 0.0),
+            fp8_fake_quant_moe=bool(getattr(config, "fp8_ds_mla_fake_quant_moe", False)),
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
+        # An externally-supplied moe_config (e.g. the EP path in NeMo-RL) bypasses
+        # moe_defaults above, which would drop the fp8 MoE fake-quant flag. Re-
+        # propagate it from the model config so the experts always see it.
+        if getattr(config, "fp8_ds_mla_fake_quant_moe", False) and hasattr(self.moe_config, "fp8_fake_quant_moe"):
+            self.moe_config.fp8_fake_quant_moe = True
+
+        # Diagnostic (env-gated, rank 0): confirm the fake-quant flags actually
+        # reached the model config. Enable with NEMO_AUTOMODEL_DSV4_FAKE_QUANT_DEBUG=1.
+        if os.environ.get("NEMO_AUTOMODEL_DSV4_FAKE_QUANT_DEBUG", "0").lower() not in ("", "0", "false", "no", "off"):
+            _rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 0
+            )
+            if _rank == 0:
+                print(
+                    "[DSV4 fake_quant flags]"
+                    f" kv={getattr(config, 'fp8_ds_mla_fake_quant_kv', None)}"
+                    f" o_proj={getattr(config, 'fp8_ds_mla_fake_quant_o_proj', None)}"
+                    f" attn_proj={getattr(config, 'fp8_ds_mla_fake_quant_attn_proj', None)}"
+                    f" moe(config)={getattr(config, 'fp8_ds_mla_fake_quant_moe', None)}"
+                    f" moe(moe_config)={getattr(self.moe_config, 'fp8_fake_quant_moe', None)}",
+                    flush=True,
+                )
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
@@ -387,19 +414,23 @@ class DeepseekV4Model(nn.Module):
         # to the compress-rope path: when compress_ratio>0 it uses
         # ``original_seq_len=args.original_seq_len`` and theta=compress_rope_theta;
         # otherwise ``original_seq_len=0`` (YaRN disabled) and theta=rope_theta.
-        rope_scaling = getattr(config, "rope_scaling", None)
         self.rotary_emb = DeepseekV4RotaryEmbedding(
             rope_theta=float(config.rope_theta),
             head_dim=int(config.head_dim),
             partial_rotary_factor=partial_rotary_factor,
             rope_scaling=None,
         )
-        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        # TF 5.8.1 nests YaRN under ``rope_parameters["compress"]`` (and renames
+        # the ``type`` key to ``rope_type``); the helper normalizes both the
+        # native and the legacy flat ``rope_scaling`` shapes. Reading the raw
+        # ``config.rope_scaling`` here would silently disable YaRN on the
+        # compress path under transformers 5.8.1.
+        compress_rope_scaling = deepseek_v4_compress_rope_scaling(config) or {}
         self.rotary_emb_compress = DeepseekV4RotaryEmbedding(
             rope_theta=float(getattr(config, "compress_rope_theta", 160000.0) or 160000.0),
             head_dim=int(config.head_dim),
             partial_rotary_factor=partial_rotary_factor,
-            rope_scaling=rope_scaling,
+            rope_scaling=compress_rope_scaling,
         )
 
     def forward(
@@ -606,6 +637,47 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         **kwargs,
     ):
         super().__init__()
+        # The fp8 fake-quant flags come from NeMo-RL's hf_config_overrides. When
+        # the resolved config class does not define these fields (e.g. a
+        # transformers-native DeepseekV4Config registered ahead of Automodel's
+        # AutoConfig.register), HF's from_dict / _consume_config_overrides filter
+        # them out of `config` (their `hasattr` / `k in config_keys` checks fail)
+        # and instead forward them here as **kwargs. Re-apply them onto `config`
+        # so the attention and MoE submodules see them via getattr.
+        _applied_fp8_flags = []
+        for _flag, _env in (
+            ("fp8_ds_mla_fake_quant_kv", "NRL_DSV4_FP8_FAKE_QUANT_KV"),
+            ("fp8_ds_mla_fake_quant_o_proj", "NRL_DSV4_FP8_FAKE_QUANT_O_PROJ"),
+            ("fp8_ds_mla_fake_quant_moe", "NRL_DSV4_FP8_FAKE_QUANT_MOE"),
+            ("fp8_ds_mla_fake_quant_attn_proj", "NRL_DSV4_FP8_FAKE_QUANT_ATTN_PROJ"),
+            # Dedicated indexer-wq_b knob for ablation; when unset the indexer
+            # falls back to the attn_proj flag (see DeepseekV4Indexer.__init__).
+            ("fp8_ds_mla_fake_quant_indexer", "NRL_DSV4_FP8_FAKE_QUANT_INDEXER"),
+        ):
+            _env_val = os.environ.get(_env)
+            if _env_val is not None and _env_val != "":
+                # Env override TAKES PRECEDENCE over the yaml/kwargs value and
+                # accepts on/off — enables clean per-component ablation in a
+                # single run without editing the yaml, independent of the
+                # config-class plumbing.
+                _on = _env_val.lower() in ("1", "true", "yes", "on")
+                setattr(config, _flag, _on)
+                kwargs.pop(_flag, None)
+                _applied_fp8_flags.append(f"{_flag}={_on}(env)")
+            elif _flag in kwargs:
+                setattr(config, _flag, kwargs.pop(_flag))
+                _applied_fp8_flags.append(_flag)
+        if os.environ.get("NEMO_AUTOMODEL_DSV4_FAKE_QUANT_DEBUG", "0").lower() not in ("", "0", "false", "no", "off"):
+            _rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 0
+            )
+            if _rank == 0:
+                print(
+                    f"[DSV4 fake_quant flags] applied from kwargs onto config: {_applied_fp8_flags}",
+                    flush=True,
+                )
         self.config = config
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)

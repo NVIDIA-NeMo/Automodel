@@ -48,6 +48,32 @@ def deepseek_v4_is_hash_routing_layer(config, layer_idx: int) -> bool:
     return layer_idx in deepseek_v4_hash_layer_indices(config)
 
 
+def deepseek_v4_compress_rope_scaling(config) -> dict | None:
+    """Return the flat YaRN dict for the compress/long-range rope path.
+
+    Transformers-native DeepSeek V4 configs nest rope settings under
+    ``rope_parameters = {"main": {...}, "compress": {...}}`` and rename the YaRN
+    ``type`` key to ``rope_type``; ``config.rope_scaling`` is only a
+    backward-compat property aliasing the nested ``rope_parameters``.  Older
+    Automodel configs express the same thing as a flat ``rope_scaling`` dict.
+    Normalize both to the flat ``{"type": "yarn", ...}`` shape consumed by
+    ``DeepseekV4RotaryEmbedding``; return ``None`` when no scaling applies.
+    """
+    rope_parameters = _config_get(config, "rope_parameters")
+    if isinstance(rope_parameters, dict):
+        compress = rope_parameters.get("compress")
+        if isinstance(compress, dict):
+            compress = dict(compress)
+            compress.setdefault("type", compress.get("rope_type"))
+            return compress
+    # Legacy Automodel config.py path: flat rope_scaling. Guard against the
+    # native BC property leaking the nested {main, compress} shape through.
+    rope_scaling = _config_get(config, "rope_scaling")
+    if isinstance(rope_scaling, dict) and not {"main", "compress"} & rope_scaling.keys():
+        return rope_scaling
+    return None
+
+
 class DeepseekV4Config(PretrainedConfig):
     """Configuration class for DeepSeek V4.
 
@@ -112,6 +138,16 @@ class DeepseekV4Config(PretrainedConfig):
         index_topk: int = 512,
         # Multi-token prediction layers appended after the main layers
         num_nextn_predict_layers: int = 1,
+        # Training-only numerical alignment with vLLM's DeepSeek V4 fp8 paths.
+        # KV/O-proj use the hardcoded ue8m0 fp8_ds_mla format; the attention
+        # input/output linear projections use the generic block FP8 path, which
+        # under DeepGEMM (VLLM_USE_DEEP_GEMM_E8M0 on; DSV4 scale_fmt=ue8m0
+        # auto-enables it) also uses UE8M0 power-of-two scales. All default
+        # off so the flags are opt-in via the model config.
+        fp8_ds_mla_fake_quant_kv: bool = False,
+        fp8_ds_mla_fake_quant_o_proj: bool = False,
+        fp8_ds_mla_fake_quant_moe: bool = False,
+        fp8_ds_mla_fake_quant_attn_proj: bool = False,
         # Standard options
         rms_norm_eps: float = 1e-6,
         attention_bias: bool = False,
@@ -164,6 +200,10 @@ class DeepseekV4Config(PretrainedConfig):
         self.index_n_heads = index_n_heads
         self.index_topk = index_topk
         self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.fp8_ds_mla_fake_quant_kv = fp8_ds_mla_fake_quant_kv
+        self.fp8_ds_mla_fake_quant_o_proj = fp8_ds_mla_fake_quant_o_proj
+        self.fp8_ds_mla_fake_quant_moe = fp8_ds_mla_fake_quant_moe
+        self.fp8_ds_mla_fake_quant_attn_proj = fp8_ds_mla_fake_quant_attn_proj
         self.rms_norm_eps = rms_norm_eps
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
