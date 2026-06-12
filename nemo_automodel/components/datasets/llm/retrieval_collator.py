@@ -322,27 +322,3 @@ def make_vision_collator_from_processor_method(tokenizer: ProcessorMixin, collat
         A collator for vision/multimodal retrieval datasets.
     """
     return getattr(tokenizer, collator_fn_name)
-
-
-# Deprecated: To be replaced by make_vision_collator_from_processor_method()
-def make_vision_retrieval_collator_from_processor_path(model_name_or_path: str, **kwargs):
-    """ "
-    Make a vision retrieval collator from a processor.
-
-    Args:
-        model_name_or_path: The name or path of the model to use, where the processor is defined.
-        **kwargs: Additional arguments to pass to the processor.
-
-    Returns:
-        A collator for vision/multimodal retrieval datasets.
-    """
-    if "tokenizer" in kwargs:
-        del kwargs["tokenizer"]
-    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
-    if config.model_type in MODELS_WITH_PROCESSOR:
-        processor = MODELS_WITH_PROCESSOR[config.model_type].from_pretrained(
-            model_name_or_path, trust_remote_code=True, **kwargs
-        )
-    else:
-        processor = AutoProcessor.from_pretrained(model_name_or_path, trust_remote_code=True, **kwargs)
-    return processor.process_queries_documents_biencoder
