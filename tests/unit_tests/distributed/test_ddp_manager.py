@@ -21,10 +21,11 @@ from nemo_automodel.components.distributed.config import DDPConfig
 
 
 def test_ddp_manager_forwards_ddp_constructor_flags(monkeypatch):
-    monkeypatch.setattr(ddp_mod.dist, "is_available", lambda: True, raising=True)
-    monkeypatch.setattr(ddp_mod.dist, "is_initialized", lambda: True, raising=True)
-    monkeypatch.setattr(ddp_mod.dist, "get_rank", lambda: 0, raising=True)
-    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda: 2, raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "is_available", MagicMock(return_value=True), raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "is_initialized", MagicMock(return_value=True), raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "get_rank", MagicMock(return_value=0), raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "get_world_size", MagicMock(return_value=2), raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "get_backend", MagicMock(return_value="gloo"), raising=True)
 
     ddp_ctor = MagicMock(return_value="wrapped")
     monkeypatch.setattr(ddp_mod, "DDP", ddp_ctor, raising=True)
