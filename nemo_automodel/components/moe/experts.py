@@ -1289,6 +1289,11 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
         else:
             return tensor
 
+    # mxfp4-resident experts hold packed base weights (no gate_and_up_projs /
+    # down_projs); those are filled from the checkpoint, nothing to init here.
+    if getattr(module, "_mxfp4_resident", False):
+        return
+
     with torch.device(buffer_device):
         if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP)):
             to_local(module.gate_and_up_projs).normal_(mean=0.0, std=init_std)
