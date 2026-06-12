@@ -141,7 +141,7 @@ navigation:
           - page: "Jais"
             path: ../../model-coverage/llm/inceptionai/jais.mdx
           - page: "MiniMax-M2"
-            path: ../../model-coverage/llm/minimax/minimax-m2.mdx
+            path: ../../model-coverage/llm/minimax/minimax-m2.md
           - page: "MiniCPM"
             path: ../../model-coverage/llm/openbmb/minicpm.mdx
           - page: "Moonlight"
