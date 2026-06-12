@@ -14,7 +14,7 @@ navigation:
         path: ../../about/key-features.mdx
         slug: key-features
       - page: "Install NeMo AutoModel"
-        path: ../../guides/installation.md
+        path: ../../guides/installation.mdx
         slug: installation
       - page: "YAML Configuration"
         path: ../../guides/configuration.mdx
