@@ -38,6 +38,7 @@ NeMo AutoModel supports [AutoModelForImageTextToText](https://huggingface.co/doc
 | LLaVA | [LLaVA](llava-hf/llava.md) | `LlavaForConditionalGeneration`, `LlavaNextForConditionalGeneration`, `LlavaNextVideoForConditionalGeneration`, `LlavaOnevisionForConditionalGeneration` |
 | lmms-lab | [LLaVA-OneVision 1.5](lmms-lab/llava-onevision.md) | `LlavaOneVisionForConditionalGeneration` |
 | Stepfun AI | [Step-3.7-Flash](stepfun-ai/step-3-7.md) | 198B-A13B MoE VLM |
+| MiniMaxAI | [MiniMax-M3](minimax/minimax-m3.md) |  428B-A22B MoE VLM |
 
 ## Fine-Tuning
 
@@ -66,4 +67,5 @@ huggingface/smolvlm
 llava-hf/llava
 lmms-lab/llava-onevision
 stepfun-ai/step-3-7
+minimax/minimax-m3
 ```

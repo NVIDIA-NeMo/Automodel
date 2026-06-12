@@ -6,6 +6,7 @@ See the [Model Coverage Overview](overview.md) for release summaries, and the [L
 
 | Date | Model | HF Model ID | Modality | Recipe | Try on Brev |
 |------|-------|-------------|----------|--------|------|
+| 2026-06-12 | MiniMax-M3 | [`MiniMaxAI/MiniMax-M3`](https://huggingface.co/MiniMaxAI/MiniMax-M3) | VLM | Documentation only | 🚧 |
 | 2026-06-04 | Nemotron-3 Ultra-550B-A55B | [`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16) | LLM | [nemotron_ultra_v3_hellaswag_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml) | 🚧 |
 | 2026-06-03 | Gemma 4 12B | [`google/gemma-4-12B`](https://huggingface.co/google/gemma-4-12B) | LLM | [gemma_4_12b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml) | 🚧 |
 | 2026-05-27 | Step-3.7-Flash | [`stepfun-ai/Step-3.7-Flash`](https://huggingface.co/stepfun-ai/Step-3.7-Flash) | VLM | Documentation only | 🚧 |
