@@ -133,6 +133,34 @@ class MXFP4ExpertStorageMixin:
         scales = _to_local(getattr(self, name + "_scales"))[0]
         return dequantize_mxfp4(packed, scales, dtype).transpose(-2, -1)
 
+    @torch.no_grad()
+    def _init_packed_placeholders(self) -> None:
+        """Register meta packed storage params from config shapes (no bf16 weights).
+
+        Used by the passthrough load flow (both frozen ``GroupedExpertsMXFP4`` and
+        LoRA-targeted ``GroupedExpertsLoRAMXFP4``): the module is built packed-at-init
+        so a packed fp4 checkpoint loads straight in with no bf16 materialization.
+        """
+        cfg = self.config
+        block = MXFP4_BLOCK_SIZE
+        up_proj_dim = cfg.moe_inter_dim * 2 if self.is_gated else cfg.moe_inter_dim
+        expert_dim = cfg.expert_dim
+        moe_inter = cfg.moe_inter_dim
+        e = self.n_routed_experts
+        assert expert_dim % block == 0 and moe_inter % block == 0, (
+            f"expert dims must be divisible by {block} for mxfp4 (expert_dim={expert_dim}, moe_inter={moe_inter})"
+        )
+        # Checkpoint orientation [E, out, in], packed along the contraction (in) dim.
+        shapes = {
+            "gate_and_up_projs": ((e, up_proj_dim, expert_dim // 2), (e, up_proj_dim, expert_dim // block)),
+            "down_projs": ((e, expert_dim, moe_inter // 2), (e, expert_dim, moe_inter // block)),
+        }
+        for name, (packed_shape, scale_shape) in shapes.items():
+            packed = torch.empty(packed_shape, dtype=torch.int8, device="meta")
+            scales = torch.empty(scale_shape, dtype=torch.float8_e8m0fnu, device="meta")
+            self.register_packed_base_weight(name, (packed, scales))
+        self._mxfp4_resident = True
+
 
 class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, GroupedExperts):
     """Frozen routed experts with mxfp4-resident base weights and no adapter.
@@ -178,29 +206,6 @@ class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, GroupedExperts):
         self.gate_and_up_projs.requires_grad_(False)
         self.down_projs.requires_grad_(False)
         self._init_mxfp4_storage()
-
-    @torch.no_grad()
-    def _init_packed_placeholders(self) -> None:
-        """Register meta packed storage params from config shapes (no bf16 weights)."""
-        cfg = self.config
-        block = MXFP4_BLOCK_SIZE
-        up_proj_dim = cfg.moe_inter_dim * 2 if self.is_gated else cfg.moe_inter_dim
-        expert_dim = cfg.expert_dim
-        moe_inter = cfg.moe_inter_dim
-        e = self.n_routed_experts
-        assert expert_dim % block == 0 and moe_inter % block == 0, (
-            f"expert dims must be divisible by {block} for mxfp4 (expert_dim={expert_dim}, moe_inter={moe_inter})"
-        )
-        # Checkpoint orientation [E, out, in], packed along the contraction (in) dim.
-        shapes = {
-            "gate_and_up_projs": ((e, up_proj_dim, expert_dim // 2), (e, up_proj_dim, expert_dim // block)),
-            "down_projs": ((e, expert_dim, moe_inter // 2), (e, expert_dim, moe_inter // block)),
-        }
-        for name, (packed_shape, scale_shape) in shapes.items():
-            packed = torch.empty(packed_shape, dtype=torch.int8, device="meta")
-            scales = torch.empty(scale_shape, dtype=torch.float8_e8m0fnu, device="meta")
-            self.register_packed_base_weight(name, (packed, scales))
-        self._mxfp4_resident = True
 
     def forward(
         self,

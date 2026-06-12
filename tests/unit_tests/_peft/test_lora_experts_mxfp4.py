@@ -311,6 +311,26 @@ def test_passthrough_init_registers_packed_params_on_meta(moe_config):
     assert [n for n, p in mx.named_parameters() if p.requires_grad] == []
 
 
+def test_lora_passthrough_init_packed_base_with_trainable_adapters(moe_config):
+    """LoRA-on-experts passthrough: packed-at-init base (no bf16) + trainable LoRA
+    adapters. This is the path a packed fp4 checkpoint loads into when experts are
+    LoRA-targeted (previously size-mismatched against the packed checkpoint keys)."""
+    # Mirror the real flow (infra wraps PEFT swap in init_empty_weights/meta) so
+    # the GroupedExpertsLoRA base-weight copy is a meta->meta no-op.
+    with torch.device("meta"):
+        orig = GroupedExperts(moe_config)
+        orig.use_torch_mm = True
+        mx = GroupedExpertsLoRAMXFP4(orig, lora_dim=8, alpha=16, passthrough=True)
+
+    assert mx._mxfp4_resident
+    assert not hasattr(mx, "gate_and_up_projs")  # base is packed, never bf16
+    assert mx.gate_and_up_projs_packed.dtype == torch.int8
+    assert mx.gate_and_up_projs_packed.is_meta
+    # Only the LoRA adapters are trainable; packed base is frozen.
+    trainable = {n for n, p in mx.named_parameters() if p.requires_grad}
+    assert trainable == {"lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"}
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_convert_frozen_experts_to_mxfp4(moe_config, device):
     import torch.nn as nn

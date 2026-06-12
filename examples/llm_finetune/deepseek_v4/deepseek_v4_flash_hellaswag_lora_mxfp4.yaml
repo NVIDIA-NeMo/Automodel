@@ -86,6 +86,10 @@ peft:
     - "*wq_b"
     - "*wkv"
     - "*wo_b"
+    - "*mlp.experts"               # routed experts: mxfp4-resident base + LoRA (GroupedExpertsLoRAMXFP4)
+    - "*shared_experts.gate_proj"  # shared experts: standard bf16 LoRA
+    - "*shared_experts.up_proj"
+    - "*shared_experts.down_proj"
   dim: 8
   alpha: 32
   use_triton: True
