@@ -94,7 +94,7 @@ def is_gated_activation(activation: str) -> bool:
     Non-gated activations (ReLU²) only use up_proj, requiring up_projs tensor
     with shape [n_experts, dim, inter_dim] - 50% memory savings.
     """
-    return activation in ("swiglu", "quick_geglu", "geglu")
+    return activation in ("swiglu", "swigluoai", "quick_geglu", "geglu")
 
 
 def _permute_tokens_for_grouped_mm(
@@ -556,6 +556,29 @@ def quick_geglu_deepep(
 
 
 @torch.compile(fullgraph=True, options={"max_autotune": True})
+def swiglu_oai_deepep(x, permuted_probs, alpha: float = 1.702, limit: float = 7.0):
+    """SwiGLU-OAI (GPT-OSS / MiniMax-M3) activation for grouped experts.
+
+    Computes ``gate * sigmoid(alpha * gate) * (up + 1)`` in fp32 with gate
+    clamped ``max=limit`` and up clamped ``+/-limit`` (when ``limit > 0``).
+
+    Unlike :func:`quick_geglu_deepep` (which expects an *interleaved* gate/up
+    layout, ``x[..., ::2]`` / ``x[..., 1::2]``), this reads the *concatenated*
+    ``[gate | up]`` layout produced by ``MoESplitExpertsStateDictMixin``
+    (``torch.cat([gate_t, up_t], dim=-1)``), matching sglang's
+    ``swiglu_no_interleaved_with_alpha_and_limit``.
+    """
+    gate, up = torch.chunk(x, 2, dim=-1)
+    gate = gate.float()
+    up = up.float()
+    if limit > 0.0:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+    inter = gate * torch.sigmoid(alpha * gate) * (up + 1.0)
+    return (inter * permuted_probs).to(x.dtype)
+
+
+@torch.compile(fullgraph=True, options={"max_autotune": True})
 def relu2_deepep(x, permuted_probs):
     """ReLU² activation for DeepEP: relu(x)^2
 
@@ -599,6 +622,12 @@ def get_expert_activation_for_deepep(config: MoEConfig):
         if getattr(config, "swiglu_limit", 0.0) > 0.0:
             return partial(swiglu_clamped_deepep, limit=config.swiglu_limit)
         return weighted_bias_swiglu_impl
+    elif config.expert_activation == "swigluoai":
+        return partial(
+            swiglu_oai_deepep,
+            alpha=config.activation_alpha,
+            limit=config.activation_limit,
+        )
     elif config.expert_activation == "quick_geglu":
         return partial(
             quick_geglu_deepep,

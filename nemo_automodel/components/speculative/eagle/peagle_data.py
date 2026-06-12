@@ -48,8 +48,10 @@ def generate_cod_sample_indices(
         num_depths: Number of parallel prediction depths ``K``.
         down_sample_ratio: Geometric decay ratio ``r in (0, 1]``.
         down_sample_ratio_min: Minimum retention ratio floor.
-        filter_position_zero: Drop position 0 from the deeper-depth candidate pool
-            (it has no preceding token to predict).
+        filter_position_zero: Drop position 0 from every depth>=1 candidate pool
+            (it has no preceding token to predict, so its chain-start anchor
+            would be negative). Keep True unless the caller guarantees
+            ``loss_mask[0] == 0``.
 
     Returns:
         Tuple of:
@@ -66,6 +68,16 @@ def generate_cod_sample_indices(
     sample_indices = [torch.arange(seq_length, device=device)]
     n_per_depth = [seq_length]
     prev_indices = all_valid_indices
+    if filter_position_zero:
+        # Position 0 has no preceding token, so it cannot be a meaningful
+        # depth>=1 reference: its chain start ``anchor_pos = sampled_idx - d``
+        # would be negative. The deeper-depth pool already drops it below (the
+        # ``next_candidates`` filter), but the initial depth-1 pool is seeded
+        # straight from ``all_valid_indices`` -- so without this a supervised
+        # position 0 (``loss_mask[0] == 1``) leaks ``anchor_pos == -1`` into the
+        # output, and the mask later indexes ``document_ids[-1]`` via Python's
+        # negative wraparound, silently breaking cross-document isolation.
+        prev_indices = prev_indices[prev_indices != 0]
 
     for d in range(1, num_depths):
         valid_length = max(0, all_valid_indices.shape[0] - d)
