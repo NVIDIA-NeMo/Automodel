@@ -16,7 +16,7 @@ import hashlib
 from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 import torch
-from transformers import AutoConfig, AutoProcessor, DataCollatorWithPadding, PreTrainedTokenizerBase, ProcessorMixin
+from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.file_utils import PaddingStrategy
 
 from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
