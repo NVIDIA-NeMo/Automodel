@@ -204,7 +204,7 @@ navigation:
             path: ../../model-coverage/vlm/llava-hf/llava.mdx
           - page: "Step-3.7-Flash"
             path: ../../model-coverage/vlm/stepfun-ai/step-3-7.md
-      - section: "Multimodal Models"
+      - section: "Multimodal"
         slug: multimodal
         contents:
           - page: "Overview"
@@ -212,7 +212,7 @@ navigation:
             slug: overview
           - page: "BAGEL"
             path: ../../model-coverage/multimodal/bytedance-seed/bagel.mdx
-      - section: "Diffusion Language Models (dLLMs)"
+      - section: "Diffusion Language Models"
         slug: dllm
         contents:
           - page: "Overview"
@@ -220,7 +220,7 @@ navigation:
             slug: overview
           - page: "DiffusionGemma"
             path: ../../model-coverage/dllm/google/diffusiongemma.mdx
-      - section: "Omni Models"
+      - section: "Omni"
         slug: omni
         contents:
           - page: "Overview"
@@ -234,7 +234,7 @@ navigation:
             path: ../../model-coverage/omni/microsoft/phi4-multimodal.mdx
           - page: "Nemotron-Omni"
             path: ../../model-coverage/omni/nvidia/nemotron-omni.mdx
-      - section: "Diffusion Models"
+      - section: "Diffusion"
         slug: diffusion
         contents:
           - page: "Overview"
