@@ -758,14 +758,43 @@ class MagiState:
         """Undispatch logits to the global sequence on the HF dispatch path; else identity."""
         return magi_undispatch_logits(logits, self.cp_group) if self.hf_dispatch else logits
 
-    def prepare_llm_batch(
+    def should_use_fused_linear_ce(self, loss_fn) -> bool:
+        """Whether the step may take the fused-linear-CE (``logits_to_keep=1``) path.
+
+        Disallowed on the HF dispatch path, which needs the full logits to undispatch
+        them to the global sequence before the loss. Unaffected when magi is off, so
+        recipes can gate on this unconditionally.
+        """
+        from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+        return isinstance(loss_fn, FusedLinearCrossEntropy) and not self.hf_dispatch
+
+    def loss_hidden_states(self, model_output):
+        """Hidden states to pass to the loss: ``None`` on the HF dispatch path (the loss
+        uses the undispatched logits), else the model's final hidden states."""
+        if self.hf_dispatch:
+            return None
+        from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+
+        return get_final_hidden_states(model_output)
+
+    def prepare_llm_batch(self, model, batch, *, device_mesh, is_thd, pad_id, num_chunks, default):
+        """Per-step batch prep for the LLM recipe.
+
+        When magi is disabled, delegates to ``default()`` (the recipe's normal
+        ``make_cp_batch_and_ctx`` path) so recipes can call this unconditionally; when
+        enabled, builds magi's own CP/packed layout. Returns ``(train_ctx, batch)`` —
+        magi does its own CP, so ``train_ctx`` is always ``nullcontext``.
+        """
+        if not self.enabled:
+            return default()
+        return self._prepare_llm_batch_magi(
+            model, batch, device_mesh=device_mesh, is_thd=is_thd, pad_id=pad_id, num_chunks=num_chunks
+        )
+
+    def _prepare_llm_batch_magi(
         self, model, batch, *, device_mesh, is_thd, pad_id, num_chunks
     ):  # pragma: no cover - requires GPU + magi_attention
-        """Per-step batch prep for the LLM recipe (assumes ``enabled``).
-
-        Returns ``(train_ctx, batch)``. magi does its own CP, so ``train_ctx`` is
-        always ``nullcontext`` (no torch-native DTensor CP context).
-        """
         if self.hf_dispatch:
             # HF path: dispatch the (single causal) sequence across the CP group.
             batch, _ = magi_prepare_batch(model, batch, self.cp_group)
@@ -782,13 +811,16 @@ class MagiState:
             )
         return nullcontext, batch
 
-    def prepare_vlm_batch(self, model, batch):
-        """Per-step batch prep for the VLM recipe (assumes ``enabled``).
+    def prepare_vlm_batch(self, model, batch, *, default):
+        """Per-step batch prep for the VLM recipe.
 
-        HF VLMs stamp the cp_group on the language-backbone attention; custom VLMs
-        use the factory attn_func with the active cp_group set in :func:`setup_magi`
-        (the vision tower stays on SDPA either way). Returns ``(train_ctx, batch)``.
+        When magi is disabled, delegates to ``default()``. When enabled, HF VLMs stamp
+        the cp_group on the language-backbone attention; custom VLMs use the factory
+        attn_func with the active cp_group set in :func:`setup_magi` (the vision tower
+        stays on SDPA either way). Returns ``(train_ctx, batch)``.
         """
+        if not self.enabled:
+            return default()
         if not self.custom:
             batch, _ = magi_prepare_vlm(model, batch, self.cp_group)
         return nullcontext, batch
