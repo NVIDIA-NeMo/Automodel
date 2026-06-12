@@ -100,5 +100,5 @@ srun \
 The recipe was validated with LoRA PEFT on HellaSwag on a 4 × GB200 (16-GPU) allocation, using the hybrid Mamba-2 / MoE Ultra backbone with MTP and Transformer Engine kernels. Training loss decreased steadily over the run (≈2.67 → ≈1.6), confirming healthy convergence end-to-end through model load, THD-packed data, FSDP2 + expert parallelism, and safetensors checkpointing.
 
 <p align="center">
-  <img src="nemotron_ultra_loss.png" alt="Nemotron-3 Ultra Training Loss Curve" width="600">
+  <img src="nemotron_ultra_loss.png" alt="Nemotron-3 Ultra Training Loss Curve" width="600" />
 </p>
