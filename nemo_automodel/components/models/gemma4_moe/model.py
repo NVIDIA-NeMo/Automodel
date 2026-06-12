@@ -1061,7 +1061,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             "mm_token_type_ids": mm_token_type_ids
             if mm_token_type_ids is not None
             else special_image_mask.to(torch.long),
-            "_cp_manual_allgather": True,
+            "_cp_manual": True,
             "_gemma4_vision_group_ids": gemma4_vision_group_ids(
                 mm_token_type_ids if mm_token_type_ids is not None else special_image_mask.to(torch.long)
             ),

@@ -27,6 +27,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel.components.distributed import cp_manual as cm
 from nemo_automodel.components.distributed import cp_utils as cu
 
 
@@ -101,13 +102,13 @@ def test_cp_attention_hooks_cp_size_one_passthrough():
     assert F.scaled_dot_product_attention is not None
 
 
-def test_cp_attention_hooks_manual_allgather_path():
+def test_cp_attention_hooks_manual_path():
     attn = _Attn()
     calls = {}
 
     def manual(self, query, key, value, *, cp_mesh, attn_mask, dropout_p, is_causal, scale, enable_gqa, kwargs):
         calls["meta"] = self._cp_allgather_metadata
-        calls["active"] = self._cp_manual_allgather_active
+        calls["active"] = self._cp_manual_active
         return torch.zeros_like(query)
 
     attn.run_cp_manual_attention = MethodType(manual, attn)
@@ -120,7 +121,7 @@ def test_cp_attention_hooks_manual_allgather_path():
     assert calls["active"] is True
     assert torch.equal(calls["meta"]["foo"], torch.tensor([1, 2, 3]))
     # post-hook cleared the per-call state
-    assert attn._cp_manual_allgather_active is False
+    assert attn._cp_manual_active is False
     assert attn._cp_allgather_metadata == {}
 
 
@@ -234,17 +235,17 @@ def test_linear_attn_position_hook_caches_position_ids():
 # ---------------------------------------------------------------------------
 def test_pad_tensor_noop_when_pad_len_zero():
     t = torch.randn(2, 4)
-    assert cu._pad_tensor_seq_dim_(t, 1, 0) is t
+    assert cm._pad_tensor_seq_dim_(t, 1, 0) is t
 
 
 def test_pad_position_ids_noop_when_pad_len_zero():
     p = torch.arange(4).unsqueeze(0)
-    assert cu._pad_position_ids_seq_dim_(p, 1, 0) is p
+    assert cm._pad_position_ids_seq_dim_(p, 1, 0) is p
 
 
 def test_pad_position_ids_extends_monotonically():
     p = torch.tensor([[0, 1, 2, 3]])
-    out = cu._pad_position_ids_seq_dim_(p, 1, 2)
+    out = cm._pad_position_ids_seq_dim_(p, 1, 2)
     assert out.tolist() == [[0, 1, 2, 3, 4, 5]]
 
 
@@ -277,10 +278,10 @@ def test_prepare_cp_batch_common_raises_without_labels():
 
 
 # ---------------------------------------------------------------------------
-# _make_manual_allgather_cp_batch: pad branches for every sequence key + extra
+# _make_manual_cp_batch: pad branches for every sequence key + extra
 # metadata, plus the contiguous slice.
 # ---------------------------------------------------------------------------
-def test_make_manual_allgather_pads_and_slices_all_keys():
+def test_make_manual_pads_and_slices_all_keys():
     cp_size = 2
     seq = 6  # pad_len = (-6) % 4 = 2 -> padded to 8, local 4
     d = 8
@@ -297,7 +298,7 @@ def test_make_manual_allgather_pads_and_slices_all_keys():
     position_ids = torch.arange(seq).unsqueeze(0)
     loss_mask = torch.ones(1, seq, dtype=torch.long)
 
-    _ctx, out = cu._make_manual_allgather_cp_batch(
+    _ctx, out = cm._make_manual_cp_batch(
         _FakeMesh(size=cp_size, rank=0),
         batch,
         primary_key="inputs_embeds",
@@ -318,7 +319,7 @@ def test_make_manual_allgather_pads_and_slices_all_keys():
     assert out["_packed_seq_ids"].shape == (1, 4)
 
 
-def test_make_manual_allgather_uses_dist_rank_when_initialized():
+def test_make_manual_uses_dist_rank_when_initialized():
     batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
     labels = torch.zeros(1, 4, dtype=torch.long)
     position_ids = torch.arange(4).unsqueeze(0)
@@ -327,7 +328,7 @@ def test_make_manual_allgather_uses_dist_rank_when_initialized():
         mock.patch("torch.distributed.is_initialized", return_value=True),
         mock.patch("torch.distributed.get_rank", return_value=0),
     ):
-        _ctx, out = cu._make_manual_allgather_cp_batch(
+        _ctx, out = cm._make_manual_cp_batch(
             _FakeMesh(size=2, rank=0),
             batch,
             primary_key="input_ids",
@@ -341,15 +342,15 @@ def test_make_manual_allgather_uses_dist_rank_when_initialized():
     assert out["input_ids"].shape == (1, 2)
 
 
-def test_make_manual_allgather_raises_when_not_divisible(monkeypatch):
+def test_make_manual_raises_when_not_divisible(monkeypatch):
     # Force padding to be a no-op so the post-pad divisibility check trips.
-    monkeypatch.setattr(cu, "_pad_tensor_seq_dim_", lambda t, *a, **k: t)
-    monkeypatch.setattr(cu, "_pad_position_ids_seq_dim_", lambda p, *a, **k: p)
+    monkeypatch.setattr(cm, "_pad_tensor_seq_dim_", lambda t, *a, **k: t)
+    monkeypatch.setattr(cm, "_pad_position_ids_seq_dim_", lambda p, *a, **k: p)
     batch = {"input_ids": torch.zeros(1, 6, dtype=torch.long)}
     labels = torch.zeros(1, 6, dtype=torch.long)
     position_ids = torch.arange(6).unsqueeze(0)
     with pytest.raises(ValueError, match="divisible by cp_size"):
-        cu._make_manual_allgather_cp_batch(
+        cm._make_manual_cp_batch(
             _FakeMesh(size=4, rank=0),
             batch,
             primary_key="input_ids",
