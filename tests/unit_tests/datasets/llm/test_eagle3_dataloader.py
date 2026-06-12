@@ -23,6 +23,8 @@ is not re-forked at every epoch boundary. These tests pin both behaviors.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from nemo_automodel.components.datasets.llm import eagle3
 
 
@@ -68,3 +70,29 @@ def test_workers_use_forkserver_when_cuda_available(monkeypatch):
     assert dl.persistent_workers is True
     # forkserver -> workers start clean, without the parent's CUDA context.
     assert dl.multiprocessing_context.get_start_method() == "forkserver"
+
+
+def test_dp_mesh_sampler_keys_on_dp_axis(monkeypatch):
+    """With a dp_mesh, the sampler distributes by dp size/rank so the cp ranks in
+    a dp group pull the identical sample (CP shards its sequence across them),
+    instead of keying on the global world rank."""
+    _patch_dataset(monkeypatch, n=8)
+    monkeypatch.setattr(eagle3.torch.cuda, "is_available", lambda: False)
+    dp_mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: 1)
+    dl = _build(distributed=True, dp_mesh=dp_mesh)
+    assert isinstance(dl.sampler, eagle3.DistributedSampler)
+    # Keyed on the dp sub-axis, not the global world.
+    assert dl.sampler.num_replicas == 2
+    assert dl.sampler.rank == 1
+
+
+def test_dp_mesh_size_one_uses_single_replica(monkeypatch):
+    """dp_size==1 (cp == world) must map to num_replicas=1 -- all data to the one
+    dp group -- not the full-world sampler that would split data across cp ranks."""
+    _patch_dataset(monkeypatch, n=8)
+    monkeypatch.setattr(eagle3.torch.cuda, "is_available", lambda: False)
+    dp_mesh = SimpleNamespace(size=lambda: 1, get_local_rank=lambda: 0)
+    dl = _build(distributed=True, dp_mesh=dp_mesh)
+    assert isinstance(dl.sampler, eagle3.DistributedSampler)
+    assert dl.sampler.num_replicas == 1
+    assert dl.sampler.rank == 0
