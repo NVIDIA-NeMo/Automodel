@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -135,3 +136,18 @@ def test_progress_bar_advances_per_optim_step(monkeypatch):
     assert fake.n == recipe.runtime.global_step == 3
     assert fake.closed
     assert set(fake.postfix) == {"loss", "acc", "lr"}
+
+
+def test_progress_bar_closed_when_loop_raises(monkeypatch):
+    """The bar is closed even when the training loop raises (try/finally)."""
+    fake = _FakeProgressBar()
+    monkeypatch.setattr(TrainDFlashRecipe, "_make_progress_bar", lambda self, **kwargs: fake)
+
+    def _boom(self, **kwargs):
+        raise RuntimeError("boom")
+
+    recipe = _build_recipe(raise_on=set(), num_batches=2, grad_accum=1)
+    monkeypatch.setattr(type(recipe.trainer_module), "forward", _boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        recipe.run_train_validation_loop()
+    assert fake.closed

@@ -223,3 +223,22 @@ def test_progress_bar_advances_per_optim_step(monkeypatch):
     assert fake.n == recipe.runtime.global_step == 2
     assert fake.closed
     assert set(fake.postfix) == {"loss", "acc", "lr"}
+
+
+class _RaisingModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = nn.Parameter(torch.zeros(4))
+
+    def forward(self, **kwargs):
+        raise RuntimeError("boom")
+
+
+def test_progress_bar_closed_when_loop_raises(monkeypatch):
+    """The bar is closed even when the training loop raises (try/finally)."""
+    fake = _FakeProgressBar()
+    monkeypatch.setattr(TrainEagle1Recipe, "_make_progress_bar", lambda self, **kwargs: fake)
+    recipe = _build_recipe(num_batches=2, grad_accum=1, trainer_module=_RaisingModule())
+    with pytest.raises(RuntimeError, match="boom"):
+        recipe.run_train_validation_loop()
+    assert fake.closed
