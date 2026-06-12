@@ -166,7 +166,10 @@ def bwd(
             Q_shared = T.alloc_shared([block_H, D], dtype)
             KV_shared = T.alloc_shared([BS, D], dtype)
             dO_shared = T.alloc_shared([block_H, D], dtype)
-            mask = T.alloc_fragment([BS], "bool")
+            # int8 (not bool): the vectorize pass turns a bool fragment into boolx8, which
+            # TileLang's CUDA codegen (PrintType) cannot emit ("Cannot convert type boolx8
+            # to CUDA type"; tile-ai/tilelang#2206). int8x8 lowers to int2 and is supported.
+            mask = T.alloc_fragment([BS], "int8")
             valid_count = T.alloc_fragment([1], T.int32)
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
@@ -191,7 +194,7 @@ def bwd(
                     mask[bi_i] = ValidMask[by, s_i, i_i * BS + bi_i] != 0
 
                 for bi_i in T.serial(BS):
-                    valid_count[0] += T.if_then_else(mask[bi_i], 1, 0)
+                    valid_count[0] += T.if_then_else(mask[bi_i] != 0, 1, 0)
 
                 # AutoModel pads causal rows with all-invalid top-k blocks; skip those blocks before MMA.
                 if valid_count[0] != 0:
@@ -204,7 +207,7 @@ def bwd(
                     # P = exp2(scores * sm_scale_log2e - LSE)
                     for h_i, bi_i in T.Parallel(block_H, BS):
                         acc_p[h_i, bi_i] = T.if_then_else(
-                            mask[bi_i],
+                            mask[bi_i] != 0,
                             T.exp2(acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2 - Lse[by, s_i, bz * block_H + h_i]),
                             0,
                         )
