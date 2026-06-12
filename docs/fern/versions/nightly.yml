@@ -7,32 +7,37 @@ navigation:
     slug: ""
   - section: "Get Started"
     contents:
-      - page: "About NeMo AutoModel"
+      - page: "About"
         path: ../../about/index.mdx
         slug: about
-      - page: "Key Features and Concepts"
+      - page: "Key Features"
         path: ../../about/key-features.mdx
         slug: key-features
       - page: "Install NeMo AutoModel"
         path: ../../guides/installation.mdx
         slug: installation
-      - page: "YAML Configuration"
+      - page: "Configuration"
         path: ../../guides/configuration.mdx
         slug: configuration
-      - page: "🤗 Transformers API Compatibility"
+      - page: "🤗 HF Compatibility"
         path: ../../guides/huggingface-api-compatibility.mdx
         slug: hf-compatibility
-      - page: "Repository Structure"
+      - page: "Repo Structure"
         path: ../../repository-structure.mdx
         slug: repo-structure
-      - page: "Release Notes"
-        path: ../../release-notes.mdx
-        slug: release-notes
-  - section: "Announcements"
-    contents:
-      - page: "Announcements"
-        path: ../../announcements.mdx
-  - section: "NeMo AutoModel Performance"
+- section: "What's New"
+  slug: whats-new
+  contents:
+    - page: "Announcements"
+      path: ../../announcements.mdx
+      slug: announcements
+    - page: "Release Notes"
+      path: ../../release-notes.mdx
+      slug: release-notes
+    - page: "Model Release Log"
+      path: ../../model-coverage/latest-models.mdx
+      slug: model-release-log
+  - section: "Performance"
     slug: performance
     contents:
       - page: "Performance Summary"
@@ -40,13 +45,13 @@ navigation:
         slug: performance-summary
   - section: "Model Coverage"
     contents:
-      - page: "Model Coverage Overview"
+      - page: "Overview"
         path: ../../model-coverage/overview.mdx
         slug: overview
-      - page: "Model Release Log"
+      - page: "Release Log"
         path: ../../model-coverage/latest-models.mdx
         slug: release-log
-      - section: "Large Language Models (LLMs)"
+      - section: "Large Language Models"
         slug: large-language-models
         contents:
           - page: "Overview"
@@ -166,7 +171,7 @@ navigation:
             path: ../../model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
           - page: "Ling 2.0"
             path: ../../model-coverage/llm/inclusionai/ling-2.mdx
-      - section: "Vision Language Models (VLMs)"
+      - section: "Vision Language Models"
         slug: vision-language-models
         contents:
           - page: "Overview"
@@ -203,8 +208,8 @@ navigation:
           - page: "LLaVA"
             path: ../../model-coverage/vlm/llava-hf/llava.mdx
           - page: "Step-3.7-Flash"
-            path: ../../model-coverage/vlm/stepfun-ai/step-3-7.mdx
-      - section: "Multimodal Models"
+            path: ../../model-coverage/vlm/stepfun-ai/step-3-7.md
+      - section: "Multimodal"
         slug: multimodal
         contents:
           - page: "Overview"
@@ -212,15 +217,7 @@ navigation:
             slug: overview
           - page: "BAGEL"
             path: ../../model-coverage/multimodal/bytedance-seed/bagel.mdx
-      - section: "Diffusion Language Models (dLLMs)"
-        slug: dllm
-        contents:
-          - page: "Overview"
-            path: ../../model-coverage/dllm/index.mdx
-            slug: overview
-          - page: "DiffusionGemma"
-            path: ../../model-coverage/dllm/google/diffusiongemma.mdx
-      - section: "Omni Models"
+      - section: "Omni"
         slug: omni
         contents:
           - page: "Overview"
@@ -234,7 +231,15 @@ navigation:
             path: ../../model-coverage/omni/microsoft/phi4-multimodal.mdx
           - page: "Nemotron-Omni"
             path: ../../model-coverage/omni/nvidia/nemotron-omni.mdx
-      - section: "Diffusion Models"
+      - section: "Diffusion Language Models"
+        slug: dllm
+        contents:
+          - page: "Overview"
+            path: ../../model-coverage/dllm/index.mdx
+            slug: overview
+          - page: "DiffusionGemma"
+            path: ../../model-coverage/dllm/google/diffusiongemma.mdx
+      - section: "Diffusion"
         slug: diffusion
         contents:
           - page: "Overview"
@@ -277,16 +282,16 @@ navigation:
       - page: "Recipes and End-to-End Examples"
         path: ../../guides/overview.mdx
         slug: overview
-      - page: "Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with NeMo AutoModel"
+      - page: "SFT & PEFT"
         path: ../../guides/llm/finetune.mdx
         slug: sft-peft
-      - page: "Function Calling with NeMo AutoModel using FunctionGemma"
-        path: ../../guides/llm/toolcalling.mdx
+      - page: "Function Calling with FunctionGemma"
+        path: ../../guides/llm/toolcalling.md
         slug: function-calling
-      - page: "Multi-Turn Agent (Tool-Calling) SFT with NeMo AutoModel"
+      - page: "Multi-Turn Agent (Tool-Calling) SFT"
         path: ../../guides/llm/agent-sft.mdx
         slug: agent-sft
-      - page: "Knowledge Distillation with NeMo AutoModel"
+      - page: "Knowledge Distillation"
         path: ../../guides/llm/knowledge-distillation.mdx
         slug: knowledge-distillation
       - page: "Fine-Tune Large MoE LLMs"
@@ -298,28 +303,28 @@ navigation:
       - page: "Hy3-preview"
         path: ../../guides/llm/hy3.md
         slug: hy3-preview
-      - page: "Fine-Tune Nemotron-3-Ultra-550B"
+      - page: "Nemotron-3-Ultra-550B"
         path: ../../guides/llm/nemotron-3-ultra.md
         slug: nemotron-3-ultra
-      - page: "Pretrain Megatron Core Datasets with NeMo AutoModel"
+      - page: "Pretraining"
         path: ../../guides/llm/pretraining.mdx
         slug: pretraining
-      - page: "LLM Pre-Training with NeMo AutoModel"
+      - page: "NanoGPT Pretraining"
         path: ../../guides/llm/nanogpt-pretraining.mdx
         slug: nanogpt-pretraining
-      - page: "Sequence Classification (SFT/PEFT) with NeMo AutoModel"
+      - page: "Sequence Classification (SFT/PEFT)"
         path: ../../guides/llm/sequence-classification.mdx
         slug: sequence-classification
-      - page: "Retrieval Fine-Tuning (Bi-Encoder and Cross-Encoder)"
+      - page: "Retrieval Fine-Tuning"
         path: ../../guides/llm/retrieval-finetune.mdx
         slug: retrieval-finetune
-      - page: "Fine-Tune Gemma 3 and Gemma 3n"
+      - page: "Gemma 3 / 3n"
         path: ../../guides/omni/gemma3-3n.md
         slug: gemma-3-3n
-      - page: "Fine-Tune Gemma 4 31B on CORD-v2 Receipts — End-to-End Guide"
+      - page: "Gemma 4 31B"
         path: ../../guides/vlm/gemma4.md
         slug: gemma-4
-      - page: "Fine-Tune Qwen3.5-VL"
+      - page: "Qwen3.5-VL"
         path: ../../guides/vlm/qwen3-5.md
         slug: qwen3-5-vl
       - page: "Nemotron-Omni"
@@ -331,97 +336,92 @@ navigation:
       - page: "Fine-Tune Step-3.7-Flash"
         path: ../../guides/vlm/step-3-7.md
         slug: step-3-7
-      - page: "Fine-Tune Qwen3-Omni for ASR"
+      - page: "ASR with Qwen3-Omni"
         path: ../../guides/audio/qwen3-omni-asr.md
         slug: qwen3-omni-asr
-      - page: "Diffusion Model Fine-Tuning with NeMo AutoModel"
+      - page: "Wan2.1-T2V Fine-Tuning"
         path: ../../guides/diffusion/finetune.mdx
         slug: diffusion-fine-tuning
+      - page: "Fine-Tuning DiffusionGemma"
+        path: ../../guides/dllm/diffusiongemma.md
+        slug: diffusiongemma
       - page: "Train an EAGLE Drafter for Speculative Decoding"
         path: ../../guides/speculative/eagle.mdx
         slug: eagle-speculative-decoding
       - page: "dLLM Fine-Tuning"
         path: ../../guides/dllm/finetune.mdx
         slug: dllm-fine-tuning
-      - page: "Fine-Tuning DiffusionGemma with NeMo AutoModel"
-        path: ../../guides/dllm/diffusiongemma.md
-        slug: diffusiongemma
-      - page: "Quantization-Aware Training (QAT) in NeMo Automodel"
+      - page: "Quantization-Aware Training (QAT)"
         path: ../../guides/quantization-aware-training.mdx
         slug: qat
       - page: "Model Training on Databricks"
         path: ../../guides/llm/databricks.mdx
         slug: databricks
-  - section: "Datasets"
+  - section: "Data"
     contents:
-      - page: "Dataset Overview: LLM, VLM, and Retrieval Datasets in NeMo AutoModel"
+      - page: "Overview"
         path: ../../guides/dataset-overview.mdx
         slug: overview
-      - page: "Integrate Your Own Text Dataset"
+      - page: "Text Dataset"
         path: ../../guides/llm/dataset.mdx
         slug: text-dataset
-      - page: "Retrieval Dataset (Embedding Fine-tuning)"
+      - page: "Retrieval Dataset"
         path: ../../guides/llm/retrieval-dataset.mdx
         slug: retrieval-dataset
-      - page: "Use the ColumnMappedTextInstructionDataset"
+      - page: "ColumnMapped Dataset"
         path: ../../guides/llm/column-mapped-text-instruction-dataset.mdx
         slug: columnmapped-dataset
-      - page: "Use the ColumnMappedTextInstructionIterableDataset (Streaming)"
+      - page: "ColumnMapped Iterable"
         path: ../../guides/llm/column-mapped-text-instruction-iterable-dataset.mdx
         slug: columnmapped-iterable
-      - page: "Integrate Your Own Multi-Modal Dataset"
+      - page: "Multi-Modal Dataset"
         path: ../../guides/vlm/dataset.mdx
         slug: multi-modal-dataset
-      - page: "Diffusion Dataset Preparation"
+      - page: "Diffusion Dataset"
         path: ../../guides/diffusion/dataset.mdx
         slug: diffusion-dataset
-  - section: "Job Launchers"
+  - section: "Run Jobs"
     contents:
-      - page: "Job Launchers"
+      - page: "Overview"
         path: ../../launcher/overview.mdx
         slug: overview
-      - page: "Run on Your Local Workstation"
+      - page: "Local Workstation"
         path: ../../launcher/local-workstation.mdx
         slug: local-workstation
-      - page: "Run on a Cluster"
+      - page: "SLURM Cluster"
         path: ../../launcher/slurm.mdx
         slug: slurm-cluster
-      - page: "Run with NeMo-Run"
+      - page: "NeMo Run"
         path: ../../launcher/nemo-run.mdx
         slug: nemo-run
-      - page: "Run on Any Cloud with SkyPilot"
+      - page: "SkyPilot"
         path: ../../launcher/skypilot.mdx
         slug: skypilot
-      - page: "SkyPilot k8s"
+      - page: "k8s with SkyPilot"
         path: ../../launcher/skypilot-kubernetes.mdx
         slug: skypilot-k8s
-  - section: "Development"
+  - section: "Advanced Training"
     contents:
-      - page: "Checkpointing in NeMo Automodel"
+      - page: "Checkpointing"
         path: ../../guides/checkpointing.mdx
         slug: checkpointing
-      - page: "Gradient (Activation) Checkpointing in NeMo AutoModel"
+      - page: "Gradient Checkpointing"
         path: ../../guides/gradient-checkpointing.mdx
         slug: gradient-checkpointing
-      - page: "Pipeline Parallelism with AutoPipeline"
+      - page: "Pipeline Parallelism"
         path: ../../guides/pipelining.mdx
         slug: pipeline-parallelism
-      - page: "FP8 Training in NeMo AutoModel"
+      - page: "FP8 Training"
         path: ../../guides/fp8-training.mdx
         slug: fp8-training
       - page: "Mixed-Precision Training"
         path: ../../guides/mixed-precision-training.mdx
         slug: mixed-precision-training
-      - page: "MLflow Logging in NeMo AutoModel"
+      - page: "MLflow Logging"
         path: ../../guides/mlflow-logging.mdx
         slug: mlflow-logging
-      - page: "Breaking Changes"
-        path: ../../breaking-changes.mdx
-        slug: breaking-changes
-      - section: "API Reference"
-        slug: api-reference
-        contents:
-          - page: "Overview"
-            path: ../../api-reference/index.mdx
-            slug: overview
-          - folder: ../product-docs/nemo-automodel/Full-Library-Reference
+- section: "Reference"
+  slug: reference
+  contents:
+    - page: "API Reference"
+    - folder: ../product-docs/nemo-automodel/Full-Library-Reference
