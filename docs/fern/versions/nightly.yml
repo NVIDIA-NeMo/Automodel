@@ -212,14 +212,6 @@ navigation:
             slug: overview
           - page: "BAGEL"
             path: ../../model-coverage/multimodal/bytedance-seed/bagel.mdx
-      - section: "Diffusion Language Models"
-        slug: dllm
-        contents:
-          - page: "Overview"
-            path: ../../model-coverage/dllm/index.mdx
-            slug: overview
-          - page: "DiffusionGemma"
-            path: ../../model-coverage/dllm/google/diffusiongemma.mdx
       - section: "Omni"
         slug: omni
         contents:
@@ -234,6 +226,14 @@ navigation:
             path: ../../model-coverage/omni/microsoft/phi4-multimodal.mdx
           - page: "Nemotron-Omni"
             path: ../../model-coverage/omni/nvidia/nemotron-omni.mdx
+      - section: "Diffusion Language Models"
+        slug: dllm
+        contents:
+          - page: "Overview"
+            path: ../../model-coverage/dllm/index.mdx
+            slug: overview
+          - page: "DiffusionGemma"
+            path: ../../model-coverage/dllm/google/diffusiongemma.mdx
       - section: "Diffusion"
         slug: diffusion
         contents:
@@ -298,13 +298,13 @@ navigation:
       - page: "Hy3-preview"
         path: ../../guides/llm/hy3.md
         slug: hy3-preview
-      - page: "Fine-Tune Nemotron-3-Ultra-550B"
+      - page: "Nemotron-3-Ultra-550B"
         path: ../../guides/llm/nemotron-3-ultra.md
         slug: nemotron-3-ultra
-      - page: "Pretrain Megatron Core Datasets"
+      - page: "Pretraining"
         path: ../../guides/llm/pretraining.mdx
         slug: pretraining
-      - page: "LLM Pre-Training"
+      - page: "NanoGPT Pretraining"
         path: ../../guides/llm/nanogpt-pretraining.mdx
         slug: nanogpt-pretraining
       - page: "Sequence Classification (SFT/PEFT)"
@@ -313,13 +313,13 @@ navigation:
       - page: "Retrieval Fine-Tuning"
         path: ../../guides/llm/retrieval-finetune.mdx
         slug: retrieval-finetune
-      - page: "Fine-Tune Gemma 3 and Gemma 3n"
+      - page: "Gemma 3 / 3n"
         path: ../../guides/omni/gemma3-3n.md
         slug: gemma-3-3n
-      - page: "Fine-Tune Gemma 4 31B on CORD-v2 Receipts"
+      - page: "Gemma 4 31B"
         path: ../../guides/vlm/gemma4.md
         slug: gemma-4
-      - page: "Fine-Tune Qwen3.5-VL"
+      - page: "Qwen3.5-VL"
         path: ../../guides/vlm/qwen3-5.md
         slug: qwen3-5-vl
       - page: "Nemotron-Omni"
@@ -331,7 +331,7 @@ navigation:
       - page: "Fine-Tune Step-3.7-Flash"
         path: ../../guides/vlm/step-3-7.md
         slug: step-3-7
-      - page: "Fine-Tune Qwen3-Omni for ASR"
+      - page: "ASR with Qwen3-Omni"
         path: ../../guides/audio/qwen3-omni-asr.md
         slug: qwen3-omni-asr
       - page: "Diffusion Model Fine-Tuning"
