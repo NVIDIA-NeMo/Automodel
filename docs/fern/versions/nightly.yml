@@ -25,13 +25,18 @@ navigation:
       - page: "Repo Structure"
         path: ../../repository-structure.mdx
         slug: repo-structure
-      - page: "Release Notes"
-        path: ../../release-notes.mdx
-        slug: release-notes
-  - section: "Announcements"
-    contents:
-      - page: "Announcements"
-        path: ../../announcements.mdx
+- section: "What's New"
+  slug: whats-new
+  contents:
+    - page: "Announcements"
+      path: ../../announcements.mdx
+      slug: announcements
+    - page: "Release Notes"
+      path: ../../release-notes.mdx
+      slug: release-notes
+    - page: "Model Release Log"
+      path: ../../model-coverage/latest-models.mdx
+      slug: model-release-log
   - section: "Performance"
     slug: performance
     contents:
@@ -334,18 +339,18 @@ navigation:
       - page: "ASR with Qwen3-Omni"
         path: ../../guides/audio/qwen3-omni-asr.md
         slug: qwen3-omni-asr
-      - page: "Diffusion Model Fine-Tuning"
+      - page: "Wan2.1-T2V Fine-Tuning"
         path: ../../guides/diffusion/finetune.mdx
         slug: diffusion-fine-tuning
+      - page: "Fine-Tuning DiffusionGemma"
+        path: ../../guides/dllm/diffusiongemma.md
+        slug: diffusiongemma
       - page: "Train an EAGLE Drafter for Speculative Decoding"
         path: ../../guides/speculative/eagle.mdx
         slug: eagle-speculative-decoding
       - page: "dLLM Fine-Tuning"
         path: ../../guides/dllm/finetune.mdx
         slug: dllm-fine-tuning
-      - page: "Fine-Tuning DiffusionGemma"
-        path: ../../guides/dllm/diffusiongemma.md
-        slug: diffusiongemma
       - page: "Quantization-Aware Training (QAT)"
         path: ../../guides/quantization-aware-training.mdx
         slug: qat
@@ -415,10 +420,8 @@ navigation:
       - page: "MLflow Logging"
         path: ../../guides/mlflow-logging.mdx
         slug: mlflow-logging
-      - section: "API Reference"
-        slug: api-reference
-        contents:
-          - page: "Overview"
-            path: ../../api-reference/index.mdx
-            slug: overview
-          - folder: ../product-docs/nemo-automodel/Full-Library-Reference
+- section: "Reference"
+  slug: reference
+  contents:
+    - page: "API Reference"
+    - folder: ../product-docs/nemo-automodel/Full-Library-Reference
