@@ -367,7 +367,15 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
     until ``pack_base_weights()`` is called (after the base checkpoint is loaded).
     """
 
-    def __init__(self, orig_module: GroupedExperts, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
+    def __init__(
+        self,
+        orig_module: GroupedExperts,
+        lora_dim=8,
+        alpha=32,
+        lora_A_init_method="xavier",
+        lora_dtype=None,
+        passthrough=False,
+    ):
         super().__init__(
             orig_module,
             lora_dim=lora_dim,
@@ -375,7 +383,18 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
             lora_A_init_method=lora_A_init_method,
             lora_dtype=lora_dtype,
         )
-        self._init_mxfp4_storage()
+        if passthrough:
+            # Build packed-at-init (no bf16 base) so a packed fp4 checkpoint loads
+            # straight into the frozen base; the LoRA adapters stay floating point.
+            if not self.use_torch_mm:
+                raise NotImplementedError(
+                    "mxfp4-resident expert weights require the torch_mm experts backend "
+                    "(backend.experts='torch_mm')."
+                )
+            self._mxfp4_resident = False
+            self._init_packed_placeholders()
+        else:
+            self._init_mxfp4_storage()
 
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
         """Forward pass with mxfp4 base weights and LoRA injection.
