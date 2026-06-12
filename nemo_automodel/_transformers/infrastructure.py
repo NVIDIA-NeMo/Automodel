@@ -97,6 +97,20 @@ def _apply_peft_and_lower_precision(
         if getattr(peft_config, "expert_weight_format", "bf16") == "mxfp4":
             from nemo_automodel.components._peft.lora import convert_frozen_experts_to_mxfp4
 
+            # mxfp4-resident experts require expert parallelism: the packed scales
+            # are only loaded/applied correctly when the MoE parallelizer shards
+            # the experts (world_size>1, ep_size>1). At world_size=1 parallelization
+            # is skipped and the packed scales are not applied — the experts decode
+            # to unscaled fp4 (~100x too large), silently corrupting results. Fail
+            # loudly rather than train on garbage.
+            if get_world_size_safe() == 1:
+                raise ValueError(
+                    "peft.expert_weight_format='mxfp4' requires expert parallelism "
+                    "(multi-GPU with distributed.ep_size>1); it is not supported on a single GPU "
+                    "(the packed expert scales are not applied without the MoE parallelizer). "
+                    "Use ep_size>1, or set expert_weight_format='bf16'."
+                )
+
             # Put the state-dict adapter(s) in passthrough mode BEFORE the checkpoint
             # load so both to_hf (destination keys) and from_hf (aggregation) keep
             # experts packed.
