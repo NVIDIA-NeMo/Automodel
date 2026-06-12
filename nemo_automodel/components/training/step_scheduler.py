@@ -146,9 +146,7 @@ class StepScheduler(Stateful):
             raise ValueError(f"log_remote_every_steps must be greater than 0, got {log_remote_every_steps}")
         self.loss_average_window_steps = loss_average_window_steps
         if loss_average_window_steps <= 0:
-            raise ValueError(
-                f"loss_average_window_steps must be greater than 0, got {loss_average_window_steps}"
-            )
+            raise ValueError(f"loss_average_window_steps must be greater than 0, got {loss_average_window_steps}")
         self.gc_every_steps = gc_every_steps
         if gc_every_steps is not None and gc_every_steps <= 0:
             raise ValueError(f"gc_every_steps must be greater than 0 if not None, got {gc_every_steps}")
