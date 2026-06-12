@@ -197,6 +197,7 @@ def _build_eagle1_recipe(num_batches, grad_accum, num_epochs, ckpt_every_steps, 
     recipe.max_grad_norm = 1e9
     recipe.num_epochs = num_epochs
     recipe.log_every_steps = 1
+    recipe.total_optim_steps = num_epochs * -(-num_batches // grad_accum)
     recipe.ckpt_every_steps = ckpt_every_steps
     recipe.save_checkpoint_every_epoch = save_every_epoch
     recipe.optimizer = torch.optim.SGD(recipe.trainer_module.parameters(), lr=0.0)

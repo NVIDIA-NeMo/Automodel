@@ -881,15 +881,23 @@ class BaseRecipe:
             tensor = tensor.cpu()
         return tensor
 
-    def _make_progress_bar(self):
-        """Create a tqdm progress bar on rank 0; returns None on other ranks."""
+    def _make_progress_bar(self, total: int | None = None, initial: int = 0):
+        """Create a tqdm progress bar on rank 0; returns None on other ranks.
+
+        Without arguments the totals come from ``self.step_scheduler``; recipes
+        without a step scheduler (e.g. the EAGLE family) pass ``total`` and
+        ``initial`` explicitly.
+        """
         if not _is_rank_0():
             return None
         from tqdm import tqdm
 
+        if total is None:
+            total = getattr(self.step_scheduler, "max_steps", None)
+            initial = getattr(self.step_scheduler, "step", 0)
         return tqdm(
-            total=getattr(self.step_scheduler, "max_steps", None),
-            initial=getattr(self.step_scheduler, "step", 0),
+            total=total,
+            initial=initial,
             desc="Training",
             unit="step",
             dynamic_ncols=True,
