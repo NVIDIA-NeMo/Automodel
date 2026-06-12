@@ -340,6 +340,7 @@ class ChatDataset(Dataset):
         chat_template: Optional[str] = None,
         shuffle_seed: Optional[int] = None,
         mask_reasoning_content: bool = False,
+        mask_history: bool = False,
         unshifted: bool = False,
         skip_invalid_samples: bool = False,
     ) -> None:
@@ -357,6 +358,12 @@ class ChatDataset(Dataset):
             chat_template: Optional Jinja template string overriding ``tokenizer.chat_template``.
             shuffle_seed: If set, shuffles Hub/Parquet data before applying a split slice.
             mask_reasoning_content: If ``True``, exclude rendered reasoning traces from the loss mask.
+            mask_history: If ``True``, supervise only the FINAL assistant turn and treat all
+                earlier turns as (clean) prompt context. Multi-turn conversations otherwise
+                supervise every assistant turn, yielding a gappy loss_mask; downstream
+                consumers that require a single contiguous supervised suffix (e.g. the
+                block-diffusion response window, matching Google's prompt+single-response
+                data model) need this. No-op for single-turn data.
             unshifted: Passed through to ``format_chat_template``.
             skip_invalid_samples: If ``True``, skip malformed JSONL lines when reading local files (warning logs
                 include skip counts). If ``False``, a bad line raises. Does not skip invalid structured rows after
@@ -378,6 +385,7 @@ class ChatDataset(Dataset):
         self.truncation = truncation
         self.start_of_turn_token = start_of_turn_token
         self.mask_reasoning_content = mask_reasoning_content
+        self.mask_history = mask_history
         self.unshifted = unshifted
         self.skip_invalid_samples = skip_invalid_samples
 
@@ -395,6 +403,29 @@ class ChatDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.dataset)
+
+    @staticmethod
+    def _keep_last_supervised_run(seq: List[int], unsupervised_value: int) -> None:
+        """In place, keep only the final contiguous supervised run; mask the rest.
+
+        Supervised positions are those ``!= unsupervised_value`` (0 for ``loss_mask``,
+        -100 for ``labels``). Used for ``mask_history``: a multi-turn conversation has
+        one supervised run per assistant turn separated by unsupervised user turns;
+        this collapses it to the last turn so the supervised tokens form a single
+        suffix.
+        """
+        last = -1
+        for i in range(len(seq) - 1, -1, -1):
+            if seq[i] != unsupervised_value:
+                last = i
+                break
+        if last < 0:
+            return
+        start = last
+        while start - 1 >= 0 and seq[start - 1] != unsupervised_value:
+            start -= 1
+        for i in range(start):
+            seq[i] = unsupervised_value
 
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
         row = self.dataset[idx]
@@ -437,4 +468,13 @@ class ChatDataset(Dataset):
             mask_reasoning_content=self.mask_reasoning_content,
             unshifted=self.unshifted,
         )
+        if self.mask_history:
+            # Collapse multi-turn supervision to the final assistant turn so the
+            # supervised tokens are a single contiguous suffix (prior turns become
+            # clean prompt context) — required by the block-diffusion response window
+            # and matching Google's prompt+single-response data model.
+            if "loss_mask" in sample:
+                self._keep_last_supervised_run(sample["loss_mask"], 0)
+            if "labels" in sample:
+                self._keep_last_supervised_run(sample["labels"], -100)
         return sample

@@ -12,7 +12,7 @@ repo contribution workflows.
 |---|---|
 | `build-and-dependency` | Container setup, uv package management, environment variables, CLI usage |
 | `cicd` | Commit/PR workflow, CI trigger mechanism, failure investigation |
-| `fern-docs` | Maintain the Fern docs site under `fern/`: pages, slugs, redirects, version aliases, library reference |
+| `fern-docs` | Maintain the Fern docs site under `docs/` (MDX content) + `docs/fern/` (infra): pages, slugs, redirects, version aliases, library reference |
 | `linting-and-formatting` | ruff rules, type hints, docstrings, copyright headers, code review checklist |
 | `parity-testing` | Verify numerical correctness against references |
 | `testing` | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
