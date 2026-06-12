@@ -131,7 +131,8 @@ def test_compiled_create_block_mask_is_cached(monkeypatch):
 
     assert dflash_mask._get_compiled_create_block_mask() is sentinel
     assert dflash_mask._get_compiled_create_block_mask() is sentinel
-    assert calls == [(dflash_mask.create_block_mask, False)]
+    # dynamic=True: rationale at the compile site in dflash_mask.py.
+    assert calls == [(dflash_mask.create_block_mask, True)]
 
 
 def test_block_mask_uncompiled_cpu_smoke():
