@@ -65,6 +65,7 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     apply_submodule_checkpointing,
     detect_kv_sharing_and_maybe_disable_cache,
     is_selective_activation_checkpointing,
+    stabilize_kv_sharing_across_fsdp,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 
@@ -374,6 +375,13 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             reshard_after_forward=False,
             offload_policy=offload_policy,
         )
+
+        # KV-sharing models (e.g. Gemma 3n) thread a single ``shared_kv_states``
+        # dict between decoder layers; FSDP2's per-layer input-cast rebuilds that
+        # dict per layer (cast_forward_inputs=True), so the producer's K/V never
+        # reach the consuming shared layers -> KeyError on the first forward.
+        # Re-establish a single canonical dict now that every layer is wrapped.
+        stabilize_kv_sharing_across_fsdp(model)
 
         return model
 
@@ -1561,24 +1569,23 @@ def _get_parallel_plan(
     3) Otherwise, prefer the model's HF-native ``_tp_plan`` (via ``get_hf_tp_shard_plan``).
     4) Otherwise, fall back to the default base plan.
 
-    When ``tp_size > 1`` and the model falls through to path 4 *and* the
-    model class was loaded from a custom-code source (HF's
-    ``trust_remote_code=True`` path, where the dynamic class lives under
-    ``transformers_modules.*``), this raises ``ValueError`` instead of
-    returning the default base plan. On recent PyTorch the default plan's
-    placements do not populate ``shard_order`` and trip an internal assert in
-    ``torch.distributed.tensor._redistribute`` on the first weight
-    redistribute, which surfaces to the user as an opaque PyTorch internal
-    error. Custom-code architectures are the only known-broken case (see
-    https://github.com/NVIDIA-NeMo/Automodel/issues/2243); known HF
-    architectures that happen to fall through (e.g. Mixtral) are left on the
-    default plan with a warning, since they have been working in practice.
+    When ``tp_size > 1`` and the model falls through to path 4, the default
+    base plan is used and a warning is logged (it shards only the llama3-style
+    wildcard modules). This applies to custom-code architectures loaded via
+    HF's ``trust_remote_code=True`` path (dynamic class under
+    ``transformers_modules.*``) as well as to known HF architectures (e.g.
+    Mixtral): #2244 previously raised ``ValueError`` for the custom-code case,
+    but build/parallelize/forward/training all succeed on the base plan at
+    tp>1 -- the missing-``shard_order`` assert only ever fired on a single
+    cross-layout ``redistribute`` during checkpoint reload, which is now fixed
+    at its source in ``checkpoint.stateful_wrappers`` (see
+    https://github.com/NVIDIA-NeMo/Automodel/issues/2243).
 
     When the model *did* define a ``_tp_plan`` but ``get_hf_tp_shard_plan``
-    raised while translating it (e.g. styles nemo does not recognize), the
-    translator's error message is folded into the ``ValueError`` as a
-    diagnostic so the user can tell whether to add a ``_tp_plan`` from
-    scratch or fix the styles in the one they already have.
+    raised while translating it (e.g. styles nemo does not recognize), that
+    error is folded into the warning as a diagnostic so the user can tell
+    whether to add a ``_tp_plan`` from scratch or fix the styles in the one
+    they already have.
     """
     model_parallel_plan = None
     model_cls = type(model)
@@ -1663,38 +1670,35 @@ def _get_parallel_plan(
             logger.info(f"Using HF-native tp plan for {model_cls.__name__}.")
         else:
             # HF places dynamic classes loaded via ``trust_remote_code=True`` under the
-            # ``transformers_modules.*`` namespace. Those are the only archs known to
-            # actually crash inside ``_redistribute`` with the default base plan, so we
-            # only fail-fast for them. See https://github.com/NVIDIA-NeMo/Automodel/issues/2243.
+            # ``transformers_modules.*`` namespace. #2244 hard-failed these at tp>1 on the
+            # theory that the default base plan's placements "trip an internal assert in
+            # _redistribute on the first weight redistribute". That diagnosis was too broad:
+            # build + parallelize_module + fully_shard + forward + training all succeed at
+            # tp>1 on the base plan (verified for NemotronFlash / DeciLM). The assert only
+            # fired on ONE specific cross-layout ``redistribute`` during checkpoint reload,
+            # where a TP-dim-0 weight composed by FSDP2 into
+            # ``(_StridedShard(0, split_factor=tp_size), Shard(0))`` has no representable
+            # ``shard_order``. That reload path now shards via ``distribute_tensor`` instead
+            # of a ``from_local(Replicate).redistribute(...)`` round-trip (see
+            # nemo_automodel.components.checkpoint.stateful_wrappers), so the crash is fixed
+            # at its source and the fail-fast is no longer warranted. Treat custom-code archs
+            # exactly like known HF archs that fall through (e.g. Mixtral): warn and use the
+            # default base plan. See https://github.com/NVIDIA-NeMo/Automodel/issues/2243.
             is_remote_code = (model_cls.__module__ or "").startswith("transformers_modules.")
-            if tp_size > 1 and is_remote_code:
-                # If the model author *did* define `_tp_plan` but it was unusable
-                # (e.g. styles nemo does not recognize), surface that diagnostic so the
-                # user knows whether to (a) add a missing `_tp_plan` from scratch or
-                # (b) fix the styles in the one they already have.
-                diag = f" Note: {hf_plan_error}." if hf_plan_error is not None else ""
-                raise ValueError(
-                    f"No tensor-parallel plan is registered for the custom-code architecture "
-                    f"'{model_cls.__name__}' (loaded via trust_remote_code=True), and no usable "
-                    f"HuggingFace `_tp_plan` was found.{diag} The default base plan cannot be used "
-                    f"at tp_size={tp_size}: it produces DTensor placements without `shard_order` "
-                    "metadata, which trips an internal assert in "
-                    "`torch.distributed.tensor._redistribute` on the first weight redistribute. "
-                    "Register a working plan in one of the following ways:\n"
-                    f"  1. Add an entry for '{model_cls.__name__}' to "
-                    "`nemo_automodel.components.distributed.optimized_tp_plans.PARALLELIZE_FUNCTIONS`.\n"
-                    "  2. Define a `_tp_plan` on the model class with styles nemo recognizes "
-                    "(e.g. `colwise`, `rowwise`, `colwise_rep`, `rowwise_rep`).\n"
-                    "  3. Pass `tp_shard_plan` (dict or import path) when constructing the parallelizer.\n"
-                    "Alternatively, run with tp_size=1."
-                )
             if tp_size > 1:
+                # If the model author *did* define `_tp_plan` but it was unusable (e.g. styles
+                # nemo does not recognize), surface that diagnostic so the user knows whether to
+                # add a missing `_tp_plan` or fix the styles in the one they already have.
+                diag = f" (note: {hf_plan_error})" if hf_plan_error is not None else ""
                 logger.warning(
-                    "No usable tensor-parallel plan is registered for '%s'. Falling back to the "
-                    "default base plan at tp_size=%d. If you hit an internal assert in "
-                    "`torch.distributed.tensor._redistribute` on `shard_order is not None`, "
-                    "register a plan via `PARALLELIZE_FUNCTIONS`, `_tp_plan`, or `tp_shard_plan`.",
+                    "No registered tensor-parallel plan for '%s'%s%s. Falling back to the "
+                    "default base plan at tp_size=%d; only modules matching the llama3-style "
+                    "wildcards will be sharded. For a tuned plan, register one via "
+                    "`PARALLELIZE_FUNCTIONS`, a recognized `_tp_plan` (e.g. `colwise`, "
+                    "`rowwise`, `colwise_rep`, `rowwise_rep`), or `tp_shard_plan`.",
                     model_cls.__name__,
+                    " (loaded via trust_remote_code=True)" if is_remote_code else "",
+                    diag,
                     tp_size,
                 )
             base_model_tp_plan = {

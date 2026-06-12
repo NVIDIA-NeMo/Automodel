@@ -25,8 +25,10 @@ other way around -- so the dependency stays one-directional and the central
 parallelizer file stays small.
 """
 
+import functools
 import logging
 import os
+import types
 from typing import List
 
 import torch
@@ -348,6 +350,92 @@ def detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:
             except Exception:
                 pass
     return has_kv_sharing
+
+
+def _iter_kv_sharing_layer_stacks(model: nn.Module):
+    """Yield ``(stack_owner, layers)`` for every KV-sharing transformer stack.
+
+    A stack qualifies when it owns a ``layers`` container whose first block's
+    ``self_attn`` exposes ``is_kv_shared_layer`` -- the marker HF sets on models
+    that pass key/value states between layers through a per-forward
+    ``shared_kv_states`` dict (e.g. Gemma 3n). Detection is structural (no
+    hard-coded class names) so it keeps working across HF renames and applies to
+    the text backbone wherever it is nested inside a VLM wrapper.
+    """
+    for module in model.modules():
+        layers = getattr(module, "layers", None)
+        if layers is None or not isinstance(layers, (nn.ModuleList, nn.ModuleDict)) or len(layers) == 0:
+            continue
+        first = next(iter(layers.values())) if isinstance(layers, nn.ModuleDict) else layers[0]
+        self_attn = getattr(first, "self_attn", None)
+        if self_attn is not None and hasattr(self_attn, "is_kv_shared_layer"):
+            yield module, layers
+
+
+def stabilize_kv_sharing_across_fsdp(model: nn.Module) -> bool:
+    """Make HF ``shared_kv_states`` dicts identity-stable across FSDP2 layers.
+
+    Gemma-3n-style models reuse key/value states from an earlier layer in later
+    ("KV-shared") layers by threading a single ``shared_kv_states`` dict, created
+    once in the text model's ``forward``, through every decoder layer as a kwarg.
+    The producing layer writes ``shared_kv_states[layer_idx]`` and the consuming
+    layer reads ``shared_kv_states[kv_shared_layer_index]``; correctness relies on
+    every layer mutating the *same* dict object.
+
+    FSDP2 breaks that assumption: when each decoder layer is wrapped with
+    ``fully_shard`` and the mixed-precision policy has ``cast_forward_inputs=True``
+    (the default), FSDP's pre-forward casts the layer's inputs via
+    ``torch.distributed.utils._apply_to_tensors``, which **rebuilds** every dict
+    kwarg into a fresh ``{}``. Each layer therefore receives its own throwaway
+    copy: the producer's write lands in a copy that is discarded, and the
+    consumer reads an empty dict -> ``KeyError: <kv_shared_layer_index>`` on the
+    first forward.
+
+    This wraps each KV-sharing layer's ``forward`` so that, after FSDP's cast has
+    run, the (rebuilt) ``shared_kv_states`` kwarg is folded into and replaced by a
+    single canonical dict owned by the stack. A forward pre-hook on the stack
+    clears that dict each step so K/V from a previous step never leak in. The
+    wrapper is a no-op when no ``shared_kv_states`` kwarg is passed, so non-FSDP /
+    single-GPU paths are unaffected.
+
+    Returns:
+        bool: Whether any KV-sharing stack was patched.
+    """
+    patched_any = False
+    for stack_owner, layers in _iter_kv_sharing_layer_stacks(model):
+        if getattr(stack_owner, "_nemo_kv_sharing_stabilized", False):
+            continue
+
+        canonical: dict = {}
+        stack_owner._nemo_shared_kv_states = canonical
+
+        def _clear_shared_kv(module, args, kwargs, _canonical=canonical):
+            _canonical.clear()
+            return None
+
+        stack_owner.register_forward_pre_hook(_clear_shared_kv, with_kwargs=True)
+
+        layer_iter = layers.values() if isinstance(layers, nn.ModuleDict) else layers
+        for layer in layer_iter:
+            func = layer.forward.__func__
+
+            @functools.wraps(func)
+            def _wrapper(self, *args, _func=func, _canonical=canonical, **kwargs):
+                incoming = kwargs.get("shared_kv_states")
+                if incoming is not None and incoming is not _canonical:
+                    # Adopt whatever FSDP's input-cast copied in, then swap in the
+                    # single canonical dict so this layer's writes are visible to
+                    # the later layers that share its K/V.
+                    _canonical.update(incoming)
+                    kwargs["shared_kv_states"] = _canonical
+                return _func(self, *args, **kwargs)
+
+            layer.forward = types.MethodType(_wrapper, layer)
+
+        stack_owner._nemo_kv_sharing_stabilized = True
+        patched_any = True
+
+    return patched_any
 
 
 def apply_selective_checkpointing_to_layers(

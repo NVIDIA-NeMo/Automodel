@@ -307,6 +307,22 @@ def get_decilm_nemotron_tp_plan(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+def _parallelize_decilm_nemotron(
+    model,  # DeciLMForCausalLM — loaded via trust_remote_code, not importable here.
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """``PARALLELIZE_FUNCTIONS`` adapter for remote-code DeciLM Nemotron-NAS models.
+
+    Thin wrapper around :func:`get_decilm_nemotron_tp_plan` with the
+    ``(model, sequence_parallel)`` signature the registry dispatch expects (the
+    model instance is unused — the plan keys are static wildcards). Registering
+    DeciLMForCausalLM here lets ``_get_parallel_plan`` find a working plan via
+    the bare-class-name fallback instead of falling through to the default base
+    plan and tripping the trust_remote_code fail-fast guard at tp_size > 1.
+    """
+    return get_decilm_nemotron_tp_plan(sequence_parallel=sequence_parallel)
+
+
 def _parallelize_baichuan(
     model: BaichuanForCausalLM | None,
     sequence_parallel: bool = False,
@@ -694,4 +710,9 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     # trust_remote_code models — matched by bare class __name__ in parallelizer
     # because their qualname includes a snapshot-hash-bearing module path.
     "NemotronLabsDiffusionModel": _parallelize_nemotron_labs_diffusion,
+    # DeciLM / Nemotron-NAS (e.g. nvidia/Llama-3_3-Nemotron-Super-49B-v1_5).
+    # Without this entry the model falls through to the default base plan and
+    # hits the trust_remote_code fail-fast guard in _get_parallel_plan at
+    # tp_size > 1. Uses separate q/k/v + separate gate/up (DeciLM is not fused).
+    "DeciLMForCausalLM": _parallelize_decilm_nemotron,
 }

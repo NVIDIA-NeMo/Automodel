@@ -128,16 +128,28 @@ class TestForVlmFullFactory:
             "model.multi_modal_projector",
         )
 
-    def test_keys_round_trip_identity(self):
-        # Both rewrites are _identity by default — keys should pass through.
+    def test_body_keys_round_trip_identity(self):
+        # Body keys (language_model / vision_tower / multi_modal_projector) pass
+        # through unchanged in both directions.
         a = Mistral3FP8StateDictAdapter.for_vlm_full()
         for k in (
             "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.embed_tokens.weight",
             "model.vision_tower.patch_conv.weight",
-            "lm_head.weight",
+            "model.multi_modal_projector.linear_1.weight",
         ):
             assert a._native_to_hf(k) == k
             assert a._hf_to_native(k) == k
+
+    def test_lm_head_key_is_remapped_both_ways(self):
+        # The model exposes the head at the top level (``lm_head.weight``) but the
+        # checkpoint nests it (``language_model.lm_head.weight``). The adapter must
+        # bridge the two so untied checkpoints (Devstral) load the head via DCP.
+        a = Mistral3FP8StateDictAdapter.for_vlm_full()
+        assert a._native_to_hf("lm_head.weight") == "language_model.lm_head.weight"
+        assert a._hf_to_native("language_model.lm_head.weight") == "lm_head.weight"
+        # Round-trips back to the model name.
+        assert a._hf_to_native(a._native_to_hf("lm_head.weight")) == "lm_head.weight"
 
 
 # --------------------------------------------------------------------------- #
@@ -161,9 +173,7 @@ class TestFromHf:
         assert w_key + "_scale_inv" not in out
         # weight dequanted to bf16
         assert out[w_key].dtype == torch.bfloat16
-        assert torch.equal(
-            out[w_key], torch.tensor([[0.5, 1.0]], dtype=torch.bfloat16)
-        )
+        assert torch.equal(out[w_key], torch.tensor([[0.5, 1.0]], dtype=torch.bfloat16))
 
     def test_bf16_weight_passes_through(self):
         a = self._adapter()
@@ -176,11 +186,13 @@ class TestFromHf:
         a = self._adapter()
         sd = {
             "model.language_model.layers.0.self_attn.q_proj.activation_scale": torch.tensor(1.0),
-            "lm_head.weight": torch.tensor([1.0]),
+            # On-disk head key is nested; from_hf must surface it as the model name.
+            "language_model.lm_head.weight": torch.tensor([1.0]),
         }
         out = a.from_hf(sd)
         assert "model.language_model.layers.0.self_attn.q_proj.activation_scale" not in out
         assert "lm_head.weight" in out
+        assert "language_model.lm_head.weight" not in out
 
     def test_fp8_weight_without_scale_passes_through_untouched(self):
         # Defensive: if no scale_inv sibling, don't dequant — pass through.
@@ -189,6 +201,16 @@ class TestFromHf:
         v = torch.tensor([[1.0]], dtype=torch.float8_e4m3fn)
         out = a.from_hf({w_key: v})
         assert out[w_key].dtype == torch.float8_e4m3fn
+
+    def test_nested_lm_head_remapped_to_model_name(self):
+        # Untied checkpoints (Devstral) ship the head under the nested name; it
+        # must arrive at the model's top-level ``lm_head.weight`` (BF16, no dequant).
+        a = self._adapter()
+        v = torch.zeros(8, 4, dtype=torch.bfloat16)
+        out = a.from_hf({"language_model.lm_head.weight": v})
+        assert "lm_head.weight" in out
+        assert "language_model.lm_head.weight" not in out
+        assert torch.equal(out["lm_head.weight"], v)
 
 
 # --------------------------------------------------------------------------- #
@@ -221,11 +243,11 @@ class TestToHf:
     def test_quantization_skips_placeholder_for_non_fp8_keys(self):
         a = self._adapter()
         v = torch.zeros(4, dtype=torch.bfloat16)
-        # vision_tower + multi_modal_projector + lm_head + embed_tokens excluded.
+        # vision_tower + multi_modal_projector + embed_tokens excluded; their
+        # keys are identity. (lm_head is covered separately since it is remapped.)
         for key in (
             "model.vision_tower.transformer.layers.0.attention.q_proj.weight",
             "model.multi_modal_projector.linear_1.weight",
-            "lm_head.weight",
             "model.language_model.embed_tokens.weight",
         ):
             out = a.to_hf({key: v}, quantization=True)
@@ -233,6 +255,18 @@ class TestToHf:
             assert key + "_scale_inv" not in out
             # Original dtype preserved
             assert out[key].dtype == torch.bfloat16
+
+    def test_lm_head_remapped_to_nested_name_no_scale(self):
+        # to_hf must rename the model's top-level head to the on-disk nested name
+        # (so the DCP destination matches the checkpoint), with no FP8 scale_inv.
+        a = self._adapter()
+        v = torch.zeros(4, dtype=torch.bfloat16)
+        out = a.to_hf({"lm_head.weight": v}, quantization=True)
+        assert "language_model.lm_head.weight" in out
+        assert "lm_head.weight" not in out
+        assert "language_model.lm_head.weight_scale_inv" not in out
+        # Original dtype preserved (no FP8 cast for the non-quantized head).
+        assert out["language_model.lm_head.weight"].dtype == torch.bfloat16
 
     def test_exclude_key_regex(self):
         a = self._adapter()
@@ -281,11 +315,21 @@ class TestConvertSingleTensorToHf:
     def test_quantization_non_fp8_emits_one_pair(self):
         a = self._adapter()
         t = torch.zeros(1)
+        # Identity-named, non-FP8 keys: one pair, name unchanged.
         for fqn in (
             "model.vision_tower.transformer.layers.0.attention.q_proj.weight",
             "model.multi_modal_projector.linear_1.weight",
-            "lm_head.weight",
         ):
             pairs = a.convert_single_tensor_to_hf(fqn, t, quantization=True)
             assert len(pairs) == 1
             assert pairs[0] == (fqn, t)
+
+    def test_quantization_lm_head_emits_one_pair_remapped(self):
+        # The head is non-FP8 (no scale_inv) but IS renamed to the on-disk
+        # nested name on the save path.
+        a = self._adapter()
+        t = torch.zeros(1)
+        pairs = a.convert_single_tensor_to_hf("lm_head.weight", t, quantization=True)
+        assert len(pairs) == 1
+        assert pairs[0][0] == "language_model.lm_head.weight"
+        assert pairs[0][1] is t

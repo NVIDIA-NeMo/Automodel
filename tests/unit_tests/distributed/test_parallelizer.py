@@ -2159,3 +2159,108 @@ class TestBagelFullLayerActivationCheckpointing:
     def test_apply_bagel_full_layer_activation_checkpointing_ignores_other_models(self):
         """Non-BAGEL models continue through the generic checkpointing path."""
         assert parallelizer._apply_bagel_full_layer_activation_checkpointing(nn.Module()) is False
+
+
+class _KVShareSelfAttn(nn.Module):
+    """Minimal Gemma3n-like attention with KV-sharing write/read semantics."""
+
+    def __init__(self, layer_idx, is_kv_shared_layer, kv_shared_layer_index, store_full_length_kv):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.is_kv_shared_layer = is_kv_shared_layer
+        self.kv_shared_layer_index = kv_shared_layer_index
+        self.store_full_length_kv = store_full_length_kv
+
+    def forward(self, hidden_states, shared_kv_states=None):
+        if self.is_kv_shared_layer:
+            # Reuse K/V produced by an earlier non-shared layer (raises KeyError
+            # if the producing layer wrote into a different dict object).
+            kv = shared_kv_states[self.kv_shared_layer_index]
+            return hidden_states + kv
+        kv = hidden_states * 2
+        if self.store_full_length_kv:
+            shared_kv_states[self.layer_idx] = kv
+        return kv
+
+
+class _KVShareLayer(nn.Module):
+    def __init__(self, self_attn):
+        super().__init__()
+        self.self_attn = self_attn
+
+    def forward(self, hidden_states, shared_kv_states=None):
+        return self.self_attn(hidden_states, shared_kv_states=shared_kv_states)
+
+
+class _KVShareTextModel(nn.Module):
+    """Fake text backbone whose forward threads one shared_kv_states dict."""
+
+    def __init__(self):
+        super().__init__()
+        # layers 0,1 produce; layer 2 reads layer 0; layer 3 reads layer 1.
+        self.layers = nn.ModuleList(
+            [
+                _KVShareLayer(_KVShareSelfAttn(0, False, None, True)),
+                _KVShareLayer(_KVShareSelfAttn(1, False, None, True)),
+                _KVShareLayer(_KVShareSelfAttn(2, True, 0, False)),
+                _KVShareLayer(_KVShareSelfAttn(3, True, 1, False)),
+            ]
+        )
+
+    def forward(self, hidden_states):
+        shared_kv_states = {}
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, shared_kv_states=shared_kv_states)
+        return hidden_states
+
+
+def _emulate_fsdp_input_cast_rebuild(text_model):
+    """Install a forward pre-hook on each layer that rebuilds dict kwargs.
+
+    Mirrors how FSDP2 injects ``cast_forward_inputs`` via a module pre-hook
+    (runs inside ``__call__`` before ``self.forward``), so ``_apply_to_tensors``
+    rebuilds every dict kwarg into a fresh object per layer.
+    """
+
+    def _rebuild_hook(module, args, kwargs):
+        kwargs = {k: (dict(v) if isinstance(v, dict) else v) for k, v in kwargs.items()}
+        return args, kwargs
+
+    for layer in text_model.layers:
+        layer.register_forward_pre_hook(_rebuild_hook, with_kwargs=True)
+
+
+class TestStabilizeKVSharingAcrossFSDP:
+    """stabilize_kv_sharing_across_fsdp keeps shared_kv_states identity-stable."""
+
+    def test_fsdp_input_cast_breaks_kv_sharing_without_fix(self):
+        model = _KVShareTextModel()
+        _emulate_fsdp_input_cast_rebuild(model)
+        # Producer writes land in a per-layer copy -> consumer reads empty dict.
+        with pytest.raises(KeyError):
+            model(torch.ones(2, 4))
+
+    def test_stabilize_restores_kv_sharing(self):
+        model = _KVShareTextModel()
+        _emulate_fsdp_input_cast_rebuild(model)
+
+        patched = parallelizer.stabilize_kv_sharing_across_fsdp(model)
+        assert patched is True
+
+        # Forward now succeeds and is repeatable (per-step dict is reset).
+        out1 = model(torch.ones(2, 4))
+        out2 = model(torch.ones(2, 4))
+        assert out1.shape == (2, 4)
+        torch.testing.assert_close(out1, out2)
+
+    def test_stabilize_is_idempotent_and_skips_non_kv_models(self):
+        # No KV-sharing self_attn -> nothing to patch.
+        plain = nn.Module()
+        plain.layers = nn.ModuleList([nn.Linear(4, 4)])
+        assert parallelizer.stabilize_kv_sharing_across_fsdp(plain) is False
+
+        model = _KVShareTextModel()
+        _emulate_fsdp_input_cast_rebuild(model)
+        assert parallelizer.stabilize_kv_sharing_across_fsdp(model) is True
+        # Second call is a no-op (already stabilized).
+        assert parallelizer.stabilize_kv_sharing_across_fsdp(model) is False

@@ -47,16 +47,20 @@ def _make_non_mistral3_cfg():
 class TestHookInstallation:
     def test_hook_installed_marker(self):
         # Idempotent guard: re-importing must not stack hooks.
-        assert getattr(
-            _mi._resolve_custom_model_cls_for_config,
-            "_mistral3_vlm_hook_installed",
-            False,
-        ) is True
+        assert (
+            getattr(
+                _mi._resolve_custom_model_cls_for_config,
+                "_mistral3_vlm_hook_installed",
+                False,
+            )
+            is True
+        )
 
     def test_reimport_is_idempotent(self):
         before = _mi._resolve_custom_model_cls_for_config
         # The package's _install_resolver_hook short-circuits if already installed.
         from nemo_automodel.components.models.mistral3_vlm import _install_resolver_hook
+
         _install_resolver_hook()
         assert _mi._resolve_custom_model_cls_for_config is before
 
@@ -70,7 +74,6 @@ class TestHookDispatch:
 
     def test_passes_through_non_mistral3_to_original(self):
         cfg = _make_non_mistral3_cfg()
-        sentinel = object()
         # Patch the original (un-hooked) resolver that our hook delegates to.
         # The hook closes over the *original* resolver at install time; we
         # replicate that path by stubbing ModelRegistry interactions.
@@ -79,14 +82,60 @@ class TestHookDispatch:
             assert _mi._resolve_custom_model_cls_for_config(cfg) is None
 
     def test_supports_config_failure_falls_back(self):
-        # If supports_config raises for some reason, the hook must catch and
-        # delegate to the original resolver rather than propagating.
+        # If the lightweight claim predicate raises for some reason, the hook
+        # must catch and delegate to the original resolver rather than
+        # propagating. (The hook uses the import-free _config_is_fp8_ministral3_vlm
+        # predicate so it can be installed without importing the heavy model.py.)
+        import nemo_automodel.components.models.mistral3_vlm as _pkg
+
         cfg = _make_fp8_mistral3_cfg()
         with patch.object(
-            Mistral3FP8VLMForConditionalGeneration,
-            "supports_config",
+            _pkg,
+            "_config_is_fp8_ministral3_vlm",
             side_effect=RuntimeError("boom"),
         ):
             with patch.object(_mi, "get_architectures", return_value=[]):
                 # Original resolver returns None; hook swallowed the exception.
                 assert _mi._resolve_custom_model_cls_for_config(cfg) is None
+
+
+class TestConfigPredicate:
+    """The import-free predicate that decides whether to claim a config.
+
+    Both ``Devstral-Small-2-24B-Instruct-2512`` and
+    ``Ministral-3-3B-Instruct-2512`` ship the identical config shape
+    (outer ``Mistral3Config`` with a ministral3 text backbone, per-tensor FP8),
+    so both route to ``Mistral3FP8VLMForConditionalGeneration`` regardless of
+    which recipe (text vs PEFT) loads them.
+    """
+
+    def test_claims_ministral3_fp8(self):
+        from nemo_automodel.components.models.mistral3_vlm import _config_is_fp8_ministral3_vlm
+
+        assert _config_is_fp8_ministral3_vlm(_make_fp8_mistral3_cfg()) is True
+
+    def test_rejects_non_ministral3_backbone(self):
+        from nemo_automodel.components.models.mistral3_vlm import _config_is_fp8_ministral3_vlm
+
+        assert _config_is_fp8_ministral3_vlm(_make_non_mistral3_cfg()) is False
+
+    def test_rejects_non_fp8(self):
+        from nemo_automodel.components.models.mistral3_vlm import _config_is_fp8_ministral3_vlm
+
+        cfg = SimpleNamespace(text_config=SimpleNamespace(model_type="ministral3"), quantization_config=None)
+        assert _config_is_fp8_ministral3_vlm(cfg) is False
+
+    def test_rejects_missing_text_config(self):
+        from nemo_automodel.components.models.mistral3_vlm import _config_is_fp8_ministral3_vlm
+
+        cfg = SimpleNamespace(quantization_config={"quant_method": "fp8"})
+        assert _config_is_fp8_ministral3_vlm(cfg) is False
+
+    def test_accepts_object_style_quant_config(self):
+        from nemo_automodel.components.models.mistral3_vlm import _config_is_fp8_ministral3_vlm
+
+        cfg = SimpleNamespace(
+            text_config=SimpleNamespace(model_type="ministral3"),
+            quantization_config=SimpleNamespace(quant_method="fp8"),
+        )
+        assert _config_is_fp8_ministral3_vlm(cfg) is True
