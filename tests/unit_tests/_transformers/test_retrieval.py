@@ -29,6 +29,12 @@ from nemo_automodel.components.models.llama_bidirectional.model import (
 from nemo_automodel.components.models.ministral_bidirectional.model import Ministral3BidirectionalModel
 
 
+def test_llama_nemotron_vl_supported_backbone_for_embedding():
+    from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
+
+    assert SUPPORTED_BACKBONES["llama_nemotron_vl"]["embedding"] == "LlamaNemotronVLModel"
+
+
 def _tiny_mistral3_vlm_config(text_model_type: str) -> Mistral3Config:
     """Build a tiny Mistral3 VLM config with a selectable text backbone."""
     text_config = {
