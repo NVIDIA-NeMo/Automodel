@@ -29,7 +29,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /workspace/minimax-m3-bf16_vv1
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
   trust_remote_code: false
   torch_dtype: bfloat16
   text_config:
@@ -54,7 +54,7 @@ processor:
   # The checkpoint's remote-code MiniMaxVLProcessor drops chat_template during
   # from_pretrained, so this helper reattaches chat_template.jinja afterwards.
   _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
-  pretrained_model_name_or_path: /workspace/minimax-m3-bf16_vv1
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
   trust_remote_code: true
 
 peft:
@@ -155,7 +155,7 @@ lr_scheduler:
   min_lr: 1.0e-7
 
 wandb:
-  project: hiddentrail
-  entity: nvidia
-  name: minimax_m3_vl_lora_pp4ep8_bf16_finalckpt
-  dir: vlm_checkpoints/minimax_m3_vl_lora_pp4ep8_8node/
+  project: <your_wandb_project>
+  entity: <your_wandb_entity>
+  name: <your_wandb_name>
+  dir: <your_wandb_save_dir>

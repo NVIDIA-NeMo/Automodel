@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Full MiniMax M3 VL SFT: EP32 + PP4
-# (128 GPUs / 16 nodes). MiniMax M3 is image-only here.
+# (128 GPUs / 16 nodes).
 
 recipe: FinetuneRecipeForVLM
 
@@ -28,7 +28,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   # Local path of the provided checkpoint; replace with the HF id once published.
-  pretrained_model_name_or_path: /workspace/minimax-m3-bf16_vv1
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
   trust_remote_code: false
   torch_dtype: bfloat16
   text_config:
@@ -57,7 +57,7 @@ processor:
   # but its remote-code __init__ drops chat_template during from_pretrained, so this
   # helper loads it via AutoProcessor (trust_remote_code) and reattaches chat_template.jinja.
   _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
-  pretrained_model_name_or_path: /workspace/minimax-m3-bf16_vv1
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
   trust_remote_code: true
 
 checkpoint:
@@ -137,7 +137,7 @@ lr_scheduler:
   min_lr: 2.0e-7
 
 wandb:
-  project: hiddentrail
-  entity: nvidia
-  name: minimax_m3_vl_sft_ep32pp4_bf16_finalckpt
-  dir: vlm_checkpoints/minimax_m3_vl_sft_ep32pp4/
+  project: <your_wandb_project>
+  entity: <your_wandb_entity>
+  name: <your_wandb_name>
+  dir: <your_wandb_save_dir>
