@@ -117,9 +117,11 @@ class MXFP4GroupedMM(torch.autograd.Function):
 
     Saves only the packed weights for backward and re-dequantizes there, so the
     bf16 weight tensor is a transient in both passes instead of being kept alive
-    by autograd. Weights are stored transposed relative to the GEMM operand
-    (``[E, N, K]`` packed along ``K``), which makes the backward GEMM operand
-    (``W^T``) the natural dequantization output; forward pays one transpose-copy.
+    by autograd. Weights are stored as ``[E, N, K]`` packed along ``K``, which is
+    the natural dequantization output and the operand the backward GEMM needs
+    directly (``grad_x = grad_out @ W``). The forward needs ``[E, K, N]``, which
+    ``torch._grouped_mm`` consumes as a transposed view (cuBLAS transB) — no
+    contiguous copy required.
 
     No weight gradient is produced — the base weights are frozen under LoRA.
     """
@@ -127,7 +129,9 @@ class MXFP4GroupedMM(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
         w_t = dequantize_mxfp4(packed, scales, x.dtype)  # [E, N, K]
-        out = torch._grouped_mm(x, w_t.transpose(-2, -1).contiguous(), offs=offs)
+        # Pass the transposed view directly; torch._grouped_mm handles the
+        # strided mat2 (transB), avoiding a full bf16 weight copy per forward.
+        out = torch._grouped_mm(x, w_t.transpose(-2, -1), offs=offs)
         ctx.save_for_backward(packed, scales, offs)
         return out
 
