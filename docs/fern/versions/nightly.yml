@@ -357,7 +357,7 @@ navigation:
       - page: "Model Training on Databricks"
         path: ../../guides/llm/databricks.mdx
         slug: databricks
-  - section: "Datasets"
+  - section: "Data"
     contents:
       - page: "Overview"
         path: ../../guides/dataset-overview.mdx
@@ -380,7 +380,7 @@ navigation:
       - page: "Diffusion Dataset"
         path: ../../guides/diffusion/dataset.mdx
         slug: diffusion-dataset
-  - section: "Job Launchers"
+  - section: "Run Jobs"
     contents:
       - page: "Overview"
         path: ../../launcher/overview.mdx
@@ -400,7 +400,7 @@ navigation:
       - page: "k8s with SkyPilot"
         path: ../../launcher/skypilot-kubernetes.mdx
         slug: skypilot-k8s
-  - section: "Development"
+  - section: "Advanced Training"
     contents:
       - page: "Checkpointing"
         path: ../../guides/checkpointing.mdx
