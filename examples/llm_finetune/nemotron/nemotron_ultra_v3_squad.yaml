@@ -25,14 +25,13 @@
 #       --rdzv-backend=c10d --rdzv-endpoint="$MASTER_ADDR":29500 \
 #       --node-rank=$SLURM_NODEID \
 #       examples/llm_finetune/finetune.py \
-#       -c examples/llm_finetune/nemotron/nemotron_ultra_v3_full_sft.yaml'
+#       -c examples/llm_finetune/nemotron/nemotron_ultra_v3_squad.yaml'
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   num_epochs: 3
-  max_steps: 100          # SQuAD THD-packs to ~37 steps/epoch (packed 4096, dp=128); 100 steps ~2.7
-                          # epochs. Raise max_steps / num_epochs for a longer fine-tune.
+  max_steps: 100
   global_batch_size: 128  # local_batch_size(1) * dp_size(128) -> 1 microbatch/GPU/step
   local_batch_size: 1
   ckpt_every_steps: 50
@@ -46,12 +45,6 @@ rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
   seed: 1111
   ranked: true
-
-# Optional experiment tracking — uncomment and set your own project/entity to log to Weights & Biases:
-# wandb:
-#   project: my-project
-#   entity: my-entity
-#   name: ultra-full-sft
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
@@ -70,16 +63,13 @@ model:
     rms_norm: te
     experts: gmm
     dispatcher: deepep
-    fake_balanced_gate: false  # real router for actual training (NOT the benchmark's balanced gate)
     enable_fsdp_optimizations: false
-
-# No `peft:` section -> full fine-tune: every parameter is trained.
 
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/ultra_full_sft/
   model_save_format: safetensors
-  save_consolidated: final   # export one HuggingFace-loadable checkpoint at the end of training
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
@@ -96,19 +86,12 @@ loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
-  # SQuAD (small, cached). make_squad_dataset applies the tokenizer's chat template when present and
-  # supervises only the answer span (answer-only loss mask), returning {input_ids, labels}. The recipe
-  # injects the model tokenizer. To fine-tune on your own instruction data instead, swap this for
-  # ColumnMappedTextInstructionDataset (path_or_dataset_id + column_mapping {question, answer} +
-  # use_hf_chat_template: true + answer_only_loss_mask: true).
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: train
 
 packed_sequence:
-  packed_sequence_size: 4096   # 8192 OOMs in the backward on 80 GB H100 with the real router
-                               # (expert-load imbalance + allocator fragmentation); 4096 fits ~49 GiB/GPU.
-                               # SQuAD is small, so runtime THD packing takes ~1-2 min (no offline pre-pack).
+  packed_sequence_size: 4096
   packing_strategy: thd
 
 dataloader:
@@ -130,10 +113,15 @@ optimizer:
   _target_: torch.optim.AdamW
   betas: [0.9, 0.95]
   eps: 1.0e-8
-  lr: 5.0e-6  # lower than PEFT (1e-4); full-FT updates all params
+  lr: 5.0e-6
   weight_decay: 0.1
 
 lr_scheduler:
   lr_decay_style: cosine
   lr_warmup_steps: 10
   min_lr: 1.0e-6
+
+# wandb:
+#   project: my-project
+#   entity: my-entity
+#   name: ultra-full-sft
