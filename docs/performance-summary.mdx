@@ -15,6 +15,7 @@ The table below shows training performance for full sequences with no padding ac
 |-------|------:|----:|----:|----:|---:|-----------:|---:|---:|---:|---:|---:|-----:|---------|-------------------------:|---------------------:|---------------:|
 | Nemotron V3 Super 120B (26.02) | 64 | 512 | 2 | 2 | 4 | 4096 | 1 | 1 | 1 | 64 | - | 64 | TE + DeepEP + TorchSDPA | 7.286 | 334 | 4,497 |
 | Nemotron V3 Nano 30B (26.02) | 8 | 512 | 4 | 4 | 16 | 4096 | 1 | 1 | 1 | 8 | - | 8 | TE + DeepEP + TorchSDPA | 15.614 | 328 | 16,789 |
+| Nemotron V3 Ultra 550B (26.04) | 128 | 256 | 2 | 2 | 1 | 4096 | 1 | 1 | 1 | 64 | - | 128 | TE + DeepEP + torch_mm | 10.05 | 293 | 815 |
 | DeepSeek V3 671B | 1024 | 8192 | 1 | 8 | 4 | 4096 | 1 | 4 | 1 | 64 | 8 | 256 | TE + DeepEP | 37.87 | 216 | 865 |
 | DeepSeek V3 671B | 256 | 512 | 1 | 8 | 1 | 4096 | 1 | 4 | 1 | 64 | 8 | 64 | TE + DeepEP | 8.18 | 250 | 1,002 |
 | Kimi K2 | 256 | 512 | 1 | 8 | 2 | 4096 | 1 | 8 | 1 | 32 | 4 | 32 | TE + DeepEP | 8.86 | 189 | 924 |
@@ -61,6 +62,7 @@ Pre-training and fine-tuning (LoRA) benchmark configurations are available in [`
 - [`deepseek_v3_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/deepseek/deepseek_v3_te_deepep.yaml) - DeepSeek V3 with TE + DeepEP
 - [`kimi_k2_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml) - Kimi K2 optimized configuration
 - [`qwen3_moe_30b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/qwen/qwen3_moe_30b_te_deepep.yaml) - Qwen3 MoE with TE + DeepEP
+- [`nemotron_ultra_v3_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/nemotron/nemotron_ultra_v3_te_deepep.yaml) - Nemotron V3 Ultra 550B with TE + DeepEP
 - [`gptoss_20b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/gpt_oss/gptoss_20b_te_deepep.yaml) - GPT-OSS 20B with optimizations
 - [`gptoss_120b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml) - GPT-OSS 120B optimized
 - [`custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/llama3_3/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml) - Llama3-70B optimized
@@ -81,5 +83,5 @@ Pre-training and fine-tuning (LoRA) benchmark configurations are available in [`
 </Note>
 
 ## Version Information
-- **Last Updated**: 2025-10-02
+- **Last Updated**: 2026-06-12
 - **NeMo AutoModel Version**: `main` Branch
