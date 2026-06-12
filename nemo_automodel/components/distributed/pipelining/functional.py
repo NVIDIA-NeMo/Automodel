@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import functools
 import inspect
 import logging
 import math
@@ -393,6 +394,49 @@ def reset_pp_stage_shapes(
         schedule._stages_backward_initialized = False
 
 
+def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
+    """Make a pipeline stage's ``forward`` emit a tensor, not a ``ModelOutput``.
+
+    Custom ``*ForCausalLM`` / ``*ForConditionalGeneration`` models now return a
+    ``CausalLMOutputWithPast`` from ``forward`` (fused-linear cross-entropy
+    support, ``compute_lm_head_logits``). ``torch.distributed.pipelining``
+    requires every stage to emit a tensor (or tuple/list of tensors):
+    ``PipelineStage._validate_fwd_outputs`` and the inter-stage P2P send/recv
+    treat the output as tensor leaves and read ``.shape`` on each, which raises
+    ``AttributeError: 'CausalLMOutputWithPast' object has no attribute 'shape'``.
+
+    The stage's outer ``forward`` is left intact (a) for models that opt out of
+    patching via ``_pp_keep_self_forward`` and (b) for MoE configs that set
+    ``patch_causal_lm_model=False`` so only the inner model is patched. In both
+    cases the kept outer ``forward`` returns a ``ModelOutput``. This wraps it so
+    the return is unwrapped to its ``.logits`` tensor:
+    ``compute_lm_head_logits`` puts the projected logits there on the final stage
+    and the pass-through ``hidden_states`` on non-final stages (``lm_head is
+    None``) -- exactly the tensor each stage must forward, and the logits the
+    last-stage loss (``PipelineCausalLMLoss`` / ``MaskedCrossEntropy``) consumes.
+
+    No-op when ``forward`` already returns a tensor or a tuple (the patched
+    ``create_pipeline_forward_causal_lm`` path, and MTP models that emit a
+    ``(logits, *mtp, seq_idx)`` tuple), since only ``ModelOutput`` is unwrapped.
+    """
+    from transformers.modeling_outputs import ModelOutput
+
+    original_forward = stage_model.forward
+    # Idempotent: avoid double-wrapping if a stage module is processed twice.
+    if getattr(original_forward, "_pp_unwraps_model_output", False):
+        return
+
+    @functools.wraps(original_forward)
+    def _pp_tensor_forward(*args, **kwargs):
+        output = original_forward(*args, **kwargs)
+        if isinstance(output, ModelOutput):
+            return output.logits
+        return output
+
+    _pp_tensor_forward._pp_unwraps_model_output = True
+    stage_model.forward = _pp_tensor_forward
+
+
 def split_model_into_stages(
     model: torch.nn.Module,
     pp_mesh: DeviceMesh,
@@ -578,6 +622,12 @@ def split_model_into_stages(
 
         # Process the model
         _process_module(stage_model)
+
+        # torch.distributed.pipelining stages must emit tensors. Custom model
+        # forwards now return a CausalLMOutputWithPast; unwrap it to .logits so
+        # stage validation and inter-stage P2P see a tensor. No-op for the
+        # patched-forward path (already returns a tensor).
+        _wrap_stage_forward_to_emit_tensor(stage_model)
 
         # Create pipeline stage
         stage = PipelineStage(
