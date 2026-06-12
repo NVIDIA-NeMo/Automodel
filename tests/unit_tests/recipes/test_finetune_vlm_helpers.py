@@ -1055,7 +1055,7 @@ def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
 
     cfg_model = InvalidModelConfig()
 
-    with pytest.raises(ValueError, match="VLM finetuning requires NeMoAutoModelForImageTextToText"):
+    with pytest.raises(ValueError, match="VLM finetuning requires a recipe-compatible model target"):
         build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
