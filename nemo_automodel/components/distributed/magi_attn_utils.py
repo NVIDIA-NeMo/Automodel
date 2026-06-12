@@ -310,7 +310,9 @@ def make_magi_attn_func(softmax_scale: Optional[float] = None):  # pragma: no co
             import torch.nn.functional as F
 
             qh, kh, vh = (e.transpose(1, 2) if e.dim() == 4 else e for e in (q, k, v))
-            return F.scaled_dot_product_attention(qh, kh, vh, is_causal=True, enable_gqa=True)
+            # Forward the configured scale (None -> SDPA default 1/sqrt(head_dim)) so a
+            # non-default attention scale (e.g. Cohere) is honored on the fallback path too.
+            return F.scaled_dot_product_attention(qh, kh, vh, is_causal=True, scale=softmax_scale, enable_gqa=True)
 
         bshd = q.dim() == 4
         if bshd:

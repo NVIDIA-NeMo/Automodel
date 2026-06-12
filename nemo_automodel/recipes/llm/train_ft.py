@@ -709,6 +709,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build loss_fn (will be set on pipeline_config if PP enabled)
         self.loss_fn = self.cfg.loss_fn.build()
+        # The HF magi dispatch path undispatches full logits before the loss, so it
+        # cannot use FusedLinearCrossEntropy (which fuses lm_head+CE from hidden states
+        # and never materializes logits). Reject the combination up front rather than
+        # failing deep in the loss with a confusing hidden_states=None error.
+        if self.magi.hf_dispatch and isinstance(self.loss_fn, FusedLinearCrossEntropy):  # pragma: no cover
+            raise ValueError(
+                "model.attn_implementation='magi' (HF dispatch path) is incompatible with "
+                "FusedLinearCrossEntropy: magi undispatches full logits before the loss, while "
+                "FusedLinearCrossEntropy computes the loss from hidden states without logits. "
+                "Use a logits-based loss (e.g. MaskedCrossEntropy) with the magi HF backend."
+            )
 
         # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
         if self.pp_enabled:
