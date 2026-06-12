@@ -293,13 +293,13 @@ navigation:
         path: ../../guides/llm/large-moe-finetune.mdx
         slug: large-moe-fine-tuning
       - page: "DeepSeek V4 Flash"
-        path: ../../guides/llm/dsv4-flash.mdx
+        path: ../../guides/llm/dsv4-flash.md
         slug: deepseek-v4-flash
       - page: "Hy3-preview"
-        path: ../../guides/llm/hy3.mdx
+        path: ../../guides/llm/hy3.md
         slug: hy3-preview
       - page: "Fine-Tune Nemotron-3-Ultra-550B"
-        path: ../../guides/llm/nemotron-3-ultra.mdx
+        path: ../../guides/llm/nemotron-3-ultra.md
         slug: nemotron-3-ultra
       - page: "Pretrain Megatron Core Datasets with NeMo AutoModel"
         path: ../../guides/llm/pretraining.mdx
@@ -314,25 +314,25 @@ navigation:
         path: ../../guides/llm/retrieval-finetune.mdx
         slug: retrieval-finetune
       - page: "Fine-Tune Gemma 3 and Gemma 3n"
-        path: ../../guides/omni/gemma3-3n.mdx
+        path: ../../guides/omni/gemma3-3n.md
         slug: gemma-3-3n
       - page: "Fine-Tune Gemma 4 31B on CORD-v2 Receipts — End-to-End Guide"
-        path: ../../guides/vlm/gemma4.mdx
+        path: ../../guides/vlm/gemma4.md
         slug: gemma-4
       - page: "Fine-Tune Qwen3.5-VL"
-        path: ../../guides/vlm/qwen3-5.mdx
+        path: ../../guides/vlm/qwen3-5.md
         slug: qwen3-5-vl
       - page: "Nemotron-Omni"
-        path: ../../guides/vlm/nemotron-omni.mdx
+        path: ../../guides/vlm/nemotron-omni.md
         slug: nemotron-omni
       - page: "Mistral Medium 3.5 VL"
-        path: ../../guides/vlm/mistral-medium-3-5.mdx
+        path: ../../guides/vlm/mistral-medium-3-5.md
         slug: mistral-medium-3-5
       - page: "Fine-Tune Step-3.7-Flash"
-        path: ../../guides/vlm/step-3-7.mdx
+        path: ../../guides/vlm/step-3-7.md
         slug: step-3-7
       - page: "Fine-Tune Qwen3-Omni for ASR"
-        path: ../../guides/audio/qwen3-omni-asr.mdx
+        path: ../../guides/audio/qwen3-omni-asr.md
         slug: qwen3-omni-asr
       - page: "Diffusion Model Fine-Tuning with NeMo AutoModel"
         path: ../../guides/diffusion/finetune.mdx
@@ -344,7 +344,7 @@ navigation:
         path: ../../guides/dllm/finetune.mdx
         slug: dllm-fine-tuning
       - page: "Fine-Tuning DiffusionGemma with NeMo AutoModel"
-        path: ../../guides/dllm/diffusiongemma.mdx
+        path: ../../guides/dllm/diffusiongemma.md
         slug: diffusiongemma
       - page: "Quantization-Aware Training (QAT) in NeMo Automodel"
         path: ../../guides/quantization-aware-training.mdx
