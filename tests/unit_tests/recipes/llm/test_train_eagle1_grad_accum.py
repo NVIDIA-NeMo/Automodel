@@ -117,6 +117,7 @@ def _build_recipe(num_batches: int, grad_accum: int, trainer_module: nn.Module |
     recipe.max_grad_norm = 1e9
     recipe.num_epochs = 1
     recipe.log_every_steps = 1
+    recipe.total_optim_steps = -(-num_batches // grad_accum)
     recipe.optimizer = torch.optim.SGD(recipe.trainer_module.parameters(), lr=0.0)
     recipe.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(recipe.optimizer, lambda s: 1.0)
     return recipe
@@ -190,3 +191,54 @@ def test_no_sync_entered_for_interior_microbatches_under_ddp(tmp_path):
         assert recipe.runtime.global_step == 2
     finally:
         dist.destroy_process_group()
+
+
+# ---------------------------------------------------------------------------
+# Progress bar: one update per optimizer step (incl. trailing flush), closed
+# ---------------------------------------------------------------------------
+
+
+class _FakeProgressBar:
+    def __init__(self):
+        self.n = 0
+        self.postfix = None
+        self.closed = False
+
+    def update(self, count=1):
+        self.n += count
+
+    def set_postfix(self, **kwargs):
+        self.postfix = kwargs
+
+    def close(self):
+        self.closed = True
+
+
+def test_progress_bar_advances_per_optim_step(monkeypatch):
+    fake = _FakeProgressBar()
+    monkeypatch.setattr(TrainEagle1Recipe, "_make_progress_bar", lambda self, **kwargs: fake)
+    # 4 batches / accum 3 -> one full window + one trailing flush = 2 steps.
+    recipe = _build_recipe(num_batches=4, grad_accum=3)
+    recipe.run_train_validation_loop()
+    assert fake.n == recipe.runtime.global_step == 2
+    assert fake.closed
+    assert set(fake.postfix) == {"loss", "acc", "lr"}
+
+
+class _RaisingModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = nn.Parameter(torch.zeros(4))
+
+    def forward(self, **kwargs):
+        raise RuntimeError("boom")
+
+
+def test_progress_bar_closed_when_loop_raises(monkeypatch):
+    """The bar is closed even when the training loop raises (try/finally)."""
+    fake = _FakeProgressBar()
+    monkeypatch.setattr(TrainEagle1Recipe, "_make_progress_bar", lambda self, **kwargs: fake)
+    recipe = _build_recipe(num_batches=2, grad_accum=1, trainer_module=_RaisingModule())
+    with pytest.raises(RuntimeError, match="boom"):
+        recipe.run_train_validation_loop()
+    assert fake.closed
