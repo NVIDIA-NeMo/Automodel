@@ -54,8 +54,8 @@ under `examples/dllm_sft/`:
 
 | Config | Description |
 |--------|-------------|
-| [`diffusion_gemma_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) | Full fine-tune on [GSM8K](https://huggingface.co/datasets/openai/gsm8k) |
-| [`diffusion_gemma_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_lora.yaml) | LoRA fine-tune  |
+| [`diffusion_gemma_sft.yaml`](../../../examples/dllm_sft/diffusion_gemma_sft.yaml) | Full fine-tune on [GSM8K](https://huggingface.co/datasets/openai/gsm8k) |
+| [`diffusion_gemma_lora.yaml`](../../../examples/dllm_sft/diffusion_gemma_lora.yaml) | LoRA fine-tune  |
 
 Both pull the checkpoint from the Hugging Face Hub
 (`google/diffusiongemma-26B-A4B-it`) automatically. GSM8K is consumed in OpenAI
@@ -88,15 +88,11 @@ The SFT and LoRA training curves on GSM8K (first 200 steps) are shown below.
 
 **SFT**
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/dllm/diffusiongemma_sft.png" alt="DiffusionGemma SFT training curves" width="900">
-</p>
+![DiffusionGemma SFT training curves](./diffusiongemma_sft.png)
 
 **LoRA**
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/dllm/diffusiongemma_lora.png" alt="DiffusionGemma LoRA training curves" width="900">
-</p>
+![DiffusionGemma LoRA training curves](./diffusiongemma_lora.png)
 
 
 ## Requirements
