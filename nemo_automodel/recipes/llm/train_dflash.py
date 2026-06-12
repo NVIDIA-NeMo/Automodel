@@ -561,134 +561,154 @@ class TrainDFlashRecipe(BaseRecipe):
                 logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
             return
 
-        for epoch_idx in range(start_epoch, self.num_epochs):
-            if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
-                self.train_dataloader.sampler.set_epoch(epoch_idx)
+        pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
+        try:
+            for epoch_idx in range(start_epoch, self.num_epochs):
+                if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
+                    self.train_dataloader.sampler.set_epoch(epoch_idx)
 
-            running_loss = 0.0
-            running_acc = 0.0
-            running_micro = 0
-            epoch_loss = 0.0
-            micro_step = 0
-            pending_micro_batches = 0
-            completed_steps = 0
-            last_batch_idx = -1
-            num_batches = len(self.train_dataloader)
-            is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
-            for batch_idx, batch in enumerate(self.train_dataloader):
-                last_batch_idx = batch_idx
-                batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-                target_batch = self.target_wrapper.generate_batch(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    loss_mask=batch["loss_mask"],
-                )
-                sync_grads = should_sync_grads(
-                    pending_micro_batches=pending_micro_batches,
-                    grad_accumulation_steps=self.grad_accumulation_steps,
-                    batch_idx=batch_idx,
-                    batches_per_epoch=num_batches,
-                    is_ddp=is_ddp,
-                )
-                sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
-                with sync_ctx:
-                    local_has_valid = 1
-                    try:
-                        metrics = self.trainer_module(
-                            input_ids=target_batch.input_ids,
-                            hidden_states=target_batch.hidden_states,
-                            loss_mask=target_batch.loss_mask,
-                        )
-                        loss = metrics.loss / self.grad_accumulation_steps
-                    except NoValidAnchorsError:
-                        # Every sample in this micro-batch is too short to form a
-                        # block; nothing to learn from it on this rank.
-                        local_has_valid = 0
-                    # Decide skip-vs-backward in lockstep so a per-rank skip never
-                    # leaves one rank issuing its gradient all-reduce alone (DDP
-                    # hang) or desyncs the accumulation windows: if ANY rank has no
-                    # valid anchors, ALL ranks skip this micro-batch together.
-                    all_have_valid = _all_ranks_have_valid(local_has_valid, is_ddp, self.device)
-                    if all_have_valid:
-                        loss.backward()
-                if not all_have_valid:
-                    self._skipped_micro_batches += 1
-                    continue
+                running_loss = 0.0
+                running_acc = 0.0
+                running_micro = 0
+                epoch_loss = 0.0
+                micro_step = 0
+                pending_micro_batches = 0
+                completed_steps = 0
+                last_batch_idx = -1
+                num_batches = len(self.train_dataloader)
+                is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
+                for batch_idx, batch in enumerate(self.train_dataloader):
+                    last_batch_idx = batch_idx
+                    batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+                    target_batch = self.target_wrapper.generate_batch(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        loss_mask=batch["loss_mask"],
+                    )
+                    sync_grads = should_sync_grads(
+                        pending_micro_batches=pending_micro_batches,
+                        grad_accumulation_steps=self.grad_accumulation_steps,
+                        batch_idx=batch_idx,
+                        batches_per_epoch=num_batches,
+                        is_ddp=is_ddp,
+                    )
+                    sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
+                    with sync_ctx:
+                        local_has_valid = 1
+                        try:
+                            metrics = self.trainer_module(
+                                input_ids=target_batch.input_ids,
+                                hidden_states=target_batch.hidden_states,
+                                loss_mask=target_batch.loss_mask,
+                            )
+                            loss = metrics.loss / self.grad_accumulation_steps
+                        except NoValidAnchorsError:
+                            # Every sample in this micro-batch is too short to form a
+                            # block; nothing to learn from it on this rank.
+                            local_has_valid = 0
+                        # Decide skip-vs-backward in lockstep so a per-rank skip never
+                        # leaves one rank issuing its gradient all-reduce alone (DDP
+                        # hang) or desyncs the accumulation windows: if ANY rank has no
+                        # valid anchors, ALL ranks skip this micro-batch together.
+                        all_have_valid = _all_ranks_have_valid(local_has_valid, is_ddp, self.device)
+                        if all_have_valid:
+                            loss.backward()
+                    if not all_have_valid:
+                        self._skipped_micro_batches += 1
+                        continue
 
-                running_loss += metrics.loss.detach().item()
-                running_acc += metrics.accuracy.detach().item()
-                running_micro += 1
-                epoch_loss += metrics.loss.detach().item()
-                micro_step += 1
-                pending_micro_batches += 1
+                    running_loss += metrics.loss.detach().item()
+                    running_acc += metrics.accuracy.detach().item()
+                    running_micro += 1
+                    epoch_loss += metrics.loss.detach().item()
+                    micro_step += 1
+                    pending_micro_batches += 1
 
-                if pending_micro_batches == self.grad_accumulation_steps:
+                    if pending_micro_batches == self.grad_accumulation_steps:
+                        torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                        self.optimizer.step()
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self.lr_scheduler.step()
+                        self.runtime.global_step += 1
+                        if pbar is not None:
+                            pbar.update(1)
+                        completed_steps += 1
+                        pending_micro_batches = 0
+                        self._maybe_save_step_checkpoint(epoch_idx)
+
+                        if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
+                            # Average over the micro-batches accumulated since the last
+                            # log, not over optimizer steps: with grad_accumulation_steps>1
+                            # (or skipped short micro-batches) the two differ, and dividing
+                            # by log_every_steps would inflate the reported loss/acc.
+                            avg_loss = running_loss / max(1, running_micro)
+                            avg_acc = running_acc / max(1, running_micro)
+                            current_lr = self.lr_scheduler.get_last_lr()[0]
+                            if pbar is not None:
+                                pbar.set_postfix(
+                                    loss=f"{avg_loss:.4f}",
+                                    acc=f"{avg_acc:.4f}",
+                                    lr=f"{current_lr:.2e}",
+                                )
+                            logger.info(
+                                "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
+                                epoch_idx,
+                                self.runtime.global_step,
+                                avg_loss,
+                                avg_acc,
+                                current_lr,
+                            )
+                            running_loss = 0.0
+                            running_acc = 0.0
+                            running_micro = 0
+
+                # Flush the trailing partial accumulation window (see EAGLE recipes
+                # for the rescale rationale).
+                if pending_micro_batches > 0:
+                    scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
+                    for p in self.trainer_module.parameters():
+                        if p.grad is not None:
+                            p.grad.mul_(scale)
                     torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.lr_scheduler.step()
                     self.runtime.global_step += 1
+                    if pbar is not None:
+                        pbar.update(1)
                     completed_steps += 1
                     pending_micro_batches = 0
                     self._maybe_save_step_checkpoint(epoch_idx)
 
-                    if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
-                        # Average over the micro-batches accumulated since the last
-                        # log, not over optimizer steps: with grad_accumulation_steps>1
-                        # (or skipped short micro-batches) the two differ, and dividing
-                        # by log_every_steps would inflate the reported loss/acc.
-                        logger.info(
-                            "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
-                            epoch_idx,
-                            self.runtime.global_step,
-                            running_loss / max(1, running_micro),
-                            running_acc / max(1, running_micro),
-                            self.lr_scheduler.get_last_lr()[0],
+                eval_metrics = self._run_eval()
+                if self.dist_env.is_main:
+                    msg = (
+                        f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps} "
+                        f"skipped_short_micro_batches={self._skipped_micro_batches}"
+                    )
+                    if eval_metrics is not None:
+                        msg += (
+                            f" val_loss={eval_metrics['val_loss']:.4f} val_accuracy={eval_metrics['val_accuracy']:.4f}"
                         )
-                        running_loss = 0.0
-                        running_acc = 0.0
-                        running_micro = 0
+                    logger.info(msg)
 
-            # Flush the trailing partial accumulation window (see EAGLE recipes
-            # for the rescale rationale).
-            if pending_micro_batches > 0:
-                scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
-                for p in self.trainer_module.parameters():
-                    if p.grad is not None:
-                        p.grad.mul_(scale)
-                torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
-                self.optimizer.step()
-                self.optimizer.zero_grad(set_to_none=True)
-                self.lr_scheduler.step()
-                self.runtime.global_step += 1
-                completed_steps += 1
-                pending_micro_batches = 0
-                self._maybe_save_step_checkpoint(epoch_idx)
+                if getattr(self, "save_checkpoint_every_epoch", False) and last_batch_idx >= 0:
+                    avg_loss = epoch_loss / max(1, micro_step) if micro_step else None
+                    self.save_checkpoint(
+                        epoch=epoch_idx + 1,
+                        step=self.runtime.global_step,
+                        train_loss=avg_loss,
+                        val_loss=eval_metrics,
+                        best_metric_key="val_loss",
+                        is_final_checkpoint=epoch_idx + 1 >= self.num_epochs,
+                    )
+                    self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
 
-            eval_metrics = self._run_eval()
-            if self.dist_env.is_main:
-                msg = (
-                    f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps} "
-                    f"skipped_short_micro_batches={self._skipped_micro_batches}"
-                )
-                if eval_metrics is not None:
-                    msg += f" val_loss={eval_metrics['val_loss']:.4f} val_accuracy={eval_metrics['val_accuracy']:.4f}"
-                logger.info(msg)
-
-            if getattr(self, "save_checkpoint_every_epoch", False) and last_batch_idx >= 0:
-                avg_loss = epoch_loss / max(1, micro_step) if micro_step else None
-                self.save_checkpoint(
-                    epoch=epoch_idx + 1,
-                    step=self.runtime.global_step,
-                    train_loss=avg_loss,
-                    val_loss=eval_metrics,
-                    best_metric_key="val_loss",
-                    is_final_checkpoint=epoch_idx + 1 >= self.num_epochs,
-                )
-                self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
-
-        self._maybe_save_final_checkpoint(self.num_epochs)
-        self._finalize_pending_checkpoint()
+            self._maybe_save_final_checkpoint(self.num_epochs)
+            self._finalize_pending_checkpoint()
+        finally:
+            if pbar is not None:
+                pbar.close()
 
 
 def main(config_path: str | None = None):
