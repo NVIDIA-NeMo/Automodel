@@ -33,17 +33,17 @@ Use image/video instruction data that matches the target agent workflow. Good ca
 - structured data-processing tasks with visual context,
 - image/video question-answer pairs for bounded task execution.
 
-For a full walkthrough of how multimodal datasets are preprocessed and integrated into NeMo AutoModel, including chat-template conversion and collate functions, see the [Multi-Modal Dataset Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/vlm/dataset.md#multi-modal-datasets).
+For a full walkthrough of how multimodal datasets are preprocessed and integrated into NeMo AutoModel, including chat-template conversion and collate functions, see the [Multi-Modal Dataset Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/vlm/dataset.mdx#multi-modal-datasets).
 
 ## Launch Training
 
 This documentation-only branch does not add a ready-to-use recipe YAML. A future recipe should use `stepfun-ai/Step-3.7-Flash` as both the model and processor checkpoint and should be sized for a large VLM MoE run with pipeline parallelism and expert parallelism.
 
-NeMo AutoModel supports several ways to launch training: the AutoModel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on Slurm batch jobs, multi-node configuration, and environment variables, see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide.
+NeMo AutoModel supports several ways to launch training: the AutoModel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on Slurm batch jobs, multi-node configuration, and environment variables, see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.mdx) guide.
 
 ### Standalone Slurm Skeleton
 
-Before running, make sure your cluster environment is configured following the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide.
+Before running, make sure your cluster environment is configured following the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.mdx) guide.
 
 ```bash
 export TRANSFORMERS_OFFLINE=1

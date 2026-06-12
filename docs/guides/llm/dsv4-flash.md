@@ -50,11 +50,11 @@ A new in-tree `HuggingFaceStorageReader` recognizes `F8_E8M0` and `F8_E5M2` dtyp
 
 A ready-to-use recipe ships at [`examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml). The yaml header documents how to scale `num_hidden_layers` and `ep_size` for the full 43-layer multi-node run.
 
-NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide.
+NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.mdx) guide.
 
 ### Standalone Slurm Script
 
-Below is a standalone Slurm script example for the HellaSwag recipe. Before running it, ensure your cluster environment is configured following the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide. Then submit the job:
+Below is a standalone Slurm script example for the HellaSwag recipe. Before running it, ensure your cluster environment is configured following the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.mdx) guide. Then submit the job:
 
 ```bash
 export TRANSFORMERS_OFFLINE=1
