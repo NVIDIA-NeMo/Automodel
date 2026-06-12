@@ -372,6 +372,20 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # stage-divergent DTensor collectives in initialize_weights() under sharding/PP.
     _skip_init_weights_on_load = True
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class.
+
+        Mirrors the MiniMax M2 backbone: PP + EP are validated; TP is unsupported
+        by the custom MoE parallelizer. Context parallelism for the block-sparse
+        DSA attention is a separate (CP-aware) implementation, so it stays off here.
+        """
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = True
+
     @classmethod
     def from_config(
         cls, config: Any, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs
