@@ -316,7 +316,7 @@ class ModelState:
             # @akoumpa: I'm not sure about this code.
             # For EP models, DCP's set_model_state_dict silently skips EP-sharded
             # LoRA params (strict=False hides the FQN mismatch caused by custom
-            # expert state_dict() keys like gate_up_linear.weight0). Bypass DCP.
+            # expert state_dict() keys like gate_up_linear.weight). Bypass DCP.
             if _has_expert_parallelism(self.model[0]):
                 for model_part in self.model:
                     _set_peft_state_dict(model_part, state_dict)
