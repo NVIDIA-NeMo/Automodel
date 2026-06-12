@@ -40,10 +40,10 @@ navigation:
         slug: performance-summary
   - section: "Model Coverage"
     contents:
-      - page: "Model Coverage Overview"
+      - page: "Overview"
         path: ../../model-coverage/overview.mdx
         slug: overview
-      - page: "Model Release Log"
+      - page: "Release Log"
         path: ../../model-coverage/latest-models.mdx
         slug: release-log
       - section: "Large Language Models"
