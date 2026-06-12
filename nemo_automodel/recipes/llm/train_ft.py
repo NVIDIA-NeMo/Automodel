@@ -1122,7 +1122,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_label_tokens,
         num_batches,
         is_train: bool = True,
-        num_label_tokens_buffer=None,
     ):
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
@@ -1158,12 +1157,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 num_chunks=_num_chunks_value,
             )
         labels = batch.pop("labels")
-        # Count label tokens from the *local* labels actually used in the loss (these are
-        # CP-sharded for backends that shard the sequence, e.g. TE-CP, and replicated for
-        # backends that don't, e.g. magi). The validation reducer sums this with
-        # include_cp=True to match the loss, so the CP factor cancels either way.
-        if num_label_tokens_buffer is not None:
-            num_label_tokens_buffer.append(int((labels != -100).sum().item()))
+        # For validation, return the count from the *local* (post-CP) labels so the reducer
+        # can sum loss and tokens consistently (include_cp=True on both); see
+        # _run_validation_epoch. Skipped during training to avoid a per-microbatch sync.
+        local_num_label_tokens = None if is_train else int((labels != -100).sum().item())
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
@@ -1269,6 +1266,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+
+        return local_num_label_tokens
 
     def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
         """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
@@ -1449,19 +1448,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             for batch in val_dataloader:
                 loss_buffer = []
-                token_buffer = []
-                self._forward_backward_step(
+                local_num_label_tokens = self._forward_backward_step(
                     0,
                     batch,
                     loss_buffer=loss_buffer,
                     num_label_tokens=None,  # we will normalize outside.
                     num_batches=1,
                     is_train=False,
-                    num_label_tokens_buffer=token_buffer,
                 )
 
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
-                total_num_label_tokens += sum(token_buffer)
+                total_num_label_tokens += local_num_label_tokens
 
         # Both loss and token count are reduced with include_cp=True over the *local*
         # (per-rank) values: the loss is per-CP-shard for sharding backends and
