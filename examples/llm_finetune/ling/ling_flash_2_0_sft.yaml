@@ -101,3 +101,8 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
+
+ci:
+  # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
+  recipe_owner: Hayden727
+  nodes: 4

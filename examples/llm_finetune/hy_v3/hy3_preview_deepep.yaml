@@ -66,7 +66,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 4
-  ep_size: 32  # 192 experts / 8 ranks = 24 experts per rank
+  ep_size: 8  # 192 experts / 8 ranks = 24 experts per rank
 
   sequence_parallel: false
   activation_checkpointing: true
@@ -132,3 +132,7 @@ optimizer:
 # wandb:
 #   project: hy3-preview-sft
 #   name: hy3_preview_deepep
+
+ci:
+  # pp_size(4) * ep_size(8) = 32 GPUs => 4 nodes (8 H100/node).
+  nodes: 4
