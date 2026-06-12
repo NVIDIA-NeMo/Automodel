@@ -709,16 +709,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build loss_fn (will be set on pipeline_config if PP enabled)
         self.loss_fn = self.cfg.loss_fn.build()
-        # The HF magi dispatch path undispatches full logits before the loss, so it
-        # cannot use FusedLinearCrossEntropy (which fuses lm_head+CE from hidden states
-        # and never materializes logits). Reject the combination up front rather than
-        # failing deep in the loss with a confusing hidden_states=None error.
         if self.magi.hf_dispatch and isinstance(self.loss_fn, FusedLinearCrossEntropy):  # pragma: no cover
             raise ValueError(
-                "model.attn_implementation='magi' (HF dispatch path) is incompatible with "
-                "FusedLinearCrossEntropy: magi undispatches full logits before the loss, while "
-                "FusedLinearCrossEntropy computes the loss from hidden states without logits. "
-                "Use a logits-based loss (e.g. MaskedCrossEntropy) with the magi HF backend."
+                "The magi HF backend needs full logits and is incompatible with "
+                "FusedLinearCrossEntropy; use a logits-based loss (e.g. MaskedCrossEntropy)."
             )
 
         # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
@@ -1139,8 +1133,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer else 0
         _thd_collater = _uses_thd_collater(self.cfg.dataloader)
+        # Gate THD/cu_seqlens processing on the dataset being THD-packed, not on TE
+        # attention being present on this rank: both TE attention and mamba need
+        # cu_seqlens, and gating on attention would drop PP stages with no attention
+        # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream.
+        _use_te_value = _thd_collater
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
         if self.magi.enabled:
             train_ctx, batch = self.magi.prepare_llm_batch(  # pragma: no cover - requires GPU + magi_attention
@@ -1148,19 +1146,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 batch,
                 device_mesh=self.device_mesh,
                 is_thd=_thd_collater,
-                pad_id=pad_id,
+                pad_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
                 num_chunks=_num_chunks_value,
             )
         else:
-            # Gate THD/cu_seqlens processing on the dataset being THD-packed, not on TE
-            # attention being present on this rank: both TE attention and mamba need
-            # cu_seqlens, and gating on attention would drop PP stages with no attention
-            # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream.
             train_ctx, batch = make_cp_batch_and_ctx(
                 self.device_mesh,
                 batch,
-                use_te=_thd_collater,
-                padding_token_id=pad_id,
+                use_te=_use_te_value,
+                padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
                 num_chunks=_num_chunks_value,
             )
         labels = batch.pop("labels")
