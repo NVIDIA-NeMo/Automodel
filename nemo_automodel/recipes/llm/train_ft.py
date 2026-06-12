@@ -584,6 +584,15 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             val_ds_name = "default"
         return val_ds_name
 
+    # Pack the validation set the same way as training when the attention backend
+    # consumes a THD/cu_seqlens layout. Besides TE, the magi backend also packs (and,
+    # at cp>1, shards) THD sequences; leaving validation unpacked would feed magi tiny
+    # per-example sequences that cp-sharding splits degenerately, inflating val loss.
+    _magi_backend = (
+        str(cfg.get("model.backend.attn", "")) == "magi" or str(cfg.get("model.attn_implementation", "")) == "magi"
+    )
+    _pack_val = (_uses_te_dot_product_attention(cfg.model) or _magi_backend) and _uses_thd_collater(cfg.dataloader)
+
     # Build validation dataloader if the config provides it
     val_dataloaders = {}
     for val_ds_name in filter(lambda x: x.startswith("validation_dataset"), cfg.to_dict().keys()):
@@ -593,9 +602,7 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             val_ds_cfg,
             cfg.validation_dataloader,
             cfg.model,
-            cfg_ps=cfg.get("packed_sequence", None)
-            if _uses_te_dot_product_attention(cfg.model) and _uses_thd_collater(cfg.dataloader)
-            else None,
+            cfg_ps=cfg.get("packed_sequence", None) if _pack_val else None,
             seed=cfg.get("seed", 42),
             local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
             global_batch_size=cfg.get("step_scheduler.global_batch_size", 1),
