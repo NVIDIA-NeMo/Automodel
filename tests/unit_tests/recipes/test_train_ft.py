@@ -31,11 +31,11 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
+from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
+from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import _as_dict, _callable_and_kwargs
-from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
-from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     build_dataloader,
@@ -1057,8 +1057,12 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
 
     # Mock the forward_backward_step to populate loss_buffer
-    def mock_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train):
+    def mock_forward_backward_step(
+        idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train, num_label_tokens_buffer=None
+    ):
         loss_buffer.append(torch.tensor(0.5))
+        if num_label_tokens_buffer is not None:
+            num_label_tokens_buffer.append(int((batch["labels"] != -100).sum().item()))
 
     monkeypatch.setattr(recipe, "_forward_backward_step", mock_forward_backward_step)
 
@@ -1119,8 +1123,12 @@ def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch)
     # Main rank (0) is different from last stage (3)
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
 
-    def mock_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train):
+    def mock_forward_backward_step(
+        idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train, num_label_tokens_buffer=None
+    ):
         loss_buffer.append(torch.tensor(0.0))  # Non-last stage has 0 loss
+        if num_label_tokens_buffer is not None:
+            num_label_tokens_buffer.append(int((batch["labels"] != -100).sum().item()))
 
     monkeypatch.setattr(recipe, "_forward_backward_step", mock_forward_backward_step)
 

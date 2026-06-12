@@ -1110,6 +1110,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_label_tokens,
         num_batches,
         is_train: bool = True,
+        num_label_tokens_buffer=None,
     ):
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
@@ -1145,6 +1146,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 num_chunks=_num_chunks_value,
             )
         labels = batch.pop("labels")
+        # Count label tokens from the *local* labels actually used in the loss (these are
+        # CP-sharded for backends that shard the sequence, e.g. TE-CP, and replicated for
+        # backends that don't, e.g. magi). The validation reducer sums this with
+        # include_cp=True to match the loss, so the CP factor cancels either way.
+        if num_label_tokens_buffer is not None:
+            num_label_tokens_buffer.append(int((labels != -100).sum().item()))
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
@@ -1430,7 +1437,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             for batch in val_dataloader:
                 loss_buffer = []
-                num_label_tokens = (batch["labels"] != -100).sum().item()
+                token_buffer = []
                 self._forward_backward_step(
                     0,
                     batch,
@@ -1438,14 +1445,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     num_label_tokens=None,  # we will normalize outside.
                     num_batches=1,
                     is_train=False,
+                    num_label_tokens_buffer=token_buffer,
                 )
 
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
-                total_num_label_tokens += num_label_tokens
+                total_num_label_tokens += sum(token_buffer)
 
+        # Both loss and token count are reduced with include_cp=True over the *local*
+        # (per-rank) values: the loss is per-CP-shard for sharding backends and
+        # replicated for non-sharding ones (magi), and token_buffer counts the same
+        # local labels — so the CP factor appears in both numerator and denominator and
+        # cancels. (Counting tokens from the global batch with include_cp=False instead
+        # mismatched the CP-summed loss and double-counted it by cp_size.)
         total_loss = self._dp_allreduce(total_loss, include_cp=True)
         total_num_label_tokens = self._dp_allreduce(
-            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device), include_cp=True
         ).item()
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
 
