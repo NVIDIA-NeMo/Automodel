@@ -74,6 +74,19 @@ class MoESplitExpertsStateDictMixin:
         self._inplace_loaded_native_keys.add(tracked)
 
     @property
+    def view_loaded_native_keys(self) -> set[str]:
+        """Native keys loaded in-place via strided views during the most recent ``from_hf``.
+
+        MoE experts with a plain local split are loaded by DCP writing the checkpoint tensors
+        straight through non-contiguous strided views into the model's grouped expert storage.
+        Such keys are intentionally absent from the dict ``from_hf`` returns (the data is already
+        in the model) but are NOT missing. ``_from_hf_w_merged_experts`` records them here so the
+        checkpoint loader can exclude them from false "missing" key-diff warnings. The record is
+        reset at the start of each load by ``_from_hf_w_merged_experts(reset_view_loaded_keys=True)``.
+        """
+        return getattr(self, "_view_loaded_native_keys", None) or set()
+
+    @property
     def _hf_prefix(self) -> str:
         """Prefix for HuggingFace format keys. Override in subclass."""
         return "model." if self._uses_model_prefix else ""
@@ -384,6 +397,7 @@ class MoESplitExpertsStateDictMixin:
         self,
         hf_state_dict: dict[str, Any],
         device_mesh: Optional["DeviceMesh"] = None,
+        reset_view_loaded_keys: bool = True,
     ) -> dict[str, Any]:
         """Convert HF checkpoint to native format.
 
@@ -393,7 +407,17 @@ class MoESplitExpertsStateDictMixin:
 
         For non-gated activations (ReLU²):
             Creates gate_and_up_projs [n_experts, dim, inter_dim] and transposed down_projs tensors.
+
+        Args:
+            reset_view_loaded_keys: Clear the in-place (strided-view) loaded-key record at the
+                start of this call. A single ``from_hf`` may invoke this method more than once
+                (e.g. backbone then MTP merge); the later call(s) pass ``False`` so the view-loaded
+                keys accumulate across one logical load. Resetting here (rather than in the loader)
+                keeps the whole view-key lifecycle inside the adapter and ensures each load starts
+                clean (no leak from a prior load such as an init-time partial load).
         """
+        if reset_view_loaded_keys:
+            self._view_loaded_native_keys = set()
 
         n_experts = self.moe_config.n_routed_experts
         is_gated = self._is_gated_moe
