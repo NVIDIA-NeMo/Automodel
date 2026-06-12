@@ -5,7 +5,7 @@ description: "End-to-end LoRA PEFT fine-tuning of Nemotron-3-Ultra-550B on Hella
 
 ## Introduction
 
-[nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16) is a large language model (LLM) trained by NVIDIA with agentic, reasoning, and conversational capabilities. It supports multi-step agents, long-context analysis, and reasoning over code, math, and science. Like other models in the family, it responds to user queries and tasks by first generating a reasoning trace and then concluding with a final response. The model's reasoning capabilities can be configured through a flag in the chat template.
+[NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16) is a large language model (LLM) trained by NVIDIA with agentic, reasoning, and conversational capabilities. It supports multi-step agents, long-context analysis, and reasoning over code, math, and science. Like other models in the family, it responds to user queries and tasks by first generating a reasoning trace and then concluding with a final response. The model's reasoning capabilities can be configured through a flag in the chat template.
 
 The model employs a hybrid Latent Mixture-of-Experts (LatentMoE) architecture, using interleaved Mamba-2 and MoE layers, along with select Attention layers. Like the Super model, the Ultra model incorporates Multi-Token Prediction (MTP) layers for faster text generation and improved quality. It is also trained using an NVFP4 pre-training recipe to maximize compute efficiency. The model has 55B active parameters and 550B parameters in total.
 
