@@ -1224,7 +1224,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             with train_ctx(), sync_ctx, fp8_ctx:
                 batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy) and not self.magi.hf_dispatch:
+                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
                     if "hidden_states" not in out:
@@ -1234,14 +1234,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else:
                     out = model(**batch)
 
-                logits = self.magi.undispatch_logits(getattr(out, "logits", out))
+                logits = getattr(out, "logits", out)
+                # magi HF path shards the sequence across CP; gather logits back before the loss (no-op otherwise)
+                logits = self.magi.undispatch_logits(logits)
 
                 local_loss = calculate_loss(
                     self.loss_fn,
                     logits=logits,
                     labels=labels,
                     model=model,
-                    hidden_states=None if self.magi.hf_dispatch else get_final_hidden_states(out),
+                    hidden_states=get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
