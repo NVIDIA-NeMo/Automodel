@@ -16,6 +16,7 @@
 import logging
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from nemo_automodel.components.distributed import megatron_fsdp as mfsdp
@@ -43,26 +44,6 @@ def _make_manager(mesh, **config_kwargs):
     """Helper to create a MegatronFSDPManager with a mock mesh and config overrides."""
     config = MegatronFSDPConfig(**config_kwargs)
     return mfsdp.MegatronFSDPManager(config=config, device_mesh=mesh)
-
-
-class _FakeMegatronFSDP:
-    def __init__(self):
-        self.model_auto_sync = False
-        self.finish_grad_sync = MagicMock()
-        self.install_optimized_model_weights = MagicMock()
-        self.zero_grad_buffer = MagicMock()
-
-
-class _FakeOptimizer:
-    def __init__(self):
-        self.step_calls = []
-        self.zero_grad_calls = []
-
-    def step(self, *args, **kwargs):
-        self.step_calls.append((args, kwargs))
-
-    def zero_grad(self, *args, **kwargs):
-        self.zero_grad_calls.append((args, kwargs))
 
 
 def test_parallelize_world_size_one_moves_to_cuda_bf16_and_enables_checkpointing_when_supported(monkeypatch):
@@ -170,29 +151,3 @@ def test_parallelize_world_size_gt_one_skips_tp_plan_when_tp_size_is_one(monkeyp
 
     # zero_dp_strategy default is 3 -> no warning print
     assert capsys.readouterr().out == ""
-
-
-def test_fully_shard_optimizer_wraps_megatron_fsdp_lifecycle(monkeypatch):
-    monkeypatch.setattr(mfsdp, "MegatronFSDP", _FakeMegatronFSDP, raising=True)
-    monkeypatch.setattr(mfsdp, "HAS_MEGATRON_FSDP", True, raising=True)
-
-    model = _FakeMegatronFSDP()
-    optimizer = _FakeOptimizer()
-
-    patched = mfsdp.fully_shard_optimizer(model, optimizer)
-    assert patched is optimizer
-    assert mfsdp.fully_shard_optimizer(model, optimizer) is optimizer
-
-    optimizer.step()
-    model.finish_grad_sync.assert_called_once_with()
-    assert len(optimizer.step_calls) == 1
-    model.install_optimized_model_weights.assert_called_once_with()
-
-    optimizer.zero_grad(set_to_none=True)
-    assert optimizer.zero_grad_calls == [((), {"set_to_none": True})]
-    model.zero_grad_buffer.assert_called_once_with()
-
-    optimizer.step(sync_grad_before_optimizer_step=False, install_optimized_model_weights=False)
-    model.finish_grad_sync.assert_called_once()
-    assert len(optimizer.step_calls) == 2
-    model.install_optimized_model_weights.assert_called_once()

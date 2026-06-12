@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-import types
 from typing import TYPE_CHECKING
 
 import torch
@@ -34,69 +33,13 @@ logger = logging.getLogger(__name__)
 
 try:
     from megatron_fsdp import MegatronFSDP
-    from megatron_fsdp.param_and_grad_buffer import ParamAndGradBuffer, make_fsdp_dtensor
+    from megatron_fsdp.fully_shard import fully_shard_optimizer as megatron_fsdp_fully_shard_optimizer
 
     HAS_MEGATRON_FSDP = True
 except (ImportError, FileNotFoundError, OSError):
     MegatronFSDP = None
-    ParamAndGradBuffer = None
-    make_fsdp_dtensor = None
+    megatron_fsdp_fully_shard_optimizer = None
     HAS_MEGATRON_FSDP = False
-
-
-def _patch_megatron_fsdp_update_main_grads() -> None:
-    """Patch MegatronFSDP DTensor parameters that lose Python-side metadata."""
-    if ParamAndGradBuffer is None or make_fsdp_dtensor is None:
-        return
-    if getattr(ParamAndGradBuffer.update_main_grads, "_nemo_orig_param_fallback", False):
-        return
-
-    def update_main_grads(self):
-        name_to_param = None
-        for name, param in self.optimizer_named_parameters:
-            orig_param = getattr(param, "orig_param", None)
-            if orig_param is None:
-                if name_to_param is None:
-                    name_to_param = {param_name: raw_param for raw_param, param_name in self.param_to_name.items()}
-                orig_param = name_to_param[name]
-            group = self.parameter_groups[self.param_to_param_group[orig_param]]
-            gbuf = group.main_grad_buffer
-            if gbuf is None:
-                continue
-
-            sharded_optimizer_state = self.bucketing_policy.data_parallel_sharding_strategy != "no_shard"
-
-            item_id = group.main_grad_buffer.param_idx[orig_param]
-            optimizer_grad = group.main_grad_buffer.get_item(item_id, only_shard=sharded_optimizer_state)
-            if group.main_weight_buffer is not None:
-                optimizer_grad = optimizer_grad.to(param.dtype)
-
-            if name not in self.dist_main_grad:
-                self.dist_main_grad[name] = make_fsdp_dtensor(
-                    local_tensor=optimizer_grad,
-                    param=orig_param,
-                    dist_index=self.dist_index,
-                    is_sharded_param=sharded_optimizer_state,
-                    is_expert_param=group.is_expert_param,
-                )
-            else:
-                if len(orig_param.shape) > 1:
-                    local_shape = (-1, *orig_param.shape[1:])
-                else:
-                    local_shape = (-1,)
-                self.dist_main_grad[name]._local_tensor = optimizer_grad.view(local_shape)
-            grad = self.dist_main_grad[name]
-
-            if optimizer_grad.numel() == 0:
-                grad = None
-
-            if getattr(self, "use_precision_aware_optimizer", False):
-                setattr(param, "decoupled_grad", grad)
-            else:
-                setattr(param, "grad", grad.to(param.dtype) if grad is not None else None)
-
-    update_main_grads._nemo_orig_param_fallback = True
-    ParamAndGradBuffer.update_main_grads = update_main_grads
 
 
 class MegatronFSDPManager:
@@ -177,8 +120,6 @@ class MegatronFSDPManager:
             if self.device_mesh.get_rank() == 0:
                 print("Warning: MegatronFSDP zero_dp_strategy is not 3. Parameters will not be sharded.")
 
-        _patch_megatron_fsdp_update_main_grads()
-
         if self.device_mesh["tp"].size() > 1:
             # Delegate plan selection to central helper. MegatronFSDP currently does not support SP.
             tp_shard_plan = _get_parallel_plan(
@@ -233,36 +174,7 @@ def fully_shard_optimizer(
         raise ImportError(
             "MegatronFSDP is not installed, please visit https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/distributed/fsdp/src for more information"
         )
-    if getattr(optimizer, "_nemo_megatron_fsdp_optimizer_patched", False):
-        return optimizer
-
-    optimizer_step_base_func = type(optimizer).step
-    optimizer_zero_grad_base_func = type(optimizer).zero_grad
-
-    def megatron_fsdp_optimizer_step(optimizer, *args, **kwargs):
-        sync_grad_before_optimizer_step = kwargs.pop("sync_grad_before_optimizer_step", True)
-        install_optimized_model_weights = kwargs.pop("install_optimized_model_weights", True)
-
-        if sync_grad_before_optimizer_step and not model.model_auto_sync:
-            model.finish_grad_sync()
-
-        optimizer_step_base_func(optimizer, *args, **kwargs)
-
-        if install_optimized_model_weights:
-            model.install_optimized_model_weights()
-
-    def megatron_fsdp_optimizer_zero_grad(optimizer, *args, **kwargs):
-        zero_grad_buffer = kwargs.pop("zero_grad_buffer", True)
-
-        optimizer_zero_grad_base_func(optimizer, *args, **kwargs)
-
-        if zero_grad_buffer:
-            model.zero_grad_buffer()
-
-    optimizer.step = types.MethodType(megatron_fsdp_optimizer_step, optimizer)
-    optimizer.zero_grad = types.MethodType(megatron_fsdp_optimizer_zero_grad, optimizer)
-    optimizer._nemo_megatron_fsdp_optimizer_patched = True
-    return optimizer
+    return megatron_fsdp_fully_shard_optimizer(optimizer)
 
 
 def maybe_shard_optimizer(
