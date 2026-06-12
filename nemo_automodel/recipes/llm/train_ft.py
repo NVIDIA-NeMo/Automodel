@@ -70,11 +70,13 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     to_float_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
@@ -1121,27 +1123,27 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         pad_id = self.tokenizer.pad_token_id if self.tokenizer else 0
         _thd_collater = _uses_thd_collater(self.cfg.dataloader)
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
-        # Gate THD/cu_seqlens processing on the dataset being THD-packed, not on TE
-        # attention being present on this rank: both TE attention and mamba need
-        # cu_seqlens, and gating on attention would drop PP stages with no attention
-        # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream. When the
-        # magi backend is active it builds its own CP/packed layout; otherwise this
-        # delegates to the default ``make_cp_batch_and_ctx`` below.
-        train_ctx, batch = self.magi.prepare_llm_batch(
-            self.model_parts[0] if hasattr(self, "model_parts") else None,
-            batch,
-            device_mesh=self.device_mesh,
-            is_thd=_thd_collater,
-            pad_id=pad_id,
-            num_chunks=_num_chunks_value,
-            default=lambda: make_cp_batch_and_ctx(
+        if self.magi.enabled:
+            train_ctx, batch = self.magi.prepare_llm_batch(  # pragma: no cover - requires GPU + magi_attention
+                self.model_parts[0] if hasattr(self, "model_parts") else None,
+                batch,
+                device_mesh=self.device_mesh,
+                is_thd=_thd_collater,
+                pad_id=pad_id,
+                num_chunks=_num_chunks_value,
+            )
+        else:
+            # Gate THD/cu_seqlens processing on the dataset being THD-packed, not on TE
+            # attention being present on this rank: both TE attention and mamba need
+            # cu_seqlens, and gating on attention would drop PP stages with no attention
+            # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream.
+            train_ctx, batch = make_cp_batch_and_ctx(
                 self.device_mesh,
                 batch,
                 use_te=_thd_collater,
                 padding_token_id=pad_id,
                 num_chunks=_num_chunks_value,
-            ),
-        )
+            )
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
@@ -1206,7 +1208,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             with train_ctx(), sync_ctx, fp8_ctx:
                 batch = filter_forward_kwargs(model, batch)
-                if self.magi.should_use_fused_linear_ce(self.loss_fn):
+                if isinstance(self.loss_fn, FusedLinearCrossEntropy) and not self.magi.hf_dispatch:
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
                     if "hidden_states" not in out:
@@ -1223,7 +1225,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     logits=logits,
                     labels=labels,
                     model=model,
-                    hidden_states=self.magi.loss_hidden_states(out),
+                    hidden_states=None if self.magi.hf_dispatch else get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)

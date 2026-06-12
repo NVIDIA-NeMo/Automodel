@@ -147,33 +147,6 @@ class TestMagiState:
         assert MagiState().undispatch_logits(sentinel) is sentinel
         assert MagiState(enabled=True, custom=True).undispatch_logits(sentinel) is sentinel
 
-    def test_should_use_fused_linear_ce(self):
-        from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-
-        flce = FusedLinearCrossEntropy.__new__(FusedLinearCrossEntropy)  # isinstance-only, skip __init__
-        # off / custom (not hf_dispatch) -> fused path allowed for an FLCE loss
-        assert MagiState().should_use_fused_linear_ce(flce) is True
-        assert MagiState(enabled=True, custom=True).should_use_fused_linear_ce(flce) is True
-        # HF dispatch path needs full logits to undispatch -> fused path disallowed
-        assert MagiState(enabled=True, custom=False).should_use_fused_linear_ce(flce) is False
-        # non-FLCE loss is never the fused path
-        assert MagiState().should_use_fused_linear_ce(object()) is False
-
-    def test_loss_hidden_states_none_on_hf_dispatch(self):
-        # HF dispatch computes the loss from undispatched logits -> no hidden states.
-        assert MagiState(enabled=True, custom=False).loss_hidden_states(object()) is None
-
-    def test_prepare_llm_batch_disabled_delegates_to_default(self):
-        marker = ("ctx", "batch")
-        out = MagiState().prepare_llm_batch(
-            None, {}, device_mesh=None, is_thd=False, pad_id=0, num_chunks=1, default=lambda: marker
-        )
-        assert out is marker
-
-    def test_prepare_vlm_batch_disabled_delegates_to_default(self):
-        marker = ("ctx", "batch")
-        assert MagiState().prepare_vlm_batch(None, {}, default=lambda: marker) is marker
-
 
 # --------------------------------------------------------------------------- #
 # setup_magi
@@ -289,9 +262,7 @@ class TestMagiStateVlmBatch:
     def test_prepare_vlm_batch_non_custom_stamps_backbone(self):
         model = _VLM()
         st = MagiState(enabled=True, custom=False, cp_group=None, cp_size=1)
-        train_ctx, batch = st.prepare_vlm_batch(
-            model, {"input_ids": torch.zeros(1, 4, dtype=torch.long)}, default=lambda: (None, None)
-        )
+        train_ctx, batch = st.prepare_vlm_batch(model, {"input_ids": torch.zeros(1, 4, dtype=torch.long)})
         from contextlib import nullcontext
 
         assert train_ctx is nullcontext
@@ -301,9 +272,7 @@ class TestMagiStateVlmBatch:
         # custom VLMs use the factory attn_func (active cp_group); no stamping here.
         model = _VLM()
         st = MagiState(enabled=True, custom=True)
-        _, batch = st.prepare_vlm_batch(
-            model, {"input_ids": torch.zeros(1, 4, dtype=torch.long)}, default=lambda: (None, None)
-        )
+        _, batch = st.prepare_vlm_batch(model, {"input_ids": torch.zeros(1, 4, dtype=torch.long)})
         assert not hasattr(model.language_model.self_attn, "_magi_self_key")
 
 
