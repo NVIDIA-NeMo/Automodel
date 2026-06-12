@@ -102,7 +102,7 @@ You should be able to see a training loss curve similar to the one shown below:
 </p>
 
 ## Run PEFT (LoRA)
-To apply LoRA (PEFT), uncomment the `peft` block in the config and tune rank/alpha/targets per the [SFT/PEFT guide](finetune.md). Example override:
+To apply LoRA (PEFT), uncomment the `peft` block in the config and tune rank/alpha/targets per the [SFT/PEFT guide](finetune.mdx). Example override:
 
 ```yaml
 peft:

@@ -203,7 +203,7 @@ navigation:
           - page: "LLaVA"
             path: ../../model-coverage/vlm/llava-hf/llava.mdx
           - page: "Step-3.7-Flash"
-            path: ../../model-coverage/vlm/stepfun-ai/step-3-7.mdx
+            path: ../../model-coverage/vlm/stepfun-ai/step-3-7.md
       - section: "Multimodal Models"
         slug: multimodal
         contents:
@@ -281,7 +281,7 @@ navigation:
         path: ../../guides/llm/finetune.mdx
         slug: sft-peft
       - page: "Function Calling with NeMo AutoModel using FunctionGemma"
-        path: ../../guides/llm/toolcalling.mdx
+        path: ../../guides/llm/toolcalling.md
         slug: function-calling
       - page: "Multi-Turn Agent (Tool-Calling) SFT with NeMo AutoModel"
         path: ../../guides/llm/agent-sft.mdx
