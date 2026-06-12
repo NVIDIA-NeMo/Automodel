@@ -437,6 +437,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
 
         with train_ctx, sync_ctx:
+            if is_train:
+                if query is not None:
+                    query["run_dummy_vision"] = False
+                if passage is not None:
+                    passage["run_dummy_vision"] = True
             q_reps = model(query)
             p_reps = model(passage)
             attr_model = _unwrap_model_for_attrs(model)

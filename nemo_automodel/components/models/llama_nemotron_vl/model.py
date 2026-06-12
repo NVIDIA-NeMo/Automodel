@@ -515,6 +515,7 @@ class LlamaNemotronVLModel(PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         num_patches_list: Optional[List[torch.Tensor]] = None,
+        run_dummy_vision: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -550,7 +551,7 @@ class LlamaNemotronVLModel(PreTrainedModel):
 
             input_embeds = input_embeds.reshape(B, N, C)
 
-        elif self.training:
+        elif self.training and run_dummy_vision is not False:
             # If there is no image in the batch, adds a dummy image to the batch
             # to ensure multi-GPU synchronization when there are batches with only text samples and others with image samples
             image_size = self.config.force_image_size or self.config.vision_config.image_size
