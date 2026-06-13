@@ -136,6 +136,19 @@ class TestGetFp32ModuleKeywords:
         model = Model()
         assert _get_fp32_module_keywords(model) == []
 
+    def test_set_and_tuple_accepted(self):
+        # HuggingFace's PreTrainedModel.__init__ converts a class-level list into an
+        # instance-level set; accept set (and tuple) so keep-fp32 keywords are not
+        # silently dropped (regression: this no-op'd the gemma4_moe/diffusion_gemma fix).
+        class Model(nn.Module):
+            _keep_in_fp32_modules = {"norm"}
+            _keep_in_fp32_modules_strict = ("head",)
+
+            def __init__(self):
+                super().__init__()
+
+        assert set(_get_fp32_module_keywords(Model())) == {"norm", "head"}
+
 
 # ---------------------------------------------------------------------------
 # Tests for _restore_fp32_modules()
@@ -226,6 +239,22 @@ class TestCastModelToDtype:
 
         for p in model.parameters():
             assert p.dtype == torch.float16
+
+    def test_set_valued_keep_in_fp32_preserved(self):
+        # Mirrors HF converting _keep_in_fp32_modules (list) to a set on the instance —
+        # the gemma4_moe/diffusion_gemma case. cast_model_to_dtype must still restore it.
+        class M(nn.Module):
+            _keep_in_fp32_modules = {"norm"}
+
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(4, 4)
+                self.norm = nn.LayerNorm(4)
+
+        model = M()
+        cast_model_to_dtype(model, torch.bfloat16)
+        assert model.norm.weight.dtype == torch.float32
+        assert model.linear.weight.dtype == torch.bfloat16
 
 
 # ---------------------------------------------------------------------------
