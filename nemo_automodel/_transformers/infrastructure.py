@@ -641,13 +641,19 @@ def apply_model_infrastructure(
             attach_cp_sdpa_hooks,
         )
 
-        cp_mesh = mesh.device_mesh["cp"]
+        # attach_cp_sdpa_hooks (the DTensor SDPA re-wrap) is only needed under
+        # torch.compile: Dynamo drops DTensor metadata through the compiled graph,
+        # so Q/K/V reach SDPA as plain tensors and must be re-wrapped. Without
+        # compile, PyTorch's context_parallel handles the SDPA dispatch natively.
+        is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
+        cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
 
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
             mp._cp_enabled = True
             attach_context_parallel_hooks(mp)
-            attach_cp_sdpa_hooks(mp, cp_mesh)
+            if is_compile_enabled:
+                attach_cp_sdpa_hooks(mp, cp_mesh)
 
     # Frozen submodules (e.g. a frozen vision tower) either land in the root FSDP unit
     # (sharded) or are excluded from wrapping, depending on the model/parallelizer. In
