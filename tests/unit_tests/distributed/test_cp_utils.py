@@ -28,10 +28,9 @@ from typing import Any
 import pytest
 import torch
 
-from nemo_automodel.components.models.gemma4_moe import cp_batch as _cm
-
 # Import module under test
 from nemo_automodel.components.distributed import cp_utils as _cu
+from nemo_automodel.components.models.gemma4_moe import cp_batch as _cm
 
 
 class _DummySubMesh:
