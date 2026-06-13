@@ -404,7 +404,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         """
         # ``target_model_backend`` selects where the frozen target runs:
         #   - ``colocated`` (default): load the target on this GPU and capture
-        #     supervision in-process.
+        #     supervision in-process via the HuggingFace forward.
+        #   - ``sglang``: like ``colocated`` but the in-process forward runs
+        #     through SGLang's ModelRunner, which is substantially faster than
+        #     the HF eager forward for mainstream architectures.
         #   - ``remote``: the target runs as a standalone server (see
         #     ``serve_target``); this process only holds the draft and pulls
         #     precomputed supervision over HTTP + NCCL. No target weights are
@@ -424,10 +427,12 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         _validate_cp_gates(cp_size, backend, packed_sequence_size)
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
+        elif backend == "sglang":
+            self._setup_sglang_target(recipe_cfg, target_path)
         elif backend == "colocated":
             self._setup_colocated_target(recipe_cfg, target_path)
         else:
-            raise ValueError(f"Unknown target_model_backend={backend!r}; expected 'colocated' or 'remote'.")
+            raise ValueError(f"Unknown target_model_backend={backend!r}; expected 'colocated', 'sglang', or 'remote'.")
 
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
@@ -527,6 +532,44 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
             cp_mesh=self.cp_mesh,
+        )
+
+    def _setup_sglang_target(self, recipe_cfg, target_path):
+        """Co-located SGLang target: serve the frozen target through SGLang on this GPU.
+
+        Same supervision contract as ``colocated`` (full-vocab logits shipped to
+        the trainer, draft-vocab projection trainer-side), but the target forward
+        runs through SGLang's ModelRunner. SGLang carves its weight + KV pool out
+        of this GPU up front (``mem_fraction_static``), and the draft trains in
+        the remainder.
+        """
+        if self.device.type != "cuda":
+            raise ValueError("target_model_backend='sglang' requires CUDA; use 'colocated' for CPU runs.")
+        if self.dist_env.world_size > 1:
+            # SGLang's global parallel state requires world_size == tp_size * pp_size,
+            # so per-rank tp=1 runners cannot share a multi-rank training process
+            # group. Multi-GPU runs split target and draft onto separate processes
+            # instead: ``serve_target --engine sglang`` + ``target_model_backend='remote'``.
+            raise ValueError(
+                "target_model_backend='sglang' supports single-process training only; "
+                "for multi-GPU runs serve the target separately (serve_target --engine sglang) "
+                "and set target_model_backend='remote'."
+            )
+        from nemo_automodel.components.speculative.eagle.sglang_target import SGLangEagle3TargetModel
+
+        sglang_args = recipe_cfg.get("sglang_args", None) or {}
+        sglang_kwargs = sglang_args.to_dict() if hasattr(sglang_args, "to_dict") else dict(sglang_args)
+        # SGLang's ServerArgs default (~0.88 of GPU memory) would starve the
+        # draft's optimizer states and activations; default to half the GPU and
+        # let ``recipe_args.sglang_args.mem_fraction_static`` override.
+        sglang_kwargs.setdefault("mem_fraction_static", 0.5)
+        self.target_model = None
+        self.target_wrapper = SGLangEagle3TargetModel.from_pretrained(
+            target_path,
+            aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
+            dtype=self.compute_dtype,
+            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
+            **sglang_kwargs,
         )
 
     def _setup_remote_target(self, recipe_cfg):
