@@ -1230,11 +1230,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else:
                     out = model(**batch)
 
-                logits = getattr(out, "logits", out)
-
                 local_loss = calculate_loss(
                     self.loss_fn,
-                    logits=logits,
+                    logits=getattr(out, "logits", out),
                     labels=labels,
                     model=model,
                     hidden_states=get_final_hidden_states(out),
