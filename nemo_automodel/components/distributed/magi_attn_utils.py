@@ -28,11 +28,12 @@ This module wires MagiAttention into the HF-transformers-based LLM path used by
    ``ALL_ATTENTION_FUNCTIONS`` so that a model loaded with
    ``attn_implementation="magi"`` routes its attention through the FFA kernel.
 2. ``magi_prepare_batch()`` builds the per-step dist-attn runtime key, dispatches
-   ``input_ids``/``position_ids`` across the CP group and stamps ``cp_group`` on
-   every attention sub-module so the registered forward can find the key.
-3. ``magi_undispatch_logits()`` gathers the sharded logits back to the global
-   (unpadded) sequence before the loss is computed, so the loss is numerically
-   identical to a non-CP run.
+   ``input_ids``/``position_ids``/``labels`` across the CP group and stamps
+   ``cp_group`` on every attention sub-module so the registered forward finds the key.
+3. Each rank runs the model on its local shard and computes a per-shard loss; the
+   recipe's cross-CP reduction sums the shards into the global loss (like TE-CP).
+   Sharding labels (rather than undispatching logits) keeps the loss path identical
+   for the HF and custom-model backends.
 
 When ``cp_size == 1`` the dispatch is a no-op shard (identity + chunk padding),
 so this path is also a clean way to swap *only* the attention kernel (FFA) in
@@ -510,22 +511,27 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
     cp_group: Optional[dist.ProcessGroup],
     chunk_size: int = DEFAULT_CHUNK_SIZE,
 ):
-    """Dispatch a (batch_size==1) packed sequence for MagiAttention.
+    """Dispatch a (batch_size==1) sequence for MagiAttention on the HF path (cp_size==1).
 
-    Builds a causal varlen dist-attn key over the single sequence, dispatches
-    ``input_ids`` and ``position_ids`` across ``cp_group`` and stamps the cp_group
-    on the model's attention modules.  ``labels`` are left global; the caller
-    undispatches the logits before the loss via :func:`magi_undispatch_logits`.
+    Builds a causal varlen dist-attn key over the single sequence and dispatches
+    ``input_ids``, ``position_ids`` *and* ``labels`` (identity shard at cp_size==1).
+    Labels are sharded the same way as the input so the loss is computed per-shard
+    (no logit undispatch); ``MaskedCrossEntropy`` does not shift, so the dispatch
+    permutation is harmless (logits[j] stay paired with labels[j]).
+
+    cp_size>1 is rejected: the HF dispatch path does not yet produce correct cross-rank
+    attention (see the guard below). Context parallelism is supported on the custom-model
+    path (``backend.attn=magi`` -> :func:`magi_prepare_packed_cp`).
 
     Args:
         model: the (possibly FSDP-wrapped) HF causal-LM.
         batch: dict with at least ``input_ids`` of shape ``[1, S]``.
-        cp_group: CP process group (size 1 allowed -> identity shard).
+        cp_group: CP process group (size 1 only; size>1 raises).
         chunk_size: dispatch solver chunk size.
 
     Returns:
-        (new_batch, key): ``new_batch`` has dispatched ``input_ids`` ``[1, local_S]``
-        and ``position_ids`` ``[1, local_S]``; ``key`` is the dist-attn runtime key.
+        (new_batch, key): ``new_batch`` has dispatched ``input_ids``/``position_ids``/
+        ``labels`` (each ``[1, local_S]``); ``key`` is the dist-attn runtime key.
     """
     from magi_attention.api import dispatch, get_position_ids, magi_attn_varlen_key
     from magi_attention.api.functools import compute_pad_size
@@ -542,6 +548,14 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
     device = input_ids.device
     seqlen = input_ids.shape[1]
     cp_size = cp_group.size() if cp_group is not None else 1
+    if cp_size > 1:
+        raise NotImplementedError(
+            "The magi HF backend (attn_implementation=magi) supports cp_size==1 only "
+            "(single-GPU FFA kernel swap). Context parallelism (cp_size>1) is validated on "
+            "the custom-model path (backend.attn=magi); use that for CP. The HF dispatch path "
+            "does not yet produce correct cross-rank attention (FFA calc_attn over a dispatched "
+            "single sequence diverges from the non-CP run)."
+        )
 
     num_heads_q, num_heads_kv, head_dim = _get_head_config(model.module if hasattr(model, "module") else model)
 
@@ -569,6 +583,10 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
     new_batch = dict(batch)
     new_batch["input_ids"] = local_input
     new_batch["position_ids"] = position_ids
+    # Shard labels the same way as the input -> per-shard loss (like the custom path).
+    # pad_value=-100 keeps the trailing dispatch padding out of the loss (ignore_index).
+    if batch.get("labels") is not None:
+        new_batch["labels"] = dispatch(batch["labels"].squeeze(0), key=key, pad_value=-100).unsqueeze(0)
     # Remove anything that no longer matches the dispatched layout.
     new_batch.pop("attention_mask", None)
     return new_batch, key
@@ -708,29 +726,6 @@ def magi_prepare_vlm(
     return batch, None
 
 
-def magi_undispatch_logits(
-    logits: torch.Tensor, cp_group: Optional[dist.ProcessGroup]
-) -> torch.Tensor:  # pragma: no cover - requires GPU + magi_attention
-    """Gather sharded/padded logits back to the global, unpadded sequence.
-
-    Args:
-        logits: model logits ``[1, local_S, V]`` (or ``[local_S, V]``).
-        cp_group: CP process group used for the matching dispatch.
-
-    Returns:
-        Global logits ``[1, S, V]``.
-    """
-    from magi_attention.api import get_most_recent_key, undispatch
-
-    key = get_most_recent_key(cp_group)
-    if key is None:
-        return logits
-    if logits.dim() == 3:
-        logits = logits.squeeze(0)
-    logits = undispatch(logits, key)
-    return logits.unsqueeze(0)
-
-
 @dataclass
 class MagiState:
     """Resolved MagiAttention wiring for a recipe, produced by :func:`setup_magi`.
@@ -748,17 +743,13 @@ class MagiState:
 
     @property
     def hf_dispatch(self) -> bool:
-        """HF path: dispatch the sequence across CP and undispatch logits before the loss.
+        """HF path: dispatch the sequence (input + labels) across CP for a per-shard loss.
 
-        The custom-model path runs the FFA kernel in place (and shards labels for a
-        per-shard loss at cp>1), so it neither dispatches the input nor undispatches
-        logits here.
+        Distinguishes the HF ``attn_implementation=magi`` path (single causal sequence,
+        :func:`magi_prepare_batch`) from the custom-model factory path; both shard labels
+        and compute a per-shard loss at cp>1, so neither undispatches logits.
         """
         return self.enabled and not self.custom
-
-    def undispatch_logits(self, logits):
-        """Undispatch logits to the global sequence on the HF dispatch path; else identity."""
-        return magi_undispatch_logits(logits, self.cp_group) if self.hf_dispatch else logits
 
     def prepare_llm_batch(
         self, model, batch, *, device_mesh, is_thd, pad_id, num_chunks

@@ -141,12 +141,6 @@ class TestMagiState:
     def test_hf_dispatch(self, enabled, custom, expected):
         assert MagiState(enabled=enabled, custom=custom).hf_dispatch is expected
 
-    def test_undispatch_logits_identity_when_not_hf_dispatch(self):
-        sentinel = object()
-        # disabled and custom paths never undispatch -> identity (no magi import needed).
-        assert MagiState().undispatch_logits(sentinel) is sentinel
-        assert MagiState(enabled=True, custom=True).undispatch_logits(sentinel) is sentinel
-
 
 # --------------------------------------------------------------------------- #
 # setup_magi
