@@ -485,15 +485,12 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     model._cp_enabled = True
     _model._cp_enabled = True
 
-    # CP attention routing (model-agnostic):
-    #   * TE DotProductAttention -> TE's own context-parallel group (set here);
-    #   * any other attention     -> the generic CP SDPA hooks (attached after the
-    #     loop). Those hooks route by capability at attention time: a module that
-    #     exposes `run_cp_manual_attention` (e.g. Gemma4 flex ring) runs its
-    #     model-owned CP, otherwise the classic DTensor SDPA CP path is used. No
-    #     model names here -- only the TE-vs-not split; the strategy choice lives
-    #     in cp_utils via the capability check.
-    needs_cp_attention_hooks = False
+    # Route each attention block's CP setup by capability:
+    #   * TE DotProductAttention            -> TE's own context-parallel group;
+    #   * a module exposing setup_cp_attention (e.g. Gemma4's p2p ring) -> installs
+    #     its own CP attention + mask handling, the same way TE/DSV4 owns everything;
+    #   * anything else                     -> the generic mask-strip + DTensor SDPA
+    #     CP hooks, attached once after the loop.
     needs_generic_cp_attention = False
     model_owned_cp_attention = False
     for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
@@ -510,14 +507,11 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                     cp_comm_type=attn_cp_comm_type,
                 )
             elif hasattr(block.self_attn, "setup_cp_attention"):
-                # Model-owned CP attention (e.g. Gemma4 p2p ring): the model
-                # installs its own SDPA hook here; the generic DTensor SDPA path
-                # is not used for it.
+                # Model-owned CP attention (e.g. Gemma4's p2p ring): the model
+                # installs its own SDPA hook + mask handling; no generic hook.
                 block.self_attn.setup_cp_attention(cp_mesh)
-                needs_cp_attention_hooks = True
                 model_owned_cp_attention = True
             else:
-                needs_cp_attention_hooks = True
                 needs_generic_cp_attention = True
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
@@ -547,24 +541,20 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         if isinstance(moe_module, MoE):
             moe_module.cp_mesh = cp_mesh
 
-    if needs_cp_attention_hooks:
-        # Generic (non-model-owned) attention needs the mask-strip + DTensor SDPA
-        # CP hooks. Model-owned attention (e.g. Gemma4's ring) installs both its
-        # transport and its own mask handling in setup_cp_attention -- the same way
-        # TE/DSV4 owns everything -- so no generic hook is attached for it.
-        if needs_generic_cp_attention:
-            from nemo_automodel.components.distributed.cp_utils import (
-                attach_context_parallel_hooks,
-                attach_cp_sdpa_hooks,
-            )
-
-            attach_context_parallel_hooks(_model)
-            attach_cp_sdpa_hooks(_model, cp_mesh)
-        logger.info(
-            "Attached CP attention hooks for %s (%s).",
-            type(_model).__name__,
-            "model-owned setup_cp_attention" if model_owned_cp_attention else "generic DTensor SDPA",
+    if needs_generic_cp_attention:
+        # Generic attention: strip the CP-invalid mask and install the classic
+        # DTensor SDPA CP hooks. (Model-owned attention already set itself up
+        # in the loop above.)
+        from nemo_automodel.components.distributed.cp_utils import (
+            attach_context_parallel_hooks,
+            attach_cp_sdpa_hooks,
         )
+
+        attach_context_parallel_hooks(_model)
+        attach_cp_sdpa_hooks(_model, cp_mesh)
+        logger.info("Attached generic DTensor-SDPA CP attention hooks for %s.", type(_model).__name__)
+    elif model_owned_cp_attention:
+        logger.info("Installed model-owned CP attention (setup_cp_attention) for %s.", type(_model).__name__)
 
 
 def parallelize_model(
