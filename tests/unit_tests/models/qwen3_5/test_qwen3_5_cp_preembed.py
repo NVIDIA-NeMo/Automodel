@@ -110,6 +110,22 @@ class TestPrepareModelInputsForCP:
         )
         assert captured["image_grid_thw"].tolist() == [[1, 2, 2]]
 
+    def test_image_grid_hws_already_thw_passes_through(self):
+        """image_grid_hws already shaped [N, 3] is used as-is (no temporal column prepended)."""
+        captured = {}
+
+        def _rope(input_ids, **kwargs):
+            captured.update(kwargs)
+            return torch.zeros(3, 1, input_ids.shape[1]), torch.zeros(1, 1)
+
+        model = _build_model(rope_index=_rope)
+        image_grid_hws = torch.tensor([[1, 2, 2]])  # [N, 3]
+        model.prepare_model_inputs_for_cp(
+            input_ids=torch.tensor([[5, 6, 7, 8]]),
+            image_grid_hws=image_grid_hws,
+        )
+        assert captured["image_grid_thw"].tolist() == [[1, 2, 2]]
+
     def test_mm_token_type_ids_synthesized_from_token_ids(self):
         """When get_rope_index accepts mm_token_type_ids, it is built from image/video token ids."""
         captured = {}
@@ -123,6 +139,70 @@ class TestPrepareModelInputsForCP:
 
         # token 6 -> image (1), token 8 -> video (2), others 0.
         assert captured["mm_token_type_ids"].tolist() == [[0, 1, 0, 2]]
+
+    def test_image_features_scattered_into_embeds(self):
+        """pixel_values path: image features replace image-token embeddings via masked_scatter."""
+        model = _build_model(image_token_id=99)
+
+        # Visual with a rotary_pos_emb so the device-move branch is exercised.
+        moved = {}
+        model.model.visual = types.SimpleNamespace(
+            rotary_pos_emb=types.SimpleNamespace(to=lambda dev: moved.setdefault("dev", dev))
+        )
+
+        feat = torch.full((1, 4), 8.0)  # one image token, hidden=4
+        model.model.get_image_features = (
+            lambda pixel_values, image_grid_thw=None, return_dict=True: types.SimpleNamespace(pooler_output=[feat])
+        )
+
+        def _mask(input_ids, *, inputs_embeds=None, image_features=None, video_features=None):
+            image_mask = (input_ids == 99).unsqueeze(-1).expand_as(inputs_embeds)
+            return image_mask, torch.zeros_like(image_mask)
+
+        model.model.get_placeholder_mask = _mask
+
+        ids = torch.tensor([[5, 99, 7]])
+        # Pass position_ids so the rope path (covered elsewhere) is skipped here.
+        out = model.prepare_model_inputs_for_cp(
+            input_ids=ids,
+            pixel_values=torch.zeros(1, 3, 2, 2),
+            image_grid_thw=torch.tensor([[1, 2, 2]]),
+            position_ids=torch.zeros(3, 1, 3, dtype=torch.long),
+        )
+
+        emb = out["inputs_embeds"]
+        assert torch.allclose(emb[0, 1], torch.full((4,), 8.0))  # image token overwritten
+        assert torch.allclose(emb[0, 0], torch.full((4,), 5.0))  # text token untouched
+        assert moved["dev"] is not None  # visual.rotary_pos_emb.to(...) ran
+
+    def test_video_features_scattered_into_embeds(self):
+        """pixel_values_videos path: video features replace video-token embeddings."""
+        model = _build_model(video_token_id=88)
+
+        feat = torch.full((1, 4), 3.0)  # one video token, hidden=4
+        model.model.get_video_features = (
+            lambda pixel_values_videos, video_grid_thw=None, return_dict=True: types.SimpleNamespace(
+                pooler_output=[feat]
+            )
+        )
+
+        def _mask(input_ids, *, inputs_embeds=None, image_features=None, video_features=None):
+            video_mask = (input_ids == 88).unsqueeze(-1).expand_as(inputs_embeds)
+            return torch.zeros_like(video_mask), video_mask
+
+        model.model.get_placeholder_mask = _mask
+
+        ids = torch.tensor([[5, 88, 7]])
+        out = model.prepare_model_inputs_for_cp(
+            input_ids=ids,
+            pixel_values_videos=torch.zeros(1, 3, 2, 2),
+            video_grid_thw=torch.tensor([[1, 2, 2]]),
+            position_ids=torch.zeros(3, 1, 3, dtype=torch.long),
+        )
+
+        emb = out["inputs_embeds"]
+        assert torch.allclose(emb[0, 1], torch.full((4,), 3.0))  # video token overwritten
+        assert torch.allclose(emb[0, 2], torch.full((4,), 7.0))  # text token untouched
 
 
 class TestForwardPreEmbedDispatch:
