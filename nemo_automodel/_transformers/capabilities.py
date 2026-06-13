@@ -212,8 +212,10 @@ class ModelSupports:
         +------------------+----------------+---------+
         """
         if _has_backend(self._model):
-            if _is_hybrid(self._model):
-                backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+            backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+            # Hybrids, and custom models that ship their own CP-aware attention and opt in
+            # via ``_supports_cp_sdpa``, may run CP on either TE or SDPA attention.
+            if _is_hybrid(self._model) or getattr(self._model, "_supports_cp_sdpa", False):
                 return backend_attn in ("te", "sdpa")
             return _uses_te_attention(self._model) or _uses_magi_attention(self._model)
         if _is_hybrid(self._model):

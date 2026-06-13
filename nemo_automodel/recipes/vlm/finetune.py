@@ -388,7 +388,17 @@ def build_dataloader(
                 )
                 _pad_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
                 _collate_max_length = packing_cfg.get("collate_max_length", None)
-                _attn_impl = get_attn_implementation(cfg_model)
+                # The packed collater builds a dense [B, 1, S, S] block-causal mask for
+                # sdpa/eager but keeps a cheap indexed [B, S] mask for flash_attention_2.
+                # At long context (e.g. 128k) the dense mask is ~S^2 bytes/sample and
+                # OOMs the dataloader workers. ``packed_sequence.attn_implementation``
+                # overrides the mask form: set it to "flash_attention_2" for
+                # context-parallel runs, where the attention mask is stripped before the
+                # model anyway (document boundaries are recovered from position_ids), so
+                # the indexed form is both sufficient and orders of magnitude cheaper.
+                # Attn compuation still uses sdpa, the attn_implementation attribute in packing_cfg
+                # is only used to swictch the mask format to [B, S] when cp>1.
+                _attn_impl = packing_cfg.get("attn_implementation", None) or get_attn_implementation(cfg_model)
 
                 configure_packing(attn_implementation=_attn_impl)
                 logging.info(f"Configured VLM neat packing for attn_implementation={_attn_impl}")
