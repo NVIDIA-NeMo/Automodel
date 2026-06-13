@@ -1,0 +1,134 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# FULL 60-layer MiniMax M3 VL, cp_size=4, 8k context.
+# 128 GPUs / 16 nodes:  world = pp(4) * dp(8) * cp(4) * tp(1) = 128.
+# ep(32) | dp*cp = 8*4 = 32  (FSDP shards params across dp_shard_cp=32, same as the
+# cp=1 ep32/pp4 recipe -- CP just shards the sequence, so per-GPU param memory is
+# unchanged and per-rank activation seqlen is 8192/4 = 2048).
+#
+# Sparse attention is ON (checkpoint default): layers 3-59 run the CP-aware
+# block-sparse DSA path (MiniMaxM3CPSparseAttention -> all-gather K/V + global
+# block selection + FlexAttention); layers 0-2 use the standard DTensor-SDPA CP path.
+#
+# Mock images at max_length=8192 (divisible by 2*cp=8): a parallelism-interaction
+# cross-check (CP x EP x PP at full depth), NOT a learning/accuracy run. Each sample
+# is a single 8k sequence (no multi-document packing -- packed multi-doc + CP is a
+# known-incorrect path until cu_seqlens-aware per-document masking lands).
+#
+# Submit by pointing the launcher's CONFIG at this file (16 nodes):
+#   examples/vlm_finetune/minimax_m3/launch_sft_ep32pp4_16nodes_genai.sub
+# (set CONFIG=examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_cp4_full_8k.yaml).
+
+recipe: FinetuneRecipeForVLM
+seed: 1234
+
+step_scheduler:
+  # dp = 128 / (pp4 * cp4 * tp1) = 8; global = local(8) * dp(8) * grad_accum(1) = 64.
+  global_batch_size: 64
+  local_batch_size: 8          # >= pp_size (4) is required for the PP microbatch split.
+  ckpt_every_steps: 1000000
+  val_every_steps: 1000000
+  log_remote_every_steps: 1
+  gc_every_steps: 10
+  max_steps: 20
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  # Override to the on-cluster path in the launcher (--model.pretrained_model_name_or_path=...).
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/athittenaman/checkpoints/minimax-m3-bf16_vv1
+  trust_remote_code: false
+  torch_dtype: bfloat16
+  text_config:
+    # bf16 checkpoint ships no MTP weights -> keep 0. Do NOT override
+    # sparse_attention_config (the recipe override replaces, not merges, the dict
+    # and would drop sparse_num_index_heads/...); the checkpoint enables it with
+    # all keys, sparse_attention_freq[3:60]=1 -> layers 3-59 are sparse.
+    num_mtp_modules: 0
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false          # auto-disabled under cp>1 anyway; explicit here.
+    experts: gmm
+    dispatcher: deepep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/athittenaman/checkpoints/minimax-m3-bf16_vv1
+  trust_remote_code: true
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: vlm_checkpoints/minimax_m3_vl_sft_cp4_full_8k/
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 4          # context parallelism under test (full model)
+  pp_size: 4
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: true
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+dataset:
+  # Mock images, single 8k sequence per sample (no multi-doc packing under CP).
+  _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
+  num_samples: 128
+  num_images_per_sample: 1
+  image_size: [256, 256]
+  max_length: 8192
+  seed: 42
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 2
+  pin_memory: true
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 2.0e-6
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 2.0e-7

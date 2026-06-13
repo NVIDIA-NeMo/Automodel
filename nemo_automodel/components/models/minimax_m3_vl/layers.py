@@ -583,7 +583,19 @@ class Block(nn.Module):
         **attn_kwargs: Any,
     ) -> torch.Tensor:
         if attention_mask is not None and padding_mask is None:
-            padding_mask = attention_mask.bool().logical_not()
+            # Derive a per-token [B, T] pad mask (True = pad) for the MoE router.
+            # Needed because packed sequences without CP pass a 4-D block-causal mask
+            # ([B, 1, T, T]) here, and the router needs a flat [B, T]; the old
+            # logical_not() left it 4-D and crashed the MoE (T*T vs T). (Under CP the
+            # mask is stripped before the model, so this only fires on packed-no-CP.)
+            # A 2-D mask is a keep/indexed mask ([B, T], non-zero = real). A packed
+            # block-causal mask is 4-D ([B, 1, T, T]); a token is real iff it attends
+            # itself (diagonal True), so pad tokens (all-False rows) -> True here.
+            if attention_mask.dim() >= 3:
+                diag = torch.diagonal(attention_mask.bool(), dim1=-2, dim2=-1)  # [..., T]
+                padding_mask = diag.reshape(attention_mask.shape[0], -1).logical_not()
+            else:
+                padding_mask = attention_mask.bool().logical_not()
 
         attn_out = self.self_attn(
             x=self.input_layernorm(x),
