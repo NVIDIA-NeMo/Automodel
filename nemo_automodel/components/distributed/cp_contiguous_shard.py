@@ -82,6 +82,82 @@ def _synthesize_single_document_seq_ids(batch: dict, primary_key: str, seq_len: 
         batch["_packed_seq_ids"] = torch.ones((primary.shape[0], seq_len), dtype=torch.long, device=primary.device)
 
 
+def _prepare_manual_cp_batch(cp_mesh, tp_mesh, batch, loss_mask):
+    """Pre-shard prep for the model-owned CP path.
+
+    Kept here (rather than in ``cp_utils.make_cp_batch_and_ctx``) so that
+    function's default, load-balanced path stays identical to upstream. Converts
+    ``attention_mask`` to a ``padding_mask`` (preserving padding semantics for
+    modules such as MoE), selects the primary sequence tensor, injects/normalizes
+    ``position_ids``, and resolves ``labels`` (falling back to ``loss_mask``).
+    """
+    attention_mask = batch.pop("attention_mask", None)
+    if attention_mask is not None and "padding_mask" not in batch:
+        if attention_mask.ndim == 4:
+            diagonal = torch.diagonal(attention_mask[:, 0], dim1=-2, dim2=-1)
+            batch["padding_mask"] = diagonal.logical_not() if attention_mask.dtype == torch.bool else diagonal != 0
+        else:
+            batch["padding_mask"] = attention_mask.bool().logical_not()
+
+    has_inputs_embeds = "inputs_embeds" in batch
+    has_input_ids = "input_ids" in batch
+    assert has_inputs_embeds ^ has_input_ids, (
+        "make_cp_batch_and_ctx requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
+    )
+    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
+    primary_seq_tensor = batch[primary_key]
+    seq_len = primary_seq_tensor.shape[1]
+
+    def _mesh_size(mesh):
+        return 0 if mesh is None else mesh.size()
+
+    batch_size = primary_seq_tensor.shape[0]
+    if "position_ids" not in batch and (_mesh_size(cp_mesh) > 1 or _mesh_size(tp_mesh) > 1):
+        batch["position_ids"] = (
+            torch.arange(0, seq_len, device=primary_seq_tensor.device).unsqueeze(0).expand(batch_size, -1).contiguous()
+        )
+    elif "position_ids" in batch:
+        position_ids = batch["position_ids"]
+        if position_ids.ndim == 2 and position_ids.shape[0] == 1 and batch_size > 1:
+            batch["position_ids"] = position_ids.expand(batch_size, -1).contiguous()
+
+    position_ids = batch["position_ids"]
+    pos_seq_dim = 2 if position_ids.ndim == 3 else 1
+
+    labels = batch.get("labels")
+    if labels is None and loss_mask is not None:
+        labels = loss_mask
+        loss_mask = None
+    if labels is None:
+        raise KeyError("Context parallelism requires `labels` in the batch, or labels passed as `loss_mask`.")
+
+    return primary_key, seq_len, labels, position_ids, pos_seq_dim, loss_mask
+
+
+def make_contiguous_shard_cp_batch_and_ctx(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+    """Prepare and contiguously shard a batch for a model that owns its CP attention.
+
+    Entry point for the ``_cp_manual`` path dispatched from
+    ``cp_utils.make_cp_batch_and_ctx``: runs the shared pre-shard prep, then keeps
+    one contiguous sequence slice per CP rank (no collective; the transport lives
+    in the model's own CP attention).
+    """
+    primary_key, seq_len, labels, position_ids, pos_seq_dim, loss_mask = _prepare_manual_cp_batch(
+        cp_mesh, tp_mesh, batch, loss_mask
+    )
+    return _make_contiguous_shard_cp_batch(
+        cp_mesh,
+        batch,
+        primary_key=primary_key,
+        seq_len=seq_len,
+        labels=labels,
+        position_ids=position_ids,
+        pos_seq_dim=pos_seq_dim,
+        loss_mask=loss_mask,
+        padding_token_id=padding_token_id,
+    )
+
+
 def _make_contiguous_shard_cp_batch(
     cp_mesh,
     batch,

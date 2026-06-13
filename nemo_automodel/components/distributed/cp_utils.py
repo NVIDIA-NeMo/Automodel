@@ -313,29 +313,77 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
             target.register_forward_hook(_post_hook, always_call=True)
 
 
-def _get_submesh(device_mesh, name):
-    if name in getattr(device_mesh, "mesh_dim_names", {}):
-        return device_mesh[name]
-    return None
+def make_cp_batch_and_ctx(
+    device_mesh,
+    batch,
+    loss_mask=None,
+    use_te: bool = False,
+    padding_token_id: int = 0,
+    num_chunks: int = 1,
+    seq_lens_padding_value: int = -1000,
+):
+    """
+    Build a CP context manager and shards a batch. If the input device_mesh is None or the size
+    of the context_parallel submesh is 1, this function is effectively a no-op.
 
+    Args:
+        cp_mesh (DeviceMesh): The device mesh for context parallel.
+        batch (Dict[str, torch.Tensor]): The input batch containing (string, torch.Tensor)
 
-def _get_mesh_size(mesh):
-    if mesh is None:
-        return 0
-    return mesh.size()
+    Returns:
+        tuple (contextmanager, dict[str, torch.Tensor]): Returns a tuple with a context manager
+        and a new batch. The context manager is either nullcontext (no CP) or CP context manager as
+        returned by `create_context_parallel_ctx`. The batch has also been passed to
+        `create_context_parallel_ctx` and is accordingly sharded.
+    """
+    from contextlib import nullcontext
 
+    def _get_submesh(device_mesh, name):
+        if name in getattr(device_mesh, "mesh_dim_names", {}):
+            return device_mesh[name]
+        return None
 
-def _prepare_cp_batch_common(cp_mesh, tp_mesh, batch, loss_mask):
+    def _get_mesh_size(mesh):
+        if mesh is None:
+            return 0
+        return mesh.size()
+
+    cp_mesh = _get_submesh(device_mesh, "cp")
+    tp_mesh = _get_submesh(device_mesh, "tp")
+
+    if use_te:
+        return nullcontext, make_cp_batch_for_te(
+            cp_mesh,
+            batch,
+            padding_token_id=padding_token_id,
+            qkv_format="thd",
+            num_chunks=num_chunks,
+            seq_lens_padding_value=seq_lens_padding_value,
+        )
+
+    if _get_mesh_size(cp_mesh) <= 1:
+        return nullcontext, batch
+
+    # Models that own their CP attention (e.g. Gemma4's p2p ring) mark the batch
+    # to request contiguous sequence sharding instead of PyTorch's load-balanced
+    # ring template; they run their own CP attention over the shards. That path's
+    # prep and sharding live in cp_contiguous_shard so the default path below
+    # stays identical to upstream.
+    if batch.pop("_cp_manual", False):
+        from nemo_automodel.components.distributed.cp_contiguous_shard import (
+            make_contiguous_shard_cp_batch_and_ctx,
+        )
+
+        return make_contiguous_shard_cp_batch_and_ctx(
+            cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id
+        )
+
     # Remove attention_mask from the batch so the model does not attempt to
-    # build a local 4D mask with the wrong key length. Preserve padding
-    # semantics for modules such as MoE.
-    attention_mask = batch.pop("attention_mask", None)
-    if attention_mask is not None and "padding_mask" not in batch:
-        if attention_mask.ndim == 4:
-            diagonal = torch.diagonal(attention_mask[:, 0], dim1=-2, dim2=-1)
-            batch["padding_mask"] = diagonal.logical_not() if attention_mask.dtype == torch.bool else diagonal != 0
-        else:
-            batch["padding_mask"] = attention_mask.bool().logical_not()
+    # build a 4D causal mask (which would have mismatched shapes with
+    # DTensor-sharded Q/K/V).  Each self_attn module's forward_pre_hook
+    # (registered by attach_context_parallel_hooks) will set is_causal=True
+    # so that SDPA handles causal masking internally.
+    batch.pop("attention_mask", None)
 
     # Determine the primary sequence tensor: inputs_embeds (VLM with CP, where
     # multimodal token replacement happened pre-shard) or input_ids (standard LLM).
@@ -344,11 +392,13 @@ def _prepare_cp_batch_common(cp_mesh, tp_mesh, batch, loss_mask):
     assert has_inputs_embeds ^ has_input_ids, (
         "make_cp_batch_and_ctx requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
     )
-    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
-    primary_seq_tensor = batch[primary_key]
+    if has_inputs_embeds:
+        primary_seq_tensor = batch["inputs_embeds"]
+    else:
+        primary_seq_tensor = batch["input_ids"]
     seq_len = primary_seq_tensor.shape[1]
 
-    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed).
+    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
     batch_size = primary_seq_tensor.shape[0]
     if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
         batch["position_ids"] = (
@@ -360,50 +410,55 @@ def _prepare_cp_batch_common(cp_mesh, tp_mesh, batch, loss_mask):
             batch["position_ids"] = position_ids.expand(batch_size, -1).contiguous()
 
     position_ids = batch["position_ids"]
+
+    # Determine correct seq dim for CP sharding
+    # mRoPE: [3, B, S] → shard on dim 2; standard: [B, S] → shard on dim 1
     pos_seq_dim = 2 if position_ids.ndim == 3 else 1
 
-    labels = batch.get("labels")
-    if labels is None and loss_mask is not None:
-        labels = loss_mask
-        loss_mask = None
-    if labels is None:
-        raise KeyError("Context parallelism requires `labels` in the batch, or labels passed as `loss_mask`.")
+    labels = batch["labels"]
 
-    return primary_key, primary_seq_tensor, seq_len, labels, position_ids, pos_seq_dim, loss_mask
-
-
-def _make_context_parallel_cp_batch_and_ctx(
-    cp_mesh,
-    batch,
-    *,
-    primary_key,
-    primary_seq_tensor,
-    seq_len,
-    labels,
-    position_ids,
-    pos_seq_dim,
-    loss_mask,
-):
+    # Collect all available tensors for context parallel.  We track each
+    # cp_buffer's batch key (when sourced from ``batch``) so the padding pass
+    # below can pick the semantically-correct fill sentinel and mirror the
+    # padded tensor back into ``batch``.  ``loss_mask`` is passed as an arg
+    # (not in batch) so it has no key.
+    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
     cp_buffers = [primary_seq_tensor, labels, position_ids]
+    # inputs_embeds is [B, S, H] → seq_dim=1; input_ids is [B, S] → seq_dim=1
     cp_seq_dims = [1, 1, pos_seq_dim]
     cp_no_restore_buffers = {primary_seq_tensor, labels}
     batch_buffer_keys: dict[int, str] = {0: primary_key, 1: "labels", 2: "position_ids"}
 
+    # Add loss_mask if available (passed as arg, not in batch -> no key)
     if loss_mask is not None:
         cp_buffers.append(loss_mask)
         cp_seq_dims.append(1)
         cp_no_restore_buffers.add(loss_mask)
 
+    # Add padding_mask if available in batch
     if "padding_mask" in batch:
+        padding_mask = batch["padding_mask"]
         batch_buffer_keys[len(cp_buffers)] = "padding_mask"
-        cp_buffers.append(batch["padding_mask"])
+        cp_buffers.append(padding_mask)
         cp_seq_dims.append(1)
-        cp_no_restore_buffers.add(batch["padding_mask"])
+        cp_no_restore_buffers.add(padding_mask)
 
+    # Pad sequence length to be divisible by 2 * cp_size (required by
+    # context_parallel load balancing). The inputs_embeds path can hit
+    # arbitrary seq lengths from the VLM collator, so we pad here rather
+    # than relying on dataset-side padding.
+    #
+    # Per-buffer pad sentinels: each tensor's "ignore" value is semantic, not
+    # dtype-derived.  ``labels``/``padding_mask``/``attention_mask`` are all
+    # int/bool but have different ignore conventions.  Falling through to 0
+    # for ``padding_mask`` (== False == "real token") would tell the MoE
+    # router to route the cp-pad slots to experts -- silently wasting capacity
+    # and skewing load-balance loss.
     PAD_FILL = {
-        "labels": -100,
-        "padding_mask": True,
-        "attention_mask": False,
+        "labels": -100,  # CE ignore_index
+        "padding_mask": True,  # bool: True == "this position is pad, ignore"
+        "attention_mask": False,  # HF: 0 == "this position is pad, ignore"
+        # everything else (input_ids, position_ids, ...) -> 0
     }
     cp_divisor = cp_mesh.size() * 2
     if seq_len % cp_divisor != 0:
@@ -422,6 +477,8 @@ def _make_context_parallel_cp_batch_and_ctx(
             if old_buf in cp_no_restore_buffers:
                 new_no_restore.add(cp_buffers[i])
         cp_no_restore_buffers = new_no_restore
+        # Mirror every batch-sourced cp_buffer back into ``batch`` so any
+        # downstream consumer reading from the dict sees the padded shape.
         for idx, key in batch_buffer_keys.items():
             batch[key] = cp_buffers[idx]
 
@@ -432,91 +489,10 @@ def _make_context_parallel_cp_batch_and_ctx(
         cp_no_restore_buffers=cp_no_restore_buffers,
         cp_rotate_method="allgather",  # TODO: expose through cfg
     )
+    # TODO(@akoumparouli): surface these in the future.
     enable_loss_parallel: bool = False
     enable_compiled_autograd: bool = False
     return get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch
-
-
-def make_cp_batch_and_ctx(
-    device_mesh,
-    batch,
-    loss_mask=None,
-    use_te: bool = False,
-    padding_token_id: int = 0,
-    num_chunks: int = 1,
-    seq_lens_padding_value: int = -1000,
-):
-    """
-    Build a CP context manager and shards a batch. If the input device_mesh is None or the size
-    of the context_parallel submesh is 1, this function is effectively a no-op.
-
-    Args:
-        device_mesh (DeviceMesh): The device mesh for context parallel.
-        batch (Dict[str, torch.Tensor]): The input batch containing (string, torch.Tensor)
-
-    Returns:
-        tuple (contextmanager, dict[str, torch.Tensor]): Returns a tuple with a context manager
-        and a new batch. The context manager is either nullcontext (no CP) or CP context manager as
-        returned by `create_context_parallel_ctx`. The batch has also been passed to
-        `create_context_parallel_ctx` and is accordingly sharded.
-    """
-    cp_mesh = _get_submesh(device_mesh, "cp")
-    tp_mesh = _get_submesh(device_mesh, "tp")
-
-    if use_te:
-        return contextlib.nullcontext, make_cp_batch_for_te(
-            cp_mesh,
-            batch,
-            padding_token_id=padding_token_id,
-            qkv_format="thd",
-            num_chunks=num_chunks,
-            seq_lens_padding_value=seq_lens_padding_value,
-        )
-
-    if _get_mesh_size(cp_mesh) <= 1:
-        return contextlib.nullcontext, batch
-
-    # Some model attention masks need a local-query/global-key representation
-    # that PyTorch's ring-template CP path cannot express. Their pre-embed step
-    # marks the batch so we use explicit contiguous sequence sharding and let the
-    # model run its own CP attention (run_cp_manual_attention) over the shards.
-    # Metadata such as mm_token_type_ids or _packed_seq_ids does not select this
-    # path by itself because other VLMs can carry those fields.
-    manual = bool(batch.pop("_cp_manual", False))
-
-    primary_key, primary_seq_tensor, seq_len, labels, position_ids, pos_seq_dim, loss_mask = _prepare_cp_batch_common(
-        cp_mesh,
-        tp_mesh,
-        batch,
-        loss_mask,
-    )
-
-    if manual:
-        from nemo_automodel.components.distributed.cp_contiguous_shard import _make_contiguous_shard_cp_batch
-
-        return _make_contiguous_shard_cp_batch(
-            cp_mesh,
-            batch,
-            primary_key=primary_key,
-            seq_len=seq_len,
-            labels=labels,
-            position_ids=position_ids,
-            pos_seq_dim=pos_seq_dim,
-            loss_mask=loss_mask,
-            padding_token_id=padding_token_id,
-        )
-
-    return _make_context_parallel_cp_batch_and_ctx(
-        cp_mesh,
-        batch,
-        primary_key=primary_key,
-        primary_seq_tensor=primary_seq_tensor,
-        seq_len=seq_len,
-        labels=labels,
-        position_ids=position_ids,
-        pos_seq_dim=pos_seq_dim,
-        loss_mask=loss_mask,
-    )
 
 
 def make_cp_batch_for_te(
