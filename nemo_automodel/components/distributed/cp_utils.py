@@ -245,14 +245,22 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
             module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
 
 
-def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
-    """Inject CP-aware attention into self-attention modules.
+def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
+    """Inject CP-aware SDPA into self_attn modules for compile + CP>1 correctness.
 
-    The installed SDPA wrapper runs the classic PyTorch context_parallel path:
-    it re-wraps local Q/K/V as DTensors so the DTensor SDPA dispatch fires the
-    CP all-gather. Models that own their CP attention (e.g. Gemma4's p2p ring
-    FlexAttention) install their own attention hooks instead and are not routed
-    here.
+    Problem: when per-layer torch.compile is active, Dynamo traces through the decoder
+    layer including Q/K/V projections.  At the F.scaled_dot_product_attention call site,
+    Q/K/V are already local tensors (DTensor metadata was never propagated through the
+    compiled graph).  The DTensor SDPA dispatch — which triggers the CP allgather — never
+    fires, so each rank silently attends only to its local sequence shard.
+
+    Fix: swap F.scaled_dot_product_attention with a @torch._dynamo.disable wrapper for
+    the duration of each self_attn forward.  Dynamo sees the disabled function and creates
+    a graph break there, so:
+      - Everything before (Q/K/V proj + RoPE) is compiled and fused.
+      - The disabled wrapper runs eagerly: re-wraps local Q/K/V as DTensors with
+        Shard(2) on the CP mesh so the DTensor SDPA dispatch fires the allgather.
+      - Everything after (O proj + residual + MLP) is compiled and fused.
 
     Seq dim at the SDPA call is 2: tensors are [B, nH, S/cp_size, D] after HF reshape.
     """
@@ -295,19 +303,12 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
     for name, module in model.named_modules():
-        if _is_cp_attention_module_name(name):
+        if name.endswith("self_attn"):
             # Hook on the inner attention module so the hook fires during both
             # the original forward AND gradient-checkpointing recompute.
             # CheckpointWrapper's recompute bypasses __call__ (and thus pre-hooks
             # on the wrapper itself), so we must hook on the wrapped module directly.
             target = module._checkpoint_wrapped_module if isinstance(module, CheckpointWrapper) else module
-            if hasattr(target, "run_cp_manual_attention"):
-                # Model-owned CP attention (e.g. Gemma4's ring) installs its own
-                # SDPA hook via setup_cp_attention; never overwrite it with the
-                # classic DTensor path (this function may be called by both the
-                # MoE parallelizer and infrastructure.py for the same model).
-                continue
-            target._cp_uses_attention_hook = True
             target.register_forward_pre_hook(_pre_hook, with_kwargs=True)
             # always_call=True ensures _original_sdpa is restored even if the forward raises.
             target.register_forward_hook(_post_hook, always_call=True)

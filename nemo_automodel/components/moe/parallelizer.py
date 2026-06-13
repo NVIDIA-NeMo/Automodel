@@ -555,11 +555,11 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         if needs_generic_cp_attention:
             from nemo_automodel.components.distributed.cp_utils import (
                 attach_context_parallel_hooks,
-                attach_cp_attention_hooks,
+                attach_cp_sdpa_hooks,
             )
 
             attach_context_parallel_hooks(_model)
-            attach_cp_attention_hooks(_model, cp_mesh)
+            attach_cp_sdpa_hooks(_model, cp_mesh)
         logger.info(
             "Attached CP attention hooks for %s (%s).",
             type(_model).__name__,

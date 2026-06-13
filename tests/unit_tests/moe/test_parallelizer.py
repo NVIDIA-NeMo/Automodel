@@ -2312,7 +2312,7 @@ class _FakeBlockWithAttn:
 def _stub_dense_cp_hooks(monkeypatch):
     cp_utils_stub = types.ModuleType("nemo_automodel.components.distributed.cp_utils")
     cp_utils_stub.attach_context_parallel_hooks = MagicMock()
-    cp_utils_stub.attach_cp_attention_hooks = MagicMock()
+    cp_utils_stub.attach_cp_sdpa_hooks = MagicMock()
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.cp_utils", cp_utils_stub)
     return cp_utils_stub
 
@@ -2348,7 +2348,7 @@ def test_apply_cp_attaches_dense_hooks_for_non_te_attention(monkeypatch):
 
     assert model._cp_enabled is True
     cp_utils_stub.attach_context_parallel_hooks.assert_called_once_with(model)
-    cp_utils_stub.attach_cp_attention_hooks.assert_called_once_with(model, cp_mesh)
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_called_once_with(model, cp_mesh)
 
 
 def test_apply_cp_flags_model_owned_attention_when_run_cp_manual_present(monkeypatch):
@@ -2379,7 +2379,7 @@ def test_apply_cp_flags_model_owned_attention_when_run_cp_manual_present(monkeyp
     P.apply_cp(model, cp_mesh)
 
     # hooks still attached; this run exercises the model_owned_cp_attention=True branch
-    cp_utils_stub.attach_cp_attention_hooks.assert_called_once_with(model, cp_mesh)
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_called_once_with(model, cp_mesh)
 
 
 def test_apply_cp_skips_attention_without_attn_module(monkeypatch):
@@ -2409,7 +2409,7 @@ def test_apply_cp_skips_attention_without_attn_module(monkeypatch):
 
     P.apply_cp(model, cp_mesh)
     cp_mesh.get_group.assert_not_called()
-    cp_utils_stub.attach_cp_attention_hooks.assert_called_once_with(model, cp_mesh)
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_called_once_with(model, cp_mesh)
 
 
 def _setup_te_and_dist_stubs(monkeypatch, DotProductAttention):
@@ -2497,7 +2497,7 @@ def test_apply_cp_mixed_te_and_non_te(monkeypatch):
     P.apply_cp(model, cp_mesh)
 
     te_attn.set_context_parallel_group.assert_called_once()
-    cp_utils_stub.attach_cp_attention_hooks.assert_called_once_with(model, cp_mesh)
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_called_once_with(model, cp_mesh)
 
 
 # ============================================================================

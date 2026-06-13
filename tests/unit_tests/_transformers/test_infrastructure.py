@@ -603,7 +603,7 @@ def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
             side_effect=lambda mp: attached.__setitem__("ctx", attached["ctx"] + 1),
         ),
         patch(
-            "nemo_automodel.components.distributed.cp_utils.attach_cp_attention_hooks",
+            "nemo_automodel.components.distributed.cp_utils.attach_cp_sdpa_hooks",
             side_effect=lambda mp, cp_mesh: attached.__setitem__("attn", attached["attn"] + 1),
         ),
     ):

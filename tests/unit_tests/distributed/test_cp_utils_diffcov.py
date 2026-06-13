@@ -87,7 +87,7 @@ def test_context_parallel_hook_uses_attention_hook_branch():
 
 
 # ---------------------------------------------------------------------------
-# attach_cp_attention_hooks: classic DTensor SDPA path. (Model-owned CP attention,
+# attach_cp_sdpa_hooks: classic DTensor SDPA path. (Model-owned CP attention,
 # e.g. Gemma4's p2p ring, is installed by the model via setup_cp_attention and is
 # covered under tests/unit_tests/models/gemma4.)
 # ---------------------------------------------------------------------------
@@ -101,13 +101,13 @@ def test_cp_attention_hooks_dtensor_sdpa_path():
         def from_local(t, device_mesh=None, placements=None):
             return t  # identity: treat local tensor as already-distributed
 
-    # attach_cp_attention_hooks imports DTensor/Shard at attach time, so patch
+    # attach_cp_sdpa_hooks imports DTensor/Shard at attach time, so patch
     # before attaching.
     with (
         mock.patch("torch.distributed.tensor.DTensor", _FakeDTensor),
         mock.patch("torch.distributed.tensor.Shard", lambda d: ("shard", d)),
     ):
-        cu.attach_cp_attention_hooks(model, _FakeMesh(size=2))
+        cu.attach_cp_sdpa_hooks(model, _FakeMesh(size=2))
         out = attn(q, k, v)
     ref = F.scaled_dot_product_attention(q, k, v)
     assert torch.allclose(out, ref)
@@ -122,7 +122,7 @@ def test_cp_attention_hooks_restores_sdpa_on_exception():
     original = F.scaled_dot_product_attention
     attn = _BoomAttn()
     model = _Wrapper(attn)
-    cu.attach_cp_attention_hooks(model, _FakeMesh(size=2))
+    cu.attach_cp_sdpa_hooks(model, _FakeMesh(size=2))
     q, k, v = _qkv()
     with pytest.raises(RuntimeError, match="boom"):
         attn(q, k, v)

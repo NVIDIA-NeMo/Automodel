@@ -638,7 +638,7 @@ def apply_model_infrastructure(
     if mesh.cp_size > 1 and mesh.ep_size <= 1 and not _uses_te_attention(model):
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
-            attach_cp_attention_hooks,
+            attach_cp_sdpa_hooks,
         )
 
         cp_mesh = mesh.device_mesh["cp"]
@@ -647,7 +647,7 @@ def apply_model_infrastructure(
         for mp in model_parts:
             mp._cp_enabled = True
             attach_context_parallel_hooks(mp)
-            attach_cp_attention_hooks(mp, cp_mesh)
+            attach_cp_sdpa_hooks(mp, cp_mesh)
 
     # Frozen submodules (e.g. a frozen vision tower) either land in the root FSDP unit
     # (sharded) or are excluded from wrapping, depending on the model/parallelizer. In
