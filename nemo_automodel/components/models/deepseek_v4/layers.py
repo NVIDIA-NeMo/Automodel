@@ -852,9 +852,7 @@ class DeepseekV4Indexer(nn.Module):
         self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
         self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
         self.ape_param = DeepseekV4FP32Parameter(torch.zeros(self.compress_ratio, proj_dim, dtype=torch.float32))
-        self.kv_norm = initialize_rms_norm_module(
-            "torch_fp32", self.head_dim, eps=config.rms_norm_eps, dtype=torch.float32
-        )
+        self.kv_norm = initialize_rms_norm_module("torch_fp32", self.head_dim, eps=config.rms_norm_eps)
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         # vLLM keeps indexer.wq_b in FP8 (generic block FP8 with UE8M0
@@ -964,9 +962,7 @@ class DeepseekV4Compressor(nn.Module):
         self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
         self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
         self.ape_param = DeepseekV4FP32Parameter(torch.zeros(compress_ratio, proj_dim, dtype=torch.float32))
-        self.kv_norm = initialize_rms_norm_module(
-            "torch_fp32", head_dim, eps=config.rms_norm_eps, dtype=torch.float32
-        )
+        self.kv_norm = initialize_rms_norm_module("torch_fp32", head_dim, eps=config.rms_norm_eps)
         self.indexer: DeepseekV4Indexer | None = (
             DeepseekV4Indexer(config, backend=self.backend) if compress_ratio == 4 else None
         )
@@ -1247,14 +1243,10 @@ class DeepseekV4Attention(nn.Module):
         self.fp8_ds_mla_fake_quant_attn_proj = bool(getattr(config, "fp8_ds_mla_fake_quant_attn_proj", False))
 
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
-        self.q_norm = initialize_rms_norm_module(
-            "torch_fp32", config.q_lora_rank, eps=config.rms_norm_eps, dtype=torch.float32
-        )
+        self.q_norm = initialize_rms_norm_module("torch_fp32", config.q_lora_rank, eps=config.rms_norm_eps)
         self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
         self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
-        self.kv_norm = initialize_rms_norm_module(
-            "torch_fp32", self.head_dim, eps=config.rms_norm_eps, dtype=torch.float32
-        )
+        self.kv_norm = initialize_rms_norm_module("torch_fp32", self.head_dim, eps=config.rms_norm_eps)
         self.wo_a = DeepseekV4GroupedLinear(
             self.num_heads * self.head_dim // config.o_groups,
             config.o_groups * config.o_lora_rank,
