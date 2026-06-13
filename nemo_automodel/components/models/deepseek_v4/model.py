@@ -63,6 +63,11 @@ from nemo_automodel.components.models.deepseek_v4.config import (
     deepseek_v4_compress_rope_scaling,
     deepseek_v4_is_hash_routing_layer,
 )
+from nemo_automodel.components.models.deepseek_v4.cp import (
+    build_dsv4_cp_causal_padding_mask,
+    dsv4_cp_enabled,
+    dsv4_cp_size,
+)
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
     DeepseekV4HyperConnection,
@@ -159,6 +164,7 @@ class DeepseekV4Block(nn.Module):
         self,
         x: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.Tensor | None = None,
         position_embeddings_compress: tuple[torch.Tensor, torch.Tensor] | None = None,
         rotary_compress: nn.Module | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -183,6 +189,8 @@ class DeepseekV4Block(nn.Module):
                 attention_mask=attention_mask,
                 position_embeddings_compress=position_embeddings_compress,
                 rotary_compress=rotary_compress,
+                position_ids=position_ids,
+                **attn_kwargs,
             )
             dtype = hidden_streams.dtype
             # Expand: native DSV4 uses comb[j, h] * residual[j], i.e. comb.T @ residual.
@@ -478,6 +486,8 @@ class DeepseekV4Model(nn.Module):
         if position_ids is None:
             seq_len = shape_ref.shape[1]
             position_ids = torch.arange(seq_len, device=shape_ref.device).unsqueeze(0).expand(shape_ref.shape[0], -1)
+        elif position_ids.shape[0] == 1 and shape_ref.shape[0] > 1:
+            position_ids = position_ids.expand(shape_ref.shape[0], -1).contiguous()
 
         # (cos, sin) pairs for the main attention path and the compressor path.
         # Rotary modules live on every stage (PP keep-list ensures it).
@@ -496,7 +506,25 @@ class DeepseekV4Model(nn.Module):
             packed_seq_lens = attn_kwargs.get("seq_lens_padded")
             if packed_seq_lens is None:
                 packed_seq_lens = attn_kwargs.get("seq_lens")
-        if packed_seq_lens is not None:
+        cp_group = attn_kwargs.get("_dsv4_cp_group")
+        cp_active = dsv4_cp_enabled(cp_group)
+        if cp_active and packed_seq_lens is not None:
+            raise NotImplementedError("DeepSeek V4 context parallelism with packed sequences is not implemented yet.")
+
+        if cp_active:
+            cp_padding_mask = padding_mask
+            if cp_padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
+                cp_padding_mask = attention_mask.bool().logical_not()
+            attention_mask_4d = build_dsv4_cp_causal_padding_mask(
+                position_ids=position_ids,
+                key_len=shape_ref.shape[1] * dsv4_cp_size(cp_group),
+                dtype=shape_ref.dtype,
+                device=shape_ref.device,
+                cp_group=cp_group,
+                padding_mask=cp_padding_mask,
+                sliding_window=sliding_window,
+            )
+        elif packed_seq_lens is not None:
             attention_mask_4d = build_packed_causal_padding_mask(
                 packed_seq_lens,
                 seq_len=shape_ref.shape[1],
@@ -525,6 +553,7 @@ class DeepseekV4Model(nn.Module):
             h = layer(
                 x=h,
                 position_embeddings=position_embeddings,
+                position_ids=position_ids,
                 position_embeddings_compress=position_embeddings_compress,
                 rotary_compress=self.rotary_emb_compress,
                 attention_mask=attention_mask_4d,
@@ -881,20 +910,37 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             if position_ids is None:
                 position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
             sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
-            mtp_attn_mask = build_causal_padding_mask(
-                attention_mask,
-                seq_len=seq_len,
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-                batch_size=batch_size,
-                sliding_window=sliding_window,
-            )
+            cp_group = attn_kwargs.get("_dsv4_cp_group")
+            if dsv4_cp_enabled(cp_group):
+                cp_padding_mask = padding_mask
+                if cp_padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
+                    cp_padding_mask = attention_mask.bool().logical_not()
+                mtp_attn_mask = build_dsv4_cp_causal_padding_mask(
+                    position_ids=position_ids,
+                    key_len=seq_len * dsv4_cp_size(cp_group),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                    cp_group=cp_group,
+                    padding_mask=cp_padding_mask,
+                    sliding_window=sliding_window,
+                )
+            else:
+                mtp_attn_mask = build_causal_padding_mask(
+                    attention_mask,
+                    seq_len=seq_len,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                    batch_size=batch_size,
+                    sliding_window=sliding_window,
+                )
             mtp_kwargs = {
                 "hidden_states": mtp_hc_hidden,
                 "position_ids": position_ids,
                 "attention_mask": mtp_attn_mask,
                 "padding_mask": padding_mask,
             }
+            if cp_group is not None:
+                mtp_kwargs["_dsv4_cp_group"] = cp_group
             if mtp_embed_inputs:
                 mtp_kwargs["embed_inputs"] = tuple(mtp_embed_inputs)
             else:

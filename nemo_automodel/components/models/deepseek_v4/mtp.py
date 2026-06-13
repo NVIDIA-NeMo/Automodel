@@ -155,6 +155,7 @@ class DeepseekV4MTPBlock(nn.Module):
             attention_mask=attention_mask,
             position_embeddings_compress=position_embeddings_compress,
             rotary_compress=self._rotary_emb_compress,
+            position_ids=position_ids,
             **attn_kwargs,
         )
         dtype = hidden_states.dtype
