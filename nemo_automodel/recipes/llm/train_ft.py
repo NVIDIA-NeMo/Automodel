@@ -1231,8 +1231,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     out = model(**batch)
 
                 logits = getattr(out, "logits", out)
-                # magi HF path shards the sequence across CP; gather logits back before the loss (no-op otherwise)
-                logits = self.magi.undispatch_logits(logits)
+                if self.magi.hf_dispatch:
+                    # magi sharded the sequence across CP; gather logits back before the loss
+                    logits = self.magi.undispatch_logits(logits)
 
                 local_loss = calculate_loss(
                     self.loss_fn,
@@ -1457,12 +1458,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
                 total_num_label_tokens += num_label_tokens
 
-        # The loss is summed over DP×CP (include_cp=True). For the magi HF path the logits
-        # are undispatched, so every CP rank holds the full *replicated* loss; reduce the
-        # token count over CP too so the cp_size factor cancels in the ratio. Other backends
-        # (TE-CP, magi-custom) compute per-shard losses whose CP-sum is already the global
-        # loss, so the token count keeps main's DP-only reduce. Relies on magi HF labels
-        # staying global (magi_prepare_batch dispatches only the input).
+        # magi HF replicates the (global-label) loss on every CP rank, so the token count
+        # must reduce over CP too for the cp_size factor to cancel. Per-shard backends
+        # (TE-CP, magi-custom) keep main's DP-only token reduce.
         total_loss = self._dp_allreduce(total_loss, include_cp=True)
         total_num_label_tokens = self._dp_allreduce(
             torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device),
