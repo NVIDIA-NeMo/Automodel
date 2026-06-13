@@ -12,10 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# LoRA fine-tuning recipe for deepseek-ai/DeepSeek-V4-Flash on HellaSwag.
-# LoRA target: 4 nodes x 8 H100-80GB = 32 GPUs, PP=1 EP=32 DP=32.
-# Estimate: routed-expert bf16 weights are ~550 GB; EP=32 gives 8 routed
-# experts/rank and avoids full base optimizer state.
+# LoRA fine-tuning of deepseek-ai/DeepSeek-V4-Flash on HellaSwag with the frozen
+# routed experts kept resident in mxfp4 (fp4-e2m1 + e8m0 block scales) and
+# dequantized on the fly in the grouped-GEMM forward/backward.
+#
+# Only the experts are quantized; every other weight (MLA attention, dense MLP,
+# embeddings, MTP, lm_head) stays bf16. The routed experts are ~90%+ of the
+# parameters, so packing them to ~4 bits cuts steady-state base-weight memory by
+# roughly 4x relative to the bf16 LoRA recipe.
+#
+# v1 constraint: mxfp4 experts require the torch_mm GroupedExperts backend, so
+# this recipe uses dispatcher=torch (NOT deepep). DeepEP + mxfp4 is a follow-up.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -35,10 +42,13 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 32
+  # Single node, 8x H200: ep_size must divide dp_size*cp_size (= world_size here).
+  ep_size: 8
 
   sequence_parallel: false
-  activation_checkpointing: false
+  # Recommended on: the 43-layer activation footprint, not the (now-packed) expert
+  # weights, is the steady-state pressure once experts are mxfp4.
+  activation_checkpointing: true
 
   moe:
     reshard_after_forward: false
@@ -63,7 +73,8 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    dispatcher: deepep
+    # mxfp4 experts run on the torch_mm grouped-GEMM path (DeepEP not yet supported).
+    dispatcher: torch
     experts: torch_mm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -75,12 +86,20 @@ peft:
     - "*wq_b"
     - "*wkv"
     - "*wo_b"
+    - "*mlp.experts"               # routed experts: mxfp4-resident base + LoRA (GroupedExpertsLoRAMXFP4)
+    - "*shared_experts.gate_proj"  # shared experts: standard bf16 LoRA
+    - "*shared_experts.up_proj"
+    - "*shared_experts.down_proj"
   dim: 8
   alpha: 32
   use_triton: True
+  # Keep the frozen routed experts packed as mxfp4 and dequantize on the fly.
+  expert_weight_format: mxfp4
 
 checkpoint:
   enabled: false
+  # The DSV4-Flash checkpoint stores experts as fp4; they are dequantized to bf16
+  # on load and then repacked to mxfp4 (Phase A). Required for the current flow.
   dequantize_base_checkpoint: true
 
 loss_fn:
