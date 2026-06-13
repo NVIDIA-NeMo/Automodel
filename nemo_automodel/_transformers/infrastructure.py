@@ -631,20 +631,20 @@ def apply_model_infrastructure(
     # so that SDPA handles causal masking internally (compatible with DTensor sharding).
     #
     # MoE models (ep_size > 1) get their full CP setup from the MoE parallelizer's
-    # apply_cp (via _shard_ep_fsdp), which routes TE attention to its own CP group,
-    # model-owned attention (e.g. Gemma4's ring) to setup_cp_attention, and generic
-    # attention to these same hooks -- so running them again here would be redundant
-    # (and previously double-applied them to Gemma4). Only dense models need this pass.
+    # apply_cp (via _shard_ep_fsdp): TE attention -> its own CP group; model-owned
+    # attention (e.g. Gemma4's ring) -> setup_cp_attention. Re-running this dense
+    # pass for them is not just redundant -- it would mask-strip their vision tower
+    # and clobber the model-owned ring (the original double-apply bug). Non-TE MoE
+    # is not excluded by the _uses_te_attention check, so gate on ep_size: only
+    # dense (non-MoE) models need this pass.
     if mesh.cp_size > 1 and mesh.ep_size <= 1 and not _uses_te_attention(model):
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
             attach_cp_sdpa_hooks,
         )
 
-        # attach_cp_sdpa_hooks (the DTensor SDPA re-wrap) is only needed under
-        # torch.compile: Dynamo drops DTensor metadata through the compiled graph,
-        # so Q/K/V reach SDPA as plain tensors and must be re-wrapped. Without
-        # compile, PyTorch's context_parallel handles the SDPA dispatch natively.
+        # The DTensor SDPA re-wrap is only needed under torch.compile (Dynamo drops
+        # DTensor metadata); without compile, context_parallel dispatches natively.
         is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
         cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
 
