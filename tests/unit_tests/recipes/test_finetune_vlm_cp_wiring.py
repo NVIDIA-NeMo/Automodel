@@ -594,12 +594,10 @@ def test_val_pos_ids_uses_dist_env_device_not_model_device():
         _ = torch.arange(0, 4).unsqueeze(0).to(model.device)
 
 
-def test_run_validation_epoch_reduces_tokens_over_cp(monkeypatch):
-    """The VLM recipe shards labels *before* counting (``local_num_label_tokens``
-    is the per-CP-shard count), so ``total_tokens`` / ``total_num_label_tokens``
-    must be all-reduced WITH include_cp=True — matching the CP-summed
-    ``total_loss`` — so ``val_loss = total_loss / total_num_label_tokens`` divides
-    like-for-like. Guards finetune.py:_run_validation_epoch."""
+def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
+    """``total_loss`` is all-reduced with include_cp=True, but ``total_tokens``
+    (measured pre-CP-shard) must NOT include CP — otherwise val_loss is scaled
+    down by cp_size. Guards the fix at finetune.py:_run_validation_epoch."""
     from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
     # No-op replacements for the heavy collaborators.
@@ -628,7 +626,7 @@ def test_run_validation_epoch_reduces_tokens_over_cp(monkeypatch):
     allreduce_calls = []
 
     def _fake_allreduce(tensor, include_cp=False):
-        allreduce_calls.append((tensor.dtype, tensor.tolist(), include_cp))
+        allreduce_calls.append((tensor.tolist(), include_cp))
         return tensor
 
     recipe._dp_allreduce = _fake_allreduce
@@ -641,15 +639,11 @@ def test_run_validation_epoch_reduces_tokens_over_cp(monkeypatch):
 
     result = recipe._run_validation_epoch([batch])
 
-    # The post-loop aggregation reduces total_loss (the only float reduce) WITH
-    # cp, then total_tokens (the very next reduce) WITHOUT cp. An earlier in-loop
-    # reduce of num_label_tokens also runs, so locate the loss reduce by dtype
-    # rather than by absolute position.
-    loss_idx = next(i for i, c in enumerate(allreduce_calls) if c[0].is_floating_point)
-    loss_call = allreduce_calls[loss_idx]
-    tokens_call = allreduce_calls[loss_idx + 1]
-    assert loss_call[2] is True, "total_loss must include CP ranks"
-    assert tokens_call[2] is True, "total_tokens must be summed over CP ranks (counts are per-shard)"
+    # total_loss all-reduced WITH cp; total_tokens and num_label_tokens WITHOUT.
+    loss_call = allreduce_calls[0]
+    tokens_call = allreduce_calls[1]
+    assert loss_call[1] is True, "total_loss must include CP ranks"
+    assert tokens_call[1] is False, "total_tokens must NOT be summed over CP ranks"
     # val_loss = (2.0 * 3 tokens) / 3 tokens == 2.0
     assert result.metrics["val_loss"] == pytest.approx(2.0)
 

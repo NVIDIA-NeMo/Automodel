@@ -1150,6 +1150,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                     for k, v in batch.items()
                 }
+                num_label_tokens = (batch["labels"] != -100).sum().item()
+
                 _model = self.model_parts[0]
                 _cp_active = (
                     self.device_mesh is not None
@@ -1159,7 +1161,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 )
                 if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
                     mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-                    prepared = _model(_pre_embed_only=True, **mm_kwargs)
+                    with torch.no_grad():
+                        prepared = _model(_pre_embed_only=True, **mm_kwargs)
                     for k in VLM_INPUT_KEYS:
                         batch.pop(k, None)
                     batch.update(prepared)
@@ -1167,10 +1170,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
                 labels = batch.pop("labels")
                 with train_ctx():
-                    local_num_label_tokens = (labels != -100).sum().item()
-                    num_label_tokens = self._dp_allreduce(
-                        torch.LongTensor([local_num_label_tokens]), include_cp=True
-                    ).item()
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                         out = self.model_parts[0](logits_to_keep=1, **batch)
@@ -1195,19 +1194,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         model=self.model_parts[0],
                         num_label_tokens=num_label_tokens,
                     )
-                    total_num_label_tokens += local_num_label_tokens
+                    total_num_label_tokens += num_label_tokens
 
                 total_loss += local_loss.item() * num_label_tokens
-                total_tokens += local_num_label_tokens
+                total_tokens += num_label_tokens
 
-        # Aggregate across ranks if distributed is initialized. The VLM recipe
-        # shards the batch (and labels) *before* counting, so `total_tokens` /
-        # `total_num_label_tokens` hold per-CP-shard counts -- reduce them over CP
-        # too (include_cp=True), matching the CP-summed `total_loss`, so
-        # `val_loss = total_loss / total_num_label_tokens` divides like-for-like.
+        # Aggregate across ranks if distributed is initialized
         total_loss = self._dp_allreduce(torch.FloatTensor([total_loss]), include_cp=True).item()
-        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens]), include_cp=True).item()
-        total_num_label_tokens = self._dp_allreduce(torch.LongTensor([total_num_label_tokens]), include_cp=True).item()
+        # `num_label_tokens` is measured before CP sharding, so each CP rank
+        # contributes the full sequence token count while `total_loss` is
+        # reconstructed from CP-sharded loss sums. Do not sum tokens over CP.
+        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens])).item()
+        total_num_label_tokens = self._dp_allreduce(torch.LongTensor([total_num_label_tokens])).item()
 
         val_loss = total_loss / max(total_tokens, 1e-8)
 
