@@ -323,7 +323,9 @@ def _minimal_diffusion_recipe_cfg(
 
 
 def _patch_lightweight_diffusion_recipe_setup(monkeypatch):
-    monkeypatch.setattr(diffusion_train, "initialize_distributed", lambda *args, **kwargs: SimpleNamespace(is_main=False))
+    monkeypatch.setattr(
+        diffusion_train, "initialize_distributed", lambda *args, **kwargs: SimpleNamespace(is_main=False)
+    )
     monkeypatch.setattr(diffusion_train, "setup_logging", lambda: None)
     monkeypatch.setattr(diffusion_train, "StatefulRNG", lambda *args, **kwargs: SimpleNamespace())
     monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
@@ -460,7 +462,12 @@ def test_build_diffusion_parallel_manager_args_parses_ddp_config():
         "_manager_type": "ddp",
         "world_size": 4,
         "activation_checkpointing": True,
+        "broadcast_buffers": False,
         "find_unused_parameters": False,
+        "static_graph": False,
+        "bucket_cap_mb": None,
+        "gradient_as_bucket_view": False,
+        "autocast_dtype": None,
     }
 
 

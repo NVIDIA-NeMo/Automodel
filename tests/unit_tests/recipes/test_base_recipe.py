@@ -211,6 +211,31 @@ class _ToyRecipe(BaseRecipe):
         self.cfg = ConfigNode(cfg_dict)
 
 
+def test_dp_allreduce_uses_world_group_without_device_mesh(tmp_path, monkeypatch):
+    """
+    DDP does not create a device mesh, so DP reductions should use the default
+    process group instead of returning the rank-local tensor unchanged.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+    recipe_inst.device_mesh = None
+    calls = []
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        calls.append((op, group, tensor.device))
+        tensor.add_(6.0)
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True, raising=False)
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False, raising=False)
+
+    reduced = recipe_inst._dp_allreduce(torch.tensor(2.0))
+
+    assert reduced.item() == 8.0
+    assert len(calls) == 1
+    assert calls[0][0] == torch.distributed.ReduceOp.SUM
+    assert calls[0][1] is None
+
+
 def test_find_latest_checkpoint(tmp_path):
     """
     Verify that the helper returns the directory whose name contains the
