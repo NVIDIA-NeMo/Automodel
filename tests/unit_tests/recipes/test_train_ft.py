@@ -1092,7 +1092,6 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
     # Mock the forward_backward_step to populate loss_buffer
     def mock_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train):
         loss_buffer.append(torch.tensor(0.5))
-        return int((batch["labels"] != -100).sum().item())
 
     monkeypatch.setattr(recipe, "_forward_backward_step", mock_forward_backward_step)
 
@@ -1155,7 +1154,6 @@ def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch)
 
     def mock_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train):
         loss_buffer.append(torch.tensor(0.0))  # Non-last stage has 0 loss
-        return int((batch["labels"] != -100).sum().item())
 
     monkeypatch.setattr(recipe, "_forward_backward_step", mock_forward_backward_step)
 

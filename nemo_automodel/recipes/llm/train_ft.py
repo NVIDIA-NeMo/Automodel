@@ -1157,10 +1157,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 num_chunks=_num_chunks_value,
             )
         labels = batch.pop("labels")
-        # For validation, return the count from the *local* (post-CP) labels so the reducer
-        # can sum loss and tokens consistently (include_cp=True on both); see
-        # _run_validation_epoch. Skipped during training to avoid a per-microbatch sync.
-        local_num_label_tokens = None if is_train else int((labels != -100).sum().item())
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
@@ -1268,8 +1264,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
-
-        return local_num_label_tokens
 
     def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
         """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
@@ -1450,7 +1444,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             for batch in val_dataloader:
                 loss_buffer = []
-                local_num_label_tokens = self._forward_backward_step(
+                num_label_tokens = (batch["labels"] != -100).sum().item()
+                self._forward_backward_step(
                     0,
                     batch,
                     loss_buffer=loss_buffer,
@@ -1460,17 +1455,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
 
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
-                total_num_label_tokens += local_num_label_tokens
+                total_num_label_tokens += num_label_tokens
 
-        # Both loss and token count are reduced with include_cp=True over the *local*
-        # (per-rank) values: the loss is per-CP-shard for sharding backends and
-        # replicated for non-sharding ones (magi), and token_buffer counts the same
-        # local labels — so the CP factor appears in both numerator and denominator and
-        # cancels. (Counting tokens from the global batch with include_cp=False instead
-        # mismatched the CP-summed loss and double-counted it by cp_size.)
+        # The loss is summed over DP×CP (include_cp=True). For the magi HF path the logits
+        # are undispatched, so every CP rank holds the full *replicated* loss; reduce the
+        # token count over CP too so the cp_size factor cancels in the ratio. Other backends
+        # (TE-CP, magi-custom) compute per-shard losses whose CP-sum is already the global
+        # loss, so the token count keeps main's DP-only reduce. Relies on magi HF labels
+        # staying global (magi_prepare_batch dispatches only the input).
         total_loss = self._dp_allreduce(total_loss, include_cp=True)
         total_num_label_tokens = self._dp_allreduce(
-            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device), include_cp=True
+            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device),
+            include_cp=self.magi.hf_dispatch,
         ).item()
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
 
