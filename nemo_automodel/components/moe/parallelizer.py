@@ -548,15 +548,17 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
             moe_module.cp_mesh = cp_mesh
 
     if needs_cp_attention_hooks:
-        from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
-
-        # Mask-strip hooks are model-agnostic and apply to both model-owned and
-        # generic CP attention. The generic DTensor SDPA hook is only installed
-        # for attention modules that did NOT own their CP setup.
-        attach_context_parallel_hooks(_model)
+        # Generic (non-model-owned) attention needs the mask-strip + DTensor SDPA
+        # CP hooks. Model-owned attention (e.g. Gemma4's ring) installs both its
+        # transport and its own mask handling in setup_cp_attention -- the same way
+        # TE/DSV4 owns everything -- so no generic hook is attached for it.
         if needs_generic_cp_attention:
-            from nemo_automodel.components.distributed.cp_utils import attach_cp_attention_hooks
+            from nemo_automodel.components.distributed.cp_utils import (
+                attach_context_parallel_hooks,
+                attach_cp_attention_hooks,
+            )
 
+            attach_context_parallel_hooks(_model)
             attach_cp_attention_hooks(_model, cp_mesh)
         logger.info(
             "Attached CP attention hooks for %s (%s).",

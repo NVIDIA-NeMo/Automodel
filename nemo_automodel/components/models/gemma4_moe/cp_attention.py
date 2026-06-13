@@ -577,6 +577,12 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
 
     def _pre_hook(module, args, kwargs):
         module._cp_manual_metadata = {name: kwargs.pop(name, None) for name in metadata_keys}
+        # Own the CP mask handling (instead of relying on the generic
+        # attach_context_parallel_hooks mask-strip): drop any full-sequence 4D
+        # attention_mask -- invalid once the sequence is CP-sharded -- and force
+        # the causal path, which the ring honors via run_cp_manual_attention.
+        kwargs["attention_mask"] = None
+        kwargs["is_causal"] = True
         F_module.scaled_dot_product_attention = _ring_sdpa
         return args, kwargs
 

@@ -227,8 +227,14 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
     ``attention_mask`` kwarg and sets ``is_causal=True`` instead, letting
     SDPA handle causal masking internally.
 
+    Modules that own their CP attention (e.g. Gemma4's ring, which exposes
+    ``run_cp_manual_attention``) are skipped: they strip the mask and set
+    ``is_causal`` themselves in ``setup_cp_attention``, the same way TE's
+    DotProductAttention handles its own masking.
+
     Based on ``accelerate.big_modeling._attach_context_parallel_hooks``.
     """
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
     def _self_attn_pre_forward_hook(_module, module_args, module_kwargs):
         if getattr(_module, "_cp_uses_attention_hook", False):
@@ -242,6 +248,9 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
 
     for name, module in model.named_modules():
         if _is_cp_attention_module_name(name):
+            target = module._checkpoint_wrapped_module if isinstance(module, CheckpointWrapper) else module
+            if hasattr(target, "run_cp_manual_attention"):
+                continue
             module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
 
 
