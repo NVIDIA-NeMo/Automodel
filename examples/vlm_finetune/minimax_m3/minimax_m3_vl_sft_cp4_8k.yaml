@@ -44,7 +44,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   # Override to the on-cluster path in the launcher (--model.pretrained_model_name_or_path=...).
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/athittenaman/checkpoints/minimax-m3-bf16_vv1
+  pretrained_model_name_or_path: /workspace/minimax-m3-bf16_vv1
   trust_remote_code: false
   torch_dtype: bfloat16
   text_config:
@@ -67,7 +67,7 @@ model:
 
 processor:
   _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/athittenaman/checkpoints/minimax-m3-bf16_vv1
+  pretrained_model_name_or_path: /workspace/minimax-m3-bf16_vv1
   trust_remote_code: true
 
 checkpoint:
