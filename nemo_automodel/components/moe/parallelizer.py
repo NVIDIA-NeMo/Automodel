@@ -548,16 +548,12 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
             moe_module.cp_mesh = cp_mesh
 
     if needs_cp_attention_hooks:
-        from nemo_automodel.components.distributed.cp_utils import (
-            attach_context_parallel_hooks,
-            attach_linear_attn_position_hooks,
-        )
+        from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
 
-        # Mask-strip + linear-attn position hooks are model-agnostic and apply to
-        # both model-owned and generic CP attention. The generic DTensor SDPA hook
-        # is only installed for attention modules that did NOT own their CP setup.
+        # Mask-strip hooks are model-agnostic and apply to both model-owned and
+        # generic CP attention. The generic DTensor SDPA hook is only installed
+        # for attention modules that did NOT own their CP setup.
         attach_context_parallel_hooks(_model)
-        attach_linear_attn_position_hooks(_model)
         if needs_generic_cp_attention:
             from nemo_automodel.components.distributed.cp_utils import attach_cp_attention_hooks
 

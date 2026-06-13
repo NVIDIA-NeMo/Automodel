@@ -131,36 +131,6 @@ def test_cp_attention_hooks_restores_sdpa_on_exception():
 
 
 # ---------------------------------------------------------------------------
-# attach_linear_attn_position_hooks
-# ---------------------------------------------------------------------------
-def test_linear_attn_position_hook_caches_position_ids():
-    class _LinAttn(torch.nn.Module):
-        def forward(self, x):
-            return x
-
-    class _DecoderLayer(torch.nn.Module):
-        layer_type = "linear_attention"
-
-        def __init__(self):
-            super().__init__()
-            self.linear_attn = _LinAttn()
-
-        def forward(self, x, position_ids=None):
-            return self.linear_attn(x)
-
-    layer = _DecoderLayer()
-    model = torch.nn.Module()
-    model.add_module("layer", layer)
-    cu.attach_linear_attn_position_hooks(model)
-    assert layer._linear_attn_pos_hook_registered is True
-    pos = torch.arange(4).unsqueeze(0)
-    layer(torch.randn(1, 4), position_ids=pos)
-    assert torch.equal(layer.linear_attn._cached_position_ids, pos)
-    # idempotent: re-attaching does not double-register
-    cu.attach_linear_attn_position_hooks(model)
-
-
-# ---------------------------------------------------------------------------
 # _pad_tensor_seq_dim_ / _pad_position_ids_seq_dim_ pad_len<=0 no-ops
 # ---------------------------------------------------------------------------
 def test_pad_tensor_noop_when_pad_len_zero():

@@ -633,7 +633,6 @@ def apply_model_infrastructure(
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
             attach_cp_attention_hooks,
-            attach_linear_attn_position_hooks,
         )
 
         cp_mesh = mesh.device_mesh["cp"]
@@ -642,7 +641,6 @@ def apply_model_infrastructure(
         for mp in model_parts:
             mp._cp_enabled = True
             attach_context_parallel_hooks(mp)
-            attach_linear_attn_position_hooks(mp)
             attach_cp_attention_hooks(mp, cp_mesh)
 
     # Frozen submodules (e.g. a frozen vision tower) either land in the root FSDP unit

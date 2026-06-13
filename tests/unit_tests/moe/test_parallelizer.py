@@ -2313,7 +2313,6 @@ def _stub_dense_cp_hooks(monkeypatch):
     cp_utils_stub = types.ModuleType("nemo_automodel.components.distributed.cp_utils")
     cp_utils_stub.attach_context_parallel_hooks = MagicMock()
     cp_utils_stub.attach_cp_attention_hooks = MagicMock()
-    cp_utils_stub.attach_linear_attn_position_hooks = MagicMock()
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.cp_utils", cp_utils_stub)
     return cp_utils_stub
 
@@ -2350,7 +2349,6 @@ def test_apply_cp_attaches_dense_hooks_for_non_te_attention(monkeypatch):
     assert model._cp_enabled is True
     cp_utils_stub.attach_context_parallel_hooks.assert_called_once_with(model)
     cp_utils_stub.attach_cp_attention_hooks.assert_called_once_with(model, cp_mesh)
-    cp_utils_stub.attach_linear_attn_position_hooks.assert_called_once_with(model)
 
 
 def test_apply_cp_flags_model_owned_attention_when_run_cp_manual_present(monkeypatch):

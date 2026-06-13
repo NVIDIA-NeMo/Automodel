@@ -589,7 +589,7 @@ def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
         moe_mesh=None,
     )
 
-    attached = {"ctx": 0, "attn": 0, "linpos": 0}
+    attached = {"ctx": 0, "attn": 0}
 
     with (
         patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
@@ -606,10 +606,6 @@ def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
             "nemo_automodel.components.distributed.cp_utils.attach_cp_attention_hooks",
             side_effect=lambda mp, cp_mesh: attached.__setitem__("attn", attached["attn"] + 1),
         ),
-        patch(
-            "nemo_automodel.components.distributed.cp_utils.attach_linear_attn_position_hooks",
-            side_effect=lambda mp: attached.__setitem__("linpos", attached["linpos"] + 1),
-        ),
     ):
         mock_ckpt = MockCheckpointer.return_value
         mock_ckpt.config = MagicMock()
@@ -625,4 +621,4 @@ def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
         )
 
     assert model._cp_enabled is True
-    assert attached == {"ctx": 1, "attn": 1, "linpos": 1}
+    assert attached == {"ctx": 1, "attn": 1}
