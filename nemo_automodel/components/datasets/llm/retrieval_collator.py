@@ -16,8 +16,14 @@ import hashlib
 from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 import torch
-from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase
+from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.file_utils import PaddingStrategy
+
+from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
+
+MODELS_WITH_PROCESSOR = {
+    "llama_nemotron_vl": LlamaNemotronVLProcessor,
+}
 
 
 def _doc_id_str_to_int64(doc_id: str) -> int:
@@ -302,3 +308,17 @@ class CrossEncoderCollator(DataCollatorWithPadding):
             batch_dict["labels"] = torch.zeros(num_labels, dtype=torch.long)
 
         return batch_dict
+
+
+def make_vision_collator_from_processor_method(tokenizer: ProcessorMixin, collator_fn_name: str):
+    """
+    Turns a method of a processor into a collator function.
+
+    Args:
+        tokenizer: The processor instance.
+        collator_fn_name: The name of the proceessor method to turn into a collator function.
+
+    Returns:
+        A collator for vision/multimodal retrieval datasets.
+    """
+    return getattr(tokenizer, collator_fn_name)
