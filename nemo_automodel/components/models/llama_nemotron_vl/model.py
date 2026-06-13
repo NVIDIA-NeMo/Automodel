@@ -219,6 +219,44 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
     return emb
 
 
+def _replace_image_token_embeddings(
+    input_embeds: torch.Tensor,
+    input_ids: torch.Tensor,
+    vit_embeds: torch.Tensor,
+    img_context_token_id: int,
+) -> torch.Tensor:
+    """Replace image placeholder token embeddings with vision embeddings."""
+    batch_size, seq_len, hidden_size = input_embeds.shape
+    flat_embeds = input_embeds.reshape(batch_size * seq_len, hidden_size)
+    flat_input_ids = input_ids.reshape(batch_size * seq_len)
+    selected_indices = (flat_input_ids == img_context_token_id).nonzero(as_tuple=False).squeeze(1)
+    vit_embeds = vit_embeds.reshape(-1, hidden_size).to(dtype=flat_embeds.dtype)
+
+    n_token = selected_indices.numel()
+    if n_token != vit_embeds.shape[0]:
+        logger.warning(
+            "image token count mismatch: selected=%s, vit_embeds=%s; truncating vision embeddings",
+            n_token,
+            vit_embeds.shape,
+        )
+        vit_embeds = vit_embeds[:n_token]
+
+    flat_embeds = flat_embeds.index_copy(0, selected_indices, vit_embeds)
+    return flat_embeds.reshape(batch_size, seq_len, hidden_size)
+
+
+def _filter_vision_embeddings_by_image_flags(
+    vit_embeds: torch.Tensor,
+    image_flags: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Keep only vision embeddings marked as real images."""
+    if image_flags is None or isinstance(image_flags, list):
+        return vit_embeds
+
+    image_flags = image_flags.squeeze(-1)
+    return vit_embeds[image_flags == 1]
+
+
 # ============================================================================
 # Bidirectional LLaMA Model
 # ============================================================================
@@ -524,32 +562,15 @@ class LlamaNemotronVLModel(PreTrainedModel):
 
         # Process and inject vision embeddings if present
         if pixel_values is not None:
-            if image_flags is None:
-                image_flags = torch.ones(pixel_values.shape[0])
-            image_flags = image_flags.squeeze(-1)
             vit_embeds = self.extract_feature(pixel_values).to(device=input_embeds.device)
+            vit_embeds = _filter_vision_embeddings_by_image_flags(vit_embeds, image_flags)
 
-            if not isinstance(image_flags, list):
-                image_flags = image_flags.squeeze(-1)
-                vit_embeds = vit_embeds[image_flags == 1]
-
-            # Inject vision tokens into text embeddings
-            B, N, C = input_embeds.shape
-            input_embeds = input_embeds.reshape(B * N, C)
-            input_ids = input_ids.reshape(B * N)
-            selected = (input_ids == self.config.img_context_token_id).to(input_embeds.device)
-            try:
-                input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
-            except Exception as e:
-                vit_embeds = vit_embeds.reshape(-1, C)
-                print(
-                    f"warning: {e}, input_embeds[selected].shape={input_embeds[selected].shape}, "
-                    f"vit_embeds.shape={vit_embeds.shape}"
-                )
-                n_token = selected.sum()
-                input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds[:n_token]
-
-            input_embeds = input_embeds.reshape(B, N, C)
+            input_embeds = _replace_image_token_embeddings(
+                input_embeds,
+                input_ids,
+                vit_embeds,
+                self.config.img_context_token_id,
+            )
 
         elif self.training and run_dummy_vision is not False:
             # If there is no image in the batch, adds a dummy image to the batch
