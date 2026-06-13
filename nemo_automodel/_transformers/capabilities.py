@@ -91,6 +91,13 @@ def _uses_te_attention(model: "nn.Module") -> bool:
     return getattr(model, "_te_attention_injected", False)
 
 
+def _is_deepseek_v4(model: "nn.Module") -> bool:
+    """True for DeepSeek-V4, whose context parallelism is the model-owned manual
+    all-gather path on the tilelang sparse-MLA backend (not TE/SDPA ring CP)."""
+    config = getattr(model, "config", None)
+    return getattr(config, "model_type", None) == "deepseek_v4" or type(model).__name__.startswith("DeepseekV4")
+
+
 def _is_hybrid(model: "nn.Module") -> bool:
     """True when the model mixes attention with non-attention layers (e.g. Mamba/SSM).
 
@@ -201,6 +208,10 @@ class ModelSupports:
         +------------------+----------------+---------+
         """
         if _has_backend(self._model):
+            if _is_deepseek_v4(self._model):
+                # DSV4 CP is the manual KV all-gather path, supported on tilelang.
+                backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+                return backend_attn == "tilelang"
             if _is_hybrid(self._model):
                 backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
                 return backend_attn in ("te", "sdpa")
