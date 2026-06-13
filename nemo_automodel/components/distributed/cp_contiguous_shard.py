@@ -175,41 +175,38 @@ def _make_contiguous_shard_cp_batch(
     # (`_packed_seq_ids`) even for a single sequence; the collates emit it only
     # for 2+ packed docs, so synthesize the trivial one-document map here.
     _synthesize_single_document_seq_ids(batch, primary_key, seq_len)
+
+    # Batch-resident sequence tensors, each sharded on seq dim 1 with its own pad
+    # sentinel. ``position_ids``/``labels``/``loss_mask`` are sharded too but handled
+    # separately below (special pad logic, or carried as locals rather than in the
+    # batch dict during padding). This single table drives padding, slicing, and the
+    # known-key set so a new field is declared in one place.
+    seq_pad_values = {
+        "input_ids": padding_token_id,
+        "inputs_embeds": 0,
+        "mm_token_type_ids": 0,
+        "_packed_seq_ids": 0,
+        "per_layer_inputs": 0,
+        "padding_mask": True,
+    }
+    known_sequence_keys = set(seq_pad_values) | {"labels", "position_ids", "loss_mask"}
+
     # Extra per-token metadata (e.g. Gemma4 vision group ids) is sharded like the
     # known sequence tensors, using model-provided seq dims / pad values.
     metadata_seq_dims = batch.pop("_cp_metadata_seq_dims", {})
     metadata_pad_values = batch.pop("_cp_metadata_pad_values", {})
-    known_sequence_keys = {
-        "input_ids",
-        "inputs_embeds",
-        "labels",
-        "position_ids",
-        "mm_token_type_ids",
-        "_packed_seq_ids",
-        "per_layer_inputs",
-        "padding_mask",
-        "loss_mask",
-    }
     extra_metadata_keys = [key for key in metadata_seq_dims if key in batch and key not in known_sequence_keys]
+
     pad_len = (-seq_len) % (2 * cp_size)
     if pad_len:
-        if "input_ids" in batch:
-            batch["input_ids"] = _pad_tensor_seq_dim_(batch["input_ids"], 1, pad_len, padding_token_id)
-        if "inputs_embeds" in batch:
-            batch["inputs_embeds"] = _pad_tensor_seq_dim_(batch["inputs_embeds"], 1, pad_len, 0)
+        for key, pad_val in seq_pad_values.items():
+            if key in batch:
+                batch[key] = _pad_tensor_seq_dim_(batch[key], 1, pad_len, pad_val)
         labels = _pad_tensor_seq_dim_(labels, 1, pad_len, -100)
         position_ids = _pad_position_ids_seq_dim_(position_ids, pos_seq_dim, pad_len)
         batch["position_ids"] = position_ids
-        if "mm_token_type_ids" in batch:
-            batch["mm_token_type_ids"] = _pad_tensor_seq_dim_(batch["mm_token_type_ids"], 1, pad_len, 0)
-        if "_packed_seq_ids" in batch:
-            batch["_packed_seq_ids"] = _pad_tensor_seq_dim_(batch["_packed_seq_ids"], 1, pad_len, 0)
-        if "per_layer_inputs" in batch:
-            batch["per_layer_inputs"] = _pad_tensor_seq_dim_(batch["per_layer_inputs"], 1, pad_len, 0)
         if loss_mask is not None:
             loss_mask = _pad_tensor_seq_dim_(loss_mask, 1, pad_len, 0)
-        if "padding_mask" in batch:
-            batch["padding_mask"] = _pad_tensor_seq_dim_(batch["padding_mask"], 1, pad_len, True)
         for key in extra_metadata_keys:
             batch[key] = _pad_tensor_seq_dim_(
                 batch[key],
@@ -240,14 +237,10 @@ def _make_contiguous_shard_cp_batch(
         slices[seq_dim] = slice(seq_start, seq_end)
         batch[key] = batch[key][tuple(slices)].contiguous()
 
-    _slice_seq("input_ids", 1)
-    _slice_seq("inputs_embeds", 1)
+    for key in seq_pad_values:
+        _slice_seq(key, 1)
     _slice_seq("labels", 1)
     _slice_seq("position_ids", pos_seq_dim)
-    _slice_seq("mm_token_type_ids", 1)
-    _slice_seq("_packed_seq_ids", 1)
-    _slice_seq("per_layer_inputs", 1)
-    _slice_seq("padding_mask", 1)
     for key in extra_metadata_keys:
         _slice_seq(key, metadata_seq_dims[key])
     if loss_mask is not None:
