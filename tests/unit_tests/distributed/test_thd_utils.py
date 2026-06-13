@@ -611,6 +611,37 @@ class TestTrailingPadAbsorption:
             f"max_seqlen should reflect post-absorption slot 128; got {int(result['max_seqlen'].item())}"
         )
 
+    def test_batched_trailing_pack_pad_compacts_without_padded_cu_seqlens(self):
+        """Batched packs with only row-trailing pad should avoid TE pad_between."""
+        packed = 8
+        batch = {
+            "input_ids": torch.tensor(
+                [
+                    [1, 2, 3, 4, 5, 0, 0, 0],
+                    [6, 7, 8, 9, 10, 11, 0, 0],
+                ],
+                dtype=torch.long,
+            ),
+            "labels": torch.tensor(
+                [
+                    [2, 3, 4, 5, 6, -100, -100, -100],
+                    [7, 8, 9, 10, 11, 12, -100, -100],
+                ],
+                dtype=torch.long,
+            ),
+            "position_ids": torch.arange(packed).unsqueeze(0).expand(2, -1),
+            "seq_lens": torch.tensor([[3, 2], [4, 2]]),
+            "seq_lens_padded": torch.tensor([[3, 5], [4, 4]]),
+        }
+
+        result = process_input_for_thd(batch)
+
+        assert torch.equal(result["input_ids"], torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]))
+        assert torch.equal(result["labels"], torch.tensor([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]))
+        assert torch.equal(result["cu_seqlens"], torch.tensor([0, 3, 5, 9, 11], dtype=torch.int32))
+        assert "cu_seqlens_padded" not in result
+        assert int(result["max_seqlen"].item()) == 4
+
     def test_split_into_chunks_mixed_short_and_full(self):
         """Two-chunk batch where chunk 0 is a near-full pack (16 trailing
         pad) and chunk 1 is short (464 trailing pad). Both absorb; their

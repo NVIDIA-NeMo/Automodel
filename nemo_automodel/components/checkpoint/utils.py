@@ -111,6 +111,9 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
     Returns:
         bool: True if the model's word embeddings are tied, False otherwise.
     """
+    if getattr(model, "_nemo_force_untied_lm_head", False):
+        return False
+
     non_tied_lm_head_models = {
         "Qwen3OmniMoeThinkerForConditionalGeneration",  # complicated config structure
         "Qwen3VLMoeForConditionalGeneration",  # top-level lm_head is untied despite nested text config
