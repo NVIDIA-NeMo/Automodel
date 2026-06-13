@@ -174,13 +174,13 @@ def test_zero_if_none_returns_zeros_when_none():
 def test_attach_sets_metadata_keys_and_method():
     module = torch.nn.Linear(2, 2)
     cpa.attach_gemma4_cp_ring_attention(module)
-    assert module._cp_allgather_metadata_keys == (
+    assert module._cp_manual_metadata_keys == (
         "mm_token_type_ids",
         "_packed_seq_ids",
         "padding_mask",
         "_gemma4_vision_group_ids",
     )
-    assert module._cp_allgather_metadata_seq_dims == {
+    assert module._cp_manual_metadata_seq_dims == {
         "mm_token_type_ids": 1,
         "_packed_seq_ids": 1,
         "padding_mask": 1,

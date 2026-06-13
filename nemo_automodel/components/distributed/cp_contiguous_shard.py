@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Manual (model-owned) context-parallel batch sharding.
+"""Contiguous-shard context-parallel batch sharding (model-owned CP path).
 
-This is the batch-side counterpart of the ``run_cp_manual_attention`` seam: it
-contiguously shards the sequence across CP ranks (each rank keeps one
+Contiguously shards the sequence across CP ranks (each rank keeps one
 ``seq_start:seq_end`` slice) so a model can run its own CP attention over the
 shards (e.g. Gemma4's p2p ring FlexAttention). It performs no collective — the
-all-gather/ring transport lives entirely in the model's attention.
+transport (e.g. Gemma4's ring) lives entirely in the model's attention. This is the
+batch-side counterpart of the ``run_cp_manual_attention`` seam, and the
+non-load-balanced peer of the ``context_parallel`` and TE/THD batch shardings.
 
 Selected by the ``_cp_manual`` batch flag and dispatched from
 ``cp_utils.make_cp_batch_and_ctx``.
@@ -81,7 +82,7 @@ def _synthesize_single_document_seq_ids(batch: dict, primary_key: str, seq_len: 
         batch["_packed_seq_ids"] = torch.ones((primary.shape[0], seq_len), dtype=torch.long, device=primary.device)
 
 
-def _make_manual_cp_batch(
+def _make_contiguous_shard_cp_batch(
     cp_mesh,
     batch,
     *,

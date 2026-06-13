@@ -157,42 +157,6 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
             module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
 
 
-def _cp_sdpa(
-    query,
-    key,
-    value,
-    *,
-    cp_mesh,
-    original_sdpa,
-    attn_mask,
-    dropout_p,
-    is_causal,
-    scale,
-    enable_gqa,
-    kwargs,
-):
-    """Run the classic PyTorch context_parallel SDPA path."""
-    from torch.distributed.tensor import DTensor, Shard
-
-    if not isinstance(query, DTensor):
-        query = DTensor.from_local(query, device_mesh=cp_mesh, placements=[Shard(2)])
-        key = DTensor.from_local(key, device_mesh=cp_mesh, placements=[Shard(2)])
-        value = DTensor.from_local(value, device_mesh=cp_mesh, placements=[Shard(2)])
-
-    out = original_sdpa(
-        query,
-        key,
-        value,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=is_causal,
-        scale=scale,
-        enable_gqa=enable_gqa,
-        **kwargs,
-    )
-    return out.to_local() if isinstance(out, DTensor) else out
-
-
 def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
     """Inject CP-aware attention into self-attention modules.
 
@@ -206,17 +170,42 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
     Seq dim at the SDPA call is 2: tensors are [B, nH, S/cp_size, D] after HF reshape.
     """
     import torch.nn.functional as F_module
+    from torch.distributed.tensor import DTensor, Shard
 
-    original_sdpa = F_module.scaled_dot_product_attention
+    _original_sdpa = F_module.scaled_dot_product_attention
     cp_size = cp_mesh.size()
     active_module = {"module": None}
+
+    @torch._dynamo.disable
+    def _cp_sdpa(
+        query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, **kwargs
+    ):
+        # Re-wrap local Q/K/V as DTensors so DTensor SDPA dispatch fires the CP allgather.
+        # Seq dim is 2: [B, nH, S/cp_size, D].
+        if not isinstance(query, DTensor):
+            query = DTensor.from_local(query, device_mesh=cp_mesh, placements=[Shard(2)])
+            key = DTensor.from_local(key, device_mesh=cp_mesh, placements=[Shard(2)])
+            value = DTensor.from_local(value, device_mesh=cp_mesh, placements=[Shard(2)])
+        out = _original_sdpa(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+            **kwargs,
+        )
+        # Unwrap back to local tensor for the compiled O-proj + MLP region.
+        return out.to_local() if isinstance(out, DTensor) else out
 
     @torch._dynamo.disable
     def cp_attention(
         query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, **kwargs
     ):
         if cp_size <= 1:
-            return original_sdpa(
+            return _original_sdpa(
                 query,
                 key,
                 value,
@@ -231,7 +220,7 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
         module = active_module["module"]
         if bool(getattr(module, "_cp_manual_active", False)):
             # The model owns its CP attention transport + compute via this seam;
-            # cp_utils stays model-agnostic (no all-gather / mask specifics here).
+            # cp_utils stays model-agnostic (no transport / mask specifics here).
             return module.run_cp_manual_attention(
                 query,
                 key,
@@ -249,33 +238,31 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
             query,
             key,
             value,
-            cp_mesh=cp_mesh,
-            original_sdpa=original_sdpa,
             attn_mask=attn_mask,
             dropout_p=dropout_p,
             is_causal=is_causal,
             scale=scale,
             enable_gqa=enable_gqa,
-            kwargs=kwargs,
+            **kwargs,
         )
 
     def _pre_hook(module, args, kwargs):
         has_manual_impl = hasattr(module, "run_cp_manual_attention")
         metadata = {}
         if has_manual_impl:
-            for name in getattr(module, "_cp_allgather_metadata_keys", ()):
+            for name in getattr(module, "_cp_manual_metadata_keys", ()):
                 metadata[name] = kwargs.pop(name, None)
-        module._cp_allgather_metadata = metadata
+        module._cp_manual_metadata = metadata
         module._cp_manual_active = has_manual_impl
         active_module["module"] = module
         F_module.scaled_dot_product_attention = cp_attention
         return args, kwargs
 
     def _post_hook(module, inputs, output):
-        module._cp_allgather_metadata = {}
+        module._cp_manual_metadata = {}
         module._cp_manual_active = False
         active_module["module"] = None
-        F_module.scaled_dot_product_attention = original_sdpa
+        F_module.scaled_dot_product_attention = _original_sdpa
 
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
@@ -288,7 +275,7 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
             target = module._checkpoint_wrapped_module if isinstance(module, CheckpointWrapper) else module
             target._cp_uses_attention_hook = True
             target.register_forward_pre_hook(_pre_hook, with_kwargs=True)
-            # always_call=True ensures original_sdpa is restored even if the forward raises.
+            # always_call=True ensures _original_sdpa is restored even if the forward raises.
             target.register_forward_hook(_post_hook, always_call=True)
 
 
@@ -491,9 +478,9 @@ def make_cp_batch_and_ctx(
     )
 
     if manual:
-        from nemo_automodel.components.distributed.cp_manual import _make_manual_cp_batch
+        from nemo_automodel.components.distributed.cp_contiguous_shard import _make_contiguous_shard_cp_batch
 
-        return _make_manual_cp_batch(
+        return _make_contiguous_shard_cp_batch(
             cp_mesh,
             batch,
             primary_key=primary_key,

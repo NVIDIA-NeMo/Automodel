@@ -515,8 +515,8 @@ def _gemma4_cp_manual_attention(
     if query.shape[1] != key.shape[1]:
         enable_gqa = True
 
-    local_metadata = getattr(attention_module, "_cp_allgather_metadata", {})
-    metadata_seq_dims = getattr(attention_module, "_cp_allgather_metadata_seq_dims", {})
+    local_metadata = getattr(attention_module, "_cp_manual_metadata", {})
+    metadata_seq_dims = getattr(attention_module, "_cp_manual_metadata_seq_dims", {})
     ctx = CPRingAttentionContext(
         module=attention_module,
         query=query,
@@ -543,13 +543,13 @@ def _gemma4_cp_manual_attention(
 
 def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module) -> None:
     """Register Gemma4's model-specific manual p2p ring CP attention handler."""
-    attention_module._cp_allgather_metadata_keys = (
+    attention_module._cp_manual_metadata_keys = (
         "mm_token_type_ids",
         "_packed_seq_ids",
         "padding_mask",
         "_gemma4_vision_group_ids",
     )
-    attention_module._cp_allgather_metadata_seq_dims = {
+    attention_module._cp_manual_metadata_seq_dims = {
         "mm_token_type_ids": 1,
         "_packed_seq_ids": 1,
         "padding_mask": 1,

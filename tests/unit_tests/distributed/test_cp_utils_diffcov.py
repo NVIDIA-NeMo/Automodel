@@ -16,7 +16,7 @@
 
 These exercise the CP attention SDPA-swap hooks, the linear-attn position hook,
 the classic DTensor _cp_sdpa path (DTensor mocked), padding/prepare helpers, and
-the manual all-gather batch builder branches that the broader suite leaves
+the manual contiguous-shard batch builder branches that the broader suite leaves
 uncovered. No GPU or real process group is required.
 """
 
@@ -27,7 +27,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.distributed import cp_manual as cm
+from nemo_automodel.components.distributed import cp_contiguous_shard as cm
 from nemo_automodel.components.distributed import cp_utils as cu
 
 
@@ -107,12 +107,12 @@ def test_cp_attention_hooks_manual_path():
     calls = {}
 
     def manual(self, query, key, value, *, cp_mesh, attn_mask, dropout_p, is_causal, scale, enable_gqa, kwargs):
-        calls["meta"] = self._cp_allgather_metadata
+        calls["meta"] = self._cp_manual_metadata
         calls["active"] = self._cp_manual_active
         return torch.zeros_like(query)
 
     attn.run_cp_manual_attention = MethodType(manual, attn)
-    attn._cp_allgather_metadata_keys = ("foo",)
+    attn._cp_manual_metadata_keys = ("foo",)
     model = _Wrapper(attn)
     cu.attach_cp_attention_hooks(model, _FakeMesh(size=2))
     q, k, v = _qkv()
@@ -122,13 +122,12 @@ def test_cp_attention_hooks_manual_path():
     assert torch.equal(calls["meta"]["foo"], torch.tensor([1, 2, 3]))
     # post-hook cleared the per-call state
     assert attn._cp_manual_active is False
-    assert attn._cp_allgather_metadata == {}
+    assert attn._cp_manual_metadata == {}
 
 
 def test_cp_attention_hooks_dtensor_sdpa_path():
     attn = _Attn()  # no run_cp_manual_attention -> classic DTensor _cp_sdpa
     model = _Wrapper(attn)
-    cu.attach_cp_attention_hooks(model, _FakeMesh(size=2))
     q, k, v = _qkv()
 
     class _FakeDTensor:
@@ -136,10 +135,13 @@ def test_cp_attention_hooks_dtensor_sdpa_path():
         def from_local(t, device_mesh=None, placements=None):
             return t  # identity: treat local tensor as already-distributed
 
+    # attach_cp_attention_hooks imports DTensor/Shard at attach time, so patch
+    # before attaching.
     with (
         mock.patch("torch.distributed.tensor.DTensor", _FakeDTensor),
         mock.patch("torch.distributed.tensor.Shard", lambda d: ("shard", d)),
     ):
+        cu.attach_cp_attention_hooks(model, _FakeMesh(size=2))
         out = attn(q, k, v)
     ref = F.scaled_dot_product_attention(q, k, v)
     assert torch.allclose(out, ref)
@@ -160,44 +162,6 @@ def test_cp_attention_hooks_restores_sdpa_on_exception():
         attn(q, k, v)
     # always_call post-hook restored the real SDPA
     assert F.scaled_dot_product_attention is original
-
-
-# ---------------------------------------------------------------------------
-# _cp_sdpa directly (already-DTensor input short-circuit)
-# ---------------------------------------------------------------------------
-def test_cp_sdpa_skips_rewrap_and_unwraps_dtensor_output():
-    _local_marker = torch.zeros(1)
-
-    class _FakeDTensor:
-        def to_local(self):
-            return _local_marker
-
-    captured = {}
-
-    def fake_sdpa(query, key, value, **kw):
-        captured["q"] = query
-        return _FakeDTensor()  # DTensor output -> _cp_sdpa must call .to_local()
-
-    with (
-        mock.patch("torch.distributed.tensor.DTensor", _FakeDTensor),
-        mock.patch("torch.distributed.tensor.Shard", lambda d: d),
-    ):
-        dt = _FakeDTensor()
-        out = cu._cp_sdpa(
-            dt,
-            dt,
-            dt,
-            cp_mesh=_FakeMesh(),
-            original_sdpa=fake_sdpa,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=True,
-            scale=None,
-            enable_gqa=False,
-            kwargs={},
-        )
-    assert captured["q"] is dt  # already a DTensor -> not re-wrapped
-    assert out is _local_marker  # DTensor output unwrapped via to_local()
 
 
 # ---------------------------------------------------------------------------
@@ -278,10 +242,10 @@ def test_prepare_cp_batch_common_raises_without_labels():
 
 
 # ---------------------------------------------------------------------------
-# _make_manual_cp_batch: pad branches for every sequence key + extra
+# _make_contiguous_shard_cp_batch: pad branches for every sequence key + extra
 # metadata, plus the contiguous slice.
 # ---------------------------------------------------------------------------
-def test_make_manual_pads_and_slices_all_keys():
+def test_make_contiguous_shard_pads_and_slices_all_keys():
     cp_size = 2
     seq = 6  # pad_len = (-6) % 4 = 2 -> padded to 8, local 4
     d = 8
@@ -298,7 +262,7 @@ def test_make_manual_pads_and_slices_all_keys():
     position_ids = torch.arange(seq).unsqueeze(0)
     loss_mask = torch.ones(1, seq, dtype=torch.long)
 
-    _ctx, out = cm._make_manual_cp_batch(
+    _ctx, out = cm._make_contiguous_shard_cp_batch(
         _FakeMesh(size=cp_size, rank=0),
         batch,
         primary_key="inputs_embeds",
@@ -319,7 +283,7 @@ def test_make_manual_pads_and_slices_all_keys():
     assert out["_packed_seq_ids"].shape == (1, 4)
 
 
-def test_make_manual_uses_dist_rank_when_initialized():
+def test_make_contiguous_shard_uses_dist_rank_when_initialized():
     batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
     labels = torch.zeros(1, 4, dtype=torch.long)
     position_ids = torch.arange(4).unsqueeze(0)
@@ -328,7 +292,7 @@ def test_make_manual_uses_dist_rank_when_initialized():
         mock.patch("torch.distributed.is_initialized", return_value=True),
         mock.patch("torch.distributed.get_rank", return_value=0),
     ):
-        _ctx, out = cm._make_manual_cp_batch(
+        _ctx, out = cm._make_contiguous_shard_cp_batch(
             _FakeMesh(size=2, rank=0),
             batch,
             primary_key="input_ids",
@@ -342,7 +306,7 @@ def test_make_manual_uses_dist_rank_when_initialized():
     assert out["input_ids"].shape == (1, 2)
 
 
-def test_make_manual_raises_when_not_divisible(monkeypatch):
+def test_make_contiguous_shard_raises_when_not_divisible(monkeypatch):
     # Force padding to be a no-op so the post-pad divisibility check trips.
     monkeypatch.setattr(cm, "_pad_tensor_seq_dim_", lambda t, *a, **k: t)
     monkeypatch.setattr(cm, "_pad_position_ids_seq_dim_", lambda p, *a, **k: p)
@@ -350,7 +314,7 @@ def test_make_manual_raises_when_not_divisible(monkeypatch):
     labels = torch.zeros(1, 6, dtype=torch.long)
     position_ids = torch.arange(6).unsqueeze(0)
     with pytest.raises(ValueError, match="divisible by cp_size"):
-        cm._make_manual_cp_batch(
+        cm._make_contiguous_shard_cp_batch(
             _FakeMesh(size=4, rank=0),
             batch,
             primary_key="input_ids",
