@@ -19,7 +19,9 @@ import torch
 import torch.nn.functional as F
 
 from nemo_automodel.components.loss.dllm_loss import (
+    BlockDiffusionCrossEntropyLoss,
     DFlashDecayLoss,
+    DLLMLossOutput,
     HybridDiffusionLLMLoss,
     MDLMCrossEntropyLoss,
     _compute_per_token_nll,
@@ -501,3 +503,144 @@ class TestDFlashDraftAccuracy:
         expected_overall = (c0 + c1).sum() / (n0 + n1).sum()
         assert torch.allclose(per_pos_acc, expected_per_pos, atol=1e-6)
         assert torch.isclose(overall_acc, expected_overall, atol=1e-6)
+
+
+class TestDFlashNormalizeMean:
+    """``normalize="mean"`` divides by the effective weight sum (decay-weighted mean)."""
+
+    def _weighted_mean(self, logits_full, target_full, block_mask_full, gamma):
+        bsz, n, bs, _ = logits_full.shape
+        offsets = torch.arange(bs).view(1, 1, -1)
+        weight = block_mask_full * (offsets > 0).float()
+        if gamma is not None:
+            decay = torch.exp(-(torch.arange(bs).float() - 1).clamp(min=0) / gamma).view(1, 1, -1)
+            weight = weight * decay
+        nll = F.cross_entropy(logits_full.reshape(-1, logits_full.size(-1)), target_full.reshape(-1), reduction="none")
+        flat_w = weight.reshape(-1)
+        return (nll * flat_w).sum() / (flat_w.sum() + 1e-6)
+
+    @pytest.mark.parametrize("gamma", [7.0, None])
+    def test_mean_matches_reference(self, gamma):
+        torch.manual_seed(0)
+        bsz, n, bs, V = 2, 3, 5, 16
+        logits_full = torch.randn(bsz, n, bs, V)
+        target_full = torch.randint(0, V, (bsz, n, bs))
+        block_mask_full = (torch.rand(bsz, n, bs) > 0.3).float()
+
+        expected = self._weighted_mean(logits_full, target_full, block_mask_full, gamma)
+
+        loss_fn = DFlashDecayLoss(loss_gamma=gamma, normalize="mean")
+        pred_logits = logits_full[:, :, 1:, :].reshape(bsz, n * (bs - 1), V)
+        pred_targets = target_full[:, :, 1:].reshape(bsz, n * (bs - 1))
+        pred_mask = block_mask_full[:, :, 1:].reshape(bsz, n * (bs - 1))
+        got = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, block_size=bs).total_loss
+
+        assert torch.isclose(expected, got, atol=1e-6)
+
+    def test_default_normalize_is_tokens(self):
+        assert DFlashDecayLoss().normalize == "tokens"
+
+    def test_invalid_normalize_raises(self):
+        with pytest.raises(ValueError, match="normalize must be"):
+            DFlashDecayLoss(normalize="bogus")
+
+
+class TestBlockDiffusionCrossEntropyLoss:
+    def test_returns_dllm_loss_output(self, dummy_inputs):
+        logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
+        result = BlockDiffusionCrossEntropyLoss()(logits, target_ids, noise_mask, p_mask, loss_mask)
+        assert isinstance(result, DLLMLossOutput)
+
+    def test_total_loss_equals_dllm_loss(self, dummy_inputs):
+        """No AR component: total_loss == dllm_loss."""
+        logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
+        result = BlockDiffusionCrossEntropyLoss()(logits, target_ids, noise_mask, p_mask, loss_mask)
+        assert torch.allclose(result.total_loss, result.dllm_loss, atol=1e-6)
+
+    def test_scores_all_supervised_canvas_even_without_noise(self, dummy_inputs):
+        """Loss support is ALL supervised canvas positions (matches Google's
+        canvas_mask, NOT noise-gated), so zero corruption still yields a nonzero
+        loss whenever supervised canvas tokens exist."""
+        logits, target_ids, _, p_mask, loss_mask = dummy_inputs
+        noise_mask = torch.zeros(B, L, dtype=torch.bool)
+        result = BlockDiffusionCrossEntropyLoss()(logits, target_ids, noise_mask, p_mask, loss_mask)
+        assert result.total_loss.item() > 0.0
+
+    def test_flat_loss_ignores_p_mask(self, dummy_inputs):
+        """Loss must NOT depend on p_mask (flat: no 1/p weighting)."""
+        logits, target_ids, noise_mask, _, loss_mask = dummy_inputs
+        loss_fn = BlockDiffusionCrossEntropyLoss()
+        r_half = loss_fn(logits, target_ids, noise_mask, torch.full((B, L), 0.5), loss_mask)
+        r_ones = loss_fn(logits, target_ids, noise_mask, torch.ones(B, L), loss_mask)
+        r_tenth = loss_fn(logits, target_ids, noise_mask, torch.full((B, L), 0.1), loss_mask)
+        assert torch.allclose(r_half.total_loss, r_ones.total_loss, atol=1e-6)
+        assert torch.allclose(r_half.total_loss, r_tenth.total_loss, atol=1e-6)
+
+    def test_differs_from_mdlm_when_p_not_one(self, dummy_inputs):
+        """Sanity: with p_mask != 1, flat loss differs from MDLM's 1/p-weighted loss."""
+        logits, target_ids, noise_mask, _, loss_mask = dummy_inputs
+        p_mask = torch.full((B, L), 0.5)
+        flat = BlockDiffusionCrossEntropyLoss()(logits, target_ids, noise_mask, p_mask, loss_mask)
+        mdlm = MDLMCrossEntropyLoss()(logits, target_ids, noise_mask, p_mask, loss_mask)
+        # MDLM scores corrupted positions only, multiplies by 1/0.5 = 2, and
+        # normalizes by supervised count; the flat block-diffusion loss scores ALL
+        # supervised canvas positions with no weight. They must differ.
+        assert not torch.allclose(flat.total_loss, mdlm.total_loss, atol=1e-4)
+
+    def test_numerical_correctness_against_reference(self):
+        """loss = sum(CE over ALL supervised canvas) / num_supervised, no weighting,
+        NOT noise-gated (matches Google's canvas-mask loss support)."""
+        torch.manual_seed(123)
+        B_t, L_t, V_t = 2, 4, 8
+        logits = torch.randn(B_t, L_t, V_t)
+        target_ids = torch.randint(0, V_t, (B_t, L_t))
+        loss_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]])
+        noise_mask = torch.tensor([[True, False, True, False], [False, True, False, False]])
+        p_mask = torch.ones(B_t, L_t)
+
+        ce = F.cross_entropy(logits.reshape(-1, V_t), target_ids.reshape(-1), reduction="none").reshape(B_t, L_t)
+        mask = loss_mask.bool()  # ALL supervised positions, regardless of noise
+        num_supervised = int(mask.sum().item())  # 5
+        expected = (ce * mask.float()).sum() / num_supervised
+
+        result = BlockDiffusionCrossEntropyLoss()(logits, target_ids, noise_mask, p_mask, loss_mask)
+        assert torch.allclose(result.total_loss, expected, atol=1e-6)
+
+    def test_all_supervised_canvas_contribute_corruption_agnostic(self):
+        """ALL supervised positions contribute regardless of corruption; a
+        corrupted-but-NOT-supervised position is still excluded (loss support =
+        supervised canvas, matching Google — not the noise mask)."""
+        torch.manual_seed(99)
+        logits = torch.randn(1, 6, 16)
+        target_ids = torch.randint(0, 16, (1, 6))
+        loss_mask = torch.tensor([[1, 1, 1, 0, 0, 0]])
+        # pos 0,1,2: supervised -> ALL included (corrupted or not)
+        # pos 3: corrupted but NOT supervised -> excluded
+        noise_mask = torch.tensor([[False, False, True, True, False, False]])
+        p_mask = torch.ones(1, 6)
+
+        ce = F.cross_entropy(logits.reshape(-1, 16), target_ids.reshape(-1), reduction="none").reshape(1, 6)
+        mask = loss_mask.bool()
+        expected = (ce * mask.float()).sum() / int(mask.sum().item())  # pos 0,1,2 / 3
+        result = BlockDiffusionCrossEntropyLoss()(logits, target_ids, noise_mask, p_mask, loss_mask)
+        assert torch.allclose(result.total_loss, expected, atol=1e-6)
+
+    def test_global_normalization_denominator(self):
+        """num_diffusion_tokens overrides the local supervised-canvas count as denominator."""
+        torch.manual_seed(1)
+        logits = torch.randn(1, 4, 8)
+        target_ids = torch.randint(0, 8, (1, 4))
+        loss_mask = torch.ones(1, 4, dtype=torch.long)
+        noise_mask = torch.tensor([[True, True, False, False]])
+        p_mask = torch.ones(1, 4)
+
+        ce = F.cross_entropy(logits.reshape(-1, 8), target_ids.reshape(-1), reduction="none").reshape(1, 4)
+        summed = (ce * loss_mask.float()).sum()  # ALL supervised positions
+
+        loss_fn = BlockDiffusionCrossEntropyLoss()
+        # local denominator = 4 supervised
+        r_local = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
+        assert torch.allclose(r_local.total_loss, summed / 4, atol=1e-6)
+        # global denominator = 10
+        r_global = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask, num_diffusion_tokens=10)
+        assert torch.allclose(r_global.total_loss, summed / 10, atol=1e-6)

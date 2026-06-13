@@ -19,6 +19,7 @@ import os
 import shutil
 from pathlib import Path
 
+import datasets
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
@@ -27,10 +28,9 @@ import yaml
 
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
 from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
 
-import datasets
 datasets.disable_caching()
 
 
@@ -46,22 +46,24 @@ def get_validation_loss(
     with torch.no_grad():
         out = model(**val_batch)
         loss = calculate_loss(
-                loss_fn,
-                logits=out.logits,
-                labels=labels,
-                num_tokens_in_batch=num_tokens_in_batch,
-            )
+            loss_fn,
+            logits=out.logits,
+            labels=labels,
+            num_tokens_in_batch=num_tokens_in_batch,
+        )
         return loss
 
 
 def compare_configs(source_config: dict, restored_config: dict):
-    """ Recursively compare two configs."""
+    """Recursively compare two configs."""
     for k, v in source_config.items():
         if k in restored_config:
             if isinstance(v, dict):
                 compare_configs(v, restored_config[k])
             else:
-                assert v == restored_config[k], f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
+                assert v == restored_config[k], (
+                    f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
+                )
 
 
 def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:

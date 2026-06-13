@@ -16,7 +16,8 @@
 
 When a CP mesh is attached (via ``apply_cp``), the forward pass:
   1. Recovers dense sequence order from PyTorch's load-balanced CP layout using
-     ``seq_index`` or ``position_ids``.
+     a local ``seq_index`` when provided, otherwise deriving it from the CP
+     DualChunkSwap layout.
   2. Runs the causal conv1d and FLA gated delta rule on that dense ordering.
   3. Restores the output back to the original load-balanced CP layout.
 
@@ -354,29 +355,60 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
 
         return torch.cat(conv_outs, dim=0).transpose(1, 2).contiguous()
 
-    def _extract_local_positions(
+    def _extract_local_seq_index(
         self,
-        position_ids: torch.Tensor | None,
         seq_index: torch.Tensor | None,
         seq_len: int,
     ) -> torch.Tensor | None:
-        for positions in (seq_index, position_ids):
-            if positions is None:
-                continue
+        if seq_index is None:
+            return None
 
-            if positions.ndim == 1:
-                local_positions = positions
-            elif positions.ndim == 2:
-                local_positions = positions[0]
-            elif positions.ndim == 3:
-                local_positions = positions[0, 0]
-            else:
-                continue
+        if seq_index.ndim == 1:
+            local_positions = seq_index
+        elif seq_index.ndim == 2:
+            local_positions = seq_index[0]
+        else:
+            return None
 
-            if local_positions.shape[-1] == seq_len:
-                return local_positions.to(dtype=torch.long)
+        if local_positions.shape[-1] == seq_len:
+            return local_positions.to(dtype=torch.long)
 
         return None
+
+    def _build_dual_chunk_local_positions(
+        self,
+        *,
+        seq_len: int,
+        cp_size: int,
+        cp_rank: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if seq_len % 2 != 0:
+            raise RuntimeError(
+                f"Qwen3.5 CP linear-attn layer {self.layer_idx} expected an even local sequence length "
+                "from DualChunkSwap CP layout."
+            )
+
+        chunk_len = seq_len // 2
+        first_chunk = cp_rank
+        second_chunk = 2 * cp_size - 1 - cp_rank
+        return torch.cat(
+            (
+                torch.arange(
+                    first_chunk * chunk_len,
+                    (first_chunk + 1) * chunk_len,
+                    device=device,
+                    dtype=torch.long,
+                ),
+                torch.arange(
+                    second_chunk * chunk_len,
+                    (second_chunk + 1) * chunk_len,
+                    device=device,
+                    dtype=torch.long,
+                ),
+            ),
+            dim=0,
+        )
 
     def _all_gather_concat(
         self,
@@ -457,13 +489,16 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         batch_size, seq_len, _ = hidden_states.shape
 
         cp_group = self._cp_mesh.get_group()
+        cp_rank = dist.get_rank(cp_group)
         cp_size = self._cp_mesh.size()
 
-        local_positions = self._extract_local_positions(position_ids, seq_index, seq_len)
+        local_positions = self._extract_local_seq_index(seq_index, seq_len)
         if local_positions is None:
-            raise RuntimeError(
-                f"Qwen3.5 CP linear-attn layer {self.layer_idx} requires seq_index or position_ids "
-                "with local sequence length metadata to undo load-balanced CP sharding."
+            local_positions = self._build_dual_chunk_local_positions(
+                seq_len=seq_len,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                device=hidden_states.device,
             )
 
         # ---- Build FLA CP context (once, reused for every sequence) ----

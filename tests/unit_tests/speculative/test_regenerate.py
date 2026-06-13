@@ -496,6 +496,28 @@ def test_run_resume_skips_already_written_shards(tmp_path: Path, monkeypatch):
     assert (tmp_path / "shard-000000.parquet").stat().st_mtime_ns == shard0_mtime_before
 
 
+def test_run_fresh_into_nonempty_dir_refuses_to_clobber(tmp_path: Path, monkeypatch):
+    """End-to-end: a fresh run (no --resume) against a dir with shards must abort
+    before rewriting the manifest or touching any shard. Guards the _run wiring:
+    the shard scan must not be gated on --resume, or the guard sees an empty set."""
+    from nemo_automodel.components.speculative import regenerate as regen
+
+    (tmp_path / "shard-000000.parquet").write_bytes(b"previous-run-data")
+    monkeypatch.setattr(
+        regen,
+        "_import_aiohttp",
+        lambda: SimpleNamespace(ClientSession=None, ClientTimeout=lambda total=None: None),
+    )
+
+    args = _run_args(tmp_path, resume=False)
+    with pytest.raises(ValueError, match="already contains"):
+        asyncio.run(regen._run(args))
+
+    # Nothing was clobbered: the old shard is intact and no manifest was written.
+    assert (tmp_path / "shard-000000.parquet").read_bytes() == b"previous-run-data"
+    assert not (tmp_path / "manifest.json").exists()
+
+
 class _SequentialSession:
     """Returns a pre-defined sequence of _FakeResponse objects, one per POST call."""
 

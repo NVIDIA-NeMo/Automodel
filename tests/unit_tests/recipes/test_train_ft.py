@@ -31,11 +31,11 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
+from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
+from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import _as_dict, _callable_and_kwargs
-from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
-from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     build_dataloader,
@@ -230,6 +230,39 @@ def test_build_validation_dataloader_no_validation_keys():
 
     assert result == {}
     mock_build.assert_not_called()
+
+
+@pytest.mark.parametrize("attn,expect_packed", [("magi", True), ("te", True), ("sdpa", False)])
+def test_build_validation_dataloader_packs_val_for_thd_backends(monkeypatch, attn, expect_packed):
+    """The validation set is packed (cfg_ps passed) for THD-consuming backends.
+
+    Regression: previously only TE triggered val packing; the magi backend left
+    validation unpacked, so at cp>1 magi sharded tiny per-example sequences
+    degenerately and inflated the val loss.
+    """
+    # Pretend the (training) dataloader uses the THD packed collater.
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda _cfg: True)
+    cfg = ConfigNode(
+        {
+            "model": {"backend": {"attn": attn}},
+            "dataloader": {},
+            "validation_dataloader": {},
+            "packed_sequence": {"packed_sequence_size": 1024},
+            "distributed": {"cp_size": 2},
+            "step_scheduler": {
+                "local_batch_size": 1,
+                "global_batch_size": 8,
+                "max_steps": 5,
+                "val_every_steps": 1,
+            },
+            "seed": 42,
+            "validation_dataset": {"some": "cfg"},
+        }
+    )
+    with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader", return_value=("dl", "tok")) as mock_build:
+        build_validation_dataloader(cfg, dp_world_size=1, dp_rank=0, pp_enabled=False)
+    _, kwargs = mock_build.call_args
+    assert (kwargs["cfg_ps"] is not None) is expect_packed
 
 
 class DummyLinear(nn.Module):
@@ -553,18 +586,21 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         "nemo_automodel.recipes._typed_config.RecipeConfig.checkpoint",
         property(lambda self: _stub_build_checkpoint_config()),
     )
-    # Stub setup_distributed to avoid requiring torch.distributed init
+    # Stub create_distributed_setup_from_config to avoid requiring torch.distributed init
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.setup_distributed",
+        "nemo_automodel.recipes.llm.train_ft.create_distributed_setup_from_config",
         lambda cfg, world_size: SimpleNamespace(
+            mesh_context=SimpleNamespace(
+                pp_enabled=False,
+                device_mesh=None,
+                moe_mesh=None,
+                cp_size=1,
+                pp_size=1,
+            ),
             strategy_config=None,
             pipeline_config=None,
-            moe_config=None,
+            moe_parallel_config=None,
             activation_checkpointing=False,
-            pp_enabled=False,
-            device_mesh=None,
-            moe_mesh=None,
-            cp_size=1,
         ),
     )
 
@@ -1818,18 +1854,21 @@ def _minimal_cfg_with_rope_fusion(cp_size: int, rope_fusion: bool):
 def _patch_setup_minimals_with_cp(monkeypatch, cp_size):
     """Variant of _patch_setup_minimals that lets us control cp_size."""
     _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
-    # Override setup_distributed to expose the desired cp_size
+    # Override create_distributed_setup_from_config to expose the desired cp_size
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.setup_distributed",
+        "nemo_automodel.recipes.llm.train_ft.create_distributed_setup_from_config",
         lambda cfg, world_size: SimpleNamespace(
+            mesh_context=SimpleNamespace(
+                pp_enabled=False,
+                device_mesh=None,
+                moe_mesh=None,
+                cp_size=cp_size,
+                pp_size=1,
+            ),
             strategy_config=None,
             pipeline_config=None,
-            moe_config=None,
+            moe_parallel_config=None,
             activation_checkpointing=False,
-            pp_enabled=False,
-            device_mesh=None,
-            moe_mesh=None,
-            cp_size=cp_size,
         ),
     )
 

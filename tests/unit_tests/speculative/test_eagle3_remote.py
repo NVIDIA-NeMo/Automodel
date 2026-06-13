@@ -266,3 +266,154 @@ def test_prefetched_batches_preserves_order_and_prefetches_ahead():
         seen.append(target_batch)
 
     assert seen == [0, 1, 2, 3, 4]  # consumed strictly in dataloader order
+
+
+class _InflightBackend:
+    """Async backend stub tracking how many requests are in flight at once."""
+
+    def __init__(self):
+        self.inflight = 0
+        self.max_inflight = 0
+
+    def generate_batch_async(self, input_ids, attention_mask, loss_mask):
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        backend = self
+
+        class _H:
+            def result(self_inner, timeout=None):
+                backend.inflight -= 1
+                return int(input_ids[0, 0].item())
+
+        return _H()
+
+
+def test_prefetched_batches_never_exceeds_depth_in_flight():
+    """The prefetcher must hold at most ``depth`` requests in flight. With depth
+    capped to the server count, one extra request means some server runs two
+    concurrent /generate forwards, which corrupts the hook-captured supervision."""
+    from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
+
+    recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
+    recipe.target_wrapper = _InflightBackend()
+    recipe.target_prefetch_depth = 2
+
+    loader = [{"input_ids": torch.full((1, 4), i), "attention_mask": None, "loss_mask": None} for i in range(6)]
+    seen = [target_batch for _b, target_batch in recipe._prefetched_batches(loader)]
+
+    assert seen == list(range(6))
+    assert recipe.target_wrapper.max_inflight == recipe.target_prefetch_depth
+
+
+# --- 6. /generate concurrency ----------------------------------------------
+
+
+class _ConcurrencyProbe:
+    """Records the maximum number of threads inside a guarded section."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def __enter__(self):
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        return self
+
+    def __exit__(self, *exc):
+        with self._lock:
+            self.active -= 1
+        return False
+
+
+def test_server_serializes_concurrent_generate_requests():
+    """Two /generate requests racing on the threaded HTTP server must run the
+    supervision forward one at a time: the aux-capture hooks live on the shared
+    model, so overlapping forwards hand each request the other's tensors."""
+    import time
+
+    target = _make_target_wrapper()
+    probe = _ConcurrencyProbe()
+    original_generate_batch = target.generate_batch
+
+    def _slow_generate_batch(**kwargs):
+        with probe:
+            time.sleep(0.05)
+            return original_generate_batch(**kwargs)
+
+    target.generate_batch = _slow_generate_batch
+
+    port = _free_port()
+    logic = TargetModelServer(target, nccl_port=port + 100, host="127.0.0.1")
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), _make_request_handler(logic))
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    backend = RemoteEagle3TargetModel.from_urls([f"http://127.0.0.1:{port}"], device="cpu", max_retries=0)
+    try:
+        backend.set_vocab_mapping(*_vocab_mapping())
+        inputs = [_batch() for _ in range(4)]
+        # Distinct sessions per thread so the requests really race on the server.
+        import requests as _requests
+
+        results = [None] * len(inputs)
+
+        def _post(i):
+            payload = wire.encode_to_bytes(
+                {"input_ids": inputs[i][0], "attention_mask": inputs[i][1], "loss_mask": inputs[i][2]}
+            )
+            resp = _requests.post(f"http://127.0.0.1:{port}/{protocol.EP_GENERATE}", data=payload, timeout=30)
+            resp.raise_for_status()
+            results[i] = wire.decode(resp.content, map_location="cpu")
+
+        threads = [threading.Thread(target=_post, args=(i,)) for i in range(len(inputs))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        assert probe.max_active == 1, "concurrent /generate forwards ran on the shared target model"
+        # Each request got the supervision for ITS OWN inputs.
+        ids, mask = _vocab_mapping()
+        for i, result in enumerate(results):
+            ref = compute_supervision(target, ids, mask, *inputs[i])
+            torch.testing.assert_close(result["target_probs"], ref["target_probs"], rtol=0, atol=0)
+    finally:
+        backend.close()
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_client_serializes_generate_per_server(monkeypatch):
+    """_ServerClient.generate must never have two requests in flight on one
+    server from this process (NCCL recv pairing relies on it)."""
+    import time
+
+    from nemo_automodel.components.speculative.eagle.remote.client import _ServerClient
+
+    monkeypatch.setenv("NEMO_EAGLE_ENABLE_NCCL", "0")
+    client = _ServerClient("http://127.0.0.1:9", timeout=5, max_retries=0)
+    probe = _ConcurrencyProbe()
+
+    class _Resp:
+        content = wire.encode_to_bytes({"x": torch.zeros(1)})
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+    def _fake_post(url, **kwargs):
+        with probe:
+            time.sleep(0.02)
+            return _Resp()
+
+    monkeypatch.setattr(client._session, "post", _fake_post)
+
+    threads = [threading.Thread(target=client.generate, args=(b"",)) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert probe.max_active == 1

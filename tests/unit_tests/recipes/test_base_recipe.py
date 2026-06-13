@@ -728,6 +728,15 @@ class TestMakeProgressBar:
         assert pbar.total is None
         pbar.close()
 
+    def test_explicit_total_and_initial_skip_step_scheduler(self, monkeypatch):
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        r = _FakeRecipe()  # deliberately no step_scheduler attribute
+        pbar = r._make_progress_bar(total=40, initial=7)
+        assert pbar is not None
+        assert pbar.total == 40
+        assert pbar.n == 7
+        pbar.close()
+
 
 class TestUpdateProgressBar:
     def _make_pbar(self):

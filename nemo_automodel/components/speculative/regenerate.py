@@ -378,7 +378,11 @@ async def _run(args: argparse.Namespace) -> int:
     _validate_args(args)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    existing = _existing_shard_indices(output_dir) if args.resume else set()
+    # Always scan for existing shards: without --resume, a non-empty set must
+    # trip the clobber guard below (gating the scan on args.resume would feed
+    # the guard an always-empty set and let a fresh run silently overwrite and
+    # interleave shards from a previous run).
+    existing = _existing_shard_indices(output_dir)
     _ensure_manifest_compatible(
         output_dir,
         _build_manifest(args),

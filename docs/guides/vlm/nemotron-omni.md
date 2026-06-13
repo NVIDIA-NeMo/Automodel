@@ -63,9 +63,9 @@ git clone -b nemotron-omni ssh://git@gitlab-master.nvidia.com:12051/huiyingl/aut
 cd automodel-omni
 ```
 
-:::{note}
+<Note>
 NemotronOmni requires `mamba_ssm`, `causal_conv1d`, and `decord` packages, which are included in the NeMo AutoModel container.
-:::
+</Note>
 
 ---
 
