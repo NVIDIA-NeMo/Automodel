@@ -24,10 +24,21 @@ distributed setup are required.
 
 from unittest.mock import patch
 
+import torch
 import torch.nn as nn
+from transformers.models.qwen3_5.configuration_qwen3_5 import (
+    Qwen3_5Config,
+    Qwen3_5TextConfig,
+    Qwen3_5VisionConfig,
+)
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
-from nemo_automodel.components.models.qwen3_5.model import Qwen3_5TextModelPP
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.qwen3_5.model import (
+    Qwen3_5CausalLMOutputWithPast,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5TextModelPP,
+)
 
 
 def _bare_pp_model() -> Qwen3_5TextModelPP:
@@ -134,3 +145,107 @@ def test_subclass_relationship():
     # No extra __init__ — the swap reuses the HF-built instance as-is.
     assert "__init__" not in Qwen3_5TextModelPP.__dict__
     assert "forward" in Qwen3_5TextModelPP.__dict__
+
+
+# ---------------------------------------------------------------------------
+# Outer-forward PP-stage dispatch, exercised on a tiny real VLM (CPU).
+# A real pipeline split (FSDP2 + PipelineStage) can't run as a unit test, so we
+# simulate the per-stage module layout the splitter produces: stage 0 keeps
+# ``embed_tokens`` but not ``lm_head``; the last stage keeps ``lm_head`` but not
+# ``embed_tokens``; middle stages keep neither.
+# ---------------------------------------------------------------------------
+
+
+def _tiny_vlm_model():
+    text_config = Qwen3_5TextConfig(
+        vocab_size=64,
+        hidden_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+        intermediate_size=32,
+        max_position_embeddings=16,
+        rms_norm_eps=1e-6,
+        pad_token_id=0,
+        layer_types=["full_attention", "full_attention"],
+        attn_implementation="eager",
+    )
+    vision_config = Qwen3_5VisionConfig(
+        depth=1,
+        hidden_size=16,
+        intermediate_size=32,
+        num_heads=2,
+        patch_size=2,
+        spatial_merge_size=1,
+        temporal_patch_size=1,
+        out_hidden_size=16,
+    )
+    config = Qwen3_5Config(
+        architectures=["Qwen3_5ForConditionalGeneration"],
+        text_config=text_config.to_dict(),
+        vision_config=vision_config.to_dict(),
+        image_token_id=60,
+        video_token_id=61,
+        vision_start_token_id=62,
+        vision_end_token_id=63,
+    )
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        enable_deepep=False,
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=True,
+    )
+    model = Qwen3_5ForConditionalGeneration(config, backend=backend, num_nextn_predict_layers=0)
+    model.eval()
+    return model
+
+
+def test_init_swaps_text_backbone_class():
+    """__init__ points the HF text backbone at the PP-safe subclass."""
+    model = _tiny_vlm_model()
+    assert isinstance(model.model.language_model, Qwen3_5TextModelPP)
+
+
+def test_full_model_forward_returns_output_dataclass():
+    """Non-PP (embed + lm_head both present) falls through to the normal path."""
+    model = _tiny_vlm_model()
+    ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    out = model(input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=False)
+    assert isinstance(out, Qwen3_5CausalLMOutputWithPast)
+    assert out.logits.shape == (1, 4, model.config.text_config.vocab_size)
+
+
+def test_first_stage_returns_raw_hidden_states():
+    """Stage 0 (embed present, lm_head dropped) returns hidden states, not logits."""
+    model = _tiny_vlm_model()
+    model.lm_head = None  # splitter drops lm_head on non-last stages
+    ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    out = model(input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=False)
+    assert torch.is_tensor(out)
+    assert out.shape == (1, 4, model.config.text_config.hidden_size)
+
+
+def test_last_stage_consumes_hidden_states_and_applies_lm_head():
+    """Last stage (embed dropped, lm_head present) takes hidden states, emits logits."""
+    model = _tiny_vlm_model()
+    model.model.language_model.embed_tokens = None  # dropped on non-first stages
+    dtype = next(model.parameters()).dtype
+    hidden = torch.randn(1, 4, model.config.text_config.hidden_size, dtype=dtype)
+    out = model(inputs_embeds=hidden, attention_mask=torch.ones(1, 4, dtype=torch.long), use_cache=False)
+    assert torch.is_tensor(out)
+    assert out.shape == (1, 4, model.config.text_config.vocab_size)
+
+
+def test_middle_stage_passes_hidden_states_through():
+    """Middle stage (neither embed nor lm_head) returns hidden states for the next stage."""
+    model = _tiny_vlm_model()
+    model.model.language_model.embed_tokens = None
+    model.lm_head = None
+    dtype = next(model.parameters()).dtype
+    hidden = torch.randn(1, 4, model.config.text_config.hidden_size, dtype=dtype)
+    out = model(inputs_embeds=hidden, attention_mask=torch.ones(1, 4, dtype=torch.long), use_cache=False)
+    assert torch.is_tensor(out)
+    assert out.shape == (1, 4, model.config.text_config.hidden_size)
