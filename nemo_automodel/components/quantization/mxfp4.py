@@ -36,6 +36,18 @@ _FP4_E2M1_TABLE = torch.tensor(
 # Midpoints between consecutive positive e2m1 magnitudes, used to round to nearest.
 _FP4_E2M1_MIDPOINTS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float32)
 
+# Per-byte expansion of the two packed e2m1 nibbles: row ``b`` holds
+# ``(value(low nibble), value(high nibble))``. A single gather over this 256-row
+# table decodes both fp4 values per byte with one int64 index tensor (half the
+# gathers of indexing the 16-entry table twice).
+_FP4_BYTE_TABLE = torch.stack(
+    [
+        _FP4_E2M1_TABLE[torch.arange(256) & 0x0F],
+        _FP4_E2M1_TABLE[(torch.arange(256) >> 4) & 0x0F],
+    ],
+    dim=-1,
+)  # [256, 2]
+
 
 def dequantize_mxfp4(packed: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Unpack fp4 e2m1 packed-int8 values and apply the per-32-column e8m0 scale.
@@ -49,23 +61,20 @@ def dequantize_mxfp4(packed: torch.Tensor, scales: torch.Tensor, dtype: torch.dt
         Dequantized tensor of shape ``[..., K]`` in ``dtype``.
     """
     packed_u8 = packed.contiguous().view(torch.uint8)
-    low = (packed_u8 & 0x0F).long()
-    high = ((packed_u8 >> 4) & 0x0F).long()
-    table = _FP4_E2M1_TABLE.to(packed_u8.device)
-    # Interleave (low, high) per byte so column indices match the original layout.
-    fp4_vals = torch.stack([table[low], table[high]], dim=-1).flatten(-2)
+    # Single gather over the 256-row byte table yields both e2m1 values per byte,
+    # interleaved (low, high) so column indices match the original layout.
+    pairs = _FP4_BYTE_TABLE.to(packed_u8.device)[packed_u8.long()]  # [..., K // 2, 2]
+    fp4_vals = pairs.flatten(-2)  # [..., K]
 
-    # Decode e8m0 to fp32: 2^(e - 127), with byte 0 mapping to 0 (all-zero block).
-    scale_u8 = scales.contiguous().view(torch.uint8).int()
-    scale_f32 = torch.where(
-        scale_u8 == 0,
-        torch.zeros_like(scale_u8, dtype=torch.float32),
-        torch.pow(2.0, (scale_u8 - 127).float()),
-    )
+    # float8_e8m0fnu casts straight to its 2^(e - 127) value (OCP MX spec: byte 0x00
+    # decodes to 2^-127, not zero). No all-zero-block special case is needed -- such a
+    # block's fp4 codes are already 0, so the product is 0 regardless of the scale.
+    scale_f32 = scales.to(torch.float32)  # [..., K // 32]
 
-    scale_expanded = scale_f32.repeat_interleave(MXFP4_BLOCK_SIZE, dim=-1)
-    scale_expanded = scale_expanded[..., : fp4_vals.shape[-1]]
-    return (fp4_vals * scale_expanded).to(dtype)
+    # Stay blocked and broadcast the per-32-column scale instead of materializing a
+    # full [..., K] scale tensor (cheaper, and fuses better under torch.compile).
+    blocked = fp4_vals.view(*fp4_vals.shape[:-1], scale_f32.shape[-1], MXFP4_BLOCK_SIZE)
+    return (blocked * scale_f32.unsqueeze(-1)).flatten(-2).to(dtype)
 
 
 def quantize_mxfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -89,19 +98,18 @@ def quantize_mxfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     amax = blocks.abs().amax(dim=-1)
 
     # e2m1 max magnitude is 6 = 1.5 * 2^2, so the shared block exponent is
-    # floor(log2(amax)) - 2. amax == 0 maps to scale byte 0 (decoded as 0).
-    nonzero = amax > 0
-    exp = torch.zeros_like(amax)
-    exp[nonzero] = torch.floor(torch.log2(amax[nonzero])) - 2.0
-    scale_bytes = torch.where(
-        nonzero,
-        (exp + 127.0).clamp(1.0, 254.0),
-        torch.zeros_like(exp),
-    ).to(torch.uint8)
-    # Zero-amax blocks divide by 1 instead of 0; their codes are all zero anyway.
-    scale = torch.where(nonzero, torch.pow(2.0, (scale_bytes.int() - 127).float()), torch.ones_like(exp))
+    # floor(log2(amax)) - 2. frexp gives floor(log2(amax)) == exponent - 1 exactly,
+    # avoiding log2 round-off near powers of two (the common case for a dequantized-fp4
+    # checkpoint); frexp(0).exponent == 0 also removes the need for a zero guard.
+    exp_field = torch.frexp(amax).exponent - 3  # (exponent - 1) - 2
+    scale_bytes = (exp_field + 127).clamp(1, 254).to(torch.uint8)
+    scales = scale_bytes.view(torch.float8_e8m0fnu)
+    scale = scales.to(torch.float32)  # exact power of two; same decode as dequantize_mxfp4
 
-    # Round each scaled magnitude to the nearest e2m1 magnitude code.
+    # Round each scaled magnitude to the nearest e2m1 magnitude code. bucketize rounds
+    # half away from zero rather than to-nearest-even (PTX cvt / OCP recommendation);
+    # irrelevant for the exact-round-trip path, where scaled values land exactly on
+    # codes and never on a midpoint tie.
     scaled = blocks.abs() / scale.unsqueeze(-1)
     midpoints = _FP4_E2M1_MIDPOINTS.to(w.device)
     codes = torch.bucketize(scaled, midpoints).to(torch.uint8)
@@ -109,7 +117,7 @@ def quantize_mxfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     codes = codes.reshape(*w.shape[:-1], k)
 
     packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).view(torch.int8)
-    return packed.contiguous(), scale_bytes.view(torch.float8_e8m0fnu).contiguous()
+    return packed.contiguous(), scales.contiguous()
 
 
 class MXFP4GroupedMM(torch.autograd.Function):
