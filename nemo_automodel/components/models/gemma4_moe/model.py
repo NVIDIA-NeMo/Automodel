@@ -85,6 +85,7 @@ from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
+from .cp_batch import make_contiguous_shard_cp_batch_and_ctx
 from .state_dict_adapter import Gemma4MoEStateDictAdapter
 
 
@@ -1061,7 +1062,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             "mm_token_type_ids": mm_token_type_ids
             if mm_token_type_ids is not None
             else special_image_mask.to(torch.long),
-            "_cp_manual": True,
+            "_cp_make_batch_fn": make_contiguous_shard_cp_batch_and_ctx,
             "_gemma4_vision_group_ids": gemma4_vision_group_ids(
                 mm_token_type_ids if mm_token_type_ids is not None else special_image_mask.to(torch.long)
             ),

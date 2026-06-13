@@ -12,17 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Contiguous-shard context-parallel batch sharding (model-owned CP path).
+"""Gemma4's contiguous-shard context-parallel batch sharding.
 
 Contiguously shards the sequence across CP ranks (each rank keeps one
-``seq_start:seq_end`` slice) so a model can run its own CP attention over the
-shards (e.g. Gemma4's p2p ring FlexAttention). It performs no collective — the
-transport (e.g. Gemma4's ring) lives entirely in the model's attention. This is the
-batch-side counterpart of the ``run_cp_manual_attention`` seam, and the
+``seq_start:seq_end`` slice) so Gemma4 can run its own p2p ring FlexAttention
+over the shards. It performs no collective -- the transport lives in Gemma4's
+attention (see ``cp_attention.py``); this is its batch-side counterpart, and the
 non-load-balanced peer of the ``context_parallel`` and TE/THD batch shardings.
 
-Selected by the ``_cp_manual`` batch flag and dispatched from
-``cp_utils.make_cp_batch_and_ctx``.
+Gemma4's ``prepare_model_inputs_for_cp`` attaches
+``make_contiguous_shard_cp_batch_and_ctx`` to the batch as ``_cp_make_batch_fn``;
+``cp_utils.make_cp_batch_and_ctx`` then invokes that callable (model-agnostically)
+in place of the default load-balanced ``context_parallel`` path.
 """
 
 import contextlib
@@ -63,8 +64,6 @@ def _synthesize_single_document_seq_ids(batch: dict, primary_key: str, seq_len: 
     Derived from ``padding_mask`` when present, else all-ones.
 
     A no-op when ``_packed_seq_ids`` is already present (genuinely packed input).
-    Models that key CP masks on something else (e.g. DeepSeek V4 uses
-    ``position_ids``) never read the synthesized tensor and simply ignore it.
 
     Args:
         batch: The CP batch dict; mutated in place to add ``_packed_seq_ids``.
@@ -135,12 +134,12 @@ def _prepare_manual_cp_batch(cp_mesh, tp_mesh, batch, loss_mask):
 
 
 def make_contiguous_shard_cp_batch_and_ctx(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
-    """Prepare and contiguously shard a batch for a model that owns its CP attention.
+    """Prepare and contiguously shard a batch for Gemma4's ring CP.
 
-    Entry point for the ``_cp_manual`` path dispatched from
-    ``cp_utils.make_cp_batch_and_ctx``: runs the shared pre-shard prep, then keeps
-    one contiguous sequence slice per CP rank (no collective; the transport lives
-    in the model's own CP attention).
+    Gemma4 attaches this callable to the batch (as ``_cp_make_batch_fn``) in its
+    pre-embed; ``cp_utils.make_cp_batch_and_ctx`` invokes it. Runs the shared
+    pre-shard prep, then keeps one contiguous sequence slice per CP rank (no
+    collective; the transport lives in Gemma4's own ring attention).
     """
     primary_key, seq_len, labels, position_ids, pos_seq_dim, loss_mask = _prepare_manual_cp_batch(
         cp_mesh, tp_mesh, batch, loss_mask

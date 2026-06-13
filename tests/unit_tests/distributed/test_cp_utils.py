@@ -28,7 +28,7 @@ from typing import Any
 import pytest
 import torch
 
-from nemo_automodel.components.distributed import cp_contiguous_shard as _cm
+from nemo_automodel.components.models.gemma4_moe import cp_batch as _cm
 
 # Import module under test
 from nemo_automodel.components.distributed import cp_utils as _cu
@@ -122,7 +122,7 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     batch = {
         "input_ids": torch.tensor([[10, 20, 30, 40]]),
         "labels": labels,
-        "_cp_manual": True,
+        "_cp_make_batch_fn": _cm.make_contiguous_shard_cp_batch_and_ctx,
     }
 
     ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask)
@@ -148,7 +148,7 @@ def test_make_cp_batch_and_ctx_pads_to_cp_load_balance_multiple(monkeypatch):
         "input_ids": torch.tensor([[1, 2, 3]]),
         "labels": torch.tensor([[1, 2, 3]]),
         "mm_token_type_ids": torch.tensor([[0, 1, 0]]),
-        "_cp_manual": True,
+        "_cp_make_batch_fn": _cm.make_contiguous_shard_cp_batch_and_ctx,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
@@ -201,7 +201,7 @@ def test_make_cp_batch_and_ctx_supports_inputs_embeds_and_per_layer_inputs(monke
         "labels": labels,
         "per_layer_inputs": per_layer_inputs,
         "mm_token_type_ids": torch.zeros(1, 4, dtype=torch.long),
-        "_cp_manual": True,
+        "_cp_make_batch_fn": _cm.make_contiguous_shard_cp_batch_and_ctx,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch)
@@ -219,7 +219,7 @@ def test_make_cp_batch_and_ctx_pads_and_slices_packed_seq_ids(monkeypatch):
         "input_ids": torch.tensor([[1, 2, 3]]),
         "labels": torch.tensor([[1, 2, 3]]),
         "_packed_seq_ids": torch.tensor([[1, 1, 2]]),
-        "_cp_manual": True,
+        "_cp_make_batch_fn": _cm.make_contiguous_shard_cp_batch_and_ctx,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
@@ -238,7 +238,7 @@ def test_make_cp_batch_and_ctx_includes_padding_mask(monkeypatch):
         "input_ids": torch.tensor([[10, 20, 30, 40]]),
         "labels": torch.tensor([[10, 20, 30, 40]]),
         "padding_mask": padding_mask,
-        "_cp_manual": True,
+        "_cp_make_batch_fn": _cm.make_contiguous_shard_cp_batch_and_ctx,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=None)
@@ -257,7 +257,7 @@ def test_make_cp_batch_and_ctx_3d_mrope_position_ids(monkeypatch):
         "input_ids": torch.arange(seq_len).unsqueeze(0),
         "labels": torch.arange(seq_len).unsqueeze(0),
         "position_ids": position_ids_3d,
-        "_cp_manual": True,
+        "_cp_make_batch_fn": _cm.make_contiguous_shard_cp_batch_and_ctx,
     }
 
     ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch)
@@ -275,7 +275,7 @@ def test_make_cp_batch_and_ctx_2d_position_ids_seq_dim(monkeypatch):
         "input_ids": torch.arange(seq_len).unsqueeze(0),
         "labels": torch.arange(seq_len).unsqueeze(0),
         "position_ids": torch.arange(seq_len).unsqueeze(0),
-        "_cp_manual": True,
+        "_cp_make_batch_fn": _cm.make_contiguous_shard_cp_batch_and_ctx,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch)
@@ -293,7 +293,7 @@ def test_make_cp_batch_and_ctx_3d_mrope_with_loss_mask(monkeypatch):
         "input_ids": torch.arange(seq_len).unsqueeze(0),
         "labels": torch.arange(seq_len).unsqueeze(0),
         "position_ids": position_ids_3d,
-        "_cp_manual": True,
+        "_cp_make_batch_fn": _cm.make_contiguous_shard_cp_batch_and_ctx,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=loss_mask)
