@@ -238,7 +238,7 @@ catalog skills live in `skills/`; contributor workflow skills live in
 | 7 | build-and-dependency     | `.agents/contributor-skills/build-and-dependency` | Container setup, uv package management, environment variables, CLI usage |
 | 8 | cicd                     | `.agents/contributor-skills/cicd`             | Commit/PR workflow, CI trigger mechanism, failure investigation |
 | 9 | testing                  | `.agents/contributor-skills/testing`          | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
-| 10 | fern-docs               | `.agents/contributor-skills/fern-docs`        | Maintain the Fern docs site under `fern/`: pages, slugs, redirects, version aliases, library reference |
+| 10 | fern-docs               | `.agents/contributor-skills/fern-docs`        | Maintain the Fern docs site under `docs/` (MDX content) + `docs/fern/` (infra) — pages, slugs, redirects, version aliases, library reference |
 
 **Always read the relevant `SKILL.md` before starting any task it covers —
 skills are mandatory context, not optional background reading.**

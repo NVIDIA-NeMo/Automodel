@@ -1,0 +1,161 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# MiniMax M3 VL (image) LoRA SFT.
+# 8-node / 64 GPUs = PP4 x DP16 with EP8 over the DP shard (ep_shard=2).
+
+recipe: FinetuneRecipeForVLM
+
+seed: 1234
+
+step_scheduler:
+  # PP4 on 64 GPUs -> dp_size = 64/4 = 16. global_batch_size must be divisible by
+  # local_batch_size * dp_size. local_batch_size=8 -> global 128 = 8 * 16 dp * 1 grad-accum.
+  global_batch_size: 128
+  local_batch_size: 8
+  ckpt_every_steps: 1000
+  val_every_steps: 25
+  log_remote_every_steps: 1
+  gc_every_steps: 10
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 90
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
+  trust_remote_code: false
+  torch_dtype: bfloat16
+  text_config:
+    num_mtp_modules: 0
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    # sdpa (not te): M3 sparse-attention layers emit an additive [B,H,T,T] bias
+    # from the DSA indexer, which only SDPA's explicit-mask path accepts. TE's
+    # DotProductAttention treats attention_mask as a boolean padding mask and
+    # crashes on the float bias (a TE block-sparse path is a perf follow-up).
+    attn: sdpa
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: gmm
+    dispatcher: deepep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  # The checkpoint's remote-code MiniMaxVLProcessor drops chat_template during
+  # from_pretrained, so this helper reattaches chat_template.jinja afterwards.
+  _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
+  trust_remote_code: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  exclude_modules:
+    - "*vision_tower*"
+    - "*vision_model*"
+    - "*vision*"
+    - "*visual*"
+    - "*multi_modal_projector*"
+    - "*patch_merge_mlp*"
+    - "*lm_head*"
+    # Index branch (selection-only) and router gates are not adapted.
+    - "*indexer*"
+    - "*block_sparse_moe.gate*"
+  dim: 32
+  alpha: 32
+  dropout: 0.0
+  moe_rank_scaling: true
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: vlm_checkpoints/minimax_m3_vl_lora_pp4ep8_8node/
+  model_save_format: safetensors
+  save_consolidated: false
+  # BF16 base checkpoint: weights load directly (no MXFP8 *_scale_inv / dequant).
+  dequantize_base_checkpoint: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 4
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+  moe:
+    # At pp=4 each rank holds ~15 of 60 layers, so the gathered experts fit without
+    # resharding (false matches the SFT recipe). Set true if memory is tight.
+    reshard_after_forward: false
+    wrap_outer_model: true
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 2
+  persistent_workers: true
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 2048
+  drop_last: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation[:256]
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 2048
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-7
+
+wandb:
+  project: <your_wandb_project>
+  entity: <your_wandb_entity>
+  name: <your_wandb_name>
+  dir: <your_wandb_save_dir>
