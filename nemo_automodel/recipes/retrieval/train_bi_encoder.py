@@ -39,6 +39,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -64,6 +65,17 @@ def _get_autocast_ctx(distributed_config):
     if autocast_dtype is None or not torch.cuda.is_available():
         return nullcontext()
     return torch.autocast(device_type="cuda", dtype=autocast_dtype)
+
+
+def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
+    """Return infrastructure kwargs forwarded to model instantiation."""
+    kwargs = {
+        "distributed_setup": distributed_setup,
+        "peft_config": peft_config,
+    }
+    if cfg.get("compile", None) is not None:
+        kwargs["compile_config"] = build_compile_config(cfg.compile)
+    return kwargs
 
 
 def contrastive_scores_and_labels(
@@ -276,9 +288,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
 
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
+            kwargs = _get_model_instantiate_kwargs(self.cfg, self.distributed_setup, self.peft_config)
             model = self.cfg.model.instantiate(
-                distributed_setup=self.distributed_setup,
-                peft_config=self.peft_config,
+                **kwargs,
             )
 
         self.model_parts = [model]

@@ -22,6 +22,7 @@ from nemo_automodel.recipes.retrieval import train_bi_encoder
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     TrainBiEncoderRecipe,
     _get_autocast_ctx,
+    _get_model_instantiate_kwargs,
     _unwrap_model_for_attrs,
     _uses_multi_vector_scoring,
 )
@@ -38,6 +39,11 @@ class _DDPLikeWrapper(torch.nn.Module):
     def __init__(self, module: torch.nn.Module):
         super().__init__()
         self.module = module
+
+
+class _DictLikeConfig(SimpleNamespace):
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 
 def test_retrieval_attrs_unwrap_ddp_like_wrapper():
@@ -86,6 +92,20 @@ def test_retrieval_autocast_ctx_uses_configured_dtype(monkeypatch):
         pass
 
     assert captured == {"device_type": "cuda", "dtype": torch.bfloat16}
+
+
+def test_retrieval_model_instantiate_kwargs_include_compile_config():
+    distributed_setup = object()
+    peft_config = object()
+    cfg = _DictLikeConfig(compile={"enabled": True, "mode": "reduce-overhead", "dynamic": False})
+
+    kwargs = _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config)
+
+    assert kwargs["distributed_setup"] is distributed_setup
+    assert kwargs["peft_config"] is peft_config
+    assert kwargs["compile_config"].enabled is True
+    assert kwargs["compile_config"].mode == "reduce-overhead"
+    assert kwargs["compile_config"].dynamic is False
 
 
 class _FakeCheckpointer:
