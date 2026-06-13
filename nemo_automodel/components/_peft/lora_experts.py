@@ -388,8 +388,7 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
             # straight into the frozen base; the LoRA adapters stay floating point.
             if not self.use_torch_mm:
                 raise NotImplementedError(
-                    "mxfp4-resident expert weights require the torch_mm experts backend "
-                    "(backend.experts='torch_mm')."
+                    "mxfp4-resident expert weights require the torch_mm experts backend (backend.experts='torch_mm')."
                 )
             self._mxfp4_resident = False
             self._init_packed_placeholders()

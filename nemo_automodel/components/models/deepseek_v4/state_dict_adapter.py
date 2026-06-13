@@ -1043,9 +1043,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         if m:
             layer_num, suffix = m.group(2), m.group(3)
             disk_suffix = "weight" if suffix == "packed" else "scale"
-            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(
-                tensor, self.moe_config.n_routed_experts
-            )
+            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(tensor, self.moe_config.n_routed_experts)
             result = []
             for t, eid in zip(expert_tensors, expert_ids):
                 out_dim = t.shape[0] // 2
@@ -1058,9 +1056,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         if m:
             layer_num, suffix = m.group(2), m.group(3)
             disk_suffix = "weight" if suffix == "packed" else "scale"
-            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(
-                tensor, self.moe_config.n_routed_experts
-            )
+            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(tensor, self.moe_config.n_routed_experts)
             return [
                 (f"layers.{layer_num}.ffn.experts.{eid}.w2.{disk_suffix}", t)
                 for t, eid in zip(expert_tensors, expert_ids)
