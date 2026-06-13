@@ -486,13 +486,10 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     _model._cp_enabled = True
 
     # Route each attention block's CP setup by capability:
-    #   * TE DotProductAttention            -> TE's own context-parallel group;
+    #   * TE DotProductAttention -> TE's own context-parallel group;
     #   * a module exposing setup_cp_attention (e.g. Gemma4's p2p ring) -> installs
-    #     its own CP attention + mask handling, the same way TE/DSV4 owns everything;
-    #   * anything else                     -> the generic mask-strip + DTensor SDPA
-    #     CP hooks, attached once after the loop.
-    needs_generic_cp_attention = False
-    model_owned_cp_attention = False
+    #     its own CP attention + mask handling (model-owned, like TE/DSV4).
+    # Any other (non-TE, non-model-owned) attention is not supported under CP here.
     for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
@@ -508,11 +505,14 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                 )
             elif hasattr(block.self_attn, "setup_cp_attention"):
                 # Model-owned CP attention (e.g. Gemma4's p2p ring): the model
-                # installs its own SDPA hook + mask handling; no generic hook.
+                # installs its own SDPA hook + mask handling.
                 block.self_attn.setup_cp_attention(cp_mesh)
-                model_owned_cp_attention = True
             else:
-                needs_generic_cp_attention = True
+                logger.warning(
+                    "Skipping CP setup for block with unsupported attention module "
+                    "(neither TE DotProductAttention nor model-owned setup_cp_attention): %s",
+                    type(attn_module).__name__ if attn_module is not None else type(block.self_attn).__name__,
+                )
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
 
@@ -540,21 +540,6 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         moe_module = block.moe if hasattr(block, "moe") else block.mlp
         if isinstance(moe_module, MoE):
             moe_module.cp_mesh = cp_mesh
-
-    if needs_generic_cp_attention:
-        # Generic attention: strip the CP-invalid mask and install the classic
-        # DTensor SDPA CP hooks. (Model-owned attention already set itself up
-        # in the loop above.)
-        from nemo_automodel.components.distributed.cp_utils import (
-            attach_context_parallel_hooks,
-            attach_cp_sdpa_hooks,
-        )
-
-        attach_context_parallel_hooks(_model)
-        attach_cp_sdpa_hooks(_model, cp_mesh)
-        logger.info("Attached generic DTensor-SDPA CP attention hooks for %s.", type(_model).__name__)
-    elif model_owned_cp_attention:
-        logger.info("Installed model-owned CP attention (setup_cp_attention) for %s.", type(_model).__name__)
 
 
 def parallelize_model(

@@ -2317,8 +2317,8 @@ def _stub_dense_cp_hooks(monkeypatch):
     return cp_utils_stub
 
 
-def test_apply_cp_attaches_dense_hooks_for_non_te_attention(monkeypatch):
-    """apply_cp should attach dense CP hooks for non-TE attention modules."""
+def test_apply_cp_warns_on_unsupported_non_te_attention(monkeypatch):
+    """Non-TE, non-model-owned attention is unsupported under CP: warn, no hooks."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     cp_utils_stub = _stub_dense_cp_hooks(monkeypatch)
 
@@ -2333,7 +2333,7 @@ def test_apply_cp_attaches_dense_hooks_for_non_te_attention(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", types.ModuleType("transformer_engine.pytorch"))
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", te_attn_stub)
 
-    non_te_attn = _FakeAttnModule()  # not a DotProductAttention
+    non_te_attn = _FakeAttnModule()  # not a DotProductAttention, no setup_cp_attention
     block = _FakeBlockWithAttn(non_te_attn)
     model = DummyModel([block])
 
@@ -2347,12 +2347,13 @@ def test_apply_cp_attaches_dense_hooks_for_non_te_attention(monkeypatch):
     P.apply_cp(model, cp_mesh)
 
     assert model._cp_enabled is True
-    cp_utils_stub.attach_context_parallel_hooks.assert_called_once_with(model)
-    cp_utils_stub.attach_cp_sdpa_hooks.assert_called_once_with(model, cp_mesh)
+    # No generic CP hooks are attached for unsupported attention.
+    cp_utils_stub.attach_context_parallel_hooks.assert_not_called()
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_not_called()
 
 
-def test_apply_cp_flags_model_owned_attention_when_run_cp_manual_present(monkeypatch):
-    """A self_attn exposing run_cp_manual_attention marks the model-owned CP path."""
+def test_apply_cp_model_owned_calls_setup_cp_attention(monkeypatch):
+    """A self_attn exposing setup_cp_attention installs its own CP attention; no generic hooks."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     cp_utils_stub = _stub_dense_cp_hooks(monkeypatch)
 
@@ -2368,8 +2369,8 @@ def test_apply_cp_flags_model_owned_attention_when_run_cp_manual_present(monkeyp
 
     non_te_attn = _FakeAttnModule()  # not a DotProductAttention
     block = _FakeBlockWithAttn(non_te_attn)
-    # The model owns its CP attention transport (e.g. Gemma4 flex ring).
-    block.self_attn.run_cp_manual_attention = lambda *a, **k: None
+    # The model owns its CP attention (e.g. Gemma4's ring) via setup_cp_attention.
+    block.self_attn.setup_cp_attention = MagicMock()
     model = DummyModel([block])
 
     cp_mesh = MagicMock()
@@ -2378,8 +2379,10 @@ def test_apply_cp_flags_model_owned_attention_when_run_cp_manual_present(monkeyp
 
     P.apply_cp(model, cp_mesh)
 
-    # hooks still attached; this run exercises the model_owned_cp_attention=True branch
-    cp_utils_stub.attach_cp_sdpa_hooks.assert_called_once_with(model, cp_mesh)
+    # Model-owned: setup_cp_attention is called; no generic hooks are attached.
+    block.self_attn.setup_cp_attention.assert_called_once_with(cp_mesh)
+    cp_utils_stub.attach_context_parallel_hooks.assert_not_called()
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_not_called()
 
 
 def test_apply_cp_skips_attention_without_attn_module(monkeypatch):
@@ -2409,7 +2412,8 @@ def test_apply_cp_skips_attention_without_attn_module(monkeypatch):
 
     P.apply_cp(model, cp_mesh)
     cp_mesh.get_group.assert_not_called()
-    cp_utils_stub.attach_cp_sdpa_hooks.assert_called_once_with(model, cp_mesh)
+    # Unsupported (non-TE, non-model-owned) attention -> warn, no hooks.
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_not_called()
 
 
 def _setup_te_and_dist_stubs(monkeypatch, DotProductAttention):
@@ -2475,7 +2479,7 @@ def test_apply_cp_uses_attention_type_and_all_gather_for_sliding_attention(monke
 
 
 def test_apply_cp_mixed_te_and_non_te(monkeypatch):
-    """apply_cp should configure TE blocks and attach dense hooks when non-TE blocks exist."""
+    """apply_cp configures TE blocks; unsupported non-TE blocks warn (no hooks)."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     cp_utils_stub = _stub_dense_cp_hooks(monkeypatch)
 
@@ -2497,7 +2501,8 @@ def test_apply_cp_mixed_te_and_non_te(monkeypatch):
     P.apply_cp(model, cp_mesh)
 
     te_attn.set_context_parallel_group.assert_called_once()
-    cp_utils_stub.attach_cp_sdpa_hooks.assert_called_once_with(model, cp_mesh)
+    # The non-TE block is unsupported under CP -> warn, no generic hooks.
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_not_called()
 
 
 # ============================================================================
