@@ -15,11 +15,9 @@
 """Coverage for gemma4 MoE model context-parallel paths and helpers.
 
 Complements test_gemma4_model.py by exercising the CP-prep methods, the
-packed-mask builder branches, the SDPA-GQA override context manager, and the
-CP/vision branches of the forward pass.
+packed-mask builder branches, and the CP/vision branches of the forward pass.
 """
 
-import sys
 from types import SimpleNamespace
 from unittest import mock
 
@@ -32,7 +30,6 @@ from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4ForConditionalGeneration,
     Gemma4TextConfig,
     _build_packed_gemma4_causal_mask_mapping,
-    _force_repeat_kv_for_sdpa,
 )
 
 
@@ -74,29 +71,6 @@ def _backend():
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
-
-
-# ---------------------------------------------------------------------------
-# _force_repeat_kv_for_sdpa
-# ---------------------------------------------------------------------------
-def test_force_repeat_kv_swaps_and_restores():
-    from transformers.integrations import sdpa_attention
-
-    original = sdpa_attention.use_gqa_in_sdpa
-    with _force_repeat_kv_for_sdpa():
-        assert sdpa_attention.use_gqa_in_sdpa(None, None) is False
-    assert sdpa_attention.use_gqa_in_sdpa is original
-
-
-def test_force_repeat_kv_import_error_is_silent(monkeypatch):
-    # Remove the cached attribute AND null the submodule so the inner
-    # `from transformers.integrations import sdpa_attention` raises ImportError.
-    import transformers.integrations as ti
-
-    monkeypatch.delattr(ti, "sdpa_attention", raising=False)
-    monkeypatch.setitem(sys.modules, "transformers.integrations.sdpa_attention", None)
-    with _force_repeat_kv_for_sdpa():
-        pass  # must not raise
 
 
 # ---------------------------------------------------------------------------

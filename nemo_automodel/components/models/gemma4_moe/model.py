@@ -19,7 +19,6 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
-import contextlib
 from typing import Any, Optional, Union
 
 import torch
@@ -87,23 +86,6 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
 from .cp_batch import make_contiguous_shard_cp_batch_and_ctx
 from .state_dict_adapter import Gemma4MoEStateDictAdapter
-
-
-@contextlib.contextmanager
-def _force_repeat_kv_for_sdpa():
-    """Disable native SDPA GQA so the CP hook can own grouped-query handling."""
-    try:
-        from transformers.integrations import sdpa_attention
-    except ImportError:
-        yield
-        return
-
-    original_use_gqa = sdpa_attention.use_gqa_in_sdpa
-    sdpa_attention.use_gqa_in_sdpa = lambda _attention_mask, _key: False
-    try:
-        yield
-    finally:
-        sdpa_attention.use_gqa_in_sdpa = original_use_gqa
 
 
 # ---------------------------------------------------------------------------
