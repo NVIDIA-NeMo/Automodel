@@ -422,11 +422,16 @@ class BiEncoderModel(nn.Module):
         if not input_dict:
             return None
 
-        if "token_type_ids" not in inspect.getfullargspec(self.model.forward).args and "token_type_ids" in input_dict:
+        forward_args = inspect.getfullargspec(self.model.forward).args
+        if "token_type_ids" not in forward_args and "token_type_ids" in input_dict:
             input_dict = {k: v for k, v in input_dict.items() if k != "token_type_ids"}
 
+        model_inputs = {k: v for k, v in input_dict.items() if k not in ["kd_labels", "run_dummy_vision"]}
+        if "run_dummy_vision" in forward_args and "run_dummy_vision" in input_dict:
+            model_inputs["run_dummy_vision"] = input_dict["run_dummy_vision"]
+
         outputs = self.model(
-            **{k: v for k, v in input_dict.items() if k not in ["kd_labels"]},
+            **model_inputs,
             return_dict=True,
             output_hidden_states=True,
         )
