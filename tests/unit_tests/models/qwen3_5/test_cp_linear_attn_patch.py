@@ -54,8 +54,8 @@ class TestPatchHfModel:
             stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
             monkeypatch.setitem(sys.modules, path, stub)
 
-    def test_fp32_params_moved_to_holder(self, fake_model, monkeypatch):
-        """Float32 bare params are moved into _fp32_params submodule via real patch_hf_model."""
+    def test_tracked_params_forced_fp32_and_moved_to_holder(self, fake_model, monkeypatch):
+        """Tracked GDN params are forced fp32 and moved into _fp32_params by patch_hf_model."""
         self._stub_qwen3_5_modules(monkeypatch)
 
         # Remove cached cp_linear_attn so re-import picks up our stubs
@@ -71,17 +71,20 @@ class TestPatchHfModel:
 
         patch_hf_model(fake_model, cp_enabled=False)
 
-        # A_log (float32) should be moved out of _parameters
+        # A_log and dt_bias are intrinsic fp32 GDN params, even when originally
+        # constructed under a bf16 default dtype.
         assert "A_log" not in la._parameters
-        # Accessed via __getattr__ → _fp32_params
+        assert "dt_bias" not in la._parameters
+        # Accessed via __getattr__ -> _fp32_params
         assert la.A_log.dtype == torch.float32
-        # dt_bias (bfloat16) stays as a regular parameter
-        assert "dt_bias" in la._parameters
+        assert la.dt_bias.dtype == torch.float32
         # _fp32_params submodule holds the moved param
         assert hasattr(la, "_fp32_params")
         assert la._fp32_params.A_log.dtype == torch.float32
+        assert la._fp32_params.dt_bias.dtype == torch.float32
         # __getattr__ resolves to the same tensor in _fp32_params
         assert la.A_log is la._fp32_params.A_log
+        assert la.dt_bias is la._fp32_params.dt_bias
 
     def test_class_always_swapped_for_fsdp(self, fake_model, monkeypatch):
         """Class is always swapped to CPAwareGatedDeltaNet for FSDP fp32 unshard support."""
@@ -251,6 +254,24 @@ class TestComputeGate:
         assert g.dtype == torch.float32
         assert g.shape == (4,)
 
+    def test_compute_gate_does_not_pre_read_holder_dt_bias(self, fake_model, monkeypatch):
+        """When dt_bias is fp32 (moved into the holder), _compute_gate must call
+        ``holder(a)`` without reading ``self.dt_bias`` -- a pre-read would touch the
+        still-sharded holder param outside the holder forward."""
+        CPAwareGatedDeltaNet, _Fp32ParamHolder, patch_hf_model = self._stub_and_import(monkeypatch)
+        # Make dt_bias intrinsically fp32 so isolation moves it into the holder.
+        for layer in fake_model.layers:
+            mod = layer.linear_attn
+            mod.dt_bias = nn.Parameter(torch.zeros(mod.dt_bias.shape, dtype=torch.float32))
+        patch_hf_model(fake_model, cp_enabled=False)
+        la = fake_model.layers[0].linear_attn
+        assert "dt_bias" in la._fp32_params._parameters
+        a = torch.zeros(4)
+        with patch.object(la._fp32_params, "forward", return_value=torch.zeros(4)) as mock_fwd:
+            la._compute_gate(a)
+            # Only ``a`` is passed -- self.dt_bias is never read.
+            mock_fwd.assert_called_once_with(a)
+
 
 class TestPatchHfModelSentinel:
     """Test that __getattr__ patching is idempotent."""
@@ -331,13 +352,23 @@ class TestPatchHfModelStateDictAdapter:
 
         adapter = getattr(fake_model, "state_dict_adapter", None)
         assert isinstance(adapter, Qwen3_5DenseStateDictAdapter)
-        assert not adapter.route_linear_attn_fp32_params
-        # Smoke-check round-trip behaviour on a sample state dict.
+        assert adapter.route_linear_attn_fp32_params
+        # Smoke-check save/load behaviour on sample holder and HF state dicts.
         out = adapter.to_hf({"layers.0.linear_attn._fp32_params.A_log": torch.zeros(4)})
         assert list(out.keys()) == ["layers.0.linear_attn.A_log"]
+        out = adapter.from_hf(
+            {
+                "layers.0.linear_attn.A_log": torch.zeros(4),
+                "layers.0.linear_attn.dt_bias": torch.ones(4),
+            }
+        )
+        assert set(out) == {
+            "layers.0.linear_attn._fp32_params.A_log",
+            "layers.0.linear_attn._fp32_params.dt_bias",
+        }
 
     def test_preserves_existing_qwen3_5_adapter(self, fake_model, monkeypatch):
-        """If a Qwen3.5 adapter already exists, CP patching preserves its load mode."""
+        """If a Qwen3.5 adapter already exists, CP patching enables holder-key loads."""
         from nemo_automodel.components.models.qwen3_5.state_dict_adapter import (
             Qwen3_5DenseStateDictAdapter,
         )
@@ -349,7 +380,7 @@ class TestPatchHfModelStateDictAdapter:
         patch_hf_model(fake_model, cp_enabled=False)
 
         assert fake_model.state_dict_adapter is adapter
-        assert not adapter.route_linear_attn_fp32_params
+        assert adapter.route_linear_attn_fp32_params
 
     def test_does_not_overwrite_unrelated_existing_adapter(self, fake_model, monkeypatch):
         """If a non-Qwen3.5 model already has a state_dict_adapter, it is preserved."""
