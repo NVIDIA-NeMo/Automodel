@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -451,7 +452,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = True
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = False
 
@@ -566,6 +567,88 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
         return pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
 
+    def prepare_model_inputs_for_cp(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        image_grid_hws: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Build full-sequence multimodal embeddings and mRoPE positions before CP sharding.
+
+        The VLM->LM multimodal scatter and mRoPE ``get_rope_index`` must run on the
+        *full* (unsharded) sequence; context-parallel sharding then happens on the
+        returned ``inputs_embeds`` / ``position_ids`` via ``make_cp_batch_and_ctx``.
+        """
+        if input_ids is None:
+            raise ValueError("Qwen3.5 dense CP pre-embedding requires input_ids.")
+
+        if image_grid_thw is None and image_grid_hws is not None and image_grid_hws.numel() > 0:
+            if image_grid_hws.shape[-1] == 2:
+                ones = torch.ones(
+                    image_grid_hws.shape[0],
+                    1,
+                    dtype=image_grid_hws.dtype,
+                    device=image_grid_hws.device,
+                )
+                image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
+            else:
+                image_grid_thw = image_grid_hws
+
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        if pixel_values is not None:
+            if hasattr(self.model.visual, "rotary_pos_emb"):
+                self.model.visual.rotary_pos_emb.to(pixel_values.device)
+            image_outputs = self.model.get_image_features(pixel_values, image_grid_thw, return_dict=True)
+            image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = self.model.get_placeholder_mask(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                image_features=image_embeds,
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if pixel_values_videos is not None:
+            if hasattr(self.model.visual, "rotary_pos_emb"):
+                self.model.visual.rotary_pos_emb.to(pixel_values_videos.device)
+            video_outputs = self.model.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
+            video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            _, video_mask = self.model.get_placeholder_mask(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                video_features=video_embeds,
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+        if position_ids is None:
+            rope_kwargs = {
+                "image_grid_thw": image_grid_thw,
+                "video_grid_thw": video_grid_thw,
+                "attention_mask": attention_mask,
+            }
+            if "mm_token_type_ids" in inspect.signature(self.model.get_rope_index).parameters:
+                if mm_token_type_ids is None:
+                    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.long)
+                    image_token_id = getattr(self.config, "image_token_id", None)
+                    video_token_id = getattr(self.config, "video_token_id", None)
+                    if image_token_id is not None:
+                        mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == image_token_id, 1)
+                    if video_token_id is not None:
+                        mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == video_token_id, 2)
+                rope_kwargs["mm_token_type_ids"] = mm_token_type_ids.to(device=input_ids.device)
+            position_ids, rope_deltas = self.model.get_rope_index(input_ids, **rope_kwargs)
+            self.model.rope_deltas = rope_deltas
+
+        return {"inputs_embeds": inputs_embeds, "position_ids": position_ids}
+
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -584,6 +667,19 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         padding_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> Qwen3_5CausalLMOutputWithPast:
+        if kwargs.pop("_pre_embed_only", False):
+            return self.prepare_model_inputs_for_cp(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
+                **kwargs,
+            )
+
         effective_use_cache = False if use_cache is None and self.training else use_cache
         kwargs = dict(kwargs)
         if effective_use_cache is not None:
