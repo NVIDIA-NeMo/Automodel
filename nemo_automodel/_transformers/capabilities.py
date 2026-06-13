@@ -91,6 +91,16 @@ def _uses_te_attention(model: "nn.Module") -> bool:
     return getattr(model, "_te_attention_injected", False)
 
 
+def _uses_magi_attention(model: "nn.Module") -> bool:
+    """True when the model uses the MagiAttention (FFA / context-parallel) backend.
+
+    MagiAttention implements context parallelism via its own load-balancing
+    dispatch (see ``components/distributed/magi_attn_utils.py``), so it supports CP.
+    """
+    backend = getattr(model, "backend", None)
+    return getattr(backend, "attn", None) == "magi"
+
+
 def _is_hybrid(model: "nn.Module") -> bool:
     """True when the model mixes attention with non-attention layers (e.g. Mamba/SSM).
 
@@ -193,6 +203,7 @@ class ModelSupports:
         | Model kind       | Attention      | CP?     |
         +------------------+----------------+---------+
         | Custom           | TE             | Yes     |
+        | Custom           | Magi (FFA)     | Yes     |
         | Custom hybrid    | TE / SDPA      | Yes     |
         | Custom           | FlexAttention  | No      |
         | HF (pure attn)   | SDPA           | Yes     |
@@ -204,7 +215,7 @@ class ModelSupports:
             if _is_hybrid(self._model):
                 backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
                 return backend_attn in ("te", "sdpa")
-            return _uses_te_attention(self._model)
+            return _uses_te_attention(self._model) or _uses_magi_attention(self._model)
         if _is_hybrid(self._model):
             return False
         return getattr(self._model, "_supports_sdpa", False) is True
@@ -219,7 +230,11 @@ class ModelSupports:
     @property
     def supports_sequence_packing(self) -> bool:
         """``forward()`` accepts ``seq_lens`` for packed-sequence training."""
-        sp_attn_backend = getattr(self._model, "_supports_sdpa", False) is True or _uses_te_attention(self._model)
+        sp_attn_backend = (
+            getattr(self._model, "_supports_sdpa", False) is True
+            or _uses_te_attention(self._model)
+            or _uses_magi_attention(self._model)
+        )
         return _supports_seq_lens(self._model) and sp_attn_backend
 
     @property
@@ -260,10 +275,14 @@ class ModelSupports:
 
     @property
     def supports_cp_with_sequence_packing(self) -> bool:
-        """CP + packed sequences requires TE attention backend."""
+        """CP + packed sequences requires the TE or MagiAttention backend.
+
+        MagiAttention dispatches the packed sequence across the CP group with its
+        own load-balancing solver and a per-document varlen mask, so it supports
+        CP + packing (see ``magi_attn_utils.magi_prepare_packed_cp``)."""
         if self.cp_size <= 1:
             return self.supports_sequence_packing
-        return self.supports_sequence_packing and _uses_te_attention(self._model)
+        return self.supports_sequence_packing and (_uses_te_attention(self._model) or _uses_magi_attention(self._model))
 
 
 def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:

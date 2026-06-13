@@ -132,7 +132,7 @@ docs-generate-library:
 # Shared preview hosted at <repo-slug>.docs.buildwithfern.com — useful for sharing a
 # work-in-progress link before merge. Requires DOCS_FERN_TOKEN in the environment
 # (org secret of the same name is wired into CI).
-docs-preview: docs-stitch
+docs-preview: docs-stitch docs-generate-library
 	fern generate --docs --preview
 
 # Trigger the Publish Fern Docs workflow on origin/main via workflow_dispatch.
