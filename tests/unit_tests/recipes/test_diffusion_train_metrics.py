@@ -467,6 +467,7 @@ def test_build_diffusion_parallel_manager_args_parses_ddp_config():
         "static_graph": False,
         "bucket_cap_mb": None,
         "gradient_as_bucket_view": False,
+        "autocast_dtype": None,
     }
 
 
