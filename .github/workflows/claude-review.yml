@@ -40,6 +40,24 @@ jobs:
           that class's nested `ModelCapabilities` dataclass (static pattern) or
           inside the `get_capabilities(cls, config)` classmethod (dynamic
           dispatch pattern).
+        - Low-precision dtype hazards in RoPE / precision-sensitive buffers. Flag
+          when a module registers a floating-point buffer used to build rotary
+          tables — `inv_freq`, `freqs_cis`, or precomputed `cos`/`sin` — and the
+          model is cast to bf16/fp16 by a model-wide cast
+          (`self.to(config.torch_dtype)`, `model.to(dtype)`, or
+          `cast_model_to_dtype`). `nn.Module.to` rounds floating-point buffers, so
+          the rotary tables then get built from a bf16-rounded frequency, and a
+          later `.float()` / `.to(torch.float32)` on that buffer CANNOT recover the
+          lost bits. This silently degrades RoPE vs HuggingFace (which keeps
+          `inv_freq` in fp32) and surfaces as a large logit/KL divergence when a
+          checkpoint is reloaded in vanilla HF. Require one of: (a) recompute the
+          frequencies in float32 from config at cache-build/forward time, or (b)
+          list the rotary module (`"rotary_emb"`) or buffer
+          (`"inv_freq"`/`"freqs_cis"`) in `_keep_in_fp32_modules`. IMPORTANT: a raw
+          `self.to(dtype)` does NOT honor `_keep_in_fp32_modules` — the cast MUST go
+          through `cast_model_to_dtype(self, dtype)`, so also flag new model code
+          that casts the whole model with a raw `self.to(dtype)` / `model.to(dtype)`
+          instead of `cast_model_to_dtype`.
 
         Do NOT comment on:
         - Style preferences or formatting
