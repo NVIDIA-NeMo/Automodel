@@ -191,7 +191,15 @@ See the pattern files for detailed implementation guidance:
 - MoE: [moe-patterns.md](./moe-patterns.md)
 - VLM: [vlm-patterns.md](./vlm-patterns.md)
 
-### 2.3 MoE state-dict adapter checklist
+### 2.3 Causal LM weight tying
+
+For any CausalLM-style class whose config can enable `tie_word_embeddings`,
+make tying explicit: declare `_tied_weights_keys`, implement `tie_weights()`
+with the actual `lm_head` and input-embedding FQNs, and add tiny tests for
+tied and untied configs. Do not tie architectures with intentionally separate
+heads, asymmetric vocab sizes, or stages that do not own both tensors.
+
+### 2.4 MoE state-dict adapter checklist
 
 For MoE models, do not stop at generic loading. The adapter must explicitly map:
 
@@ -210,7 +218,7 @@ Do not use these shortcuts:
   and NeMo layouts require it and a test proves the conversion is reversible.
 - Do not skip router or shared-expert tests because dense-layer tests pass.
 
-### 2.4 VLM onboarding checklist
+### 2.5 VLM onboarding checklist
 
 For VLMs, confirm the Hugging Face config has `vision_config` and `text_config`
 and that `architectures` points to a conditional-generation class. Start from
@@ -225,7 +233,7 @@ The implementation should explicitly cover:
 - Registration of the `ForConditionalGeneration` class in `_transformers/registry.py`.
 - Tiny tests that exercise image-text inputs and verify the adapter round-trip.
 
-### 2.5 Register in registry
+### 2.6 Register in registry
 
 Add the model to `MODEL_ARCH_MAPPING` in `_transformers/registry.py`:
 
@@ -249,7 +257,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 }
 ```
 
-### 2.6 Declare model capabilities (mandatory)
+### 2.7 Declare model capabilities (mandatory)
 
 Every class registered in `MODEL_ARCH_MAPPING` must declare its parallelism
 capabilities. Pick exactly one of the two patterns below — never both, never
