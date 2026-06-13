@@ -187,6 +187,41 @@ def test_attach_sets_metadata_keys_and_method():
         "_gemma4_vision_group_ids": 1,
     }
     assert callable(module.run_cp_manual_attention)
+    assert callable(module.setup_cp_attention)
+
+
+def test_setup_cp_attention_installs_model_owned_sdpa_swap(monkeypatch):
+    """setup_cp_attention swaps SDPA -> ring on the module, captures the attention
+    kwargs into _cp_manual_metadata, and restores SDPA after the forward."""
+    import torch.nn.functional as F
+
+    captured = {}
+
+    def fake_ring(module, query, key, value, *, cp_mesh, attn_mask, dropout_p, is_causal, scale, enable_gqa, kwargs):
+        captured["meta"] = dict(module._cp_manual_metadata)
+        captured["uses_hook"] = module._cp_uses_attention_hook
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(cpa, "_gemma4_cp_manual_attention", fake_ring)
+
+    class _Attn(torch.nn.Module):
+        def forward(self, q, k, v, **kw):
+            return F.scaled_dot_product_attention(q, k, v)
+
+    attn = _Attn()
+    cpa.attach_gemma4_cp_ring_attention(attn)  # binds metadata keys + setup_cp_attention
+    original = F.scaled_dot_product_attention
+    attn.setup_cp_attention(object())  # model installs its own SDPA-swap hook (cp_mesh stubbed)
+    assert attn._cp_uses_attention_hook is True
+
+    q = torch.randn(1, 2, 4, 8)
+    out = attn(q, q.clone(), q.clone(), mm_token_type_ids=torch.tensor([[1, 0, 1, 0]]))
+    assert torch.equal(out, torch.zeros_like(q))  # ring ran -> SDPA was swapped
+    assert torch.equal(captured["meta"]["mm_token_type_ids"], torch.tensor([[1, 0, 1, 0]]))
+    assert captured["uses_hook"] is True
+    # post-hook restored SDPA and cleared the per-call metadata
+    assert F.scaled_dot_product_attention is original
+    assert attn._cp_manual_metadata == {}
 
 
 # ---------------------------------------------------------------------------

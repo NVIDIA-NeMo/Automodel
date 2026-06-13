@@ -494,6 +494,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     #     model names here -- only the TE-vs-not split; the strategy choice lives
     #     in cp_utils via the capability check.
     needs_cp_attention_hooks = False
+    needs_generic_cp_attention = False
     model_owned_cp_attention = False
     for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
@@ -508,10 +509,16 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                     _get_cp_stream(),
                     cp_comm_type=attn_cp_comm_type,
                 )
+            elif hasattr(block.self_attn, "setup_cp_attention"):
+                # Model-owned CP attention (e.g. Gemma4 p2p ring): the model
+                # installs its own SDPA hook here; the generic DTensor SDPA path
+                # is not used for it.
+                block.self_attn.setup_cp_attention(cp_mesh)
+                needs_cp_attention_hooks = True
+                model_owned_cp_attention = True
             else:
                 needs_cp_attention_hooks = True
-                if hasattr(block.self_attn, "run_cp_manual_attention"):
-                    model_owned_cp_attention = True
+                needs_generic_cp_attention = True
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
 
@@ -543,17 +550,22 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     if needs_cp_attention_hooks:
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
-            attach_cp_attention_hooks,
             attach_linear_attn_position_hooks,
         )
 
+        # Mask-strip + linear-attn position hooks are model-agnostic and apply to
+        # both model-owned and generic CP attention. The generic DTensor SDPA hook
+        # is only installed for attention modules that did NOT own their CP setup.
         attach_context_parallel_hooks(_model)
         attach_linear_attn_position_hooks(_model)
-        attach_cp_attention_hooks(_model, cp_mesh)
+        if needs_generic_cp_attention:
+            from nemo_automodel.components.distributed.cp_utils import attach_cp_attention_hooks
+
+            attach_cp_attention_hooks(_model, cp_mesh)
         logger.info(
             "Attached CP attention hooks for %s (%s).",
             type(_model).__name__,
-            "model-owned run_cp_manual_attention" if model_owned_cp_attention else "generic DTensor SDPA",
+            "model-owned setup_cp_attention" if model_owned_cp_attention else "generic DTensor SDPA",
         )
 
 

@@ -160,12 +160,11 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
 def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
     """Inject CP-aware attention into self-attention modules.
 
-    The installed SDPA wrapper dispatches to one of two separate paths:
-      - classic PyTorch context_parallel attention, which re-wraps local Q/K/V
-        as DTensors and lets DTensor SDPA dispatch run; or
-      - model-owned manual CP attention (``run_cp_manual_attention``), where the
-        model runs its own CP attention transport over the contiguous shards
-        (e.g. Gemma4's p2p ring FlexAttention).
+    The installed SDPA wrapper runs the classic PyTorch context_parallel path:
+    it re-wraps local Q/K/V as DTensors so the DTensor SDPA dispatch fires the
+    CP all-gather. Models that own their CP attention (e.g. Gemma4's p2p ring
+    FlexAttention) install their own attention hooks instead and are not routed
+    here.
 
     Seq dim at the SDPA call is 2: tensors are [B, nH, S/cp_size, D] after HF reshape.
     """
@@ -173,8 +172,6 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
     from torch.distributed.tensor import DTensor, Shard
 
     _original_sdpa = F_module.scaled_dot_product_attention
-    cp_size = cp_mesh.size()
-    active_module = {"module": None}
 
     @torch._dynamo.disable
     def _cp_sdpa(
@@ -200,68 +197,11 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
         # Unwrap back to local tensor for the compiled O-proj + MLP region.
         return out.to_local() if isinstance(out, DTensor) else out
 
-    @torch._dynamo.disable
-    def cp_attention(
-        query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, **kwargs
-    ):
-        if cp_size <= 1:
-            return _original_sdpa(
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal,
-                scale=scale,
-                enable_gqa=enable_gqa,
-                **kwargs,
-            )
-
-        module = active_module["module"]
-        if bool(getattr(module, "_cp_manual_active", False)):
-            # The model owns its CP attention transport + compute via this seam;
-            # cp_utils stays model-agnostic (no transport / mask specifics here).
-            return module.run_cp_manual_attention(
-                query,
-                key,
-                value,
-                cp_mesh=cp_mesh,
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal,
-                scale=scale,
-                enable_gqa=enable_gqa,
-                kwargs=kwargs,
-            )
-
-        return _cp_sdpa(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            dropout_p=dropout_p,
-            is_causal=is_causal,
-            scale=scale,
-            enable_gqa=enable_gqa,
-            **kwargs,
-        )
-
     def _pre_hook(module, args, kwargs):
-        has_manual_impl = hasattr(module, "run_cp_manual_attention")
-        metadata = {}
-        if has_manual_impl:
-            for name in getattr(module, "_cp_manual_metadata_keys", ()):
-                metadata[name] = kwargs.pop(name, None)
-        module._cp_manual_metadata = metadata
-        module._cp_manual_active = has_manual_impl
-        active_module["module"] = module
-        F_module.scaled_dot_product_attention = cp_attention
+        F_module.scaled_dot_product_attention = _cp_sdpa
         return args, kwargs
 
     def _post_hook(module, inputs, output):
-        module._cp_manual_metadata = {}
-        module._cp_manual_active = False
-        active_module["module"] = None
         F_module.scaled_dot_product_attention = _original_sdpa
 
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
@@ -273,6 +213,12 @@ def attach_cp_attention_hooks(model: torch.nn.Module, cp_mesh) -> None:
             # CheckpointWrapper's recompute bypasses __call__ (and thus pre-hooks
             # on the wrapper itself), so we must hook on the wrapped module directly.
             target = module._checkpoint_wrapped_module if isinstance(module, CheckpointWrapper) else module
+            if hasattr(target, "run_cp_manual_attention"):
+                # Model-owned CP attention (e.g. Gemma4's ring) installs its own
+                # SDPA hook via setup_cp_attention; never overwrite it with the
+                # classic DTensor path (this function may be called by both the
+                # MoE parallelizer and infrastructure.py for the same model).
+                continue
             target._cp_uses_attention_hook = True
             target.register_forward_pre_hook(_pre_hook, with_kwargs=True)
             # always_call=True ensures _original_sdpa is restored even if the forward raises.

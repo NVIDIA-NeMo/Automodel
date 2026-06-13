@@ -541,8 +541,62 @@ def _gemma4_cp_manual_attention(
     return _run_gemma4_cp_ring_attention(attention_module, ctx)
 
 
+def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> None:
+    """Swap ``F.scaled_dot_product_attention`` -> Gemma4 ring CP attention on this module.
+
+    Gemma4 owns its CP attention end-to-end (it does not use cp_utils' generic CP
+    SDPA hooks). It installs its own ``@torch._dynamo.disable`` SDPA wrapper -- on
+    the inner attention module so it also fires during gradient-checkpointing
+    recompute -- that runs the p2p ring FlexAttention. The per-forward attention
+    kwargs the ring needs (mm_token_type_ids, packed-seq ids, padding/vision masks)
+    are captured off the forward kwargs into ``_cp_manual_metadata`` here, since the
+    swapped SDPA only receives Q/K/V.
+    """
+    import torch.nn.functional as F_module
+
+    original_sdpa = F_module.scaled_dot_product_attention
+    metadata_keys = getattr(attention_module, "_cp_manual_metadata_keys", ())
+
+    @torch._dynamo.disable
+    def _ring_sdpa(
+        query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, **kwargs
+    ):
+        return _gemma4_cp_manual_attention(
+            attention_module,
+            query,
+            key,
+            value,
+            cp_mesh=cp_mesh,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+            kwargs=kwargs,
+        )
+
+    def _pre_hook(module, args, kwargs):
+        module._cp_manual_metadata = {name: kwargs.pop(name, None) for name in metadata_keys}
+        F_module.scaled_dot_product_attention = _ring_sdpa
+        return args, kwargs
+
+    def _post_hook(module, inputs, output):
+        module._cp_manual_metadata = {}
+        F_module.scaled_dot_product_attention = original_sdpa
+
+    attention_module._cp_uses_attention_hook = True
+    attention_module.register_forward_pre_hook(_pre_hook, with_kwargs=True)
+    attention_module.register_forward_hook(_post_hook, always_call=True)
+
+
 def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module) -> None:
-    """Register Gemma4's model-specific manual p2p ring CP attention handler."""
+    """Register Gemma4's model-owned p2p ring CP attention on a self-attention module.
+
+    Declares the metadata keys the ring needs and exposes ``setup_cp_attention(cp_mesh)``
+    -- the model-owned CP-attention seam the parallelizer calls (with the CP mesh)
+    instead of cp_utils' generic SDPA hooks. ``run_cp_manual_attention`` is also bound
+    as the ring entry point.
+    """
     attention_module._cp_manual_metadata_keys = (
         "mm_token_type_ids",
         "_packed_seq_ids",
@@ -556,3 +610,4 @@ def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module) -> None:
         "_gemma4_vision_group_ids": 1,
     }
     attention_module.run_cp_manual_attention = MethodType(_gemma4_cp_manual_attention, attention_module)
+    attention_module.setup_cp_attention = MethodType(_install_gemma4_cp_ring_sdpa, attention_module)

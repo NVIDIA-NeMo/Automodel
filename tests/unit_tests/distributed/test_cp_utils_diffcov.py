@@ -20,7 +20,6 @@ the manual contiguous-shard batch builder branches that the broader suite leaves
 uncovered. No GPU or real process group is required.
 """
 
-from types import MethodType
 from unittest import mock
 
 import pytest
@@ -88,43 +87,10 @@ def test_context_parallel_hook_uses_attention_hook_branch():
 
 
 # ---------------------------------------------------------------------------
-# attach_cp_attention_hooks: cp_size<=1 passthrough, manual path, DTensor path
+# attach_cp_attention_hooks: classic DTensor SDPA path. (Model-owned CP attention,
+# e.g. Gemma4's p2p ring, is installed by the model via setup_cp_attention and is
+# covered under tests/unit_tests/models/gemma4.)
 # ---------------------------------------------------------------------------
-def test_cp_attention_hooks_cp_size_one_passthrough():
-    attn = _Attn()
-    model = _Wrapper(attn)
-    cu.attach_cp_attention_hooks(model, _FakeMesh(size=1))
-    q, k, v = _qkv()
-    out = attn(q, k, v)
-    ref = F.scaled_dot_product_attention(q, k, v)
-    assert torch.allclose(out, ref)
-    # SDPA must be restored after the forward (post-hook)
-    assert F.scaled_dot_product_attention is not None
-
-
-def test_cp_attention_hooks_manual_path():
-    attn = _Attn()
-    calls = {}
-
-    def manual(self, query, key, value, *, cp_mesh, attn_mask, dropout_p, is_causal, scale, enable_gqa, kwargs):
-        calls["meta"] = self._cp_manual_metadata
-        calls["active"] = self._cp_manual_active
-        return torch.zeros_like(query)
-
-    attn.run_cp_manual_attention = MethodType(manual, attn)
-    attn._cp_manual_metadata_keys = ("foo",)
-    model = _Wrapper(attn)
-    cu.attach_cp_attention_hooks(model, _FakeMesh(size=2))
-    q, k, v = _qkv()
-    out = attn(q, k, v, foo=torch.tensor([1, 2, 3]))
-    assert torch.equal(out, torch.zeros_like(q))
-    assert calls["active"] is True
-    assert torch.equal(calls["meta"]["foo"], torch.tensor([1, 2, 3]))
-    # post-hook cleared the per-call state
-    assert attn._cp_manual_active is False
-    assert attn._cp_manual_metadata == {}
-
-
 def test_cp_attention_hooks_dtensor_sdpa_path():
     attn = _Attn()  # no run_cp_manual_attention -> classic DTensor _cp_sdpa
     model = _Wrapper(attn)
