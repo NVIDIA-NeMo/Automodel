@@ -95,6 +95,7 @@ class TestParsing:
                 "static_graph": True,
                 "bucket_cap_mb": 64,
                 "gradient_as_bucket_view": True,
+                "autocast_dtype": "bfloat16",
             }
         )
         assert isinstance(result["strategy_config"], DDPConfig)
@@ -104,6 +105,7 @@ class TestParsing:
         assert result["strategy_config"].static_graph is True
         assert result["strategy_config"].bucket_cap_mb == 64
         assert result["strategy_config"].gradient_as_bucket_view is True
+        assert result["strategy_config"].autocast_dtype == torch.bfloat16
 
     def test_all_parallelism_keys(self):
         cfg = {

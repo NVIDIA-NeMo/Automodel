@@ -58,6 +58,14 @@ def _unwrap_model_for_attrs(model):
     return getattr(model, "module", model)
 
 
+def _get_autocast_ctx(distributed_config):
+    """Return the optional recipe-level autocast context."""
+    autocast_dtype = getattr(distributed_config, "autocast_dtype", None)
+    if autocast_dtype is None or not torch.cuda.is_available():
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=autocast_dtype)
+
+
 def contrastive_scores_and_labels(
     query: torch.Tensor, key: torch.Tensor, current_train_n_passages: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -362,10 +370,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
         self.loss_average_window_steps = int(self.cfg.get("loss_average_window_steps", 50))
         if self.loss_average_window_steps <= 0:
-            raise ValueError(
-                "loss_average_window_steps must be greater than 0, "
-                f"got {self.loss_average_window_steps}"
-            )
+            raise ValueError(f"loss_average_window_steps must be greater than 0, got {self.loss_average_window_steps}")
         self.loss_average_window = deque(maxlen=self.loss_average_window_steps)
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
@@ -425,7 +430,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         query, passage = _unpack_qp(batch)
 
         model = self.model_parts[0]
-        train_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
+        train_ctx = _get_autocast_ctx(self.distributed_config)
         sync_ctx = (
             get_sync_ctx(
                 model,
