@@ -372,6 +372,63 @@ class TestCastFrozenModulesToComputeDtype:
         assert model.vision.pos.dtype == torch.bfloat16
 
 
+class TestRopeBufferPreserved:
+    """Regression: a model-wide bf16 cast must not round rotary frequency buffers.
+
+    ``nn.Module.to(bf16)`` rounds floating-point buffers, including a rotary
+    embedding's (non-persistent) ``inv_freq`` / ``freqs_cis``. Building cos/sin from a
+    bf16-rounded buffer degrades RoPE precision vs HF (which keeps it fp32) and shows
+    up as a large logit/KL divergence when a checkpoint is reloaded in vanilla HF.
+    Models guard against this by listing the rotary module (or buffer) in
+    ``_keep_in_fp32_modules``; these tests pin that ``cast_model_to_dtype`` honors it
+    for non-persistent rope buffers (the mechanism the per-model fixes rely on).
+    """
+
+    @staticmethod
+    def _rope_model(keep, *, buffer_name="inv_freq", module_name="rotary_emb"):
+        class Rope(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Non-persistent, exactly like the real rotary frequency buffers.
+                self.register_buffer(buffer_name, torch.arange(0, 8, 2, dtype=torch.float32), persistent=False)
+
+        class M(nn.Module):
+            _keep_in_fp32_modules = keep
+
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(4, 4)
+                setattr(self, module_name, Rope())
+
+        return M()
+
+    def test_rotary_emb_keyword_keeps_inv_freq_fp32(self):
+        # deepseek_v4 / mimo_v2_flash / gemma4_moe / diffusion_gemma case.
+        model = self._rope_model(["rotary_emb"])
+        cast_model_to_dtype(model, torch.bfloat16)
+        assert model.rotary_emb.inv_freq.dtype == torch.float32  # protected
+        assert model.linear.weight.dtype == torch.bfloat16  # everything else cast
+
+    def test_unprotected_inv_freq_is_rounded(self):
+        # Without the keep-list entry the bug reproduces: inv_freq is rounded to bf16.
+        model = self._rope_model([])
+        cast_model_to_dtype(model, torch.bfloat16)
+        assert model.rotary_emb.inv_freq.dtype == torch.bfloat16
+
+    def test_inv_freq_keyword_protects_non_rotary_named_module(self):
+        # minimax_m3_vl vision tower: inv_freq lives on a module not named "rotary_emb",
+        # so the "inv_freq" buffer-name keyword is what pins it fp32.
+        model = self._rope_model(["inv_freq"], module_name="vision_tower")
+        cast_model_to_dtype(model, torch.bfloat16)
+        assert model.vision_tower.inv_freq.dtype == torch.float32
+
+    def test_freqs_cis_keyword_protects_buffer(self):
+        # deepseek_v3 / kimi_k25_vl: the real-valued frequency buffer is named "freqs_cis".
+        model = self._rope_model(["freqs_cis"], buffer_name="freqs_cis", module_name="model")
+        cast_model_to_dtype(model, torch.bfloat16)
+        assert model.model.freqs_cis.dtype == torch.float32
+
+
 class TestRestoreFp32Buffers:
     def test_buffers_restored_params_untouched(self):
         """_restore_fp32_buffers casts buffers but not parameters."""
