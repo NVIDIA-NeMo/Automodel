@@ -20,35 +20,6 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
 
-_CP_NON_TEXT_MODULE_PATH_PARTS: frozenset[str] = frozenset(
-    {
-        "audio_encoder",
-        "audio_model",
-        "audio_tower",
-        "image_encoder",
-        "image_model",
-        "image_tower",
-        "video_encoder",
-        "video_model",
-        "video_tower",
-        "vision_encoder",
-        "vision_model",
-        "vision_tower",
-        "visual",
-        "visual_model",
-    }
-)
-
-
-def _is_cp_non_text_module_path(name: str) -> bool:
-    return any(part in _CP_NON_TEXT_MODULE_PATH_PARTS for part in name.split("."))
-
-
-def _is_cp_attention_module_name(name: str) -> bool:
-    if not name.endswith("self_attn"):
-        return False
-    return not _is_cp_non_text_module_path(name)
-
 
 def _build_position_ids(batch, device):
     """Add position_ids to the batch only if they are missing."""
@@ -231,17 +202,13 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
     """
 
     def _self_attn_pre_forward_hook(_module, module_args, module_kwargs):
-        if getattr(_module, "_cp_uses_attention_hook", False):
-            module_kwargs["attention_mask"] = None
-            module_kwargs["is_causal"] = True
-            return module_args, module_kwargs
         if "attention_mask" in module_kwargs:
             module_kwargs["attention_mask"] = None
             module_kwargs["is_causal"] = True
         return module_args, module_kwargs
 
     for name, module in model.named_modules():
-        if _is_cp_attention_module_name(name):
+        if name.endswith("self_attn"):
             module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
 
 

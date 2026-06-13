@@ -345,17 +345,6 @@ class _FakeModel(torch.nn.Module):
         self.layers = torch.nn.ModuleList([_FakeTransformerBlock(), _FakeTransformerBlock()])
 
 
-class _FakeVLM(torch.nn.Module):
-    """Toy VLM with language and vision self-attention modules."""
-
-    def __init__(self):
-        super().__init__()
-        self.model = torch.nn.Module()
-        self.model.language_model = _FakeModel()
-        self.model.vision_tower = torch.nn.Module()
-        self.model.vision_tower.encoder = _FakeModel()
-
-
 def test_attach_context_parallel_hooks_registers_on_self_attn():
     """Hooks should be registered on every module whose name ends with 'self_attn'."""
     model = _FakeModel()
@@ -411,29 +400,6 @@ def test_attach_context_parallel_hooks_skips_non_self_attn():
     assert len(model.layers._forward_pre_hooks) == 0
     for layer in model.layers:
         assert len(layer._forward_pre_hooks) == 0
-
-
-def test_attach_context_parallel_hooks_skips_vision_tower_self_attn():
-    """CP hooks should not alter full-sequence vision tower attention."""
-    model = _FakeVLM()
-
-    _cu.attach_context_parallel_hooks(model)
-
-    assert len(model.model.language_model.layers[0].self_attn._forward_pre_hooks) == 1
-    assert len(model.model.vision_tower.encoder.layers[0].self_attn._forward_pre_hooks) == 0
-
-
-def test_cp_attention_module_name_filter_excludes_multimodal_towers():
-    assert _cu._is_cp_attention_module_name("model.language_model.layers.0.self_attn")
-    assert not _cu._is_cp_attention_module_name("model.vision_tower.encoder.layers.0.self_attn")
-    assert not _cu._is_cp_attention_module_name("model.vision_model.encoder.layers.0.self_attn")
-    assert not _cu._is_cp_attention_module_name("model.image_model.encoder.layers.0.self_attn")
-    assert not _cu._is_cp_attention_module_name("model.image_tower.encoder.layers.0.self_attn")
-    assert not _cu._is_cp_attention_module_name("model.audio_tower.encoder.layers.0.self_attn")
-    assert not _cu._is_cp_attention_module_name("model.audio_model.encoder.layers.0.self_attn")
-    assert not _cu._is_cp_attention_module_name("model.video_tower.encoder.layers.0.self_attn")
-    assert not _cu._is_cp_attention_module_name("model.video_model.encoder.layers.0.self_attn")
-    assert not _cu._is_cp_attention_module_name("model.visual_model.encoder.layers.0.self_attn")
 
 
 # ============================================================================

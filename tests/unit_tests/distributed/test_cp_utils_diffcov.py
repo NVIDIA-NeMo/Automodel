@@ -65,28 +65,6 @@ def _qkv(seq=4, d=8, heads=2):
 
 
 # ---------------------------------------------------------------------------
-# attach_context_parallel_hooks: the _cp_uses_attention_hook fast path
-# ---------------------------------------------------------------------------
-def test_context_parallel_hook_uses_attention_hook_branch():
-    attn = _Attn()
-    model = _Wrapper(attn)
-    cu.attach_context_parallel_hooks(model)
-    attn._cp_uses_attention_hook = True
-    captured = {}
-
-    def spy(_m, args, kwargs):
-        captured["mask"] = kwargs.get("attention_mask", "absent")
-        captured["causal"] = kwargs.get("is_causal")
-
-    attn.register_forward_pre_hook(spy, with_kwargs=True)
-    q, k, v = _qkv()
-    attn(q, k, v, attention_mask=torch.ones(1, 1, 4, 4))
-    # the CP hook forced attention_mask=None and is_causal=True
-    assert captured["mask"] is None
-    assert captured["causal"] is True
-
-
-# ---------------------------------------------------------------------------
 # attach_cp_sdpa_hooks: classic DTensor SDPA path. (Model-owned CP attention,
 # e.g. Gemma4's p2p ring, is installed by the model via setup_cp_attention and is
 # covered under tests/unit_tests/models/gemma4.)
