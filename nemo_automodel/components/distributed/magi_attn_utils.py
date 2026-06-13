@@ -511,22 +511,20 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
     cp_group: Optional[dist.ProcessGroup],
     chunk_size: int = DEFAULT_CHUNK_SIZE,
 ):
-    """Dispatch a (batch_size==1) sequence for MagiAttention on the HF path (cp_size==1).
+    """Dispatch a (batch_size==1) sequence for MagiAttention on the HF path.
 
     Builds a causal varlen dist-attn key over the single sequence and dispatches
-    ``input_ids``, ``position_ids`` *and* ``labels`` (identity shard at cp_size==1).
-    Labels are sharded the same way as the input so the loss is computed per-shard
-    (no logit undispatch); ``MaskedCrossEntropy`` does not shift, so the dispatch
-    permutation is harmless (logits[j] stay paired with labels[j]).
-
-    cp_size>1 is rejected: the HF dispatch path does not yet produce correct cross-rank
-    attention (see the guard below). Context parallelism is supported on the custom-model
-    path (``backend.attn=magi`` -> :func:`magi_prepare_packed_cp`).
+    ``input_ids``, ``position_ids`` *and* ``labels`` across ``cp_group`` (identity
+    shard at cp_size==1; load-balanced sharding at cp_size>1). Labels are sharded the
+    same way as the input so the loss is computed per-shard and summed across CP — no
+    logit undispatch; ``MaskedCrossEntropy`` does not shift, so the dispatch
+    permutation is harmless (logits[j] stay paired with labels[j]). The FFA kernel
+    does the cross-rank KV exchange via the stamped ``cp_group`` + the dist key.
 
     Args:
         model: the (possibly FSDP-wrapped) HF causal-LM.
         batch: dict with at least ``input_ids`` of shape ``[1, S]``.
-        cp_group: CP process group (size 1 only; size>1 raises).
+        cp_group: CP process group (size 1 -> identity shard).
         chunk_size: dispatch solver chunk size.
 
     Returns:
@@ -548,14 +546,6 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
     device = input_ids.device
     seqlen = input_ids.shape[1]
     cp_size = cp_group.size() if cp_group is not None else 1
-    if cp_size > 1:
-        raise NotImplementedError(
-            "The magi HF backend (attn_implementation=magi) supports cp_size==1 only "
-            "(single-GPU FFA kernel swap). Context parallelism (cp_size>1) is validated on "
-            "the custom-model path (backend.attn=magi); use that for CP. The HF dispatch path "
-            "does not yet produce correct cross-rank attention (FFA calc_attn over a dispatched "
-            "single sequence diverges from the non-CP run)."
-        )
 
     num_heads_q, num_heads_kv, head_dim = _get_head_config(model.module if hasattr(model, "module") else model)
 

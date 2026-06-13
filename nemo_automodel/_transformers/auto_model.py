@@ -554,7 +554,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             else getattr(pretrained_model_name_or_path_or_config, "name_or_path", "")
         )
 
-        if is_hf_model:
+        if is_hf_model and attn_implementation != "magi":
             _verify_sdpa_support(model, mesh.cp_size)
 
         # HF from_pretrained on a real device loads (and potentially quantizes) weights
