@@ -629,7 +629,13 @@ def apply_model_infrastructure(
     # Attach CP attention-mask hooks for dense (non-TE) context parallelism.
     # These hooks strip attention_mask and set is_causal=True on self_attn modules
     # so that SDPA handles causal masking internally (compatible with DTensor sharding).
-    if mesh.cp_size > 1 and not _uses_te_attention(model):
+    #
+    # MoE models (ep_size > 1) get their full CP setup from the MoE parallelizer's
+    # apply_cp (via _shard_ep_fsdp), which routes TE attention to its own CP group,
+    # model-owned attention (e.g. Gemma4's ring) to setup_cp_attention, and generic
+    # attention to these same hooks -- so running them again here would be redundant
+    # (and previously double-applied them to Gemma4). Only dense models need this pass.
+    if mesh.cp_size > 1 and mesh.ep_size <= 1 and not _uses_te_attention(model):
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
             attach_cp_attention_hooks,
