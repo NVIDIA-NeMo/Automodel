@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from collections import deque
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import torch
 
@@ -20,6 +22,7 @@ from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.recipes.retrieval import train_bi_encoder
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     TrainBiEncoderRecipe,
+    _get_autocast_ctx,
     _unwrap_model_for_attrs,
     _uses_multi_vector_scoring,
 )
@@ -56,6 +59,34 @@ def test_retrieval_attrs_accept_unwrapped_model():
 
     assert _unwrap_model_for_attrs(inner) is inner
     assert _uses_multi_vector_scoring(inner) is True
+
+
+def test_retrieval_autocast_ctx_disabled_by_default(monkeypatch):
+    def _unexpected_autocast(*args, **kwargs):
+        raise AssertionError("autocast should be disabled when autocast_dtype is unset")
+
+    monkeypatch.setattr(train_bi_encoder.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(train_bi_encoder.torch, "autocast", _unexpected_autocast)
+
+    with _get_autocast_ctx(SimpleNamespace(autocast_dtype=None)):
+        pass
+
+
+def test_retrieval_autocast_ctx_uses_configured_dtype(monkeypatch):
+    captured = {}
+
+    def _fake_autocast(*, device_type, dtype):
+        captured["device_type"] = device_type
+        captured["dtype"] = dtype
+        return nullcontext()
+
+    monkeypatch.setattr(train_bi_encoder.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(train_bi_encoder.torch, "autocast", _fake_autocast)
+
+    with _get_autocast_ctx(SimpleNamespace(autocast_dtype=torch.bfloat16)):
+        pass
+
+    assert captured == {"device_type": "cuda", "dtype": torch.bfloat16}
 
 
 class _FakeCheckpointer:

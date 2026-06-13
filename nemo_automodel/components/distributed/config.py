@@ -305,6 +305,9 @@ class DDPConfig:
         static_graph (bool): Tell DDP the used/unused parameter set is stable.
         bucket_cap_mb (Optional[float]): DDP gradient bucket size in MiB. ``None`` uses PyTorch's default.
         gradient_as_bucket_view (bool): Make gradients views into DDP buckets after the first iteration.
+        autocast_dtype (Optional[torch.dtype]): If set, recipes can wrap the forward pass in
+            ``torch.autocast(device_type="cuda", dtype=autocast_dtype)``. Set to ``None`` to disable.
+            Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
     """
 
     activation_checkpointing: bool = False
@@ -313,6 +316,7 @@ class DDPConfig:
     static_graph: bool = False
     bucket_cap_mb: Optional[float] = None
     gradient_as_bucket_view: bool = False
+    autocast_dtype: Optional[torch.dtype] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
