@@ -332,6 +332,14 @@ def make_cp_batch_and_ctx(
     if _get_mesh_size(cp_mesh) <= 1:
         return nullcontext, batch
 
+    # A model that owns its CP attention can attach a batch-sharding callable to
+    # the batch in its pre-embed step (e.g. Gemma4's contiguous ring shard); honor
+    # it instead of the default load-balanced context_parallel path. This keeps
+    # make_cp_batch_and_ctx model-agnostic -- the implementation lives with the model.
+    cp_make_batch_fn = batch.pop("_cp_make_batch_fn", None)
+    if cp_make_batch_fn is not None:
+        return cp_make_batch_fn(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
+
     # Remove attention_mask from the batch so the model does not attempt to
     # build a 4D causal mask (which would have mismatched shapes with
     # DTensor-sharded Q/K/V).  Each self_attn module's forward_pre_hook

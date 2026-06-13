@@ -629,17 +629,28 @@ def apply_model_infrastructure(
     # Attach CP attention-mask hooks for dense (non-TE) context parallelism.
     # These hooks strip attention_mask and set is_causal=True on self_attn modules
     # so that SDPA handles causal masking internally (compatible with DTensor sharding).
-    if mesh.cp_size > 1 and not _uses_te_attention(model):
+    #
+    # MoE models (ep_size > 1) get their full CP setup from the MoE parallelizer's
+    # apply_cp (via _shard_ep_fsdp): TE attention -> its own CP group; model-owned
+    # attention (e.g. Gemma4's ring) -> setup_cp_attention. Re-running this dense
+    # pass for them is not just redundant -- it would mask-strip their vision tower
+    # and clobber the model-owned ring (the original double-apply bug). Non-TE MoE
+    # is not excluded by the _uses_te_attention check, so gate on ep_size: only
+    # dense (non-MoE) models need this pass.
+    if mesh.cp_size > 1 and mesh.ep_size <= 1 and not _uses_te_attention(model):
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
             attach_cp_sdpa_hooks,
         )
 
+        # The DTensor SDPA re-wrap is only needed under torch.compile (Dynamo drops
+        # DTensor metadata); without compile, context_parallel dispatches natively.
         is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
         cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
 
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
+            mp._cp_enabled = True
             attach_context_parallel_hooks(mp)
             if is_compile_enabled:
                 attach_cp_sdpa_hooks(mp, cp_mesh)
