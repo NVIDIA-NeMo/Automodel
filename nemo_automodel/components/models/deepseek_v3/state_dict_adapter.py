@@ -284,6 +284,16 @@ def _slice_scale_for_dtensor(
             global_start_row = mesh_coord * chunk_size
             global_end_row = global_start_row + local_size
 
+            import os as _os_dbg2
+            if _os_dbg2.environ.get("NRL_DEQUANT_DEBUG") == "1":
+                print(
+                    f"[NRL_DEQUANT_DEBUG slice] shard_dim={shard_dim} mesh_coord={mesh_coord} "
+                    f"mesh_dim_size={mesh_dim_size} chunk={chunk_size} global_start_row={global_start_row} "
+                    f"MISALIGNED_START={global_start_row % block_size != 0} local_size={local_size} "
+                    f"global_num_blocks={global_num_blocks} global_size_upper={global_size}",
+                    flush=True,
+                )
+
             # Convert row range to block range
             # Start block: floor(start_row / block_size)
             # End block: ceil(end_row / block_size)
@@ -386,6 +396,17 @@ def dequantize_from_fp8(
     scale_local = scale_inv.to_local() if scale_is_dtensor else scale_inv
 
     expected_scale_shape = calculate_scale_shape(weight_local, BLOCK_SIZE)
+    import os as _os_dbg
+    if _os_dbg.environ.get("NRL_DEQUANT_DEBUG") == "1":
+        _r0 = weight_local.shape[0] % BLOCK_SIZE if weight_local.dim() >= 1 else 0
+        _c0 = weight_local.shape[1] % BLOCK_SIZE if weight_local.dim() >= 2 else 0
+        print(
+            f"[NRL_DEQUANT_DEBUG] name={name} wD={weight_is_dtensor} sD={scale_is_dtensor} "
+            f"wlocal={tuple(weight_local.shape)} slocal={tuple(scale_local.shape)} "
+            f"exp={tuple(expected_scale_shape)} match={scale_local.shape == expected_scale_shape} "
+            f"row%128={_r0} col%128={_c0}",
+            flush=True,
+        )
     if scale_local.shape != expected_scale_shape:
         logger.debug(
             f"{name} scale_inv shape {scale_local.shape} doesn't match expected shape {expected_scale_shape}, slicing scale_inv"

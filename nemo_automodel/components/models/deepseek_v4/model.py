@@ -842,7 +842,24 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             mtp_hc_hidden = None
         if self.lm_head:
             hidden_dtype = hidden_states.dtype
-            logits = self.lm_head(hidden_states.float()).to(hidden_dtype)
+            # Optional seq-chunked lm_head: compute fp32 logits in token chunks and
+            # cast each to hidden_dtype, so the full [tokens x vocab] fp32 tensor is
+            # never materialized at once (step-2 train OOM hotspot on cu13,
+            # vocab=129280). Mathematically identical to the full lm_head (the linear
+            # is row-independent) → logits/logprobs/KL and gradients are unchanged.
+            # Gated by NEMO_AUTOMODEL_LMHEAD_CHUNK_TOKENS (default 0 = off). Chunks the
+            # token dim, works for 3D [B, S, H] and 2D thd [N, H].
+            _lmh_chunk = int(os.environ.get("NEMO_AUTOMODEL_LMHEAD_CHUNK_TOKENS", "0") or 0)
+            _tok_dim = hidden_states.dim() - 2
+            _n_tok = hidden_states.shape[_tok_dim]
+            if _lmh_chunk > 0 and _n_tok > _lmh_chunk:
+                _parts = []
+                for _s in range(0, _n_tok, _lmh_chunk):
+                    _h = hidden_states.narrow(_tok_dim, _s, min(_lmh_chunk, _n_tok - _s)).float()
+                    _parts.append(self.lm_head(_h).to(hidden_dtype))
+                logits = torch.cat(_parts, dim=_tok_dim)
+            else:
+                logits = self.lm_head(hidden_states.float()).to(hidden_dtype)
         else:
             logits = hidden_states
         if thd_mode and logits.dim() == 2:
