@@ -14,6 +14,8 @@
 
 """Tests for DLLMCollator (two-stage block-aligned padding)."""
 
+import pytest
+
 from nemo_automodel.components.datasets.dllm.collate import DLLMCollator
 
 
@@ -24,6 +26,25 @@ def _make_sample(length, pad_token_id=0):
         "loss_mask": [1] * length,
         "attention_mask": [1] * length,
     }
+
+
+def test_single_turn_guard_runs_every_batch():
+    """The response-window single-turn guard must fire on EVERY batch, not only the first.
+
+    Regression for the once-only / shared-collator bug: the collator instance is shared
+    across the train and all val dataloaders, so a multi-turn ``loss_mask`` in a LATER
+    batch (after a single-turn batch has already passed) must still raise. Under the old
+    ``_runs_checked`` once-only gate it would silently pass and mis-window an intervening
+    user turn into the response canvas.
+    """
+    collator = DLLMCollator(block_size=8, eos_token_id=2, pad_token_id=0, response_window=True)
+    # Batch 1: single-turn (one contiguous supervised run) -> passes the guard.
+    single = {"input_ids": list(range(1, 9)), "loss_mask": [0, 0, 1, 1, 1, 1, 1, 1], "attention_mask": [1] * 8}
+    collator([single])
+    # Batch 2 (same instance): multi-turn (two supervised runs) -> must STILL raise.
+    multi = {"input_ids": list(range(1, 9)), "loss_mask": [0, 1, 1, 0, 1, 1, 0, 0], "attention_mask": [1] * 8}
+    with pytest.raises(AssertionError, match="supervised runs"):
+        collator([multi])
 
 
 # ---------------------------------------------------------------------------

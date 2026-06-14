@@ -145,11 +145,18 @@ class TestMoELatentProjectionForward:
         ):
             mock_gate.return_value = (
                 torch.rand(batch_size * seq_len, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device),
-                torch.randint(0, moe_config.n_routed_experts, (batch_size * seq_len, moe_config.n_activated_experts), device=device),
+                torch.randint(
+                    0,
+                    moe_config.n_routed_experts,
+                    (batch_size * seq_len, moe_config.n_activated_experts),
+                    device=device,
+                ),
                 None,
             )
             # Experts receive latent-dim input and return latent-dim output
-            mock_experts.return_value = torch.randn(batch_size * seq_len, moe_config.moe_latent_size, dtype=torch.bfloat16, device=device)
+            mock_experts.return_value = torch.randn(
+                batch_size * seq_len, moe_config.moe_latent_size, dtype=torch.bfloat16, device=device
+            )
 
             output = moe(x)
 
@@ -174,10 +181,17 @@ class TestMoELatentProjectionForward:
         ):
             mock_gate.return_value = (
                 torch.rand(batch_size * seq_len, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device),
-                torch.randint(0, moe_config.n_routed_experts, (batch_size * seq_len, moe_config.n_activated_experts), device=device),
+                torch.randint(
+                    0,
+                    moe_config.n_routed_experts,
+                    (batch_size * seq_len, moe_config.n_activated_experts),
+                    device=device,
+                ),
                 None,
             )
-            mock_experts.return_value = torch.randn(batch_size * seq_len, moe_config.moe_latent_size, dtype=torch.bfloat16, device=device)
+            mock_experts.return_value = torch.randn(
+                batch_size * seq_len, moe_config.moe_latent_size, dtype=torch.bfloat16, device=device
+            )
 
             moe(x)
 
@@ -201,16 +215,28 @@ class TestMoELatentProjectionForward:
         ):
             mock_gate.return_value = (
                 torch.rand(batch_size * seq_len, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device),
-                torch.randint(0, moe_config.n_routed_experts, (batch_size * seq_len, moe_config.n_activated_experts), device=device),
+                torch.randint(
+                    0,
+                    moe_config.n_routed_experts,
+                    (batch_size * seq_len, moe_config.n_activated_experts),
+                    device=device,
+                ),
                 None,
             )
-            mock_experts.return_value = torch.randn(batch_size * seq_len, moe_config.moe_latent_size, dtype=torch.bfloat16, device=device)
-            mock_shared.return_value = torch.randn(batch_size * seq_len, moe_config.dim, dtype=torch.bfloat16, device=device)
+            mock_experts.return_value = torch.randn(
+                batch_size * seq_len, moe_config.moe_latent_size, dtype=torch.bfloat16, device=device
+            )
+            mock_shared.return_value = torch.randn(
+                batch_size * seq_len, moe_config.dim, dtype=torch.bfloat16, device=device
+            )
 
             with (
                 patch("torch.cuda.Stream") as mock_stream_class,
                 patch("torch.cuda.current_stream") as mock_current_stream,
                 patch("torch.cuda.stream") as mock_stream_context,
+                # The shared-expert fork/join calls Tensor.record_stream with the
+                # mocked stream; no-op the helper so the mock isn't passed to it.
+                patch("nemo_automodel.components.moe.layers._record_stream_safe"),
             ):
                 mock_stream = Mock()
                 mock_stream.wait_stream = Mock()
@@ -248,10 +274,17 @@ class TestMoELatentProjectionForward:
         ):
             mock_gate.return_value = (
                 torch.rand(batch_size * seq_len, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device),
-                torch.randint(0, moe_config.n_routed_experts, (batch_size * seq_len, moe_config.n_activated_experts), device=device),
+                torch.randint(
+                    0,
+                    moe_config.n_routed_experts,
+                    (batch_size * seq_len, moe_config.n_activated_experts),
+                    device=device,
+                ),
                 None,
             )
-            mock_experts.return_value = torch.randn(batch_size * seq_len, moe_config.dim, dtype=torch.bfloat16, device=device)
+            mock_experts.return_value = torch.randn(
+                batch_size * seq_len, moe_config.dim, dtype=torch.bfloat16, device=device
+            )
 
             moe(x)
 
@@ -276,10 +309,17 @@ class TestMoELatentProjectionForward:
         ):
             mock_gate.return_value = (
                 torch.rand(batch_size * seq_len, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device),
-                torch.randint(0, moe_config.n_routed_experts, (batch_size * seq_len, moe_config.n_activated_experts), device=device),
+                torch.randint(
+                    0,
+                    moe_config.n_routed_experts,
+                    (batch_size * seq_len, moe_config.n_activated_experts),
+                    device=device,
+                ),
                 None,
             )
-            mock_experts.return_value = torch.randn(batch_size * seq_len, moe_config.moe_latent_size, dtype=torch.bfloat16, device=device)
+            mock_experts.return_value = torch.randn(
+                batch_size * seq_len, moe_config.moe_latent_size, dtype=torch.bfloat16, device=device
+            )
 
             output = moe(x, padding_mask=padding_mask)
 
@@ -325,12 +365,8 @@ class TestMoELatentProjectionInitWeights:
         with torch.no_grad():
             init_fn(moe)
 
-        torch.testing.assert_close(
-            moe.fc1_latent_proj.bias, torch.zeros_like(moe.fc1_latent_proj.bias)
-        )
-        torch.testing.assert_close(
-            moe.fc2_latent_proj.bias, torch.zeros_like(moe.fc2_latent_proj.bias)
-        )
+        torch.testing.assert_close(moe.fc1_latent_proj.bias, torch.zeros_like(moe.fc1_latent_proj.bias))
+        torch.testing.assert_close(moe.fc2_latent_proj.bias, torch.zeros_like(moe.fc2_latent_proj.bias))
 
     def test_init_weights_no_latent_proj_noop(self, moe_config, backend_config, device):
         """Test that _init_weights is a no-op for MoE without latent projections."""

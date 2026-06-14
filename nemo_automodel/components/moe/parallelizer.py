@@ -40,6 +40,30 @@ logger = logging.getLogger(__name__)
 _CP_STREAM = None
 
 
+def _moe_shard_placement(param):
+    """FSDP shard placement for grouped-expert params.
+
+    Shard on dim=1 for the (>=2D) expert weights since there may be more shards than
+    experts (dim=0). A 1D param (e.g. the per-expert bias of the experts="te"
+    GroupedLinear path, shape [out_features]) has no dim 1, so shard it on dim 0
+    instead. FSDP all-gathers before use, so the shard dim is a storage detail and does
+    not change compute.
+    """
+    return Shard(0) if param.ndim < 2 else Shard(1)
+
+
+def _is_selective_ac(activation_checkpointing: object) -> bool:
+    """Return True when the AC mode requests selective checkpointing.
+
+    Kept inline (rather than imported from the dense FSDP2 parallelizer) so that
+    threading the mode does not pull the heavy ``distributed.parallelizer`` module
+    into the lightweight call path.
+    """
+    return (
+        isinstance(activation_checkpointing, str) and activation_checkpointing.lower().replace("-", "_") == "selective"
+    )
+
+
 def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
     config = getattr(model, "config", None)
     if getattr(config, "model_type", None) == "deepseek_v4":
@@ -78,6 +102,34 @@ def _get_moe_module(block: nn.Module) -> MoE | None:
         module = getattr(block, name, None)
         if isinstance(module, MoE):
             return module
+
+
+def _get_model_moe_config(model: nn.Module):
+    """Return the model-level MoE config exposed by custom MoE architectures."""
+    candidates = []
+    inner = getattr(model, "model", None)
+    if inner is not None:
+        candidates.append(inner)
+        text_model = get_text_module(inner)
+        if text_model is not inner:
+            candidates.append(text_model)
+    candidates.append(model)
+
+    for candidate in candidates:
+        moe_config = getattr(candidate, "moe_config", None)
+        if moe_config is not None:
+            return moe_config
+
+    raise AttributeError("MoE models must expose moe_config on the inner, text, or top-level model.")
+
+
+def _module_weights_are_tied(left: nn.Module | None, right: nn.Module | None) -> bool:
+    """Return True when two modules expose the same ``weight`` parameter object."""
+    if left is None or right is None:
+        return False
+    left_weight = getattr(left, "weight", None)
+    right_weight = getattr(right, "weight", None)
+    return left_weight is not None and left_weight is right_weight
 
 
 class ExpertParallel(ParallelStyle):
@@ -166,6 +218,7 @@ def apply_ac(
     ignore_router: bool = False,
     hidden_size: int | None = None,
     num_experts: int | None = None,
+    selective: bool = False,
 ):
     """Apply activation checkpointing to the model.
 
@@ -175,7 +228,31 @@ def apply_ac(
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
         num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
             first, then falls back to model.config attributes.
+        selective: If True, applies TorchTitan-style per-op selective activation checkpointing
+            (shared with the dense FSDP2 path) to each block. Takes precedence over
+            ``ignore_router``; the shared policy already saves expert-parallel communication
+            collectives and ``topk``, so it composes with expert parallelism.
     """
+    if selective:
+        # Reuse the dense FSDP2 selective policy so the save-op set (attention,
+        # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
+        from nemo_automodel.components.distributed.activation_checkpointing import (
+            SELECTIVE_AC_WRAPPER_FLAG,
+            make_selective_checkpoint_context_fn,
+        )
+
+        selective_context_fn = make_selective_checkpoint_context_fn()
+        for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+            block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, context_fn=selective_context_fn)
+            # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
+            # selective policy visible to the partitioner) instead of unwrapping and
+            # compiling the block inner, which would collapse selective AC into full
+            # recompute. The flag is only read when per-layer torch.compile is
+            # enabled, so it is a no-op for every other mode.
+            setattr(block, SELECTIVE_AC_WRAPPER_FLAG, True)
+            parent_layers.register_module(layer_id, block)
+        return
+
     # Derive hidden_size and num_experts from model.config if not provided
     if hidden_size is None:
         cfg = getattr(model, "config", None)
@@ -289,11 +366,16 @@ def apply_fsdp(
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
+            # Forward the same mp_policy used elsewhere so that when params are
+            # kept in fp32 (e.g. for fp32 master weights under FSDP2) the
+            # all-gathered expert weights are still cast to param_dtype for
+            # forward compute (required by GMM / TE kernels that expect bf16).
             fully_shard(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
-                shard_placement_fn=lambda _: Shard(1),
+                shard_placement_fn=_moe_shard_placement,
                 reshard_after_forward=reshard_after_forward,
+                mp_policy=mp_policy,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters
@@ -306,11 +388,35 @@ def apply_fsdp(
             ignored_params = set(moe_module.experts.parameters())
         fully_shard_default(block, ignored_params=ignored_params)
 
-    if hasattr(_model, "embed_tokens") and _model.embed_tokens is not None:
-        fully_shard_default(_model.embed_tokens)
+    # Re-establish weight tying before detecting it: a device/dtype move during
+    # from_pretrained (HF replaces param tensors) can silently break a tie set in
+    # __init__ (lm_head.weight = embed_tokens.weight), so the identity check below
+    # would miss it and shard embed and lm_head as two INDEPENDENT FSDP params.
+    # For tie_word_embeddings models those two then drift apart during full
+    # fine-tuning, diverging from the tied architecture and breaking checkpoint
+    # resume (the checkpoint drops lm_head and reconstructs it from embed on load,
+    # silently discarding the drifted lm_head). Re-tying here keeps them in one
+    # FSDP root so they remain a single shared parameter.
+    # NB: re-point output->input embedding directly (model.__init__'s own tie);
+    # HF's tie_weights() is incompatible with this model's _tied_weights_keys
+    # format ('list' object has no attribute 'keys').
+    if getattr(getattr(model, "config", None), "tie_word_embeddings", False):
+        _out = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
+        _inp = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+        if _out is not None and _inp is not None and hasattr(_out, "weight") and hasattr(_inp, "weight"):
+            _out.weight = _inp.weight
 
-    lm_head = getattr(_model, "lm_head", None) or getattr(model, "lm_head", None)
-    if lm_head is not None:
+    embed_tokens = getattr(_model, "embed_tokens", None)
+    inner_lm_head = getattr(_model, "lm_head", None)
+    outer_lm_head = getattr(model, "lm_head", None) if model is not _model else None
+    lm_head = inner_lm_head or outer_lm_head
+    tied_input_output_embeddings = _module_weights_are_tied(embed_tokens, lm_head)
+    tied_embeddings_cross_fsdp_roots = tied_input_output_embeddings and lm_head is outer_lm_head
+
+    if embed_tokens is not None and not tied_input_output_embeddings:
+        fully_shard_default(embed_tokens)
+
+    if lm_head is not None and not tied_input_output_embeddings:
         # Use custom mixed precision policy for lm_head if lm_head_precision is specified
         if lm_head_precision == torch.float32:
             lm_head_mp_policy = MixedPrecisionPolicy(
@@ -327,6 +433,12 @@ def apply_fsdp(
             )
         else:
             fully_shard_default(lm_head)
+    elif tied_input_output_embeddings and lm_head_precision is not None:
+        logger.warning(
+            "Skipping separate lm_head FSDP wrapping because lm_head.weight is tied to embed_tokens.weight; "
+            "lm_head_precision=%s will not be applied independently.",
+            lm_head_precision,
+        )
 
     # TODO: properly handle all possible multimodal component names
     if hasattr(model, "audio_tower") and model.audio_tower is not None:
@@ -341,7 +453,18 @@ def apply_fsdp(
         else:
             logging.info("Skipping FSDP wrap for frozen visual tower")
 
-    fully_shard_default(_model)
+    if tied_embeddings_cross_fsdp_roots and wrap_outer_model and model is not _model:
+        logger.info(
+            "Skipping separate inner-model FSDP root because lm_head.weight is tied to embed_tokens.weight "
+            "across the outer model boundary; the outer FSDP root will own the tied parameter."
+        )
+    else:
+        if tied_embeddings_cross_fsdp_roots and not wrap_outer_model:
+            logger.warning(
+                "lm_head.weight is tied to embed_tokens.weight across the outer model boundary, but "
+                "wrap_outer_model=False prevents preserving the tie in one FSDP root."
+            )
+        fully_shard_default(_model)
 
     # If model has a nested structure (outer model wrapping inner _model), wrap the outer model if requested
     if wrap_outer_model and model is not _model:
@@ -365,7 +488,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     # "Padding mask not supported with context parallelism!".
     _model._cp_enabled = True
 
-    for _, block in _model.layers.named_children():
+    for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
         if layer_type in ("full_attention", "sliding_attention"):
@@ -422,7 +545,7 @@ def parallelize_model(
     tp_axis_name: str | None = None,
     ep_axis_name: str | None = None,
     ep_shard_axis_names: tuple[str, ...] | None = None,
-    activation_checkpointing: bool = False,
+    activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = False,
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
@@ -441,15 +564,20 @@ def parallelize_model(
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1
     if ep_enabled:
-        assert model.model.moe_config.n_routed_experts % moe_mesh[ep_axis_name].size() == 0, (
-            f"n_routed_experts {model.model.moe_config.n_routed_experts} must be divisible by "
+        moe_config = _get_model_moe_config(model)
+        assert moe_config.n_routed_experts % moe_mesh[ep_axis_name].size() == 0, (
+            f"n_routed_experts {moe_config.n_routed_experts} must be divisible by "
             f"expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
         )
 
         apply_ep(model, moe_mesh[ep_axis_name], moe_mesh=moe_mesh)
 
     if activation_checkpointing:
-        apply_ac(model, ignore_router=ignore_router_for_ac)
+        apply_ac(
+            model,
+            ignore_router=ignore_router_for_ac,
+            selective=_is_selective_ac(activation_checkpointing),
+        )
 
     if ep_shard_axis_names is not None:
         ep_shard_mesh = moe_mesh[ep_shard_axis_names]

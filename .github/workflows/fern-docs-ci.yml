@@ -18,14 +18,14 @@
 name: Fern docs (check)
 
 # Triggers on push to mirrored PR branches (`pull-request/<n>`) created by the
-# FW-CI mirror bot — same pattern as build-docs.yml. This runs in the trusted
-# base-repo context, so DOCS_FERN_TOKEN is available even for fork PRs.
+# FW-CI mirror bot. This runs in the trusted base-repo context, so
+# DOCS_FERN_TOKEN is available even for fork PRs.
 on:
   push:
     branches:
       - "pull-request/[0-9]+"
     paths:
-      - 'fern/**'
+      - 'docs/**'
       - '.github/workflows/fern-docs-ci.yml'
 
 permissions:
@@ -38,14 +38,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      # `fern check` validates that every path: referenced by docs.yml / the
+      # version YAMLs exists on disk. The frozen v0.4 pages are archived off main,
+      # so restore them before checking or the validation fatals on missing paths.
+      - name: Stitch archived version pages
+        uses: ./.github/actions/stitch-fern-versions
+        with:
+          archived-versions: |
+            v0.4=docs-archive
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: '20'
 
-      - name: Install Fern CLI
-        run: npm install -g fern-api
-
       - name: Validate Fern configuration
-        working-directory: ./fern
-        run: fern check
+        working-directory: ./docs/fern
+        run: |
+          # Pin the Fern CLI to the version in fern.config.json so CI matches
+          # local `make docs-check` (and the global-theme-capable 5.29.0+ pin).
+          fern_version=$(jq -r .version fern.config.json)
+          npx -y "fern-api@$fern_version" check

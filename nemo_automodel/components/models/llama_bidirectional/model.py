@@ -22,6 +22,7 @@ To add support for other backbones (e.g., Qwen2, Mistral), create a similar
 module in a new directory (e.g., qwen2_bidirectional/) with its own ModelClass export.
 """
 
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -88,6 +89,15 @@ class LlamaBidirectionalModel(LlamaModel):
     """
 
     config_class = LlamaBidirectionalConfig
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     def __init__(self, config: LlamaConfig):
         """
@@ -189,6 +199,15 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
     """
 
     config_class = LlamaBidirectionalConfig
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     def __init__(self, config):
         super().__init__(config)

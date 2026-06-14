@@ -19,20 +19,20 @@ import os
 import shutil
 from pathlib import Path
 
+import datasets
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
 import torch.nn as nn
+import yaml
 from safetensors import safe_open
 from transformers import AutoModelForImageTextToText
-import yaml
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
 
-import datasets
 datasets.disable_caching()
 
 
@@ -71,13 +71,15 @@ def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
 
 
 def compare_configs(source_config: dict, restored_config: dict):
-    """ Recursively compare two configs."""
+    """Recursively compare two configs."""
     for k, v in source_config.items():
         if k in restored_config:
             if isinstance(v, dict):
                 compare_configs(v, restored_config[k])
             else:
-                assert v == restored_config[k], f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
+                assert v == restored_config[k], (
+                    f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
+                )
 
 
 def load_safetensors(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
@@ -116,12 +118,13 @@ def get_validation_loss(
     with torch.no_grad():
         out = model(**val_batch)
         loss = calculate_loss(
-                loss_fn,
-                logits=out.logits,
-                labels=labels,
-                mask=loss_mask,
-            )
+            loss_fn,
+            logits=out.logits,
+            labels=labels,
+            mask=loss_mask,
+        )
         return loss
+
 
 def get_test_consolidated_vlm_checkpoint_expected_keys():
     # transformers 5.8 flattened SiglipVisionModel: the v5.5 `vision_model.`
@@ -419,12 +422,12 @@ def get_test_consolidated_vlm_checkpoint_expected_keys():
     }
     return expected_model_keys, expected_optim_keys
 
+
 def test_consolidated_vlm_checkpoint():
     """
     Tests HF consolidated checkpoint for VLM.
     """
     expected_model_keys, expected_optim_keys = get_test_consolidated_vlm_checkpoint_expected_keys()
-
 
     script_path = Path(__file__).parent.resolve()
     cfg = parse_args_and_load_config(script_path / "gemma3" / "gemma3_vl_4b_cord_v2.yaml")

@@ -19,31 +19,22 @@ gradient rescaling, ``_save_checkpoint``, and ``_run_eval``."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
+from nemo_automodel.recipes.llm._spec_train_utils import optim_steps_per_epoch as _optim_steps_per_epoch
 from nemo_automodel.recipes.llm.train_eagle3 import (
     TrainEagle3Recipe,
     _all_reduce_mean,
-    _optim_steps_per_epoch,
 )
 
 # ---------------------------------------------------------------------------
 # Minimal stand-ins that satisfy the Eagle3 training loop interface
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class _FakeBatch:
-    input_ids: torch.Tensor
-    attention_mask: torch.Tensor
-    loss_mask: torch.Tensor
-    aux_hidden_states: torch.Tensor
-    logits: torch.Tensor
 
 
 class _FakeMetrics:
@@ -83,13 +74,16 @@ class _FakeTrainerModule(nn.Module):
 class _FakeTargetWrapper:
     def generate_batch(self, input_ids, attention_mask, loss_mask):
         bs, sl = input_ids.shape
-        return _FakeBatch(
+        return Eagle3TargetBatch(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
             aux_hidden_states=torch.randn(bs, sl, 16),
             logits=torch.randn(bs, sl, 64),
         )
+
+    def close(self):
+        pass
 
 
 class _KeyedLoader:
@@ -129,6 +123,7 @@ def _build_recipe(tmp_path, num_samples=5, grad_accum=3, num_epochs=1, log_every
     recipe.dist_env = SimpleNamespace(is_main=True, world_size=1)
     recipe.trainer_module = trainer_module
     recipe.target_wrapper = _FakeTargetWrapper()
+    recipe.target_prefetch_depth = 0
     recipe.train_dataloader = train_loader
     recipe.val_dataloader = None
     recipe.output_dir = tmp_path
@@ -264,3 +259,35 @@ def test_logging_path_is_exercised(tmp_path):
     recipe = _build_recipe(tmp_path, num_samples=4, grad_accum=2, log_every=1)
     recipe.run_train_validation_loop()
     assert recipe.runtime.global_step == 2
+
+
+# ---------------------------------------------------------------------------
+# Progress bar: one update per optimizer step, postfix at log points, closed
+# ---------------------------------------------------------------------------
+
+
+class _FakeProgressBar:
+    def __init__(self):
+        self.n = 0
+        self.postfix = None
+        self.closed = False
+
+    def update(self, count=1):
+        self.n += count
+
+    def set_postfix(self, **kwargs):
+        self.postfix = kwargs
+
+    def close(self):
+        self.closed = True
+
+
+def test_progress_bar_advances_per_optim_step(tmp_path, monkeypatch):
+    fake = _FakeProgressBar()
+    monkeypatch.setattr(TrainEagle3Recipe, "_make_progress_bar", lambda self, **kwargs: fake)
+    # 5 samples / accum 3 -> one full window + one trailing flush = 2 steps.
+    recipe = _build_recipe(tmp_path, num_samples=5, grad_accum=3, log_every=1)
+    recipe.run_train_validation_loop()
+    assert fake.n == recipe.runtime.global_step == 2
+    assert fake.closed
+    assert set(fake.postfix) == {"loss", "acc", "lr"}

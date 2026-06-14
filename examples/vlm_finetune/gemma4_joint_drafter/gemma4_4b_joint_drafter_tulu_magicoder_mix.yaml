@@ -53,7 +53,7 @@ model:
   drafter_loss_weight: 0.01
   drafter_num_steps: 4
   # K=4 + bf16 + 2048 fixed-pad pushes activation memory past 80GB on H100
-  # Enable HF gradient checkpointing on the base to recompute its 42-layer activations during backward. 
+  # Enable HF gradient checkpointing on the base to recompute its 42-layer activations during backward.
   # Adds ~25-30% time overhead but reclaims tens of GB.
   base_activation_checkpointing: true
   text_config:

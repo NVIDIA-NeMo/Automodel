@@ -17,6 +17,7 @@
 Provides masking strategies for dLLM SFT:
 - ``corrupt_uniform``: uniform per-sequence corruption
 - ``corrupt_blockwise``: per-block weighted corruption with exponential position bias
+- ``corrupt_uniform_random``: per-block random-token (D3PM-uniform) corruption
 """
 
 from __future__ import annotations
@@ -217,3 +218,77 @@ def corrupt_blockwise(
     noisy_input_ids = torch.where(masked_indices, mask_token_id, input_ids)
 
     return noisy_input_ids, masked_indices, p_mask.float()
+
+
+def corrupt_uniform_random(
+    input_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+    vocab_size: int,
+    block_size: int | None = None,
+    eps: float = 1e-3,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-block uniform random-token (D3PM-uniform) corruption for block diffusion.
+
+    This is the ``diffusion_gemma`` corruption kernel. Unlike MDLM/LLaDA
+    absorbing-``[MASK]`` corruption (:func:`corrupt_uniform`), corrupted
+    positions are replaced with a **random token sampled uniformly over the full
+    vocabulary** — there is no ``mask_token_id``. This matches the checkpoint's
+    own canvas initialisation / renoising (``torch.randint`` over the vocab).
+
+    For each block (or the whole sequence when ``block_size is None``) a single
+    corruption level ``t ~ U(eps, 1)`` is sampled; every supervised position in
+    that block is then independently replaced with probability ``t``. No noise
+    schedule and no positional bias are applied ("everything is uniform").
+
+    The returned ``p_mask`` is **all ones**: the uniform kernel uses a flat loss
+    (plain mean cross-entropy over corrupted tokens, no ``1/t`` reweighting), so
+    there is no per-position probability to divide by. ``p_mask`` is kept in the
+    return signature only for plumbing compatibility with the MDLM loss path.
+
+    Args:
+        input_ids: Clean token IDs, shape ``[B, L]``.
+        loss_mask: Binary mask of supervised positions, shape ``[B, L]``. Only
+            supervised positions are ever corrupted.
+        vocab_size: Vocabulary size; replacement tokens are drawn from
+            ``[0, vocab_size)``.
+        block_size: If given, sample ``t`` per contiguous block of this length;
+            otherwise sample one ``t`` per sequence.
+        eps: Minimum corruption level (lower bound of ``t``).
+        generator: Optional ``torch.Generator`` (on ``input_ids.device``) used for
+            ALL random draws (``t``, the corruption mask, the replacement tokens).
+            Pass a step-seeded generator so the corruption is a deterministic
+            function of the training step and reproduces exactly on checkpoint
+            resume; ``None`` falls back to the global RNG (not resume-safe).
+
+    Returns:
+        Tuple of ``(noisy_input_ids, noise_mask, p_mask)``, each shape ``[B, L]``.
+
+        * ``noisy_input_ids`` — ``input_ids`` with corrupted positions replaced
+          by uniform random tokens.
+        * ``noise_mask`` — bool mask of corrupted (supervised) positions.
+        * ``p_mask`` — all ones (float32); flat loss has no per-token weight.
+    """
+    B, L = input_ids.shape
+    device = input_ids.device
+
+    if block_size is None:
+        t = eps + (1.0 - eps) * torch.rand((B, 1), device=device, generator=generator)  # [B, 1]
+        p_corrupt = t.expand(B, L)
+    else:
+        num_blocks = math.ceil(L / block_size)
+        padded_L = num_blocks * block_size
+        t = eps + (1.0 - eps) * torch.rand((B, num_blocks, 1), device=device, generator=generator)  # [B, nb, 1]
+        p_corrupt = t.expand(B, num_blocks, block_size).reshape(B, padded_L)[:, :L]
+
+    noise_mask = torch.rand((B, L), device=device, generator=generator) < p_corrupt
+    noise_mask = noise_mask & loss_mask.bool()
+
+    # Replace corrupted positions with uniform random tokens (no mask token).
+    random_tokens = torch.randint(0, vocab_size, (B, L), device=device, dtype=input_ids.dtype, generator=generator)
+    noisy_input_ids = torch.where(noise_mask, random_tokens, input_ids)
+
+    # Flat loss: no 1/p weighting. p_mask is all ones (plumbing compatibility).
+    p_mask = torch.ones((B, L), device=device, dtype=torch.float32)
+
+    return noisy_input_ids, noise_mask, p_mask
