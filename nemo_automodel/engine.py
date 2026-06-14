@@ -742,12 +742,15 @@ class Engine:
                 if lf is not None:
                     result = lf(mo)
                     loss, metrics = result if isinstance(result, tuple) else (result, {})
-                    if is_train:
-                        loss.backward()
-                    loss_sum = loss_sum + loss.detach()
-                    any_loss = True
-                    for k, v in metrics.items():
-                        metric_sums[k] = metric_sums.get(k, 0.0) + float(v)
+                    # A forward-only loss_fn may return None (e.g. it only captures
+                    # outputs, like inference logprob extraction) — skip the loss path.
+                    if loss is not None:
+                        if is_train:
+                            loss.backward()
+                        loss_sum = loss_sum + loss.detach()
+                        any_loss = True
+                        for k, v in metrics.items():
+                            metric_sums[k] = metric_sums.get(k, 0.0) + float(v)
             if mo.logprobs is not None:
                 agg_logprobs.extend(t.detach() for t in mo.logprobs)
             if mo.entropy is not None:
