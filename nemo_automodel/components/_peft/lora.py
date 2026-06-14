@@ -25,6 +25,7 @@ from torch.distributed.tensor.placement_types import Shard as _Shard
 
 from nemo_automodel.components._peft.lora_experts import (
     GroupedExpertsDeepEPLoRA,
+    GroupedExpertsDeepEPLoRAMXFP4,
     GroupedExpertsLoRA,
     GroupedExpertsLoRAMXFP4,
 )
@@ -517,7 +518,6 @@ def patch_moe_module(
     lora_A_init_method="xavier",
     lora_dtype=None,
     expert_weight_format="bf16",
-    passthrough=False,
 ):
     """
     Patches a custom MoE module (GroupedExperts or GroupedExpertsDeepEP) with LoRA.
@@ -531,9 +531,6 @@ def patch_moe_module(
         expert_weight_format (str, optional): "bf16" keeps frozen base expert weights in
             floating point; "mxfp4" keeps them packed as fp4-e2m1 + e8m0 block scales with
             on-the-fly dequantization. Defaults to "bf16".
-        passthrough (bool, optional): For mxfp4, build the packed base at init (no bf16
-            materialization) so a packed fp4 checkpoint loads straight in. Set by the
-            checkpoint-load flow. Defaults to False (pack from materialized weights).
 
     Returns:
         nn.Module: The LoRA-wrapped MoE module.
@@ -543,9 +540,8 @@ def patch_moe_module(
     if isinstance(orig_module, GroupedExpertsTE):
         raise NotImplementedError("LoRA is not supported for Transformer Engine (TE) expert modules.")
     elif isinstance(orig_module, GroupedExpertsDeepEP):
-        if expert_weight_format == "mxfp4":
-            raise NotImplementedError("expert_weight_format='mxfp4' is not supported for DeepEP expert modules yet.")
-        new_module = GroupedExpertsDeepEPLoRA(
+        deepep_lora_cls = GroupedExpertsDeepEPLoRAMXFP4 if expert_weight_format == "mxfp4" else GroupedExpertsDeepEPLoRA
+        new_module = deepep_lora_cls(
             orig_module,
             lora_dim=dim,
             alpha=alpha,
@@ -553,23 +549,14 @@ def patch_moe_module(
             lora_dtype=lora_dtype,
         )
     elif isinstance(orig_module, GroupedExperts):
-        if expert_weight_format == "mxfp4":
-            new_module = GroupedExpertsLoRAMXFP4(
-                orig_module,
-                lora_dim=dim,
-                alpha=alpha,
-                lora_A_init_method=lora_A_init_method,
-                lora_dtype=lora_dtype,
-                passthrough=passthrough,
-            )
-        else:
-            new_module = GroupedExpertsLoRA(
-                orig_module,
-                lora_dim=dim,
-                alpha=alpha,
-                lora_A_init_method=lora_A_init_method,
-                lora_dtype=lora_dtype,
-            )
+        lora_cls = GroupedExpertsLoRAMXFP4 if expert_weight_format == "mxfp4" else GroupedExpertsLoRA
+        new_module = lora_cls(
+            orig_module,
+            lora_dim=dim,
+            alpha=alpha,
+            lora_A_init_method=lora_A_init_method,
+            lora_dtype=lora_dtype,
+        )
     else:
         raise NotImplementedError(f"Unsupported MoE module type: {type(orig_module)}")
 
@@ -582,7 +569,6 @@ def apply_lora_to_linear_modules(
     peft_config: PeftConfig,
     quantization_config=None,
     skip_freeze: bool = False,
-    expert_passthrough: bool = False,
 ) -> int:
     """
     Replace selected nn.Linear layers with LinearLoRA layers (in-place).
@@ -592,8 +578,6 @@ def apply_lora_to_linear_modules(
         peft_config: PEFT configuration for LoRA parameters.
         quantization_config: Optional separate QLoRA quantization configuration.
         skip_freeze: If True, skip the global parameter freeze (caller will handle it later).
-        expert_passthrough: For mxfp4 expert LoRA, build packed-at-init so a packed fp4
-            checkpoint loads straight in (set by the checkpoint-load flow).
 
     Returns:
         Number of modules that were modified with LoRA.
@@ -666,7 +650,6 @@ def apply_lora_to_linear_modules(
                     lora_A_init_method=peft_config.lora_A_init,
                     lora_dtype=lora_dtype,
                     expert_weight_format=peft_config.expert_weight_format,
-                    passthrough=expert_passthrough,
                 )
 
                 # Find parent and replace
@@ -734,6 +717,15 @@ def convert_frozen_experts_to_mxfp4(model: nn.Module, passthrough: bool = False)
     """
     # Import here to avoid a hard dependency at module import time.
     from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
+    from nemo_automodel.components.moe.quantized_experts import GroupedExpertsDeepEPMXFP4
+
+    # Exact-type → mxfp4-resident replacement. Exact `type(...) is` (not isinstance) so the
+    # LoRA-on-experts subclasses (already MXFP4ExpertStorageMixin, skipped above) and any
+    # bf16 LoRA experts are left untouched — only genuinely frozen modules are converted.
+    frozen_conversions = {
+        GroupedExperts: GroupedExpertsMXFP4,
+        GroupedExpertsDeepEP: GroupedExpertsDeepEPMXFP4,
+    }
 
     num_converted = 0
     unsupported = 0
@@ -741,11 +733,12 @@ def convert_frozen_experts_to_mxfp4(model: nn.Module, passthrough: bool = False)
         # Already mxfp4-resident (frozen or LoRA-targeted) — skip.
         if isinstance(module, MXFP4ExpertStorageMixin):
             continue
-        if isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsTE)):
+        if isinstance(module, GroupedExpertsTE):
             unsupported += 1
             continue
-        if type(module) is GroupedExperts:
-            new_module = GroupedExpertsMXFP4(module, passthrough=passthrough)
+        new_cls = frozen_conversions.get(type(module))
+        if new_cls is not None:
+            new_module = new_cls(module, passthrough=passthrough)
             parent_name, _, child_name = name.rpartition(".")
             parent = model.get_submodule(parent_name) if parent_name else model
             setattr(parent, child_name, new_module)
@@ -753,8 +746,8 @@ def convert_frozen_experts_to_mxfp4(model: nn.Module, passthrough: bool = False)
 
     if unsupported:
         logger.warning(
-            "expert_weight_format='mxfp4' skipped %d DeepEP/TE expert module(s); only the torch_mm "
-            "GroupedExperts backend is supported. Set backend.dispatcher='torch' and backend.experts='torch_mm'.",
+            "expert_weight_format='mxfp4' skipped %d Transformer Engine expert module(s); TE experts have no "
+            "packed variant. Use backend.experts='torch_mm' (with backend.dispatcher='torch' or 'deepep').",
             unsupported,
         )
     return num_converted

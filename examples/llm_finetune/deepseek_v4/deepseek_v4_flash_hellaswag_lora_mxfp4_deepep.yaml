@@ -1,0 +1,153 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# LoRA fine-tuning of deepseek-ai/DeepSeek-V4-Flash on HellaSwag with the frozen
+# routed experts kept resident in mxfp4 (fp4-e2m1 + e8m0 block scales) and
+# dequantized on the fly in the grouped-GEMM forward/backward, dispatched with DeepEP.
+#
+# This is the DeepEP counterpart of deepseek_v4_flash_hellaswag_lora_mxfp4.yaml.
+# mxfp4 quantizes only the expert *weights* (local to each EP rank); DeepEP only
+# governs token *dispatch/combine* (fused all-to-all of bf16 activations + fp32 probs).
+# They intersect only at the two post-dispatch grouped GEMMs, which read the packed
+# weights via MXFP4GroupedMM. Unlike the torch dispatcher (which all-gathers every
+# token to every rank), DeepEP routes each rank only the tokens for its local experts,
+# so this is the scalable EP path for DSV4 at EP=8/64.
+#
+# Only the experts are quantized; every other weight (MLA attention, dense MLP,
+# embeddings, MTP, lm_head) stays bf16. The routed experts are ~90%+ of the
+# parameters, so packing them to ~4 bits cuts steady-state base-weight memory by
+# roughly 4x relative to the bf16 LoRA recipe.
+#
+# Constraint: mxfp4 experts require the torch_mm experts backend (the grouped_gemm
+# 'gmm' path has no packed variant), so this recipe pairs dispatcher=deepep with
+# experts=torch_mm.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 1
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  gc_every_steps: 10
+  num_epochs: 1
+  max_steps: 100
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  # Single node, 8x H200: ep_size must divide dp_size*cp_size (= world_size here).
+  ep_size: 8
+
+  sequence_parallel: false
+  # Recommended on: the 43-layer activation footprint, not the (now-packed) expert
+  # weights, is the steady-state pressure once experts are mxfp4.
+  activation_checkpointing: true
+
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    num_nextn_predict_layers: 0
+  trust_remote_code: false
+  load_base_model: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: tilelang
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    # mxfp4 experts run on the torch_mm grouped-GEMM path, dispatched with DeepEP.
+    dispatcher: deepep
+    experts: torch_mm
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+    - "*wq_a"
+    - "*wq_b"
+    - "*wkv"
+    - "*wo_b"
+  dim: 8
+  alpha: 32
+  use_triton: True
+  # Keep the frozen routed experts packed as mxfp4 and dequantize on the fly.
+  expert_weight_format: mxfp4
+
+checkpoint:
+  enabled: false
+  # The DSV4-Flash checkpoint stores experts as fp4; they are dequantized to bf16
+  # on load and then repacked to mxfp4 (Phase A). Required for the current flow.
+  dequantize_base_checkpoint: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: false
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  fused: true
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1e-5
+  weight_decay: 0.1
