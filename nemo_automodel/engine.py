@@ -541,6 +541,10 @@ class Engine:
         """
         per_values = None
         values = getattr(out, "values", None)
+        # Guard: HF model outputs subclass OrderedDict, so `.values` is its dict
+        # method unless the model genuinely exposes a value-head tensor.
+        if not isinstance(values, torch.Tensor):
+            values = None
         if values is not None:
             if values.dim() == 3 and values.shape[-1] == 1:
                 values = values.squeeze(-1)  # [B, T, 1] -> [B, T]
@@ -549,6 +553,8 @@ class Engine:
         per_logprobs: list[torch.Tensor] | None = None
         per_entropy: list[torch.Tensor] | None = None
         logits = getattr(out, "logits", None)
+        if not isinstance(logits, torch.Tensor):
+            logits = None
         if logits is None and values is None:
             logits = out  # raw logits tensor
         if logits is not None:
