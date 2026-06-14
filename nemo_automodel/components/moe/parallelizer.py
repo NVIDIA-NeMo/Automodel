@@ -310,6 +310,40 @@ def apply_ac(
         parent_layers.register_module(layer_id, block)
 
 
+def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):
+    """Shard each ``_fp32_params`` holder in ``block`` as its own fp32 FSDP unit.
+
+    Qwen3.5 GatedDeltaNet keeps its SSM-gating params (A_log/dt_bias) in fp32
+    storage, isolated in a ``_fp32_params`` holder submodule. FSDP2 requires a
+    dtype-uniform parameter group, so these are sharded separately with an fp32
+    mixed-precision policy and excluded from the block's (bf16) FSDP unit.
+
+    Returns the set of holder parameters to exclude from the block's FSDP wrap.
+    """
+    fp32_mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.float32,
+        cast_forward_inputs=False,
+    )
+    ignored: set = set()
+    for name, sub in block.named_modules():
+        if not name.endswith("_fp32_params"):
+            continue
+        holder_params = list(sub.parameters(recurse=False))
+        if not holder_params:
+            continue
+        fully_shard(
+            sub,
+            mesh=fsdp_mesh,
+            reshard_after_forward=reshard_after_forward,
+            mp_policy=fp32_mp_policy,
+            offload_policy=offload_policy,
+        )
+        ignored.update(holder_params)
+    return ignored
+
+
 def apply_fsdp(
     model: torch.nn.Module,
     fsdp_mesh: DeviceMesh,
@@ -381,6 +415,16 @@ def apply_fsdp(
         ignored_params = None
         if isinstance(moe_module, MoE) and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())
+
+        # Isolate the linear_attn SSM-gating params (A_log/dt_bias), which are kept
+        # in fp32 storage, into their own fp32 FSDP group so the rest of the block
+        # stays dtype-uniform (FSDP2 requires uniform dtype within a group). Shard
+        # the holder on its own and exclude its params from the block's FSDP unit.
+        fp32_ignored = _shard_fp32_param_holders(
+            block, fsdp_mesh, reshard_after_forward, offload_policy
+        )
+        if fp32_ignored:
+            ignored_params = (ignored_params or set()) | fp32_ignored
         fully_shard_default(block, ignored_params=ignored_params)
 
     # Re-establish weight tying before detecting it: a device/dtype move during
