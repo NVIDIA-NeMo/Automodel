@@ -661,5 +661,3 @@ def _resolve_ssm_dtype(config):
     if isinstance(ssm_dtype, str):
         ssm_dtype = dtype_from_str(ssm_dtype)
     return ssm_dtype or torch.float32
-
-

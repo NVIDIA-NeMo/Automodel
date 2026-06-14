@@ -420,9 +420,7 @@ def apply_fsdp(
         # in fp32 storage, into their own fp32 FSDP group so the rest of the block
         # stays dtype-uniform (FSDP2 requires uniform dtype within a group). Shard
         # the holder on its own and exclude its params from the block's FSDP unit.
-        fp32_ignored = _shard_fp32_param_holders(
-            block, fsdp_mesh, reshard_after_forward, offload_policy
-        )
+        fp32_ignored = _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy)
         if fp32_ignored:
             ignored_params = (ignored_params or set()) | fp32_ignored
         fully_shard_default(block, ignored_params=ignored_params)
