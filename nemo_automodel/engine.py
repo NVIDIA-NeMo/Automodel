@@ -55,11 +55,12 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from nemo_automodel.components.datasets.datum import Datum, collate_datums
+from nemo_automodel.components.datasets.datum import Datum, PackedBatch, collate_datums
 from nemo_automodel.components.training.model_output import (
     ModelOutput,
     compute_entropy,
     selected_token_logprobs,
+    split_per_datum,
 )
 from nemo_automodel.loss_fns import BUILTIN_LOSSES, LossFn
 
@@ -310,6 +311,9 @@ class Engine:
                 "this is a planned follow-up. Use the recipe PP path for now."
             )
 
+        if isinstance(batch, PackedBatch):
+            return self._forward_backward_packed(batch, loss_fn, forward_only=forward_only)
+
         if self._is_datum_input(batch):
             return self._forward_backward_datums(
                 self._as_microbatch_datum_lists(batch),
@@ -552,6 +556,74 @@ class Engine:
             total = contrib if total is None else total + contrib
         denom = sample_denom if sample_level else token_denom
         return total / max(denom, 1e-8)
+
+    def _forward_backward_packed(
+        self,
+        packed: PackedBatch,
+        loss_fn: Callable[[ModelOutput], "torch.Tensor | tuple[torch.Tensor, dict]"] | None,
+        *,
+        forward_only: bool,
+    ) -> ModelOutput:
+        """Pass-through door for already-packed batches (e.g. verl).
+
+        Runs ``model(**packed.model_inputs)``, builds a per-datum
+        :class:`ModelOutput` by splitting flat outputs via ``packed.seq_lens``,
+        then calls ``loss_fn(model_output)`` which returns a scalar loss (or
+        ``(loss, metrics)``). The caller owns packing and normalization — the
+        Engine owns forward + extraction + the microbatch lifecycle + backward.
+        """
+        if loss_fn is None and not forward_only:
+            raise ValueError("PackedBatch training requires a loss_fn returning a scalar loss.")
+
+        from nemo_automodel.components.distributed.utils import get_sync_ctx
+        from nemo_automodel.components.training.utils import (
+            prepare_for_final_backward,
+            prepare_for_grad_accumulation,
+        )
+        from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+
+        model = self.model_parts[0]
+        device = self.device
+        is_train = not forward_only
+        if is_train:
+            prepare_for_grad_accumulation(self.model_parts, pp_enabled=False)
+            prepare_for_final_backward(self.model_parts, pp_enabled=False)
+
+        model_inputs = self._batch_to_device(dict(packed.model_inputs), device)
+        sync_ctx = get_sync_ctx(model, True, self.config.defer_fsdp_grad_sync) if is_train else nullcontext()
+        fwd_ctx = nullcontext() if is_train else torch.no_grad()
+        # The caller already built the (THD/CP) layout, so no make_cp_batch_and_ctx here.
+        with fwd_ctx, sync_ctx:
+            out = model(**filter_forward_kwargs(model, model_inputs))
+            mo = self._build_packed_model_output(getattr(out, "logits", out), packed, detach=False)
+            metrics: dict = {}
+            loss = None
+            if loss_fn is not None:
+                result = loss_fn(mo)
+                loss, metrics = result if isinstance(result, tuple) else (result, {})
+                if is_train:
+                    loss.backward()
+
+        return ModelOutput(
+            loss=loss.detach() if loss is not None else None,
+            logprobs=[t.detach() for t in mo.logprobs] if mo.logprobs is not None else None,
+            entropy=[t.detach() for t in mo.entropy] if mo.entropy is not None else None,
+            metrics={**metrics, **({"loss": float(loss.detach())} if loss is not None else {})},
+        )
+
+    def _build_packed_model_output(self, logits: torch.Tensor, packed: PackedBatch, *, detach: bool) -> ModelOutput:
+        """Split flat THD logits into per-datum logprobs/entropy via ``seq_lens``."""
+        if logits.dim() == 3 and logits.shape[0] == 1:
+            logits = logits.squeeze(0)  # [1, total, V] -> [total, V]
+        per_logprobs = None
+        if packed.targets is not None:
+            flat_lp = selected_token_logprobs(logits, packed.targets)
+            per_logprobs = split_per_datum(flat_lp, packed.seq_lens)
+        per_entropy = split_per_datum(compute_entropy(logits), packed.seq_lens)
+        if detach:
+            per_logprobs = [t.detach() for t in per_logprobs] if per_logprobs is not None else None
+            per_entropy = [t.detach() for t in per_entropy]
+        return ModelOutput(logprobs=per_logprobs, entropy=per_entropy, metrics={})
 
     def _global_denominator(self, datums: list[Datum]) -> tuple[float, float]:
         """Global (token, sample) counts across data ranks for loss normalization.

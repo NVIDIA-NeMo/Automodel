@@ -47,6 +47,7 @@ Conventions
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -57,7 +58,34 @@ from nemo_automodel.components.datasets.utils import default_collater, packed_se
 
 CROSS_ENTROPY_IGNORE_IDX = -100
 
-__all__ = ["Datum", "collate_datums"]
+__all__ = ["Datum", "PackedBatch", "collate_datums"]
+
+
+@dataclass
+class PackedBatch:
+    """An already-packed batch — the pass-through door for frameworks that pack.
+
+    Frameworks like verl produce a packed/THD batch themselves (flat tokens +
+    ``cu_seqlens``) and own their own loss normalization. Rather than make them
+    un-pack into :class:`Datum` only for the Engine to re-pack, they hand the
+    Engine a ``PackedBatch`` and a scalar-returning loss closure. The Engine
+    still provides the forward + per-datum :class:`ModelOutput` extraction +
+    microbatch lifecycle + backward; the caller owns packing and normalization.
+
+    Args:
+        model_inputs: kwargs passed straight to ``model(**model_inputs)`` — e.g.
+            ``input_ids`` (``[1, total]`` THD or ``[B, T]``), ``position_ids``,
+            ``cu_seqlens``/``attention_mask``. The caller is responsible for the
+            layout (including any CP sharding).
+        seq_lens: per-sequence lengths used to split flat per-token model
+            outputs back into per-datum tensors (via ``split_per_datum``).
+        targets: optional flat ``[total]`` next-token targets used to extract
+            per-token logprobs. ``None`` skips logprob extraction.
+    """
+
+    model_inputs: dict[str, Any]
+    seq_lens: Sequence[int]
+    targets: torch.Tensor | None = None
 
 
 @dataclass
