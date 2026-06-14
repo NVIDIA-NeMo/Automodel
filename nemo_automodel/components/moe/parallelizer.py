@@ -319,7 +319,11 @@ def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_p
     mixed-precision policy and excluded from the block's (bf16) FSDP unit.
 
     Returns the set of holder parameters to exclude from the block's FSDP wrap.
+    Blocks that do not expose ``named_modules`` (e.g. non-``nn.Module`` test
+    stubs) cannot hold fp32 holders, so an empty set is returned.
     """
+    if not hasattr(block, "named_modules"):
+        return set()
     fp32_mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.float32,
         reduce_dtype=torch.float32,
