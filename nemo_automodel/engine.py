@@ -91,6 +91,19 @@ class Engine:
         optimizer: Any = None  # ConfigNode with .build(model, device_mesh=, is_peft=)
         peft: Any = None  # already-instantiated PEFT config
         seed: int = 42
+
+        # ── RL role semantics ────────────────────────────────────────
+        # trainable=False -> no optimizer, params frozen, eval() by default
+        # (reference / reward models). output_head selects what forward emits:
+        # "lm" -> logprobs/entropy from logits; "value" -> per-token values from
+        # a value head (critic). hooks are applied to each model part after
+        # construction (model -> model | None); installing a value head or
+        # freezing modules goes here. NOTE: these run POST-construction; true
+        # pre-DDP/FSDP-wrap hooks need a build_model extension (follow-up).
+        trainable: bool = True
+        output_head: str = "lm"  # "lm" | "value"
+        hooks: list[Callable[[nn.Module], "nn.Module | None"]] | None = None
+
         max_grad_norm: float = 1.0
         defer_fsdp_grad_sync: bool = True
         has_packed_sequence: bool = False
@@ -137,6 +150,33 @@ class Engine:
 
         if self.config.model is not None:
             self._construct()
+        self._apply_roles()
+
+    def _apply_roles(self) -> None:
+        """Apply RL role semantics: pre-wrap hooks (post-construction) + trainable.
+
+        Runs for both construction paths. Hooks transform each model part
+        (``model -> model | None``; ``None`` means in-place). ``trainable=False``
+        drops the optimizer/scheduler, freezes params, and sets eval — the
+        reference / reward / frozen-critic case.
+        """
+        if self.config.hooks:
+            transformed = []
+            for part in self.model_parts:
+                for hook in self.config.hooks:
+                    result = hook(part)
+                    if result is not None:
+                        part = result
+                transformed.append(part)
+            self.model_parts = transformed
+
+        if not self.config.trainable:
+            self.optimizers = []
+            self.lr_schedulers = []
+            for part in self.model_parts:
+                part.eval()
+                for p in part.parameters():
+                    p.requires_grad_(False)
 
     def _construct(self) -> None:
         """Build distributed setup + model + optimizer from ``self.config``.
@@ -187,7 +227,8 @@ class Engine:
             self.pp = None
 
         # 3. Optimizer (a list — one per part — possibly megatron-fsdp sharded).
-        if self.config.optimizer is not None:
+        #    Skipped for non-trainable roles (ref / reward); _apply_roles freezes.
+        if self.config.optimizer is not None and self.config.trainable:
             optimizer = self.config.optimizer.build(
                 model, device_mesh=self.device_mesh, is_peft=self.config.peft is not None
             )
@@ -393,16 +434,23 @@ class Engine:
             return ModelOutput(loss=loss_tensor, metrics=metrics)
         return {"loss": loss_tensor, "metrics": metrics}
 
-    @torch.no_grad()
-    def forward(self, datums: Sequence[Datum], *, broadcast_output: bool = True) -> ModelOutput:
-        """Forward-only pass returning per-datum logprobs and entropy.
+    def forward(
+        self,
+        datums: Sequence[Datum],
+        *,
+        disable_adapters: bool = False,
+        broadcast_output: bool = True,
+    ) -> ModelOutput:
+        """Forward-only pass returning per-datum logprobs and entropy (or values).
 
         Reference-policy / critic evaluation. Runs the model over the collated
-        ``datums``, then slices vocab outputs back to per-datum, per-token
-        ``logprobs`` (of each datum's ``target_tokens``) and ``entropy``.
+        ``datums``, then slices outputs back to per-datum tensors —
+        ``logprobs``/``entropy`` for ``output_head="lm"`` or ``values`` for
+        ``output_head="value"``.
 
-        Currently supports the non-PP path with full logits (no
-        ``FusedLinearCrossEntropy``); ``broadcast_output`` is accepted for API
+        ``disable_adapters=True`` runs the base model with LoRA adapters off —
+        the doc's "reference logprobs without a second engine" trick. Currently
+        supports the non-PP path; ``broadcast_output`` is accepted for API
         forward-compatibility with the PP path.
         """
         if self.pp_enabled:
@@ -425,25 +473,54 @@ class Engine:
             num_chunks=self.config.cp_num_chunks,
         )
         labels = batch.pop("labels", None)
-        with train_ctx():
+        adapter_ctx = self.disable_adapter() if disable_adapters else nullcontext()
+        with torch.no_grad(), adapter_ctx, train_ctx():
             out = model(**filter_forward_kwargs(model, batch))
-        return self._build_model_output(getattr(out, "logits", out), datums, labels, detach=True)
+        return self._build_model_output(out, datums, labels, detach=True)
+
+    @contextmanager
+    def disable_adapter(self):
+        """Temporarily disable LoRA/PEFT adapters on the model (base-model forward).
+
+        Delegates to the model's own ``disable_adapter`` context if present
+        (PEFT models expose one); otherwise a no-op for models without adapters.
+        """
+        model = self.model_parts[0]
+        fn = getattr(model, "disable_adapter", None)
+        if callable(fn):
+            with fn():
+                yield
+        else:
+            yield
 
     def _build_model_output(
         self,
-        logits: torch.Tensor,
+        out: Any,
         datums: list[Datum],
         labels: torch.Tensor | None,
         *,
         detach: bool,
     ) -> ModelOutput:
-        """Slice padded ``[B, T, V]`` logits into per-datum logprobs/entropy.
+        """Slice padded ``[B, T, ...]`` model output into per-datum fields.
 
-        ``logprobs[i]`` is the per-token logprob the model assigns to datum ``i``'s
-        ``target_tokens``; ``entropy[i]`` the per-token entropy. With ``detach``
-        the graph is dropped (forward-only); without it the tensors stay
-        differentiable for the loss path.
+        With ``output_head == "value"`` the model is expected to emit ``.values``
+        (``[B, T]`` or ``[B, T, 1]``); ``ModelOutput.values[i]`` is datum ``i``'s
+        per-token value. Otherwise ``logits`` are turned into per-datum
+        ``logprobs`` (of each datum's ``target_tokens``) and ``entropy``. With
+        ``detach`` the graph is dropped (forward-only).
         """
+        if self.config.output_head == "value":
+            values = getattr(out, "values", None)
+            if values is None:
+                raise ValueError("output_head='value' but the model output has no `.values`.")
+            if values.dim() == 3 and values.shape[-1] == 1:
+                values = values.squeeze(-1)  # [B, T, 1] -> [B, T]
+            per_values = [values[i, : d.seq_len] for i, d in enumerate(datums)]
+            if detach:
+                per_values = [t.detach() for t in per_values]
+            return ModelOutput(values=per_values, metrics={})
+
+        logits = getattr(out, "logits", out)
         per_logprobs: list[torch.Tensor] | None = None
         if labels is not None:
             token_lp = selected_token_logprobs(logits, labels.clamp_min(0))  # [B, T]
@@ -513,7 +590,7 @@ class Engine:
             fwd_ctx = nullcontext() if is_train else torch.no_grad()
             with fwd_ctx, train_ctx(), sync_ctx:
                 out = model(**filter_forward_kwargs(model, batch))
-                mo = self._build_model_output(getattr(out, "logits", out), mb, labels, detach=False)
+                mo = self._build_model_output(out, mb, labels, detach=False)
                 per_datum_losses = loss_fn(mo, mb, **loss_kwargs)
                 loss = self._reduce_datum_losses(per_datum_losses, mb, token_denom, sample_denom)
                 if is_train:
