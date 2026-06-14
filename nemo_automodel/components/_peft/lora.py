@@ -518,6 +518,7 @@ def patch_moe_module(
     lora_A_init_method="xavier",
     lora_dtype=None,
     expert_weight_format="bf16",
+    passthrough=False,
 ):
     """
     Patches a custom MoE module (GroupedExperts or GroupedExpertsDeepEP) with LoRA.
@@ -531,32 +532,29 @@ def patch_moe_module(
         expert_weight_format (str, optional): "bf16" keeps frozen base expert weights in
             floating point; "mxfp4" keeps them packed as fp4-e2m1 + e8m0 block scales with
             on-the-fly dequantization. Defaults to "bf16".
+        passthrough (bool, optional): Only used with expert_weight_format="mxfp4". When True,
+            the frozen base is registered as packed placeholders at init so a packed fp4
+            checkpoint loads straight in (no bf16 expert materialization). Defaults to False.
 
     Returns:
         nn.Module: The LoRA-wrapped MoE module.
     """
     if expert_weight_format not in ("bf16", "mxfp4"):
         raise ValueError(f"Unsupported expert_weight_format: {expert_weight_format}")
+    common = dict(lora_dim=dim, alpha=alpha, lora_A_init_method=lora_A_init_method, lora_dtype=lora_dtype)
+    mxfp4 = expert_weight_format == "mxfp4"
     if isinstance(orig_module, GroupedExpertsTE):
         raise NotImplementedError("LoRA is not supported for Transformer Engine (TE) expert modules.")
     elif isinstance(orig_module, GroupedExpertsDeepEP):
-        deepep_lora_cls = GroupedExpertsDeepEPLoRAMXFP4 if expert_weight_format == "mxfp4" else GroupedExpertsDeepEPLoRA
-        new_module = deepep_lora_cls(
-            orig_module,
-            lora_dim=dim,
-            alpha=alpha,
-            lora_A_init_method=lora_A_init_method,
-            lora_dtype=lora_dtype,
-        )
+        if mxfp4:
+            new_module = GroupedExpertsDeepEPLoRAMXFP4(orig_module, passthrough=passthrough, **common)
+        else:
+            new_module = GroupedExpertsDeepEPLoRA(orig_module, **common)
     elif isinstance(orig_module, GroupedExperts):
-        lora_cls = GroupedExpertsLoRAMXFP4 if expert_weight_format == "mxfp4" else GroupedExpertsLoRA
-        new_module = lora_cls(
-            orig_module,
-            lora_dim=dim,
-            alpha=alpha,
-            lora_A_init_method=lora_A_init_method,
-            lora_dtype=lora_dtype,
-        )
+        if mxfp4:
+            new_module = GroupedExpertsLoRAMXFP4(orig_module, passthrough=passthrough, **common)
+        else:
+            new_module = GroupedExpertsLoRA(orig_module, **common)
     else:
         raise NotImplementedError(f"Unsupported MoE module type: {type(orig_module)}")
 
@@ -642,7 +640,10 @@ def apply_lora_to_linear_modules(
                             moe_dim,
                         )
 
-                # Replace the module in the model
+                # Replace the module in the model. For mxfp4, build LoRA experts in
+                # passthrough mode (packed base placeholders) so the packed fp4 checkpoint
+                # loads straight in — matching the model-wide packed adapter mode set in
+                # _apply_peft_and_lower_precision and avoiding bf16 expert materialization.
                 new_module = patch_moe_module(
                     module,
                     dim=moe_dim,
@@ -650,6 +651,7 @@ def apply_lora_to_linear_modules(
                     lora_A_init_method=peft_config.lora_A_init,
                     lora_dtype=lora_dtype,
                     expert_weight_format=peft_config.expert_weight_format,
+                    passthrough=(peft_config.expert_weight_format == "mxfp4"),
                 )
 
                 # Find parent and replace

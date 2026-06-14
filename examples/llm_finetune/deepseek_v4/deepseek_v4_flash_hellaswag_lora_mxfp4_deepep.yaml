@@ -91,10 +91,18 @@ model:
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules:
+    # attention
     - "*wq_a"
     - "*wq_b"
     - "*wkv"
     - "*wo_b"
+    # routed experts: GroupedExpertsDeepEP -> GroupedExpertsDeepEPLoRAMXFP4
+    # (frozen base stays mxfp4-packed; only the LoRA adapters train)
+    - "*mlp.experts"
+    # shared experts: dense MLP nn.Linear (base stays bf16, LoRA adapters bf16)
+    - "*shared_experts.gate_proj"
+    - "*shared_experts.up_proj"
+    - "*shared_experts.down_proj"
   dim: 8
   alpha: 32
   use_triton: True

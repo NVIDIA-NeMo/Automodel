@@ -362,12 +362,24 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
     and backward (see ``MXFP4ExpertStorageMixin``). Only the LoRA adapters (and
     optional expert biases) remain in floating point.
 
-    When constructed from a module whose weights are still on the meta device,
-    packing is deferred: the module behaves exactly like ``GroupedExpertsLoRA``
-    until ``pack_base_weights()`` is called (after the base checkpoint is loaded).
+    Two load paths:
+    - ``passthrough=False`` (default): packing is deferred. The base loads as bf16 and
+      is packed after the checkpoint load (``pack_base_weights()``). Works with any
+      checkpoint, but materializes bf16 experts at load (high peak).
+    - ``passthrough=True``: register packed base placeholders at init (no bf16 storage)
+      so a packed fp4 checkpoint loads straight into them via the adapter's packed path,
+      never materializing bf16 experts. The scale-out path for the full DeepSeek-V4-Flash.
     """
 
-    def __init__(self, orig_module: GroupedExperts, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
+    def __init__(
+        self,
+        orig_module: GroupedExperts,
+        lora_dim=8,
+        alpha=32,
+        lora_A_init_method="xavier",
+        lora_dtype=None,
+        passthrough=False,
+    ):
         super().__init__(
             orig_module,
             lora_dim=lora_dim,
@@ -375,7 +387,13 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
             lora_A_init_method=lora_A_init_method,
             lora_dtype=lora_dtype,
         )
-        self._init_mxfp4_storage()
+        if passthrough:
+            # Swap the frozen bf16 base placeholders (from super().__init__) for packed
+            # mxfp4 placeholders; the LoRA adapters just built are left untouched. A packed
+            # checkpoint then loads straight in with no bf16 expert materialization.
+            self._init_packed_placeholders()
+        else:
+            self._init_mxfp4_storage()
 
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
         """Forward pass with mxfp4 base weights and LoRA injection.
@@ -434,10 +452,14 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
             experts_start_idx,
         )
 
-        lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A)
-        lora_gate_and_up_B = _to_local(self.lora_gate_and_up_B)
-        lora_down_A = _to_local(self.lora_down_A)
-        lora_down_B = _to_local(self.lora_down_B)
+        # Match the activation dtype for the LoRA grouped GEMMs. The frozen base is
+        # dequantized to x.dtype inside MXFP4GroupedMM, but the adapters may be a
+        # different dtype (GroupedExperts allocates its base — hence the adapter dtype —
+        # as fp32 when no backend dtype is set), which would mismatch torch._grouped_mm.
+        lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A).to(x.dtype)
+        lora_gate_and_up_B = _to_local(self.lora_gate_and_up_B).to(x.dtype)
+        lora_down_A = _to_local(self.lora_down_A).to(x.dtype)
+        lora_down_B = _to_local(self.lora_down_B).to(x.dtype)
 
         y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
 
@@ -710,7 +732,13 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
     """
 
     def __init__(
-        self, orig_module: GroupedExpertsDeepEP, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None
+        self,
+        orig_module: GroupedExpertsDeepEP,
+        lora_dim=8,
+        alpha=32,
+        lora_A_init_method="xavier",
+        lora_dtype=None,
+        passthrough=False,
     ):
         super().__init__(
             orig_module,
@@ -719,7 +747,13 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
             lora_A_init_method=lora_A_init_method,
             lora_dtype=lora_dtype,
         )
-        self._init_mxfp4_storage()
+        if passthrough:
+            # Packed base placeholders (no bf16) so a packed fp4 checkpoint loads straight
+            # in; the LoRA adapters from super().__init__ are untouched. See
+            # GroupedExpertsLoRAMXFP4 for the passthrough vs deferred distinction.
+            self._init_packed_placeholders()
+        else:
+            self._init_mxfp4_storage()
 
     def forward(
         self,
@@ -750,10 +784,12 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
 
-        lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A)
-        lora_gate_and_up_B = _to_local(self.lora_gate_and_up_B)
-        lora_down_A = _to_local(self.lora_down_A)
-        lora_down_B = _to_local(self.lora_down_B)
+        # Match the activation dtype for the LoRA grouped GEMMs (the base dequantizes to
+        # x.dtype inside MXFP4GroupedMM; adapters may be fp32 — see GroupedExpertsLoRAMXFP4).
+        lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A).to(x.dtype)
+        lora_gate_and_up_B = _to_local(self.lora_gate_and_up_B).to(x.dtype)
+        lora_down_A = _to_local(self.lora_down_A).to(x.dtype)
+        lora_down_B = _to_local(self.lora_down_B).to(x.dtype)
 
         if torch.count_nonzero(tokens_per_expert) > 0:
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)

@@ -428,7 +428,11 @@ class Gate(nn.Module):
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sqrtsoftplus":
             # sqrt(softplus(x)) = sqrt(log(1 + exp(x))), used in DeepSeek V4.
-            scores = torch.sqrt(F.softplus(scores.float()))
+            # clamp_min keeps the sqrt argument strictly positive: softplus(x) underflows
+            # to exactly 0.0 in fp32 for very negative logits (x <~ -104), and sqrt'(0) = inf
+            # makes the backward NaN. The clamp bounds the gradient with a negligible
+            # (sqrt(1e-12) = 1e-6) change to the forward value.
+            scores = torch.sqrt(F.softplus(scores.float()).clamp_min(1e-12))
             original_scores = scores
 
             if self.e_score_correction_bias is not None:

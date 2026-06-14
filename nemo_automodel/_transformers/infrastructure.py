@@ -88,19 +88,8 @@ def _apply_peft_and_lower_precision(
             logger.info("Enabling PEFT with Pipeline Parallelism")
             logger.info("Disabling Triton with Pipeline Parallelism Enabled.")
             peft_config.use_triton = False
-        # Skip freeze here - will do global freeze after checkpoint loading.
-        # For mxfp4, LoRA-targeted experts are built packed-at-init (passthrough)
-        # so the packed fp4 checkpoint loads straight in (matches the adapter's
-        # passthrough mode set below); otherwise they'd carry bf16 base params and
-        # size-mismatch against the packed checkpoint keys.
-        expert_passthrough = getattr(peft_config, "expert_weight_format", "bf16") == "mxfp4"
-        apply_lora_to_linear_modules(
-            model,
-            peft_config,
-            quantization_config=quantization_config,
-            skip_freeze=True,
-            expert_passthrough=expert_passthrough,
-        )
+        # Skip freeze here - will do global freeze after checkpoint loading
+        apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config, skip_freeze=True)
 
         # Convert frozen (non-LoRA-targeted) routed experts to mxfp4-resident storage.
         # LoRA-targeted experts are already GroupedExpertsLoRAMXFP4 from the call above.
@@ -126,7 +115,11 @@ def _apply_peft_and_lower_precision(
 
             # Put the state-dict adapter(s) in passthrough mode BEFORE the checkpoint
             # load so both to_hf (destination keys) and from_hf (aggregation) keep
-            # experts packed.
+            # experts packed. Both frozen (convert_frozen_experts_to_mxfp4 passthrough)
+            # and LoRA-targeted experts (GroupedExperts*LoRAMXFP4 built passthrough in
+            # apply_lora_to_linear_modules) load the packed fp4 keys straight into packed
+            # params — no bf16 expert materialization, so the load-time _aggregate_experts
+            # bf16 re-stack OOM is avoided.
             for part in getattr(model, "parts", [model]):
                 adapter = getattr(part, "state_dict_adapter", None)
                 if adapter is not None and hasattr(adapter, "expert_storage_format"):
