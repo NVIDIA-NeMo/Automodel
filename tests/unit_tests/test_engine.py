@@ -85,12 +85,100 @@ def test_forward_backward_dict_returns_dict_and_grads():
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
 
 
-def test_forward_backward_datums_returns_model_output():
-    engine, _ = _engine()
-    out = engine.forward_backward(_datums(), loss_fn=toy_loss)
+def _rl_datums(vocab=16):
+    """Datums carrying old logprobs + advantages for IS/PPO losses."""
+    return [
+        Datum(
+            input_ids=torch.randint(0, vocab, (5,)),
+            loss_inputs={
+                "target_tokens": torch.randint(0, vocab, (5,)),
+                "weights": torch.ones(5),
+                "logprobs": -torch.rand(5),
+                "advantages": torch.randn(5),
+            },
+        ),
+        Datum(
+            input_ids=torch.randint(0, vocab, (3,)),
+            loss_inputs={
+                "target_tokens": torch.randint(0, vocab, (3,)),
+                "weights": torch.tensor([1.0, 1.0, 0.0]),
+                "logprobs": -torch.rand(3),
+                "advantages": torch.randn(3),
+            },
+        ),
+    ]
+
+
+def test_forward_backward_datums_default_cross_entropy():
+    engine, model = _engine()
+    out = engine.forward_backward(_datums())  # default loss_fn="cross_entropy"
     assert isinstance(out, ModelOutput)
     assert out.loss is not None and torch.isfinite(out.loss)
     assert out.metrics["loss"] == pytest.approx(float(out.loss))
+    assert len(out.logprobs) == 2  # per-datum, aligned to input order
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+
+
+@pytest.mark.parametrize("loss_name", ["cross_entropy", "importance_sampling", "ppo"])
+def test_builtin_losses_run_and_backprop(loss_name):
+    engine, model = _engine()
+    out = engine.forward_backward(_rl_datums(), loss_fn=loss_name)
+    assert torch.isfinite(out.loss)
+    assert any(p.grad is not None for p in model.parameters())
+
+
+def test_custom_lossfn_matches_cross_entropy():
+    def my_ce(model_output, datums):
+        return [-lp for lp in model_output.logprobs]
+
+    torch.manual_seed(0)
+    e1, _ = _engine()
+    l1 = float(e1.forward_backward(_datums(), loss_fn="cross_entropy").loss)
+    torch.manual_seed(0)
+    e2, _ = _engine()
+    l2 = float(e2.forward_backward(_datums(), loss_fn=my_ce).loss)
+    assert l1 == pytest.approx(l2, rel=1e-5)
+
+
+def test_datums_forward_only_no_grads():
+    engine, model = _engine()
+    out = engine.forward_backward(_datums(), loss_fn="cross_entropy", forward_only=True)
+    assert torch.isfinite(out.loss)
+    assert all(p.grad is None for p in model.parameters())
+
+
+def test_multiple_microbatches_accumulate_datums():
+    engine, model = _engine()
+    mbs = [_datums(), _datums()]  # list[list[Datum]]
+    out = engine.forward_backward(mbs, loss_fn="cross_entropy")
+    assert torch.isfinite(out.loss)
+    assert len(out.logprobs) == 4  # 2 datums x 2 microbatches, in order
+
+
+def test_reduce_token_level_normalization():
+    # Two datums, token-level loss; weighted sum / global token count.
+    d = [
+        Datum(input_ids=torch.tensor([1, 2]), loss_inputs={"weights": torch.tensor([1.0, 1.0])}),
+        Datum(input_ids=torch.tensor([3]), loss_inputs={"weights": torch.tensor([0.0])}),
+    ]
+    per = [torch.tensor([2.0, 4.0]), torch.tensor([8.0])]  # token-level
+    # weighted sum = 2*1 + 4*1 + 8*0 = 6; global token count = 2 -> 3.0
+    loss = Engine._reduce_datum_losses(per, d, token_denom=2.0, sample_denom=2.0)
+    assert float(loss) == pytest.approx(3.0)
+
+
+def test_reduce_sample_level_normalization():
+    d = [Datum(input_ids=torch.tensor([1, 2])), Datum(input_ids=torch.tensor([3]))]
+    per = [torch.tensor(2.0), torch.tensor(4.0)]  # scalar per datum -> sample-level
+    loss = Engine._reduce_datum_losses(per, d, token_denom=99.0, sample_denom=2.0)
+    assert float(loss) == pytest.approx(3.0)  # (2 + 4) / 2
+
+
+def test_global_denominator_local():
+    engine, _ = _engine()
+    token, sample = engine._global_denominator(_datums())
+    assert token == pytest.approx(8.0)  # weights: ones(5) + ones(3)
+    assert sample == pytest.approx(2.0)
 
 
 def test_forward_only_leaves_no_grads():

@@ -61,6 +61,7 @@ from nemo_automodel.components.training.model_output import (
     compute_entropy,
     selected_token_logprobs,
 )
+from nemo_automodel.loss_fns import BUILTIN_LOSSES, LossFn
 
 __all__ = ["Engine"]
 
@@ -256,31 +257,49 @@ class Engine:
         """
         if isinstance(batch, dict):
             return [batch], False
-        if isinstance(batch, Sequence) and len(batch) > 0 and isinstance(batch[0], Datum):
-            return [collate_datums(list(batch))], True
         if isinstance(batch, Sequence):
             return list(batch), False
         raise TypeError(f"Unsupported batch type: {type(batch)!r}")
 
+    @staticmethod
+    def _is_datum_input(batch: Any) -> bool:
+        """True for ``list[Datum]`` or ``list[list[Datum]]`` (the tinker path)."""
+        if not isinstance(batch, Sequence) or isinstance(batch, dict) or len(batch) == 0:
+            return False
+        head = batch[0]
+        if isinstance(head, Datum):
+            return True
+        return isinstance(head, Sequence) and len(head) > 0 and isinstance(head[0], Datum)
+
+    @staticmethod
+    def _as_microbatch_datum_lists(batch: Any) -> list[list[Datum]]:
+        """Normalize Datum input to ``list[list[Datum]]`` (one inner list per microbatch)."""
+        return [list(batch)] if isinstance(batch[0], Datum) else [list(mb) for mb in batch]
+
     def forward_backward(
         self,
         batch: Any,
-        loss_fn: Callable | None = None,
+        loss_fn: "str | LossFn | Callable | None" = None,
         *,
+        loss_kwargs: dict | None = None,
         num_microbatches: int | None = None,
         forward_only: bool = False,
         num_label_tokens: int | None = None,
     ) -> dict | ModelOutput:
         """Run forward + (optional) backward over one or more microbatches.
 
-        ``batch`` may be a single dict, a list of microbatch dicts, or a list of
-        :class:`Datum`. With ``Datum`` input a :class:`ModelOutput` is returned;
-        otherwise a ``{"loss", "metrics"}`` dict.
+        Two input modes:
 
-        ``loss_fn`` defaults to ``config.loss_fn``. A custom ``loss_fn`` receives
-        ``(model_output, batch_labels)`` semantics via ``calculate_loss`` only
-        when it is a built-in loss; arbitrary callables are invoked as
-        ``loss_fn(logits=..., labels=...)``-free — see the SFT path below.
+        * **Datum mode** (``list[Datum]`` or ``list[list[Datum]]``): the tinker
+          path. ``loss_fn`` is a built-in name (``"cross_entropy"`` default,
+          ``"importance_sampling"``, ``"ppo"``) or a ``LossFn`` callable
+          ``(ModelOutput, Sequence[Datum]) -> Sequence[Tensor]``. The Engine owns
+          weighting, the global token/sample denominator across data ranks, and
+          backward. Returns a :class:`ModelOutput`.
+        * **Dict mode** (``dict`` or ``list[dict]``): the legacy SFT path.
+          ``loss_fn`` is an Automodel loss instance (or ``None`` to use the
+          model's own loss); reduction goes through ``calculate_loss``. Returns
+          ``{"loss", "metrics"}``.
 
         The microbatch lifecycle (grad-accumulation prep, MoE aux-loss scaling,
         final-backward hook) is handled here so callers don't reproduce it.
@@ -289,6 +308,14 @@ class Engine:
             raise NotImplementedError(
                 "Engine.forward_backward does not yet support pipeline parallelism; "
                 "this is a planned follow-up. Use the recipe PP path for now."
+            )
+
+        if self._is_datum_input(batch):
+            return self._forward_backward_datums(
+                self._as_microbatch_datum_lists(batch),
+                loss_fn if loss_fn is not None else "cross_entropy",
+                loss_kwargs or {},
+                forward_only=forward_only,
             )
 
         from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
@@ -396,15 +423,154 @@ class Engine:
         labels = batch.pop("labels", None)
         with train_ctx():
             out = model(**filter_forward_kwargs(model, batch))
-        logits = getattr(out, "logits", out)  # [B, T, V]
+        return self._build_model_output(getattr(out, "logits", out), datums, labels, detach=True)
 
+    def _build_model_output(
+        self,
+        logits: torch.Tensor,
+        datums: list[Datum],
+        labels: torch.Tensor | None,
+        *,
+        detach: bool,
+    ) -> ModelOutput:
+        """Slice padded ``[B, T, V]`` logits into per-datum logprobs/entropy.
+
+        ``logprobs[i]`` is the per-token logprob the model assigns to datum ``i``'s
+        ``target_tokens``; ``entropy[i]`` the per-token entropy. With ``detach``
+        the graph is dropped (forward-only); without it the tensors stay
+        differentiable for the loss path.
+        """
         per_logprobs: list[torch.Tensor] | None = None
         if labels is not None:
             token_lp = selected_token_logprobs(logits, labels.clamp_min(0))  # [B, T]
-            per_logprobs = [token_lp[i, : d.seq_len].detach() for i, d in enumerate(datums)]
+            per_logprobs = [token_lp[i, : d.seq_len] for i, d in enumerate(datums)]
         token_ent = compute_entropy(logits)  # [B, T]
-        per_entropy = [token_ent[i, : d.seq_len].detach() for i, d in enumerate(datums)]
+        per_entropy = [token_ent[i, : d.seq_len] for i, d in enumerate(datums)]
+        if detach:
+            per_logprobs = [t.detach() for t in per_logprobs] if per_logprobs is not None else None
+            per_entropy = [t.detach() for t in per_entropy]
         return ModelOutput(logprobs=per_logprobs, entropy=per_entropy, metrics={})
+
+    def _forward_backward_datums(
+        self,
+        mb_datum_lists: list[list[Datum]],
+        loss_fn: "str | LossFn",
+        loss_kwargs: dict,
+        *,
+        forward_only: bool,
+    ) -> ModelOutput:
+        """Datum/LossFn path: forward → per-datum loss → reduce → backward.
+
+        Owns the doc's normalization: applies ``weights``, divides by the global
+        token (or sample) count across data ranks, and runs the microbatch
+        lifecycle. Matches the recipe's non-PP loss formula (weighted sum of
+        per-token losses / global token count), so DP scaling stays identical to
+        the proven path.
+        """
+        from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+        from nemo_automodel.components.distributed.utils import get_sync_ctx
+        from nemo_automodel.components.training.utils import (
+            prepare_after_first_microbatch,
+            prepare_for_final_backward,
+            prepare_for_grad_accumulation,
+        )
+        from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+
+        loss_fn = BUILTIN_LOSSES[loss_fn] if isinstance(loss_fn, str) else loss_fn
+        all_datums = [d for mb in mb_datum_lists for d in mb]
+        token_denom, sample_denom = self._global_denominator(all_datums)
+        is_train = not forward_only
+        model = self.model_parts[0]
+        device = self.device
+        n = len(mb_datum_lists)
+
+        if is_train:
+            prepare_for_grad_accumulation(self.model_parts, pp_enabled=False)
+            self._set_moe_scale(int(token_denom))
+
+        agg_logprobs: list[torch.Tensor] = []
+        agg_entropy: list[torch.Tensor] = []
+        loss_sum = torch.zeros((), device=device)
+        for i, mb in enumerate(mb_datum_lists):
+            is_last = i == n - 1
+            if is_train and is_last:
+                prepare_for_final_backward(self.model_parts, pp_enabled=False)
+
+            batch = self._batch_to_device(collate_datums(mb), device)
+            train_ctx, batch = make_cp_batch_and_ctx(
+                self.device_mesh,
+                batch,
+                use_te=self.config.cp_use_te,
+                padding_token_id=self.config.cp_padding_token_id,
+                num_chunks=self.config.cp_num_chunks,
+            )
+            labels = batch.pop("labels", None)
+            sync_ctx = get_sync_ctx(model, is_last, self.config.defer_fsdp_grad_sync) if is_train else nullcontext()
+            fwd_ctx = nullcontext() if is_train else torch.no_grad()
+            with fwd_ctx, train_ctx(), sync_ctx:
+                out = model(**filter_forward_kwargs(model, batch))
+                mo = self._build_model_output(getattr(out, "logits", out), mb, labels, detach=False)
+                per_datum_losses = loss_fn(mo, mb, **loss_kwargs)
+                loss = self._reduce_datum_losses(per_datum_losses, mb, token_denom, sample_denom)
+                if is_train:
+                    loss.backward()
+            loss_sum = loss_sum + loss.detach()
+            agg_logprobs.extend(t.detach() for t in (mo.logprobs or []))
+            agg_entropy.extend(t.detach() for t in (mo.entropy or []))
+            if is_train and i == 0:
+                prepare_after_first_microbatch()
+
+        return ModelOutput(
+            loss=loss_sum,
+            logprobs=agg_logprobs or None,
+            entropy=agg_entropy or None,
+            metrics={"loss": float(loss_sum)},
+        )
+
+    @staticmethod
+    def _reduce_datum_losses(
+        per_datum_losses: Sequence[torch.Tensor],
+        datums: list[Datum],
+        token_denom: float,
+        sample_denom: float,
+    ) -> torch.Tensor:
+        """Weight + sum per-datum losses, normalized by the global denominator.
+
+        Token-level (per-token tensors) are multiplied by ``weights`` and summed,
+        divided by the global token count. Sample-level (scalar per datum) are
+        summed and divided by the global sample count. Homogeneity is decided
+        from the first datum's loss shape.
+        """
+        sample_level = per_datum_losses[0].numel() == 1
+        total = None
+        for loss_i, d in zip(per_datum_losses, datums):
+            if sample_level:
+                contrib = loss_i.reshape(())
+            else:
+                w = d.loss_inputs.get("weights")
+                contrib = (loss_i * w.to(loss_i)).sum() if w is not None else loss_i.sum()
+            total = contrib if total is None else total + contrib
+        denom = sample_denom if sample_level else token_denom
+        return total / max(denom, 1e-8)
+
+    def _global_denominator(self, datums: list[Datum]) -> tuple[float, float]:
+        """Global (token, sample) counts across data ranks for loss normalization.
+
+        Token count = sum of ``weights`` (or sequence lengths when absent);
+        sample count = number of datums. Both all-reduced over the DP(+CP) group.
+        """
+        token_local = 0.0
+        for d in datums:
+            w = d.loss_inputs.get("weights")
+            token_local += float(w.sum()) if w is not None else float(d.seq_len)
+        sample_local = float(len(datums))
+
+        group = self._dp_group(include_cp=True)
+        if group is not None and dist.is_initialized():
+            t = torch.tensor([token_local, sample_local], device=self.device)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM, group=group)
+            token_local, sample_local = float(t[0]), float(t[1])
+        return token_local, sample_local
 
     # ── Optimizer ────────────────────────────────────────────────────
 
