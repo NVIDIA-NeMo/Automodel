@@ -104,5 +104,5 @@ lr_scheduler:
 
 ci:
   # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
-  recipe_owner: Hayden727
+  recipe_owner: akoumpa
   nodes: 4
