@@ -676,6 +676,10 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(Qwen3ForSequenceClassification): _parallelize_qwen_classification,
     # Hard-coded qualname to avoid eagerly importing transformers.models.qwen3_5.
     "transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5ForConditionalGeneration": _parallelize_qwen3_5_vlm,
+    # NeMo-native Qwen3.5 dense (custom-model port): same plan — shard self_attn +
+    # MLP, leave the GatedDeltaNet (linear_attn) replicated.
+    "nemo_automodel.components.models.qwen3_5.model.Qwen3_5ForConditionalGeneration": _parallelize_qwen3_5_vlm,
+    "nemo_automodel.components.models.qwen3_5.model.Qwen3_5ForCausalLM": _parallelize_qwen3_5_vlm,
     _get_class_qualname(LlamaForCausalLM): _parallelize_llama,
     _get_class_qualname(Ministral3ForCausalLM): _parallelize_ministral3,
     # Mistral3 VLM (Pixtral + Ministral3) — native HF class plus the Automodel
