@@ -380,7 +380,9 @@ class Engine:
                 "this is a planned follow-up. Use the recipe PP path for now."
             )
 
-        if isinstance(batch, PackedBatch):
+        if isinstance(batch, PackedBatch) or (
+            isinstance(batch, Sequence) and len(batch) > 0 and isinstance(batch[0], PackedBatch)
+        ):
             return self._forward_backward_packed(batch, loss_fn, forward_only=forward_only)
 
         if self._is_datum_input(batch):
@@ -674,24 +676,39 @@ class Engine:
 
     def _forward_backward_packed(
         self,
-        packed: PackedBatch,
-        loss_fn: Callable[[ModelOutput], "torch.Tensor | tuple[torch.Tensor, dict]"] | None,
+        packed: "PackedBatch | Sequence[PackedBatch]",
+        loss_fn: "Callable | Sequence[Callable] | None",
         *,
         forward_only: bool,
     ) -> ModelOutput:
         """Pass-through door for already-packed batches (e.g. verl).
 
-        Runs ``model(**packed.model_inputs)``, builds a per-datum
-        :class:`ModelOutput` by splitting flat outputs via ``packed.seq_lens``,
-        then calls ``loss_fn(model_output)`` which returns a scalar loss (or
-        ``(loss, metrics)``). The caller owns packing and normalization — the
-        Engine owns forward + extraction + the microbatch lifecycle + backward.
+        ``packed`` is one :class:`PackedBatch` or a list of them (microbatches —
+        verl hands the whole batch and micro-batches internally, so this runs the
+        grad-accumulation lifecycle across them just like the Datum path does).
+        ``loss_fn`` is one callable applied to every microbatch, or a list with
+        one callable per microbatch (each closing over its own microbatch data).
+        Each is called ``loss_fn(model_output) -> Tensor | (Tensor, metrics)`` and
+        returns the (caller-normalized) scalar loss for that microbatch.
+
+        The caller owns packing + normalization; the Engine owns forward +
+        per-datum extraction (split by ``seq_lens``) + the microbatch lifecycle +
+        backward. Per-datum outputs are returned concatenated in microbatch order
+        (the caller restores original order via its own indices).
         """
-        if loss_fn is None and not forward_only:
+        packs = [packed] if isinstance(packed, PackedBatch) else list(packed)
+        if isinstance(loss_fn, (list, tuple)):
+            loss_fns = list(loss_fn)
+            if len(loss_fns) != len(packs):
+                raise ValueError(f"got {len(loss_fns)} loss_fns for {len(packs)} microbatches")
+        else:
+            loss_fns = [loss_fn] * len(packs)
+        if any(lf is None for lf in loss_fns) and not forward_only:
             raise ValueError("PackedBatch training requires a loss_fn returning a scalar loss.")
 
         from nemo_automodel.components.distributed.utils import get_sync_ctx
         from nemo_automodel.components.training.utils import (
+            prepare_after_first_microbatch,
             prepare_for_final_backward,
             prepare_for_grad_accumulation,
         )
@@ -700,30 +717,55 @@ class Engine:
         model = self.model_parts[0]
         device = self.device
         is_train = not forward_only
+        n = len(packs)
         if is_train:
             prepare_for_grad_accumulation(self.model_parts, pp_enabled=False)
-            prepare_for_final_backward(self.model_parts, pp_enabled=False)
 
-        model_inputs = self._batch_to_device(dict(packed.model_inputs), device)
-        sync_ctx = get_sync_ctx(model, True, self.config.defer_fsdp_grad_sync) if is_train else nullcontext()
-        fwd_ctx = nullcontext() if is_train else torch.no_grad()
-        # The caller already built the (THD/CP) layout, so no make_cp_batch_and_ctx here.
-        with fwd_ctx, sync_ctx:
-            out = model(**filter_forward_kwargs(model, model_inputs))
-            mo = self._build_packed_model_output(getattr(out, "logits", out), packed, detach=False)
-            metrics: dict = {}
-            loss = None
-            if loss_fn is not None:
-                result = loss_fn(mo)
-                loss, metrics = result if isinstance(result, tuple) else (result, {})
-                if is_train:
-                    loss.backward()
+        agg_logprobs: list[torch.Tensor] = []
+        agg_entropy: list[torch.Tensor] = []
+        agg_values: list[torch.Tensor] = []
+        loss_sum = torch.zeros((), device=device)
+        any_loss = False
+        metric_sums: dict[str, float] = {}
+        for i, (pk, lf) in enumerate(zip(packs, loss_fns)):
+            is_last = i == n - 1
+            if is_train and is_last:
+                prepare_for_final_backward(self.model_parts, pp_enabled=False)
 
+            model_inputs = self._batch_to_device(dict(pk.model_inputs), device)
+            sync_ctx = get_sync_ctx(model, is_last, self.config.defer_fsdp_grad_sync) if is_train else nullcontext()
+            fwd_ctx = nullcontext() if is_train else torch.no_grad()
+            # The caller already built the (THD/CP) layout, so no make_cp_batch_and_ctx here.
+            with fwd_ctx, sync_ctx:
+                out = model(**filter_forward_kwargs(model, model_inputs))
+                mo = self._build_packed_model_output(getattr(out, "logits", out), pk, detach=False)
+                if lf is not None:
+                    result = lf(mo)
+                    loss, metrics = result if isinstance(result, tuple) else (result, {})
+                    if is_train:
+                        loss.backward()
+                    loss_sum = loss_sum + loss.detach()
+                    any_loss = True
+                    for k, v in metrics.items():
+                        metric_sums[k] = metric_sums.get(k, 0.0) + float(v)
+            if mo.logprobs is not None:
+                agg_logprobs.extend(t.detach() for t in mo.logprobs)
+            if mo.entropy is not None:
+                agg_entropy.extend(t.detach() for t in mo.entropy)
+            if mo.values is not None:
+                agg_values.extend(t.detach() for t in mo.values)
+            if is_train and i == 0:
+                prepare_after_first_microbatch()
+
+        metrics = {k: v / n for k, v in metric_sums.items()}
+        if any_loss:
+            metrics["loss"] = float(loss_sum)
         return ModelOutput(
-            loss=loss.detach() if loss is not None else None,
-            logprobs=[t.detach() for t in mo.logprobs] if mo.logprobs is not None else None,
-            entropy=[t.detach() for t in mo.entropy] if mo.entropy is not None else None,
-            metrics={**metrics, **({"loss": float(loss.detach())} if loss is not None else {})},
+            loss=loss_sum if any_loss else None,
+            logprobs=agg_logprobs or None,
+            entropy=agg_entropy or None,
+            values=agg_values or None,
+            metrics=metrics,
         )
 
     def _build_packed_model_output(self, logits: torch.Tensor, packed: PackedBatch, *, detach: bool) -> ModelOutput:

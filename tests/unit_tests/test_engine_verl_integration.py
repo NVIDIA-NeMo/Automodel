@@ -157,3 +157,34 @@ def test_passthrough_forward_only_no_grad():
     assert out.loss is None
     assert [lp.shape[0] for lp in out.logprobs] == [5, 3]  # extraction still works
     assert all(p.grad is None for p in model.parameters())
+
+
+def test_passthrough_multi_microbatch_accumulates():
+    """verl hands the whole batch; the pass-through micro-batches with grad accum."""
+    engine, model = _engine()
+
+    def _packed_and_closure(mb):
+        flat, offsets = mb["flat_input_ids"], mb["offsets"]
+        seq_lens = [b - a for a, b in zip(offsets[:-1], offsets[1:])]
+        packed = PackedBatch(
+            model_inputs={"input_ids": flat.unsqueeze(0)}, seq_lens=seq_lens, targets=torch.roll(flat, -1)
+        )
+        adv = [mb["advantages"][a:b] for a, b in zip(offsets[:-1], offsets[1:])]
+        old = [mb["old_logprobs"][a:b] for a, b in zip(offsets[:-1], offsets[1:])]
+        ntok = float(mb["loss_mask"].sum())
+
+        def closure(mo, adv=adv, old=old, ntok=ntok):
+            losses = [(-(torch.exp(lp - o) * a)).sum() for lp, a, o in zip(mo.logprobs, adv, old)]
+            loss = torch.stack(losses).sum() / ntok
+            return loss, {"pg_loss": float(loss.detach())}
+
+        return packed, closure
+
+    m1, c1 = _packed_and_closure(_fake_verl_microbatch())
+    m2, c2 = _packed_and_closure(_fake_verl_microbatch())
+    out = engine.forward_backward([m1, m2], loss_fn=[c1, c2])  # list of microbatches + per-mb closures
+    assert torch.isfinite(out.loss)
+    assert "pg_loss" in out.metrics
+    assert len(out.logprobs) == 4  # 2 datums x 2 microbatches, concatenated in order
+    # grads accumulated across both microbatches before any optimizer step
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
