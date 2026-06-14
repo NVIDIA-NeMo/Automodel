@@ -23,6 +23,9 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
+from nemo_automodel.components.speculative.eagle.backend import Eagle3TargetBackend
+
 
 def _shift_left_with_zero(tensor: torch.Tensor) -> torch.Tensor:
     """Shift a batched sequence tensor left and zero-fill the tail.
@@ -38,22 +41,93 @@ def _shift_left_with_zero(tensor: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class Eagle3TargetBatch:
-    """Target-model outputs needed by the draft trainer."""
+    """Target-model supervision for one draft-training batch.
+
+    Carries exactly one supervision encoding (validated in ``__post_init__``),
+    both consumed directly by ``Eagle3TrainerModule.forward``:
+
+    - ``logits`` -- the target's full-vocab logits; the draft-vocab projection
+      happens trainer-side. Used by the co-located backend, where the tensor
+      never leaves the GPU.
+    - ``target_probs`` + ``position_mask`` -- the already-projected draft-vocab
+      distribution, so a backend that computes it itself (e.g. a remote server)
+      only transfers draft-vocab-sized tensors.
+    """
 
     aux_hidden_states: torch.Tensor
-    logits: torch.Tensor
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     loss_mask: torch.Tensor
+    logits: torch.Tensor | None = None
+    target_probs: torch.Tensor | None = None
+    position_mask: torch.Tensor | None = None
+    # Packing metadata (None unless packing is enabled), unshifted slot frame:
+    # per-document position_ids / seq_lens (block-causal mask) and doc_remaining
+    # (gates cross-document TTT supervision).
+    position_ids: torch.Tensor | None = None
+    seq_lens: torch.Tensor | None = None
+    doc_remaining: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        has_logits = self.logits is not None
+        has_precomputed = self.target_probs is not None and self.position_mask is not None
+        if has_logits == has_precomputed:
+            raise ValueError(
+                "Eagle3TargetBatch requires exactly one supervision source: either "
+                "`logits` (full-vocab, projected trainer-side) or both `target_probs` "
+                "and `position_mask` (precomputed over the draft vocab)."
+            )
+
+    def to_trainer_inputs(self) -> dict[str, torch.Tensor]:
+        """Return kwargs for ``Eagle3TrainerModule.forward``, dispatching on
+        whichever supervision encoding this batch carries."""
+        inputs = {
+            "input_ids": self.input_ids,
+            "attention_mask": self.attention_mask,
+            "loss_mask": self.loss_mask,
+            "aux_hidden_states": self.aux_hidden_states,
+        }
+        if self.logits is not None:
+            inputs["target_logits"] = self.logits
+        else:
+            inputs["target_probs"] = self.target_probs
+            inputs["position_mask"] = self.position_mask
+        if self.seq_lens is not None:
+            inputs["position_ids"] = self.position_ids
+            inputs["seq_lens"] = self.seq_lens
+            inputs["doc_remaining"] = self.doc_remaining
+        return inputs
 
 
-class HFEagle3TargetModel:
-    """Thin wrapper that captures three auxiliary hidden states from a causal LM."""
+class HFEagle3TargetModel(Eagle3TargetBackend):
+    """Co-located backend that captures three auxiliary hidden states from a causal LM."""
 
-    def __init__(self, model: nn.Module, aux_layer_ids: Sequence[int] | None = None):
+    def __init__(self, model: nn.Module, aux_layer_ids: Sequence[int] | None = None, cp_mesh=None):
         self.model = model.eval()
         candidate_ids = list(aux_layer_ids) if aux_layer_ids is not None else self._default_aux_layer_ids()
         self.aux_layer_ids = self._validate_aux_layer_ids(candidate_ids)
+        # Context parallelism shards the (frozen) target forward along the sequence
+        # dim; generate_batch gathers the aux/logits back to the full sequence so
+        # the draft stays CP-unaware. cp_mesh is the "cp" device submesh (or None).
+        self.cp_mesh = cp_mesh
+        self._cp_size = cp_mesh.size() if cp_mesh is not None else 1
+        if self._cp_size > 1:
+            from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+
+            attach_context_parallel_hooks(self.model)
+            n_self_attn = sum(1 for name, _ in self.model.named_modules() if name.endswith("self_attn"))
+            if n_self_attn == 0:
+                raise ValueError(
+                    "Context parallelism requires the target's attention modules to be named "
+                    "'*self_attn' (so the causal mask is fixed under sequence sharding), but none "
+                    "were found on the target model."
+                )
+
+    def _check_captured(self, captured: dict[int, torch.Tensor]) -> None:
+        if len(captured) != len(self.aux_layer_ids):
+            raise RuntimeError(
+                f"Expected {len(self.aux_layer_ids)} captured aux layers but got {len(captured)}: {sorted(captured)}"
+            )
 
     def _default_aux_layer_ids(self) -> list[int]:
         # EAGLE-3 default 3-layer recipe (low / mid / high).
@@ -132,8 +206,17 @@ class HFEagle3TargetModel:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> Eagle3TargetBatch:
-        """Run the target model and capture aux hidden states plus logits."""
+        """Run the target model and capture aux hidden states plus logits.
+
+        With ``seq_lens`` (packing), the target runs with a ``[B, 1, T, T]``
+        block-causal mask and per-document ``position_ids`` so its outputs respect
+        document boundaries; the packing metadata is forwarded unshifted to the
+        trainer. ``seq_lens=None`` keeps the original 2D-mask path.
+        """
         layers = self._get_transformer_layers()
         captured: dict[int, torch.Tensor] = {}
         handles = []
@@ -158,25 +241,93 @@ class HFEagle3TargetModel:
             name: False for name in ("output_hidden_states", "output_attentions", "use_cache") if name in forward_params
         }
 
+        # Packing isolates documents per attention backend; the mask strategy
+        # differs because FlashAttention has no 4D-mask code path:
+        #   * SDPA / eager consume the [B, 1, T, T] block-causal additive mask.
+        #   * FlashAttention infers per-document cu_seqlens from the reset points
+        #     in a per-document ``position_ids`` and is passed ``attention_mask=None``.
+        #     Feeding FA the 4D additive mask instead drives its unpad gather out
+        #     of bounds: the mask flattens to B*T*T entries and the gather indexes
+        #     a B*T-row tensor with them. transformers only packs from position_ids
+        #     at batch size 1 (see ``_is_packed_sequence``).
+        target_attention_mask = attention_mask
+        if seq_lens is not None:
+            if position_ids is None or "position_ids" not in forward_params:
+                raise ValueError(
+                    "EAGLE-3 sequence packing requires per-document position_ids, but none were "
+                    "provided or the target model's forward does not accept a `position_ids` argument."
+                )
+            extra_kwargs["position_ids"] = position_ids
+            attn_impl = getattr(self.model.config, "_attn_implementation", None) or ""
+            if "flash" in attn_impl:
+                if input_ids.shape[0] != 1:
+                    raise ValueError(
+                        "EAGLE-3 sequence packing with a FlashAttention target only supports "
+                        f"micro_batch_size=1 (got {input_ids.shape[0]}). FlashAttention infers "
+                        "document boundaries from per-document position_ids, which transformers "
+                        "packs only at batch size 1. Set micro_batch_size=1 or load the target "
+                        "with attn_implementation='sdpa'."
+                    )
+                # attention_mask=None + per-document position_ids -> FA varlen packing.
+                target_attention_mask = None
+            else:
+                param_dtype = next(self.model.parameters()).dtype
+                target_attention_mask = build_block_causal_additive_mask(
+                    seq_lens,
+                    seq_length=input_ids.shape[1],
+                    dtype=param_dtype,
+                    device=input_ids.device,
+                )
+
         try:
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                **extra_kwargs,
-            )
+            if self._cp_size > 1:
+                # Context parallelism: shard the sequence, run the target as ring
+                # attention, then gather aux/logits back to the full sequence.
+                # Packing (which needs the 4D block-causal mask) is gated off
+                # upstream, so attention_mask is None and the self_attn hooks force
+                # is_causal.
+                from nemo_automodel.components.distributed.cp_utils import gather_cp_seq, make_target_cp_ctx
+
+                if "position_ids" not in forward_params:
+                    raise ValueError(
+                        "Context parallelism requires the target model's forward to accept `position_ids`."
+                    )
+                cp_ctx, cp_input_ids, cp_position_ids, orig_len = make_target_cp_ctx(
+                    self.cp_mesh, input_ids, position_ids
+                )
+                cp_extra = {k: v for k, v in extra_kwargs.items() if k != "position_ids"}
+                with cp_ctx:
+                    outputs = self.model(
+                        input_ids=cp_input_ids,
+                        attention_mask=None,
+                        position_ids=cp_position_ids,
+                        **cp_extra,
+                    )
+                    raw_logits = outputs.logits if hasattr(outputs, "logits") else outputs
+                    self._check_captured(captured)
+                    # Gather inside the CP context, before the hooks are removed.
+                    gathered = gather_cp_seq(
+                        self.cp_mesh,
+                        [captured[layer_id] for layer_id in self.aux_layer_ids] + [raw_logits],
+                        seq_dim=1,
+                        orig_len=orig_len,
+                    )
+                aux_hidden_states = torch.cat(gathered[:-1], dim=-1)
+                target_logits = gathered[-1]
+            else:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=target_attention_mask,
+                    **extra_kwargs,
+                )
+                self._check_captured(captured)
+                aux_hidden_states = torch.cat([captured[layer_id] for layer_id in self.aux_layer_ids], dim=-1)
+                # HF causal LM outputs wrap logits in a dataclass; AutoModel's
+                # custom causal LM returns the logits tensor directly.
+                target_logits = outputs.logits if hasattr(outputs, "logits") else outputs
         finally:
             for handle in handles:
                 handle.remove()
-
-        if len(captured) != len(self.aux_layer_ids):
-            raise RuntimeError(
-                f"Expected {len(self.aux_layer_ids)} captured aux layers but got {len(captured)}: {sorted(captured)}"
-            )
-
-        aux_hidden_states = torch.cat([captured[layer_id] for layer_id in self.aux_layer_ids], dim=-1)
-        # HF causal LM outputs wrap logits in a dataclass; AutoModel's
-        # custom causal LM returns the logits tensor directly.
-        target_logits = outputs.logits if hasattr(outputs, "logits") else outputs
         shifted_logits = _shift_left_with_zero(target_logits)
         shifted_input_ids = _shift_left_with_zero(input_ids)
         shifted_loss_mask = _shift_left_with_zero(loss_mask)
@@ -186,4 +337,7 @@ class HFEagle3TargetModel:
             input_ids=shifted_input_ids,
             attention_mask=attention_mask,
             loss_mask=shifted_loss_mask,
+            position_ids=position_ids,
+            seq_lens=seq_lens,
+            doc_remaining=doc_remaining,
         )

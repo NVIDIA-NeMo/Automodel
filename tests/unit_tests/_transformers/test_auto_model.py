@@ -30,6 +30,7 @@ from nemo_automodel._transformers.auto_model import (
     _init_model,
     _patch_attention,
     _patch_remote_code_compat,
+    _resolve_distributed_setup,
 )
 from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 from nemo_automodel._transformers.model_init import (
@@ -41,7 +42,168 @@ from nemo_automodel._transformers.model_init import (
     no_hf_meta_device,
 )
 from nemo_automodel.components.checkpoint.utils import _get_checkpoint_tensor_dtypes
+from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MoEParallelizerConfig
+from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+
+
+class _FakeMesh:
+    def __init__(self, sizes):
+        self._sizes = sizes
+        self.mesh_dim_names = tuple(sizes)
+
+    def __getitem__(self, axis):
+        return types.SimpleNamespace(size=lambda: self._sizes[axis])
+
+
+class TestResolveMeshContext:
+    def test_device_mesh_input_builds_topology_only_setup(self):
+        device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
+
+        setup = _resolve_distributed_setup(
+            distributed_setup=None,
+            device_mesh=device_mesh,
+        )
+
+        assert setup.mesh_context.device_mesh is device_mesh
+        assert setup.mesh_context.moe_mesh is None
+        assert setup.strategy_config is None
+        assert setup.pipeline_config is None
+        assert setup.moe_parallel_config is None
+        assert setup.activation_checkpointing is False
+
+    def test_device_mesh_rejects_mesh_context(self):
+        mesh_context = MeshContext()
+
+        with pytest.raises(TypeError, match="DeviceMesh"):
+            _resolve_distributed_setup(
+                distributed_setup=None,
+                device_mesh=mesh_context,
+            )
+
+    def test_distributed_setup_and_device_mesh_are_mutually_exclusive(self):
+        device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
+        distributed_setup = DistributedSetup(mesh_context=MeshContext())
+
+        with pytest.raises(ValueError, match="either distributed_setup or device_mesh"):
+            _resolve_distributed_setup(
+                distributed_setup=distributed_setup,
+                device_mesh=device_mesh,
+            )
+
+    def test_distributed_setup_input_supplies_configs(self):
+        device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
+        moe_mesh = _FakeMesh({MeshAxisName.EP_SHARD: 1, MeshAxisName.EP: 8})
+        distributed_config = FSDP2Config(activation_checkpointing=True)
+        moe_config = MoEParallelizerConfig()
+        source_setup = DistributedSetup(
+            mesh_context=MeshContext.from_meshes(device_mesh, moe_mesh),
+            strategy_config=distributed_config,
+            moe_parallel_config=moe_config,
+            activation_checkpointing=True,
+        )
+
+        setup = _resolve_distributed_setup(
+            distributed_setup=source_setup,
+        )
+
+        assert setup.mesh_context.device_mesh is device_mesh
+        assert setup.mesh_context.moe_mesh is moe_mesh
+        assert setup.strategy_config is distributed_config
+        assert setup.moe_parallel_config is moe_config
+        assert setup.activation_checkpointing is True
+
+    def test_missing_distributed_setup_returns_empty_setup(self):
+        setup = _resolve_distributed_setup(distributed_setup=None)
+
+        assert isinstance(setup.mesh_context, MeshContext)
+        assert setup.strategy_config is None
+        assert setup.activation_checkpointing is False
+
+
+class TestFromPretrainedDeviceMesh:
+    def test_from_pretrained_accepts_device_mesh_as_topology_shortcut(self):
+        device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
+        sentinel_model = object()
+
+        with (
+            patch("torch.cuda.current_device", return_value=0),
+            patch("nemo_automodel._transformers.auto_model.instantiate_infrastructure") as mock_infra,
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=MagicMock()),
+            patch("nemo_automodel._transformers.auto_model.get_is_hf_model", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.resolve_sdpa_method", return_value=None) as mock_sdpa,
+            patch.object(NeMoAutoModelForCausalLM, "_build_model", return_value=sentinel_model) as mock_build,
+        ):
+            mock_infra.return_value = (None, None, None, None)
+
+            result = NeMoAutoModelForCausalLM.from_pretrained("test-model", device_mesh=device_mesh)
+
+        assert result is sentinel_model
+        assert mock_infra.call_args.kwargs["distributed_config"] is None
+        assert mock_infra.call_args.kwargs["moe_parallel_config"] is None
+        assert mock_infra.call_args.kwargs["activation_checkpointing"] is False
+        assert mock_infra.call_args.kwargs["mesh"].device_mesh is device_mesh
+        assert mock_infra.call_args.kwargs["mesh"].moe_mesh is None
+        mock_sdpa.assert_called_once_with(None, device_mesh, False)
+        assert mock_build.call_args.kwargs["mesh"].device_mesh is device_mesh
+
+    def test_from_pretrained_accepts_distributed_setup(self):
+        device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
+        moe_mesh = _FakeMesh({MeshAxisName.EP_SHARD: 1, MeshAxisName.EP: 8})
+        distributed_config = FSDP2Config(activation_checkpointing=True)
+        moe_config = MoEParallelizerConfig()
+        distributed_setup = DistributedSetup(
+            mesh_context=MeshContext.from_meshes(device_mesh, moe_mesh),
+            strategy_config=distributed_config,
+            moe_parallel_config=moe_config,
+            activation_checkpointing=True,
+        )
+        sentinel_model = object()
+
+        with (
+            patch("torch.cuda.current_device", return_value=0),
+            patch("nemo_automodel._transformers.auto_model.instantiate_infrastructure") as mock_infra,
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=MagicMock()),
+            patch("nemo_automodel._transformers.auto_model.get_is_hf_model", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.resolve_sdpa_method", return_value=None) as mock_sdpa,
+            patch.object(NeMoAutoModelForCausalLM, "_build_model", return_value=sentinel_model) as mock_build,
+        ):
+            mock_infra.return_value = (None, None, None, None)
+
+            result = NeMoAutoModelForCausalLM.from_pretrained("test-model", distributed_setup=distributed_setup)
+
+        assert result is sentinel_model
+        assert mock_infra.call_args.kwargs["distributed_config"] is distributed_config
+        assert mock_infra.call_args.kwargs["moe_parallel_config"] is moe_config
+        assert mock_infra.call_args.kwargs["activation_checkpointing"] is True
+        assert mock_infra.call_args.kwargs["mesh"].device_mesh is device_mesh
+        mock_sdpa.assert_called_once_with(None, device_mesh, True)
+        assert mock_build.call_args.kwargs["mesh"].moe_mesh is moe_mesh
+
+    def test_from_pretrained_rejects_distributed_setup_with_device_mesh(self):
+        device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
+        distributed_setup = DistributedSetup(mesh_context=MeshContext())
+
+        with pytest.raises(ValueError, match="either distributed_setup or device_mesh"):
+            NeMoAutoModelForCausalLM.from_pretrained(
+                "test-model",
+                distributed_setup=distributed_setup,
+                device_mesh=device_mesh,
+            )
+
+    def test_from_pretrained_rejects_separate_distributed_kwargs(self):
+        with pytest.raises(TypeError, match="distributed_setup"):
+            NeMoAutoModelForCausalLM.from_pretrained(
+                "test-model",
+                distributed_config=FSDP2Config(),
+            )
+
+    def test_from_pretrained_rejects_moe_mesh_kwarg(self):
+        with pytest.raises(TypeError, match="distributed_setup"):
+            NeMoAutoModelForCausalLM.from_pretrained(
+                "test-model",
+                moe_mesh=object(),
+            )
 
 
 class TestPatchAttention:
@@ -926,6 +1088,100 @@ class TestModelMappingKeyErrorFallback:
         assert fake_model.linear.weight.dtype == torch.bfloat16
         assert fake_model.norm.weight.dtype == torch.float32
         mock_wrap.assert_called_once_with(FakeModel)
+
+    def test_force_hf_pretrained_explicit_fp32_promotes_all_to_fp32(self):
+        """Explicit fp32 request unifies every floating tensor to fp32 (master weights)."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 2, bias=False)
+                self.norm = torch.nn.LayerNorm(2)
+
+        fake_config = FakeConfig()
+        # Simulate HF's mixed-dtype load: most params bf16, a stray param fp32.
+        fake_model = FakeModel()
+        fake_model.linear.to(torch.bfloat16)
+        fake_model.norm.to(torch.float32)
+
+        cls = self._make_cls({})
+        cls._from_pretrained_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch(
+                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                return_value={
+                    "linear.weight": torch.bfloat16,
+                    "norm.weight": torch.float32,
+                },
+            ),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            _init_model(
+                cls,
+                "test-model",
+                attn_implementation="eager",
+                torch_dtype=torch.float32,
+                quantization_config=None,
+                force_hf=True,
+            )
+
+        assert fake_model.linear.weight.dtype == torch.float32
+        assert fake_model.norm.weight.dtype == torch.float32
+        # Storage was upcast to fp32, but the checkpoint's original (compute) dtype is
+        # recorded so downstream sharding can keep the bulk in bf16 compute.
+        assert fake_model.linear.weight._hf_compute_dtype == torch.bfloat16
+        assert fake_model.norm.weight._hf_compute_dtype == torch.float32
+
+    def test_force_hf_pretrained_explicit_bf16_preserves_intrinsic_fp32(self):
+        """Explicit bf16 request keeps bf16 params bf16 but preserves intrinsically-fp32 params."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 2, bias=False)
+                self.norm = torch.nn.LayerNorm(2)
+
+        fake_config = FakeConfig()
+        fake_model = FakeModel()
+        fake_model.linear.to(torch.bfloat16)
+        fake_model.norm.to(torch.float32)
+
+        cls = self._make_cls({})
+        cls._from_pretrained_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch(
+                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                return_value={
+                    "linear.weight": torch.bfloat16,
+                    "norm.weight": torch.float32,
+                },
+            ),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            _init_model(
+                cls,
+                "test-model",
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16,
+                quantization_config=None,
+                force_hf=True,
+            )
+
+        assert fake_model.linear.weight.dtype == torch.bfloat16
+        # promote(fp32, bf16) == fp32 -> intrinsically-fp32 checkpoint param survives.
+        assert fake_model.norm.weight.dtype == torch.float32
 
     def test_fallback_path_known_config_type(self):
         """Fallback (non-force_hf, no custom model) path: _model_mapping succeeds."""

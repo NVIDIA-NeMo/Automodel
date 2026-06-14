@@ -171,9 +171,7 @@ def test_make_cp_batch_and_ctx_includes_padding_mask(monkeypatch):
     _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=None)
 
     # padding_mask should be in cp_buffers
-    assert any(
-        t is padding_mask for t in captured_kwargs["cp_buffers"]
-    ), "padding_mask must be included in cp_buffers"
+    assert any(t is padding_mask for t in captured_kwargs["cp_buffers"]), "padding_mask must be included in cp_buffers"
     assert padding_mask in captured_kwargs["cp_no_restore_buffers"]
 
 
@@ -454,7 +452,8 @@ def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
             return torch.arange(total_tokens)
 
     import sys
-    sys.modules['transformer_engine_torch'] = MockTex
+
+    sys.modules["transformer_engine_torch"] = MockTex
 
     monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
 

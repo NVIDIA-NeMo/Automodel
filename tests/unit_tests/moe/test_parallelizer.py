@@ -462,6 +462,30 @@ def test_apply_ep_parallelizes_moe_experts(monkeypatch):
     assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
 
 
+def test_apply_ep_parallelizes_diffusion_style_block_moe(monkeypatch):
+    """Diffusion Gemma exposes the MoE branch as block.moe, not block.mlp."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    parallelize_module_mock = MagicMock()
+    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+
+    class DiffusionBlock:
+        def __init__(self):
+            self.moe = DummyMoE()
+
+    block = DiffusionBlock()
+    model = type("Outer", (), {"model": DummyModel([block])})()
+    ep_mesh = type("Mesh", (), {"size": lambda self: 2})()
+
+    P.apply_ep(model, ep_mesh)
+
+    assert parallelize_module_mock.call_count == 1
+    _, kwargs = parallelize_module_mock.call_args
+    assert kwargs["module"] is block.moe.experts
+    assert kwargs["device_mesh"] is ep_mesh
+    assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
+
+
 def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     wrapper_returns = [object(), object()]
@@ -631,6 +655,39 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     assert model_call is not None and model_call[1]["mesh"] is fsdp_mesh
 
 
+def test_apply_fsdp_skips_separate_wrapping_for_tied_embeddings(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    block = DummyBlock(mlp=DummyMoE())
+    shared_weight = object()
+    embed = types.SimpleNamespace(weight=shared_weight)
+    lm_head = types.SimpleNamespace(weight=shared_weight)
+    inner_model = DummyModel([block], embed_tokens=embed)
+    outer_model = types.SimpleNamespace(model=inner_model, lm_head=lm_head)
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=outer_model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=True,
+        ep_shard_enabled=False,
+        ep_shard_mesh=None,
+        wrap_outer_model=True,
+    )
+
+    assert _find_call_by_first_arg(fully_shard_mock, embed) is None
+    assert _find_call_by_first_arg(fully_shard_mock, lm_head) is None
+    assert _find_call_by_first_arg(fully_shard_mock, inner_model) is None
+
+    outer_call = _find_call_by_first_arg(fully_shard_mock, outer_model)
+    assert outer_call is not None and outer_call[1]["mesh"] is fsdp_mesh
+
+
 def test_apply_fsdp_without_ep_enabled_has_no_ignored_params(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
@@ -775,7 +832,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     )
     apply_ep_mock.assert_called_once()
     # AC enabled
-    apply_ac_mock.assert_called_once_with(model, ignore_router=False)
+    apply_ac_mock.assert_called_once_with(model, ignore_router=False, selective=False)
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args
     # handle positional or keyword invocations
@@ -790,6 +847,35 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     assert ep_enabled is True
     assert ep_shard_enabled is True
     assert ep_shard_mesh_arg.size() == 2
+
+
+def test_parallelize_model_accepts_top_level_moe_config(monkeypatch):
+    """Custom MoE models may expose moe_config on the outer model itself."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_ep_mock = MagicMock()
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_ep", apply_ep_mock)
+    monkeypatch.setattr(P, "apply_ac", MagicMock())
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+
+    world_mesh = FakeWorldMesh({"dp": 1, ("dp",): 1}, mesh_dim_names=["dp"])
+    moe_mesh = FakeMoeMesh({"ep": 2})
+    model = type("Outer", (), {"moe_config": type("MC", (), {"n_routed_experts": 4})()})()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=moe_mesh,
+        dp_axis_names=("dp",),
+        cp_axis_name=None,
+        tp_axis_name=None,
+        ep_axis_name="ep",
+        ep_shard_axis_names=None,
+        activation_checkpointing=False,
+    )
+
+    apply_ep_mock.assert_called_once()
+    apply_fsdp_mock.assert_not_called()
 
 
 def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypatch):
@@ -1656,6 +1742,85 @@ def test_parallelize_model_ignore_router_for_ac_defaults_to_false(monkeypatch):
     apply_ac_mock.assert_called_once()
     args, kwargs = apply_ac_mock.call_args
     assert kwargs.get("ignore_router") is False
+    # Full (True) AC is not selective.
+    assert kwargs.get("selective") is False
+
+
+def test_parallelize_model_passes_selective_to_apply_ac(monkeypatch):
+    """parallelize_model translates activation_checkpointing='selective' into selective=True."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_ac_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_ac", apply_ac_mock)
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_fsdp", MagicMock())
+
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+
+    model = Outer()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=None,
+        dp_axis_names=("dp",),
+        activation_checkpointing="selective",
+    )
+
+    apply_ac_mock.assert_called_once()
+    _, kwargs = apply_ac_mock.call_args
+    assert kwargs.get("selective") is True
+    assert kwargs.get("ignore_router") is False
+
+
+def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
+    """selective=True wraps every block with the shared dense selective policy and
+    does not require hidden_size/num_experts (router dims are only needed for the
+    router-save policy)."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    sentinel_ctx = object()
+    sentinel_flag = "_nemo_selective_ac"
+    dense_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+    dense_stub.make_selective_checkpoint_context_fn = MagicMock(return_value=sentinel_ctx)
+    dense_stub.SELECTIVE_AC_WRAPPER_FLAG = sentinel_flag
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.activation_checkpointing", dense_stub)
+
+    wrapped = []
+
+    class _Wrapper:
+        def __init__(self, block):
+            self.block = block
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        assert preserve_rng_state is True
+        assert context_fn is sentinel_ctx
+        w = _Wrapper(block)
+        wrapped.append(w)
+        return w
+
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    blocks = [DummyBlock(), DummyBlock(), DummyBlock()]
+    model = DummyModel(blocks)
+
+    # No hidden_size/num_experts provided — selective path must not need them.
+    P.apply_ac(model, selective=True)
+
+    assert len(wrapped) == 3
+    assert len(model.layers.registered) == 3
+    dense_stub.make_selective_checkpoint_context_fn.assert_called_once()
+    # Each wrapper is tagged so _apply_per_layer_compile compiles it OUTER
+    # (preserving the selective policy) rather than collapsing to inner compile.
+    for w in wrapped:
+        assert getattr(w, sentinel_flag, False) is True
 
 
 # ============================================================================

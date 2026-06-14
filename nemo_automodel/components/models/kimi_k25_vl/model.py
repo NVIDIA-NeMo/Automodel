@@ -23,6 +23,7 @@ This is a self-contained implementation that includes all necessary components:
 
 import logging
 import math
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -143,7 +144,7 @@ class KimiK25VLConfig(PretrainedConfig):
         return output
 
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
 from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids
 from nemo_automodel.components.models.kimi_k25_vl.state_dict_adapter import KimiK25VLStateDictAdapter
@@ -890,6 +891,15 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = True
+
     @classmethod
     def from_config(cls, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):
         return cls(config, moe_config=moe_config, backend=backend, **kwargs)
@@ -986,14 +996,22 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         labels=None,
         use_cache=None,
         output_attentions=None,
-        output_hidden_states=None,
+        output_hidden_states: Optional[bool] = None,
         return_dict=None,
         pixel_values=None,
         grid_thws=None,
         padding_mask=None,
         target_seq_length=None,  # For PP: fixed output length after image expansion
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ):
+        # Resolve from the text/decoder sub-config (the language model produces text logits).
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config.text_config, "output_hidden_states", False)
+        )
+
         # Retrieve pre-chunked VLM inputs from model attributes (set by finetune.py for PP)
         if (
             pixel_values is None
@@ -1034,7 +1052,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
             **kwargs,
         )
 
-        logits = self.lm_head(hidden_states) if self.lm_head is not None else hidden_states
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None and self.lm_head is not None:
@@ -1052,7 +1070,10 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
 
         if return_dict is None:
             return_dict = False
-        if not return_dict:
+        # Return a bare tensor only in the legacy default path. When hidden states are
+        # requested we must return a ModelOutput so the final hidden states travel with
+        # the output (callers read getattr(out, "logits", out), so this stays compatible).
+        if not return_dict and not output_hidden_states:
             return logits
 
         return LlavaCausalLMOutputWithPast(

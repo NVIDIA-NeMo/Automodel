@@ -19,6 +19,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+try:
+    from nemo_automodel.components.loss.triton.soft_cross_entropy import HAVE_TRITON, fused_soft_cross_entropy
+except ImportError:
+    HAVE_TRITON = False
+
 
 def masked_soft_cross_entropy(
     logits: torch.Tensor,
@@ -48,6 +53,9 @@ def masked_soft_cross_entropy(
     Returns:
         Scalar loss normalized by the number of valid positions.
     """
+    if HAVE_TRITON and logits.is_cuda:
+        return fused_soft_cross_entropy(logits, target_probs, position_mask)
+
     log_probs = F.log_softmax(logits.float(), dim=-1)
     per_token_loss = -(target_probs * log_probs).sum(dim=-1)
     valid_mask = position_mask.squeeze(-1).to(per_token_loss.dtype)

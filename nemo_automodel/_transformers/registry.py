@@ -32,6 +32,20 @@ logger = logging.getLogger(__name__)
 MODEL_ARCH_MAPPING = OrderedDict(
     [
         (
+            "BagelForUnifiedMultimodal",
+            (
+                "nemo_automodel.components.models.bagel.model",
+                "BagelForUnifiedMultimodal",
+            ),
+        ),
+        (
+            "BagelForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.bagel.model",
+                "BagelForUnifiedMultimodal",
+            ),
+        ),
+        (
             "BaichuanForCausalLM",
             ("nemo_automodel.components.models.baichuan.model", "BaichuanForCausalLM"),
         ),
@@ -50,6 +64,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "DeepseekV4ForCausalLM",
             ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
+        ),
+        (
+            "DiffusionGemmaForBlockDiffusion",
+            ("nemo_automodel.components.models.diffusion_gemma.model", "DiffusionGemmaForBlockDiffusion"),
         ),
         (
             "Ernie4_5_MoeForCausalLM",
@@ -110,6 +128,13 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "MiniMaxM2ForCausalLM",
             ("nemo_automodel.components.models.minimax_m2.model", "MiniMaxM2ForCausalLM"),
+        ),
+        (
+            "MiniMaxM3SparseForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.minimax_m3_vl.model",
+                "MiniMaxM3SparseForConditionalGeneration",
+            ),
         ),
         (
             "MiMoV2FlashForCausalLM",
@@ -206,6 +231,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen3_next.model", "Qwen3NextForCausalLM"),
         ),
         (
+            "Qwen3_5ForCausalLM",
+            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForCausalLM"),
+        ),
+        (
+            "Qwen3_5ForConditionalGeneration",
+            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForConditionalGeneration"),
+        ),
+        (
             "Qwen3OmniMoeForConditionalGeneration",
             (
                 "nemo_automodel.components.models.qwen3_omni_moe.model",
@@ -240,6 +273,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # checkpoint config.json.  Registered eagerly with AutoConfig so that
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
+    "bagel": ("nemo_automodel.components.models.bagel.configuration", "BagelConfig"),
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
     "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
@@ -248,6 +282,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
+    "minimax_m3_vl": ("nemo_automodel.components.models.minimax_m3_vl.config", "MiniMaxM3VLConfig"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
     "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
