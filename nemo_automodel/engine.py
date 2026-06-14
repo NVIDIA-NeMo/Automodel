@@ -92,16 +92,14 @@ class Engine:
         peft: Any = None  # already-instantiated PEFT config
         seed: int = 42
 
-        # ── RL role semantics ────────────────────────────────────────
-        # trainable=False -> no optimizer, params frozen, eval() by default
-        # (reference / reward models). output_head selects what forward emits:
-        # "lm" -> logprobs/entropy from logits; "value" -> per-token values from
-        # a value head (critic). hooks are applied to each model part after
-        # construction (model -> model | None); installing a value head or
-        # freezing modules goes here. NOTE: these run POST-construction; true
+        # Generic model-surgery hooks applied to each model part after
+        # construction (model -> model | None; None = in-place): freeze modules,
+        # install a value head, patch layers. The Engine holds NO role policy —
+        # "roles" (actor / critic / reference) are assembled by the caller via
+        # these hooks + whether an optimizer is provided; the Engine just runs
+        # whatever model it is given (like Megatron-core, which has no
+        # actor/critic/value-head concept). NOTE: post-construction; true
         # pre-DDP/FSDP-wrap hooks need a build_model extension (follow-up).
-        trainable: bool = True
-        output_head: str = "lm"  # "lm" | "value"
         hooks: list[Callable[[nn.Module], "nn.Module | None"]] | None = None
 
         max_grad_norm: float = 1.0
@@ -150,33 +148,28 @@ class Engine:
 
         if self.config.model is not None:
             self._construct()
-        self._apply_roles()
+        self._apply_hooks()
 
-    def _apply_roles(self) -> None:
-        """Apply RL role semantics: pre-wrap hooks (post-construction) + trainable.
+    def _apply_hooks(self) -> None:
+        """Apply generic post-construction model-surgery hooks to each part.
 
-        Runs for both construction paths. Hooks transform each model part
-        (``model -> model | None``; ``None`` means in-place). ``trainable=False``
-        drops the optimizer/scheduler, freezes params, and sets eval — the
-        reference / reward / frozen-critic case.
+        ``model -> model | None`` transforms (``None`` = in-place): freeze
+        modules, install a value head, patch layers. The Engine holds no role
+        policy — a critic is just a model that emits ``values``; a reference is
+        an Engine with no optimizer (and a caller-frozen model). NOTE: runs
+        post-construction; true pre-DDP/FSDP-wrap hooks need a build_model
+        extension (follow-up).
         """
-        if self.config.hooks:
-            transformed = []
-            for part in self.model_parts:
-                for hook in self.config.hooks:
-                    result = hook(part)
-                    if result is not None:
-                        part = result
-                transformed.append(part)
-            self.model_parts = transformed
-
-        if not self.config.trainable:
-            self.optimizers = []
-            self.lr_schedulers = []
-            for part in self.model_parts:
-                part.eval()
-                for p in part.parameters():
-                    p.requires_grad_(False)
+        if not self.config.hooks:
+            return
+        transformed = []
+        for part in self.model_parts:
+            for hook in self.config.hooks:
+                result = hook(part)
+                if result is not None:
+                    part = result
+            transformed.append(part)
+        self.model_parts = transformed
 
     def _construct(self) -> None:
         """Build distributed setup + model + optimizer from ``self.config``.
@@ -227,8 +220,9 @@ class Engine:
             self.pp = None
 
         # 3. Optimizer (a list — one per part — possibly megatron-fsdp sharded).
-        #    Skipped for non-trainable roles (ref / reward); _apply_roles freezes.
-        if self.config.optimizer is not None and self.config.trainable:
+        #    Omit config.optimizer (or inject optimizers=[]) for a frozen /
+        #    forward-only model (reference / reward).
+        if self.config.optimizer is not None:
             optimizer = self.config.optimizer.build(
                 model, device_mesh=self.device_mesh, is_peft=self.config.peft is not None
             )
@@ -444,9 +438,9 @@ class Engine:
         """Forward-only pass returning per-datum logprobs and entropy (or values).
 
         Reference-policy / critic evaluation. Runs the model over the collated
-        ``datums``, then slices outputs back to per-datum tensors —
-        ``logprobs``/``entropy`` for ``output_head="lm"`` or ``values`` for
-        ``output_head="value"``.
+        ``datums``, then slices outputs back to per-datum tensors. The fields
+        populated are duck-typed on what the model emits: ``logprobs``/``entropy``
+        from a ``.logits`` output, ``values`` from a ``.values`` output.
 
         ``disable_adapters=True`` runs the base model with LoRA adapters off —
         the doc's "reference logprobs without a second engine" trick. Currently
@@ -503,34 +497,38 @@ class Engine:
     ) -> ModelOutput:
         """Slice padded ``[B, T, ...]`` model output into per-datum fields.
 
-        With ``output_head == "value"`` the model is expected to emit ``.values``
-        (``[B, T]`` or ``[B, T, 1]``); ``ModelOutput.values[i]`` is datum ``i``'s
-        per-token value. Otherwise ``logits`` are turned into per-datum
-        ``logprobs`` (of each datum's ``target_tokens``) and ``entropy``. With
-        ``detach`` the graph is dropped (forward-only).
+        Duck-typed on what the model *emits*, not on any role config — the
+        Engine surfaces what is there, it does not know "actor"/"critic": a
+        ``.values`` output yields per-token ``values`` (a critic); a ``.logits``
+        output (or a raw logits tensor) yields per-token ``logprobs`` (of each
+        datum's ``target_tokens``) and ``entropy``. A model emitting both yields
+        both. For custom extraction, subclass this method (cf. verl's
+        per-head engine subclasses). With ``detach`` the graph is dropped.
         """
-        if self.config.output_head == "value":
-            values = getattr(out, "values", None)
-            if values is None:
-                raise ValueError("output_head='value' but the model output has no `.values`.")
+        per_values = None
+        values = getattr(out, "values", None)
+        if values is not None:
             if values.dim() == 3 and values.shape[-1] == 1:
                 values = values.squeeze(-1)  # [B, T, 1] -> [B, T]
             per_values = [values[i, : d.seq_len] for i, d in enumerate(datums)]
-            if detach:
-                per_values = [t.detach() for t in per_values]
-            return ModelOutput(values=per_values, metrics={})
 
-        logits = getattr(out, "logits", out)
         per_logprobs: list[torch.Tensor] | None = None
-        if labels is not None:
-            token_lp = selected_token_logprobs(logits, labels.clamp_min(0))  # [B, T]
-            per_logprobs = [token_lp[i, : d.seq_len] for i, d in enumerate(datums)]
-        token_ent = compute_entropy(logits)  # [B, T]
-        per_entropy = [token_ent[i, : d.seq_len] for i, d in enumerate(datums)]
+        per_entropy: list[torch.Tensor] | None = None
+        logits = getattr(out, "logits", None)
+        if logits is None and values is None:
+            logits = out  # raw logits tensor
+        if logits is not None:
+            if labels is not None:
+                token_lp = selected_token_logprobs(logits, labels.clamp_min(0))  # [B, T]
+                per_logprobs = [token_lp[i, : d.seq_len] for i, d in enumerate(datums)]
+            token_ent = compute_entropy(logits)  # [B, T]
+            per_entropy = [token_ent[i, : d.seq_len] for i, d in enumerate(datums)]
+
         if detach:
+            per_values = [t.detach() for t in per_values] if per_values is not None else None
             per_logprobs = [t.detach() for t in per_logprobs] if per_logprobs is not None else None
-            per_entropy = [t.detach() for t in per_entropy]
-        return ModelOutput(logprobs=per_logprobs, entropy=per_entropy, metrics={})
+            per_entropy = [t.detach() for t in per_entropy] if per_entropy is not None else None
+        return ModelOutput(logprobs=per_logprobs, entropy=per_entropy, values=per_values, metrics={})
 
     def _forward_backward_datums(
         self,

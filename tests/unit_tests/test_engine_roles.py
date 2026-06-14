@@ -11,7 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Phase 4 — RL role semantics: trainable, output_head, hooks, disable_adapters."""
+"""RL roles are assembled by the CALLER, not the Engine.
+
+The Engine holds no role policy (like Megatron-core): a critic is just a model
+that emits ``values``; a reference is an Engine with no optimizer + a frozen
+model. These are expressed via generic mechanisms — duck-typed output
+extraction, the ``hooks`` model-surgery seam, and "inject no optimizer" — not
+``output_head`` / ``trainable`` config.
+"""
 
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -85,75 +92,79 @@ def _datums(vocab=16):
     ]
 
 
-def _engine(model, *, trainable=True, output_head="lm", lr=0.1):
-    cfg = Engine.Config(trainable=trainable, output_head=output_head)
-    opt = [torch.optim.SGD(model.parameters(), lr=lr)] if trainable else None
-    return Engine(cfg, model_parts=[model], optimizers=opt)
+def _trainable(model, lr=0.1):
+    return Engine(model_parts=[model], optimizers=[torch.optim.SGD(model.parameters(), lr=lr)])
 
 
-# ── trainable=False (reference / reward model) ──────────────────────────────
+def _reference(model):
+    """Caller-side reference role: no optimizer + frozen, eval. No Engine flag."""
+    for p in model.parameters():
+        p.requires_grad_(False)
+    model.eval()
+    return Engine(model_parts=[model], optimizers=[])
 
 
-def test_non_trainable_freezes_and_drops_optimizer():
-    torch.manual_seed(0)
-    ref = _engine(ToyLM(), trainable=False, lr=0.1)
-    assert ref.optimizers == []
-    assert all(not p.requires_grad for p in ref.parts[0].parameters())
-    assert not ref.parts[0].training  # eval()
-    # forward still works (ref logprobs).
-    out = ref.forward(_datums())
+# ── Duck-typed extraction: the Engine surfaces what the model emits ─────────
+
+
+def test_lm_model_yields_logprobs():
+    eng = _trainable(ToyLM())
+    out = eng.forward(_datums())
+    assert out.logprobs is not None and out.values is None
     assert [lp.shape[0] for lp in out.logprobs] == [4, 2]
 
 
-def test_non_trainable_optimizer_step_raises():
-    ref = _engine(ToyLM(), trainable=False)
-    with pytest.raises(RuntimeError, match="no optimizers"):
-        ref.optimizer_step()
+def test_value_model_yields_values():
+    eng = _trainable(ToyValueModel())
+    out = eng.forward(_datums())
+    assert out.values is not None and out.logprobs is None  # no output_head config needed
+    assert [v.shape[0] for v in out.values] == [4, 2]
 
 
-# ── output_head="value" (critic) ────────────────────────────────────────────
-
-
-def test_value_head_forward_emits_values():
-    critic = _engine(ToyValueModel(), output_head="value")
-    out = critic.forward(_datums())
-    assert out.values is not None and out.logprobs is None
-    assert [v.shape[0] for v in out.values] == [4, 2]  # per-token, per-datum
-
-
-def test_value_head_train_with_custom_value_loss():
-    critic = _engine(ToyValueModel(), output_head="value")
-    datums = _datums()
+def test_critic_trains_with_custom_value_loss():
+    critic = _trainable(ToyValueModel())
 
     def value_loss(model_output, datums):
-        # simple MSE-to-zero critic loss; token-level (per-token tensor per datum)
-        return [v.pow(2) for v in model_output.values]
+        return [v.pow(2) for v in model_output.values]  # token-level MSE-to-zero
 
-    out = critic.forward_backward(datums, loss_fn=value_loss)
-    assert isinstance(out, ModelOutput)
-    assert torch.isfinite(out.loss)
+    out = critic.forward_backward(_datums(), loss_fn=value_loss)
+    assert isinstance(out, ModelOutput) and torch.isfinite(out.loss)
     ok, _ = critic.optimizer_step()
     assert ok
 
 
-def test_value_head_missing_values_raises():
-    # An LM model under output_head="value" has no `.values`.
-    eng = _engine(ToyLM(), output_head="value")
-    with pytest.raises(ValueError, match="no `.values`"):
-        eng.forward(_datums())
+# ── Reference = no optimizer + frozen (caller-assembled, no Engine flag) ────
 
 
-# ── hooks (post-construction) ───────────────────────────────────────────────
+def test_reference_has_no_optimizer_and_runs_forward():
+    ref = _reference(ToyLM())
+    assert ref.optimizers == []
+    assert all(not p.requires_grad for p in ref.parts[0].parameters())
+    assert not ref.parts[0].training
+    assert ref.forward(_datums()).logprobs is not None
 
 
-def test_hooks_applied_to_model_parts():
+def test_optimizer_step_without_optimizer_raises():
+    ref = _reference(ToyLM())
+    with pytest.raises(RuntimeError, match="no optimizers"):
+        ref.optimizer_step()
+
+
+# ── hooks: the generic model-surgery seam (how a value head/freeze is done) ──
+
+
+def test_hook_freezes_module_in_place():
+    model = ToyLM()
+
     def freeze_embed(m):
         m.embed.weight.requires_grad_(False)
-        return None  # in-place
+        return None
 
-    model = ToyLM()
-    cfg = Engine.Config(hooks=[freeze_embed])
-    eng = Engine(cfg, model_parts=[model], optimizers=[torch.optim.SGD(model.parameters(), lr=0.1)])
+    eng = Engine(
+        Engine.Config(hooks=[freeze_embed]),
+        model_parts=[model],
+        optimizers=[torch.optim.SGD(model.parameters(), lr=0.1)],
+    )
     assert not eng.parts[0].embed.weight.requires_grad
 
 
@@ -163,41 +174,39 @@ def test_hook_can_replace_module():
     assert eng.parts[0] is replacement
 
 
-# ── disable_adapters (LoRA ref without a second engine) ─────────────────────
+# ── disable_adapters: generic PEFT mechanism (used by SFT eval + RL ref) ────
 
 
 def test_disable_adapters_changes_output():
     torch.manual_seed(0)
     model = ToyLoRAModel()
-    eng = _engine(model)
+    eng = _trainable(model)
     datums = _datums()
     with_adapter = eng.forward(datums).logprobs
     without_adapter = eng.forward(datums, disable_adapters=True).logprobs
-    # adapter on vs off must produce different logprobs
     assert not torch.allclose(with_adapter[0], without_adapter[0])
-    # adapter restored after the context
-    assert model._adapter_on is True
+    assert model._adapter_on is True  # restored after the context
 
 
 def test_disable_adapter_noop_without_adapters():
-    eng = _engine(ToyLM())
-    # no disable_adapter method on the model -> no-op, still runs
-    out = eng.forward(_datums(), disable_adapters=True)
+    eng = _trainable(ToyLM())
+    out = eng.forward(_datums(), disable_adapters=True)  # no-op, still runs
     assert out.logprobs is not None
 
 
-# ── Deliverable: actor / critic / ref as three Engines ──────────────────────
+# ── Deliverable: actor / critic / ref are three CALLER-assembled Engines ────
 
 
-def test_actor_critic_ref_roles():
+def test_actor_critic_ref_are_caller_assembled():
     torch.manual_seed(0)
-    actor = _engine(ToyLM(), trainable=True)
-    critic = _engine(ToyValueModel(), trainable=True, output_head="value")
-    ref = _engine(ToyLM(), trainable=False)
+    actor = _trainable(ToyLM())  # policy: logits -> logprobs, trainable
+    critic = _trainable(ToyValueModel())  # value model -> values, trainable
+    ref = _reference(ToyLM())  # frozen, no optimizer
 
     datums = _datums()
     assert actor.forward(datums).logprobs is not None
     assert critic.forward(datums).values is not None
     assert ref.forward(datums).logprobs is not None
-    # only actor + critic are trainable
     assert actor.optimizers and critic.optimizers and ref.optimizers == []
+    # The Engine class is identical for all three — only the model + optimizer differ.
+    assert type(actor) is type(critic) is type(ref) is Engine
