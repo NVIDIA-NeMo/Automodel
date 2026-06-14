@@ -252,10 +252,21 @@ def _dense_moe_config(config: Qwen3_5TextConfig, dtype: torch.dtype) -> MoEConfi
     """
     inter = config.intermediate_size
     return MoEConfig(
-        dim=config.hidden_size, inter_dim=inter, moe_inter_dim=inter,
-        n_routed_experts=0, n_shared_experts=0, n_activated_experts=0,
-        n_expert_groups=0, n_limited_groups=0, train_gate=True, gate_bias_update_factor=0.0,
-        aux_loss_coeff=0.0, score_func="softmax", route_scale=1.0, norm_topk_prob=True, dtype=dtype,
+        dim=config.hidden_size,
+        inter_dim=inter,
+        moe_inter_dim=inter,
+        n_routed_experts=0,
+        n_shared_experts=0,
+        n_activated_experts=0,
+        n_expert_groups=0,
+        n_limited_groups=0,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        norm_topk_prob=True,
+        dtype=dtype,
     )
 
 
@@ -798,6 +809,12 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
         param_dtype = next(self.model.language_model.parameters()).dtype
         dtype = get_dtype(getattr(text_config, "torch_dtype", None), param_dtype)
+        # ``super().__init__`` ran HF ``post_init`` (-> ``initialize_weights``) and may
+        # have cast the inherited ``lm_head`` to a different bulk dtype before the
+        # native backbone was swapped in; realign it to the backbone dtype so the
+        # final hidden states and ``lm_head`` agree.
+        if self.lm_head is not None and self.lm_head.weight.dtype != dtype:
+            self.lm_head = self.lm_head.to(dtype)
         self.mtp_config = build_mtp_config_from_hf(
             text_config,
             loss_scaling_factor=mtp_loss_scaling_factor,
@@ -1146,7 +1163,15 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         # Initialize the native text backbone (embed/norm/layers incl. the
         # GatedDeltaNet/SSMGate-specific init). The HF vision tower + lm_head were
         # initialized by ``super().__init__`` (or loaded from a checkpoint).
-        self.model.language_model.init_weights(buffer_device=buffer_device)
+        # HF's ``post_init`` (in ``super().__init__``) routes through
+        # ``init_weights -> initialize_weights`` *before* the backbone is swapped in,
+        # so ``language_model`` may still be the HF text model whose ``init_weights``
+        # takes no ``buffer_device``; fall back to the no-arg HF signature then.
+        language_model = self.model.language_model
+        try:
+            language_model.init_weights(buffer_device=buffer_device)
+        except TypeError:
+            language_model.init_weights()
         mtp = getattr(self, "mtp", None)
         if mtp is not None:
             with buffer_device:
