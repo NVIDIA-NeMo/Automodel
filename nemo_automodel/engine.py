@@ -46,6 +46,7 @@ clear error rather than silently running the wrong thing.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -64,7 +65,24 @@ from nemo_automodel.components.training.model_output import (
 )
 from nemo_automodel.loss_fns import BUILTIN_LOSSES, LossFn
 
-__all__ = ["Engine"]
+__all__ = ["Engine", "CheckpointHandle"]
+
+
+class CheckpointHandle:
+    """Handle to an in-flight or completed ``save_state``.
+
+    ``wait()`` blocks until the checkpoint is durable. For a synchronous save it
+    is a no-op (already durable on return); for an async save it flushes the
+    underlying async checkpointer.
+    """
+
+    def __init__(self, path: str, checkpointer: Any):
+        self.path = path
+        self._checkpointer = checkpointer
+
+    def wait(self) -> None:
+        if getattr(getattr(self._checkpointer, "config", None), "is_async", False):
+            self._checkpointer.async_wait()
 
 
 class Engine:
@@ -120,6 +138,11 @@ class Engine:
         # an explicit loss_fn (e.g. MaskedCrossEntropy / FusedLinearCrossEntropy).
         loss_fn: Any = None
 
+        # CheckpointingConfig (or a dict of its fields) for save_state/load_state.
+        # None -> a default DCP training-resume config (torch_save, sharded, no
+        # consolidation). Checkpoint = training resume, distinct from export().
+        checkpoint: Any = None
+
     # ── Construction ─────────────────────────────────────────────────
 
     def __init__(
@@ -138,6 +161,7 @@ class Engine:
         self.optimizers: list[torch.optim.Optimizer] = list(optimizers) if optimizers is not None else []
         self.lr_schedulers: list[Any] = list(lr_schedulers) if lr_schedulers is not None else []
         self.pp: Any = None  # AutoPipeline when PP is enabled, else None
+        self._checkpointer: Any = None  # lazily built on first save_state/load_state
 
         # Distributed handles.
         self.distributed_setup = distributed_setup
@@ -281,6 +305,16 @@ class Engine:
 
         name = "dp_cp" if self.device_mesh["cp"].size() > 1 else "dp"
         return get_flat_mesh(self.device_mesh, name).get_local_rank()
+
+    def _tp_rank(self) -> int:
+        if not self.device_mesh or "tp" not in self.device_mesh.mesh_dim_names or self.device_mesh["tp"].size() == 1:
+            return 0
+        return self.device_mesh.get_local_rank("tp")
+
+    def _pp_rank(self) -> int:
+        if not self.device_mesh or "pp" not in self.device_mesh.mesh_dim_names or self.device_mesh["pp"].size() == 1:
+            return 0
+        return self.device_mesh.get_local_rank("pp")
 
     # ── Forward / backward ───────────────────────────────────────────
 
@@ -827,6 +861,77 @@ class Engine:
             for name, param in part.named_parameters():
                 tensor = param.full_tensor() if hasattr(param, "full_tensor") else param
                 yield name, tensor.detach()
+
+    # ── Checkpoint (training resume) ─────────────────────────────────
+
+    def _build_checkpointer(self):
+        if self._checkpointer is not None:
+            return self._checkpointer
+        from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+
+        cfg = self.config.checkpoint
+        if cfg is None:
+            # Default: DCP sharded resume checkpoint (no HF consolidation).
+            cfg = CheckpointingConfig(
+                model_save_format="torch_save",
+                save_consolidated=False,
+                is_peft=self.config.peft is not None,
+            )
+        elif isinstance(cfg, dict):
+            cfg = CheckpointingConfig(**cfg)
+        self._checkpointer = cfg.build(
+            dp_rank=self.dp_rank,
+            tp_rank=self._tp_rank(),
+            pp_rank=self._pp_rank(),
+            moe_mesh=self.moe_mesh,
+        )
+        return self._checkpointer
+
+    def _ckpt_model(self):
+        """Model arg for the Checkpointer: single part, or the parts list (PP)."""
+        return self.model_parts[0] if len(self.model_parts) == 1 else self.model_parts
+
+    def save_state(self, path: str, *, user_state: Any | None = None, async_save: bool = False) -> CheckpointHandle:
+        """Save model + optimizer (+ scheduler) state for training resume.
+
+        Collective — all ranks must call. ``user_state`` is saved **locally on
+        the rank that provides it** (pass it on one rank for a single global
+        object, or per-rank objects); ``load_state`` returns the local rank's
+        ``user_state``. This is training-resume state, distinct from
+        :meth:`export` (HF weights). Returns a :class:`CheckpointHandle`; with
+        ``async_save=False`` the checkpoint is durable before return.
+        """
+        ckptr = self._build_checkpointer()
+        model = self._ckpt_model()
+        ckptr.save_model(model, path, peft_config=self.config.peft)
+        if self.optimizers:
+            ckptr.save_optimizer(self.optimizers, model, path, self.lr_schedulers or None)
+        if user_state is not None:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            us_dir = os.path.join(path, "user_state")
+            os.makedirs(us_dir, exist_ok=True)
+            torch.save(user_state, os.path.join(us_dir, f"rank_{rank}.pt"))
+        handle = CheckpointHandle(path, ckptr)
+        if not async_save:
+            handle.wait()
+        return handle
+
+    def load_state(self, path: str) -> Any | None:
+        """Restore model + optimizer (+ scheduler) state from ``path``.
+
+        Collective. Returns this rank's ``user_state`` if one was saved,
+        otherwise ``None``.
+        """
+        ckptr = self._build_checkpointer()
+        model = self._ckpt_model()
+        ckptr.load_model(model, os.path.join(path, "model"))
+        if self.optimizers:
+            ckptr.load_optimizer(self.optimizers, model, path, self.lr_schedulers or None)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        us_path = os.path.join(path, "user_state", f"rank_{rank}.pt")
+        if os.path.exists(us_path):
+            return torch.load(us_path, weights_only=False)
+        return None
 
     # ── Helpers ──────────────────────────────────────────────────────
 
