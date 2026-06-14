@@ -15,7 +15,7 @@
 # SFT recipe for tencent/Hy3-preview (295B MoE, 192 experts top-8, 256K context).
 # Requires transformers >= 5.6.0 for the hy_v3 architecture.
 #
-# Hardware: 8 GPUs (80 GB+ each) for LoRA; 32 GPUs for full fine-tuning.
+# Hardware: 8 GPUs (80 GB+ each) for LoRA; 64 GPUs (8 nodes) for full fine-tuning.
 #   automodel examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml --nproc-per-node 8
 #
 # EP size must divide num_experts (192): e.g. ep_size=8 gives 24 experts/rank.
@@ -65,8 +65,8 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 4
-  ep_size: 8  # 192 experts / 8 ranks = 24 experts per rank
+  pp_size: 8
+  ep_size: 8  # 192 experts / 8 ranks = 24 experts/rank; keep ep intra-node (8 GPUs) so DeepEP dispatch stays on NVLink
 
   sequence_parallel: false
   activation_checkpointing: true
@@ -134,5 +134,8 @@ optimizer:
 #   name: hy3_preview_deepep
 
 ci:
-  # pp_size(4) * ep_size(8) = 32 GPUs => 4 nodes (8 H100/node).
-  nodes: 4
+  # pp_size(8) * ep_size(8) = 64 GPUs => 8 nodes (8 H100/node).
+  # Verified on cw (H100-80GB): trains at ~42 GiB/GPU. Note pp4*ep8=32 (4 nodes) OOMs
+  # at the first optimizer.step, and dp does not shard the experts (only pp*ep does),
+  # so the fix is more pp, not more dp; ep stays 8 to keep DeepEP intra-node.
+  nodes: 8
