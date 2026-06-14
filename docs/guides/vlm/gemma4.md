@@ -508,7 +508,7 @@ Example parsed output (test sample 4):
 | **Average NED** | **0.0601** |
 | **Field-Level Accuracy** | **92.6%** |
 | Perfect matches (NED=0.0) | 10/20 (50%) |
-| Near-perfect (NED<0.05) | 14/20 (70%) |
+| Near-perfect (NED&lt;0.05) | 14/20 (70%) |
 
 ### Field-Level Extraction Accuracy (Actual)
 
