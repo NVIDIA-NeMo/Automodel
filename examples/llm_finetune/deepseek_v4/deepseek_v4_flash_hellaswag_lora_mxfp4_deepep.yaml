@@ -120,8 +120,10 @@ peft:
 
 checkpoint:
   enabled: false
-  # The DSV4-Flash checkpoint stores experts as fp4; they are dequantized to bf16
-  # on load and then repacked to mxfp4 (Phase A). Required for the current flow.
+  # The DSV4-Flash checkpoint is quantized: fp4 routed experts + fp8 non-expert
+  # projections. This enables quant-aware loading -- the fp8 non-expert weights are
+  # dequantized to bf16, while the fp4 experts are passed through packed (mxfp4,
+  # never materialized in bf16). Required to load this checkpoint.
   dequantize_base_checkpoint: true
 
 loss_fn:
