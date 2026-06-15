@@ -17,16 +17,21 @@
 
 name: Fern docs (check)
 
-# Triggers on push to mirrored PR branches (`pull-request/<n>`) created by the
-# FW-CI mirror bot. This runs in the trusted base-repo context, so
-# DOCS_FERN_TOKEN is available even for fork PRs.
+# Runs `fern check` on every push to a `pull-request/<n>` branch -- i.e. whenever
+# `/ok to test <sha>` is posted: copy-pr-bot copies the PR onto pull-request/<n>
+# and pushes it, which fires this (exactly like the main `CICD NeMo` pipeline).
+#
+# Deliberately NO `paths:` filter. GitHub evaluates a push `paths:` filter against
+# the branch-creation diff, which is unreliable for the first push copy-pr-bot
+# makes to a brand-new pull-request/<n> branch, so a docs-only PR can skip a
+# path-filtered check entirely -- that is how a malformed nightly.yml slipped past
+# CI and broke the publish on main. cicd-main.yml omits the filter for the same
+# reason. `fern check` is ~25s and needs no secrets, so running it on every mirror
+# push is cheap and safe.
 on:
   push:
     branches:
       - "pull-request/[0-9]+"
-    paths:
-      - 'docs/**'
-      - '.github/workflows/fern-docs-ci.yml'
 
 permissions:
   contents: read
