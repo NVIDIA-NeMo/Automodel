@@ -143,3 +143,7 @@ wandb:
   entity: <your_wandb_entity>
   name: <your_wandb_name>
   dir: <your_wandb_save_dir>
+
+ci:
+  # pp_size(8) * ep_size(8) = 64 GPUs => 8 nodes (8 H100/node).
+  nodes: 8
