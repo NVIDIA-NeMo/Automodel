@@ -59,7 +59,7 @@ from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.magi_attn_utils import MagiState, set_active_attn_spec, setup_magi
+from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
@@ -1156,12 +1156,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
                 num_chunks=_num_chunks_value,
             )
-        # Prefix-tree / arbitrary mask spec (cp=1): hand the per-step AttnMaskSpec to
-        # the magi attention backend out-of-band. Setting it every step (the batch's
-        # spec or None) is self-clearing, so a stale spec never leaks into the next
-        # batch. The collate attaches "magi_attn_spec"; plain batches omit it.
-        if self.magi.enabled:
-            set_active_attn_spec(batch.pop("magi_attn_spec", None))
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 

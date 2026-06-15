@@ -35,6 +35,7 @@ import sys
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from _prefix_tree_reference import build_reference_mask
 
 from nemo_automodel.components.datasets.llm.prefix_tree import fold_shared_prefix_rollouts
 from nemo_automodel.components.distributed.magi_attn_utils import (
@@ -47,35 +48,6 @@ from nemo_automodel.components.distributed.magi_attn_utils import (
 # bf16 vs fp32-reference tolerance (the FFA kernel runs in bf16).
 MAX_DIFF_TOL = 2e-2
 COS_SIM_TOL = 0.999
-
-
-def _build_reference_mask(prompt_len: int, completion_lens: list[int], total: int) -> torch.Tensor:
-    """Dense boolean attend-mask, built straight from the rollout structure.
-
-    ``allowed[q, k]`` is True iff query ``q`` may attend to key ``k`` under the
-    "prompt ++ completion as an independent causal sequence" semantics:
-      * prompt query: causal within the prompt only;
-      * completion query: FULL to the prompt, CAUSAL within its own completion.
-    """
-    # node id per flat position: -1 for prompt, c for completion c.
-    node_of = [-1] * prompt_len
-    for c, n in enumerate(completion_lens):
-        node_of.extend([c] * n)
-    assert len(node_of) == total
-
-    allowed = torch.zeros(total, total, dtype=torch.bool)
-    for q in range(total):
-        qc = node_of[q]
-        for k in range(q + 1):  # causal upper bound: never attend to the future
-            kc = node_of[k]
-            if kc == -1:
-                # prompt key: prompt query causal (k<=q already), completion query full.
-                allowed[q, k] = True
-            elif kc == qc:
-                # same completion, causal (k<=q already).
-                allowed[q, k] = True
-            # different completion -> blocked.
-    return allowed
 
 
 def main() -> int:
@@ -121,7 +93,7 @@ def main() -> int:
     set_active_attn_spec(None)
 
     # --- reference: exact SDPA with the independently built dense mask, fp32 ---
-    allowed = _build_reference_mask(prompt_len, completion_lens, total).to(device)
+    allowed = build_reference_mask(prompt_len, completion_lens, total).to(device)
     q4, k4, v4 = (t.float().transpose(0, 1).unsqueeze(0) for t in (q, k, v))  # [1, H, T, D]
     out_ref = F.scaled_dot_product_attention(q4, k4, v4, attn_mask=allowed, scale=scale)
     out_ref = out_ref.squeeze(0).transpose(0, 1)  # [T, H, D]

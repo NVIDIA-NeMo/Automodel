@@ -14,7 +14,7 @@
 
 
 # To run this recipe:
-#   torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py --config examples/llm_finetune/qwen/qwen3_magi_prefix_tree_rollouts.yaml
+#   torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py --config examples/llm_finetune/qwen/qwen25_magi_prefix_tree_rollouts.yaml
 #
 # Shared-prefix RL rollout finetune with the MagiAttention (FFA) backend and a
 # block-sparse prefix-tree mask, WITHOUT context parallelism (cp_size=1). Each
@@ -26,6 +26,11 @@
 # Qwen3 MoE magi examples to compare against plain varlen packing.
 #
 # Notes for the magi prefix-tree backend (cp=1):
+#   * the model MUST be a registered custom model (in MODEL_ARCH_MAPPING) so
+#     backend.attn="magi" wires the custom-model attn_func, which is the only
+#     magi path that reads the out-of-band AttnMaskSpec. Qwen2 is registered;
+#     a plain HF model would route through the HF magi backend and ignore the
+#     prefix-tree spec.
 #   * local_batch_size must be 1: each folded group is already one flat sequence
 #     with no batch dim, and the prefix-tree mask is built per group.
 #   * backend.rope_fusion must be false: magi applies RoPE positionally with the
@@ -53,7 +58,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3-0.6B
+  pretrained_model_name_or_path: Qwen/Qwen2.5-0.5B  # registered custom model -> magi custom attn_func
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: magi              # MagiAttention Flex-Flash-Attention backend
@@ -81,7 +86,7 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.prefix_tree.build_mock_rollout_dataset
+  _target_: nemo_automodel.components.datasets.llm.mock_prefix_tree.build_mock_rollout_dataset
   num_groups: 64
   completions_per_group: 4
   prompt_len: 64

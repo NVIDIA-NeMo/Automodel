@@ -36,6 +36,7 @@ import sys
 
 import torch
 import torch.nn.functional as F
+from _prefix_tree_reference import build_reference_mask
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from nemo_automodel.components.datasets.llm.prefix_tree import fold_shared_prefix_rollouts
@@ -43,30 +44,6 @@ from nemo_automodel.components.datasets.llm.prefix_tree import fold_shared_prefi
 # fp32 both sides: a tight tolerance that flags any mask error rather than noise.
 MAX_DIFF_TOL = 1e-3
 COS_SIM_TOL = 0.9999
-
-
-def _build_reference_mask(prompt_len: int, completion_lens: list[int], total: int) -> torch.Tensor:
-    """Dense boolean attend-mask, built straight from the rollout structure.
-
-    ``allowed[q, k]`` is True iff query ``q`` may attend to key ``k`` under the
-    "prompt ++ completion as an independent causal sequence" semantics:
-      * prompt query: causal within the prompt only;
-      * completion query: FULL to the prompt, CAUSAL within its own completion.
-    """
-    node_of = [-1] * prompt_len
-    for c, n in enumerate(completion_lens):
-        node_of.extend([c] * n)
-    assert len(node_of) == total
-
-    allowed = torch.zeros(total, total, dtype=torch.bool)
-    for q in range(total):
-        qc = node_of[q]
-        for k in range(q + 1):  # causal upper bound: never attend to the future
-            kc = node_of[k]
-            if kc == -1 or kc == qc:
-                # prompt key (full for completions, causal for prompt) or same completion.
-                allowed[q, k] = True
-    return allowed
 
 
 def _spec_mask_mod(spec):
@@ -112,7 +89,7 @@ def main() -> int:
     out_flex = flex_attention(q, k, v, block_mask=block_mask, scale=scale)  # [1, H, T, D]
 
     # --- reference: exact SDPA with the independently built dense mask ---
-    allowed = _build_reference_mask(prompt_len, completion_lens, total).to(device)
+    allowed = build_reference_mask(prompt_len, completion_lens, total).to(device)
     out_ref = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed, scale=scale)
 
     a = out_flex.float()
