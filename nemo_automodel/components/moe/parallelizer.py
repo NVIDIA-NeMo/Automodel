@@ -541,29 +541,41 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     # Prefer nested text modules when present (VLM models)
     _model = get_text_module(_model)
 
-    # Set model-level flag so the forward pass can null out attention_mask.
+    # Set CP flags so wrapper and text-module forward paths can prepare
+    # full-sequence embeddings and null out local attention masks.
     # With CP the mask is not sharded along the sequence dim and TE asserts
     # "Padding mask not supported with context parallelism!".
+    model._cp_enabled = True
     _model._cp_enabled = True
 
+    # Route each attention block's CP setup by capability:
+    #   * TE DotProductAttention -> TE's own context-parallel group;
+    #   * a module exposing setup_cp_attention (e.g. Gemma4's p2p ring) -> installs
+    #     its own CP attention + mask handling (model-owned, like TE/DSV4).
+    # Any other (non-TE, non-model-owned) attention is not supported under CP here.
     for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
         if layer_type in ("full_attention", "sliding_attention"):
-            attn_module = block.self_attn.attn_module
-            if not isinstance(attn_module, DotProductAttention):
-                logger.warning(
-                    "Skipping CP setup for block with non-TE attention module: %s",
-                    type(attn_module).__name__,
+            attn_module = getattr(block.self_attn, "attn_module", None)
+            if isinstance(attn_module, DotProductAttention):
+                attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
+                attn_module.set_context_parallel_group(
+                    cp_mesh.get_group(),
+                    torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
+                    _get_cp_stream(),
+                    cp_comm_type=attn_cp_comm_type,
                 )
-                continue
-            attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
-            attn_module.set_context_parallel_group(
-                cp_mesh.get_group(),
-                torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
-                _get_cp_stream(),
-                cp_comm_type=attn_cp_comm_type,
-            )
+            elif hasattr(block.self_attn, "setup_cp_attention"):
+                # Model-owned CP attention (e.g. Gemma4's p2p ring): the model
+                # installs its own SDPA hook + mask handling.
+                block.self_attn.setup_cp_attention(cp_mesh)
+            else:
+                logger.warning(
+                    "Skipping CP setup for block with unsupported attention module "
+                    "(neither TE DotProductAttention nor model-owned setup_cp_attention): %s",
+                    type(attn_module).__name__ if attn_module is not None else type(block.self_attn).__name__,
+                )
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
 
