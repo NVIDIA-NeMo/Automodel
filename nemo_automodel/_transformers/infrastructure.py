@@ -39,6 +39,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     _maybe_adapt_state_dict_to_hf,
 )
+from nemo_automodel.components.checkpoint.utils import ensure_tied_lm_head
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
     DistributedStrategyConfig,
@@ -74,6 +75,13 @@ if TYPE_CHECKING:
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_tied_lm_heads(model) -> None:
+    """Re-apply local tied LM-head aliases on model parts that own both tensors."""
+    model_parts = model.parts if hasattr(model, "parts") else [model]
+    for model_part in model_parts:
+        ensure_tied_lm_head(model_part)
 
 
 #  PEFT / quantization helpers
@@ -535,6 +543,7 @@ def apply_model_infrastructure(
             setattr(part, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
     else:
         model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh)
+        _ensure_tied_lm_heads(model)
         if compile_config is not None and not isinstance(model_wrapper, FSDP2Manager):
             model = compile_model(model, compile_config)
         if isinstance(model_wrapper, FSDP2Manager):

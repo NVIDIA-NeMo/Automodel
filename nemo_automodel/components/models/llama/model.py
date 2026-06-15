@@ -432,6 +432,12 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        # Transformers v5 does not reliably tie this custom model from the
+        # dict-shaped _tied_weights_keys alone. Explicitly honor the config
+        # flag after initialization.
+        if getattr(config, "tie_word_embeddings", False):
+            self.tie_weights()
+
         # Convert to configured dtype if specified
         if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
             self.to(dtype=config.torch_dtype)
@@ -451,6 +457,10 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        if getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def set_decoder(self, decoder):
         self.model = decoder

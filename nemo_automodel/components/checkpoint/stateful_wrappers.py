@@ -57,6 +57,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from nemo_automodel.components.checkpoint.utils import (
+    ensure_tied_lm_head,
     get_lm_head_weight_and_name,
     has_local_tied_lm_head,
     is_tied_word_embeddings,
@@ -251,6 +252,13 @@ class ModelState:
         self.is_init_step = is_init_step
         self.skip_task_head_prefixes = skip_task_head_prefixes or []
 
+    def _refresh_local_tied_lm_head(self) -> None:
+        """Refresh tied-head metadata after DCP has normalized module state."""
+        self.has_local_tied_lm_head = has_local_tied_lm_head(self.model[0])
+        if self.uses_tied_lm_head:
+            _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
+            self.lm_head_param_name = lm_head_param_name
+
     def state_dict(self) -> dict[str, Any]:
         """
         Get the model's state dictionary.
@@ -283,6 +291,7 @@ class ModelState:
         if self.is_peft:
             model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
 
+        self._refresh_local_tied_lm_head()
         if self.has_local_tied_lm_head:
             model_state_dict.pop(self.lm_head_param_name, None)
 
@@ -305,6 +314,9 @@ class ModelState:
         """
         if self.is_init_step:
             self._set_base_model_state_dict(state_dict)
+            if self.uses_tied_lm_head and not self.is_peft:
+                for model_part in self.model:
+                    ensure_tied_lm_head(model_part)
             return
 
         # Multi-stage PP models have different state dicts for each stage.
@@ -336,9 +348,14 @@ class ModelState:
         for model_part in self.model:
             set_model_state_dict(model_part, state_dict, options=options)
 
+        if self.uses_tied_lm_head and not self.is_peft:
+            for model_part in self.model:
+                ensure_tied_lm_head(model_part)
+
     def _get_base_model_state_dict(self) -> dict[str, Any]:
         model_state_dict = {k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()}
 
+        self._refresh_local_tied_lm_head()
         if self.has_local_tied_lm_head:
             model_state_dict.pop(self.lm_head_param_name, None)
 
