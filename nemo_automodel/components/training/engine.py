@@ -63,9 +63,20 @@ from nemo_automodel.components.training.model_output import (
     selected_token_logprobs,
     split_per_datum,
 )
-from nemo_automodel.loss_fns import BUILTIN_LOSSES, LossFn
-
 __all__ = ["Engine", "CheckpointHandle"]
+
+# Datum-mode loss contract. The loss IS the algorithm and is owned by the caller:
+# every RL consumer (verl, slime, nemo-rl) and verl's other backends (megatron,
+# fsdp) bring their own loss, so no loss library lives here — just the type and
+# the default SFT cross-entropy used when no ``loss_fn`` is given.
+LossFn = Callable[["ModelOutput", Sequence["Datum"]], Sequence[torch.Tensor]]
+
+
+def cross_entropy(model_output: "ModelOutput", datums: "Sequence[Datum]", **kwargs) -> list[torch.Tensor]:
+    """Default Datum-mode loss: token-level NLL of each datum's target tokens."""
+    if model_output.logprobs is None:
+        raise ValueError("loss requires per-datum logprobs in ModelOutput (forward produced none).")
+    return [-lp for lp in model_output.logprobs]
 
 
 class CheckpointHandle:
@@ -349,7 +360,7 @@ class Engine:
     def forward_backward(
         self,
         batch: Any,
-        loss_fn: "str | LossFn | Callable | None" = None,
+        loss_fn: "LossFn | None" = None,
         *,
         loss_kwargs: dict | None = None,
         num_microbatches: int | None = None,
@@ -361,10 +372,10 @@ class Engine:
         Two input modes:
 
         * **Datum mode** (``list[Datum]`` or ``list[list[Datum]]``): the tinker
-          path. ``loss_fn`` is a built-in name (``"cross_entropy"``) or a
-          ``LossFn`` callable
-          ``(ModelOutput, Sequence[Datum]) -> Sequence[Tensor]`` — RL objectives
-          (PPO, etc.) are supplied by the caller, not built in. The Engine owns
+          path. ``loss_fn`` is a ``LossFn`` callable
+          ``(ModelOutput, Sequence[Datum]) -> Sequence[Tensor]`` (defaults to
+          token-level cross-entropy when ``None``) — RL objectives (PPO, etc.)
+          are supplied by the caller, not built in. The Engine owns
           weighting, the global token/sample denominator across data ranks, and
           backward. Returns a :class:`ModelOutput`.
         * **Dict mode** (``dict`` or ``list[dict]``): the legacy SFT path.
@@ -389,7 +400,7 @@ class Engine:
         if self._is_datum_input(batch):
             return self._forward_backward_datums(
                 self._as_microbatch_datum_lists(batch),
-                loss_fn if loss_fn is not None else "cross_entropy",
+                loss_fn if loss_fn is not None else cross_entropy,
                 loss_kwargs or {},
                 forward_only=forward_only,
             )
@@ -576,7 +587,7 @@ class Engine:
     def _forward_backward_datums(
         self,
         mb_datum_lists: list[list[Datum]],
-        loss_fn: "str | LossFn",
+        loss_fn: "LossFn",
         loss_kwargs: dict,
         *,
         forward_only: bool,
@@ -598,7 +609,6 @@ class Engine:
         )
         from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 
-        loss_fn = BUILTIN_LOSSES[loss_fn] if isinstance(loss_fn, str) else loss_fn
         all_datums = [d for mb in mb_datum_lists for d in mb]
         token_denom, sample_denom = self._global_denominator(all_datums)
         is_train = not forward_only

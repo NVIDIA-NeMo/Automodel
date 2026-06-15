@@ -143,7 +143,7 @@ def test_custom_lossfn_matches_cross_entropy():
 
     torch.manual_seed(0)
     e1, _ = _engine()
-    l1 = float(e1.forward_backward(_datums(), loss_fn="cross_entropy").loss)
+    l1 = float(e1.forward_backward(_datums()).loss)  # default loss_fn = cross_entropy
     torch.manual_seed(0)
     e2, _ = _engine()
     l2 = float(e2.forward_backward(_datums(), loss_fn=my_ce).loss)
@@ -152,7 +152,7 @@ def test_custom_lossfn_matches_cross_entropy():
 
 def test_datums_forward_only_no_grads():
     engine, model = _engine()
-    out = engine.forward_backward(_datums(), loss_fn="cross_entropy", forward_only=True)
+    out = engine.forward_backward(_datums(), forward_only=True)
     assert torch.isfinite(out.loss)
     assert all(p.grad is None for p in model.parameters())
 
@@ -160,7 +160,7 @@ def test_datums_forward_only_no_grads():
 def test_multiple_microbatches_accumulate_datums():
     engine, model = _engine()
     mbs = [_datums(), _datums()]  # list[list[Datum]]
-    out = engine.forward_backward(mbs, loss_fn="cross_entropy")
+    out = engine.forward_backward(mbs)  # default loss_fn = cross_entropy
     assert torch.isfinite(out.loss)
     assert len(out.logprobs) == 4  # 2 datums x 2 microbatches, in order
 
