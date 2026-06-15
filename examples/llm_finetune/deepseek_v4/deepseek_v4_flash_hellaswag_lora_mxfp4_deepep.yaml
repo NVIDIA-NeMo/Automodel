@@ -111,6 +111,10 @@ peft:
   dim: 8
   alpha: 32
   use_triton: True
+  # fp32 LoRA adapters: fp32 master weights + fp32 AdamW state for stability (small-update
+  # swamping), while FSDP2's param_dtype=bf16 still runs the adapter matmuls in bf16. Adapters
+  # are tiny so the fp32 optimizer-state cost is negligible. Matches HF PEFT's default.
+  lora_dtype: float32
   # Keep the frozen routed experts packed as mxfp4 and dequantize on the fly.
   expert_weight_format: mxfp4
 
