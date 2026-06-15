@@ -138,8 +138,25 @@ class CheckpointingConfig:
 
         # Normalize legacy bools and string aliases to a consolidated export mode.
         self.save_consolidated = _normalize_save_consolidated(self.save_consolidated)
+
+        # Consolidated HF safetensors export needs local filesystem semantics and is not
+        # supported on msc:// cloud storage paths; use DCP (save_consolidated=false) instead.
+        if self.save_consolidated != SaveConsolidatedMode.FALSE and str(self.checkpoint_dir).startswith("msc://"):
+            raise ValueError(
+                f"Consolidated safetensors export (save_consolidated={self.save_consolidated.value}) is not "
+                f"compatible with remote cloud storage paths ('{self.checkpoint_dir}'). Set save_consolidated=false "
+                f"to use DCP format with MSC cloud storage instead."
+            )
         if self.save_consolidated != SaveConsolidatedMode.FALSE and not self.is_peft:
-            if not self.v4_compatible:
+            if self.model_save_format != SerializationFormat.SAFETENSORS:
+                logging.warning(
+                    "checkpoint.save_consolidated=%s is ignored when checkpoint.model_save_format=%s. "
+                    "Export sharded torch_save checkpoints back to Hugging Face safetensors after training with "
+                    "scripts/export_llm_dcp_to_hf.py.",
+                    self.save_consolidated.value,
+                    self.model_save_format.value,
+                )
+            elif not self.v4_compatible:
                 logging.warning(
                     "save_consolidated=%s but v4_compatible=False; "
                     "checkpoint assets may be not compatible with transformers v4; "

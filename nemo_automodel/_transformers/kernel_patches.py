@@ -257,6 +257,11 @@ def _apply_preload_overrides(tp_size, cp_size, has_packed_sequence, attn_impleme
         logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
         use_liger_kernel = False
 
+    # MagiAttention runs its own context-parallel dispatch + masking (incl. packing),
+    # so it must keep its registered backend rather than being forced to SDPA/flash here.
+    if attn_implementation == "magi":
+        return attn_implementation, use_liger_kernel
+
     if cp_size > 1:
         attn_implementation = "sdpa"
         logger.warning("Packed sequence is supported only with SDPA. Setting model's attn_implementation to sdpa")

@@ -565,7 +565,9 @@ def _get_fp32_module_keywords(model: nn.Module) -> list[str]:
     keywords: list[str] = []
     for attr in ("_keep_in_fp32_modules_strict", "_keep_in_fp32_modules"):
         val = getattr(model, attr, None)
-        if isinstance(val, (list, tuple)):
+        # HuggingFace's PreTrainedModel.__init__ normalizes a class-level
+        # list[str] into an instance-level set[str], so accept both (and tuple).
+        if isinstance(val, (list, set, tuple)):
             keywords.extend(val)
 
     # de-duplicate while preserving order

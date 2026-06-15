@@ -53,6 +53,7 @@ from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -493,6 +494,11 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
 class FinetuneRecipeForVLM(BaseRecipe):
     """Recipe for fine-tuning a VLM model."""
 
+    # MagiAttention is disabled until setup() resolves it from config; this
+    # disabled default keeps the train step working if setup() is skipped (e.g.
+    # unit tests that exercise the step directly). It is read-only.
+    magi = MagiState()
+
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
 
@@ -535,6 +541,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         ) = self._distributed_setup_attributes(
             create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
         )
+
+        # MagiAttention (FFA) backend for the language backbone; the vision tower
+        # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
+        # model.backend.attn="magi" (custom VLMs, e.g. qwen3_vl_moe).
+        self.magi = setup_magi(self.cfg, self.device_mesh, label="VLM language backbone")
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
@@ -869,7 +880,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     if k != "input_ids":
                         batch.pop(k, None)
 
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        if self.magi.enabled:
+            # magi manages the language-backbone attention itself (vision stays on
+            # SDPA); skip the torch-native DTensor CP context.
+            train_ctx, batch = self.magi.prepare_vlm_batch(
+                self.model_parts[0], batch
+            )  # pragma: no cover - requires GPU + magi_attention
+        else:
+            train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
 
         if self.pp_enabled:

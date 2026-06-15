@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -399,6 +400,40 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         cast_model_to_dtype(self, dtype)
 
 
+class Qwen3_5TextModelPP(Qwen3_5TextModel):
+    """``Qwen3_5TextModel`` whose forward survives a pipeline-parallel split.
+
+    The PP splitter rewrites ``self.layers`` from an ``nn.ModuleList`` into an
+    ``nn.ModuleDict`` keyed by original layer index, and drops ``norm`` (sets it to
+    ``None``) on every stage except the last. HF's text forward is not PP-aware: it
+    does ``self.layers[: config.num_hidden_layers]`` (a slice, which raises
+    ``KeyError`` on a ``ModuleDict``) and calls ``self.norm(...)`` unconditionally
+    (``None`` is not callable on non-last stages).
+
+    Rather than fork HF's mRoPE / linear-attention-mask / rotary logic (which is
+    version-sensitive), this override briefly presents the stage's layers as a
+    slice-able ``nn.ModuleList`` over the *same* layer objects and swaps a dropped
+    ``norm`` for an ``nn.Identity`` no-op, delegates to HF's ``forward`` via
+    ``super()``, then restores both. ``embed_tokens`` is untouched: non-first stages
+    are fed ``inputs_embeds`` so it is never called. Outside PP (``layers`` is a
+    ``ModuleList`` and ``norm`` is present) both branches are skipped, so this is a
+    pure passthrough to the upstream forward.
+    """
+
+    def forward(self, *args, **kwargs):
+        saved_layers = self.layers
+        saved_norm = self.norm
+        try:
+            if isinstance(saved_layers, nn.ModuleDict):
+                self.layers = nn.ModuleList(saved_layers.values())
+            if saved_norm is None:
+                self.norm = nn.Identity()
+            return super().forward(*args, **kwargs)
+        finally:
+            self.layers = saved_layers
+            self.norm = saved_norm
+
+
 class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditionalGeneration):
     """Qwen3.5/Qwen3.6 dense VLM with optional Megatron-style MTP head.
 
@@ -417,7 +452,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = True
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = False
 
@@ -452,6 +487,12 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         del kwargs
         super().__init__(config)
         self.backend = backend or BackendConfig()
+
+        # Make the HF text backbone forward pipeline-split-safe. Same instance and
+        # weights — only the (overridden) forward changes — so this is transparent
+        # outside PP and survives the splitter's deepcopy (it is class-based, not a
+        # monkeypatched instance attribute).
+        self.model.language_model.__class__ = Qwen3_5TextModelPP
 
         text_config = config.text_config
         param_dtype = next(self.model.language_model.parameters()).dtype
@@ -526,6 +567,88 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
         return pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
 
+    def prepare_model_inputs_for_cp(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        image_grid_hws: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Build full-sequence multimodal embeddings and mRoPE positions before CP sharding.
+
+        The VLM->LM multimodal scatter and mRoPE ``get_rope_index`` must run on the
+        *full* (unsharded) sequence; context-parallel sharding then happens on the
+        returned ``inputs_embeds`` / ``position_ids`` via ``make_cp_batch_and_ctx``.
+        """
+        if input_ids is None:
+            raise ValueError("Qwen3.5 dense CP pre-embedding requires input_ids.")
+
+        if image_grid_thw is None and image_grid_hws is not None and image_grid_hws.numel() > 0:
+            if image_grid_hws.shape[-1] == 2:
+                ones = torch.ones(
+                    image_grid_hws.shape[0],
+                    1,
+                    dtype=image_grid_hws.dtype,
+                    device=image_grid_hws.device,
+                )
+                image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
+            else:
+                image_grid_thw = image_grid_hws
+
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        if pixel_values is not None:
+            if hasattr(self.model.visual, "rotary_pos_emb"):
+                self.model.visual.rotary_pos_emb.to(pixel_values.device)
+            image_outputs = self.model.get_image_features(pixel_values, image_grid_thw, return_dict=True)
+            image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = self.model.get_placeholder_mask(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                image_features=image_embeds,
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if pixel_values_videos is not None:
+            if hasattr(self.model.visual, "rotary_pos_emb"):
+                self.model.visual.rotary_pos_emb.to(pixel_values_videos.device)
+            video_outputs = self.model.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
+            video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            _, video_mask = self.model.get_placeholder_mask(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                video_features=video_embeds,
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+        if position_ids is None:
+            rope_kwargs = {
+                "image_grid_thw": image_grid_thw,
+                "video_grid_thw": video_grid_thw,
+                "attention_mask": attention_mask,
+            }
+            if "mm_token_type_ids" in inspect.signature(self.model.get_rope_index).parameters:
+                if mm_token_type_ids is None:
+                    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.long)
+                    image_token_id = getattr(self.config, "image_token_id", None)
+                    video_token_id = getattr(self.config, "video_token_id", None)
+                    if image_token_id is not None:
+                        mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == image_token_id, 1)
+                    if video_token_id is not None:
+                        mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == video_token_id, 2)
+                rope_kwargs["mm_token_type_ids"] = mm_token_type_ids.to(device=input_ids.device)
+            position_ids, rope_deltas = self.model.get_rope_index(input_ids, **rope_kwargs)
+            self.model.rope_deltas = rope_deltas
+
+        return {"inputs_embeds": inputs_embeds, "position_ids": position_ids}
+
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -544,6 +667,19 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         padding_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> Qwen3_5CausalLMOutputWithPast:
+        if kwargs.pop("_pre_embed_only", False):
+            return self.prepare_model_inputs_for_cp(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
+                **kwargs,
+            )
+
         effective_use_cache = False if use_cache is None and self.training else use_cache
         kwargs = dict(kwargs)
         if effective_use_cache is not None:
@@ -569,6 +705,51 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             for key, value in kwargs.items()
             if key not in {"pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"}
         }
+
+        # --- Pipeline-parallel stage dispatch ---
+        # Under PP the model is split: stage 0 keeps embed_tokens (+ vision tower),
+        # the last stage keeps lm_head (+ final norm), middle stages keep neither.
+        # Detect a split stage and (a) on non-first stages feed the upstream hidden
+        # states straight into the text backbone, (b) on non-last stages return raw
+        # hidden states for the next stage, (c) run lm_head only where it survives.
+        # MTP needs embed_tokens (absent past stage 0) so it is skipped under PP.
+        language_model = self.model.language_model
+        is_first_stage = getattr(language_model, "embed_tokens", None) is not None
+        is_last_stage = getattr(self, "lm_head", None) is not None
+        if not (is_first_stage and is_last_stage):
+            if is_first_stage:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
+                    pixel_values_videos=pixel_values_videos,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    mm_token_type_ids=mm_token_type_ids,
+                    **model_kwargs,
+                )
+                hidden_states = outputs.last_hidden_state
+            else:
+                # The PP schedule passes the upstream stage's hidden states in the
+                # input_ids slot (a float tensor) or as inputs_embeds.
+                hs = inputs_embeds
+                if hs is None and input_ids is not None and torch.is_floating_point(input_ids):
+                    hs = input_ids
+                text_out = language_model(
+                    inputs_embeds=hs,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    **model_kwargs,
+                )
+                hidden_states = getattr(text_out, "last_hidden_state", text_out)
+            if not is_last_stage:
+                return hidden_states
+            return self.lm_head(hidden_states)
+
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
