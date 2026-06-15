@@ -310,9 +310,14 @@ def make_vision_collator_from_processor_method(tokenizer: ProcessorMixin, collat
 
     Args:
         tokenizer: The processor instance.
-        collator_fn_name: The name of the proceessor method to turn into a collator function.
+        collator_fn_name: The name of the processor method to turn into a collator function.
 
     Returns:
         A collator for vision/multimodal retrieval datasets.
     """
-    return getattr(tokenizer, collator_fn_name)
+    if not hasattr(tokenizer, collator_fn_name):
+        raise ValueError(f"Processor {type(tokenizer).__name__} has no collator method {collator_fn_name!r}")
+    collator = getattr(tokenizer, collator_fn_name)
+    if not callable(collator):
+        raise ValueError(f"Processor attribute {collator_fn_name!r} on {type(tokenizer).__name__} is not callable")
+    return collator

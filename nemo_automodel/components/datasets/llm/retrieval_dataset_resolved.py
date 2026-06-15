@@ -229,7 +229,20 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
         self.model_type = model_type
         self.expected_n_passages = expected_n_passages
         self.epoch = 0
-        self._num_records = int(num_samples) if num_samples is not None else _count_jsonl_records(self.paths)
+        total_records = _count_jsonl_records(self.paths)
+        if num_samples is None:
+            self._num_records = total_records
+        else:
+            requested_records = int(num_samples)
+            if requested_records < 1:
+                raise ValueError(f"num_samples must be >= 1, got {requested_records}")
+            if requested_records > total_records:
+                logger.warning(
+                    "Requested %d resolved retrieval samples but only found %d row(s). Using all.",
+                    requested_records,
+                    total_records,
+                )
+            self._num_records = min(requested_records, total_records)
         if self._num_records < 1:
             raise ValueError(f"Resolved retrieval dataset is empty: {data_path}")
 
@@ -256,6 +269,7 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
         global_idx = 0
         local_idx_for_rank = 0
         for repeat_idx in range(self.repeat):
+            records_seen_this_repeat = 0
             for path in self._iter_paths(repeat_idx):
                 record_dir = path.parent
                 with path.open("r", encoding="utf-8") as f:
@@ -263,12 +277,15 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
                         line = line.strip()
                         if not line:
                             continue
+                        if records_seen_this_repeat >= self._num_records:
+                            break
                         if global_idx % world_size == rank:
                             emit = local_idx_for_rank % num_workers == worker_id
                             local_idx_for_rank += 1
                         else:
                             emit = False
                         global_idx += 1
+                        records_seen_this_repeat += 1
                         if not emit:
                             continue
                         try:
@@ -290,6 +307,8 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
                             model_type=self.model_type,
                             expected_n_passages=self.expected_n_passages,
                         )
+                if records_seen_this_repeat >= self._num_records:
+                    break
 
 
 def make_resolved_retrieval_dataset(
@@ -317,7 +336,7 @@ def make_resolved_retrieval_dataset(
         shuffle_files: Shuffle shard order each epoch.
         seed: File shuffle seed.
         decode_images: Decode image paths to RGB PIL images. Set false for text-only/debug inspection.
-        num_samples: Optional record count override to skip a JSONL line-count scan.
+        num_samples: Optional cap on the number of JSONL records to stream per repeat.
         data_dir_list: Alias for ``data_path`` to match existing retrieval configs.
 
     Returns:

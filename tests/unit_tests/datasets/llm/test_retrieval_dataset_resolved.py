@@ -91,6 +91,25 @@ def test_resolved_retrieval_dataset_rank_sharding(tmp_path, monkeypatch):
     assert [example["question"] for example in dataset] == ["Q1", "Q3"]
 
 
+def test_resolved_retrieval_dataset_num_samples_caps_iteration(tmp_path):
+    data_path = tmp_path / "shard-00000.jsonl"
+    _write_jsonl(
+        data_path,
+        [{"question": f"Q{i}", "doc_text": [f"P{i}"], "doc_image": [""]} for i in range(5)],
+    )
+
+    dataset = rdr.make_resolved_retrieval_dataset(
+        str(data_path),
+        n_passages=1,
+        decode_images=False,
+        num_samples=3,
+        repeat=2,
+    )
+
+    assert len(dataset) == 6
+    assert [example["question"] for example in dataset] == ["Q0", "Q1", "Q2", "Q0", "Q1", "Q2"]
+
+
 def test_resolved_retrieval_dataset_rejects_wrong_passage_count(tmp_path):
     data_path = tmp_path / "shard-00000.jsonl"
     _write_jsonl(data_path, [{"question": "Q", "doc_text": ["P"], "doc_image": [""]}])
