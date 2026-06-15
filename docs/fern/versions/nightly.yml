@@ -25,18 +25,18 @@ navigation:
       - page: "Repo Structure"
         path: ../../repository-structure.mdx
         slug: repo-structure
-- section: "What's New"
-  slug: whats-new
-  contents:
-    - page: "Announcements"
-      path: ../../announcements.mdx
-      slug: announcements
-    - page: "Release Notes"
-      path: ../../release-notes.mdx
-      slug: release-notes
-    - page: "Model Release Log"
-      path: ../../model-coverage/latest-models.mdx
-      slug: model-release-log
+  - section: "What's New"
+    slug: whats-new
+    contents:
+      - page: "Announcements"
+        path: ../../announcements.mdx
+        slug: announcements
+      - page: "Release Notes"
+        path: ../../release-notes.mdx
+        slug: release-notes
+      - page: "Model Release Log"
+        path: ../../model-coverage/latest-models.mdx
+        slug: model-release-log
   - section: "Performance"
     slug: performance
     contents:
@@ -420,8 +420,9 @@ navigation:
       - page: "MLflow Logging"
         path: ../../guides/mlflow-logging.mdx
         slug: mlflow-logging
-- section: "Reference"
-  slug: reference
-  contents:
-    - page: "API Reference"
-    - folder: ../product-docs/nemo-automodel/Full-Library-Reference
+  - section: "Reference"
+    slug: reference
+    contents:
+      - page: "API Reference"
+        path: ../../api-reference/index.mdx
+      - folder: ../product-docs/nemo-automodel/Full-Library-Reference
