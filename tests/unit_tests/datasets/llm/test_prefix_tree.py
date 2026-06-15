@@ -35,14 +35,10 @@ def test_fold_basic_layout_and_mask():
     assert folded.labels == [_, _, 11, _, 21, 22, _]
     # Each completion's positions continue from the prompt length (P=2).
     assert folded.position_ids == [0, 1, 2, 3, 2, 3, 4]
-
-    spec = folded.spec
-    assert spec.total_seqlen == 7
-    assert spec.q_ranges == [[0, 2], [2, 4], [2, 4], [4, 7], [4, 7]]
-    assert spec.k_ranges == [[0, 2], [2, 4], [0, 2], [4, 7], [0, 2]]
-    assert spec.mask_types == ["causal", "causal", "full", "causal", "full"]
-    # Per-sample flat ranges: prompt node + completion node.
-    assert folded.sample_token_ranges == [[[0, 2], [2, 4]], [[0, 2], [4, 7]]]
+    # Tree structure: node 0 is the prompt, nodes 1..N the completions; each path
+    # is prompt -> completion. The magi backend turns this into the AttnMaskSpec.
+    assert folded.node_lengths == [2, 2, 3]
+    assert folded.sample_paths == [[0, 1], [0, 2]]
 
 
 def test_fold_single_completion():
@@ -51,8 +47,8 @@ def test_fold_single_completion():
     # Prompt masked; token 7 predicts 8; last token 8 masked.
     assert folded.labels == [CROSS_ENTROPY_IGNORE_IDX, 8, CROSS_ENTROPY_IGNORE_IDX]
     assert folded.position_ids == [0, 1, 2]
-    assert folded.spec.q_ranges == [[0, 1], [1, 3], [1, 3]]
-    assert folded.spec.mask_types == ["causal", "causal", "full"]
+    assert folded.node_lengths == [1, 2]
+    assert folded.sample_paths == [[0, 1]]
 
 
 def test_fold_empty_prompt_collapses_to_varlen_blocks():
@@ -62,10 +58,9 @@ def test_fold_empty_prompt_collapses_to_varlen_blocks():
     assert folded.labels == [11, CROSS_ENTROPY_IGNORE_IDX, CROSS_ENTROPY_IGNORE_IDX]
     # Each completion restarts at position 0.
     assert folded.position_ids == [0, 1, 0]
-    # Block-diagonal causal: each completion attends only to itself.
-    assert folded.spec.q_ranges == [[0, 2], [2, 3]]
-    assert folded.spec.k_ranges == [[0, 2], [2, 3]]
-    assert folded.spec.mask_types == ["causal", "causal"]
+    # Empty prompt node 0; each completion is its own block (no shared ancestor).
+    assert folded.node_lengths == [0, 2, 1]
+    assert folded.sample_paths == [[1], [2]]
 
 
 def test_fold_custom_ignore_idx():
@@ -95,15 +90,14 @@ def test_collate_builds_batched_tensors():
     group = {"prompt_ids": [1, 2], "completions": [[10, 11], [20]]}
     batch = prefix_tree_collate_fn([group])
 
-    assert set(batch) == {"input_ids", "labels", "position_ids", "magi_attn_spec"}
+    assert set(batch) == {"input_ids", "labels", "position_ids", "prefix_tree"}
     for key in ("input_ids", "labels", "position_ids"):
         assert batch[key].shape == (1, 5)
         assert batch[key].dtype == torch.long
     assert torch.equal(batch["input_ids"], torch.tensor([[1, 2, 10, 11, 20]]))
     assert torch.equal(batch["labels"], torch.tensor([[-100, -100, 11, -100, -100]]))
-    # The spec the recipe activates matches a direct fold of the same group.
-    expected = fold_shared_prefix_rollouts([1, 2], [[10, 11], [20]]).spec
-    assert batch["magi_attn_spec"].fingerprint() == expected.fingerprint()
+    # Tree structure (node_lengths, sample_paths) for the magi backend to build the spec.
+    assert batch["prefix_tree"] == ([2, 2, 1], [[0, 1], [0, 2]])
 
 
 def test_collate_rejects_multi_group_batch():

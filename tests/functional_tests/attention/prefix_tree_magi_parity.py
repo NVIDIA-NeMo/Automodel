@@ -39,6 +39,7 @@ from _prefix_tree_reference import build_reference_mask
 
 from nemo_automodel.components.datasets.llm.prefix_tree import fold_shared_prefix_rollouts
 from nemo_automodel.components.distributed.magi_attn_utils import (
+    AttnMaskSpec,
     is_magi_available,
     make_magi_attn_func,
     set_active_attn_spec,
@@ -77,6 +78,7 @@ def main() -> int:
     completion_lens = [16, 24, 8]
     completions = [list(range(100 + 1000 * i, 100 + 1000 * i + n)) for i, n in enumerate(completion_lens)]
     folded = fold_shared_prefix_rollouts(prompt_ids, completions)
+    spec, sample_token_ranges = AttnMaskSpec.prefix_tree(folded.node_lengths, folded.sample_paths)
     prompt_len = len(prompt_ids)
     total = len(folded.input_ids)
 
@@ -88,7 +90,7 @@ def main() -> int:
 
     # --- magi (under test): FFA with the prefix-tree spec, THD [T, H, D] ---
     attn_func = make_magi_attn_func(softmax_scale=scale)
-    set_active_attn_spec(folded.spec)
+    set_active_attn_spec(spec)
     out_magi = attn_func(q, k, v)  # [T, H, D]
     set_active_attn_spec(None)
 
@@ -107,7 +109,7 @@ def main() -> int:
 
     # Per-completion slice diffs, to localize any divergence to a specific branch.
     ok = True
-    for i, (start, end) in enumerate([rng[-1] for rng in folded.sample_token_ranges]):
+    for i, (start, end) in enumerate([rng[-1] for rng in sample_token_ranges]):
         cd = (a[start:end] - b[start:end]).abs().max().item()
         print(f"  completion[{i}] tokens [{start}:{end}] max_diff={cd:.6e}")
         ok = ok and cd < MAX_DIFF_TOL

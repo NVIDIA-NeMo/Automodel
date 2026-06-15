@@ -40,6 +40,7 @@ from _prefix_tree_reference import build_reference_mask
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from nemo_automodel.components.datasets.llm.prefix_tree import fold_shared_prefix_rollouts
+from nemo_automodel.components.distributed.magi_attn_utils import AttnMaskSpec
 
 # fp32 both sides: a tight tolerance that flags any mask error rather than noise.
 MAX_DIFF_TOL = 1e-3
@@ -75,6 +76,7 @@ def main() -> int:
     completion_lens = [16, 24, 8]
     completions = [list(range(100 + 1000 * i, 100 + 1000 * i + n)) for i, n in enumerate(completion_lens)]
     folded = fold_shared_prefix_rollouts(prompt_ids, completions)
+    spec, sample_token_ranges = AttnMaskSpec.prefix_tree(folded.node_lengths, folded.sample_paths)
     prompt_len = len(prompt_ids)
     total = len(folded.input_ids)
 
@@ -85,7 +87,7 @@ def main() -> int:
     v = torch.randn(1, num_heads, total, head_dim, device=device, dtype=torch.float32)
 
     # --- under test: flex_attention with the spec realized as a block mask ---
-    block_mask = create_block_mask(_spec_mask_mod(folded.spec), B=1, H=1, Q_LEN=total, KV_LEN=total, device=device)
+    block_mask = create_block_mask(_spec_mask_mod(spec), B=1, H=1, Q_LEN=total, KV_LEN=total, device=device)
     out_flex = flex_attention(q, k, v, block_mask=block_mask, scale=scale)  # [1, H, T, D]
 
     # --- reference: exact SDPA with the independently built dense mask ---
@@ -101,7 +103,7 @@ def main() -> int:
 
     # Per-completion slice diffs (output laid out as [1, H, T, D] -> slice on T).
     ok = True
-    for i, (start, end) in enumerate([rng[-1] for rng in folded.sample_token_ranges]):
+    for i, (start, end) in enumerate([rng[-1] for rng in sample_token_ranges]):
         cd = (a[:, :, start:end] - b[:, :, start:end]).abs().max().item()
         print(f"  completion[{i}] tokens [{start}:{end}] max_diff={cd:.6e}")
         ok = ok and cd < MAX_DIFF_TOL

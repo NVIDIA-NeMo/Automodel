@@ -15,14 +15,15 @@
 """Shared-prefix rollout folding for multi-turn prefix-tree attention (cp=1).
 
 Folds a group of rollouts that share one prompt prefix (one prompt -> N sampled
-completions) into a single deduplicated flat token layout plus a block-sparse
-prefix-tree attention mask (:class:`AttnMaskSpec`). The shared prompt is stored
+completions) into a single deduplicated flat token layout plus the prefix-tree
+structure (``node_lengths`` / ``sample_paths``). The shared prompt is stored
 once; every completion attends FULL to the prompt and CAUSAL to itself.
 
 This is the verl RFC #6401 / Automodel #2385 shared-prefix RL training layout,
-restricted to the cp=1 path (no context-parallel dispatch). The produced spec is
-consumed by the magi custom-model attention backend via
-``set_active_attn_spec``; enable it with ``model.backend.attn: magi``.
+restricted to the cp=1 path (no context-parallel dispatch). The collate carries
+the structure on the batch; the magi backend builds the ``AttnMaskSpec`` from it
+and activates it (the datasets layer must not import ``components.distributed``).
+Enable it with ``model.backend.attn: magi``.
 
 Branch-point note: the shared prompt's final position is stored once, so it can
 predict only one next token. The N completions diverge there, so the
@@ -35,14 +36,16 @@ from dataclasses import dataclass
 
 import torch
 
-from nemo_automodel.components.distributed.magi_attn_utils import AttnMaskSpec
-
 CROSS_ENTROPY_IGNORE_IDX = -100
 
 
 @dataclass
 class FoldedRollouts:
-    """Deduplicated flat layout + prefix-tree mask for one shared-prefix group.
+    """Deduplicated flat layout + prefix-tree structure for one shared-prefix group.
+
+    The attention mask itself is built in the magi backend from ``node_lengths`` /
+    ``sample_paths`` (via ``AttnMaskSpec.prefix_tree``); the datasets layer must not
+    import ``components.distributed``, so it only carries the structure.
 
     Attributes:
         input_ids: flat ``[prompt | completion_0 | completion_1 | ...]`` tokens.
@@ -50,16 +53,17 @@ class FoldedRollouts:
             prompt and each completion's last token are ``-100`` (ignored).
         position_ids: prompt positions ``0..P-1``; each completion continues from
             ``P`` (so RoPE sees ``prompt ++ completion``).
-        spec: the prefix-tree :class:`AttnMaskSpec` for this group.
-        sample_token_ranges: per-completion flat ``[start, end)`` ranges of its
-            nodes, for reconstructing per-sample outputs.
+        node_lengths: token count of each node, flat-layout order
+            ``[len(prompt), len(c_0), len(c_1), ...]``.
+        sample_paths: root -> leaf node indices per completion, e.g.
+            ``[[0, 1], [0, 2], ...]``.
     """
 
     input_ids: list[int]
     labels: list[int]
     position_ids: list[int]
-    spec: AttnMaskSpec
-    sample_token_ranges: list[list[list[int]]]
+    node_lengths: list[int]
+    sample_paths: list[list[int]]
 
 
 def fold_shared_prefix_rollouts(
@@ -121,14 +125,12 @@ def fold_shared_prefix_rollouts(
     else:
         sample_paths = [[i + 1] for i in range(len(completions))]
 
-    spec, sample_token_ranges = AttnMaskSpec.prefix_tree(node_lengths, sample_paths)
-
     return FoldedRollouts(
         input_ids=input_ids,
         labels=labels,
         position_ids=position_ids,
-        spec=spec,
-        sample_token_ranges=sample_token_ranges,
+        node_lengths=node_lengths,
+        sample_paths=sample_paths,
     )
 
 
@@ -136,10 +138,11 @@ def prefix_tree_collate_fn(batch: list[dict]) -> dict:
     """Collate one shared-prefix rollout group into a model-ready batch (cp=1).
 
     Folds the group with :func:`fold_shared_prefix_rollouts` and emits the flat
-    tokens plus the prefix-tree mask. Only ``local_batch_size == 1`` is supported:
-    each group already packs many completions into one flat sequence, and the mask
-    is built per group. The returned ``magi_attn_spec`` is picked up by the recipe
-    and handed to the magi attention backend via ``set_active_attn_spec``.
+    tokens plus the prefix-tree structure. Only ``local_batch_size == 1`` is
+    supported: each group already packs many completions into one flat sequence,
+    and the mask is per group. The ``prefix_tree`` entry is popped by the magi
+    backend (``MagiState.prepare_llm_batch``), which builds and activates the
+    ``AttnMaskSpec`` from it.
 
     Args:
         batch: a length-1 list holding one rollout group dict with keys
@@ -147,7 +150,7 @@ def prefix_tree_collate_fn(batch: list[dict]) -> dict:
 
     Returns:
         Dict with ``input_ids``, ``labels``, ``position_ids`` (each ``[1, T]``)
-        and ``magi_attn_spec`` (the :class:`AttnMaskSpec`).
+        and ``prefix_tree`` (``(node_lengths, sample_paths)``).
 
     Raises:
         ValueError: if ``batch`` does not hold exactly one rollout group.
@@ -160,5 +163,5 @@ def prefix_tree_collate_fn(batch: list[dict]) -> dict:
         "input_ids": torch.tensor([folded.input_ids], dtype=torch.long),
         "labels": torch.tensor([folded.labels], dtype=torch.long),
         "position_ids": torch.tensor([folded.position_ids], dtype=torch.long),
-        "magi_attn_spec": folded.spec,
+        "prefix_tree": (folded.node_lengths, folded.sample_paths),
     }

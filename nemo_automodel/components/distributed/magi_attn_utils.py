@@ -749,11 +749,15 @@ class MagiState:
         Returns ``(train_ctx, batch)``. magi does its own CP, so ``train_ctx`` is
         always ``nullcontext`` (no torch-native DTensor CP context).
         """
-        # cp=1 arbitrary mask spec (e.g. prefix tree): activate the per-step spec the
-        # collate attached, out-of-band, for the magi attn_func. Setting it every step
-        # (the batch's spec or None) is self-clearing, so a stale spec never leaks into
-        # the next batch; plain batches omit "magi_attn_spec".
-        set_active_attn_spec(batch.pop("magi_attn_spec", None))
+        # cp=1 prefix-tree mask: the datasets layer cannot import this module (component
+        # independence), so the collate attaches the tree structure and the spec is built
+        # and activated here, out-of-band, for the magi attn_func. Setting it every step
+        # (a spec or None) is self-clearing, so a stale spec never leaks into the next
+        # batch; plain batches omit "prefix_tree".
+        prefix_tree = batch.pop("prefix_tree", None)
+        node_lengths, sample_paths = prefix_tree if prefix_tree is not None else (None, None)
+        spec = AttnMaskSpec.prefix_tree(node_lengths, sample_paths)[0] if prefix_tree is not None else None
+        set_active_attn_spec(spec)
         if self.hf_dispatch:
             # HF path: dispatch the (single causal) sequence across the CP group.
             batch, _ = magi_prepare_batch(model, batch, self.cp_group)
