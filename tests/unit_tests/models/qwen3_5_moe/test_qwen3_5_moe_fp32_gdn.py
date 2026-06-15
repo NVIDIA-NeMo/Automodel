@@ -12,7 +12,7 @@ pytest.importorskip("transformers.models.qwen3_5_moe")
 
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 
-from nemo_automodel.components.models.common.gated_delta_net_fp32 import HOLDER_NAME, isolate_fp32_params
+from nemo_automodel.components.models.common.gated_delta_net_fp32 import HOLDER_NAME
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 
 
@@ -51,10 +51,8 @@ def test_constructor_forces_tracked_params_fp32_under_bf16_default_dtype():
     assert gdn.A_log.dtype == torch.float32
     assert gdn.dt_bias.dtype == torch.float32
 
-    holder = isolate_fp32_params(gdn)
-    assert holder is not None
     assert HOLDER_NAME in gdn._modules
     assert "A_log" not in gdn._parameters
     assert "dt_bias" not in gdn._parameters
-    assert holder.A_log.dtype == torch.float32
-    assert holder.dt_bias.dtype == torch.float32
+    assert gdn._fp32_params.A_log.dtype == torch.float32
+    assert gdn._fp32_params.dt_bias.dtype == torch.float32

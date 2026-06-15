@@ -306,6 +306,10 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
+        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
+        if "_fp32_params" not in keep_fp32:
+            keep_fp32.append("_fp32_params")
+        self._keep_in_fp32_modules = keep_fp32
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3NextStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=model_dtype
@@ -377,7 +381,7 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        cast_model_to_dtype(self, dtype)
+        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device

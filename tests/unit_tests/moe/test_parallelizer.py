@@ -275,24 +275,6 @@ def _install_torch_and_layers_stubs(monkeypatch):
     experts_stub.GroupedExpertsTE = GroupedExpertsTE
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.experts", experts_stub)
 
-    # Stub the GatedDeltaNet fp32 helper (imported lazily inside apply_fsdp). The real
-    # module pulls in the heavy ``models.common`` package and ``torch.nn.functional``,
-    # neither of which exists under the stubbed ``torch`` used here. Parent packages are
-    # stubbed too so the lazy ``from ...common.gated_delta_net_fp32 import ...`` does not
-    # trigger their real (heavy) ``__init__``.
-    models_pkg = types.ModuleType("nemo_automodel.components.models")
-    models_common_pkg = types.ModuleType("nemo_automodel.components.models.common")
-    gdn_fp32_stub = types.ModuleType("nemo_automodel.components.models.common.gated_delta_net_fp32")
-    gdn_fp32_stub.HOLDER_NAME = "_fp32_params"
-    gdn_fp32_stub.isolate_gated_delta_net_fp32_params = lambda model: False
-    monkeypatch.setitem(sys.modules, "nemo_automodel.components.models", models_pkg)
-    monkeypatch.setitem(sys.modules, "nemo_automodel.components.models.common", models_common_pkg)
-    monkeypatch.setitem(
-        sys.modules,
-        "nemo_automodel.components.models.common.gated_delta_net_fp32",
-        gdn_fp32_stub,
-    )
-
 
 def _import_parallelizer_with_stubs(monkeypatch):
     import importlib
@@ -673,70 +655,64 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     assert model_call is not None and model_call[1]["mesh"] is fsdp_mesh
 
 
-def test_shard_fp32_gdn_holders_shards_each_holder(monkeypatch):
-    """``_shard_fp32_gdn_holders`` fully_shards each ``_fp32_params`` holder in a block."""
+def test_shard_fp32_param_holders_shards_each_holder(monkeypatch):
+    """``_shard_fp32_param_holders`` fully_shards each model-owned fp32 holder."""
     P = _import_parallelizer_with_stubs(monkeypatch)
 
     fully_shard_mock = MagicMock()
     monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
 
-    holder = type("Holder", (), {"_modules": {}})()
-    gdn = type("GDN", (), {"_modules": {"_fp32_params": holder}})()
+    holder_param = object()
+
+    class Holder:
+        def parameters(self, recurse=False):
+            return iter([holder_param])
+
+    holder = Holder()
     block = type(
         "Block",
         (),
-        {"_modules": {"linear_attn": gdn}, "modules": lambda self: iter([self, gdn, holder])},
+        {"named_modules": lambda self: iter([("", self), ("linear_attn._fp32_params", holder)])},
     )()
 
     mesh = object()
-    mp_policy = object()
-    count = P._shard_fp32_gdn_holders(
-        block,
-        mesh=mesh,
-        mp_policy=mp_policy,
-        offload_policy=None,
-        reshard_after_forward=False,
-    )
+    ignored = P._shard_fp32_param_holders(block, mesh, reshard_after_forward=False, offload_policy=None)
 
-    assert count == 1
+    assert ignored == {holder_param}
     holder_call = _find_call_by_first_arg(fully_shard_mock, holder)
     assert holder_call is not None
     _, kwargs = holder_call
     assert kwargs["mesh"] is mesh
-    assert kwargs["mp_policy"] is mp_policy
     assert kwargs["reshard_after_forward"] is False
 
 
-def test_apply_fsdp_shards_fp32_gdn_holders_when_isolated(monkeypatch):
-    """apply_fsdp builds an fp32 holder policy and shards each holder per block when
-    ``isolate_gated_delta_net_fp32_params`` reports intrinsically-fp32 GDN params."""
+def test_apply_fsdp_shards_model_owned_fp32_holders(monkeypatch):
+    """apply_fsdp shards each model-owned ``_fp32_params`` holder per block."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
     fully_shard_mock = MagicMock()
     monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
     monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="FP32_MP"))
 
-    # Force the lazily-imported isolation helper to report fp32 GDN params so the
-    # fp32 branch (policy build + per-block holder shard) runs.
-    gdn_stub = sys.modules["nemo_automodel.components.models.common.gated_delta_net_fp32"]
-    monkeypatch.setattr(gdn_stub, "isolate_gated_delta_net_fp32_params", lambda model: True)
+    holder_param = object()
 
-    holder = type("Holder", (), {"_modules": {}})()
-    gdn = type("GDN", (), {"_modules": {"_fp32_params": holder}})()
+    class Holder:
+        def parameters(self, recurse=False):
+            return iter([holder_param])
+
+    holder = Holder()
 
     class BlockWithHolder:
         def __init__(self):
-            self._modules = {}
             self.mlp = DummyMoE()
-            self._gdn = gdn
 
-        def modules(self):
-            return iter([self, self._gdn, holder])
+        def named_modules(self):
+            return iter([("", self), ("linear_attn._fp32_params", holder)])
 
     block = BlockWithHolder()
     model = DummyModel([block])
     fsdp_mesh = object()
-    mp_policy = MagicMock()  # provides reduce_dtype / cast_forward_inputs for the fp32 policy
+    mp_policy = MagicMock()
 
     P.apply_fsdp(
         model=model,
@@ -753,6 +729,10 @@ def test_apply_fsdp_shards_fp32_gdn_holders_when_isolated(monkeypatch):
     _, holder_kwargs = holder_call
     assert holder_kwargs["mesh"] is fsdp_mesh
     assert holder_kwargs["mp_policy"] == "FP32_MP"
+
+    block_call = _find_call_by_first_arg(fully_shard_mock, block)
+    assert block_call is not None
+    assert holder_param in block_call[1]["ignored_params"]
 
 
 def test_apply_fsdp_skips_separate_wrapping_for_tied_embeddings(monkeypatch):

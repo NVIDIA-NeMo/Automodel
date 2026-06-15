@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 
-from nemo_automodel.components.models.common.gated_delta_net_fp32 import HOLDER_NAME, isolate_fp32_params
+from nemo_automodel.components.models.common.gated_delta_net_fp32 import HOLDER_NAME
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextFp32GatedDeltaNet
 
 
@@ -29,29 +29,31 @@ def _expected_gate(a: torch.Tensor) -> torch.Tensor:
 
 def test_compute_gate_fallback_without_holder():
     gdn = _bare_gdn()
-    a = torch.zeros(4)
+    a = torch.zeros_like(gdn.A_log)
     g = gdn._compute_gate(a)
     assert g.dtype == torch.float32
     assert torch.allclose(g, _expected_gate(a), atol=1e-5)
 
 
 def test_compute_gate_routes_through_holder():
-    gdn = _bare_gdn()
-    isolate_fp32_params(gdn)
+    gdn = _constructed_gdn()
+    gdn._fp32_params.A_log.data.fill_(1.0)
+    gdn._fp32_params.dt_bias.data.zero_()
     assert HOLDER_NAME in gdn._modules
-    # A_log/dt_bias now resolve from the holder via __getattr__.
+    assert "A_log" not in gdn._parameters
+    assert "dt_bias" not in gdn._parameters
     assert gdn.A_log is gdn._fp32_params._parameters["A_log"]
+    assert gdn.dt_bias is gdn._fp32_params._parameters["dt_bias"]
 
-    a = torch.zeros(4)
+    a = torch.zeros_like(gdn.A_log)
     g = gdn._compute_gate(a)
     assert g.dtype == torch.float32
     assert torch.allclose(g, _expected_gate(a), atol=1e-5)
 
 
 def test_compute_gate_fp32_with_bf16_input():
-    gdn = _bare_gdn()
-    isolate_fp32_params(gdn)
-    g = gdn._compute_gate(torch.zeros(4, dtype=torch.bfloat16))
+    gdn = _constructed_gdn()
+    g = gdn._compute_gate(torch.zeros_like(gdn.A_log, dtype=torch.bfloat16))
     assert g.dtype == torch.float32
 
 
@@ -79,11 +81,24 @@ def test_constructor_forces_tracked_params_fp32_under_bf16_default_dtype():
 
     assert gdn.A_log.dtype == torch.float32
     assert gdn.dt_bias.dtype == torch.float32
-
-    holder = isolate_fp32_params(gdn)
-    assert holder is not None
     assert HOLDER_NAME in gdn._modules
     assert "A_log" not in gdn._parameters
     assert "dt_bias" not in gdn._parameters
-    assert holder.A_log.dtype == torch.float32
-    assert holder.dt_bias.dtype == torch.float32
+    assert gdn._fp32_params.A_log.dtype == torch.float32
+    assert gdn._fp32_params.dt_bias.dtype == torch.float32
+
+
+def _constructed_gdn() -> Qwen3NextFp32GatedDeltaNet:
+    cfg = Qwen3NextConfig(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=16,
+        rms_norm_eps=1e-6,
+        layer_types=["linear_attention"],
+    )
+    return Qwen3NextFp32GatedDeltaNet(cfg, layer_idx=0)
