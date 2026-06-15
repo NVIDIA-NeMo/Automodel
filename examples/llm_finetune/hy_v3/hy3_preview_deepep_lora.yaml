@@ -125,3 +125,7 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_name>
+
+ci:
+  # pp_size(1) * ep_size(64) = 64 GPUs => 8 nodes (8 H100/node).
+  nodes: 8
