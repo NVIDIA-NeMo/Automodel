@@ -363,8 +363,11 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # Pipeline-parallel routing: keep this VLM's own forward (which splices vision
     # features) instead of letting patch_hf_model_for_pp swap in the generic
     # CausalLM forward (which would drop pixel_values). MTP per-depth outputs are
-    # logits (shared lm_head); rotary buffers stay fp32.
-    _keep_in_fp32_modules = ["rotary_emb"]
+    # logits (shared lm_head); rotary buffers stay fp32. "rotary_emb" covers the text
+    # rope; "inv_freq" additionally pins the vision tower's rotary buffer
+    # (vision_encoder.py) fp32 — the bf16 cast would otherwise round it and degrade
+    # vision RoPE (see llama/rope_utils.py).
+    _keep_in_fp32_modules = ["rotary_emb", "inv_freq"]
     _pp_keep_self_forward: bool = True
     mtp_outputs_are_logits = True
     # The state-dict adapter fully populates every tensor from the checkpoint

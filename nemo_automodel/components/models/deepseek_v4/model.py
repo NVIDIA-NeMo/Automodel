@@ -574,6 +574,10 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         "self_attn.compressor.indexer.ape",
         "e_score_correction_bias",
         "lm_head",
+        # RoPE inv_freq (matches rotary_emb + rotary_emb_compress) must stay fp32: the
+        # bf16 cast in initialize_weights would otherwise round it and degrade rotary
+        # precision vs HF (see llama/rope_utils.py).
+        "rotary_emb",
     ]
 
     @dataclass(frozen=True)
