@@ -35,7 +35,8 @@ from typing import Any, Optional
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 
 _FP32_PARAMS_TO_BARE = re.compile(r"(\.linear_attn)\._fp32_params\.")
-_BARE_FP32_PARAM_NAMES = ("A_log",)
+# Both SSM-gating params live in the fp32 ``SSMGate`` holder; route both on load.
+_BARE_FP32_PARAM_NAMES = ("A_log", "dt_bias")
 _MTP_HF_TO_NATIVE = {
     "mtp.fc.weight": "mtp.layers.0.eh_proj.weight",
     "mtp.pre_fc_norm_embedding.weight": "mtp.layers.0.enorm.weight",

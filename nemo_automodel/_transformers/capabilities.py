@@ -102,6 +102,10 @@ def _is_hybrid(model: "nn.Module") -> bool:
     inner = getattr(model, "language_model", None)
     if inner is not None:
         candidates.append(getattr(inner, "config", None))
+    # VLM configs nest the decoder config under ``text_config``.
+    for c in list(candidates):
+        if c is not None:
+            candidates.append(getattr(c, "text_config", None))
     for config in candidates:
         if config is None:
             continue
@@ -110,6 +114,11 @@ def _is_hybrid(model: "nn.Module") -> bool:
             if pattern and any(str(c).upper() == "M" for c in pattern):
                 return True
         if getattr(config, "is_hybrid_model", False) is True:
+            return True
+        # Qwen3.5 / Qwen3-Next style: per-layer ``layer_types`` mixing
+        # ``linear_attention`` (gated-delta / SSM) with ``full_attention``.
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types and any(str(t) == "linear_attention" for t in layer_types):
             return True
     return False
 

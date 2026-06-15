@@ -627,6 +627,17 @@ class TestConvertSingleTensorToHf:
         assert result[0][0] == "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"
         assert torch.equal(result[0][1], tensor)
 
+    def test_strips_fp32_holder_segment_on_save(self, adapter):
+        # The fp32 SSM-gating holder is stripped back to the bare HF key on save.
+        tensor = torch.randn(8)
+        fqn = "model.language_model.layers.0.linear_attn._fp32_params.A_log"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+        assert len(result) == 1
+        assert result[0][0] == "model.language_model.layers.0.linear_attn.A_log"
+        assert torch.equal(result[0][1], tensor)
+
     def test_non_expert_tensor_passthrough(self, adapter):
         tensor = torch.randn(64, 64)
         fqn = "model.language_model.layers.0.self_attn.q_proj.weight"
@@ -793,3 +804,73 @@ class TestFromHFEpShard:
         # No ep_shard slicing — full transposed tensor
         assert local_gate.shape == (n_experts, hidden, inter)
         torch.testing.assert_close(local_gate, gate_up_hf.transpose(1, 2).to(adapter.dtype))
+
+
+class TestFp32ParamRouting:
+    """Routing/stripping of SSM-gating params into/out of the fp32 holder."""
+
+    def test_strip_fp32_params_removes_holder_segment(self):
+        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _strip_fp32_params
+
+        assert (
+            _strip_fp32_params("model.language_model.layers.0.linear_attn._fp32_params.A_log")
+            == "model.language_model.layers.0.linear_attn.A_log"
+        )
+        assert (
+            _strip_fp32_params("model.language_model.layers.0.linear_attn._fp32_params.dt_bias")
+            == "model.language_model.layers.0.linear_attn.dt_bias"
+        )
+
+    def test_strip_fp32_params_passthrough(self):
+        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _strip_fp32_params
+
+        for key in (
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.linear_attn.norm.weight",
+        ):
+            assert _strip_fp32_params(key) == key
+
+    def test_route_fp32_params_routes_gating_keys(self):
+        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _route_fp32_params
+
+        assert (
+            _route_fp32_params("model.language_model.layers.0.linear_attn.A_log")
+            == "model.language_model.layers.0.linear_attn._fp32_params.A_log"
+        )
+        assert (
+            _route_fp32_params("model.language_model.layers.0.linear_attn.dt_bias")
+            == "model.language_model.layers.0.linear_attn._fp32_params.dt_bias"
+        )
+
+    def test_route_fp32_params_passthrough(self):
+        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _route_fp32_params
+
+        # Already routed, non-gating param, and a non-linear_attn A_log all pass through.
+        for key in (
+            "model.language_model.layers.0.linear_attn._fp32_params.A_log",
+            "model.language_model.layers.0.linear_attn.norm.weight",
+            "model.some.other.path.A_log",
+        ):
+            assert _route_fp32_params(key) == key
+
+    def test_route_strip_round_trip(self):
+        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import (
+            _route_fp32_params,
+            _strip_fp32_params,
+        )
+
+        bare = "model.language_model.layers.3.linear_attn.A_log"
+        assert _strip_fp32_params(_route_fp32_params(bare)) == bare
+
+    def test_from_hf_routes_gating_keys_into_holder(self, adapter):
+        # On load, bare HF SSM-gating keys are routed into the fp32 holder.
+        hf_state = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.randn(8),
+            "model.language_model.layers.0.linear_attn.dt_bias": torch.randn(8),
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        assert "model.language_model.layers.0.linear_attn._fp32_params.A_log" in out
+        assert "model.language_model.layers.0.linear_attn._fp32_params.dt_bias" in out
+        assert "model.language_model.layers.0.linear_attn.A_log" not in out
