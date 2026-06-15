@@ -120,12 +120,22 @@ def test_collator_end_to_end_no_prefix():
 def test_collator_with_prefix_and_pad_multiple():
     tok = FakeTokenizer()
     collator = rc.BiEncoderCollator(
-        tokenizer=tok, q_max_len=32, p_max_len=32, query_prefix="Q:", passage_prefix="D:", padding=True, pad_to_multiple_of=4
+        tokenizer=tok,
+        q_max_len=32,
+        p_max_len=32,
+        query_prefix="Q:",
+        passage_prefix="D:",
+        padding=True,
+        pad_to_multiple_of=4,
     )
     # Make varying lengths so padding is exercised and rounded to multiple-of 4
     batch = [
         {"question": "short", "doc_text": ["tiny", "a bit longer"], "doc_image": ["", ""]},
-        {"question": "this is a somewhat longer question", "doc_text": ["short doc", "this is a longish doc text"], "doc_image": ["", ""]},
+        {
+            "question": "this is a somewhat longer question",
+            "doc_text": ["short doc", "this is a longish doc text"],
+            "doc_image": ["", ""],
+        },
     ]
     out = collator(batch)
     # Verify padding rounded to multiple of 4
@@ -220,3 +230,22 @@ def test_collator_with_dataset_instruction():
     # The instruction adds 12 words, so we should see significantly more tokens
     assert with_instruction_tokens > without_instruction_tokens
     assert with_instruction_tokens - without_instruction_tokens > 10  # At least 10 more tokens from instruction
+
+
+def test_make_vision_collator_from_processor_method_validates_method_name():
+    class FakeProcessor:
+        not_callable = "not a collator"
+
+        def collate(self, batch):
+            return {"size": len(batch)}
+
+    processor = FakeProcessor()
+
+    collator = rc.make_vision_collator_from_processor_method(processor, "collate")
+    assert collator([{"x": 1}, {"x": 2}]) == {"size": 2}
+
+    with pytest.raises(ValueError, match="no collator method"):
+        rc.make_vision_collator_from_processor_method(processor, "missing")
+
+    with pytest.raises(ValueError, match="not callable"):
+        rc.make_vision_collator_from_processor_method(processor, "not_callable")
