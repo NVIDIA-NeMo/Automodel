@@ -183,6 +183,18 @@ class LlamaRotaryEmbedding(nn.Module):
         compute_fn = rope_functions.get(rope_type, _compute_llama3_inv_freq)
         inv_freq, self.attention_scaling = compute_fn(config, device)
 
+        # Keep the config + compute fn so ``_build_cache`` can recompute ``inv_freq``
+        # in float32. ``LlamaForCausalLM.__init__`` casts the whole model via
+        # ``self.to(config.torch_dtype)``, and ``nn.Module.to`` rounds floating-point
+        # buffers -- so the ``inv_freq`` buffer registered below is downcast to bf16.
+        # Building the cos/sin tables from that bf16-rounded buffer degrades RoPE
+        # precision relative to HuggingFace (which keeps ``inv_freq`` in float32) and
+        # surfaces as a large logit divergence when a checkpoint is reloaded in
+        # vanilla HF. Recomputing from config keeps the tables float32-accurate
+        # regardless of the model's parameter dtype.
+        self._rope_config = config
+        self._inv_freq_compute_fn = compute_fn
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("_cos_cache", None, persistent=False)
         self.register_buffer("_sin_cache", None, persistent=False)
@@ -192,9 +204,14 @@ class LlamaRotaryEmbedding(nn.Module):
         """Build cos/sin cache in config dtype for positions [0, seq_len)."""
         self.max_seq_len_cached = seq_len
 
-        # Compute in float32 for precision, then convert to target dtype
+        # Compute in float32 for precision, then convert to target dtype.
+        # Recompute inv_freq from config instead of reading ``self.inv_freq``: the
+        # registered buffer is rounded to the model dtype (e.g. bf16) by the
+        # model-wide ``.to()`` in ``LlamaForCausalLM.__init__``, and upcasting a
+        # bf16 buffer back to float32 cannot recover the lost precision. See __init__.
         t = torch.arange(seq_len, device=device, dtype=torch.float32)
-        inv_freq = self.inv_freq.to(device=device, dtype=torch.float32)
+        inv_freq, _ = self._inv_freq_compute_fn(self._rope_config, device)
+        inv_freq = inv_freq.to(device=device, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)  # [seq, head_dim]
 

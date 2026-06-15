@@ -77,6 +77,7 @@ except (ModuleNotFoundError, ImportError, AttributeError):
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -503,6 +504,10 @@ class Gemma4MoEModel(HFGemma4Model):
 # ---------------------------------------------------------------------------
 class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin):
     supports_gradient_checkpointing = True
+    # RoPE inv_freq must stay fp32: initialize_weights casts the model to bf16 and
+    # nn.Module.to rounds floating buffers; cast_model_to_dtype restores keep-fp32
+    # modules afterwards (see llama/rope_utils.py).
+    _keep_in_fp32_modules = ["rotary_emb"]
     """Gemma4 VL conditional generation model with NeMo MoE backend.
 
     When the checkpoint has ``enable_moe_block=True`` in its text config,
@@ -759,7 +764,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         # Needed only when constructing the model directly, doesn't affect when loading a ckpt via from_pretrained().
         language_model = self.model.language_model
         if not isinstance(language_model, Gemma4MoETextModelBackend):
-            self.to(dtype)
+            cast_model_to_dtype(self, dtype)
             return
 
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -768,7 +773,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             for layer in language_model.layers.values():
                 layer.moe.init_weights(buffer_device)
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
 
 
 if _GEMMA4_HF_AVAILABLE:
