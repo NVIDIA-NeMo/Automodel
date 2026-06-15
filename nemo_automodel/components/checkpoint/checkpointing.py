@@ -25,13 +25,23 @@ import torch
 import torch.distributed.checkpoint as dcp
 import yaml
 
+try:
+    import multistorageclient as msc
+
+    MSC_AVAILABLE = True
+except ImportError:
+    msc = None
+    MSC_AVAILABLE = False
+
 # Safe import of HF_HUB_CACHE from huggingface_hub.constants
 try:
     from huggingface_hub.constants import HF_HUB_CACHE
 except ImportError:
     HF_HUB_CACHE = None
 
+from safetensors.torch import load as safetensors_load
 from safetensors.torch import load_file, save_file
+from safetensors.torch import save as safetensors_save
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -113,6 +123,71 @@ def _normalize_dtype_mapping_to_state_dict_keys(
                 normalized[prefixed_fqn] = dtype_str
 
     return normalized
+
+
+def is_cloud_path(path: str) -> bool:
+    """Check if path is a cloud storage path (MSC)."""
+    return path.startswith("msc://")
+
+
+def _ensure_msc_available() -> None:
+    """Raise an error if MSC is not installed but a cloud path is used."""
+    if not MSC_AVAILABLE:
+        raise ImportError(
+            "multistorageclient is required for cloud storage paths. "
+            "Install it with: pip install multi-storage-client "
+            "--index-url https://pypi.nvidia.com"
+        )
+
+
+def _adapter_path(checkpoint_dir: str) -> str:
+    """Return the PEFT adapter safetensors path inside a checkpoint dir (local or ``msc://``)."""
+    if is_cloud_path(checkpoint_dir):
+        return checkpoint_dir.rstrip("/") + "/adapter_model.safetensors"
+    return os.path.join(checkpoint_dir, "adapter_model.safetensors")
+
+
+def _save_safetensors(state_dict: dict[str, torch.Tensor], path: str) -> None:
+    """Write a safetensors file to a local path or an ``msc://`` cloud path.
+
+    For cloud paths the tensors are serialized to bytes and streamed to the MSC
+    file handle, since ``save_file`` only accepts a local filesystem path.
+    """
+    if is_cloud_path(path):
+        _ensure_msc_available()
+        with msc.open(path, "wb") as f:
+            f.write(safetensors_save(state_dict))
+    else:
+        save_file(state_dict, path)
+
+
+def _load_safetensors(path: str) -> dict[str, torch.Tensor]:
+    """Read a safetensors file from a local path or an ``msc://`` cloud path."""
+    if is_cloud_path(path):
+        _ensure_msc_available()
+        with msc.open(path, "rb") as f:
+            return safetensors_load(f.read())
+    return load_file(path)
+
+
+def _maybe_msc_reader(
+    path: str, storage_reader: Optional[_HuggingFaceStorageReader]
+) -> Optional[_HuggingFaceStorageReader]:
+    """Return an MSC filesystem reader for ``msc://`` paths, else the given reader."""
+    if storage_reader is None and is_cloud_path(path):
+        _ensure_msc_available()
+        return msc.torch.MultiStorageFileSystemReader(path)
+    return storage_reader
+
+
+def _maybe_msc_writer(
+    path: str, storage_writer: Optional[_HuggingFaceStorageWriter]
+) -> Optional[_HuggingFaceStorageWriter]:
+    """Return an MSC filesystem writer for ``msc://`` paths, else the given writer."""
+    if storage_writer is None and is_cloud_path(path):
+        _ensure_msc_available()
+        return msc.torch.MultiStorageFileSystemWriter(path)
+    return storage_writer
 
 
 def _is_safetensors_checkpoint(path: str) -> bool:
@@ -473,6 +548,7 @@ class Checkpointer:
         is_init_step: bool = False,
         use_checkpoint_id: bool = True,
         key_mapping: Optional[dict[str, str]] = None,
+        allow_checkpoint_key_subset: bool = False,
     ) -> None:
         """
         Load model weights from `model_path`.
@@ -489,9 +565,11 @@ class Checkpointer:
             is_init_step: If True, treat load as initialization from a base checkpoint.
             use_checkpoint_id: Pass `checkpoint_id` to DCP if True; disable when using direct HF paths.
             key_mapping: Optional key remapping when reading from HF checkpoints.
+            allow_checkpoint_key_subset: If True, keep the model's current initialization for
+                parameters that are absent from the checkpoint instead of requiring an exact key match.
         """
         # Validate checkpoint directory
-        if not os.path.exists(model_path):
+        if not os.path.exists(model_path) and not is_cloud_path(model_path):
             raise FileNotFoundError(f"Model path {model_path} does not exist")
         model_state = ModelState(
             model,
@@ -610,7 +688,9 @@ class Checkpointer:
         # keys: the storage reader renames checkpoint keys in metadata, and then to_hf also
         # renames model keys, producing a mismatch in the DCP planner.
         reader_key_mapping = None if has_state_dict_adapter else key_mapping
-        storage_reader = self._get_storage_reader(model_path, reader_key_mapping, is_init_step=is_init_step)
+        storage_reader = self._get_storage_reader(
+            model_path, reader_key_mapping, is_init_step=is_init_step, is_safetensors=is_safetensors
+        )
 
         # MoE adapters return views into model storage; DCP writes safetensors
         # data straight through them and from_hf skips the rebuild.
@@ -629,8 +709,10 @@ class Checkpointer:
             and isinstance(lm_head_param_name, str)
             and lm_head_param_name in state_dict
         )
-        if should_try_tied_lm_head_compat:
+        checkpoint_metadata_keys: set[str] = set()
+        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset:
             checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+        if should_try_tied_lm_head_compat:
             if lm_head_param_name not in checkpoint_metadata_keys:
                 for source_name in get_tied_lm_head_source_names(model_state.model[0], lm_head_param_name):
                     if source_name not in checkpoint_metadata_keys or source_name in state_dict:
@@ -655,6 +737,46 @@ class Checkpointer:
                     )
                     state_dict.pop(lm_head_param_name, None)
 
+        if allow_checkpoint_key_subset:
+            missing_checkpoint_keys = sorted(key for key in state_dict if key not in checkpoint_metadata_keys)
+            # A subset load tolerates a few absent keys (e.g. heads excluded at save time);
+            # a checkpoint sharing NO keys with the model is a wrong or unreadable checkpoint
+            # and must not become a silent no-op load.
+            if missing_checkpoint_keys and len(missing_checkpoint_keys) == len(state_dict):
+                raise RuntimeError(
+                    f"Checkpoint {model_path} contains none of the {len(state_dict)} requested model keys "
+                    f"(checkpoint has {len(checkpoint_metadata_keys)} keys, examples="
+                    f"{sorted(checkpoint_metadata_keys)[:5]}). Refusing to continue with "
+                    "allow_checkpoint_key_subset=True because the load would be a no-op."
+                )
+            # Subset loading means the checkpoint keys must be a SUBSET of the model keys
+            # (the model may carry extra heads kept at init). Keys the checkpoint has but the
+            # model lacks signal that the wrong architecture was built (e.g. a VLM checkpoint
+            # loaded into an LLM model would drop the vision tower), so refuse rather than
+            # silently export a partial model. lm_head is never a false positive here: it is
+            # only popped from state_dict when it is also absent from the checkpoint.
+            unmatched_checkpoint_keys = sorted(
+                key for key in checkpoint_metadata_keys if key not in state_dict and not key.endswith("_extra_state")
+            )
+            if unmatched_checkpoint_keys:
+                raise RuntimeError(
+                    f"Checkpoint {model_path} has {len(unmatched_checkpoint_keys)} keys absent from the built "
+                    f"model (examples={unmatched_checkpoint_keys[:5]}). The model was likely constructed with the "
+                    "wrong architecture for this checkpoint (e.g. exporting a VLM checkpoint with an LLM recipe). "
+                    "Rebuild the model with the recipe that produced the checkpoint."
+                )
+            if missing_checkpoint_keys:
+                for key in missing_checkpoint_keys:
+                    state_dict.pop(key, None)
+                logging.warning(
+                    "Checkpoint %s is missing %d requested model keys. Keeping the current model "
+                    "initialization for those parameters because allow_checkpoint_key_subset=True "
+                    "(examples=%s).",
+                    model_path,
+                    len(missing_checkpoint_keys),
+                    missing_checkpoint_keys[:10],
+                )
+
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
 
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
@@ -663,6 +785,10 @@ class Checkpointer:
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
         loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
+        if allow_checkpoint_key_subset:
+            # Keys deliberately kept at init were already warned about above; keep
+            # reporting unexpected keys, which nothing else surfaces.
+            expected_keys_for_diff &= loaded_keys_for_diff
         key_diff = _summarize_state_dict_key_diff(expected_keys_for_diff, loaded_keys_for_diff)
         if key_diff["missing_count"] or key_diff["unexpected_count"]:
             logging.warning(
@@ -674,7 +800,10 @@ class Checkpointer:
                 key_diff["missing_examples"],
                 key_diff["unexpected_examples"],
             )
-        model_state.load_state_dict(state_dict, strict=not (len(model_state.model) > 1 or has_state_dict_adapter))
+        model_state.load_state_dict(
+            state_dict,
+            strict=not (len(model_state.model) > 1 or has_state_dict_adapter or allow_checkpoint_key_subset),
+        )
 
         del state_dict
         gc.collect()
@@ -958,8 +1087,9 @@ class Checkpointer:
         is_model = True if "/model" in path else False
         # PEFT loading is broadcasted from rank0 so it is a special case
         if self.config.is_peft and is_model and (not is_init_step):
-            state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
+            state_dict = _load_safetensors(_adapter_path(path))
         else:
+            storage_reader = _maybe_msc_reader(path, storage_reader)
             dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
         return state_dict
 
@@ -985,13 +1115,17 @@ class Checkpointer:
         # PEFT saving is done on rank0 so it is a special case
         if self.config.is_peft and is_model:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                save_file(state_dict, os.path.join(path, "adapter_model.safetensors"))
+                _save_safetensors(state_dict, _adapter_path(path))
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
             return
 
         ret = None
         planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
+
+        # Routes to MSC storage write for cloud paths
+        storage_writer = _maybe_msc_writer(path, storage_writer)
+
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx
             ret = dcp.async_save(
@@ -1233,7 +1367,11 @@ fi
             )
 
     def _get_storage_reader(
-        self, model_path: str, key_mapping: Optional[dict[str, str]], is_init_step: bool = False
+        self,
+        model_path: str,
+        key_mapping: Optional[dict[str, str]],
+        is_init_step: bool = False,
+        is_safetensors: bool | None = None,
     ) -> Optional[_HuggingFaceStorageReader]:
         """
         Construct a Hugging Face storage reader when loading safetensors or during init.
@@ -1248,29 +1386,38 @@ fi
             model_path: Path to the model checkpoint directory or HF snapshot.
             key_mapping: Optional key remapping for conversion.
             is_init_step: If True, always produce a reader for base HF load.
+            is_safetensors: Whether `model_path` holds a safetensors checkpoint; computed
+                from the directory contents when not supplied.
 
         Returns:
-            Configured storage reader or None for other formats.
+            Configured storage reader, or None for the default DCP FileSystemReader.
         """
-        if self.config.model_save_format == SerializationFormat.SAFETENSORS or is_init_step:
-            # The upstream HuggingFaceStorageReader delegates dtype decoding to
-            # safetensors.torch._TYPES, which does not yet recognize the FP8
-            # scale dtypes emitted by some quantized HF checkpoints (e.g.
-            # DeepSeek V4's F8_E8M0 scales → KeyError('F8_E8M0') inside
-            # read_metadata → DCP ends up with metadata=None on every rank).
-            # The in-tree backport's DTYPE_MAP was extended for F8_E8M0/F8_E5M2,
-            # so prefer it for base-model HF loads. Mid-training DCP loads may
-            # still use the faster upstream reader.
-            if key_mapping is None and not is_init_step:
-                try:
-                    from torch.distributed.checkpoint.hf_storage import (
-                        HuggingFaceStorageReader as _UpstreamHFReader,
-                    )
+        # The configured save format does not always match what is on disk at `model_path`
+        # (e.g. exporting a torch_save DCP checkpoint with a safetensors-configured
+        # checkpointer). A safetensors reader on a non-safetensors directory returns EMPTY
+        # metadata instead of raising, so trust the directory contents for non-init loads.
+        if is_safetensors is None:
+            is_safetensors = _is_safetensors_checkpoint(model_path)
+        if not is_init_step and not is_safetensors:
+            return None
+        # The upstream HuggingFaceStorageReader delegates dtype decoding to
+        # safetensors.torch._TYPES, which does not yet recognize the FP8
+        # scale dtypes emitted by some quantized HF checkpoints (e.g.
+        # DeepSeek V4's F8_E8M0 scales → KeyError('F8_E8M0') inside
+        # read_metadata → DCP ends up with metadata=None on every rank).
+        # The in-tree backport's DTYPE_MAP was extended for F8_E8M0/F8_E5M2,
+        # so prefer it for base-model HF loads. Mid-training DCP loads may
+        # still use the faster upstream reader.
+        if key_mapping is None and not is_init_step:
+            try:
+                from torch.distributed.checkpoint.hf_storage import (
+                    HuggingFaceStorageReader as _UpstreamHFReader,
+                )
 
-                    return _UpstreamHFReader(path=model_path)
-                except ImportError:
-                    pass
-            return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
+                return _UpstreamHFReader(path=model_path)
+            except ImportError:
+                pass
+        return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
     def _get_original_model_path(self, model_state: ModelState) -> str | None:
         """
@@ -1383,8 +1530,14 @@ def save_config(config: dict[str, Any], weights_path: str) -> None:
         config: Config to save
         weights_path: Path to save config
     """
-    with open(os.path.join(weights_path, "config.yaml"), "w") as f:
-        yaml.dump(config, f, sort_keys=False, default_flow_style=False)
+    config_path = os.path.join(weights_path, "config.yaml")
+    if is_cloud_path(weights_path):
+        _ensure_msc_available()
+        with msc.open(config_path, "w") as f:
+            yaml.dump(config, f, sort_keys=False, default_flow_style=False)
+    else:
+        with open(config_path, "w") as f:
+            yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
 
 def _ensure_dirs(*dirs: Optional[str]) -> None:
@@ -1396,7 +1549,8 @@ def _ensure_dirs(*dirs: Optional[str]) -> None:
     """
     for d in dirs:
         if d:
-            os.makedirs(d, exist_ok=True)
+            if not is_cloud_path(d):
+                os.makedirs(d, exist_ok=True)
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 

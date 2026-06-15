@@ -148,3 +148,47 @@ def test_rope_fused_path_does_not_sync_on_position_values():
     with patch.object(torch.Tensor, "max", _no_max):
         cos, sin, freqs = rope(x, torch.arange(6).unsqueeze(0))
     assert cos.shape == (1, 6, 8)
+
+
+def test_bf16_model_cast_does_not_degrade_inv_freq():
+    """A model-wide ``.to(bfloat16)`` must not degrade RoPE precision.
+
+    ``LlamaForCausalLM.__init__`` casts the whole model via
+    ``self.to(config.torch_dtype)``, and ``nn.Module.to`` rounds floating-point
+    buffers -- so the ``inv_freq`` buffer is downcast to bf16. Building the cos/sin
+    tables from that bf16-rounded buffer (then upcasting) loses precision relative to
+    HF, which keeps ``inv_freq`` in float32; the gap shows up as a large logit/KL
+    divergence when a checkpoint is reloaded in vanilla HF. The tables must therefore
+    be identical whether or not the module was cast to bf16.
+
+    Uses real Llama-3.2 rope params (``rope_theta=5e5`` + ``llama3`` scaling): the
+    low-frequency components are where the bf16 rounding error is largest.
+    """
+    config = LlamaConfig(
+        hidden_size=2048,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=64,
+        max_position_embeddings=131072,
+        rope_theta=500000.0,
+        rope_scaling={
+            "rope_type": "llama3",
+            "factor": 32.0,
+            "high_freq_factor": 4.0,
+            "low_freq_factor": 1.0,
+            "original_max_position_embeddings": 8192,
+        },
+        torch_dtype=torch.bfloat16,
+    )
+    x = torch.zeros(1, 9, config.hidden_size, dtype=torch.bfloat16)
+    pos = torch.arange(9).unsqueeze(0)
+
+    rope_ref = LlamaRotaryEmbedding(config)  # inv_freq stays float32
+    rope_cast = LlamaRotaryEmbedding(config).to(torch.bfloat16)  # mimics the model-wide cast
+    assert rope_cast.inv_freq.dtype == torch.bfloat16  # buffer is rounded by .to()
+
+    cos_ref, sin_ref = rope_ref(x, pos)
+    cos_cast, sin_cast = rope_cast(x, pos)
+    # Bit-for-bit: the cast module must still build its tables from float32 inv_freq.
+    torch.testing.assert_close(cos_cast, cos_ref, rtol=0, atol=0)
+    torch.testing.assert_close(sin_cast, sin_ref, rtol=0, atol=0)

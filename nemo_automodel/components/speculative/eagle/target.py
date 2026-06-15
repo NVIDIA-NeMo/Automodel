@@ -102,10 +102,32 @@ class Eagle3TargetBatch:
 class HFEagle3TargetModel(Eagle3TargetBackend):
     """Co-located backend that captures three auxiliary hidden states from a causal LM."""
 
-    def __init__(self, model: nn.Module, aux_layer_ids: Sequence[int] | None = None):
+    def __init__(self, model: nn.Module, aux_layer_ids: Sequence[int] | None = None, cp_mesh=None):
         self.model = model.eval()
         candidate_ids = list(aux_layer_ids) if aux_layer_ids is not None else self._default_aux_layer_ids()
         self.aux_layer_ids = self._validate_aux_layer_ids(candidate_ids)
+        # Context parallelism shards the (frozen) target forward along the sequence
+        # dim; generate_batch gathers the aux/logits back to the full sequence so
+        # the draft stays CP-unaware. cp_mesh is the "cp" device submesh (or None).
+        self.cp_mesh = cp_mesh
+        self._cp_size = cp_mesh.size() if cp_mesh is not None else 1
+        if self._cp_size > 1:
+            from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+
+            attach_context_parallel_hooks(self.model)
+            n_self_attn = sum(1 for name, _ in self.model.named_modules() if name.endswith("self_attn"))
+            if n_self_attn == 0:
+                raise ValueError(
+                    "Context parallelism requires the target's attention modules to be named "
+                    "'*self_attn' (so the causal mask is fixed under sequence sharding), but none "
+                    "were found on the target model."
+                )
+
+    def _check_captured(self, captured: dict[int, torch.Tensor]) -> None:
+        if len(captured) != len(self.aux_layer_ids):
+            raise RuntimeError(
+                f"Expected {len(self.aux_layer_ids)} captured aux layers but got {len(captured)}: {sorted(captured)}"
+            )
 
     def _default_aux_layer_ids(self) -> list[int]:
         # EAGLE-3 default 3-layer recipe (low / mid / high).
@@ -258,24 +280,54 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
                 )
 
         try:
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=target_attention_mask,
-                **extra_kwargs,
-            )
+            if self._cp_size > 1:
+                # Context parallelism: shard the sequence, run the target as ring
+                # attention, then gather aux/logits back to the full sequence.
+                # Packing (which needs the 4D block-causal mask) is gated off
+                # upstream, so attention_mask is None and the self_attn hooks force
+                # is_causal.
+                from nemo_automodel.components.distributed.cp_utils import gather_cp_seq, make_target_cp_ctx
+
+                if "position_ids" not in forward_params:
+                    raise ValueError(
+                        "Context parallelism requires the target model's forward to accept `position_ids`."
+                    )
+                cp_ctx, cp_input_ids, cp_position_ids, orig_len = make_target_cp_ctx(
+                    self.cp_mesh, input_ids, position_ids
+                )
+                cp_extra = {k: v for k, v in extra_kwargs.items() if k != "position_ids"}
+                with cp_ctx:
+                    outputs = self.model(
+                        input_ids=cp_input_ids,
+                        attention_mask=None,
+                        position_ids=cp_position_ids,
+                        **cp_extra,
+                    )
+                    raw_logits = outputs.logits if hasattr(outputs, "logits") else outputs
+                    self._check_captured(captured)
+                    # Gather inside the CP context, before the hooks are removed.
+                    gathered = gather_cp_seq(
+                        self.cp_mesh,
+                        [captured[layer_id] for layer_id in self.aux_layer_ids] + [raw_logits],
+                        seq_dim=1,
+                        orig_len=orig_len,
+                    )
+                aux_hidden_states = torch.cat(gathered[:-1], dim=-1)
+                target_logits = gathered[-1]
+            else:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=target_attention_mask,
+                    **extra_kwargs,
+                )
+                self._check_captured(captured)
+                aux_hidden_states = torch.cat([captured[layer_id] for layer_id in self.aux_layer_ids], dim=-1)
+                # HF causal LM outputs wrap logits in a dataclass; AutoModel's
+                # custom causal LM returns the logits tensor directly.
+                target_logits = outputs.logits if hasattr(outputs, "logits") else outputs
         finally:
             for handle in handles:
                 handle.remove()
-
-        if len(captured) != len(self.aux_layer_ids):
-            raise RuntimeError(
-                f"Expected {len(self.aux_layer_ids)} captured aux layers but got {len(captured)}: {sorted(captured)}"
-            )
-
-        aux_hidden_states = torch.cat([captured[layer_id] for layer_id in self.aux_layer_ids], dim=-1)
-        # HF causal LM outputs wrap logits in a dataclass; AutoModel's
-        # custom causal LM returns the logits tensor directly.
-        target_logits = outputs.logits if hasattr(outputs, "logits") else outputs
         shifted_logits = _shift_left_with_zero(target_logits)
         shifted_input_ids = _shift_left_with_zero(input_ids)
         shifted_loss_mask = _shift_left_with_zero(loss_mask)
