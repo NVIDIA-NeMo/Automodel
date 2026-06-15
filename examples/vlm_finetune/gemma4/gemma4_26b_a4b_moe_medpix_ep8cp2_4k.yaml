@@ -12,68 +12,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# TP4+PP4 on 2 nodes (16 GPUs): tp=4, pp=4, dp=1. global_batch=4, local_batch=4
-# Submit via slurm: sbatch sub_qwen35_27b_tp4pp4.sh
+# Gemma 4 26B-A4B MoE — MedPix-VQA fine-tuning at EP8 x CP2, 4k sequence length.
+# Topology on 8 GPUs: EP8 x CP2 x DP4 (dp_size = world / (tp*cp) = 8/2 = 4;
+# ep_size=8 divides dp_size*cp_size = 8). CP shards the 4k sequence across 2
+# ranks; the frozen vision/audio towers and embeddings are kept frozen.
+#
+# Run (single node, 8 GPUs):
+#   torchrun --standalone --nproc-per-node=8 examples/vlm_finetune/finetune.py \
+#     -c examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_medpix_ep8cp2_4k.yaml
 
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
-  global_batch_size: 32
-  local_batch_size: 4
-  ckpt_every_steps: 2000
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 500
   val_every_steps: 500
-  num_epochs: 10
-  max_steps: 30
+  max_steps: 100
+  num_epochs: 1
 
 dist_env:
   backend: nccl
-  timeout_minutes: 10
+  timeout_minutes: 60
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 1234
+  seed: 42
   ranked: true
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3.5-27B
+  pretrained_model_name_or_path: google/gemma-4-26B-A4B-it
+  torch_dtype: torch.bfloat16
+  trust_remote_code: true
+  attn_implementation: eager
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa
-    linear: torch
-    rms_norm: torch
-    rope_fusion: false
-  attn_implementation: sdpa
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: true
+    dispatcher: deepep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+  text_config:
+    use_cache: false
 
 processor:
-  _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3.5-27B
+  padding_side: right
 
 checkpoint:
   enabled: false
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  tp_size: 4
-  cp_size: 1
-  pp_size: 4
-  dp_replicate_size: 1
-  ep_size: 1
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 2
+  ep_size: 8
   sequence_parallel: false
-  activation_checkpointing: true
-  defer_fsdp_grad_sync: false
-
-  pipeline:
-    pp_schedule: 1f1b
-    pp_microbatch_size: 1
-    scale_grads_in_schedule: false
-    round_virtual_stages_to_pp_multiple: up
-    dtype: bf16
-
-freeze_config:
-  freeze_vision_tower: true
-  freeze_audio_tower: true
-  freeze_language_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -86,17 +84,19 @@ dataset:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 0
+  pin_memory: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
+    max_length: 4096
 
 optimizer:
   _target_: torch.optim.AdamW
+  lr: 2e-5
+  weight_decay: 0.01
   betas: [0.9, 0.95]
-  eps: 1e-8
-  lr: 1.0e-5
-  weight_decay: 0.1
 
-# wandb:
-#   project: <your-project>
-#   entity: <your-entity>
-#   name: <your-run-name>
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false

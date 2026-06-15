@@ -265,14 +265,17 @@ class Qwen3NextAttention(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
+        # Use -1 for the head dim so the (possibly tensor-parallel-sharded) local
+        # head count is inferred from the projection output. Without TP this equals
+        # the full head count; with TP (colwise q/k/v_proj) it is heads // tp_size.
         if qkv_format == "thd":
-            q = q.view(num_tokens, self.num_heads, self.head_dim * 2)
-            k = k.view(num_tokens, self.num_kv_heads, self.head_dim)
-            v = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+            q = q.view(num_tokens, -1, self.head_dim * 2)
+            k = k.view(num_tokens, -1, self.head_dim)
+            v = v.view(num_tokens, -1, self.head_dim)
         else:
-            q = q.view(bsz, seqlen, self.num_heads, self.head_dim * 2)
-            k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-            v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            q = q.view(bsz, seqlen, -1, self.head_dim * 2)
+            k = k.view(bsz, seqlen, -1, self.head_dim)
+            v = v.view(bsz, seqlen, -1, self.head_dim)
 
         q, gate = torch.chunk(q, 2, dim=-1)
         gate = gate.reshape(*x.shape[:-1], -1)

@@ -33,33 +33,8 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDeltaNet
 
-from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
-    Fp32GateParamHolder,
-    force_fp32_gated_delta_net_params,
-    isolate_fp32_params,
-    make_fp32_getattr,
-    mark_gated_delta_net_fp32_params,
-    mark_keep_in_fp32_modules_strict,
-)
 from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
-
-# Backwards-compatible aliases (the holder + getattr helpers were factored out
-# into ``common.gated_delta_net_fp32`` so the native Qwen3.5-MoE and Qwen3-Next
-# paths can reuse them). Existing imports of these private names keep working.
-_Fp32ParamHolder = Fp32GateParamHolder
-_make_fp32_getattr = make_fp32_getattr
-
-
-def apply_model_runtime_patches(model, mesh=None):
-    """Apply Qwen3.5 runtime patches after model construction.
-
-    The GatedDeltaNet wrapper is needed for both distributed training and
-    single-GPU packed-sequence runs, so it must run before sharding or first
-    forward rather than only from the FSDP parallelization strategy.
-    """
-    cp_enabled = getattr(mesh, "cp_size", 1) > 1
-    patch_hf_model(model, cp_enabled=cp_enabled)
-    return model
+from nemo_automodel.shared.utils import dtype_from_str
 
 
 class _AllGatherConcatFn(Function):
@@ -92,37 +67,59 @@ class _AllGatherConcatFn(Function):
         return grad_local, None, None
 
 
+class _SSMGateParam:
+    """Get-only (non-data) descriptor exposing an ``SSMGate`` param as an attribute.
+
+    Lets ``self.A_log`` / ``self.dt_bias`` resolve to the fp32 ``SSMGate`` holder
+    (``self._fp32_params``) without a ``__getattr__`` monkeypatch. Being a non-data
+    descriptor, it does not intercept assignment, so HF's ``__init__`` doing
+    ``self.A_log = nn.Parameter(...)`` still routes through ``nn.Module.__setattr__``
+    into ``_parameters`` (where it lives until ``install_ssm_gate`` moves it).
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __get__(self, obj, owner=None):
+        if obj is None:
+            return self
+        return getattr(obj._fp32_params, self.name)
+
+
 class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
     """Drop-in replacement for ``Qwen3_5MoeGatedDeltaNet`` with FLA Context Parallelism.
 
-    All ``__init__`` parameters and weights are inherited unchanged from the HF
-    class.  The only addition is ``_cp_mesh`` which is set externally by
-    ``apply_cp`` in the parallelizer.
+    The SSM-gating params (``A_log``/``dt_bias``) are moved into a fp32 ``SSMGate``
+    submodule (``_fp32_params``) at construction so they keep fp32 storage (master
+    weights) even under a bf16 bulk dtype, and so FSDP can shard them in their own
+    dtype-uniform fp32 group. ``A_log``/``dt_bias`` remain readable as attributes via
+    get-only descriptors that resolve to the submodule — no ``__getattr__`` patch.
+
+    ``_cp_mesh`` is set externally by the parallelizer to enable context parallelism.
     """
 
     _cp_mesh: DeviceMesh | None
+    # Get-only (non-data) descriptors: reads resolve to the fp32 ``SSMGate`` holder,
+    # while writes during HF ``__init__`` (``self.A_log = nn.Parameter(...)``) still
+    # land in ``_parameters`` (handled by ``nn.Module.__setattr__``) before we move
+    # them into the holder.
+    A_log = _SSMGateParam("A_log")
+    dt_bias = _SSMGateParam("dt_bias")
 
     def __init__(self, config, layer_idx: int):
         super().__init__(config, layer_idx)
-        mark_gated_delta_net_fp32_params(self)
-        force_fp32_gated_delta_net_params(self)
         self._cp_mesh = None
+        # HF created bare ``A_log``/``dt_bias`` in ``_parameters``; move them into a
+        # native fp32 ``SSMGate`` submodule (built directly, not relocated at runtime).
+        install_ssm_gate(self, fp32_dtype=_resolve_ssm_dtype(config))
 
     def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
-        """Compute the gating value ``g`` using fp32 params.
+        """Compute the gating value ``g`` via the fp32 ``SSMGate`` submodule.
 
-        When ``_fp32_params`` exists (FSDP mixed-dtype), delegates to the holder's
-        forward so the FSDP unshard/reshard lifecycle is natural. ``self.dt_bias``
-        is read only when the holder does *not* own it; otherwise it would touch the
-        holder-owned (still-sharded) parameter outside the holder forward, defeating
-        the isolation. Falls back to the inline computation when no holder exists.
+        Computing inside the submodule's forward keeps FSDP's unshard/reshard
+        lifecycle natural for the isolated fp32 group.
         """
-        holder = self._modules.get("_fp32_params")
-        if holder is not None:
-            if "dt_bias" in holder._parameters:
-                return holder(a)
-            return holder(a, self.dt_bias)
-        return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        return self._fp32_params(a)
 
     def _forward_no_cp(
         self,
@@ -610,98 +607,57 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         return output
 
 
-def patch_hf_model(model, cp_enabled=False):
-    """Patch HF Qwen3.5 GatedDeltaNet modules for FSDP and optional CP support.
+# SSM-gating params kept in fp32 storage (regardless of the model's bulk dtype)
+# and isolated in the ``_fp32_params`` SSMGate submodule for FSDP.
+_FP32_PARAM_NAMES = ("A_log", "dt_bias")
 
-    For FSDP compatibility, move float32 bare params (A_log) into a
-    ``_fp32_params`` submodule so ``fully_shard_by_dtype`` can wrap them
-    in a separate FSDP group.
 
-    Every ``Qwen3_5GatedDeltaNet`` instance's ``__class__`` is swapped to
-    ``CPAwareGatedDeltaNet`` whose ``forward()`` calls ``self._fp32_params()``
-    to trigger FSDP unshard before accessing the fp32 params.  When
-    ``cp_enabled=True``, the CP mesh is also configured.
+class SSMGate(torch.nn.Module):
+    """Owns the fp32 SSM-gating params (``A_log``/``dt_bias``) and computes the gate.
 
-    Additionally, every ``Qwen3_5DecoderLayer`` instance is class-swapped to
-    ``Qwen3_5DecoderLayerWithPacking`` so that NEAT-packed sequence metadata
-    (``cu_seqlens``, ``indices``, ``position_ids``) reaches ``linear_attn``
-    via real keyword arguments instead of relying on instance-attribute
-    side-channels (issue #2131).
+    Keeping these in a dedicated submodule lets FSDP shard them in their own
+    dtype-uniform fp32 group (true master weights), and computing the gate inside
+    ``forward`` keeps FSDP's unshard/reshard lifecycle natural.
     """
-    import logging
 
-    try:
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
-    except ImportError:
-        return
+    def __init__(self, num_v_heads: int, dtype: torch.dtype = torch.float32):
+        super().__init__()
+        self.A_log = torch.nn.Parameter(torch.empty(num_v_heads, dtype=dtype))
+        self.dt_bias = torch.nn.Parameter(torch.empty(num_v_heads, dtype=dtype))
 
-    try:
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+    def forward(self, a: torch.Tensor) -> torch.Tensor:
+        return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-        from nemo_automodel.components.models.qwen3_5.decoder_layer import Qwen3_5DecoderLayerWithPacking
-    except (AttributeError, ImportError):
-        Qwen3_5DecoderLayer = None
-        Qwen3_5DecoderLayerWithPacking = None
 
-    _logger = logging.getLogger(__name__)
-    patched = 0
-    for name, mod in model.named_modules():
-        # Class-swap decoder layers so their forward threads packing kwargs
-        # into linear_attn. Doing this before the GatedDeltaNet pass means
-        # the swap is independent of which (if any) inner layer is patched.
-        if (
-            Qwen3_5DecoderLayer is not None
-            and isinstance(mod, Qwen3_5DecoderLayer)
-            and not isinstance(mod, Qwen3_5DecoderLayerWithPacking)
-            and getattr(mod, "layer_type", None) == "linear_attention"
-        ):
-            mod.__class__ = Qwen3_5DecoderLayerWithPacking
+def install_ssm_gate(mod, fp32_dtype=torch.float32):
+    """Move ``mod``'s HF-created bare ``A_log``/``dt_bias`` into a fp32 ``SSMGate``.
 
-        if not isinstance(mod, Qwen3_5GatedDeltaNet):
-            continue
+    HF's GatedDeltaNet ``__init__`` creates ``A_log``/``dt_bias`` as bare params in
+    ``mod._parameters``. This relocates them into an :class:`SSMGate` submodule
+    registered as ``_fp32_params`` (casting to ``fp32_dtype``), so they keep fp32
+    storage under a bf16 bulk dtype and get their own dtype-uniform FSDP group.
+    Attribute access (``self.A_log``/``self.dt_bias``) continues to work via the
+    :class:`_SSMGateParam` descriptors on ``CPAwareGatedDeltaNet`` — no
+    ``__getattr__`` patch. Returns the gate submodule.
+    """
+    num_v_heads = mod._parameters["A_log"].shape[0]
+    gate = SSMGate(num_v_heads, dtype=fp32_dtype)
+    for pname in _FP32_PARAM_NAMES:
+        param = mod._parameters.pop(pname)
+        if param.dtype != fp32_dtype:
+            param.data = param.data.to(fp32_dtype)
+        setattr(gate, pname, param)  # overwrite the freshly-built empty param
+    mod.add_module("_fp32_params", gate)
+    return gate
 
-        mod.__class__ = CPAwareGatedDeltaNet
-        mod._cp_mesh = None
 
-        # Class-swapping bypasses CPAwareGatedDeltaNet.__init__, so first enforce
-        # the GDN fp32 dtype contract, then move those params into a holder for FSDP.
-        # The CPAwareGatedDeltaNet forward calls ``self._fp32_params()`` to trigger
-        # FSDP unshard; __getattr__ redirects ``self.A_log`` to the holder so it
-        # returns the unsharded plain tensor.
-        mark_gated_delta_net_fp32_params(mod)
-        force_fp32_gated_delta_net_params(mod)
-        isolate_fp32_params(mod)
-        patched += 1
+def _resolve_ssm_dtype(config):
+    """Resolve the fp32 storage dtype for the SSM-gating params from ``config``.
 
-    if patched > 0:
-        _logger.info(
-            "Patched %d GatedDeltaNet modules (cp=%s) with FSDP-safe fp32 param wrapping.",
-            patched,
-            cp_enabled,
-        )
-
-        # Declare the fp32-compute submodules so fully_shard_by_dtype keeps them in
-        # fp32 compute even under fp32 master weights (bf16 compute for the bulk). The
-        # ``_fp32_params`` holder created above is the authoritative marker; the
-        # GatedDeltaNet forward uses those params directly without re-upcasting.
-        mark_keep_in_fp32_modules_strict(model)
-
-        # Attach a Qwen3.5 state_dict_adapter so saved checkpoints hide the
-        # ``_fp32_params`` wrapping and remain HF-loadable directly. After this
-        # runtime patch, physical params live in ``_fp32_params``, so HF loads
-        # must route bare ``linear_attn.A_log`` / ``dt_bias`` keys into the holder.
-        # Use dynamic import to avoid pulling ``components.checkpoint`` into
-        # this file's static import graph: ``cp_linear_attn`` is reached from
-        # ``components.distributed.parallelizer`` and the adapter inherits
-        # from ``components.checkpoint.state_dict_adapter``, which would
-        # otherwise create a forbidden ``distributed -> checkpoint`` chain
-        # under the import-linter ``independence`` contract.
-        import importlib
-
-        adapter_module = importlib.import_module("nemo_automodel.components.models.qwen3_5.state_dict_adapter")
-        adapter_cls = adapter_module.Qwen3_5DenseStateDictAdapter
-        adapter = getattr(model, "state_dict_adapter", None)
-        if adapter is None:
-            model.state_dict_adapter = adapter_cls()
-        elif isinstance(adapter, adapter_cls):
-            adapter.route_linear_attn_fp32_params = True
+    Honors ``mamba_ssm_dtype`` (Qwen3.5 stores ``A_log``/``dt_bias`` in fp32);
+    defaults to ``torch.float32``.
+    """
+    ssm_dtype = getattr(config, "mamba_ssm_dtype", None)
+    if isinstance(ssm_dtype, str):
+        ssm_dtype = dtype_from_str(ssm_dtype)
+    return ssm_dtype or torch.float32

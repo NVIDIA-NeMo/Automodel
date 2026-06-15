@@ -2409,9 +2409,18 @@ class _FakeBlockWithAttn:
             self.attention_type = attention_type
 
 
-def test_apply_cp_skips_non_te_attention(monkeypatch):
-    """apply_cp should skip blocks whose attn_module is not DotProductAttention."""
+def _stub_dense_cp_hooks(monkeypatch):
+    cp_utils_stub = types.ModuleType("nemo_automodel.components.distributed.cp_utils")
+    cp_utils_stub.attach_context_parallel_hooks = MagicMock()
+    cp_utils_stub.attach_cp_sdpa_hooks = MagicMock()
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.cp_utils", cp_utils_stub)
+    return cp_utils_stub
+
+
+def test_apply_cp_warns_on_unsupported_non_te_attention(monkeypatch):
+    """Non-TE, non-model-owned attention is unsupported under CP: warn, no hooks."""
     P = _import_parallelizer_with_stubs(monkeypatch)
+    cp_utils_stub = _stub_dense_cp_hooks(monkeypatch)
 
     # Stub DotProductAttention in the TE import inside apply_cp
     te_attn_stub = types.ModuleType("transformer_engine.pytorch.attention")
@@ -2424,7 +2433,7 @@ def test_apply_cp_skips_non_te_attention(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", types.ModuleType("transformer_engine.pytorch"))
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", te_attn_stub)
 
-    non_te_attn = _FakeAttnModule()  # not a DotProductAttention
+    non_te_attn = _FakeAttnModule()  # not a DotProductAttention, no setup_cp_attention
     block = _FakeBlockWithAttn(non_te_attn)
     model = DummyModel([block])
 
@@ -2435,8 +2444,76 @@ def test_apply_cp_skips_non_te_attention(monkeypatch):
     dist_stub = sys.modules["torch.distributed"]
     dist_stub.get_process_group_ranks = MagicMock(return_value=[0, 1])
 
-    # Should not raise — just skip the non-TE block
     P.apply_cp(model, cp_mesh)
+
+    assert model._cp_enabled is True
+    # No generic CP hooks are attached for unsupported attention.
+    cp_utils_stub.attach_context_parallel_hooks.assert_not_called()
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_not_called()
+
+
+def test_apply_cp_model_owned_calls_setup_cp_attention(monkeypatch):
+    """A self_attn exposing setup_cp_attention installs its own CP attention; no generic hooks."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    cp_utils_stub = _stub_dense_cp_hooks(monkeypatch)
+
+    te_attn_stub = types.ModuleType("transformer_engine.pytorch.attention")
+
+    class DotProductAttention:
+        pass
+
+    te_attn_stub.DotProductAttention = DotProductAttention
+    monkeypatch.setitem(sys.modules, "transformer_engine", types.ModuleType("transformer_engine"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", types.ModuleType("transformer_engine.pytorch"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", te_attn_stub)
+
+    non_te_attn = _FakeAttnModule()  # not a DotProductAttention
+    block = _FakeBlockWithAttn(non_te_attn)
+    # The model owns its CP attention (e.g. Gemma4's ring) via setup_cp_attention.
+    block.self_attn.setup_cp_attention = MagicMock()
+    model = DummyModel([block])
+
+    cp_mesh = MagicMock()
+    cp_mesh.get_group.return_value = MagicMock()
+    sys.modules["torch.distributed"].get_process_group_ranks = MagicMock(return_value=[0, 1])
+
+    P.apply_cp(model, cp_mesh)
+
+    # Model-owned: setup_cp_attention is called; no generic hooks are attached.
+    block.self_attn.setup_cp_attention.assert_called_once_with(cp_mesh)
+    cp_utils_stub.attach_context_parallel_hooks.assert_not_called()
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_not_called()
+
+
+def test_apply_cp_skips_attention_without_attn_module(monkeypatch):
+    """HF attention without attn_module uses dense CP hooks, not TE CP setup."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    cp_utils_stub = _stub_dense_cp_hooks(monkeypatch)
+
+    te_attn_stub = types.ModuleType("transformer_engine.pytorch.attention")
+
+    class DotProductAttention:
+        pass
+
+    te_attn_stub.DotProductAttention = DotProductAttention
+    monkeypatch.setitem(sys.modules, "transformer_engine", types.ModuleType("transformer_engine"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", types.ModuleType("transformer_engine.pytorch"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", te_attn_stub)
+
+    class AttentionWithoutAttnModuleBlock:
+        layer_type = "full_attention"
+
+        def __init__(self):
+            self.self_attn = _FakeAttnModule()
+            self.mlp = object()
+
+    model = DummyModel([AttentionWithoutAttnModuleBlock()])
+    cp_mesh = MagicMock()
+
+    P.apply_cp(model, cp_mesh)
+    cp_mesh.get_group.assert_not_called()
+    # Unsupported (non-TE, non-model-owned) attention -> warn, no hooks.
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_not_called()
 
 
 def _setup_te_and_dist_stubs(monkeypatch, DotProductAttention):
@@ -2502,8 +2579,9 @@ def test_apply_cp_uses_attention_type_and_all_gather_for_sliding_attention(monke
 
 
 def test_apply_cp_mixed_te_and_non_te(monkeypatch):
-    """apply_cp should configure TE blocks and skip non-TE blocks in the same model."""
+    """apply_cp configures TE blocks; unsupported non-TE blocks warn (no hooks)."""
     P = _import_parallelizer_with_stubs(monkeypatch)
+    cp_utils_stub = _stub_dense_cp_hooks(monkeypatch)
 
     class DotProductAttention:
         def __init__(self):
@@ -2522,8 +2600,9 @@ def test_apply_cp_mixed_te_and_non_te(monkeypatch):
 
     P.apply_cp(model, cp_mesh)
 
-    # TE block configured, non-TE block skipped (no error)
     te_attn.set_context_parallel_group.assert_called_once()
+    # The non-TE block is unsupported under CP -> warn, no generic hooks.
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_not_called()
 
 
 # ============================================================================

@@ -58,6 +58,16 @@ from nemo_automodel.components.moe import state_dict_utils
 from nemo_automodel.components.moe.layers import MoEConfig
 
 
+def _strip_fp32_params(key: str) -> str:
+    """Strip the fp32 holder segment from GDN state-dict keys."""
+    return strip_fp32_holder_key(key)
+
+
+def _route_fp32_params(key: str) -> str:
+    """Route bare GDN fp32 params into the holder used by the native module."""
+    return route_fp32_holder_key(key)
+
+
 class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
     """Converts between HF Qwen3.5-MoE checkpoints and the NeMo native format.
 

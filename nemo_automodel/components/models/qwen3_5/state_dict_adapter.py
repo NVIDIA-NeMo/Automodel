@@ -14,13 +14,10 @@
 
 """State-dict adapter for Qwen3.5 dense (non-MoE) models.
 
-Qwen3.5 dense uses HF's GatedDeltaNet linear-attention layers. For FSDP
-compatibility (mixed-dtype: bf16 + fp32 ``A_log`` / ``dt_bias``),
-``patch_hf_model`` in ``cp_linear_attn`` moves ``A_log`` and ``dt_bias`` from
-``mod._parameters`` into a ``_fp32_params`` submodule and patches ``__getattr__``
-to redirect ``mod.A_log`` / ``mod.dt_bias`` reads. After patching, the model's
-state_dict contains keys of the form ``...linear_attn._fp32_params.A_log``
-instead of the original ``...linear_attn.A_log``.
+Qwen3.5 dense keeps its GatedDeltaNet SSM-gating parameters (``A_log`` /
+``dt_bias``) in a fp32 ``_fp32_params`` holder. The model's state dict therefore
+contains keys of the form ``...linear_attn._fp32_params.A_log`` instead of the
+original ``...linear_attn.A_log``.
 
 This adapter renames keys at save/load boundaries so that on-disk checkpoints
 match the original HF Qwen3.5 layout (bare ``A_log``) and are directly
@@ -36,6 +33,7 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAda
 from nemo_automodel.components.models.common.gated_delta_net_fp32 import upcast_gated_delta_net_fp32_state_tensor
 
 _FP32_PARAMS_TO_BARE = re.compile(r"(\.linear_attn)\._fp32_params\.")
+# Both SSM-gating params live in the fp32 ``SSMGate`` holder; route both on load.
 _BARE_FP32_PARAM_NAMES = ("A_log", "dt_bias")
 _MTP_HF_TO_NATIVE = {
     "mtp.fc.weight": "mtp.layers.0.eh_proj.weight",

@@ -52,9 +52,18 @@ class TestRouteToFp32Holder:
         key = "model.language_model.layers.0.linear_attn._fp32_params.A_log"
         assert _route_to_fp32_holder(key) == key
 
+    def test_routes_bare_dt_bias_to_holder(self):
+        # Both SSM-gating master weights (A_log and dt_bias) live in the fp32
+        # ``_fp32_params`` holder, so dt_bias is routed the same as A_log.
+        assert (
+            _route_to_fp32_holder("model.language_model.layers.0.linear_attn.dt_bias")
+            == "model.language_model.layers.0.linear_attn._fp32_params.dt_bias"
+        )
+
     def test_does_not_route_other_linear_attn_keys(self):
-        for key in ("model.language_model.layers.0.linear_attn.norm.weight",):
-            assert _route_to_fp32_holder(key) == key
+        # Non SSM-gating params (e.g. the GatedDeltaNet norm) stay in place.
+        key = "model.language_model.layers.0.linear_attn.norm.weight"
+        assert _route_to_fp32_holder(key) == key
 
     def test_does_not_route_a_log_outside_linear_attn(self):
         # Defensive: only linear_attn.A_log should be routed.
@@ -214,7 +223,9 @@ class TestAdapter:
 
     def test_convert_single_tensor_to_hf_upcasts_gdn_fp32_params(self):
         t = torch.zeros(4, dtype=torch.bfloat16)
-        out = self.adapter.convert_single_tensor_to_hf("model.language_model.layers.0.linear_attn._fp32_params.A_log", t)
+        out = self.adapter.convert_single_tensor_to_hf(
+            "model.language_model.layers.0.linear_attn._fp32_params.A_log", t
+        )
         assert out[0][0] == "model.language_model.layers.0.linear_attn.A_log"
         assert out[0][1].dtype == torch.float32
 
