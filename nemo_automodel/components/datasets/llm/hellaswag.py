@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from datasets import load_dataset
-
+from nemo_automodel.components.datasets.hf_compat import load_dataset
 from nemo_automodel.components.datasets.utils import SFTSingleTurnPreprocessor
 
 

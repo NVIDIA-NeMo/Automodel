@@ -70,6 +70,17 @@ def test_is_tied_word_embeddings_falls_back_to_top_level_when_no_text_config():
     assert checkpoint_utils.is_tied_word_embeddings(model) is True
 
 
+def test_is_tied_word_embeddings_respects_force_untied_lm_head_flag():
+    class DummyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(tie_word_embeddings=True)
+            self._nemo_force_untied_lm_head = True
+
+    model = DummyModel()
+    assert checkpoint_utils.is_tied_word_embeddings(model) is False
+
+
 def test_is_tied_word_embeddings_handles_missing_config():
     class DummyModel(nn.Module):
         def __init__(self) -> None:

@@ -13,8 +13,7 @@
 # limitations under the License.
 import logging
 
-from datasets import load_dataset
-
+from nemo_automodel.components.datasets.hf_compat import load_dataset
 from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
