@@ -650,7 +650,6 @@ def apply_model_infrastructure(
 
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
-            mp._cp_enabled = True
             attach_context_parallel_hooks(mp)
             if is_compile_enabled:
                 attach_cp_sdpa_hooks(mp, cp_mesh)

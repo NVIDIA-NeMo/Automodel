@@ -572,7 +572,7 @@ class TestFromConfigLoadBaseModelKwarg:
 
 def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
     """When mesh.cp_size>1 and attention is non-TE, apply_model_infrastructure
-    attaches the mask-strip CP hook to every model part and flags _cp_enabled.
+    attaches the mask-strip CP hook to every model part.
     The DTensor-SDPA hook is gated on torch.compile; this case has no compile
     (model_wrapper=None), so it is not attached.
     Guards infrastructure.py:apply_model_infrastructure CP branch."""
@@ -622,5 +622,4 @@ def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
             pretrained_model_name_or_path="",
         )
 
-    assert model._cp_enabled is True
     assert attached == {"ctx": 1, "attn": 0}
