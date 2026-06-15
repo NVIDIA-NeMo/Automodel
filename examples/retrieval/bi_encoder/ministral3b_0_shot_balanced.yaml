@@ -124,7 +124,7 @@ dataloader:
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mbppretrieval_function_gemma_3200_20260531_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mbppretrieval_function_nemotron_2400_20260531_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_fewshot_qwen3next_3200_20260611_retry_qwen3_8B_0_95_perc.json
-      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/ybabakhin/git/codex/codex-orchestrator/pipeline_state/audits/humaneval_eval_like_qwen36_func_2400_20260523_filtered_20260611/train.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/humaneval_eval_like_qwen36_func_2400_20260523_filtered_20260611.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_deu_10k_qwen3_8B_0_95_perc_positives_unrolled.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_eng_10k_qwen3_8B_0_95_perc_positives_unrolled.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_fra_10k_qwen3_8B_0_95_perc_positives_unrolled.json
