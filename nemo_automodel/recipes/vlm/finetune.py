@@ -868,8 +868,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
             if not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False):
                 mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-                with torch.no_grad():
-                    prepared = _model(_pre_embed_only=True, **mm_kwargs)
+                prepared = _model(_pre_embed_only=True, **mm_kwargs)
                 for k in VLM_INPUT_KEYS:
                     batch.pop(k, None)
                 batch.update(prepared)
