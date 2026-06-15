@@ -643,8 +643,6 @@ def apply_model_infrastructure(
             attach_cp_sdpa_hooks,
         )
 
-        # The DTensor SDPA re-wrap is only needed under torch.compile (Dynamo drops
-        # DTensor metadata); without compile, context_parallel dispatches natively.
         is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
         cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
 
