@@ -84,8 +84,9 @@ def _install_torch_and_layers_stubs(monkeypatch):
     nn_stub = types.ModuleType("torch.nn")
 
     class Parameter:
-        def __init__(self, data=None):
+        def __init__(self, data=None, requires_grad=True):
             self.data = data
+            self.requires_grad = requires_grad
 
     class Module:
         pass
