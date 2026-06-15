@@ -710,8 +710,21 @@ class Checkpointer:
             and lm_head_param_name in state_dict
         )
         checkpoint_metadata_keys: set[str] = set()
-        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset:
+        extra_state_keys = sorted(key for key in state_dict if key.endswith("_extra_state"))
+        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys:
             checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+        if extra_state_keys:
+            missing_extra_state_keys = [key for key in extra_state_keys if key not in checkpoint_metadata_keys]
+            if missing_extra_state_keys:
+                for key in missing_extra_state_keys:
+                    state_dict.pop(key, None)
+                logging.warning(
+                    "Checkpoint %s is missing %d requested module _extra_state keys. Keeping current module "
+                    "extra state for those entries (examples=%s).",
+                    model_path,
+                    len(missing_extra_state_keys),
+                    missing_extra_state_keys[:10],
+                )
         if should_try_tied_lm_head_compat:
             if lm_head_param_name not in checkpoint_metadata_keys:
                 for source_name in get_tied_lm_head_source_names(model_state.model[0], lm_head_param_name):
