@@ -34,8 +34,12 @@ the loss free of any distributed/scaling knowledge — the doc's separation of
 
 The built-ins read selected-token logprobs from ``model_output.logprobs`` (per
 datum, ``[T_i]``, the logprob the model assigns to that datum's
-``target_tokens``) and pull old logprobs / advantages from the datum's
-``loss_inputs``.
+``target_tokens``).
+
+Only role-agnostic losses live here. RL-specific objectives (PPO, importance
+sampling, etc.) read advantages / behavior-policy logprobs and belong to the RL
+consumer — e.g. verl supplies its own ``ppo_loss`` to the Engine via the
+``PackedBatch`` loss-closure path; the Engine never needs them itself.
 """
 
 from __future__ import annotations
@@ -51,7 +55,7 @@ if TYPE_CHECKING:  # excluded from the import-linter contract
 
 LossFn = Callable[["ModelOutput", Sequence["Datum"]], Sequence[torch.Tensor]]
 
-__all__ = ["LossFn", "BUILTIN_LOSSES", "cross_entropy", "importance_sampling", "ppo"]
+__all__ = ["LossFn", "BUILTIN_LOSSES", "cross_entropy"]
 
 
 def _require_logprobs(model_output: "ModelOutput") -> list[torch.Tensor]:
@@ -65,45 +69,6 @@ def cross_entropy(model_output: "ModelOutput", datums: Sequence["Datum"], **kwar
     return [-lp for lp in _require_logprobs(model_output)]
 
 
-def importance_sampling(model_output: "ModelOutput", datums: Sequence["Datum"], **kwargs) -> list[torch.Tensor]:
-    """Token-level importance-sampling policy-gradient loss.
-
-    ``-(exp(logprob - old_logprob) * advantage)`` per token. Reads
-    ``loss_inputs["logprobs"]`` (behavior-policy logprobs) and
-    ``loss_inputs["advantages"]`` from each datum.
-    """
-    out = []
-    for lp, d in zip(_require_logprobs(model_output), datums):
-        old = d.loss_inputs["logprobs"].to(lp)
-        adv = d.loss_inputs["advantages"].to(lp)
-        out.append(-(torch.exp(lp - old) * adv))
-    return out
-
-
-def ppo(
-    model_output: "ModelOutput",
-    datums: Sequence["Datum"],
-    *,
-    clip_eps: float = 0.2,
-    **kwargs,
-) -> list[torch.Tensor]:
-    """Token-level PPO clipped surrogate loss.
-
-    ``-min(ratio * adv, clip(ratio, 1±clip_eps) * adv)`` per token.
-    """
-    out = []
-    for lp, d in zip(_require_logprobs(model_output), datums):
-        old = d.loss_inputs["logprobs"].to(lp)
-        adv = d.loss_inputs["advantages"].to(lp)
-        ratio = torch.exp(lp - old)
-        unclipped = ratio * adv
-        clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
-        out.append(-torch.minimum(unclipped, clipped))
-    return out
-
-
 BUILTIN_LOSSES: dict[str, LossFn] = {
     "cross_entropy": cross_entropy,
-    "importance_sampling": importance_sampling,
-    "ppo": ppo,
 }

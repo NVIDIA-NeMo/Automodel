@@ -29,7 +29,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.datasets.datum import Datum
 from nemo_automodel.components.training.model_output import ModelOutput
-from nemo_automodel.engine import Engine
+from nemo_automodel.components.training.engine import Engine
 
 
 class ToyLM(nn.Module):

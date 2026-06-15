@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from nemo_automodel.components.datasets.datum import Datum
 from nemo_automodel.components.training.model_output import ModelOutput
-from nemo_automodel.engine import Engine
+from nemo_automodel.components.training.engine import Engine
 
 
 class ToyLM(nn.Module):
@@ -86,7 +86,7 @@ def test_forward_backward_dict_returns_dict_and_grads():
 
 
 def _rl_datums(vocab=16):
-    """Datums carrying old logprobs + advantages for IS/PPO losses."""
+    """Datums carrying old logprobs + advantages for a caller-supplied RL loss."""
     return [
         Datum(
             input_ids=torch.randint(0, vocab, (5,)),
@@ -119,10 +119,20 @@ def test_forward_backward_datums_default_cross_entropy():
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
 
 
-@pytest.mark.parametrize("loss_name", ["cross_entropy", "importance_sampling", "ppo"])
-def test_builtin_losses_run_and_backprop(loss_name):
+def test_caller_supplied_rl_lossfn_runs_and_backprops():
+    # RL objectives (PPO, importance sampling) are caller-supplied LossFns, not
+    # Engine built-ins. Verify the Datum door runs an advantage-reading loss and
+    # backprops through it.
+    def importance_sampling(model_output, datums, **kwargs):
+        out = []
+        for lp, d in zip(model_output.logprobs, datums):
+            old = d.loss_inputs["logprobs"].to(lp)
+            adv = d.loss_inputs["advantages"].to(lp)
+            out.append(-(torch.exp(lp - old) * adv))
+        return out
+
     engine, model = _engine()
-    out = engine.forward_backward(_rl_datums(), loss_fn=loss_name)
+    out = engine.forward_backward(_rl_datums(), loss_fn=importance_sampling)
     assert torch.isfinite(out.loss)
     assert any(p.grad is not None for p in model.parameters())
 

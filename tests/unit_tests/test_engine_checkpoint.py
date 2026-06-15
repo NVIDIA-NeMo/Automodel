@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from nemo_automodel.engine import CheckpointHandle, Engine
+from nemo_automodel.components.training.engine import CheckpointHandle, Engine
 
 
 class ToyLM(nn.Module):

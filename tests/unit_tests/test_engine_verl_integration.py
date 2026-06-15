@@ -33,7 +33,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.datasets.datum import Datum, PackedBatch
 from nemo_automodel.components.training.model_output import ModelOutput
-from nemo_automodel.engine import Engine
+from nemo_automodel.components.training.engine import Engine
 
 
 class ToyLM(nn.Module):
@@ -90,10 +90,22 @@ def datums_from_verl(mb) -> list[Datum]:
     return datums
 
 
+def _datum_ppo_loss(model_output, datums, *, clip_eps=0.2, **kwargs):
+    """Caller-supplied PPO LossFn (Datum-door signature). RL objectives are not
+    Engine built-ins; the consumer provides them."""
+    out = []
+    for lp, d in zip(model_output.logprobs, datums):
+        old = d.loss_inputs["logprobs"].to(lp)
+        adv = d.loss_inputs["advantages"].to(lp)
+        ratio = torch.exp(lp - old)
+        out.append(-torch.minimum(ratio * adv, torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv))
+    return out
+
+
 def test_datum_door_runs_ppo_through_engine():
     engine, model = _engine()
     datums = datums_from_verl(_fake_verl_microbatch())
-    out = engine.forward_backward(datums, loss_fn="ppo")
+    out = engine.forward_backward(datums, loss_fn=_datum_ppo_loss)
     assert isinstance(out, ModelOutput)
     assert torch.isfinite(out.loss)
     assert len(out.logprobs) == 2  # per-datum, input order

@@ -361,9 +361,10 @@ class Engine:
         Two input modes:
 
         * **Datum mode** (``list[Datum]`` or ``list[list[Datum]]``): the tinker
-          path. ``loss_fn`` is a built-in name (``"cross_entropy"`` default,
-          ``"importance_sampling"``, ``"ppo"``) or a ``LossFn`` callable
-          ``(ModelOutput, Sequence[Datum]) -> Sequence[Tensor]``. The Engine owns
+          path. ``loss_fn`` is a built-in name (``"cross_entropy"``) or a
+          ``LossFn`` callable
+          ``(ModelOutput, Sequence[Datum]) -> Sequence[Tensor]`` — RL objectives
+          (PPO, etc.) are supplied by the caller, not built in. The Engine owns
           weighting, the global token/sample denominator across data ranks, and
           backward. Returns a :class:`ModelOutput`.
         * **Dict mode** (``dict`` or ``list[dict]``): the legacy SFT path.
