@@ -240,6 +240,52 @@ class TestCastModelToDtype:
         for p in model.parameters():
             assert p.dtype == torch.float16
 
+    def test_skip_modules_left_untouched(self):
+        """Submodules named in ``skip_modules`` keep their original dtype."""
+
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(4, 4)
+                self._fp32_params = nn.Linear(4, 4)
+
+        model = Model()
+        cast_model_to_dtype(model, torch.bfloat16, skip_modules=("_fp32_params",))
+
+        # Regular submodule is cast; the skipped holder stays fp32.
+        assert model.linear.weight.dtype == torch.bfloat16
+        assert model._fp32_params.weight.dtype == torch.float32
+
+    def test_skip_modules_nested_and_restored(self):
+        """Nested skip_modules are preserved and re-attached after the cast."""
+
+        class Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self._fp32_params = nn.Linear(2, 2)
+                self.proj = nn.Linear(2, 2)
+
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.block = Inner()
+
+        model = Model()
+        cast_model_to_dtype(model, torch.bfloat16, skip_modules=("_fp32_params",))
+
+        assert model.block.proj.weight.dtype == torch.bfloat16
+        # Holder preserved in fp32 and re-attached (still reachable on the module).
+        assert model.block._fp32_params.weight.dtype == torch.float32
+        assert model.block._fp32_params is dict(model.block.named_modules())["_fp32_params"]
+
+    def test_skip_modules_empty_is_noop(self):
+        """An empty skip_modules tuple casts everything (default behavior)."""
+        model = SimpleModel()
+        cast_model_to_dtype(model, torch.bfloat16, skip_modules=())
+
+        for p in model.parameters():
+            assert p.dtype == torch.bfloat16
+
     def test_set_valued_keep_in_fp32_preserved(self):
         # Mirrors HF converting _keep_in_fp32_modules (list) to a set on the instance —
         # the gemma4_moe/diffusion_gemma case. cast_model_to_dtype must still restore it.

@@ -786,6 +786,16 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         # Expose moe_config for FSDP sync mixin
         self.model.moe_config = self.model.language_model.moe_config
 
+        # Keep the SSM-gating params (A_log/dt_bias) — isolated in each
+        # linear_attn ``_fp32_params`` holder at construction — in fp32 storage
+        # even when the model's bulk dtype is bf16, matching the intrinsically-fp32
+        # dtype Qwen3.5 checkpoints store them in. cast_model_to_dtype() (called
+        # from initialize_weights) honors this list.
+        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
+        if "_fp32_params" not in keep_fp32:
+            keep_fp32.append("_fp32_params")
+        self._keep_in_fp32_modules = keep_fp32
+
         self.vocab_size = text_config.vocab_size
         pad_token_id = getattr(text_config, "pad_token_id", None)
         self.pad_token_id = pad_token_id if pad_token_id is not None else -1
@@ -1073,7 +1083,11 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 for sublayer in mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)
 
-        cast_model_to_dtype(self, dtype)
+        # Skip the SSM-gating holders so they keep fp32 storage (master weights):
+        # cast_model_to_dtype cannot reliably restore fp32 once FSDP2-sharded, so it
+        # detaches them and never casts them. Each holder is its own fp32 FSDP group
+        # (moe/parallelizer._shard_fp32_param_holders), so this is dtype-uniform-safe.
+        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
         with buffer_device:
             self.model.language_model.rotary_emb.device = buffer_device

@@ -52,6 +52,24 @@ from nemo_automodel.components.models.qwen3_5.state_dict_adapter import (
 from nemo_automodel.components.moe import state_dict_utils
 from nemo_automodel.components.moe.layers import MoEConfig
 
+# The SSM-gating params (A_log/dt_bias) live in fp32 storage inside a
+# ``linear_attn._fp32_params`` holder submodule. Checkpoints stay in the bare HF
+# key namespace (``linear_attn.A_log``), so strip the holder segment on save and
+# route bare keys back into the holder on load.
+_FP32_PARAMS_RE = re.compile(r"(\.linear_attn)\._fp32_params\.")
+_FP32_HOLDER_PARAM_NAMES = ("A_log", "dt_bias")
+
+
+def _strip_fp32_params(key: str) -> str:
+    return _FP32_PARAMS_RE.sub(r"\1.", key)
+
+
+def _route_fp32_params(key: str) -> str:
+    if not key.endswith(_FP32_HOLDER_PARAM_NAMES) or "._fp32_params." in key or ".linear_attn." not in key:
+        return key
+    head, tail = key.rsplit(".linear_attn.", 1)
+    return f"{head}.linear_attn._fp32_params.{tail}"
+
 
 class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
     """Converts between HF Qwen3.5-MoE checkpoints and the NeMo native format.
@@ -260,7 +278,8 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 down_tensor, device_mesh, rank
             )
 
-        return state_dict
+        # Route bare SSM-gating keys into the linear_attn ``_fp32_params`` holder.
+        return {_route_fp32_params(k): v for k, v in state_dict.items()}
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Rename a single native key to HF format and transpose expert tensors."""
@@ -317,6 +336,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 break
 
         new_fqn = map_qwen3_5_mtp_to_hf_key(new_fqn)
+        new_fqn = _strip_fp32_params(new_fqn)
 
         if exclude_key_regex and re.match(exclude_key_regex, new_fqn):
             return []
