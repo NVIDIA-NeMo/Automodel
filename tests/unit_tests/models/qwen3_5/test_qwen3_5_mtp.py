@@ -77,6 +77,10 @@ def _backend():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
+        # rope_fusion defaults to (HAVE_TE and cuda) -> True on the GPU CI runner.
+        # Qwen3.5's gated-query RoPE is incompatible with TE's fused rope kernel,
+        # so every recipe sets rope_fusion=false. Pin it for deterministic tests.
+        rope_fusion=False,
         enable_deepep=False,
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=True,

@@ -49,6 +49,12 @@ def _backend():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
+        # BackendConfig.rope_fusion defaults to (HAVE_TE and cuda), so it is True on
+        # the GPU CI runner. Qwen3.5's gated-query RoPE is incompatible with TE's
+        # fused rope kernel (it expects a plain 4D layout), which is why every
+        # Qwen3.5 recipe sets rope_fusion=false. Pin it here so the test exercises
+        # the supported (non-fused) path deterministically on both CPU and GPU.
+        rope_fusion=False,
         enable_deepep=False,
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=True,
@@ -217,9 +223,15 @@ class TestDenseTextBackbone:
         assert out.past_key_values is None
 
     def test_forward_shape_mixed_layers(self):
+        # The linear_attention block runs FLA's gated-delta-rule / causal_conv1d
+        # kernels, which are CUDA-only (no CPU fallback when CUDA is present), so
+        # build the backbone and inputs on the GPU. Skip when no GPU is available.
+        if not torch.cuda.is_available():
+            pytest.skip("linear_attention forward requires CUDA (FLA kernels)")
+        device = torch.device("cuda")
         cfg = _tiny_config(layer_types=("full_attention", "linear_attention"))
-        backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
-        out = backbone(input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long))
+        backbone = Qwen3_5DenseTextBackbone(cfg, _backend()).to(device)
+        out = backbone(input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long, device=device))
         assert out.last_hidden_state.shape == (1, 4, cfg.hidden_size)
 
     def test_forward_accepts_inputs_embeds(self):
