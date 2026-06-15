@@ -76,6 +76,21 @@ class ModelWithStrictFp32Parameter(nn.Module):
         self.mixer.scale = nn.Parameter(torch.ones(4))
 
 
+class ModelWithStrictFp32Buffer(nn.Module):
+    """Model that declares one strict fp32 buffer by qualified buffer name."""
+
+    _keep_in_fp32_modules_strict = ["router.e_score_correction_bias"]
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4)
+        self.router = nn.Module()
+        self.router.register_buffer(
+            "e_score_correction_bias",
+            torch.tensor([1.001, -2.003, 0.3333, 17.125], dtype=torch.float32),
+        )
+
+
 class ModelWithBothFp32Attrs(nn.Module):
     """Model with both _keep_in_fp32_modules and _keep_in_fp32_modules_strict."""
 
@@ -238,9 +253,26 @@ class TestCastModelToDtype:
 
     def test_strict_fp32_parameters_preserved(self):
         model = ModelWithStrictFp32Parameter()
+        original_scale = torch.tensor([1.001, -2.003, 0.3333, 17.125], dtype=torch.float32)
+        with torch.no_grad():
+            model.mixer.scale.copy_(original_scale)
+
         cast_model_to_dtype(model, torch.bfloat16)
 
         assert model.mixer.scale.dtype == torch.float32
+        assert torch.equal(model.mixer.scale, original_scale)
+        assert not torch.equal(model.mixer.scale, original_scale.to(torch.bfloat16).float())
+        assert model.linear.weight.dtype == torch.bfloat16
+
+    def test_strict_fp32_buffers_preserve_values(self):
+        model = ModelWithStrictFp32Buffer()
+        original_bias = model.router.e_score_correction_bias.clone()
+
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert model.router.e_score_correction_bias.dtype == torch.float32
+        assert torch.equal(model.router.e_score_correction_bias, original_bias)
+        assert not torch.equal(model.router.e_score_correction_bias, original_bias.to(torch.bfloat16).float())
         assert model.linear.weight.dtype == torch.bfloat16
 
     def test_both_fp32_attrs_preserved(self):

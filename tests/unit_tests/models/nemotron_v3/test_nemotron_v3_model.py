@@ -1148,14 +1148,18 @@ class TestNemotronV3ModelWithMoE:
             enable_hf_state_dict_adapter=False,
         )
         base_model = NemotronV3Model(config, backend=backend)
+        original_bias = torch.tensor([1.001, -2.003, 0.3333, 17.125], dtype=torch.float32)
+        base_model.layers["0"].mixer.gate.e_score_correction_bias.copy_(original_bias)
         cast_model_to_dtype(base_model, torch.bfloat16)
 
         base_gate = base_model.layers["0"].mixer.gate
         assert base_model.embed_tokens.weight.dtype == torch.bfloat16
         assert base_model.layers["0"].mixer.experts.gate_and_up_projs.dtype == torch.bfloat16
         assert base_gate.e_score_correction_bias.dtype == torch.float32
+        assert torch.equal(base_gate.e_score_correction_bias, original_bias)
 
         model = NemotronHForCausalLM(config, backend=backend)
+        model.model.layers["0"].mixer.gate.e_score_correction_bias.copy_(original_bias)
         cast_model_to_dtype(model, torch.bfloat16)
 
         gate = model.model.layers["0"].mixer.gate
@@ -1163,7 +1167,9 @@ class TestNemotronV3ModelWithMoE:
         assert model.model.embed_tokens.weight.dtype == torch.bfloat16
         assert model.model.layers["0"].mixer.experts.gate_and_up_projs.dtype == torch.bfloat16
         assert gate.e_score_correction_bias.dtype == torch.float32
+        assert torch.equal(gate.e_score_correction_bias, original_bias)
         assert state_dict["model.layers.0.mixer.gate.e_score_correction_bias"].dtype == torch.float32
+        assert torch.equal(state_dict["model.layers.0.mixer.gate.e_score_correction_bias"], original_bias)
 
     @skip_if_no_gpu
     def test_moe_model_forward(self, config, backend):

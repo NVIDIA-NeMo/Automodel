@@ -474,12 +474,30 @@ def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -
     """
     fp32_keywords = _get_fp32_module_keywords(model)
     strict_fp32_keywords = _get_strict_fp32_module_keywords(model)
+    has_dtensor_params = _has_dtensor_params(model)
+
+    if has_dtensor_params:
+        fp32_snapshots = _snapshot_fp32_tensors(
+            model,
+            parameter_keywords=strict_fp32_keywords,
+            buffer_keywords=fp32_keywords,
+        )
+    else:
+        fp32_snapshots = _snapshot_fp32_tensors(
+            model,
+            parameter_keywords=fp32_keywords,
+            buffer_keywords=fp32_keywords,
+        )
 
     model.to(dtype)
     if fp32_keywords:
-        if _has_dtensor_params(model):
+        if has_dtensor_params:
             if strict_fp32_keywords:
-                _restore_fp32_modules(model, strict_fp32_keywords)
+                _restore_fp32_tensor_snapshots(
+                    model,
+                    parameter_snapshots=fp32_snapshots[0],
+                    buffer_snapshots={},
+                )
 
             buffer_only_keywords = [kw for kw in fp32_keywords if kw not in strict_fp32_keywords]
             if buffer_only_keywords:
@@ -489,9 +507,17 @@ def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -
                     "FSDP2 requires uniform dtype within each parameter group.",
                     buffer_only_keywords,
                 )
-                _restore_fp32_buffers(model, buffer_only_keywords)
+            _restore_fp32_tensor_snapshots(
+                model,
+                parameter_snapshots={},
+                buffer_snapshots=fp32_snapshots[1],
+            )
         else:
-            _restore_fp32_modules(model, fp32_keywords)
+            _restore_fp32_tensor_snapshots(
+                model,
+                parameter_snapshots=fp32_snapshots[0],
+                buffer_snapshots=fp32_snapshots[1],
+            )
 
 
 @contextmanager
@@ -581,6 +607,53 @@ def _has_dtensor_params(model: nn.Module) -> bool:
     except ImportError:
         return False
     return any(isinstance(p, DTensor) for p in model.parameters())
+
+
+def _snapshot_fp32_tensors(
+    model: nn.Module,
+    *,
+    parameter_keywords: list[str],
+    buffer_keywords: list[str],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Clone fp32-preserved tensors before a broad dtype cast.
+
+    Casting ``fp32 -> bf16 -> fp32`` restores the dtype but not the original
+    values. Snapshot the matching tensors first so strict fp32 state such as
+    router correction bias or recurrent-decay parameters is restored exactly.
+    """
+    parameter_snapshots = {
+        name: param.detach().to(torch.float32).clone()
+        for name, param in model.named_parameters()
+        if param.is_floating_point() and any(keyword in name for keyword in parameter_keywords)
+    }
+    buffer_snapshots = {
+        name: buf.detach().to(torch.float32).clone()
+        for name, buf in model.named_buffers()
+        if buf.is_floating_point() and any(keyword in name for keyword in buffer_keywords)
+    }
+    return parameter_snapshots, buffer_snapshots
+
+
+def _restore_fp32_tensor_snapshots(
+    model: nn.Module,
+    *,
+    parameter_snapshots: dict[str, torch.Tensor],
+    buffer_snapshots: dict[str, torch.Tensor],
+) -> None:
+    """Restore fp32-preserved tensors from pre-cast snapshots."""
+    named_parameters = dict(model.named_parameters())
+    for name, snapshot in parameter_snapshots.items():
+        param = named_parameters.get(name)
+        if param is None:
+            continue
+        param.data = snapshot.to(dtype=torch.float32)
+
+    for name, snapshot in buffer_snapshots.items():
+        module_name, _, buffer_name = name.rpartition(".")
+        module = model.get_submodule(module_name) if module_name else model
+        if buffer_name not in module._buffers:
+            continue
+        module._buffers[buffer_name] = snapshot.to(dtype=torch.float32)
 
 
 def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:
