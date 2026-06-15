@@ -654,7 +654,7 @@ def _snapshot_fp32_tensors(
     }
     buffer_snapshots = {
         name: buf.detach().to(torch.float32).clone()
-        for name, buf in model.named_buffers()
+        for name, buf in model.named_buffers(remove_duplicate=False)
         if buf.is_floating_point() and any(keyword in name for keyword in buffer_keywords)
     }
     return parameter_snapshots, buffer_snapshots
