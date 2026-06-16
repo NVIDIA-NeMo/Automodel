@@ -488,6 +488,12 @@ class TestNemotronV3Mamba2Mixer:
         assert mixer.A_log.shape == (config.mamba_num_heads,)
         assert mixer.D.shape == (config.mamba_num_heads,)
 
+        params = dict(mixer.named_parameters())
+        assert "_fp32_params.A_log" in params
+        assert "_fp32_params.dt_bias" in params
+        assert "A_log" not in mixer._parameters
+        assert "dt_bias" not in mixer._parameters
+
         # Check no_weight_decay attributes
         assert getattr(mixer.A_log, "_no_weight_decay", False)
         assert getattr(mixer.D, "_no_weight_decay", False)

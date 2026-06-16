@@ -187,6 +187,21 @@ class NemotronV3MambaRMSNormGated(nn.Module):
         )
 
 
+class NemotronV3MambaFP32Params(nn.Module):
+    """Owns Nemotron V3 Mamba parameters that need fp32 storage and compute."""
+
+    def __init__(self, num_heads: int):
+        super().__init__()
+        self.dt_bias = nn.Parameter(torch.ones(num_heads, dtype=torch.float32))
+        A = torch.arange(1, num_heads + 1, dtype=torch.float32)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
+
+    def forward(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``A_log`` and ``dt_bias`` through the holder's FSDP hooks."""
+        return self.A_log, self.dt_bias
+
+
 class NemotronV3Mamba2Mixer(nn.Module):
     """Mamba2 mixer for NemotronV3 (training-only, uses CUDA kernels).
 
@@ -239,10 +254,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
         )
 
         # SSM parameters
-        self.dt_bias = nn.Parameter(torch.ones(self.num_heads))
-        A = torch.arange(1, self.num_heads + 1)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.A_log._no_weight_decay = True
+        self._fp32_params = NemotronV3MambaFP32Params(self.num_heads)
         self.D = nn.Parameter(torch.ones(self.num_heads))
         self.D._no_weight_decay = True
 
@@ -258,6 +270,17 @@ class NemotronV3Mamba2Mixer(nn.Module):
 
         # Context parallelism — set post-construction by the parallelizer
         self.cp = None
+
+    @property
+    def dt_bias(self) -> torch.Tensor:
+        return self._fp32_params.dt_bias
+
+    @property
+    def A_log(self) -> torch.Tensor:
+        return self._fp32_params.A_log
+
+    def _get_fp32_ssm_params(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._fp32_params()
 
     def forward(
         self,
@@ -354,13 +377,14 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 projected_states = self.cp.pre_conv_ssm(projected_states, cu_seqlens=cu_seqlens_cp)
                 if squeezed and cu_seqlens_cp is not None:
                     projected_states = projected_states.unsqueeze(0).contiguous()
-                A = -torch.exp(self.cp.get_A_log().float())
+                A_log, dt_bias = self._get_fp32_ssm_params()
+                A = -torch.exp(self.cp.get_A_log(A_log).float())
 
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.cp.get_conv1d_weight(),
                     self.cp.get_conv1d_bias(),
-                    self.cp.get_dt_bias(),
+                    self.cp.get_dt_bias(dt_bias),
                     A,
                     D=self.cp.get_D(),
                     chunk_size=self.chunk_size,
@@ -389,13 +413,14 @@ class NemotronV3Mamba2Mixer(nn.Module):
                     out = out.squeeze(0)
                 return out
             else:
-                A = -torch.exp(self.A_log.float())
+                A_log, dt_bias = self._get_fp32_ssm_params()
+                A = -torch.exp(A_log.float())
 
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.conv1d.weight.squeeze(1),
                     self.conv1d.bias,
-                    self.dt_bias,
+                    dt_bias,
                     A,
                     D=self.D,
                     chunk_size=self.chunk_size,
@@ -446,10 +471,11 @@ class NemotronV3Mamba2Mixer(nn.Module):
             )
 
             # Reshape for selective_state_update
-            A = -torch.exp(self.A_log.float())
+            A_log, dt_bias = self._get_fp32_ssm_params()
+            A = -torch.exp(A_log.float())
             A = A[:, None, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
             dt = dt[:, :, None].expand(-1, -1, self.head_dim)
-            dt_bias = self.dt_bias[:, None].expand(-1, self.head_dim)
+            dt_bias = dt_bias[:, None].expand(-1, self.head_dim)
             D = self.D[:, None].expand(-1, self.head_dim)
             B = B.view(batch_size, self.n_groups, self.ssm_state_size)
             C = C.view(batch_size, self.n_groups, self.ssm_state_size)
@@ -509,13 +535,14 @@ class NemotronV3Mamba2Mixer(nn.Module):
             dim=-1,
         )
 
-        A = -torch.exp(self.A_log.float())
+        A_log, dt_bias = self._get_fp32_ssm_params()
+        A = -torch.exp(A_log.float())
         dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
         # Chunk SSM scan
         scan_output, ssm_state = mamba_chunk_scan_combined(
             hidden_states_inner.view(batch_size, seq_len, -1, self.head_dim),
-            nn.functional.softplus(dt + self.dt_bias),
+            nn.functional.softplus(dt + dt_bias),
             A,
             B.view(batch_size, seq_len, self.n_groups, -1),
             C.view(batch_size, seq_len, self.n_groups, -1),

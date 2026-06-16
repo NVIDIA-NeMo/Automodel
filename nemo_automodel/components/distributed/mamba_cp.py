@@ -461,13 +461,13 @@ class MambaContextParallel:
             return None
         return self._slice_conv_param(self._mixer.conv1d.bias)
 
-    def get_dt_bias(self) -> torch.Tensor:
+    def get_dt_bias(self, dt_bias: torch.Tensor | None = None) -> torch.Tensor:
         """Slice ``dt_bias`` for the current CP rank."""
-        return self._slice_vector_param(self._mixer.dt_bias)
+        return self._slice_vector_param(self._mixer.dt_bias if dt_bias is None else dt_bias)
 
-    def get_A_log(self) -> torch.Tensor:
+    def get_A_log(self, A_log: torch.Tensor | None = None) -> torch.Tensor:
         """Slice ``A_log`` for the current CP rank."""
-        return self._slice_vector_param(self._mixer.A_log)
+        return self._slice_vector_param(self._mixer.A_log if A_log is None else A_log)
 
     def get_D(self) -> torch.Tensor:
         """Slice ``D`` for the current CP rank."""

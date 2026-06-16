@@ -531,6 +531,7 @@ class TestNemotronHForCausalLM:
                 expected[name] = values
 
         assert expected, "Nemotron V3 Mamba layers should create decay parameters"
+        assert all("._fp32_params." in name for name in expected)
 
         cast_model_to_dtype(model, torch.bfloat16)
 
