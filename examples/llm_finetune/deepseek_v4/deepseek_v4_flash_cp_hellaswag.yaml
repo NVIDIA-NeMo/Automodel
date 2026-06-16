@@ -141,6 +141,8 @@ optimizer:
   weight_decay: 0.1
 
 ci:
-  # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
+  # dp(4) * tp(1) * pp(4) * cp(8) = 128 GPUs => 16 nodes (8 H100/node).
+  # ep_size(32) shards experts within the dp*cp group (4*8=32); it does not
+  # multiply the mesh.
   recipe_owner: huiyingl
   nodes: 16
