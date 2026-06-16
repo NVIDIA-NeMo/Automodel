@@ -212,7 +212,19 @@ def _fusible(module) -> bool:
         return False
     if getattr(module, "dropout_p", 0.0) and module.training:
         return False
-    for w in (module.weight, lora_A.weight, lora_B.weight):
+    # QLoRA / quantized base weights are stored as packed buffers (e.g. bitsandbytes 4-bit
+    # carries a ``quant_state`` and a flattened weight shaped like ``(1, out*in/2)`` rather than
+    # a 2D ``(out_features, in_features)`` matrix). The fused path calls ``F.linear(x, base_weight)``
+    # directly, which fails for a packed buffer ("mat1 and mat2 shapes cannot be multiplied"); bail
+    # so the per-linear ``LinearLoRA.forward`` path (which dequantizes the base) handles it instead.
+    base_w = module.weight
+    if getattr(base_w, "quant_state", None) is not None or getattr(module, "quant_state", None) is not None:
+        return False
+    out_features = getattr(module, "out_features", None)
+    in_features = getattr(module, "in_features", None)
+    if out_features is not None and in_features is not None and tuple(base_w.shape) != (out_features, in_features):
+        return False
+    for w in (base_w, lora_A.weight, lora_B.weight):
         if isinstance(w, DTensor):
             return False
     return True
