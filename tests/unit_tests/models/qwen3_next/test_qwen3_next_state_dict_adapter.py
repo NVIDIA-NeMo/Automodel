@@ -12,20 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
 from unittest.mock import Mock, patch
 
-from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
+import torch
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
+from nemo_automodel.components.moe.config import MoEConfig
 
 
 class TestApplyKeyMapping:
     def _make_adapter(self):
-        return Qwen3NextStateDictAdapter(
-            config=object(), moe_config=object(), backend=object(), dtype=torch.float32
-        )
+        return Qwen3NextStateDictAdapter(config=object(), moe_config=object(), backend=object(), dtype=torch.float32)
 
     def test_shared_expert_to_shared_experts_mapping(self):
         """Test that shared_expert (singular) is mapped to shared_experts (plural)"""
@@ -178,9 +176,7 @@ class TestQwen3NextStateDictAdapter:
         moe_config = self.create_mock_moe_config()
         backend = self.create_mock_backend_config()
 
-        adapter = Qwen3NextStateDictAdapter(
-            config=config, moe_config=moe_config, backend=backend, dtype=torch.float16
-        )
+        adapter = Qwen3NextStateDictAdapter(config=config, moe_config=moe_config, backend=backend, dtype=torch.float16)
 
         assert adapter.config is config
         assert adapter.moe_config is moe_config
@@ -478,7 +474,7 @@ class TestConvertSingleTensorToHf:
         tensor = torch.randn(8, 256, 1024)
         fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts") as mock_convert:
             mock_convert.return_value = [
                 ("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(512, 256)),
                 ("model.layers.0.mlp.experts.0.up_proj.weight", torch.randn(512, 256)),
@@ -498,7 +494,7 @@ class TestConvertSingleTensorToHf:
         tensor = torch.randn(128, 256)
         fqn = "model.layers.0.mlp.shared_experts.gate_proj.weight"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor)
 
             assert len(result) == 1
@@ -515,7 +511,7 @@ class TestConvertSingleTensorToHf:
         tensor = torch.randn(64, 64)
         fqn = "model.layers.0.attention.weight"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor)
 
             assert len(result) == 1
@@ -531,7 +527,7 @@ class TestConvertSingleTensorToHf:
         tensor = torch.randn(64, 64)
         fqn = "exclude_this.weight"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
 
             assert len(result) == 0
@@ -545,7 +541,7 @@ class TestConvertSingleTensorToHf:
         tensor = torch.randn(8, 256, 1024)
         fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts") as mock_convert:
             mock_convert.return_value = [
                 ("model.layers.0.mlp.shared_experts.gate_proj.weight", torch.randn(128, 256)),
                 ("exclude_me.weight", torch.randn(64, 64)),
@@ -557,3 +553,86 @@ class TestConvertSingleTensorToHf:
             assert len(result) == 1
             assert result[0][0] == "model.layers.0.mlp.shared_expert.gate_proj.weight"
             assert "exclude_me.weight" not in [k for k, _ in result]
+
+
+class TestFp32HolderKeyStripping:
+    """After FSDP isolation, A_log/dt_bias live under ``linear_attn._fp32_params.*``.
+
+    The adapter must hide that wrapping on save so checkpoints stay HF-loadable.
+    """
+
+    def _make_adapter(self):
+        moe_config = Mock()
+        moe_config.n_routed_experts = 8
+        moe_config.moe_inter_dim = 512
+        backend = Mock()
+        backend.dispatcher = "torch"
+        backend.experts = "torch"
+        return Qwen3NextStateDictAdapter(config=Mock(), moe_config=moe_config, backend=backend, dtype=torch.float32)
+
+    def test_convert_single_tensor_strips_a_log(self):
+        adapter = self._make_adapter()
+        result = adapter.convert_single_tensor_to_hf("model.layers.1.linear_attn._fp32_params.A_log", torch.zeros(4))
+        assert [k for k, _ in result] == ["model.layers.1.linear_attn.A_log"]
+
+    def test_convert_single_tensor_strips_dt_bias(self):
+        adapter = self._make_adapter()
+        result = adapter.convert_single_tensor_to_hf("model.layers.0.linear_attn._fp32_params.dt_bias", torch.ones(4))
+        assert [k for k, _ in result] == ["model.layers.0.linear_attn.dt_bias"]
+
+    def test_to_hf_strips_holder(self):
+        adapter = self._make_adapter()
+        out = adapter.to_hf({"model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4)})
+        assert "model.layers.0.linear_attn.A_log" in out
+        assert all("_fp32_params" not in k for k in out)
+
+    def test_to_hf_upcasts_gdn_fp32_params_saved_as_bf16(self):
+        adapter = self._make_adapter()
+        state_dict = {
+            "model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4, dtype=torch.bfloat16),
+            "model.layers.0.linear_attn._fp32_params.dt_bias": torch.ones(4, dtype=torch.bfloat16),
+            "model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+        }
+
+        out = adapter.to_hf(state_dict)
+
+        assert out["model.layers.0.linear_attn.A_log"].dtype == torch.float32
+        assert out["model.layers.0.linear_attn.dt_bias"].dtype == torch.float32
+        q_proj_key = "model.layers.0.self_attn.q_proj.weight"
+        assert out[q_proj_key] is state_dict[q_proj_key]
+        assert out[q_proj_key].dtype == torch.bfloat16
+
+    def test_bare_key_unchanged(self):
+        adapter = self._make_adapter()
+        result = adapter.convert_single_tensor_to_hf("model.layers.0.linear_attn.A_log", torch.zeros(4))
+        assert [k for k, _ in result] == ["model.layers.0.linear_attn.A_log"]
+
+    def test_convert_single_tensor_upcasts_gdn_fp32_params(self):
+        adapter = self._make_adapter()
+        result = adapter.convert_single_tensor_to_hf(
+            "model.layers.0.linear_attn._fp32_params.dt_bias",
+            torch.zeros(4, dtype=torch.bfloat16),
+        )
+        assert result[0][0] == "model.layers.0.linear_attn.dt_bias"
+        assert result[0][1].dtype == torch.float32
+
+    def test_from_hf_routes_and_upcasts_gdn_fp32_params_loaded_as_bf16(self):
+        adapter = self._make_adapter()
+        hf_state = {
+            "model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.bfloat16),
+            "model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.bfloat16),
+            "model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+        }
+
+        with patch.object(
+            adapter, "_from_hf_w_merged_experts", side_effect=lambda state, device_mesh=None: dict(state)
+        ):
+            out = adapter.from_hf(hf_state)
+
+        a_log_key = "model.layers.0.linear_attn._fp32_params.A_log"
+        dt_bias_key = "model.layers.0.linear_attn._fp32_params.dt_bias"
+        q_proj_key = "model.layers.0.self_attn.q_proj.weight"
+        assert out[a_log_key].dtype == torch.float32
+        assert out[dt_bias_key].dtype == torch.float32
+        assert out[q_proj_key] is hf_state[q_proj_key]
+        assert out[q_proj_key].dtype == torch.bfloat16

@@ -60,6 +60,10 @@ import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
+from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
+    has_gated_delta_net_fp32_checkpoint_contract,
+    is_gated_delta_net_fp32_param_key,
+)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
 from nemo_automodel.shared.utils import dtype_from_str
@@ -662,6 +666,7 @@ def _restore_loaded_model_dtype(
     if not checkpoint_dtypes:
         return
 
+    preserve_gdn_fp32_params = has_gated_delta_net_fp32_checkpoint_contract(hf_config)
     restored_dtype_by_tensor_id: dict[int, torch.dtype] = {}
     restored_count = 0
     for name, checkpoint_dtype in checkpoint_dtypes.items():
@@ -669,22 +674,34 @@ def _restore_loaded_model_dtype(
         if tensor is None:
             continue
 
+        effective_checkpoint_dtype = (
+            torch.float32
+            if checkpoint_dtype.is_floating_point
+            and preserve_gdn_fp32_params
+            and is_gated_delta_net_fp32_param_key(name)
+            else checkpoint_dtype
+        )
+
         # Record the checkpoint's original dtype on the tensor as the compute-dtype
         # hint. Storage may be upcast below (fp32 master weights), which erases the
         # dtype HF intended for compute; downstream sharding (fully_shard_by_dtype)
         # reads ``_hf_compute_dtype`` to keep intrinsically-fp32 params (e.g. ``A_log``)
         # computing in fp32 while the bulk computes in mp_policy.param_dtype.
-        if checkpoint_dtype.is_floating_point and tensor.dtype.is_floating_point:
-            tensor._hf_compute_dtype = checkpoint_dtype
+        if effective_checkpoint_dtype.is_floating_point and tensor.dtype.is_floating_point:
+            tensor._hf_compute_dtype = effective_checkpoint_dtype
 
         # Pick the unification target. For an explicit floating request, take the
         # wider of (checkpoint, requested) so explicit fp32 is honored as master
         # weights while intrinsically-fp32 checkpoint params survive a bf16 request.
         # For "auto" (requested_dtype is None) or non-floating tensors, mirror the
         # checkpoint dtype exactly (preserves today's behavior).
-        target_dtype = checkpoint_dtype
-        if requested_dtype is not None and checkpoint_dtype.is_floating_point and tensor.dtype.is_floating_point:
-            target_dtype = torch.promote_types(checkpoint_dtype, requested_dtype)
+        target_dtype = effective_checkpoint_dtype
+        if (
+            requested_dtype is not None
+            and effective_checkpoint_dtype.is_floating_point
+            and tensor.dtype.is_floating_point
+        ):
+            target_dtype = torch.promote_types(effective_checkpoint_dtype, requested_dtype)
 
         if tensor.dtype == target_dtype:
             continue

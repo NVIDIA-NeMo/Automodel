@@ -874,3 +874,65 @@ class TestFp32ParamRouting:
         assert "model.language_model.layers.0.linear_attn._fp32_params.A_log" in out
         assert "model.language_model.layers.0.linear_attn._fp32_params.dt_bias" in out
         assert "model.language_model.layers.0.linear_attn.A_log" not in out
+
+    def test_to_hf_strips_a_log_holder(self, adapter):
+        sd = {"model.language_model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4)}
+        out = adapter.to_hf(sd)
+        assert "model.language_model.layers.0.linear_attn.A_log" in out
+        assert all("_fp32_params" not in k for k in out)
+
+    def test_to_hf_strips_dt_bias_holder(self, adapter):
+        sd = {"model.language_model.layers.2.linear_attn._fp32_params.dt_bias": torch.ones(4)}
+        out = adapter.to_hf(sd)
+        assert "model.language_model.layers.2.linear_attn.dt_bias" in out
+        assert all("_fp32_params" not in k for k in out)
+
+    def test_to_hf_upcasts_gdn_fp32_params_saved_as_bf16(self, adapter):
+        sd = {
+            "model.language_model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.linear_attn._fp32_params.dt_bias": torch.ones(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+        }
+
+        out = adapter.to_hf(sd)
+
+        assert out["model.language_model.layers.0.linear_attn.A_log"].dtype == torch.float32
+        assert out["model.language_model.layers.0.linear_attn.dt_bias"].dtype == torch.float32
+        q_proj_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        assert out[q_proj_key] is sd[q_proj_key]
+        assert out[q_proj_key].dtype == torch.bfloat16
+
+    def test_convert_single_tensor_strips_holder(self, adapter):
+        result = adapter.convert_single_tensor_to_hf(
+            "model.language_model.layers.1.linear_attn._fp32_params.A_log", torch.zeros(4)
+        )
+        assert [k for k, _ in result] == ["model.language_model.layers.1.linear_attn.A_log"]
+
+    def test_convert_single_tensor_upcasts_gdn_fp32_params(self, adapter):
+        result = adapter.convert_single_tensor_to_hf(
+            "model.language_model.layers.1.linear_attn._fp32_params.dt_bias",
+            torch.zeros(4, dtype=torch.bfloat16),
+        )
+        assert result[0][0] == "model.language_model.layers.1.linear_attn.dt_bias"
+        assert result[0][1].dtype == torch.float32
+
+    def test_bare_key_unchanged(self, adapter):
+        result = adapter.convert_single_tensor_to_hf("model.language_model.layers.0.linear_attn.A_log", torch.zeros(4))
+        assert [k for k, _ in result] == ["model.language_model.layers.0.linear_attn.A_log"]
+
+    def test_from_hf_routes_and_upcasts_gdn_fp32_params_loaded_as_bf16(self, adapter):
+        hf_state = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        a_log_key = "model.language_model.layers.0.linear_attn._fp32_params.A_log"
+        dt_bias_key = "model.language_model.layers.0.linear_attn._fp32_params.dt_bias"
+        q_proj_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        assert out[a_log_key].dtype == torch.float32
+        assert out[dt_bias_key].dtype == torch.float32
+        assert out[q_proj_key] is hf_state[q_proj_key]
+        assert out[q_proj_key].dtype == torch.bfloat16
