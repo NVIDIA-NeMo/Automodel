@@ -883,6 +883,17 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     logger.info("Per-layer torch.compile applied to %d decoder layers", compiled_count)
 
 
+def _subtree_all_frozen(module: nn.Module) -> bool:
+    """Return True if ``module`` owns parameters and none of them require grad.
+
+    Used to skip FSDP-wrapping a frozen submodule that never runs in the forward
+    (e.g. the audio tower on image/text-only data); see
+    ``apply_fsdp2_sharding_recursively``.
+    """
+    params = list(module.parameters())
+    return len(params) > 0 and not any(p.requires_grad for p in params)
+
+
 def apply_fsdp2_sharding_recursively(
     module: nn.Module,
     mesh: DeviceMesh,
@@ -986,6 +997,17 @@ def apply_fsdp2_sharding_recursively(
                     fsdp_units[i].set_modules_to_backward_prefetch(targets)
     else:
         for name, sub_module in module.named_children():
+            # A frozen audio tower never runs in the forward on image/text-only
+            # data (in gemma E4B and E2B models), so wrapping its layers as their own FSDP units leaves those
+            # units never all-gathered. Under gradient accumulation FSDP's
+            # deferred post-backward then dereferences their (never-created)
+            # ``_unsharded_param`` and raises ``AttributeError``. Skip it so its
+            # params stay with the always-run root FSDP unit (which is still
+            # sharded, and whose frozen params have ``grad is None`` so the
+            # accumulate path is a no-op). Mirrors the audio_tower guard in
+            # ``components/moe/parallelizer.py``.
+            if name == "audio_tower" and _subtree_all_frozen(sub_module):
+                continue
             apply_fsdp2_sharding_recursively(
                 sub_module,
                 mesh,
