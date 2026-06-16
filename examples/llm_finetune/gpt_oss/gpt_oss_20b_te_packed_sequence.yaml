@@ -20,7 +20,11 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 4
+  # local_batch_size 1 (not 4): full-FT of the 20B MoE on a single 8xH100-80GB node
+  # OOMs in the MoE experts grouped-GEMM / cross-entropy at lbs=4; lbs=1 (grad-accum
+  # keeps global_batch_size=32) trains within ~35 GiB/GPU. Activation checkpointing is
+  # not usable here (DeepEP token dispatch is non-deterministic -> recompute mismatch).
+  local_batch_size: 1
   ckpt_every_steps: 500
   num_epochs: 2
 
