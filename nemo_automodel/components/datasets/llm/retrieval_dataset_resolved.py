@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Resolved retrieval JSONL dataset.
+"""Resolved retrieval dataset.
 
 This loader is for retrieval data whose expensive corpus join has already been
-performed offline. Each JSONL row is one training example with query text and
-the selected positive/negative passages inline:
+performed offline. Each JSONL row or packed shard row is one training example
+with query text and the selected positive/negative passages inline:
 
 ```
 {"question": "...", "doc_text": ["pos", "neg"], "doc_image": ["images/a.jpg", ""]}
 ```
 
 It intentionally avoids HuggingFace corpus loading and document-id lookups in
-the training hot path. Image paths are opened lazily inside DataLoader workers.
+the training hot path. Loose image paths are opened lazily inside DataLoader
+workers. Packed SQLite/Parquet shards store image bytes inline.
 """
 
 from __future__ import annotations
@@ -60,18 +61,30 @@ def _coerce_path_list(data_path: str | Sequence[str]) -> list[Path]:
         if path.is_dir():
             paths.extend(sorted(path.glob("*.jsonl")))
             paths.extend(sorted(path.glob("*.sqlite")))
+            paths.extend(sorted(path.glob("*.parquet")))
         elif path.is_file():
             paths.append(path)
         else:
             raise FileNotFoundError(f"Resolved retrieval data path does not exist: {path}")
 
     if not paths:
-        raise ValueError(f"No JSONL or SQLite files found in resolved retrieval data path: {data_path}")
+        raise ValueError(f"No JSONL, SQLite, or Parquet files found in resolved retrieval data path: {data_path}")
     return paths
 
 
 def _is_sqlite_path(path: Path) -> bool:
     return path.suffix == ".sqlite"
+
+
+def _is_parquet_path(path: Path) -> bool:
+    return path.suffix == ".parquet"
+
+
+def _import_pyarrow_parquet():
+    has_pq, pq = safe_import("pyarrow.parquet")
+    if not has_pq:
+        raise ImportError("pyarrow is required to read resolved retrieval Parquet shards. Install pyarrow.")
+    return pq
 
 
 def _count_resolved_records(paths: Sequence[Path]) -> int:
@@ -80,6 +93,9 @@ def _count_resolved_records(paths: Sequence[Path]) -> int:
         if _is_sqlite_path(path):
             with _open_sqlite_connection(path) as conn:
                 count += int(conn.execute("SELECT COUNT(*) FROM records").fetchone()[0])
+        elif _is_parquet_path(path):
+            pq = _import_pyarrow_parquet()
+            count += int(pq.ParquetFile(path).metadata.num_rows)
         else:
             with path.open("r", encoding="utf-8") as f:
                 for line in f:
@@ -260,8 +276,18 @@ def _load_sqlite_images(conn: sqlite3.Connection, record_id: int) -> dict[int, b
     }
 
 
+def _parquet_images_to_dict(image_values: Sequence[Any] | None) -> dict[int, bytes]:
+    if image_values is None:
+        return {}
+    return {
+        doc_idx: bytes(image_jpeg)
+        for doc_idx, image_jpeg in enumerate(image_values)
+        if image_jpeg is not None and len(image_jpeg) > 0
+    }
+
+
 class ResolvedRetrievalJsonlDataset(IterableDataset):
-    """Stream resolved retrieval JSONL shards across ranks and DataLoader workers."""
+    """Stream resolved retrieval JSONL/SQLite/Parquet shards across ranks and DataLoader workers."""
 
     def __init__(
         self,
@@ -383,19 +409,60 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
                     continue
                 yield _parse_sqlite_record(record_json), _load_sqlite_images(conn, int(record_id))
 
+    def _iter_parquet_records(
+        self,
+        path: Path,
+        *,
+        state: dict[str, int],
+        rank: int,
+        world_size: int,
+        worker_id: int,
+        num_workers: int,
+    ) -> Iterable[tuple[dict[str, Any], dict[int, bytes]]]:
+        pq = _import_pyarrow_parquet()
+        parquet_file = pq.ParquetFile(path)
+        for row_group_idx in range(parquet_file.num_row_groups):
+            if state["records_seen_this_repeat"] >= self._num_records:
+                break
+            row_group_rows = int(parquet_file.metadata.row_group(row_group_idx).num_rows)
+            rows_to_consume = min(row_group_rows, self._num_records - state["records_seen_this_repeat"])
+            if state["parquet_group_idx"] % world_size == rank:
+                emit = state["parquet_local_group_idx_for_rank"] % num_workers == worker_id
+                state["parquet_local_group_idx_for_rank"] += 1
+            else:
+                emit = False
+            state["parquet_group_idx"] += 1
+            state["records_seen_this_repeat"] += rows_to_consume
+            if not emit:
+                continue
+
+            table = parquet_file.read_row_group(row_group_idx, columns=["record_json", "image_jpeg"])
+            record_json_col = table.column("record_json").combine_chunks()
+            image_col = table.column("image_jpeg").combine_chunks()
+            for row_idx in range(rows_to_consume):
+                record_json = record_json_col[row_idx].as_py()
+                image_values = image_col[row_idx].as_py()
+                yield _parse_sqlite_record(record_json), _parquet_images_to_dict(image_values)
+
     def __iter__(self) -> Iterable[dict[str, Any]]:
         worker = get_worker_info()
         worker_id = worker.id if worker is not None else 0
         num_workers = worker.num_workers if worker is not None else 1
         rank, world_size = _get_dist_info()
 
-        state = {"global_idx": 0, "local_idx_for_rank": 0, "records_seen_this_repeat": 0}
+        state = {
+            "global_idx": 0,
+            "local_idx_for_rank": 0,
+            "parquet_group_idx": 0,
+            "parquet_local_group_idx_for_rank": 0,
+            "records_seen_this_repeat": 0,
+        }
         for repeat_idx in range(self.repeat):
             state["records_seen_this_repeat"] = 0
             for path in self._iter_paths(repeat_idx):
                 record_dir = path.parent
-                record_iter = (
-                    self._iter_sqlite_records(
+                if _is_parquet_path(path):
+                    record_iter = self._iter_parquet_records(
                         path,
                         state=state,
                         rank=rank,
@@ -403,8 +470,8 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
                         worker_id=worker_id,
                         num_workers=num_workers,
                     )
-                    if _is_sqlite_path(path)
-                    else self._iter_jsonl_records(
+                elif _is_sqlite_path(path):
+                    record_iter = self._iter_sqlite_records(
                         path,
                         state=state,
                         rank=rank,
@@ -412,7 +479,15 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
                         worker_id=worker_id,
                         num_workers=num_workers,
                     )
-                )
+                else:
+                    record_iter = self._iter_jsonl_records(
+                        path,
+                        state=state,
+                        rank=rank,
+                        world_size=world_size,
+                        worker_id=worker_id,
+                        num_workers=num_workers,
+                    )
                 for record, packed_images in record_iter:
                     yield _normalize_resolved_record(
                         record,
@@ -441,10 +516,10 @@ def make_resolved_retrieval_dataset(
     data_dir_list: str | Sequence[str] | None = None,
     do_shuffle: bool | None = None,
 ) -> ResolvedRetrievalJsonlDataset:
-    """Build a streaming resolved retrieval JSONL dataset.
+    """Build a streaming resolved retrieval dataset.
 
     Args:
-        data_path: JSONL file, directory of JSONL shards, or list of files/directories.
+        data_path: JSONL/SQLite/Parquet file, directory of shards, or list of files/directories.
         model_type: ``"bi_encoder"`` or ``"cross_encoder"``.
         data_type: Accepted for YAML parity with ``make_retrieval_dataset``.
         n_passages: Optional validation check for the number of docs per row.
