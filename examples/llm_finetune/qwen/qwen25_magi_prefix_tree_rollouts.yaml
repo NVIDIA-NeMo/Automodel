@@ -28,9 +28,11 @@
 # Notes for the magi prefix-tree backend (cp=1):
 #   * the model MUST be a registered custom model (in MODEL_ARCH_MAPPING) so
 #     backend.attn="magi" wires the custom-model attn_func, which is the only
-#     magi path that reads the out-of-band AttnMaskSpec. Qwen2 is registered;
-#     a plain HF model would route through the HF magi backend and ignore the
-#     prefix-tree spec.
+#     magi path that reads the out-of-band AttnMaskSpec. Qwen2 is registered.
+#     A plain HF model routes through the HF magi backend (attn_implementation=
+#     "magi"), whose fixed attention interface cannot receive the mask spec; the
+#     recipe raises NotImplementedError in that case rather than silently
+#     dropping the prefix-tree mask.
 #   * local_batch_size must be 1: each folded group is already one flat sequence
 #     with no batch dim, and the prefix-tree mask is built per group.
 #   * backend.rope_fusion must be false: magi applies RoPE positionally with the
