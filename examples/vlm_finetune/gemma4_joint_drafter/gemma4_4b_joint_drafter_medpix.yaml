@@ -24,7 +24,7 @@
 # ``_shift_labels_left`` already.
 #
 # torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py \
-#     -c examples/vlm_finetune/gemma4/gemma4_4b_joint_drafter_multi_step.yaml
+#     -c examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_medpix.yaml
 #
 # Requires: transformers>=5.8.0.dev
 
@@ -125,7 +125,7 @@ optimizer:
 # you see early base-loss spikes when bumping K, bump warmup to 50 first
 # before lowering drafter_loss_weight.
 lr_scheduler:
-  lr_warmup_steps: 25
+# 10% of max_steps as warmup is used by default which is what we want hence not setting lr_warmup_steps here.
   lr_decay_style: cosine
 
 freeze_config:
