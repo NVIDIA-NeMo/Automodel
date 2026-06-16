@@ -122,12 +122,20 @@ def _fully_shard(
     mesh: DeviceMesh,
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy],
+    reshard_after_forward: Optional[bool] = None,
 ) -> None:
     if isinstance(module, nn.ModuleList):
         for layer in module:
-            _fully_shard(layer, mesh, mp_policy, offload_policy)
+            _fully_shard(layer, mesh, mp_policy, offload_policy, reshard_after_forward)
     else:
-        fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+        kwargs = {
+            "mesh": mesh,
+            "mp_policy": mp_policy,
+            "offload_policy": offload_policy,
+        }
+        if reshard_after_forward is not None:
+            kwargs["reshard_after_forward"] = reshard_after_forward
+        fully_shard(module, **kwargs)
 
 
 def _mp_policy_with_param_dtype(
@@ -238,11 +246,17 @@ def fully_shard_by_dtype(
             return_paths=True,
         ):
             if (len(grouped_params) == 2 and dtype == least_items_dtype) or len(grouped_params) > 2:
+                reshard_after_forward = (
+                    False
+                    if fp32_compute_module_names and any(token in path for token in fp32_compute_module_names)
+                    else None
+                )
                 _fully_shard(
                     _get_module_from_path(module, path),
                     mesh=mesh,
                     mp_policy=_mp_policy_with_param_dtype(mp_policy, dtype),
                     offload_policy=offload_policy,
+                    reshard_after_forward=reshard_after_forward,
                 )
         if len(grouped_params) == 2:
             parent_dtype = next(dtype for dtype in grouped_params if dtype != least_items_dtype)

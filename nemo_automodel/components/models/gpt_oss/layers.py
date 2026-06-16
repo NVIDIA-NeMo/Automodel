@@ -37,6 +37,10 @@ from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
+def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+
+
 class GptOssFP32Parameter(nn.Module):
     """Callable holder for fp32 tensors that need their own FSDP unit."""
 
@@ -45,7 +49,7 @@ class GptOssFP32Parameter(nn.Module):
         self.weight = nn.Parameter(value.to(torch.float32))
 
     def forward(self) -> torch.Tensor:
-        return self.weight
+        return _full_tensor_if_dtensor(self.weight)
 
 
 class GptOssAttention(nn.Module):

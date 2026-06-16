@@ -60,6 +60,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -72,6 +73,10 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     dsv4_sinkhorn_normalize,
     dsv4_sparse_attention,
 )
+
+
+def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
 
 
 def _dsv4_kernel_backend(backend: BackendConfig) -> str:
@@ -575,7 +580,7 @@ class DeepseekV4FP32Parameter(nn.Module):
 
     def forward(self, reference: torch.Tensor | None = None) -> torch.Tensor:
         del reference
-        return self.weight
+        return _full_tensor_if_dtensor(self.weight)
 
 
 class DeepseekV4Indexer(nn.Module):

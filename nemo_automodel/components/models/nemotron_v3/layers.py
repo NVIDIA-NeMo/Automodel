@@ -32,6 +32,10 @@ from nemo_automodel.components.models.common import (
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
+def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+
+
 class NemotronV3Attention(nn.Module):
     """GQA attention for NemotronV3 (no RoPE), compatible with TE/SDPA backends."""
 
@@ -201,7 +205,11 @@ class NemotronV3MambaFP32Params(nn.Module):
 
     def forward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return SSM params through the holder's FSDP hooks."""
-        return self.A_log, self.dt_bias, self.D
+        return (
+            _full_tensor_if_dtensor(self.A_log),
+            _full_tensor_if_dtensor(self.dt_bias),
+            _full_tensor_if_dtensor(self.D),
+        )
 
 
 class NemotronV3Mamba2Mixer(nn.Module):

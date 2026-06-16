@@ -366,7 +366,8 @@ Where to declare it:
 - **Trainable fp32 params inside mixed modules**: do not leave them as bare parameters on a
   module that also owns bf16 bulk weights. A strict marker identifies the compute dtype, but it
   does not create an FSDP-isolatable subtree. Move the params into a small `_fp32_params` holder,
-  call the holder in `forward` so FSDP hooks run, keep the holder out of broad dtype casts with
+  call the holder in `forward` so FSDP hooks run, return a full tensor from the holder when FSDP
+  exposes the parameter as a `DTensor`, keep the holder out of broad dtype casts with
   `cast_model_to_dtype(..., skip_modules=("_fp32_params",))`, and make the state-dict adapter
   strip/route holder keys plus upcast loaded tensors to fp32.
 - **HF-derived models with fp32 runtime params**: build the fp32 structure in the model or layer
