@@ -155,31 +155,6 @@ def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
     return getattr(model_config, "model_type", None) != "deepseek_v4"
 
 
-def _is_deepseek_v4_model_or_config(model_or_config: Any) -> bool:
-    config = getattr(model_or_config, "config", model_or_config)
-    return getattr(config, "model_type", None) == "deepseek_v4" or type(model_or_config).__name__.startswith(
-        "DeepseekV4"
-    )
-
-
-def _lcm(a: int, b: int) -> int:
-    import math
-
-    return abs(a * b) // math.gcd(a, b) if a and b else max(a, b)
-
-
-def _dsv4_cp_local_seq_multiple(model_or_config: Any) -> int:
-    config = getattr(model_or_config, "config", model_or_config)
-    ratios = [int(r) for r in (getattr(config, "compress_ratios", None) or []) if int(r) > 0]
-    multiple = 1
-    for ratio in ratios:
-        # Ratio-4 layers use cross-window overlap. Miles requires local shards
-        # divisible by 2*ratio so the boundary overlap is well-formed per rank.
-        required = 2 * ratio if ratio == 4 else ratio
-        multiple = _lcm(multiple, required)
-    return max(multiple, 1)
-
-
 def _get_num_thd_chunks(pp_enabled, cfg):
     if pp_enabled:
         return cfg.get("step_scheduler.local_batch_size", 1) // cfg.get("distributed.pipeline.pp_microbatch_size", 1)
@@ -1164,13 +1139,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream.
         _use_te_value = _thd_collater
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
-        # DeepSeek V4 manual context parallelism (Miles-style): the model owns its
-        # CP attention (contiguous query shard + all-gathered K/V), so attach a
-        # model-owned batch-sharding callable that cp_utils.make_cp_batch_and_ctx
-        # invokes instead of the default load-balanced context_parallel path.
-        model_for_cp = self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
         cp_size = getattr(getattr(self, "dist_setup", None), "cp_size", self.cfg.get("distributed.cp_size", 1))
-        dsv4_manual_cp = cp_size > 1 and _is_deepseek_v4_model_or_config(model_for_cp)
         if self.magi.enabled:
             train_ctx, batch = self.magi.prepare_llm_batch(  # pragma: no cover - requires GPU + magi_attention
                 self.model_parts[0] if hasattr(self, "model_parts") else None,
@@ -1181,23 +1150,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 num_chunks=_num_chunks_value,
             )
         else:
-            if dsv4_manual_cp:
-                if self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0:
-                    raise NotImplementedError(
-                        "DeepSeek V4 context parallelism with packed sequences is not implemented yet."
-                    )
-                from functools import partial
-
-                from nemo_automodel.components.models.deepseek_v4.cp import (
-                    make_dsv4_contiguous_shard_cp_batch_and_ctx,
-                )
-
-                cp_mesh = self.device_mesh["cp"]
-                batch["_cp_make_batch_fn"] = partial(
-                    make_dsv4_contiguous_shard_cp_batch_and_ctx,
-                    pad_multiple=cp_size * _dsv4_cp_local_seq_multiple(model_for_cp),
-                )
-                batch["_dsv4_cp_group"] = cp_mesh.get_group()
+            # Model-owned context parallelism: if the model exposes a CP input-prep
+            # hook, let it attach its own batch-sharding callable (``_cp_make_batch_fn``)
+            # before make_cp_batch_and_ctx shards the batch, instead of the default
+            # load-balanced context_parallel path. DSV4 uses this for its Miles-style
+            # contiguous query shard + all-gathered K/V.
+            _model_cp = self.model_parts[0] if hasattr(self, "model_parts") else None
+            if cp_size > 1 and _model_cp is not None and hasattr(_model_cp, "prepare_model_inputs_for_cp"):
+                batch.update(_model_cp.prepare_model_inputs_for_cp(input_ids=batch["input_ids"]))
             train_ctx, batch = make_cp_batch_and_ctx(
                 self.device_mesh,
                 batch,
@@ -1306,7 +1266,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
                         cu_seqlens=batch.get("cu_seqlens"),
                     )
-                if dsv4_manual_cp and is_train:
+                # Model-owned CP (e.g. DSV4) can request a zero-valued full-logits
+                # term so every CP rank's backward reaches all parameters even when
+                # its local loss is fully masked (avoids FSDP2 unused-parameter hangs).
+                if is_train and batch.get("_cp_full_logits_grad_touch"):
                     logits = getattr(out, "logits", out)
                     if isinstance(logits, torch.Tensor):
                         local_loss = local_loss + logits.sum() * 0.0

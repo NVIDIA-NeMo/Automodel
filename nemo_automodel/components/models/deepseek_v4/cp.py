@@ -21,8 +21,31 @@ collectives before DSV4 sparse attention consumes them.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.distributed as dist
+
+
+def _lcm(a: int, b: int) -> int:
+    return abs(a * b) // math.gcd(a, b) if a and b else max(a, b)
+
+
+def dsv4_cp_local_seq_multiple(model_or_config) -> int:
+    """Required per-CP-rank sequence-length multiple for DSV4 Miles-style CP.
+
+    Compress-ratio layers constrain how the sequence may be split across CP ranks:
+    a ratio-R layer needs each local shard divisible by R, and ratio-4 layers use
+    cross-window overlap so they need ``2*R``. The returned value is the LCM across
+    all configured ``compress_ratios`` (1 when none are configured).
+    """
+    config = getattr(model_or_config, "config", model_or_config)
+    ratios = [int(r) for r in (getattr(config, "compress_ratios", None) or []) if int(r) > 0]
+    multiple = 1
+    for ratio in ratios:
+        required = 2 * ratio if ratio == 4 else ratio
+        multiple = _lcm(multiple, required)
+    return max(multiple, 1)
 
 
 def dsv4_cp_enabled(cp_group) -> bool:
@@ -154,13 +177,18 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     keeps one ``seq_start:seq_end`` slice; DSV4 attention all-gathers K/V across CP
     ranks during forward. No collective happens here -- this is the batch-side
     counterpart of ``cp.py``'s activation gathers. Returns ``(nullcontext, batch)``.
+
+    ``pad_multiple`` is the required *per-CP-rank* shard multiple (from
+    ``dsv4_cp_local_seq_multiple``); the global sequence is padded so it is divisible
+    by ``cp_size`` and each local shard is divisible by ``pad_multiple`` (>= 2).
     """
     import contextlib
 
+    if "cu_seqlens" in batch or batch.get("qkv_format") == "thd":
+        raise NotImplementedError("DeepSeek V4 context parallelism with packed sequences is not implemented yet.")
+
     cp_size = cp_mesh.size()
-    divisor = max(int(pad_multiple or (2 * cp_size)), 2 * cp_size)
-    if divisor % cp_size != 0:
-        raise ValueError(f"DSV4 CP pad multiple must be divisible by cp_size, got {divisor=} {cp_size=}")
+    divisor = cp_size * max(int(pad_multiple or 2), 2)
 
     # attention_mask -> padding_mask (True == pad) so CP attention can rebuild the
     # local-query/global-key mask after K/V is all-gathered.

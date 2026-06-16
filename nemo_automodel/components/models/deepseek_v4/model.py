@@ -65,7 +65,9 @@ from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import (
     build_dsv4_cp_causal_padding_mask,
     dsv4_cp_enabled,
+    dsv4_cp_local_seq_multiple,
     dsv4_cp_size,
+    make_dsv4_contiguous_shard_cp_batch_and_ctx,
 )
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
@@ -789,6 +791,27 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             embeds.append(self.model.embed_tokens(cur_input_ids))
         return tuple(embeds)
 
+    def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
+        """Model-owned context-parallel batch prep (Miles-style contiguous shard).
+
+        Returns the keys ``cp_utils.make_cp_batch_and_ctx`` needs to delegate CP
+        sharding back to this model: a ``_cp_make_batch_fn`` callable (with the
+        config-derived per-rank shard multiple bound) plus a flag asking the recipe
+        to keep the full logits in the autograd graph so every CP rank's backward
+        reaches all parameters even when its local loss is fully masked. DSV4 embeds
+        internally, so (unlike VLM models) this does not pre-embed -- it leaves
+        ``input_ids`` for the sharding callable.
+        """
+        from functools import partial  # noqa: PLC0415
+
+        return {
+            "_cp_make_batch_fn": partial(
+                make_dsv4_contiguous_shard_cp_batch_and_ctx,
+                pad_multiple=dsv4_cp_local_seq_multiple(self.config),
+            ),
+            "_cp_full_logits_grad_touch": True,
+        }
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -800,6 +823,12 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
     ) -> "DeepseekV4CausalLMOutput" | tuple[torch.Tensor, ...] | torch.Tensor:
+        # Model-owned context-parallel input prep. The recipe routes the batch
+        # through ``__call__(_pre_embed_only=True)`` before CP sharding so the model
+        # can attach its own ``_cp_make_batch_fn`` (see ``prepare_model_inputs_for_cp``).
+        if attn_kwargs.pop("_pre_embed_only", False):
+            return self.prepare_model_inputs_for_cp(input_ids=input_ids)
+
         if output_hidden_states is None:
             output_hidden_states = getattr(getattr(self, "config", None), "output_hidden_states", False)
 

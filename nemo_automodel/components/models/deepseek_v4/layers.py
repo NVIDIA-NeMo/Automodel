@@ -1055,6 +1055,15 @@ class DeepseekV4Attention(nn.Module):
     def sinks(self) -> torch.Tensor:
         return self.sinks_param()
 
+    def setup_cp_attention(self, cp_mesh) -> None:
+        """Model-owned context-parallel hook, called by ``moe.parallelizer.apply_cp``.
+
+        DSV4 runs Miles-style CP (contiguous query shard + all-gathered K/V), so there
+        is no TE ``DotProductAttention`` to configure -- we just record the CP process
+        group that ``forward`` uses to all-gather K/V across CP ranks.
+        """
+        self._cp_group = cp_mesh.get_group()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1066,7 +1075,7 @@ class DeepseekV4Attention(nn.Module):
         position_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        cp_group = kwargs.get("_dsv4_cp_group")
+        cp_group = kwargs.get("_dsv4_cp_group") or getattr(self, "_cp_group", None)
         cp_active = dsv4_cp_enabled(cp_group)
         batch, seq_len = hidden_states.shape[:2]
         effective_start_pos = start_pos

@@ -222,7 +222,7 @@ def _prepare_batch(
 ):
     if cp_size > 1:
         cp_mesh = device_mesh["cp"]
-        batch["_cp_make_batch_fn"] = partial(make_dsv4_contiguous_shard_cp_batch_and_ctx, pad_multiple=cp_size * 128)
+        batch["_cp_make_batch_fn"] = partial(make_dsv4_contiguous_shard_cp_batch_and_ctx, pad_multiple=128)
         batch["_dsv4_cp_group"] = cp_mesh.get_group()
     train_ctx, batch = make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=0)
     labels = batch.pop("labels")
