@@ -66,6 +66,7 @@ class StepScheduler(Stateful):
         save_checkpoint_every_epoch: bool = True,
         val_every_steps: Optional[int] = None,
         log_remote_every_steps: int = 1,
+        loss_average_window_steps: int = 50,
         gc_every_steps: Optional[int] = None,
         start_step: int = 0,
         start_epoch: int = 0,
@@ -87,6 +88,7 @@ class StepScheduler(Stateful):
                 Default: True.
             val_every_steps (Optional[int]): Number of training steps between validation.
             log_remote_every_steps (int): Frequency of remote logging (e.g., WandB, MLflow). Default: 1 (every step).
+            loss_average_window_steps (int): Rolling window size for averaged training loss metrics.
             gc_every_steps (Optional[int]): Frequency of manual garbage collection steps.
             start_step (int): Initial global step. Used when resuming from checkpoint. Default: 0.
             start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
@@ -142,6 +144,9 @@ class StepScheduler(Stateful):
         self.log_remote_every_steps = log_remote_every_steps
         if log_remote_every_steps <= 0:
             raise ValueError(f"log_remote_every_steps must be greater than 0, got {log_remote_every_steps}")
+        self.loss_average_window_steps = loss_average_window_steps
+        if loss_average_window_steps <= 0:
+            raise ValueError(f"loss_average_window_steps must be greater than 0, got {loss_average_window_steps}")
         self.gc_every_steps = gc_every_steps
         if gc_every_steps is not None and gc_every_steps <= 0:
             raise ValueError(f"gc_every_steps must be greater than 0 if not None, got {gc_every_steps}")
@@ -326,6 +331,8 @@ class StepSchedulerConfig:
         val_every_steps: Run validation every N optimizer steps.
             ``None`` disables periodic validation.
         log_remote_every_steps: Log to WandB / MLflow every N steps.
+        loss_average_window_steps: Rolling window size for averaged training loss
+            metrics.
         gc_every_steps: Force ``gc.collect()`` every N steps.
             ``None`` disables manual GC.
         start_step: Initial global step (for checkpoint resume).
@@ -339,6 +346,7 @@ class StepSchedulerConfig:
     save_checkpoint_every_epoch: bool = True
     val_every_steps: int | None = None
     log_remote_every_steps: int = 1
+    loss_average_window_steps: int = 50
     gc_every_steps: int | None = None
     start_step: int = 0
     start_epoch: int = 0

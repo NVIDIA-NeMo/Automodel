@@ -822,6 +822,32 @@ class TestApplyFsdpShardingRecursively:
             assert kwargs["offload_policy"] is None
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    def test_apply_fsdp_sharding_module_list_respects_explicit_reshard_override(
+        self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy, mock_offload_policy
+    ):
+        """Test apply_fsdp2_sharding_recursively with an explicit reshard override."""
+        mock_mesh.mesh_dim_names = ("dp", "tp")
+
+        def mock_shard(x, **kwargs):
+            x.set_modules_to_forward_prefetch = MagicMock()
+            x.set_modules_to_backward_prefetch = MagicMock()
+            return x
+
+        mock_fully_shard.side_effect = mock_shard
+
+        apply_fsdp2_sharding_recursively(
+            module=mock_module_list,
+            mesh=mock_mesh,
+            mp_policy=mock_mp_policy,
+            offload_policy=mock_offload_policy,
+            reshard_after_forward=False,
+        )
+
+        assert mock_fully_shard.call_count == 3
+        for call in mock_fully_shard.call_args_list:
+            assert call.kwargs["reshard_after_forward"] is False
+
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_regular_module(
         self, mock_fully_shard, mock_single_module, mock_mesh, mock_mp_policy, mock_offload_policy
     ):
