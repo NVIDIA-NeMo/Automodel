@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import logging
 import math
-import types
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
@@ -302,12 +300,10 @@ class LinearLoRA(nn.Linear):
             use_memory_efficient_lora = self._should_use_memory_efficient_lora(x)
             if use_memory_efficient_lora:
                 if self.dropout_position == "pre" or not self.training or self.dropout_p == 0.0:
-                    return LoRATritonFunction.apply(
-                        x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype, False, res
+                    return apply_memory_efficient_lora(
+                        x, self.lora_A.weight, self.lora_B.weight, self.scale, False, res
                     )
-                lora_res = LoRATritonFunction.apply(
-                    x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype, False
-                )
+                lora_res = apply_memory_efficient_lora(x, self.lora_A.weight, self.lora_B.weight, self.scale, False)
             else:
                 lora_res = self.lora_B(self.lora_A(x) * self.scale)
             if self.dropout_position == "post":
@@ -395,10 +391,8 @@ class TritonLinearLoRA(LinearLoRA):
             x = F.dropout(x, p=self.dropout_p, training=self.training)
         if self.use_memory_efficient_lora:
             if self.dropout_position == "pre" or not self.training or self.dropout_p == 0.0:
-                return LoRATritonFunction.apply(
-                    x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype, True, res
-                )
-            lora_res = LoRATritonFunction.apply(x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype, True)
+                return apply_memory_efficient_lora(x, self.lora_A.weight, self.lora_B.weight, self.scale, True, res)
+            lora_res = apply_memory_efficient_lora(x, self.lora_A.weight, self.lora_B.weight, self.scale, True)
         else:
             lora_res = self.lora_B(self.lora_A(x) * self.scale)
         if self.dropout_position == "post":
@@ -674,71 +668,7 @@ def apply_lora_to_linear_modules(
     if n_fused_mlps:
         logger.info("Fused %d LoRA SwiGLU/ReLU2 MLP module(s) for memory-efficient backward.", n_fused_mlps)
 
-    patch_gemma3n_inplace_lora_views(model)
-
     return num_modules_matched
-
-
-def patch_gemma3n_inplace_lora_views(model: nn.Module) -> int:
-    """Make gemma3n's ``per_layer_model_projection`` LoRA output safe to mutate in place.
-
-    transformers gemma3n ``Gemma3nTextModel.project_per_layer_inputs`` mutates the output of
-    ``self.per_layer_model_projection(inputs_embeds)`` in place (``per_layer_projection *= ...``).
-    When that projection is a LoRA-patched linear using the memory-efficient
-    :class:`LoRATritonFunction`, the returned tensor is a view of the custom autograd Function's
-    output. Some torch versions flag such a view and forbid the in-place op with
-    ``RuntimeError: Output 0 of LoRATritonFunctionBackward is a view and is being modified inplace``.
-
-    This wraps the (single) ``per_layer_model_projection`` module's ``forward`` so it returns a
-    fresh, non-view tensor via :meth:`~torch.Tensor.clone`. ``clone`` is an identity in the autograd
-    graph (gradients pass straight through), so numerics and gradients are unchanged; it only
-    detaches the output from the Function's view so the downstream in-place op is legal. The clone
-    is scoped to this one gemma3n module, so non-gemma3n LoRA pays nothing.
-
-    Detection is structural (a module that owns both a ``per_layer_model_projection`` submodule and
-    a ``project_per_layer_inputs`` method) rather than class-name based, so it keeps working across
-    transformers renames and applies wherever the text backbone is nested inside a VLM wrapper. It
-    is a no-op when the projection is not a LoRA module (e.g. it was excluded from ``target_modules``),
-    when it was already wrapped, or when transformers lacks these attributes.
-
-    Args:
-        model: The (already LoRA-patched) model to scan and wrap in place.
-
-    Returns:
-        int: Number of ``per_layer_model_projection`` modules wrapped.
-    """
-    n_wrapped = 0
-    for module in model.modules():
-        proj = getattr(module, "per_layer_model_projection", None)
-        if proj is None or not callable(getattr(module, "project_per_layer_inputs", None)):
-            continue
-        # Only the memory-efficient LoRA path returns a view; a plain Linear or the non-efficient
-        # LoRA path (res + lora_res) already returns a fresh tensor, so wrapping is unnecessary.
-        if not isinstance(proj, LinearLoRA) or not getattr(proj, "use_memory_efficient_lora", False):
-            continue
-        if getattr(proj, "_nemo_inplace_view_safe", False):
-            continue
-
-        orig_forward = proj.forward
-
-        @functools.wraps(orig_forward.__func__ if hasattr(orig_forward, "__func__") else orig_forward)
-        def _clone_forward(self, x, _orig=orig_forward):
-            out = _orig(x)
-            # ``clone`` only matters when the output is a view of a custom-Function output; it is a
-            # cheap autograd identity otherwise. Guard on tensor-ness to stay robust to odd returns.
-            return out.clone() if isinstance(out, torch.Tensor) else out
-
-        proj.forward = types.MethodType(_clone_forward, proj)
-        proj._nemo_inplace_view_safe = True
-        n_wrapped += 1
-
-    if n_wrapped:
-        logger.info(
-            "Patched %d gemma3n per_layer_model_projection LoRA module(s) to return a non-view "
-            "tensor (project_per_layer_inputs mutates it in place).",
-            n_wrapped,
-        )
-    return n_wrapped
 
 
 class LoRATritonFunction(torch.autograd.Function):
@@ -770,11 +700,14 @@ class LoRATritonFunction(torch.autograd.Function):
 
         Reshapes 3D tensors into 2D and then calls either Triton kernels or PyTorch matmuls. When ``res`` is
         provided, the residual is added in-place into the LoRA output to avoid allocating a separate add result.
+
+        Always returns a **2D** tensor; the caller restores the original leading dimensions. Keeping the
+        ``(N, out) -> (bs, seq, out)`` reshape *outside* this ``autograd.Function`` means the Function's output
+        is never a view, so a downstream consumer may safely mutate the LoRA output in place (the reshape done
+        by the caller is an ordinary autograd view, which supports in-place ops).
         """
-        reshape = x.dim() == 3
-        if reshape:
-            bs, seq_len, d = x.shape
-            x = x.reshape(-1, d)
+        if x.dim() == 3:
+            x = x.reshape(-1, x.shape[-1])
             if res is not None:
                 res = res.reshape(-1, res.shape[-1])
 
@@ -786,8 +719,6 @@ class LoRATritonFunction(torch.autograd.Function):
         if res is not None:
             lora_res.add_(res)
 
-        if reshape:
-            return lora_res.view(bs, seq_len, -1)
         return lora_res
 
     @staticmethod
@@ -800,11 +731,16 @@ class LoRATritonFunction(torch.autograd.Function):
         """
         x, lora_A, lora_B = ctx.saved_tensors
         scale = ctx.scale
-        d_res = d_y if ctx.has_residual and ctx.needs_input_grad[6] else None
 
         reshape = x.dim() == 3
         if reshape:
             bs, seq_len, d = x.shape
+        # forward now returns a 2D output, so d_y arrives 2D; the residual input kept its original
+        # (possibly 3D) shape, so its gradient must be reshaped back to match that input.
+        d_res = None
+        if ctx.has_residual and ctx.needs_input_grad[6]:
+            d_res = d_y.reshape(bs, seq_len, -1) if reshape else d_y
+        if reshape:
             d_y = d_y.reshape(-1, d_y.shape[-1])
             x = x.reshape(-1, d)
 
@@ -836,3 +772,17 @@ class LoRATritonFunction(torch.autograd.Function):
         if ctx.num_inputs == 6:
             return gradients + (None,)
         return gradients
+
+
+def apply_memory_efficient_lora(x, lora_A, lora_B, scale, use_triton_kernel, res=None):
+    """Run :class:`LoRATritonFunction` and restore the input's leading dimensions.
+
+    ``LoRATritonFunction.forward`` returns a 2D tensor (its reshape is intentionally kept outside the
+    autograd Function so the output is never a view). Reshape back to the input rank here; the result
+    is an ordinary autograd view, which — unlike a custom-Function output view — a downstream consumer
+    may mutate in place (e.g. transformers' gemma3n ``project_per_layer_inputs``).
+    """
+    out = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, use_triton_kernel, res)
+    if x.dim() == 3:
+        out = out.reshape(*x.shape[:-1], -1)
+    return out

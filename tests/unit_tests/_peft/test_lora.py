@@ -23,6 +23,7 @@ from nemo_automodel.components._peft.lora import (
     LoRATritonFunction,
     PeftConfig,
     apply_lora_to_linear_modules,
+    apply_memory_efficient_lora,
     patch_linear_module,
 )
 from nemo_automodel.shared.import_utils import safe_import_te
@@ -173,7 +174,7 @@ def test_memory_efficient_lora_matches_legacy_forward_and_backward(input_shape):
     lora_A_ref = lora_A.detach().clone().requires_grad_(True)
     lora_B_ref = lora_B.detach().clone().requires_grad_(True)
 
-    efficient = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, False)
+    efficient = apply_memory_efficient_lora(x, lora_A, lora_B, scale, False)
     legacy = F.linear(F.linear(x_ref, lora_A_ref) * scale, lora_B_ref)
 
     grad = torch.randn_like(legacy)
@@ -204,7 +205,7 @@ def test_memory_efficient_lora_with_residual_matches_legacy_forward_and_backward
     lora_B_ref = lora_B.detach().clone().requires_grad_(True)
     res_ref = res.detach().clone().requires_grad_(True)
 
-    efficient = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, False, res)
+    efficient = apply_memory_efficient_lora(x, lora_A, lora_B, scale, False, res)
     legacy = res_ref + F.linear(F.linear(x_ref, lora_A_ref) * scale, lora_B_ref)
 
     grad = torch.randn_like(legacy)
@@ -480,27 +481,29 @@ class _Gemma3nTextModelMini(nn.Module):
         )
 
 
-def test_patch_gemma3n_inplace_lora_views_wraps_and_preserves_numerics():
-    """The gemma3n patch makes the in-place projection legal without changing numerics or grads."""
-    from nemo_automodel.components._peft.lora import patch_gemma3n_inplace_lora_views
+def test_memory_efficient_lora_output_is_inplace_safe():
+    """A consumer may mutate the memory-efficient LoRA output in place, with no model-specific patch.
 
+    Regression for AM-453: transformers gemma3n ``project_per_layer_inputs`` does
+    ``per_layer_projection *= scale`` on the projection output. Previously the memory-efficient LoRA
+    returned a *view of a custom-autograd-Function output*, so the in-place op raised
+    "Output 0 of LoRATritonFunctionBackward is a view and is being modified inplace". The
+    ``(N, out) -> (bs, seq, out)`` reshape now happens outside the Function, so its output is an
+    ordinary (in-place-safe) view -- fixing the bug class generically (no gemma3n-specific code).
+    """
     p, d, nlayers = 8, 5, 3
     torch.manual_seed(0)
-    patched_model = _Gemma3nTextModelMini(p, d, nlayers)
+    model = _Gemma3nTextModelMini(p, d, nlayers)
     patch_linear_module(
-        patched_model.per_layer_model_projection, dim=4, alpha=8, use_triton=False, use_memory_efficient_lora=True
+        model.per_layer_model_projection, dim=4, alpha=8, use_triton=False, use_memory_efficient_lora=True
     )
 
-    # Reference: identical weights, out-of-place consumer, no model-side patch.
+    # Reference: identical weights, out-of-place consumer.
     torch.manual_seed(0)
     ref_model = _Gemma3nTextModelMini(p, d, nlayers)
     patch_linear_module(
         ref_model.per_layer_model_projection, dim=4, alpha=8, use_triton=False, use_memory_efficient_lora=True
     )
-
-    assert patch_gemma3n_inplace_lora_views(patched_model) == 1
-    # Idempotent: a second call wraps nothing.
-    assert patch_gemma3n_inplace_lora_views(patched_model) == 0
 
     inputs_embeds = torch.randn(2, 3, p)
     per_layer_inputs = torch.randn(2, 3, nlayers, d)
@@ -508,41 +511,28 @@ def test_patch_gemma3n_inplace_lora_views_wraps_and_preserves_numerics():
     for with_pli in (False, True):
         pli = per_layer_inputs if with_pli else None
 
-        for m in (patched_model, ref_model):
+        for m in (model, ref_model):
             m.per_layer_model_projection.lora_A.weight.grad = None
             m.per_layer_model_projection.lora_B.weight.grad = None
 
-        x_patched = inputs_embeds.detach().clone().requires_grad_(True)
-        # With the patch, the in-place consumer must NOT raise.
-        out_patched = patched_model.project_per_layer_inputs(
-            x_patched, pli.detach().clone() if with_pli else None, inplace=True
-        )
-        out_patched.sum().backward()
+        x_in = inputs_embeds.detach().clone().requires_grad_(True)
+        # The in-place consumer must NOT raise -- this is the regression.
+        out = model.project_per_layer_inputs(x_in, pli.detach().clone() if with_pli else None, inplace=True)
+        out.sum().backward()
 
         x_ref = inputs_embeds.detach().clone().requires_grad_(True)
         out_ref = ref_model.project_per_layer_inputs(x_ref, pli.detach().clone() if with_pli else None, inplace=False)
         out_ref.sum().backward()
 
-        assert torch.allclose(out_patched, out_ref, atol=1e-6)
-        assert torch.allclose(x_patched.grad, x_ref.grad, atol=1e-6)
+        assert torch.allclose(out, out_ref, atol=1e-6)
+        assert torch.allclose(x_in.grad, x_ref.grad, atol=1e-6)
         assert torch.allclose(
-            patched_model.per_layer_model_projection.lora_A.weight.grad,
+            model.per_layer_model_projection.lora_A.weight.grad,
             ref_model.per_layer_model_projection.lora_A.weight.grad,
             atol=1e-6,
         )
         assert torch.allclose(
-            patched_model.per_layer_model_projection.lora_B.weight.grad,
+            model.per_layer_model_projection.lora_B.weight.grad,
             ref_model.per_layer_model_projection.lora_B.weight.grad,
             atol=1e-6,
         )
-
-
-def test_patch_gemma3n_inplace_lora_views_noop_without_lora():
-    """The patch is a no-op when per_layer_model_projection was not LoRA-patched."""
-    from nemo_automodel.components._peft.lora import patch_gemma3n_inplace_lora_views
-
-    model = _Gemma3nTextModelMini()
-    # Plain nn.Linear projection (e.g. excluded from target_modules) -> nothing to wrap.
-    assert patch_gemma3n_inplace_lora_views(model) == 0
-    # A non-gemma3n model (no per_layer_model_projection) is also a no-op.
-    assert patch_gemma3n_inplace_lora_views(DummyModel()) == 0
