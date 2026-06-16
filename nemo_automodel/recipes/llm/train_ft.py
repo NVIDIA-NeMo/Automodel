@@ -1272,7 +1272,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if is_train and batch.get("_cp_full_logits_grad_touch"):
                     logits = getattr(out, "logits", out)
                     if isinstance(logits, torch.Tensor):
-                        local_loss = local_loss + logits.sum() * 0.0
+                        # Promote to fp32 before summing: bf16 logits over a large
+                        # vocab (e.g. DSV4's 129280) overflow to inf, and inf * 0.0
+                        # would be nan, poisoning local_loss and the backward pass.
+                        local_loss = local_loss + logits.float().sum() * 0.0
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()

@@ -702,7 +702,9 @@ class DeepseekV4Indexer(nn.Module):
             query_start=query_start,
             query_total_len=query_total_len,
         )
-        q_positions = _query_positions(position_ids, batch=batch, seq_len=seq_len, device=hidden_states.device, cp_group=cp_group)
+        q_positions = _query_positions(
+            position_ids, batch=batch, seq_len=seq_len, device=hidden_states.device, cp_group=cp_group
+        )
         valid_end = ((q_positions + 1) // self.compress_ratio).unsqueeze(-1)
         pooled_pos = torch.arange(pooled_kv.shape[1], device=hidden_states.device).view(1, 1, -1)
         index_scores = torch.where(
@@ -866,7 +868,9 @@ class DeepseekV4Compressor(nn.Module):
                 position_ids=position_ids,
                 cp_group=cp_group,
             )
-            q_positions = _query_positions(position_ids, batch=batch, seq_len=seq_len, device=raw_topk.device, cp_group=cp_group)
+            q_positions = _query_positions(
+                position_ids, batch=batch, seq_len=seq_len, device=raw_topk.device, cp_group=cp_group
+            )
             threshold = ((q_positions + 1) // self.compress_ratio).unsqueeze(-1)
             causal_invalid = raw_topk >= threshold
             indexer_topk = torch.where(causal_invalid, torch.full_like(raw_topk, -1), raw_topk)

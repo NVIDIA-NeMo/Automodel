@@ -2162,7 +2162,9 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
     class _CPModel(nn.Module):
         def __init__(self):
             super().__init__()
-            self.lin = nn.Linear(4, 4)
+            # Wide output + large magnitude in fp16 so a naive (low-precision)
+            # logits.sum() overflows to inf; the grad touch must promote to fp32.
+            self.lin = nn.Linear(4, 8192)
             self.prepared = False
 
         def prepare_model_inputs_for_cp(self, input_ids):
@@ -2170,7 +2172,8 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
             return {"_cp_full_logits_grad_touch": True}
 
         def forward(self, **batch):
-            return SimpleNamespace(logits=self.lin(batch["input_ids"].float()))
+            logits = (self.lin(batch["input_ids"].float()) + 50.0).to(torch.float16)
+            return SimpleNamespace(logits=logits)
 
     model = _CPModel()
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
@@ -2188,7 +2191,8 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
 
     def _fake_calc_loss(loss_fn, *, logits, labels, model, hidden_states, num_label_tokens):
         captured["logits_is_tensor"] = isinstance(logits, torch.Tensor)
-        return logits.sum()
+        # finite base loss (fp32) so any non-finiteness must come from the grad touch
+        return logits.float().mean()
 
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
@@ -2208,5 +2212,8 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
     assert model.prepared is True  # cp_size>1 + hasattr -> hook body ran
     assert captured["logits_is_tensor"]
     assert len(loss_buffer) == 1
+    # the fp32-promoted grad touch must not poison the loss with inf/nan
+    assert torch.isfinite(loss_buffer[0]).all()
     # the grad-touch kept the full logits in the graph, so backward populated grads
     assert model.lin.weight.grad is not None
+    assert torch.isfinite(model.lin.weight.grad).all()
