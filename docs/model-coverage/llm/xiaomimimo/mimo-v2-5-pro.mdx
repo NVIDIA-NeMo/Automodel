@@ -22,7 +22,7 @@ description: ""
 ## Architecture
 
 - `MiMoV2ForCausalLM`
-- Sliding-window attention via the `MiMoV2Attention(is_swa=True)` path.
+- Sliding-window attention using the `MiMoV2Attention(is_swa=True)` path.
 - MoE blocks use `nemo_automodel.components.moe.layers.MoE` with `score_func="sigmoid_with_bias"` and `gate_precision=fp32`.
 - FP8 round-trip in `MiMoV2StateDictAdapter` covers the bulk of attention/expert weights; layer norms, the gate, `lm_head`, and `embed_tokens` stay in bf16 per `NON_QUANTIZED_KEY_PATTERNS`.
 
@@ -36,7 +36,7 @@ description: ""
 
 | Recipe | Description |
 |---|---|
-| [mimo_v25_pro_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml) | SFT — MiMo-V2.5-Pro on HellaSwag |
+| [mimo_v25_pro_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml) | SFT: MiMo-V2.5-Pro on HellaSwag |
 
 ## Try with NeMo AutoModel
 
