@@ -318,11 +318,12 @@ def make_resolved_retrieval_dataset(
     n_passages: int | None = None,
     image_root: str | None = None,
     repeat: int = 1,
-    shuffle_files: bool = False,
+    shuffle_files: bool | None = None,
     seed: int = 42,
     decode_images: bool = True,
     num_samples: int | None = None,
     data_dir_list: str | Sequence[str] | None = None,
+    do_shuffle: bool | None = None,
 ) -> ResolvedRetrievalJsonlDataset:
     """Build a streaming resolved retrieval JSONL dataset.
 
@@ -338,6 +339,7 @@ def make_resolved_retrieval_dataset(
         decode_images: Decode image paths to RGB PIL images. Set false for text-only/debug inspection.
         num_samples: Optional cap on the number of JSONL records to stream per repeat.
         data_dir_list: Alias for ``data_path`` to match existing retrieval configs.
+        do_shuffle: Compatibility alias for existing retrieval configs; maps to ``shuffle_files`` when set.
 
     Returns:
         A rank/worker-sharded ``IterableDataset`` yielding retrieval examples.
@@ -352,6 +354,8 @@ def make_resolved_retrieval_dataset(
         data_path = data_dir_list
     if data_path is None:
         raise ValueError("data_path or data_dir_list is required")
+    if shuffle_files is None:
+        shuffle_files = bool(do_shuffle)
     return ResolvedRetrievalJsonlDataset(
         data_path=data_path,
         image_root=image_root,

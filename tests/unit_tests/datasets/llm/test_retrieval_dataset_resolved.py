@@ -38,7 +38,7 @@ if "torchvision" not in sys.modules:
     sys.modules["torchvision.transforms.functional"] = functional
 
 import nemo_automodel.components.datasets.llm.retrieval_dataset_resolved as rdr
-from examples.retrieval.bi_encoder import prepare_resolved_vl_retrieval_data as prep
+from tools.retrieval import prepare_resolved_vl_retrieval_data as prep
 
 
 def _write_jsonl(path, records):
@@ -155,3 +155,51 @@ def test_prepare_resolved_vl_retrieval_data_writes_jsonl_and_images(tmp_path, mo
     row = json.loads((output_dir / "shard-00000.jsonl").read_text(encoding="utf-8").splitlines()[0])
     assert row["question"] == "Q"
     assert row["doc_image"] == ["images/00000000_00.jpg", ""]
+
+
+def test_prepare_resolved_vl_retrieval_data_parallel_build_shard(tmp_path, monkeypatch):
+    image_mod = pytest.importorskip("PIL.Image")
+
+    monkeypatch.setattr(
+        prep, "load_datasets", lambda data_dir_list, concatenate, seed: ([{"idx": i} for i in range(5)], {})
+    )
+
+    def _transform_func(item, num_neg_docs, corpus_dict, use_dataset_instruction):
+        idx = item["idx"]
+        return {
+            "question": f"Q{idx}",
+            "doc_text": [f"P{idx}", f"N{idx}"],
+            "doc_image": [image_mod.new("RGB", (2, 2), color="blue"), ""],
+            "doc_id": [f"p{idx}", f"n{idx}"],
+            "query_instruction": "",
+            "passage_instruction": "",
+        }
+
+    monkeypatch.setattr(prep, "_transform_func", _transform_func)
+
+    output_dir = tmp_path / "resolved"
+    metadata = prep.resolve_dataset(
+        data_dir_list=["train.json"],
+        output_dir=output_dir,
+        n_passages=2,
+        samples_per_shard=1,
+        seed=42,
+        max_samples=5,
+        use_dataset_instruction=False,
+        jpeg_quality=90,
+        num_build_shards=2,
+        build_shard_index=1,
+    )
+
+    assert metadata["num_records"] == 2
+    assert metadata["num_build_shards"] == 2
+    assert metadata["build_shard_index"] == 1
+    assert metadata["shards"] == ["shard-00001-00000.jsonl", "shard-00001-00001.jsonl"]
+    assert (output_dir / "metadata-build-shard-00001.json").is_file()
+    assert (output_dir / "images" / "shard-00001" / "00000001_00.jpg").is_file()
+
+    rows = [
+        json.loads((output_dir / shard_path).read_text(encoding="utf-8").strip()) for shard_path in metadata["shards"]
+    ]
+    assert [row["question"] for row in rows] == ["Q1", "Q3"]
+    assert rows[0]["doc_image"] == ["images/shard-00001/00000001_00.jpg", ""]
