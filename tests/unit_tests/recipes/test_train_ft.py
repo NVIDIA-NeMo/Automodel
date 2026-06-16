@@ -2127,3 +2127,86 @@ class TestRunValidationToolCallEval:
         # An evaluate() that raised contributes an empty result -> zeros, count 0.
         assert out.metrics["tool_call/_count"] == 0.0
         assert out.metrics["tool_call/has_call"] == 0.0
+
+
+def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
+    """Non-PP step: the model-owned CP hook attaches its batch prep, and the
+    ``_cp_full_logits_grad_touch`` flag adds the zero-valued full-logits term so
+    backward still reaches every parameter."""
+    from contextlib import nullcontext
+
+    cfg = ConfigNode(
+        {
+            "nvtx": False,
+            "model": {},
+            "dataloader": {"collate_fn": "nemo_automodel.components.datasets.utils.default_collater"},
+            "dataset": {},
+            "validation_dataloader": {},
+            "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
+            "optimizer": {},
+            "loss_fn": {},
+            "checkpoint": {"best_metric_key": "default"},
+            "distributed": {"cp_size": 2},
+            "autopipeline": {"pp_microbatch_size": 1},
+        }
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.initialize_distributed",
+        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: False)
+    recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+
+    class _CPModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = nn.Linear(4, 4)
+            self.prepared = False
+
+        def prepare_model_inputs_for_cp(self, input_ids):
+            self.prepared = True
+            return {"_cp_full_logits_grad_touch": True}
+
+        def forward(self, **batch):
+            return SimpleNamespace(logits=self.lin(batch["input_ids"].float()))
+
+    model = _CPModel()
+    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
+    object.__setattr__(recipe, "device_mesh", None)
+    object.__setattr__(recipe, "pp_enabled", False)
+    object.__setattr__(recipe, "magi", SimpleNamespace(enabled=False))
+    object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
+    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "model_parts", [model])
+    object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
+    object.__setattr__(recipe, "loss_fn", object())  # not FusedLinearCrossEntropy
+    object.__setattr__(recipe, "_get_dp_group_size", lambda include_cp=False: 1)
+
+    captured = {}
+
+    def _fake_calc_loss(loss_fn, *, logits, labels, model, hidden_states, num_label_tokens):
+        captured["logits_is_tensor"] = isinstance(logits, torch.Tensor)
+        return logits.sum()
+
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, **k: (nullcontext, batch),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_loss", _fake_calc_loss)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_final_hidden_states", lambda out: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_sync_ctx", lambda *a, **k: nullcontext())
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.filter_forward_kwargs", lambda model, batch: batch)
+
+    batch = {"input_ids": torch.randn(1, 4, 4), "labels": torch.zeros(1, 4, dtype=torch.long)}
+    loss_buffer = []
+    recipe._forward_backward_step(
+        idx=0, batch=batch, loss_buffer=loss_buffer, num_label_tokens=None, num_batches=1, is_train=True
+    )
+
+    assert model.prepared is True  # cp_size>1 + hasattr -> hook body ran
+    assert captured["logits_is_tensor"]
+    assert len(loss_buffer) == 1
+    # the grad-touch kept the full logits in the graph, so backward populated grads
+    assert model.lin.weight.grad is not None
