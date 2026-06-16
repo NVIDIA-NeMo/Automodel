@@ -655,6 +655,86 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     assert model_call is not None and model_call[1]["mesh"] is fsdp_mesh
 
 
+def test_shard_fp32_param_holders_shards_each_holder(monkeypatch):
+    """``_shard_fp32_param_holders`` fully_shards each model-owned fp32 holder."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+
+    holder_param = object()
+
+    class Holder:
+        def parameters(self, recurse=False):
+            return iter([holder_param])
+
+    holder = Holder()
+    block = type(
+        "Block",
+        (),
+        {"named_modules": lambda self: iter([("", self), ("linear_attn._fp32_params", holder)])},
+    )()
+
+    mesh = object()
+    ignored = P._shard_fp32_param_holders(block, mesh, reshard_after_forward=False, offload_policy=None)
+
+    assert ignored == {holder_param}
+    holder_call = _find_call_by_first_arg(fully_shard_mock, holder)
+    assert holder_call is not None
+    _, kwargs = holder_call
+    assert kwargs["mesh"] is mesh
+    assert kwargs["reshard_after_forward"] is False
+
+
+def test_apply_fsdp_shards_model_owned_fp32_holders(monkeypatch):
+    """apply_fsdp shards each model-owned ``_fp32_params`` holder per block."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="FP32_MP"))
+
+    holder_param = object()
+
+    class Holder:
+        def parameters(self, recurse=False):
+            return iter([holder_param])
+
+    holder = Holder()
+
+    class BlockWithHolder:
+        def __init__(self):
+            self.mlp = DummyMoE()
+
+        def named_modules(self):
+            return iter([("", self), ("linear_attn._fp32_params", holder)])
+
+    block = BlockWithHolder()
+    model = DummyModel([block])
+    fsdp_mesh = object()
+    mp_policy = MagicMock()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        ep_shard_mesh=None,
+        mp_policy=mp_policy,
+    )
+
+    # The holder is sharded as its own fp32 unit before the block-level shard.
+    holder_call = _find_call_by_first_arg(fully_shard_mock, holder)
+    assert holder_call is not None
+    _, holder_kwargs = holder_call
+    assert holder_kwargs["mesh"] is fsdp_mesh
+    assert holder_kwargs["mp_policy"] == "FP32_MP"
+
+    block_call = _find_call_by_first_arg(fully_shard_mock, block)
+    assert block_call is not None
+    assert holder_param in block_call[1]["ignored_params"]
+
+
 def test_apply_fsdp_skips_separate_wrapping_for_tied_embeddings(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)

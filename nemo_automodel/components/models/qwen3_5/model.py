@@ -76,6 +76,19 @@ def _default_init_device() -> torch.device:
     return torch.device("cpu")
 
 
+def _qwen3_5_backend(backend: BackendConfig | None = None) -> BackendConfig:
+    """Return a Qwen3.5 backend with TE fused RoPE disabled.
+
+    Qwen3.5 VLM training can feed full-attention layers in packed/THD shape via
+    the shared Qwen3-Next attention block. TE fused RoPE expects 4D inputs there,
+    so keep the non-fused RoPE path while preserving the rest of the backend
+    selection (TE Linear, attention backend, etc.).
+    """
+    resolved = copy.copy(backend) if backend is not None else BackendConfig()
+    resolved.rope_fusion = False
+    return resolved
+
+
 def build_mtp_config_from_hf(
     config: Any,
     *,
@@ -593,7 +606,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         super().__init__()
         del kwargs
         self.config = config
-        self.backend = backend or BackendConfig()
+        self.backend = _qwen3_5_backend(backend)
 
         self.model = Qwen3_5DenseTextBackbone(config, self.backend)
         dtype = next(self.model.parameters()).dtype
@@ -789,7 +802,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     ) -> None:
         del kwargs
         super().__init__(config)
-        self.backend = backend or BackendConfig()
+        self.backend = _qwen3_5_backend(backend)
 
         text_config = config.text_config
         # Replace the HF text decoder with the native NeMo backbone (built on the
