@@ -37,6 +37,7 @@ from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 
 LOGGER = logging.getLogger(__name__)
 
@@ -881,6 +882,11 @@ class KimiK25VLModel(nn.Module):
 class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """KimiK25VL model with backend-aware DeepseekV3 language model."""
 
+    # RoPE freqs/inv_freq must stay fp32: from_pretrained casts the model to bf16 and
+    # nn.Module.to rounds floating buffers; routing through cast_model_to_dtype restores
+    # these keep-fp32 buffers afterwards (see llama/rope_utils.py).
+    _keep_in_fp32_modules = ["freqs_cis", "rotary_emb"]
+
     config_class = KimiK25VLConfig
     base_model_prefix = "model"
     main_input_name = "pixel_values"
@@ -937,7 +943,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         config.torch_dtype = torch_dtype
         model = cls.from_config(config, torch_dtype=torch_dtype, *model_args, **kwargs)
         model.name_or_path = pretrained_model_name_or_path
-        model = model.to(dtype=torch_dtype)
+        cast_model_to_dtype(model, torch_dtype)
 
         LOGGER.info(f"Model created with dtype={torch_dtype}. Weights loaded by DCP via adapter.")
         return model
