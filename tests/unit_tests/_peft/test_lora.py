@@ -23,6 +23,7 @@ from nemo_automodel.components._peft.lora import (
     LoRATritonFunction,
     PeftConfig,
     apply_lora_to_linear_modules,
+    apply_memory_efficient_lora,
     patch_linear_module,
 )
 from nemo_automodel.shared.import_utils import safe_import_te
@@ -173,7 +174,7 @@ def test_memory_efficient_lora_matches_legacy_forward_and_backward(input_shape):
     lora_A_ref = lora_A.detach().clone().requires_grad_(True)
     lora_B_ref = lora_B.detach().clone().requires_grad_(True)
 
-    efficient = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, False)
+    efficient = apply_memory_efficient_lora(x, lora_A, lora_B, scale, False)
     legacy = F.linear(F.linear(x_ref, lora_A_ref) * scale, lora_B_ref)
 
     grad = torch.randn_like(legacy)
@@ -204,7 +205,7 @@ def test_memory_efficient_lora_with_residual_matches_legacy_forward_and_backward
     lora_B_ref = lora_B.detach().clone().requires_grad_(True)
     res_ref = res.detach().clone().requires_grad_(True)
 
-    efficient = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, False, res)
+    efficient = apply_memory_efficient_lora(x, lora_A, lora_B, scale, False, res)
     legacy = res_ref + F.linear(F.linear(x_ref, lora_A_ref) * scale, lora_B_ref)
 
     grad = torch.randn_like(legacy)
@@ -429,3 +430,109 @@ class TestTELinearLoRA:
         assert patched.lora_B.weight.grad is not None, "lora_B should have gradients"
         assert torch.isfinite(patched.lora_A.weight.grad).all(), "lora_A gradients should be finite"
         assert torch.isfinite(patched.lora_B.weight.grad).all(), "lora_B gradients should be finite"
+
+
+class _Gemma3nTextModelMini(nn.Module):
+    """Minimal stand-in for transformers ``Gemma3nTextModel`` exercising the bug.
+
+    Owns a ``per_layer_model_projection`` linear and a ``project_per_layer_inputs`` method whose
+    first op mutates the projection output in place (``*=``), exactly like the real HF method.
+    """
+
+    class _Cfg:
+        num_hidden_layers = 3
+
+    class _Norm(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(d))
+
+        def forward(self, x):
+            var = x.float().pow(2).mean(-1, keepdim=True)
+            return (x * torch.rsqrt(var + 1e-6).to(x.dtype)) * (1.0 + self.weight)
+
+    def __init__(self, p=8, d=5, nlayers=3):
+        super().__init__()
+        self.config = self._Cfg()
+        self.config.num_hidden_layers = nlayers
+        self.hidden_size_per_layer_input = d
+        self.per_layer_model_projection = nn.Linear(p, d * nlayers, bias=False)
+        self.per_layer_projection_norm = self._Norm(d)
+        self.register_buffer("per_layer_projection_scale", torch.tensor(d**-0.5))
+        self.register_buffer("per_layer_input_scale", torch.tensor(2.0**0.5))
+
+    def project_per_layer_inputs(self, inputs_embeds, per_layer_inputs=None, inplace=True):
+        per_layer_projection = self.per_layer_model_projection(inputs_embeds)
+        scale = self.per_layer_projection_scale.to(dtype=inputs_embeds.dtype, device=per_layer_projection.device)
+        if inplace:
+            per_layer_projection *= scale  # the offending in-place op (HF parity)
+        else:
+            per_layer_projection = per_layer_projection * scale
+        per_layer_projection = per_layer_projection.reshape(
+            *inputs_embeds.shape[:-1], self.config.num_hidden_layers, self.hidden_size_per_layer_input
+        )
+        per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
+        if per_layer_inputs is None:
+            return per_layer_projection
+        if per_layer_projection.shape != per_layer_inputs.shape:
+            per_layer_inputs = per_layer_inputs[..., : self.config.num_hidden_layers, :]
+        return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale.to(
+            dtype=inputs_embeds.dtype, device=per_layer_projection.device
+        )
+
+
+def test_memory_efficient_lora_output_is_inplace_safe():
+    """A consumer may mutate the memory-efficient LoRA output in place, with no model-specific patch.
+
+    Regression for AM-453: transformers gemma3n ``project_per_layer_inputs`` does
+    ``per_layer_projection *= scale`` on the projection output. Previously the memory-efficient LoRA
+    returned a *view of a custom-autograd-Function output*, so the in-place op raised
+    "Output 0 of LoRATritonFunctionBackward is a view and is being modified inplace". The
+    ``(N, out) -> (bs, seq, out)`` reshape now happens outside the Function, so its output is an
+    ordinary (in-place-safe) view -- fixing the bug class generically (no gemma3n-specific code).
+    """
+    p, d, nlayers = 8, 5, 3
+    torch.manual_seed(0)
+    model = _Gemma3nTextModelMini(p, d, nlayers)
+    patch_linear_module(
+        model.per_layer_model_projection, dim=4, alpha=8, use_triton=False, use_memory_efficient_lora=True
+    )
+
+    # Reference: identical weights, out-of-place consumer.
+    torch.manual_seed(0)
+    ref_model = _Gemma3nTextModelMini(p, d, nlayers)
+    patch_linear_module(
+        ref_model.per_layer_model_projection, dim=4, alpha=8, use_triton=False, use_memory_efficient_lora=True
+    )
+
+    inputs_embeds = torch.randn(2, 3, p)
+    per_layer_inputs = torch.randn(2, 3, nlayers, d)
+
+    for with_pli in (False, True):
+        pli = per_layer_inputs if with_pli else None
+
+        for m in (model, ref_model):
+            m.per_layer_model_projection.lora_A.weight.grad = None
+            m.per_layer_model_projection.lora_B.weight.grad = None
+
+        x_in = inputs_embeds.detach().clone().requires_grad_(True)
+        # The in-place consumer must NOT raise -- this is the regression.
+        out = model.project_per_layer_inputs(x_in, pli.detach().clone() if with_pli else None, inplace=True)
+        out.sum().backward()
+
+        x_ref = inputs_embeds.detach().clone().requires_grad_(True)
+        out_ref = ref_model.project_per_layer_inputs(x_ref, pli.detach().clone() if with_pli else None, inplace=False)
+        out_ref.sum().backward()
+
+        assert torch.allclose(out, out_ref, atol=1e-6)
+        assert torch.allclose(x_in.grad, x_ref.grad, atol=1e-6)
+        assert torch.allclose(
+            model.per_layer_model_projection.lora_A.weight.grad,
+            ref_model.per_layer_model_projection.lora_A.weight.grad,
+            atol=1e-6,
+        )
+        assert torch.allclose(
+            model.per_layer_model_projection.lora_B.weight.grad,
+            ref_model.per_layer_model_projection.lora_B.weight.grad,
+            atol=1e-6,
+        )
