@@ -506,19 +506,42 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
 
         def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None, *args, **kwargs):
+            pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
+            explicit_reshard_after_forward = kwargs.get("reshard_after_forward")
+            if explicit_reshard_after_forward is None and len(args) >= 4:
+                explicit_reshard_after_forward = args[3]
+
             if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
-                items = module.items() if isinstance(module, nn.ModuleDict) else enumerate(module)
-                for layer_id, child in items:
-                    if isinstance(child, (nn.ModuleList, nn.ModuleDict)):
-                        _fsdp_by_dtype(child, mesh, mp_policy, offload_policy)
+                all_items = list(module.items()) if isinstance(module, nn.ModuleDict) else list(enumerate(module))
+                flat_layer_items = [
+                    (layer_id, child)
+                    for layer_id, child in all_items
+                    if not isinstance(child, (nn.ModuleList, nn.ModuleDict))
+                ]
+                nested_items = [
+                    (layer_id, child)
+                    for layer_id, child in all_items
+                    if isinstance(child, (nn.ModuleList, nn.ModuleDict))
+                ]
+
+                for _, child in nested_items:
+                    _fsdp_by_dtype(child, mesh, mp_policy, offload_policy)
+
+                for enum_id, (_, child) in enumerate(flat_layer_items):
+                    if explicit_reshard_after_forward is not None:
+                        reshard_after_forward = explicit_reshard_after_forward
+                    elif pp_enabled:
+                        reshard_after_forward = False
                     else:
-                        parallelizer_utils.fully_shard_by_dtype(
-                            child,
-                            mesh,
-                            mp_policy,
-                            offload_policy,
-                            fp32_compute_module_names=fp32_compute_module_names,
-                        )
+                        reshard_after_forward = enum_id < len(flat_layer_items) - 1
+                    parallelizer_utils.fully_shard_by_dtype(
+                        child,
+                        mesh,
+                        mp_policy,
+                        offload_policy,
+                        fp32_compute_module_names=fp32_compute_module_names,
+                        reshard_after_forward=reshard_after_forward,
+                    )
             else:
                 for _, sub in module.named_children():
                     _fsdp_by_dtype(sub, mesh, mp_policy, offload_policy)
