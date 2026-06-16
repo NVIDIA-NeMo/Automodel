@@ -844,8 +844,9 @@ class BaseRecipe:
 
     def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)
-        if dp_group is not None:
-            tensor = tensor.cuda()
+        if dp_group is not None or dist.is_initialized():
+            if not tensor.is_cuda and torch.cuda.is_available():
+                tensor = tensor.cuda()
             dist.all_reduce(tensor, op=op, group=dp_group)
             tensor = tensor.cpu()
         return tensor
