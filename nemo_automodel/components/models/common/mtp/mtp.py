@@ -187,11 +187,13 @@ class MTPModule(nn.Module):
           ``embed_fn``. The module rolls ``input_ids`` cumulatively left by 1
           per depth and applies ``embed_fn`` to produce the future-token
           embedding for that depth.
-        * **Final-stage PP**: pass ``embed_inputs`` (a tuple of pre-rolled
-          per-depth embeddings, length ``num_depths``). Used when the last PP
-          stage no longer owns ``embed_tokens``; the first PP stage has
-          already produced the rolled embeddings and propagated them through
-          the pipeline.
+        * **Final-stage PP / multimodal**: pass ``embed_inputs`` (a tuple of
+          pre-rolled per-depth embeddings, length ``num_depths``). Used when
+          the last PP stage no longer owns ``embed_tokens``, or for multimodal
+          models (e.g. SALM) where some positions carry continuous audio
+          embeddings that cannot be recovered by re-embedding an integer token
+          id — the caller pre-rolls the fused embedding tensor and passes it
+          here.
 
         Args:
             hidden_states: Output of the main model's final norm (``h_0``);
