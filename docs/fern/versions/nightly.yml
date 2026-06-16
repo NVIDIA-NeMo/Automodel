@@ -169,6 +169,8 @@ navigation:
             path: ../../model-coverage/llm/tencent/hy-mt2.mdx
           - page: "MiMo-V2-Flash"
             path: ../../model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
+          - page: "MiMo-V2.5-Pro"
+            path: ../../model-coverage/llm/xiaomimimo/mimo-v2-5-pro.mdx
           - page: "Ling 2.0"
             path: ../../model-coverage/llm/inclusionai/ling-2.mdx
       - section: "Vision Language Models"
