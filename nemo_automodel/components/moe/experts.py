@@ -1320,6 +1320,19 @@ class GroupedExpertsTE(nn.Module):
             output1 = self.gate_up_linear(permuted_local_hidden_states, m_splits)
             output1 = self.expert_activation(output1, permuted_probs)
             output2 = self.down_linear(output1, m_splits)
+            # The down-projection bias must be weighted by the per-token routing probability
+            # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
+            # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
+            # TE's GroupedLinear adds the down bias UNWEIGHTED inside the GEMM, so each of the
+            # top-k expert contributions carries a full prob-independent bias that is then
+            # summed in the combine step, producing a large systematic offset (e.g. gpt-oss-20b
+            # step-0 loss ~8.2 vs the correct ~4.5). Add the missing (prob - 1) * down_bias term
+            # so the net down-bias contribution becomes prob * down_bias.
+            if self.expert_bias:
+                down_bias = self._get_stacked_bias(self.down_linear)
+                if down_bias is not None:
+                    splits_t = torch.as_tensor(m_splits, device=output2.device)
+                    output2 = _apply_bias(output2, down_bias, splits_t, permuted_probs - 1.0)
         else:
             # Handle edge case: no tokens routed to local experts
             # Perform dummy computation for gradient flow
