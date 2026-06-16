@@ -712,9 +712,36 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             )
         if getattr(config, "audio_config", None) is not None:
             # Dense + audio variant: gemma-4-E2B-it, gemma-4-E4B-it.
-            # CP not yet supported here: kv-sharing + per-layer-inputs are not
-            # wired through the p2p ring. Tracked separately from this 31B PR.
-            return ModelCapabilities()
+            # CP supported; TP/PP/EP off. Two features beyond plain-dense 31B were
+            # exercised:
+            #   * per-layer inputs (``hidden_size_per_layer_input``): under CP,
+            #     computed on the full sequence in ``prepare_model_inputs_for_cp``
+            #     and sharded contiguously on the seq dim alongside
+            #     ``inputs_embeds`` (the 4D ``per_layer_inputs`` tensor is a known
+            #     key in cp_batch); the HF dense forward applies the token-local
+            #     projection per shard (verified bit-identical to non-CP prep).
+            #   * KV-sharing: when the KV cache is active each shared layer reads
+            #     its source layer's CP-local sharded K/V from
+            #     ``DynamicCache.shared_layers`` and rotates it through the same
+            #     ring as any other K/V. Under the activation checkpointing that
+            #     CP training uses HF disables the cache, so shared layers
+            #     recompute their own K/V -- identical between CP and non-CP, so
+            #     parity holds either way (the dead shared-layer K/V projections
+            #     are frozen by ``freeze_unused_kv_sharing_params``).
+            # TP is intentionally OFF: HF's ``Gemma4Model.forward`` builds the
+            # per-layer inputs via ``torch.where(multimodal_mask, pad_embedding,
+            # inputs_embeds)`` where ``pad_embedding`` is sliced from the (TP-
+            # sharded) embedding weight. Under DTensor this raises "mixed
+            # torch.Tensor and DTensor" -- an HF-side limitation we cannot fix
+            # without patching frozen transformers source. (Plain-dense 31B has
+            # no ``hidden_size_per_layer_input`` so it skips this branch and TP
+            # works there.)
+            return ModelCapabilities(
+                supports_tp=False,
+                supports_cp=True,
+                supports_pp=False,
+                supports_ep=False,
+            )
         # Plain dense variant: gemma-4-31B-it
         return ModelCapabilities(
             supports_tp=True,
