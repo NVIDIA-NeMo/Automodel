@@ -158,6 +158,51 @@ def test_prepare_resolved_vl_retrieval_data_writes_jsonl_and_images(tmp_path, mo
     assert row["doc_image"] == ["images/00000000_00.jpg", ""]
 
 
+def test_prepare_resolved_vl_retrieval_data_writes_sqlite_packed_images(tmp_path, monkeypatch):
+    image_mod = pytest.importorskip("PIL.Image")
+
+    monkeypatch.setattr(prep, "load_datasets", lambda data_dir_list, concatenate, seed: ([{"raw": "row"}], {}))
+    monkeypatch.setattr(
+        prep,
+        "_transform_func",
+        lambda item, num_neg_docs, corpus_dict, use_dataset_instruction: {
+            "question": "Q",
+            "doc_text": ["P", "N"],
+            "doc_image": [image_mod.new("RGB", (2, 2), color="blue"), ""],
+            "doc_id": ["p", "n"],
+            "query_instruction": "",
+            "passage_instruction": "",
+        },
+    )
+
+    output_dir = tmp_path / "resolved"
+    metadata = prep.resolve_dataset(
+        data_dir_list=["train.json"],
+        output_dir=output_dir,
+        n_passages=2,
+        samples_per_shard=10,
+        seed=42,
+        max_samples=None,
+        use_dataset_instruction=False,
+        jpeg_quality=90,
+        image_storage="sqlite",
+    )
+
+    assert metadata["format"] == "nemo_automodel_resolved_vl_retrieval_sqlite"
+    assert metadata["image_storage"] == "sqlite"
+    assert metadata["num_records"] == 1
+    assert metadata["shards"] == ["shard-00000.sqlite"]
+    assert not (output_dir / "images").exists()
+
+    dataset = rdr.make_resolved_retrieval_dataset(data_dir_list=str(output_dir), n_passages=2)
+    example = next(iter(dataset))
+    assert example["question"] == "Q"
+    assert example["doc_text"] == ["P", "N"]
+    assert example["doc_id"] == ["p", "n"]
+    assert example["doc_image"][0].mode == "RGB"
+    assert example["doc_image"][1] == ""
+
+
 def test_prepare_resolved_vl_retrieval_data_parallel_build_shard(tmp_path, monkeypatch):
     image_mod = pytest.importorskip("PIL.Image")
 

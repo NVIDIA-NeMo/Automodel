@@ -32,6 +32,8 @@ import json
 import logging
 import os
 import random
+import sqlite3
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -57,23 +59,32 @@ def _coerce_path_list(data_path: str | Sequence[str]) -> list[Path]:
         path = Path(entry)
         if path.is_dir():
             paths.extend(sorted(path.glob("*.jsonl")))
+            paths.extend(sorted(path.glob("*.sqlite")))
         elif path.is_file():
             paths.append(path)
         else:
             raise FileNotFoundError(f"Resolved retrieval data path does not exist: {path}")
 
     if not paths:
-        raise ValueError(f"No JSONL files found in resolved retrieval data path: {data_path}")
+        raise ValueError(f"No JSONL or SQLite files found in resolved retrieval data path: {data_path}")
     return paths
 
 
-def _count_jsonl_records(paths: Sequence[Path]) -> int:
+def _is_sqlite_path(path: Path) -> bool:
+    return path.suffix == ".sqlite"
+
+
+def _count_resolved_records(paths: Sequence[Path]) -> int:
     count = 0
     for path in paths:
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    count += 1
+        if _is_sqlite_path(path):
+            with _open_sqlite_connection(path) as conn:
+                count += int(conn.execute("SELECT COUNT(*) FROM records").fetchone()[0])
+        else:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        count += 1
     return count
 
 
@@ -120,7 +131,27 @@ def _resolve_image_path(image_ref: str, *, image_root: Path | None, record_dir: 
     return record_dir / image_path
 
 
-def _open_image(image_ref: Any, *, image_root: Path | None, record_dir: Path, decode_images: bool) -> Any:
+def _decode_image_bytes(image_bytes: bytes) -> Any:
+    has_pil, image_module = safe_import("PIL.Image")
+    if not has_pil:
+        raise ImportError("Pillow is required to decode resolved retrieval images. Install pillow.")
+
+    with image_module.open(BytesIO(image_bytes)) as image:
+        return image.convert("RGB")
+
+
+def _open_image(
+    image_ref: Any,
+    *,
+    image_root: Path | None,
+    record_dir: Path,
+    decode_images: bool,
+    packed_image_bytes: bytes | None = None,
+) -> Any:
+    if packed_image_bytes is not None:
+        if not decode_images:
+            return str(image_ref)
+        return _decode_image_bytes(packed_image_bytes)
     if image_ref is None:
         return ""
     if isinstance(image_ref, str) and not image_ref:
@@ -151,6 +182,7 @@ def _normalize_resolved_record(
     decode_images: bool,
     model_type: str,
     expected_n_passages: int | None,
+    packed_images: dict[int, bytes] | None = None,
 ) -> dict[str, Any]:
     question = record.get("question", record.get("query"))
     if question is None:
@@ -168,10 +200,17 @@ def _normalize_resolved_record(
         raise ValueError(
             f"Resolved retrieval field 'doc_image' must have length {len(doc_text)}, got {len(doc_image_raw)}"
         )
-    doc_image = [
-        _open_image(image_ref, image_root=image_root, record_dir=record_dir, decode_images=decode_images)
-        for image_ref in doc_image_raw
-    ]
+    doc_image = []
+    for doc_idx, image_ref in enumerate(doc_image_raw):
+        doc_image.append(
+            _open_image(
+                image_ref,
+                image_root=image_root,
+                record_dir=record_dir,
+                decode_images=decode_images,
+                packed_image_bytes=packed_images.get(doc_idx) if packed_images is not None else None,
+            )
+        )
 
     result = {
         "question": str(question),
@@ -197,6 +236,28 @@ def _normalize_resolved_record(
             }
         )
     return result
+
+
+def _open_sqlite_connection(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
+def _load_sqlite_record(conn: sqlite3.Connection, record_id: int) -> tuple[dict[str, Any], dict[int, bytes]]:
+    row = conn.execute("SELECT record_json FROM records WHERE id = ?", (record_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"Resolved retrieval SQLite record id {record_id} not found")
+    record = json.loads(row[0])
+    if not isinstance(record, dict):
+        raise ValueError(f"Resolved retrieval SQLite record must be an object, got {type(record).__name__}")
+    images = {
+        int(doc_idx): bytes(image_jpeg)
+        for doc_idx, image_jpeg in conn.execute(
+            "SELECT doc_idx, image_jpeg FROM images WHERE record_id = ? ORDER BY doc_idx", (record_id,)
+        )
+    }
+    return record, images
 
 
 class ResolvedRetrievalJsonlDataset(IterableDataset):
@@ -229,7 +290,7 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
         self.model_type = model_type
         self.expected_n_passages = expected_n_passages
         self.epoch = 0
-        total_records = _count_jsonl_records(self.paths)
+        total_records = _count_resolved_records(self.paths)
         if num_samples is None:
             self._num_records = total_records
         else:
@@ -260,54 +321,110 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
             rng.shuffle(paths)
         return paths
 
+    def _iter_jsonl_records(
+        self,
+        path: Path,
+        *,
+        state: dict[str, int],
+        rank: int,
+        world_size: int,
+        worker_id: int,
+        num_workers: int,
+    ) -> Iterable[tuple[dict[str, Any], dict[int, bytes] | None]]:
+        with path.open("r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                if state["records_seen_this_repeat"] >= self._num_records:
+                    break
+                if state["global_idx"] % world_size == rank:
+                    emit = state["local_idx_for_rank"] % num_workers == worker_id
+                    state["local_idx_for_rank"] += 1
+                else:
+                    emit = False
+                state["global_idx"] += 1
+                state["records_seen_this_repeat"] += 1
+                if not emit:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Failed to parse resolved retrieval JSONL at {path}:{line_no}: {e}") from e
+                if not isinstance(record, dict):
+                    raise ValueError(
+                        f"Resolved retrieval JSONL record must be an object at {path}:{line_no}, "
+                        f"got {type(record).__name__}"
+                    )
+                yield record, None
+
+    def _iter_sqlite_records(
+        self,
+        path: Path,
+        *,
+        state: dict[str, int],
+        rank: int,
+        world_size: int,
+        worker_id: int,
+        num_workers: int,
+    ) -> Iterable[tuple[dict[str, Any], dict[int, bytes]]]:
+        with _open_sqlite_connection(path) as conn:
+            for (record_id,) in conn.execute("SELECT id FROM records ORDER BY id"):
+                if state["records_seen_this_repeat"] >= self._num_records:
+                    break
+                if state["global_idx"] % world_size == rank:
+                    emit = state["local_idx_for_rank"] % num_workers == worker_id
+                    state["local_idx_for_rank"] += 1
+                else:
+                    emit = False
+                state["global_idx"] += 1
+                state["records_seen_this_repeat"] += 1
+                if not emit:
+                    continue
+                record, packed_images = _load_sqlite_record(conn, int(record_id))
+                yield record, packed_images
+
     def __iter__(self) -> Iterable[dict[str, Any]]:
         worker = get_worker_info()
         worker_id = worker.id if worker is not None else 0
         num_workers = worker.num_workers if worker is not None else 1
         rank, world_size = _get_dist_info()
 
-        global_idx = 0
-        local_idx_for_rank = 0
+        state = {"global_idx": 0, "local_idx_for_rank": 0, "records_seen_this_repeat": 0}
         for repeat_idx in range(self.repeat):
-            records_seen_this_repeat = 0
+            state["records_seen_this_repeat"] = 0
             for path in self._iter_paths(repeat_idx):
                 record_dir = path.parent
-                with path.open("r", encoding="utf-8") as f:
-                    for line_no, line in enumerate(f, start=1):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if records_seen_this_repeat >= self._num_records:
-                            break
-                        if global_idx % world_size == rank:
-                            emit = local_idx_for_rank % num_workers == worker_id
-                            local_idx_for_rank += 1
-                        else:
-                            emit = False
-                        global_idx += 1
-                        records_seen_this_repeat += 1
-                        if not emit:
-                            continue
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError as e:
-                            raise ValueError(
-                                f"Failed to parse resolved retrieval JSONL at {path}:{line_no}: {e}"
-                            ) from e
-                        if not isinstance(record, dict):
-                            raise ValueError(
-                                f"Resolved retrieval JSONL record must be an object at {path}:{line_no}, "
-                                f"got {type(record).__name__}"
-                            )
-                        yield _normalize_resolved_record(
-                            record,
-                            image_root=self.image_root,
-                            record_dir=record_dir,
-                            decode_images=self.decode_images,
-                            model_type=self.model_type,
-                            expected_n_passages=self.expected_n_passages,
-                        )
-                if records_seen_this_repeat >= self._num_records:
+                record_iter = (
+                    self._iter_sqlite_records(
+                        path,
+                        state=state,
+                        rank=rank,
+                        world_size=world_size,
+                        worker_id=worker_id,
+                        num_workers=num_workers,
+                    )
+                    if _is_sqlite_path(path)
+                    else self._iter_jsonl_records(
+                        path,
+                        state=state,
+                        rank=rank,
+                        world_size=world_size,
+                        worker_id=worker_id,
+                        num_workers=num_workers,
+                    )
+                )
+                for record, packed_images in record_iter:
+                    yield _normalize_resolved_record(
+                        record,
+                        image_root=self.image_root,
+                        record_dir=record_dir,
+                        decode_images=self.decode_images,
+                        model_type=self.model_type,
+                        expected_n_passages=self.expected_n_passages,
+                        packed_images=packed_images,
+                    )
+                if state["records_seen_this_repeat"] >= self._num_records:
                     break
 
 
