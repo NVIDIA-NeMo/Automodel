@@ -550,6 +550,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
 
     from transformer_engine.pytorch.attention import DotProductAttention
 
+    is_dsv4 = _is_deepseek_v4_model(model)
     if hasattr(model, "model") and model.model is not None:
         _model = model.model
     else:
@@ -572,7 +573,13 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
-        if layer_type in ("full_attention", "sliding_attention"):
+        if is_dsv4:
+            # DSV4 TileLang attention consumes the CP process group directly from
+            # the forward kwargs and manually all-gathers K/V & compressed K/V
+            # (Miles-style). There is no TE DotProductAttention submodule to
+            # configure here, so skip the generic per-block CP setup.
+            pass
+        elif layer_type in ("full_attention", "sliding_attention"):
             attn_module = getattr(block.self_attn, "attn_module", None)
             if isinstance(attn_module, DotProductAttention):
                 attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type

@@ -38,6 +38,8 @@ from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
+    _dsv4_cp_local_seq_multiple,
+    _is_deepseek_v4_model_or_config,
     build_dataloader,
     build_model,
     build_validation_dataloader,
@@ -306,6 +308,20 @@ class DummyOptConfig:
 
     def instantiate(self, params):
         return torch.optim.SGD(params, lr=0.01)
+
+
+def test_deepseek_v4_cp_local_seq_multiple_uses_compress_ratios():
+    cfg = SimpleNamespace(model_type="deepseek_v4", compress_ratios=[0, 4, 128])
+    model = SimpleNamespace(config=cfg)
+
+    assert _is_deepseek_v4_model_or_config(model)
+    assert _dsv4_cp_local_seq_multiple(model) == 128
+
+
+def test_deepseek_v4_cp_local_seq_multiple_handles_ratio4_only():
+    cfg = SimpleNamespace(model_type="deepseek_v4", compress_ratios=[4])
+
+    assert _dsv4_cp_local_seq_multiple(cfg) == 8
 
 
 class DummyModelConfig:
