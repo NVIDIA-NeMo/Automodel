@@ -37,6 +37,17 @@ from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
+class GptOssFP32Parameter(nn.Module):
+    """Callable holder for fp32 tensors that need their own FSDP unit."""
+
+    def __init__(self, value: torch.Tensor):
+        super().__init__()
+        self.weight = nn.Parameter(value.to(torch.float32))
+
+    def forward(self) -> torch.Tensor:
+        return self.weight
+
+
 class GptOssAttention(nn.Module):
     def __init__(self, config: "GptOssConfig", backend: BackendConfig, use_sliding_attention: bool = False):
         super().__init__()
@@ -87,8 +98,17 @@ class GptOssAttention(nn.Module):
             num_gqa_groups=self.num_key_value_heads,
             softmax_type="learnable",
         )
-        # TE initializes sinks inside the attn_module
-        self.sinks = nn.Parameter(torch.empty(self.num_attention_heads)) if backend.attn == "flex" else None
+        # TE initializes sinks inside the attn_module. Flex keeps them in a tiny
+        # holder so FSDP can isolate the fp32 parameter from bf16 projections.
+        self.sinks_param = (
+            GptOssFP32Parameter(torch.empty(self.num_attention_heads, dtype=torch.float32))
+            if backend.attn == "flex"
+            else None
+        )
+
+    @property
+    def sinks(self) -> torch.Tensor | None:
+        return self.sinks_param() if self.sinks_param is not None else None
 
     def forward(
         self,
@@ -137,9 +157,10 @@ class GptOssAttention(nn.Module):
         )
 
         if self.backend.attn == "flex":
+            sinks = self.sinks
             updated_attn_kwargs = {
                 "scale": self.softmax_scale,
-                "sink_weights": (self.sinks.to_local() if isinstance(self.sinks, DTensor) else self.sinks),
+                "sink_weights": sinks.to_local() if isinstance(sinks, DTensor) else sinks,
                 "sliding_window": (self.sliding_window if self.sliding_window is not None else 0),
                 "enable_gqa": True,
             }
@@ -170,7 +191,7 @@ class GptOssAttention(nn.Module):
             ]
 
             if self.backend.attn == "flex":
-                nn.init.normal_(self.sinks, mean=0.0, std=init_std)
+                nn.init.normal_(self.sinks_param.weight, mean=0.0, std=init_std)
             else:
                 nn.init.normal_(self.attn_module.softmax_offset, mean=0.0, std=init_std)
             for linear in linear_list:

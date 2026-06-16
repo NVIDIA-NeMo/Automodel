@@ -69,7 +69,7 @@ def test_cast_bf16_keeps_flex_attention_sinks_fp32():
 
     expected = {}
     for name, param in model.named_parameters():
-        if name.endswith("self_attn.sinks"):
+        if name.endswith("self_attn.sinks_param.weight"):
             values = torch.linspace(0.00123, 0.00456, param.numel(), dtype=torch.float32).reshape_as(param)
             param.data.copy_(values)
             expected[name] = values

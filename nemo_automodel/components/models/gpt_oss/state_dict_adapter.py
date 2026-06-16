@@ -72,6 +72,8 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         }
         if self.backend.attn == "te":
             self.hf_to_internal_map["self_attn.sinks"] = "self_attn.attn_module.softmax_offset"
+        else:
+            self.hf_to_internal_map["self_attn.sinks"] = "self_attn.sinks_param.weight"
 
         # Reverse mapping for to_hf conversion
         self.internal_to_hf_map = {v: k for k, v in self.hf_to_internal_map.items() if v is not None}
