@@ -32,6 +32,10 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 
 from nemo_automodel._transformers.utils import _should_load_before_shard
+from nemo_automodel._transformers.v4_patches.kv_sharing import (
+    install_kv_sharing_holder,
+    should_install_kv_sharing_holder,
+)
 from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
@@ -123,6 +127,11 @@ def _apply_runtime_compatibility_fixes(model):
     model_parts = model.parts if hasattr(model, "parts") else [model]
     if should_fix_rotary_embeddings(model_parts):
         fix_rotary_embeddings(model_parts)
+    # HF cross-layer KV sharing (e.g. gemma3n) threads a mutable shared_kv_states
+    # dict through layers; FSDP2 cast_forward_inputs rebuilds it per layer and
+    # breaks sharing (AM-454). Swap in a pytree-opaque holder shared by reference.
+    if should_install_kv_sharing_holder(model_parts):
+        install_kv_sharing_holder(model_parts)
     return model
 
 
