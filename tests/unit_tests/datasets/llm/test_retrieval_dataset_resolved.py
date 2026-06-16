@@ -13,13 +13,14 @@
 # limitations under the License.
 
 import importlib.machinery
+import importlib.util
 import json
 import sys
 import types
 
 import pytest
 
-if "torchvision" not in sys.modules:
+if "torchvision" not in sys.modules and importlib.util.find_spec("torchvision") is None:
     torchvision = types.ModuleType("torchvision")
     transforms = types.ModuleType("torchvision.transforms")
     functional = types.ModuleType("torchvision.transforms.functional")
