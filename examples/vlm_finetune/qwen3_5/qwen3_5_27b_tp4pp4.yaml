@@ -100,3 +100,8 @@ optimizer:
 #   project: <your-project>
 #   entity: <your-entity>
 #   name: <your-run-name>
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 2                          # TP=4 * PP=4 = 16 GPUs = 2 nodes x 8 GPUs
+  time: "00:30:00"

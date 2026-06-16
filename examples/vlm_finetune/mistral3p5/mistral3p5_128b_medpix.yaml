@@ -127,3 +127,8 @@ wandb:
   project: huiyingl_workspace
   entity: Nemo-automodel
   name: mistral3p5_128b_medpix
+
+ci:
+  recipe_owner: akoumpa
+  nodes: 8                          # TP=8 * PP=8 = 64 GPUs = 8 nodes x 8 GPUs
+  time: "00:30:00"
