@@ -198,6 +198,18 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
             d_x = torch.addmm(d_e @ gW, d_R, gA)
             d_x = d_x.addmm_(d_g, uW).addmm_(d_Q, uA).view(ctx.orig_shape)
 
+        # Each returned gradient must live on the same device as its corresponding input. Under
+        # pipeline-parallel graph construction torch tracks the LoRA parameters on the meta device
+        # while the activations (and the grads computed from them) are on cuda, so it rejected the
+        # cuda grads ("invalid gradient ... expected device meta but got cuda"). Move each LoRA grad
+        # onto its parameter's device: a no-op in normal single-device training, and correct in the
+        # PP/meta graph pass (the real gradients still flow on the cuda execution passes).
+        d_gA, d_gB = d_gA.to(gA.device), d_gB.to(gB.device)
+        d_uA, d_uB = d_uA.to(uA.device), d_uB.to(uB.device)
+        d_dA, d_dB = d_dA.to(dA.device), d_dB.to(dB.device)
+        if d_x is not None:
+            d_x = d_x.to(x.device)
+
         # order matches forward(x, gW, gA, gB, gS, uW, uA, uB, uS, dW, dA, dB, dS)
         return (d_x, None, d_gA, d_gB, None, None, d_uA, d_uB, None, None, d_dA, d_dB, None)
 
@@ -316,6 +328,14 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
         d_x = None
         if needs_x:
             d_x = torch.addmm(d_e @ uW, d_Q, uA).view(ctx.orig_shape)
+
+        # See LoRASwiGLUMLPFunction.backward: return each LoRA grad on its parameter's device so the
+        # pipeline-parallel meta graph pass (params on meta, activations on cuda) doesn't reject the
+        # cuda grads. No-op in normal single-device training.
+        d_uA, d_uB = d_uA.to(uA.device), d_uB.to(uB.device)
+        d_dA, d_dB = d_dA.to(dA.device), d_dB.to(dB.device)
+        if d_x is not None:
+            d_x = d_x.to(x.device)
 
         # order matches forward(x, uW, uA, uB, uS, dW, dA, dB, dS)
         return (d_x, None, d_uA, d_uB, None, None, d_dA, d_dB, None)
