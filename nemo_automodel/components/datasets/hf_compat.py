@@ -15,8 +15,8 @@
 from dataclasses import is_dataclass
 from typing import Any
 
+import datasets
 from datasets import Features
-from datasets import load_dataset as _load_dataset
 from datasets.features import features as hf_features
 
 _LIST_FEATURE_DICT = {
@@ -68,7 +68,12 @@ def patch_datasets_list_feature_deserializer() -> None:
 
 
 def load_dataset(*args: Any, **kwargs: Any) -> Any:
-    """Call ``datasets.load_dataset`` after applying compatibility patches."""
+    """Call ``datasets.load_dataset`` after applying compatibility patches.
+
+    ``datasets.load_dataset`` is resolved dynamically (via attribute access on the
+    module) rather than bound at import time, so callers/tests that monkeypatch
+    ``datasets.load_dataset`` are honored.
+    """
 
     patch_datasets_list_feature_deserializer()
-    return _load_dataset(*args, **kwargs)
+    return datasets.load_dataset(*args, **kwargs)
