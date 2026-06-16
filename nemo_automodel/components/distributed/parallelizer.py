@@ -1001,7 +1001,7 @@ def apply_fsdp2_sharding_recursively(
     else:
         for name, sub_module in module.named_children():
             # A frozen audio tower never runs in the forward on image/text-only
-            # data, so wrapping its layers as their own FSDP units leaves those
+            # data (in gemma E4B and E2B models), so wrapping its layers as their own FSDP units leaves those
             # units never all-gathered. Under gradient accumulation FSDP's
             # deferred post-backward then dereferences their (never-created)
             # ``_unsharded_param`` and raises ``AttributeError``. Skip it so its
