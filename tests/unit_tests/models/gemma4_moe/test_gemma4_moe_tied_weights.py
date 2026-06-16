@@ -25,6 +25,7 @@ Runs on CPU (no CUDA / TE / DeepEP required).
 """
 
 import torch
+import torch.nn as nn
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
 
 from nemo_automodel.components.models.common import BackendConfig
@@ -103,3 +104,26 @@ def test_untied_lm_head_is_separate():
     model = _build(tie_word_embeddings=False)
     assert model.lm_head.weight is not model.model.language_model.embed_tokens.weight
     assert model.lm_head.weight.data_ptr() != model.model.language_model.embed_tokens.weight.data_ptr()
+
+
+def test_tie_weights_hook_reties_to_active_embedding():
+    """The public tie_weights() hook must re-point lm_head at the active MoE embedding.
+
+    Checkpoint/AutoModel paths call ``model.tie_weights()`` after construction
+    (e.g. via ``ensure_tied_lm_head``); this guards that the override re-ties to
+    the live embedding rather than HF's generic behavior.
+    """
+    model = _build(tie_word_embeddings=True)
+    # Break the tie with a fresh, independent parameter.
+    model.lm_head.weight = nn.Parameter(model.lm_head.weight.detach().clone())
+    assert model.lm_head.weight is not model.model.language_model.embed_tokens.weight
+
+    model.tie_weights()
+    assert model.lm_head.weight is model.model.language_model.embed_tokens.weight
+
+
+def test_tie_weights_hook_is_noop_when_untied():
+    """tie_weights() must not alias storage when the config requests untied embeddings."""
+    model = _build(tie_word_embeddings=False)
+    model.tie_weights()
+    assert model.lm_head.weight is not model.model.language_model.embed_tokens.weight
