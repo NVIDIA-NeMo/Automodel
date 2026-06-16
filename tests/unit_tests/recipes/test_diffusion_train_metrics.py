@@ -497,7 +497,12 @@ def test_build_diffusion_parallel_manager_args_accepts_confignode_ddp_config():
         "_manager_type": "ddp",
         "world_size": 4,
         "activation_checkpointing": False,
+        "broadcast_buffers": False,
         "find_unused_parameters": False,
+        "static_graph": False,
+        "bucket_cap_mb": None,
+        "gradient_as_bucket_view": False,
+        "autocast_dtype": None,
     }
 
 
