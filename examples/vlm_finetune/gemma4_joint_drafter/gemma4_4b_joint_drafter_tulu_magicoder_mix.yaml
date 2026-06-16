@@ -21,8 +21,8 @@
 # turns, ``default_collate_fn`` does not produce a ``pixel_values`` tensor and
 # the base treats the batch as text-only.
 #
-# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py \
-#     -c examples/vlm_finetune/gemma4/gemma4_4b_joint_drafter_text_mix.yaml
+# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c \
+# examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_tulu_magicoder_mix.yaml
 #
 # Requires: transformers>=5.8.0.dev
 
@@ -121,9 +121,8 @@ optimizer:
   weight_decay: 0.01
   betas: [0.9, 0.95]
 
-# 10% of max_steps as warmup
 lr_scheduler:
-  lr_warmup_steps: 200
+# 10% of max_steps as warmup is used by default which is what we want hence not setting lr_warmup_steps here.
   lr_decay_style: cosine
 
 freeze_config:

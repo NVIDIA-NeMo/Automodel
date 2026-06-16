@@ -71,6 +71,10 @@ distributed:
   ep_size: 8
 
   sequence_parallel: false
+  # Recompute transformer-block activations in backward so the fp32 master weights
+  # (restored for custom MoE under FSDP2 in #1896) fit within 80GB; without this the
+  # 35B-A3B run OOMs intermittently at its ~67 GiB steady-state peak on 8xH100.
+  activation_checkpointing: true
 
 freeze_config:
   freeze_vision_tower: true

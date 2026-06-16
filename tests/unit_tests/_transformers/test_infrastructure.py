@@ -147,6 +147,38 @@ def _run_apply_model_infrastructure(*, is_meta_device, load_base_model, model_wr
         return result, mock_ckpt
 
 
+def test_apply_model_infrastructure_handles_unwrapped_single_rank_ddp_model():
+    """Single-rank DDP skips wrapping, so the returned model may not have ``.module``."""
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+    from nemo_automodel.components.distributed.ddp import DDPManager
+
+    model = _DummyModel()
+    model_wrapper = object.__new__(DDPManager)
+
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._shard_ep_fsdp", return_value=model),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+    ):
+        mock_ckpt = MockCheckpointer.return_value
+        mock_ckpt.config = MagicMock()
+        mock_ckpt.config.dequantize_base_checkpoint = False
+
+        result = apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=model_wrapper,
+        )
+
+    assert result is model
+    assert hasattr(model, "_pre_shard_hf_state_dict_keys")
+
+
 class TestApplyModelInfrastructurePostShardInit:
     """Tests for initialize_model_weights being called in apply_model_infrastructure."""
 

@@ -120,6 +120,16 @@ class OptimizerConfig:
         """Construct a single optimizer for ``params`` (one model part)."""
         raise NotImplementedError(f"{type(self).__name__} must implement _build_optimizer()")
 
+    def build_from_param_groups(
+        self,
+        param_groups: list[dict[str, Any]],
+        *,
+        device_mesh: DeviceMesh | None = None,
+    ) -> torch.optim.Optimizer:
+        """Build one optimizer from caller-defined parameter groups."""
+        foreach = _foreach_for_mesh(device_mesh)
+        return self._build_optimizer(param_groups, foreach=foreach)
+
 
 @dataclass
 class AdamConfig(OptimizerConfig):
@@ -379,6 +389,25 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             optimizers.append(self.factory(params=trainable_params, **kwargs))
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
+
+    def build_from_param_groups(
+        self,
+        param_groups: list[dict[str, Any]],
+        *,
+        device_mesh: DeviceMesh | None = None,
+    ) -> torch.optim.Optimizer:
+        assert callable(self.factory), "OptimizerFromFactoryConfig.factory must be a callable"
+        foreach = _foreach_for_mesh(device_mesh)
+
+        kwargs = dict(self.kwargs)
+        for attr in _DTYPE_FIELDS:
+            val = kwargs.get(attr, None)
+            if isinstance(val, str):
+                kwargs[attr] = dtype_from_str(val)
+        if foreach is not None and "foreach" not in kwargs and _factory_accepts_foreach(self.factory):
+            kwargs["foreach"] = foreach
+
+        return self.factory(params=param_groups, **kwargs)
 
 
 # ---------------------------------------------------------------------------

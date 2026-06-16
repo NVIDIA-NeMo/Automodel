@@ -14,13 +14,10 @@
 
 """State-dict adapter for Qwen3.5 dense (non-MoE) models.
 
-Qwen3.5 dense uses HF's GatedDeltaNet linear-attention layers. For FSDP
-compatibility (mixed-dtype: bf16 + fp32 ``A_log``), ``patch_hf_model`` in
-``cp_linear_attn`` moves ``A_log`` from ``mod._parameters`` into a
-``_fp32_params`` submodule and patches ``__getattr__`` to redirect
-``mod.A_log`` reads. After patching, the model's state_dict contains keys of
-the form ``...linear_attn._fp32_params.A_log`` instead of the original
-``...linear_attn.A_log``.
+Qwen3.5 dense keeps its GatedDeltaNet SSM-gating parameters (``A_log`` /
+``dt_bias``) in a fp32 ``_fp32_params`` holder. The model's state dict therefore
+contains keys of the form ``...linear_attn._fp32_params.A_log`` instead of the
+original ``...linear_attn.A_log``.
 
 This adapter renames keys at save/load boundaries so that on-disk checkpoints
 match the original HF Qwen3.5 layout (bare ``A_log``) and are directly
@@ -33,6 +30,7 @@ import re
 from typing import Any, Optional
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.models.common.gated_delta_net_fp32 import upcast_gated_delta_net_fp32_state_tensor
 
 _FP32_PARAMS_TO_BARE = re.compile(r"(\.linear_attn)\._fp32_params\.")
 # Both SSM-gating params live in the fp32 ``SSMGate`` holder; route both on load.
@@ -78,7 +76,11 @@ class Qwen3_5DenseStateDictAdapter(StateDictAdapter):
         self.route_linear_attn_fp32_params = route_linear_attn_fp32_params
 
     def to_hf(self, state_dict: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-        return {map_qwen3_5_mtp_to_hf_key(_strip_fp32_prefix(k)): v for k, v in state_dict.items()}
+        hf_state_dict: dict[str, Any] = {}
+        for key, value in state_dict.items():
+            hf_key = map_qwen3_5_mtp_to_hf_key(_strip_fp32_prefix(key))
+            hf_state_dict[hf_key] = upcast_gated_delta_net_fp32_state_tensor(hf_key, value)
+        return hf_state_dict
 
     def from_hf(
         self,
@@ -87,10 +89,15 @@ class Qwen3_5DenseStateDictAdapter(StateDictAdapter):
         **kwargs: Any,
     ) -> dict[str, Any]:
         del device_mesh, kwargs
-        return {self._map_from_hf_key(k): v for k, v in hf_state_dict.items()}
+        native_state_dict: dict[str, Any] = {}
+        for key, value in hf_state_dict.items():
+            native_key = self._map_from_hf_key(key)
+            native_state_dict[native_key] = upcast_gated_delta_net_fp32_state_tensor(native_key, value)
+        return native_state_dict
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
-        return [(map_qwen3_5_mtp_to_hf_key(_strip_fp32_prefix(fqn)), tensor)]
+        hf_key = map_qwen3_5_mtp_to_hf_key(_strip_fp32_prefix(fqn))
+        return [(hf_key, upcast_gated_delta_net_fp32_state_tensor(hf_key, tensor))]
 
     def _map_from_hf_key(self, key: str) -> str:
         key = map_qwen3_5_mtp_from_hf_key(key)

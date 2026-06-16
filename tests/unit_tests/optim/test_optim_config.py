@@ -90,6 +90,20 @@ class TestOptimizerConfigBase:
         with pytest.raises(NotImplementedError):
             OptimizerConfig()._build_optimizer(_params())
 
+    def test_build_from_param_groups_preserves_group_options(self):
+        model = _model()
+        params = list(model.parameters())
+        param_groups = [
+            {"params": [params[0]], "weight_decay": 0.1},
+            {"params": [params[1]], "weight_decay": 0.0},
+        ]
+
+        opt = AdamWConfig(lr=1e-3, weight_decay=0.1).build_from_param_groups(param_groups)
+
+        assert isinstance(opt, torch.optim.AdamW)
+        assert opt.param_groups[0]["weight_decay"] == 0.1
+        assert opt.param_groups[1]["weight_decay"] == 0.0
+
 
 # ---------------------------------------------------------------------------
 # build_optimizer (Automodel-native orchestration)
@@ -165,6 +179,18 @@ class TestOptimizerFromFactoryConfig:
     def test_build_requires_callable_factory(self):
         with pytest.raises(AssertionError, match="must be a callable"):
             OptimizerFromFactoryConfig(factory=None).build(_model())
+
+    def test_build_from_param_groups_uses_factory(self):
+        cfg = OptimizerFromFactoryConfig(
+            factory=torch.optim.SGD,
+            kwargs={"lr": 0.01, "momentum": 0.9},
+        )
+        params = list(_model().parameters())
+        opt = cfg.build_from_param_groups([{"params": [params[0]]}, {"params": [params[1]], "weight_decay": 0.0}])
+
+        assert isinstance(opt, torch.optim.SGD)
+        assert len(opt.param_groups) == 2
+        assert opt.param_groups[0]["momentum"] == 0.9
 
 
 # ---------------------------------------------------------------------------

@@ -50,7 +50,11 @@ class DDPManager:
 
         # Extract config fields for easy access
         self.activation_checkpointing = config.activation_checkpointing
+        self.broadcast_buffers = config.broadcast_buffers
         self.find_unused_parameters = config.find_unused_parameters
+        self.static_graph = config.static_graph
+        self.bucket_cap_mb = config.bucket_cap_mb
+        self.gradient_as_bucket_view = config.gradient_as_bucket_view
 
         # Setup distributed environment
         self._setup_distributed()
@@ -125,8 +129,14 @@ class DDPManager:
                 if hasattr(layer, "post_attention_layernorm"):
                     layers[i].post_attention_layernorm = checkpoint_wrapper(layers[i].post_attention_layernorm)
 
-        return DDP(
-            model.to(self.device),
-            device_ids=[self.device] if self.device.type == "cuda" else None,
-            find_unused_parameters=self.find_unused_parameters,
-        )
+        ddp_kwargs = {
+            "device_ids": [self.device] if self.device.type == "cuda" else None,
+            "broadcast_buffers": self.broadcast_buffers,
+            "find_unused_parameters": self.find_unused_parameters,
+            "static_graph": self.static_graph,
+            "gradient_as_bucket_view": self.gradient_as_bucket_view,
+        }
+        if self.bucket_cap_mb is not None:
+            ddp_kwargs["bucket_cap_mb"] = self.bucket_cap_mb
+
+        return DDP(model.to(self.device), **ddp_kwargs)

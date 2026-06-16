@@ -479,6 +479,123 @@ class TestMTPLossDispatch:
         assert abs(out.item() - expected) < 1e-6, f"expected {expected}, got {out.item()}"
 
 
+class TestMTPInputEmbeds:
+    """Verify that NemotronHForCausalLM correctly uses pre-fused embeddings (inputs_embeds)
+    as the MTP future-token signal instead of re-embedding from input_ids.
+
+    This is the multimodal fix: in SALM, audio positions carry padding_id in mtp_input_ids
+    but the correct audio embedding in inputs_embeds.  Without this path, embed_fn(padding_id)
+    would be used at every audio position, injecting wrong future-token signal into MTP fusion.
+
+    The fix lives in model.py: when inputs_embeds is provided, it is pre-rolled per depth
+    and passed to MTPModule as embed_inputs, bypassing the embed_fn path entirely.
+    """
+
+    @pytest.mark.run_only_on("GPU")
+    def test_embed_inputs_overrides_embed_fn(self, backend):
+        """When embed_inputs is passed to MTPModule, the fusion sublayer receives it
+        directly instead of calling embed_fn(rolled_input_ids)."""
+        from nemo_automodel.components.models.common.mtp import MTPConfig, roll_tensor
+        from nemo_automodel.components.models.nemotron_v3.mtp import build_nemotron_v3_mtp
+
+        H = 64
+        B, S = 2, 10
+        config = MockNemotronV3Config(num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*")
+        mtp_config = MTPConfig(num_layers=1, layer_pattern="*")
+        mtp = build_nemotron_v3_mtp(
+            config, mtp_config=mtp_config, backend=backend, moe_config=None, dtype=torch.bfloat16
+        ).to(torch.bfloat16)
+
+        hidden_states = torch.randn(B, S, H, dtype=torch.bfloat16)
+        # Pre-fused embeddings (e.g. SALM audio+text): fill with a recognizable value.
+        input_embeds = torch.full((B, S, H), 7.0, dtype=torch.bfloat16)
+        # Pre-roll once for depth 0 (as model.py does before calling mtp).
+        rolled = roll_tensor(input_embeds, shifts=-1, dim=-2)
+
+        captured_embed_inputs = []
+        original_first_sublayer_call = mtp.layers[0].forward
+
+        def patched_first_sublayer(h, **kwargs):
+            if "embed_input" in kwargs:
+                captured_embed_inputs.append(kwargs["embed_input"].detach().clone())
+            return original_first_sublayer_call(h, **kwargs)
+
+        mtp.layers[0].forward = patched_first_sublayer
+
+        # Pass via embed_inputs tuple (the path model.py takes for multimodal).
+        mtp(hidden_states=hidden_states, embed_inputs=(rolled,))
+
+        assert len(captured_embed_inputs) == 1
+        assert torch.allclose(captured_embed_inputs[0], rolled), (
+            "embed_input to fusion sublayer should equal the pre-rolled embed_inputs tensor"
+        )
+
+    @pytest.mark.run_only_on("GPU")
+    def test_without_inputs_embeds_uses_embed_fn(self, backend):
+        """Regression: when inputs_embeds is absent the original embed_fn path is unchanged."""
+        from nemo_automodel.components.models.common.mtp import MTPConfig
+        from nemo_automodel.components.models.nemotron_v3.mtp import build_nemotron_v3_mtp
+
+        H = 64
+        B, S = 2, 10
+        config = MockNemotronV3Config(num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*")
+        mtp_config = MTPConfig(num_layers=1, layer_pattern="*")
+        mtp = build_nemotron_v3_mtp(
+            config, mtp_config=mtp_config, backend=backend, moe_config=None, dtype=torch.bfloat16
+        ).to(torch.bfloat16)
+
+        hidden_states = torch.randn(B, S, H, dtype=torch.bfloat16)
+        input_ids = torch.randint(0, 64, (B, S))
+        sentinel = torch.full((B, S, H), 5.0, dtype=torch.bfloat16)
+
+        embed_fn_calls = []
+
+        def embed_fn(ids):
+            embed_fn_calls.append(ids.clone())
+            return sentinel.clone()
+
+        captured_embed_inputs = []
+        original_first_sublayer_call = mtp.layers[0].forward
+
+        def patched_first_sublayer(h, **kwargs):
+            if "embed_input" in kwargs:
+                captured_embed_inputs.append(kwargs["embed_input"].detach().clone())
+            return original_first_sublayer_call(h, **kwargs)
+
+        mtp.layers[0].forward = patched_first_sublayer
+
+        mtp(hidden_states=hidden_states, input_ids=input_ids, embed_fn=embed_fn)
+
+        assert len(embed_fn_calls) == 1, "embed_fn must be called when no embed_inputs provided"
+        assert len(captured_embed_inputs) == 1
+        assert torch.allclose(captured_embed_inputs[0], sentinel), (
+            "embed_input must equal embed_fn output when embed_inputs is None"
+        )
+
+    @pytest.mark.run_only_on("GPU")
+    def test_model_forward_passes_inputs_embeds_to_mtp(self, backend):
+        """NemotronHForCausalLM.forward() must thread inputs_embeds into self.mtp() so
+        that the per-depth hidden states differ from the inputs_embeds-absent case."""
+        model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
+        model.train()
+        B, S = 2, 8
+        input_ids = torch.randint(0, config.vocab_size, (B, S))
+        # Craft inputs_embeds that differ from what embed_tokens(input_ids) would give.
+        inputs_embeds = torch.randn(B, S, config.hidden_size, dtype=torch.bfloat16)
+
+        # Forward with input_ids only (embed_fn path).
+        out_ids = model(input_ids=input_ids, labels=input_ids.clone())
+        # Forward with inputs_embeds (rolled-embeds path), keeping input_ids for MTP token rolling.
+        out_embs = model(input_ids=input_ids, inputs_embeds=inputs_embeds, labels=input_ids.clone())
+
+        assert out_embs.mtp_per_depth_h is not None
+        # The two forwards used different future-token embeddings in MTP, so the
+        # per-depth hidden states must differ.
+        assert not torch.allclose(out_ids.mtp_per_depth_h[0], out_embs.mtp_per_depth_h[0]), (
+            "mtp_per_depth_h should differ when inputs_embeds differ from embed_tokens(input_ids)"
+        )
+
+
 class TestMTPStateDictAdapter:
     def test_mtp_keys_in_state_dict(self, backend):
         """Internal model state_dict must contain the expected mtp.* keys

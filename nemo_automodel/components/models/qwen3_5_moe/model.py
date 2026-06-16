@@ -202,6 +202,18 @@ def _default_init_device() -> torch.device:
     return torch.device("cpu")
 
 
+def _qwen3_5_moe_backend(backend: BackendConfig | None = None) -> BackendConfig:
+    """Return a Qwen3.5-MoE backend with TE fused RoPE disabled.
+
+    The Qwen3.5 full-attention blocks reuse Qwen3-Next attention, and VLM/packed
+    execution can present THD-shaped q/k tensors. TE fused RoPE expects 4D inputs
+    in this path, so use non-fused RoPE while preserving the rest of the backend.
+    """
+    resolved = copy.copy(backend) if backend is not None else BackendConfig()
+    resolved.rope_fusion = False
+    return resolved
+
+
 def build_mtp_config_from_hf(
     config: Any,
     *,
@@ -726,7 +738,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     ):
         if not _QWEN3_5_MOE_HF_AVAILABLE:
             raise UnavailableError("transformers.models.qwen3_5_moe is not available.")
-        backend = backend or BackendConfig()
+        backend = _qwen3_5_moe_backend(backend)
 
         # _init_model() only overrides the top-level hf_config.torch_dtype; for
         # VL configs the nested text_config / vision_config keep their original

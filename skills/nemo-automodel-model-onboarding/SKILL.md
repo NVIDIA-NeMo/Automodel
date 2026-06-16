@@ -362,8 +362,14 @@ Where to declare it:
 
 - **NeMo-native model class** (you own `model.py`): a class attribute, e.g.
   `_keep_in_fp32_modules_strict = ["e_score_correction_bias"]` (see `deepseek_v4`, `ling_v2`).
-- **HF model you only patch** (e.g. Qwen3.5): set it on the instance inside `patch_hf_model`,
-  e.g. `model._keep_in_fp32_modules_strict = existing + ("_fp32_params",)`.
+- **Custom/HF-derived model class with fp32 runtime params**: build the fp32 structure in the
+  model or layer constructor. For GatedDeltaNet-style `A_log` / `dt_bias`, move them into a
+  real `_fp32_params` holder during construction, compute the sensitive gate inside that
+  holder's `forward`, keep the holder out of broad dtype casts with
+  `cast_model_to_dtype(..., skip_modules=("_fp32_params",))`, and make the state-dict adapter
+  strip/route holder keys plus upcast loaded tensors to fp32. Do not use a runtime monkeypatch,
+  and do not infer the contract globally from a module path such as `linear_attn` or from an
+  `A_log` parameter name alone.
 
 Always declare the pin for these params. A normal checkpoint load also auto-records each
 param's original HF dtype and uses it as a fallback, but that recording is skipped on the
