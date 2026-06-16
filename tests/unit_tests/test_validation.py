@@ -471,6 +471,19 @@ class TestValidateForMesh:
         _attach(model)
         validate_for_mesh(model, _mesh(cp=2))
 
+    @pytest.mark.parametrize("backend_attn", ["te", "sdpa", "flex"])
+    def test_cp_fails_deepseek_v4_non_tilelang(self, backend_attn):
+        """DSV4 + non-tilelang + cp>1 must point the user at tilelang, not TE."""
+        model = _DeepseekV4Like(backend_attn=backend_attn)
+        _attach(model)
+        with pytest.raises(ValueError, match="Context parallelism.*TileLang attention backend"):
+            validate_for_mesh(model, _mesh(cp=2))
+
+    def test_cp_passes_deepseek_v4_tilelang(self):
+        model = _DeepseekV4Like(backend_attn="tilelang")
+        _attach(model)
+        validate_for_mesh(model, _mesh(cp=2))
+
     def test_ep_fails_for_dense(self):
         model = _Bare()
         _attach(model)

@@ -616,7 +616,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        # CP is supported with the Miles-style TileLang attention path; the runtime
+        # gate in ``_transformers/capabilities.py`` restricts it to ``attn='tilelang'``.
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
 
