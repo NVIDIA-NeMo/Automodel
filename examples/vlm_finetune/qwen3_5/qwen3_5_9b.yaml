@@ -65,7 +65,11 @@ freeze_config:
   freeze_language_model: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  # FusedLinearCrossEntropy fuses the lm_head projection with cross-entropy and
+  # computes it in chunks, so the full [num_tokens, vocab] logits tensor is never
+  # materialized. MaskedCrossEntropy fp32-upcasts the full logits and OOMs at the
+  # F.cross_entropy call on large VLM batches (AM-457). Matches qwen3_6_27b_medpix.
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
