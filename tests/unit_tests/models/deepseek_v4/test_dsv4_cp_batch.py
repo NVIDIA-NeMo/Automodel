@@ -40,6 +40,19 @@ from nemo_automodel.components.models.deepseek_v4.cp import (
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
 
 
+@pytest.fixture(autouse=True)
+def _force_no_dist(monkeypatch):
+    """Exercise the single-process (no process group) path deterministically.
+
+    These tests drive the CP helpers/callable with a fake mesh whose ``get_group``
+    returns a sentinel, not a real ProcessGroup. If another test in the same pytest
+    worker left ``torch.distributed`` initialized, the helpers would otherwise call
+    ``dist.get_rank(group=<sentinel>)`` and raise. Pin ``is_initialized`` to False so
+    rank resolution falls back to ``cp_mesh.get_local_rank()``.
+    """
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+
 class _FakeMesh:
     """Minimal stand-in for a CP device-mesh slice (no real process group)."""
 
