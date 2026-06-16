@@ -809,6 +809,15 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         # Expose moe_config for the MoE parallelizer assertion
         self.model.moe_config = self.model.language_model.moe_config
 
+        # HF's super().__init__() tied lm_head.weight to the *original* text
+        # embed_tokens, but the language_model replacement above swapped in a
+        # fresh embed_tokens and orphaned that alias. Re-tie lm_head to the
+        # now-active embedding when the config requests tied embeddings (Gemma
+        # defaults to tie_word_embeddings=True). The shared Parameter survives
+        # the in-place cast in initialize_weights().
+        if getattr(text_config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.language_model.embed_tokens.weight
+
         self.vocab_size = text_config.vocab_size
         # State dict adapter for HF ↔ NeMo weight conversion
         if self.backend.enable_hf_state_dict_adapter:
