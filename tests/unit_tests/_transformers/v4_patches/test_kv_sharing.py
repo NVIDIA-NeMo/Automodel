@@ -174,3 +174,24 @@ def test_install_is_idempotent_per_stack():
     second = install_kv_sharing_holder([model])
     assert first == 3
     assert second == 0  # already installed -> skipped
+
+
+def test_apply_runtime_compatibility_fixes_installs_holder():
+    """The fix is wired into _apply_runtime_compatibility_fixes (the prod path)."""
+    from nemo_automodel._transformers.infrastructure import _apply_runtime_compatibility_fixes
+
+    model = _TextModel()
+    _simulate_fsdp_cast(model)
+    returned = _apply_runtime_compatibility_fixes(model)
+    assert returned is model
+    # Holder is installed -> sharing works despite the simulated FSDP cast.
+    out = model(torch.zeros(2))
+    assert torch.allclose(out, torch.zeros(2))
+
+
+def test_apply_runtime_compatibility_fixes_noop_without_kv_sharing():
+    from nemo_automodel._transformers.infrastructure import _apply_runtime_compatibility_fixes
+
+    model = _TextModel(num_kv_shared_layers=0)
+    _apply_runtime_compatibility_fixes(model)
+    assert not getattr(model.layers[0], "_kv_sharing_holder_installed", False)
