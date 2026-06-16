@@ -41,6 +41,10 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 # changes per step (new anchor positions), but the create_block_mask machinery
 # itself is identical — compiling once and reusing avoids per-step Python
 # overhead of evaluating mask_mod across the BlockMask grid.
+# ``dynamic=True``: the mask shape depends on the per-batch anchor count
+# (``min(num_anchors, valid anchors in the batch)``), so a static compile
+# re-specializes (a full recompile, a multi-second stall mid-training) every
+# time a batch carries a new anchor count. One dynamic compile covers all.
 _compiled_create_block_mask = None
 
 
@@ -48,7 +52,7 @@ def _get_compiled_create_block_mask():
     """Lazy-initialise a compiled ``create_block_mask`` and cache it."""
     global _compiled_create_block_mask
     if _compiled_create_block_mask is None:
-        _compiled_create_block_mask = torch.compile(create_block_mask, dynamic=False)
+        _compiled_create_block_mask = torch.compile(create_block_mask, dynamic=True)
     return _compiled_create_block_mask
 
 

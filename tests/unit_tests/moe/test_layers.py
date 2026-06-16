@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import importlib.util
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -1417,30 +1417,11 @@ class TestMoE:
             mock_experts.return_value = torch.randn(batch_size * seq_len, moe_config.dim, device=device)
             mock_shared.return_value = torch.randn(batch_size * seq_len, moe_config.dim, device=device)
 
-            # Patch at the module level to avoid CUDA stream issues on CPU
-            with (
-                patch("torch.cuda.Stream") as mock_stream_class,
-                patch("torch.cuda.current_stream") as mock_current_stream,
-                patch("torch.cuda.stream") as mock_stream_context,
-                # The shared-expert fork/join calls Tensor.record_stream with the
-                # mocked stream; no-op the helper so the mock isn't passed to it.
-                patch("nemo_automodel.components.moe.layers._record_stream_safe"),
-            ):
-                mock_stream = Mock()
-                mock_stream.wait_stream = Mock()
-                mock_stream_class.return_value = mock_stream
-                mock_current_stream.return_value = Mock()
+            # Shared experts run inline on the main stream (no side-stream overlap).
+            output = moe(x)
 
-                # Create a context manager that just yields
-                mock_context = Mock()
-                mock_context.__enter__ = Mock(return_value=None)
-                mock_context.__exit__ = Mock(return_value=None)
-                mock_stream_context.return_value = mock_context
-
-                output = moe(x)
-
-                assert output.shape == x.shape
-                assert output.device == device
+            assert output.shape == x.shape
+            assert output.device == device
 
     def test_moe_forward_with_padding_mask(self, moe_config, backend_config, device):
         """Test MoE forward pass with padding mask."""

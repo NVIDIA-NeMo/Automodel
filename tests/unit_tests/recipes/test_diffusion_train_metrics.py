@@ -471,6 +471,36 @@ def test_build_diffusion_parallel_manager_args_parses_ddp_config():
     }
 
 
+def test_build_diffusion_parallel_manager_args_accepts_confignode_fsdp_config():
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=ConfigNode({"dp_size": 8, "cpu_offload": False}),
+        ddp_cfg=None,
+        world_size=8,
+        dtype=torch.bfloat16,
+        lora_enabled=False,
+    )
+
+    assert manager_args["_manager_type"] == "fsdp2"
+    assert manager_args["dp_size"] == 8
+
+
+def test_build_diffusion_parallel_manager_args_accepts_confignode_ddp_config():
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=None,
+        ddp_cfg=ConfigNode({"backend": "nccl", "activation_checkpointing": False}),
+        world_size=4,
+        dtype=torch.bfloat16,
+        lora_enabled=False,
+    )
+
+    assert manager_args == {
+        "_manager_type": "ddp",
+        "world_size": 4,
+        "activation_checkpointing": False,
+        "find_unused_parameters": False,
+    }
+
+
 def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(monkeypatch):
     pipe = SimpleNamespace(transformer=_TinyTransformer())
     manager = SimpleNamespace(device_mesh="mesh")

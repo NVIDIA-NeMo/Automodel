@@ -235,29 +235,25 @@ def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | No
 
 
 def has_local_tied_lm_head(model: nn.Module) -> bool:
-    """Return whether the current model partition can locally satisfy a tied LM head.
+    """Return whether the current model partition has an actual tied LM head.
 
-    This is intentionally stricter than ``is_tied_word_embeddings()``: pipeline
-    stages often keep the config flag set to ``True`` even though ``lm_head`` and
-    ``embed_tokens`` live on different partitions and therefore cannot be
-    reconstructed from each other locally.
-
-    Note: we purposefully do NOT check ``lm_head.weight is embed_tokens.weight``.
-    After FSDP/TP sharding both are wrapped into separate ``DTensor``s and the
-    ``is``-identity is broken, but HF's ``tie_weights()`` can still relink them
-    locally on load. The only case we actually need to distinguish is "is the
-    embedding source present on this partition at all?", which answers "can we
-    safely omit ``lm_head.weight`` during save and rematerialize on load?".
+    This is stricter than ``is_tied_word_embeddings()``: pipeline stages often
+    keep the config flag set to ``True`` even when ``lm_head`` and
+    ``embed_tokens`` live on different partitions. Some custom models can also
+    declare tied embeddings in config without actually aliasing the parameters.
+    In that case omitting ``lm_head.weight`` from a checkpoint loses trained
+    state, so only treat it as safely tied when the local tensors share storage.
 
     Args:
         model: Model or pipeline stage to inspect.
 
     Returns:
-        ``True`` when the model is configured with tied word embeddings AND
-        both the local ``lm_head`` and the input embedding live on this
-        partition. ``False`` when the config isn't tied, or when the local
-        partition is missing one of the two (typical for PP non-last / non-first
-        stages).
+        ``True`` when the model is configured with tied word embeddings, both
+        the local ``lm_head`` and the input embedding live on this partition,
+        and the two tensors share local storage. ``False`` when the config
+        isn't tied, the local partition is missing one of the two (typical for
+        PP non-last / non-first stages), or the tensors are separate despite
+        matching shapes.
     """
     if not is_tied_word_embeddings(model):
         return False
@@ -275,7 +271,102 @@ def has_local_tied_lm_head(model: nn.Module) -> bool:
     # producing a strict-load shape mismatch on resume.
     if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
         return False
-    return True
+    return _same_tensor_storage(lm_head_weight, input_embeddings_weight)
+
+
+def _get_module_by_normalized_name(model: nn.Module, normalized_module_name: str) -> nn.Module | None:
+    """Return a module by FQN after applying wrapper-prefix normalization."""
+    if normalized_module_name == "":
+        return model
+    for name, module in model.named_modules():
+        if _normalize_param_name(name) == normalized_module_name:
+            return module
+    return None
+
+
+def ensure_tied_lm_head(model: nn.Module) -> bool:
+    """Ensure a local tied LM head actually aliases the input embedding.
+
+    Hugging Face ``tie_weights()`` is the first choice because model classes can
+    have custom tying rules. The direct assignment fallback handles wrapped
+    models whose generic ``tie_weights()`` no longer reaches the local
+    ``lm_head``/embedding pair after sharding.
+
+    Args:
+        model: Model or pipeline stage to inspect and update.
+
+    Returns:
+        ``True`` if the local ``lm_head`` and input embedding are tied after the
+        call, otherwise ``False``.
+    """
+    if not is_tied_word_embeddings(model):
+        return False
+    if has_local_tied_lm_head(model):
+        return True
+
+    lm_head_weight, lm_head_param_name = get_lm_head_weight_and_name(model)
+    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
+    if lm_head_weight is not None and input_embeddings_weight is not None:
+        if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
+            return False
+
+    tie_weights = getattr(model, "tie_weights", None)
+    if callable(tie_weights):
+        try:
+            tie_weights()
+        except AttributeError:
+            pass
+        if has_local_tied_lm_head(model):
+            return True
+
+    lm_head_weight, lm_head_param_name = get_lm_head_weight_and_name(model)
+    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
+    if lm_head_weight is None or lm_head_param_name is None or input_embeddings_weight is None:
+        return False
+    if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
+        return False
+
+    lm_head_module_name = lm_head_param_name.rsplit(".", 1)[0]
+    lm_head_module = _get_module_by_normalized_name(model, lm_head_module_name)
+    if lm_head_module is None or not hasattr(lm_head_module, "weight"):
+        return False
+
+    try:
+        lm_head_module.weight = input_embeddings_weight
+    except (AttributeError, TypeError, RuntimeError):
+        return False
+
+    return has_local_tied_lm_head(model)
+
+
+def _same_tensor_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Return whether two tensors are aliases of the same local storage."""
+    if left is right:
+        return True
+
+    def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        to_local = getattr(tensor, "to_local", None)
+        if callable(to_local):
+            try:
+                return to_local()
+            except RuntimeError:
+                return tensor
+        return tensor
+
+    left_local = _local_tensor(left)
+    right_local = _local_tensor(right)
+    if left_local is right_local:
+        return True
+    if left_local.device.type == "meta" or right_local.device.type == "meta":
+        return False
+
+    try:
+        return (
+            left_local.untyped_storage().data_ptr() == right_local.untyped_storage().data_ptr()
+            and left_local.storage_offset() == right_local.storage_offset()
+        )
+    except RuntimeError:
+        return False
 
 
 def materialize_missing_tied_lm_head(

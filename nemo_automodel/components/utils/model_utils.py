@@ -458,6 +458,22 @@ def freeze_deepseek_v4_indexer_params(model):
         logger.info("Froze %d DeepSeek V4 indexer parameters.", frozen_count)
 
 
+def freeze_minimax_m3_indexer_params(model):
+    """Freeze MiniMax M3 lightning-indexer params that only feed discrete top-k masks."""
+    config = getattr(model, "config", None)
+    if not str(getattr(config, "model_type", "")).startswith("minimax_m3"):
+        return
+
+    frozen_count = 0
+    for name, param in model.named_parameters():
+        if ".self_attn.indexer." in name:
+            param.requires_grad_(False)
+            frozen_count += 1
+
+    if frozen_count > 0:
+        logger.info("Froze %d MiniMax M3 indexer parameters.", frozen_count)
+
+
 def cast_mixed_dtype_params_to_bf16(model):
     """Cast fp32 parameters and buffers to bf16 for FSDP2 compatibility."""
     for p in model.parameters():

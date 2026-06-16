@@ -39,6 +39,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     _maybe_adapt_state_dict_to_hf,
 )
+from nemo_automodel.components.checkpoint.utils import ensure_tied_lm_head
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
     DistributedStrategyConfig,
@@ -64,6 +65,7 @@ from nemo_automodel.components.utils.model_utils import (
     count_model_parameters,
     enable_radio_vit_fused_attn,
     freeze_deepseek_v4_indexer_params,
+    freeze_minimax_m3_indexer_params,
     freeze_unused_kv_sharing_params,
     init_empty_weights,
     print_trainable_parameters,
@@ -73,6 +75,13 @@ if TYPE_CHECKING:
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_tied_lm_heads(model) -> None:
+    """Re-apply local tied LM-head aliases on model parts that own both tensors."""
+    model_parts = model.parts if hasattr(model, "parts") else [model]
+    for model_part in model_parts:
+        ensure_tied_lm_head(model_part)
 
 
 #  PEFT / quantization helpers
@@ -517,6 +526,7 @@ def apply_model_infrastructure(
     # so the optimizer never tracks them and checkpoint save/resume stay consistent.
     freeze_unused_kv_sharing_params(model)
     freeze_deepseek_v4_indexer_params(model)
+    freeze_minimax_m3_indexer_params(model)
 
     # NemotronOmni RADIO: opt into the fused SDPA path on ViT attention blocks.
     enable_radio_vit_fused_attn(model)
@@ -533,6 +543,7 @@ def apply_model_infrastructure(
             setattr(part, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
     else:
         model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh)
+        _ensure_tied_lm_heads(model)
         if compile_config is not None and not isinstance(model_wrapper, FSDP2Manager):
             model = compile_model(model, compile_config)
         if isinstance(model_wrapper, FSDP2Manager):
@@ -628,7 +639,15 @@ def apply_model_infrastructure(
     # Attach CP attention-mask hooks for dense (non-TE) context parallelism.
     # These hooks strip attention_mask and set is_causal=True on self_attn modules
     # so that SDPA handles causal masking internally (compatible with DTensor sharding).
-    if mesh.cp_size > 1 and not _uses_te_attention(model):
+    #
+    # MoE models (ep_size > 1) get their full CP setup from the MoE parallelizer's
+    # apply_cp (via _shard_ep_fsdp): TE attention -> its own CP group; model-owned
+    # attention (e.g. Gemma4's ring) -> setup_cp_attention. Re-running this dense
+    # pass for them is not just redundant -- it would mask-strip their vision tower
+    # and clobber the model-owned ring (the original double-apply bug). Non-TE MoE
+    # is not excluded by the _uses_te_attention check, so gate on ep_size: only
+    # dense (non-MoE) models need this pass.
+    if mesh.cp_size > 1 and mesh.ep_size <= 1 and not _uses_te_attention(model):
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
             attach_cp_sdpa_hooks,

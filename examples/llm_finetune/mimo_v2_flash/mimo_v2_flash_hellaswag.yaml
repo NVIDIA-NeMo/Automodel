@@ -132,3 +132,7 @@ wandb:
   project: automodel-mimo-v2-flash
   name: mimo_v2_flash_hellaswag_16n
   mode: online
+
+ci:
+  # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
+  nodes: 16

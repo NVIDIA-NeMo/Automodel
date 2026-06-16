@@ -42,16 +42,10 @@ DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
 logger = logging.getLogger(__name__)
 
-_MODEL_RUNTIME_PATCHES = {
-    "Qwen3_5ForCausalLM": (
-        "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn",
-        "apply_model_runtime_patches",
-    ),
-    "Qwen3_5ForConditionalGeneration": (
-        "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn",
-        "apply_model_runtime_patches",
-    ),
-}
+# Models build their CP/fp32-gate-aware modules at construction; no load-time
+# runtime patching is registered here. (Qwen3.5 dense/MoE build the native
+# CPAwareGatedDeltaNet + fp32 SSMGate in their model __init__.)
+_MODEL_RUNTIME_PATCHES = {}
 
 
 def _assert_same_signature(original, patched):
@@ -256,6 +250,11 @@ def _apply_preload_overrides(tp_size, cp_size, has_packed_sequence, attn_impleme
     if tp_size > 1 or cp_size > 1:
         logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
         use_liger_kernel = False
+
+    # MagiAttention runs its own context-parallel dispatch + masking (incl. packing),
+    # so it must keep its registered backend rather than being forced to SDPA/flash here.
+    if attn_implementation == "magi":
+        return attn_implementation, use_liger_kernel
 
     if cp_size > 1:
         attn_implementation = "sdpa"
