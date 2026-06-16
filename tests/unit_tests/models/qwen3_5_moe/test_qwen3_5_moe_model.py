@@ -493,9 +493,14 @@ class TestQwen3_5MoeForConditionalGeneration:
     def test_initialization_configures_backend_components(self, vl_config, backend_config, moe_config):
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
 
-        assert model.backend is backend_config
+        assert model.backend is not backend_config
+        assert model.backend.attn == backend_config.attn
+        assert model.backend.linear == backend_config.linear
+        assert model.backend.rms_norm == backend_config.rms_norm
+        assert model.backend.rope_fusion is False
         assert isinstance(model.model, Qwen3_5MoeModel)
         assert isinstance(model.model.language_model, Qwen3_5MoeTextModelBackend)
+        assert model.model.language_model.backend is model.backend
         assert model.model.moe_config is model.model.language_model.moe_config
 
         vision_model = getattr(model.model, "visual")
@@ -1012,7 +1017,11 @@ class TestFromConfigDirect:
         model = Qwen3_5MoeForConditionalGeneration.from_config(vl_config, moe_config=moe_config, backend=backend_config)
 
         assert isinstance(model, Qwen3_5MoeForConditionalGeneration)
-        assert model.backend is backend_config
+        assert model.backend is not backend_config
+        assert model.backend.attn == backend_config.attn
+        assert model.backend.linear == backend_config.linear
+        assert model.backend.rms_norm == backend_config.rms_norm
+        assert model.backend.rope_fusion is False
 
 
 # ---------------------------------------------------------------------------

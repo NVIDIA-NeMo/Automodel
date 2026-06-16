@@ -1223,6 +1223,65 @@ class TestLoadModelCheckpointKeySubset:
         assert "missing=0" in caplog.text
 
 
+class TestLoadModelExtraState:
+    """Test checkpoint load compatibility for module extra-state keys."""
+
+    def _make_checkpointer(self):
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/test",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="test/model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def test_missing_extra_state_keys_are_dropped_before_dcp_load(self, caplog):
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Module()
+        initial_state_dict = {
+            "layer.weight": torch.zeros(2, 2),
+            "layer._extra_state": torch.empty(0),
+        }
+        captured = {}
+
+        def fake_do_load(state_dict, *args, **kwargs):
+            captured["requested_keys"] = set(state_dict)
+            return {key: value.clone() for key, value in state_dict.items()}
+
+        caplog.set_level(logging.WARNING)
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch.object(checkpointer, "_get_storage_reader", return_value=object()),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
+                return_value={"layer.weight"},
+            ),
+            patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = initial_state_dict.copy()
+
+            checkpointer.load_model(model, model_path="/fake/path")
+
+        assert captured["requested_keys"] == {"layer.weight"}
+        assert "module _extra_state keys" in caplog.text
+        mock_model_state.load_state_dict.assert_called_once()
+
+
 # =============================================================================
 # Tests for Checkpointer.initialize_model_weights
 # =============================================================================
