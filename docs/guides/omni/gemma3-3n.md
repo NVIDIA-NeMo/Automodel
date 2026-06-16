@@ -131,7 +131,7 @@ NeMo AutoModel uses a flexible configuration system that combines YAML configura
 
 The simplest way to run fine-tuning is with a YAML configuration file. We provide configs for both Gemma 3 and Gemma 3n.
 
-:::{note}
+<Note>
 These VLM recipes require the optional `vlm` dependency set. If you see `ImportError: qwen_vl_utils is not installed`, install VLM dependencies first:
 
 ```bash
@@ -139,7 +139,7 @@ uv sync --frozen --extra vlm
 ```
 
 (If you're using pip: `pip3 install "nemo-automodel[vlm]"`.)
-:::
+</Note>
 
 #### Run Gemma 3 Fine-Tuning
 

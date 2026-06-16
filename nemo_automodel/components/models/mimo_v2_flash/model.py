@@ -585,7 +585,10 @@ class MiMoV2FlashModel(nn.Module):
 class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Causal LM wrapper for MiMo-V2-Flash with Automodel checkpoint adapters."""
 
-    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "attention_sink_bias"]
+    # "rotary_emb" (matches self.rotary_emb + self.swa_rotary_emb) pins their inv_freq
+    # buffers in fp32: cast_model_to_dtype's bf16 cast would otherwise round inv_freq and
+    # degrade RoPE precision vs HF (see llama/rope_utils.py).
+    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "attention_sink_bias", "rotary_emb"]
     _pp_keep_self_forward = True
     _skip_init_weights_on_load = True
 

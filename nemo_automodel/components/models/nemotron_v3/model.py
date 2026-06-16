@@ -820,6 +820,18 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             # tensors for the same reason.
             mtp_hidden = hidden_states
             mtp_embeds_for_call = tuple(mtp_embed_inputs) if mtp_embed_inputs else ()
+            # SALM / multimodal: when inputs_embeds (pre-fused audio+text) are present
+            # and no PP embeddings were provided, pre-roll them per depth so audio
+            # positions carry the correct audio embedding rather than embed_fn(padding_id).
+            if not mtp_embeds_for_call and inputs_embeds is not None:
+                from nemo_automodel.components.models.common.mtp import roll_tensor  # noqa: PLC0415
+
+                cur_emb = inputs_embeds
+                salm_embed_inputs: list[torch.Tensor] = []
+                for _ in range(self.mtp_config.num_layers):
+                    cur_emb = roll_tensor(cur_emb, shifts=-1, dim=-2)
+                    salm_embed_inputs.append(cur_emb)
+                mtp_embeds_for_call = tuple(salm_embed_inputs)
             if is_thd:
                 if mtp_hidden.dim() == 3 and mtp_hidden.shape[0] == 1:
                     mtp_hidden = mtp_hidden.squeeze(0)

@@ -63,6 +63,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
+    ensure_tied_lm_head,
     estimate_state_dict_bytes,
     estimate_tensor_bytes,
     format_bytes,
@@ -71,7 +72,6 @@ from nemo_automodel.components.checkpoint.utils import (
     get_tied_lm_head_source_names,
     get_world_size_safe,
     is_rank_0,
-    is_tied_word_embeddings,
     materialize_missing_tied_lm_head,
 )
 
@@ -785,6 +785,12 @@ class Checkpointer:
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
         loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
+        # MoE experts load in-place via strided views into model storage (DCP writes through
+        # them), so they are absent from the returned state_dict but ARE loaded. The adapter
+        # tracks them (reset + populated entirely inside from_hf); count them as loaded for the
+        # diff to avoid false "missing" warnings while genuinely unloaded params are still flagged.
+        _adapter = getattr(model_state.model[0], "state_dict_adapter", None)
+        loaded_keys_for_diff |= getattr(_adapter, "view_loaded_native_keys", None) or set()
         if allow_checkpoint_key_subset:
             # Keys deliberately kept at init were already warned about above; keep
             # reporting unexpected keys, which nothing else surfaces.
@@ -926,6 +932,12 @@ class Checkpointer:
                     " Requires custom initialization to be implemented."
                 )
 
+        # Custom models constructed on meta tensors are materialized and
+        # initialized here, after __init__ has already returned. Re-apply tied
+        # embeddings at this point so random from-config initialization does not
+        # leave lm_head.weight split from embed_tokens.weight.
+        ensure_tied_lm_head(model)
+
         if peft_init_method is not None:
             _init_peft_adapters(model, peft_init_method)
 
@@ -969,15 +981,8 @@ class Checkpointer:
 
         _reinit_non_persistent_buffers(model, device, model_type=model_type)
 
-        is_tied_lm_head = is_tied_word_embeddings(model)
         self.config.original_model_root_dir = root_dir
-        if hasattr(model, "tie_weights") and is_tied_lm_head:
-            try:
-                model.tie_weights()
-            except AttributeError:
-                # PP splitting sets unused modules to None; skip weight tying
-                # on stages that don't own both embed_tokens and lm_head.
-                pass
+        ensure_tied_lm_head(model)
 
     def maybe_wait_for_staging(self) -> None:
         """
@@ -1881,6 +1886,7 @@ def _load_full_state_dict_into_model(
             # _distribute_state_dict would instead move the *entire* state dict onto the
             # device (a second full copy), OOMing a 30B model on one 80GB GPU.
             part.load_state_dict(state_dict, strict=False)
+        ensure_tied_lm_head(part)
 
 
 def _convert_checkpoint_with_transformers(

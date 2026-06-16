@@ -90,5 +90,5 @@ The bringup was validated against the official DeepSeek inference reference (`ds
 The training loss curve below is from a 43-layer full-finetune run on HellaSwag with the full attention zoo (SWA + CSA + HCA) live.
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/b5ed8837-40cb-41c6-8b90-2789e5e872cc" alt="DeepSeek V4 Flash Training Loss Curve" width="600">
+  <img src="https://github.com/user-attachments/assets/b5ed8837-40cb-41c6-8b90-2789e5e872cc" alt="DeepSeek V4 Flash Training Loss Curve" width="600" />
 </p>

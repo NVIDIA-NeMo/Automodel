@@ -46,8 +46,12 @@ def test_fused_lora_mlp_matches_reference_fp32():
     # reference
     xr = x0.clone().requires_grad_(True)
     ref_p = {k: v.clone().requires_grad_(True) for k, v in dict(gA=gA, gB=gB, uA=uA, uB=uB, dA=dA, dB=dB).items()}
-    (_ref_mlp(xr, gW, ref_p["gA"], ref_p["gB"], gS, uW, ref_p["uA"], ref_p["uB"], uS,
-              dW, ref_p["dA"], ref_p["dB"], dS) * gout).sum().backward()
+    (
+        _ref_mlp(
+            xr, gW, ref_p["gA"], ref_p["gB"], gS, uW, ref_p["uA"], ref_p["uB"], uS, dW, ref_p["dA"], ref_p["dB"], dS
+        )
+        * gout
+    ).sum().backward()
 
     # fused
     xf = x0.clone().requires_grad_(True)
@@ -155,6 +159,28 @@ def test_fused_helper_declines_on_dropout_and_dora():
     gate = _make_lora(H, I, R)
     gate.use_dora = True
     assert fused_lora_swiglu_mlp(gate, up, down, x) is None
+
+
+def test_fused_helper_declines_on_quantized_base():
+    """QLoRA/quantized base weights are packed buffers, not a 2D (out, in) matrix; the fused path
+    must decline so the per-linear (dequantizing) path handles them.
+
+    Regression for AM-435: with a 4-bit-packed base, ``F.linear(x, base_weight)`` in the fused
+    forward failed with "mat1 and mat2 shapes cannot be multiplied (Nx4096 and 1x14680064)".
+    """
+    H, I, R = 64, 96, 8
+    up, down = _make_lora(H, I, R), _make_lora(I, H, R)
+    x = torch.randn(2, 16, H)
+
+    # (a) packed/flattened base weight (shape != (out_features, in_features))
+    gate_packed = _make_lora(H, I, R)
+    gate_packed.weight = nn.Parameter(torch.zeros(1, I * H // 2), requires_grad=False)
+    assert fused_lora_swiglu_mlp(gate_packed, up, down, x) is None
+
+    # (b) bitsandbytes-style quant_state marker on the module
+    gate_qs = _make_lora(H, I, R)
+    gate_qs.quant_state = object()
+    assert fused_lora_swiglu_mlp(gate_qs, up, down, x) is None
 
 
 def _lora_swiglu_mlp(H, I, R):

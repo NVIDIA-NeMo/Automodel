@@ -488,16 +488,13 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
     """
 
     def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
-        # Patch HF GatedDeltaNet for FSDP mixed-dtype support (and CP if enabled)
-        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import patch_hf_model
-
         cp_mesh_name = dp_shard_cp_mesh_name.replace("dp_shard_", "")
         cp_enabled = cp_mesh_name in device_mesh.mesh_dim_names and device_mesh[cp_mesh_name].size() > 1
-        patch_hf_model(model, cp_enabled=cp_enabled)
 
-        # Submodules that must compute in fp32 even under fp32 master weights (bf16
-        # compute). patch_hf_model declares ``_fp32_params`` on the model.
-        fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
+        # The Qwen3.5 model builds CPAwareGatedDeltaNet with a fp32 ``SSMGate``
+        # (``_fp32_params``) at construction — no runtime patch needed. Keep those
+        # params in their own dtype-uniform fp32 FSDP group (true master weights).
+        fp32_compute_module_names = ("_fp32_params",)
 
         # Delegate TP, AC, mixed precision to the default strategy, but
         # override the FSDP sharding to use fully_shard_by_dtype.
@@ -886,6 +883,17 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     logger.info("Per-layer torch.compile applied to %d decoder layers", compiled_count)
 
 
+def _subtree_all_frozen(module: nn.Module) -> bool:
+    """Return True if ``module`` owns parameters and none of them require grad.
+
+    Used to skip FSDP-wrapping a frozen submodule that never runs in the forward
+    (e.g. the audio tower on image/text-only data); see
+    ``apply_fsdp2_sharding_recursively``.
+    """
+    params = list(module.parameters())
+    return len(params) > 0 and not any(p.requires_grad for p in params)
+
+
 def apply_fsdp2_sharding_recursively(
     module: nn.Module,
     mesh: DeviceMesh,
@@ -989,6 +997,17 @@ def apply_fsdp2_sharding_recursively(
                     fsdp_units[i].set_modules_to_backward_prefetch(targets)
     else:
         for name, sub_module in module.named_children():
+            # A frozen audio tower never runs in the forward on image/text-only
+            # data (in gemma E4B and E2B models), so wrapping its layers as their own FSDP units leaves those
+            # units never all-gathered. Under gradient accumulation FSDP's
+            # deferred post-backward then dereferences their (never-created)
+            # ``_unsharded_param`` and raises ``AttributeError``. Skip it so its
+            # params stay with the always-run root FSDP unit (which is still
+            # sharded, and whose frozen params have ``grad is None`` so the
+            # accumulate path is a no-op). Mirrors the audio_tower guard in
+            # ``components/moe/parallelizer.py``.
+            if name == "audio_tower" and _subtree_all_frozen(sub_module):
+                continue
             apply_fsdp2_sharding_recursively(
                 sub_module,
                 mesh,

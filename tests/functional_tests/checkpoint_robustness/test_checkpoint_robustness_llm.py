@@ -534,12 +534,22 @@ def test_checkpoint_robustness():
             hf_kwargs["device_map"] = "auto"
         if original_quantization_config is not None:
             hf_kwargs["quantization_config"] = original_quantization_config
+        # Load the reference model straight onto the target GPU. Materialising a
+        # 14B checkpoint on CPU and then ``.to(device)`` costs ~50-225s, and that
+        # rank-0-only stall trips the NCCL watchdog while the other ranks idle at
+        # the post-phase ``_barrier()`` below (the failure mode this test hit on
+        # large models). ``device_map`` places weights on the GPU directly (~12s).
+        # trust_remote_code models need the ``_no_meta`` real-device init, which is
+        # incompatible with device_map's meta dispatch, and the auto/quantized
+        # paths set ``device_map`` themselves -- so restrict this to standard-HF loads.
+        if "device_map" not in hf_kwargs and not trust_remote_code and original_quantization_config is None:
+            hf_kwargs["device_map"] = {"": device}
 
         if is_peft:
             from peft import PeftModel
 
             with _no_meta:
-                if hf_device_map_auto:
+                if "device_map" in hf_kwargs:
                     base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
                 else:
                     base_model = _fix_meta_rotary_embeddings(
@@ -586,7 +596,7 @@ def test_checkpoint_robustness():
         else:
             _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
             with _no_meta:
-                if hf_device_map_auto:
+                if "device_map" in hf_kwargs:
                     hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
                 else:
                     hf_model = _fix_meta_rotary_embeddings(
