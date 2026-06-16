@@ -27,7 +27,7 @@ from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateD
 logger = logging.getLogger(__name__)
 
 _MAMBA_FP32_PARAMS_TO_BARE = re.compile(r"(\.mixer)\._fp32_params\.")
-_MAMBA_FP32_PARAM_NAMES = ("A_log", "dt_bias")
+_MAMBA_FP32_PARAM_NAMES = ("A_log", "dt_bias", "D")
 
 
 def _strip_mamba_fp32_holder_key(key: str) -> str:

@@ -469,9 +469,9 @@ class MambaContextParallel:
         """Slice ``A_log`` for the current CP rank."""
         return self._slice_vector_param(self._mixer.A_log if A_log is None else A_log)
 
-    def get_D(self) -> torch.Tensor:
+    def get_D(self, D: torch.Tensor | None = None) -> torch.Tensor:
         """Slice ``D`` for the current CP rank."""
-        return self._slice_vector_param(self._mixer.D)
+        return self._slice_vector_param(self._mixer.D if D is None else D)
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #

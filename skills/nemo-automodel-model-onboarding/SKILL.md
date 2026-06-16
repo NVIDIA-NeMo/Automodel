@@ -351,9 +351,9 @@ the bare-class form because they need a config to make the decision.
 ### 2.7 Keep intrinsically-fp32 params in fp32 compute
 
 Some parameters are numerically unstable in low precision and must be **computed** in fp32
-even when the rest of the model computes in bf16 — e.g. SSM/Mamba `A_log` / `dt_bias`
-(`D` only when the reference model treats it as intrinsically fp32); MoE sigmoid-gate bias
-(`e_score_correction_bias`); attention-sink bias; per-head `scale`.
+even when the rest of the model computes in bf16 — e.g. SSM/Mamba `A_log` / `dt_bias`,
+plus `D` for Mamba variants whose reference checkpoints keep it fp32; MoE sigmoid-gate
+bias (`e_score_correction_bias`); attention-sink bias; per-head `scale`.
 If your model has any such params, declare them in `_keep_in_fp32_modules_strict` as
 parameter-name substrings; sharding (`fully_shard_by_dtype`) reads this list and gives those
 params an fp32 compute dtype while everything else uses `mp_policy.param_dtype` (bf16). A
@@ -526,7 +526,7 @@ that only surface in a full parity comparison.
 - [ ] Created example YAML config
 - [ ] Verified model loads via `NeMoAutoModelForCausalLM.from_pretrained()`
 - [ ] Created unit tests (forward shape, state_dict round-trip)
-- [ ] Declared `_keep_in_fp32_modules_strict` for every intrinsically-fp32 param (SSM `A_log`/`dt_bias`, MoE gate bias, attention-sink bias, `scale`, …) — see §2.7
+- [ ] Declared `_keep_in_fp32_modules_strict` for every intrinsically-fp32 param (SSM `A_log`/`dt_bias`, Mamba `D` when reference-fp32, MoE gate bias, attention-sink bias, `scale`, …) — see §2.7
 - [ ] Created layer equivalence tests for every rewritten layer (matching model dtype)
 - [ ] Created functional tests (training loss decreases)
 - [ ] Updated docs/model-coverage page
