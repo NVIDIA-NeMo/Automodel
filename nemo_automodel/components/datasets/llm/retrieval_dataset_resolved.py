@@ -244,20 +244,20 @@ def _open_sqlite_connection(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _load_sqlite_record(conn: sqlite3.Connection, record_id: int) -> tuple[dict[str, Any], dict[int, bytes]]:
-    row = conn.execute("SELECT record_json FROM records WHERE id = ?", (record_id,)).fetchone()
-    if row is None:
-        raise ValueError(f"Resolved retrieval SQLite record id {record_id} not found")
-    record = json.loads(row[0])
+def _parse_sqlite_record(record_json: str) -> dict[str, Any]:
+    record = json.loads(record_json)
     if not isinstance(record, dict):
         raise ValueError(f"Resolved retrieval SQLite record must be an object, got {type(record).__name__}")
-    images = {
+    return record
+
+
+def _load_sqlite_images(conn: sqlite3.Connection, record_id: int) -> dict[int, bytes]:
+    return {
         int(doc_idx): bytes(image_jpeg)
         for doc_idx, image_jpeg in conn.execute(
             "SELECT doc_idx, image_jpeg FROM images WHERE record_id = ? ORDER BY doc_idx", (record_id,)
         )
     }
-    return record, images
 
 
 class ResolvedRetrievalJsonlDataset(IterableDataset):
@@ -369,7 +369,7 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
         num_workers: int,
     ) -> Iterable[tuple[dict[str, Any], dict[int, bytes]]]:
         with _open_sqlite_connection(path) as conn:
-            for (record_id,) in conn.execute("SELECT id FROM records ORDER BY id"):
+            for record_id, record_json in conn.execute("SELECT id, record_json FROM records ORDER BY id"):
                 if state["records_seen_this_repeat"] >= self._num_records:
                     break
                 if state["global_idx"] % world_size == rank:
@@ -381,8 +381,7 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
                 state["records_seen_this_repeat"] += 1
                 if not emit:
                     continue
-                record, packed_images = _load_sqlite_record(conn, int(record_id))
-                yield record, packed_images
+                yield _parse_sqlite_record(record_json), _load_sqlite_images(conn, int(record_id))
 
     def __iter__(self) -> Iterable[dict[str, Any]]:
         worker = get_worker_info()
