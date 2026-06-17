@@ -78,6 +78,26 @@ def _supports_seq_lens(model: nn.Module) -> bool:
     return False
 
 
+def _supports_padding_mask(model: nn.Module) -> bool:
+    """
+    Check if the model's forward() accepts padding_mask.
+
+    Returns True if:
+    - forward() has an explicit `padding_mask` parameter, OR
+    - forward() has **kwargs (so it won't crash if padding_mask is passed)
+
+    Returns False otherwise.
+    """
+    sig = _get_forward_signature(model)
+    if sig is None:
+        return False
+    params = sig.parameters
+    if "padding_mask" in params:
+        return True
+    for param in params.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
 # Umbrella of multimodal kwarg names used by VLM forwards across families.
 # Mirrors the discovery pattern of ``fake_image._VISION_TOKEN_ID_ATTRS``: every
 # consumer iterates this list and uses whichever keys the live batch contains,
