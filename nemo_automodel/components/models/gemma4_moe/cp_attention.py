@@ -29,6 +29,36 @@ logger = logging.getLogger(__name__)
 _GEMMA4_CP_FLEX_RING_OK_LOGGED = False
 
 
+def _patch_fsdp_accumulated_grad_guard() -> None:
+    """Guard ``FSDPParam.to_accumulated_grad_if_needed`` against uninitialized params.
+
+    On some torch builds that method reads ``self._unsharded_param`` (the lazily
+    set unsharded tensor) without first checking it exists. In FSDP2 post-backward
+    under fp32 grad-reduce, frozen / never-unsharded params (e.g. the frozen Gemma4
+    vision tower and embeddings) have no ``_unsharded_param`` yet and it raises
+    ``AttributeError``. Such params carry no grad to upcast anyway, so wrap the
+    method to skip them when uninitialized. No-op once applied / on fixed builds.
+    """
+    try:
+        from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+    except Exception:
+        return
+    orig = FSDPParam.to_accumulated_grad_if_needed
+    if getattr(orig, "_gemma4_guarded", False):
+        return
+
+    def guarded(self):
+        if not hasattr(self, "_unsharded_param"):
+            return
+        return orig(self)
+
+    guarded._gemma4_guarded = True
+    FSDPParam.to_accumulated_grad_if_needed = guarded
+
+
+_patch_fsdp_accumulated_grad_guard()
+
+
 @dataclass(frozen=True)
 class CPRingAttentionContext:
     """Inputs for Gemma4 manual ring CP attention (built by the run_cp_manual_attention seam)."""
@@ -576,7 +606,19 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
         )
 
     def _pre_hook(module, args, kwargs):
-        module._cp_manual_metadata = {name: kwargs.pop(name, None) for name in metadata_keys}
+        captured = {name: kwargs.pop(name, None) for name in metadata_keys}
+        # Dense Gemma4 routes through HF's decoder layers, which do not thread the
+        # CP/vision metadata down to self_attn kwargs (the MoE backend does). The
+        # dense forward stashes it on the module as ``_cp_dense_metadata``; fall
+        # back to that for any key the caller didn't pass so the ring can still
+        # build the vision-bidirectional / packed masks. Persisted across the step
+        # (not cleared by the post-hook) so it survives activation-checkpoint recompute.
+        fallback = getattr(module, "_cp_dense_metadata", None)
+        if fallback:
+            for name in metadata_keys:
+                if captured.get(name) is None:
+                    captured[name] = fallback.get(name)
+        module._cp_manual_metadata = captured
         # Own the CP mask handling (instead of relying on the generic
         # attach_context_parallel_hooks mask-strip): drop any full-sequence 4D
         # attention_mask -- invalid once the sequence is CP-sharded -- and force
