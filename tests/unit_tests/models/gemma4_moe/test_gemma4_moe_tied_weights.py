@@ -73,8 +73,13 @@ def _make_cpu_backend():
     )
 
 
-def _build(tie_word_embeddings: bool) -> Gemma4ForConditionalGeneration:
-    config = Gemma4Config(text_config=_make_text_config(tie_word_embeddings=tie_word_embeddings))
+def _build(tie_word_embeddings: bool, text_tie: bool | None = None) -> Gemma4ForConditionalGeneration:
+    # The controlling flag is the top-level Gemma4Config.tie_word_embeddings (matches HF);
+    # text_tie lets a test set a conflicting nested value to prove top-level wins.
+    config = Gemma4Config(
+        text_config=_make_text_config(tie_word_embeddings=tie_word_embeddings if text_tie is None else text_tie),
+        tie_word_embeddings=tie_word_embeddings,
+    )
     model = Gemma4ForConditionalGeneration(config, backend=_make_cpu_backend())
     # Sanity: construction routed through the real NeMo MoE backend (the path
     # that replaces language_model and breaks HF's tie).
@@ -127,3 +132,13 @@ def test_tie_weights_hook_is_noop_when_untied():
     model = _build(tie_word_embeddings=False)
     model.tie_weights()
     assert model.lm_head.weight is not model.model.language_model.embed_tokens.weight
+
+
+def test_top_level_flag_controls_tie_when_flags_disagree():
+    """The controlling flag is top-level Gemma4Config.tie_word_embeddings, not text_config (matches HF)."""
+    # top-level True wins over text_config False -> tied
+    tied = _build(tie_word_embeddings=True, text_tie=False)
+    assert tied.lm_head.weight is tied.model.language_model.embed_tokens.weight
+    # top-level False wins over text_config True -> untied
+    untied = _build(tie_word_embeddings=False, text_tie=True)
+    assert untied.lm_head.weight is not untied.model.language_model.embed_tokens.weight

@@ -900,9 +900,14 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         Accepts and ignores positional/keyword arguments (e.g. HF v5's
         ``recompute_mapping``) so it stays drop-in compatible with the HF
         ``init_weights() -> tie_weights(...)`` call path.
+
+        The controlling flag is the top-level ``Gemma4Config.tie_word_embeddings``
+        (verified against HF: the top-level flag decides tying regardless of the
+        nested ``text_config`` value), so read it first and only fall back to
+        ``text_config`` for configs that don't expose a top-level flag.
         """
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
-        if getattr(text_config, "tie_word_embeddings", False):
+        if getattr(self.config, "tie_word_embeddings", getattr(text_config, "tie_word_embeddings", False)):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
     def forward(
