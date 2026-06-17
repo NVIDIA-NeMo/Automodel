@@ -244,7 +244,7 @@ def select_sparse_blocks(
 
 
 @torch.no_grad()
-def build_block_sparse_attn_bias(
+def build_block_sparse_attn_mask(
     idx_q: torch.Tensor,
     idx_k: torch.Tensor,
     *,
@@ -255,17 +255,23 @@ def build_block_sparse_attn_bias(
     num_q_heads: int,
     score_type: str = "max",
 ) -> torch.Tensor:
-    """Build the additive ``[B, num_q_heads, T, T]`` block-sparse causal bias.
+    """Build the boolean ``[B, num_q_heads, T, T]`` block-sparse causal keep-mask.
 
-    Eager (non-CP) path: selects blocks via :func:`select_sparse_blocks` over the
+    Eager (i.e non-CP) path: selects blocks via :func:`select_sparse_blocks` over the
     square sequence, expands the block selection to a per-key mask, intersects
-    with token-level causal, and returns an additive bias (``0`` where attended,
-    ``-inf`` otherwise) repeat-interleaved across GQA groups.
+    with token-level causal, and returns a **boolean** keep-mask (``True`` where
+    attended) repeat-interleaved across GQA groups.
+
+    NOTE: returns a boolean mask, NOT an additive ``0``/``-inf`` bias. An additive
+    ``-inf`` bias is numerically unsafe under SDPA in bf16 -- it leaks past the mask
+    at early (few-key) positions, while ``finfo.min`` produces NaNs. SDPA masks
+    correctly with a boolean ``attn_mask`` (matching the CP path's FlexAttention
+    ``BlockMask``).
 
     Args:
         idx_q: ``[B, T, H_idx, D]`` index queries (post norm + RoPE).
         idx_k: ``[B, T, 1, D]`` shared index key (post norm + RoPE).
-        num_q_heads: number of main attention heads; the per-idx-head bias is
+        num_q_heads: number of main attention heads; the per-idx-head mask is
             expanded ``num_q_heads // H_idx`` times (GQA, repeat-interleave).
     """
     bsz, seqlen, h_idx, dim = idx_q.shape
@@ -284,24 +290,29 @@ def build_block_sparse_attn_bias(
     causal = torch.tril(torch.ones(seqlen, seqlen, dtype=torch.bool, device=device))
     key_sel = block_sel.repeat_interleave(block_size, dim=-1)[..., :seqlen]  # [B, H_idx, Tq, Tk]
     key_sel = key_sel & causal[None, None]
-    bias = torch.where(key_sel, 0.0, float("-inf")).to(torch.float32)
 
     rep = num_q_heads // h_idx
-    return bias.repeat_interleave(rep, dim=1)  # [B, num_q_heads, Tq, Tk]
+    return key_sel.repeat_interleave(rep, dim=1)  # [B, num_q_heads, Tq, Tk] bool (True == attend)
 
 
-def _padding_mask_to_additive_bias(attention_mask: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-    """Convert an incoming attention mask to an additive key bias broadcastable to ``ref``.
+def _padding_mask_to_keep_mask(attention_mask: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """Convert an incoming padding mask to a boolean key keep-mask broadcastable to ``ref``.
 
-    Accepts a 2-D ``[B, T]`` keep-mask (1/True = attend) or an already-additive
-    float mask; returns ``0`` where attended and ``-inf`` where masked.
+    Accepts a 2-D ``[B, T]`` keep-mask (1/True = attend) or an already-boolean 4-D mask;
+    returns a boolean mask (``True`` where the key is attendable) to be AND-ed with the
+    block-sparse keep-mask. Boolean (not additive) so the eager SDPA path is bf16-safe --
+    see :func:`build_block_sparse_attn_mask`.
     """
     if attention_mask.is_floating_point() and attention_mask.dim() >= 3:
-        return attention_mask.to(ref.dtype)
+        raise ValueError(
+            "MiniMax M3 expects a padding keep-mask (2-D [B, T] keep-mask or 4-D bool); got a "
+            f"4-D float mask of shape {tuple(attention_mask.shape)}. Additive float masks are not "
+            "supported (they leak under bf16 SDPA -- see build_block_sparse_attn_mask)."
+        )
     mask = attention_mask
     if mask.dim() == 2:
-        mask = mask[:, None, None, :]  # [B, 1, 1, T] -> masks padded *keys*
-    return torch.where(mask.bool(), 0.0, float("-inf")).to(dtype=ref.dtype, device=ref.device)
+        mask = mask[:, None, None, :]  # [B, 1, 1, T] keep-mask -> masks padded *keys*
+    return mask.bool().to(device=ref.device)
 
 
 class MiniMaxM3Indexer(nn.Module):
@@ -351,7 +362,7 @@ class MiniMaxM3Indexer(nn.Module):
             cp_size=attn_kwargs.get("cp_size", 1),
             cp_rank=attn_kwargs.get("cp_rank", 0),
         )
-        return build_block_sparse_attn_bias(
+        return build_block_sparse_attn_mask(
             idx_q,
             idx_k,
             block_size=self.block_size,
@@ -473,12 +484,13 @@ class MiniMaxM3Attention(nn.Module):
         if self.indexer is not None:
             if qkv_format != "bshd":
                 raise NotImplementedError("MiniMax M3 sparse attention currently supports bshd format only.")
-            sparse_bias = self.indexer(x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, **attn_kwargs)
+            sparse_keep = self.indexer(x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, **attn_kwargs)
             # Preserve the caller's padding mask: padded keys must stay masked
-            # rather than becoming eligible for top-k block selection.
+            # rather than becoming eligible for top-k block selection. Boolean AND
+            # (not additive) so SDPA is bf16-safe -- see build_block_sparse_attn_mask.
             if attention_mask is not None:
-                sparse_bias = sparse_bias + _padding_mask_to_additive_bias(attention_mask, sparse_bias)
-            attention_mask = sparse_bias
+                sparse_keep = sparse_keep & _padding_mask_to_keep_mask(attention_mask, sparse_keep)
+            attention_mask = sparse_keep
 
         q, k = apply_rotary_emb_qk(
             q,

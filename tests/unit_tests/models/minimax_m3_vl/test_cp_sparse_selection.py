@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.minimax_m3_vl.layers import (
-    build_block_sparse_attn_bias,
+    build_block_sparse_attn_mask,
     select_sparse_blocks,
 )
 
@@ -95,12 +95,12 @@ def test_topk_ge_numblocks_degenerates_to_causal():
         assert torch.equal(sel[0, 0, q], expected), f"query {q} not degenerate-causal"
 
 
-def test_eager_bias_consistent_with_selection():
-    """build_block_sparse_attn_bias's 0/-inf pattern matches select_sparse_blocks
+def test_eager_mask_consistent_with_selection():
+    """build_block_sparse_attn_mask's boolean keep pattern matches select_sparse_blocks
     expanded to keys and intersected with token-level causal."""
     seqlen, block_size, topk, num_q_heads = 24, 8, 2, 8
     idx_q, idx_k = _rand_idx(seqlen, h_idx=4, seed=7)
-    bias = build_block_sparse_attn_bias(
+    keep = build_block_sparse_attn_mask(
         idx_q,
         idx_k,
         block_size=block_size,
@@ -108,8 +108,9 @@ def test_eager_bias_consistent_with_selection():
         init_blocks=0,
         local_blocks=1,
         num_q_heads=num_q_heads,
-    )  # [B, num_q_heads, T, T]
-    assert bias.shape == (idx_q.shape[0], num_q_heads, seqlen, seqlen)
+    )  # [B, num_q_heads, T, T] bool (True == attend)
+    assert keep.dtype == torch.bool
+    assert keep.shape == (idx_q.shape[0], num_q_heads, seqlen, seqlen)
 
     sel = select_sparse_blocks(idx_q, idx_k, block_size=block_size, topk_blocks=topk, init_blocks=0, local_blocks=1)
     causal = torch.tril(torch.ones(seqlen, seqlen, dtype=torch.bool))
@@ -117,10 +118,7 @@ def test_eager_bias_consistent_with_selection():
     rep = num_q_heads // sel.shape[1]
     expected_attend = key_sel.repeat_interleave(rep, dim=1)  # [B, num_q_heads, T, T]
 
-    attended = bias == 0.0
-    masked = bias == float("-inf")
-    assert torch.equal(attended, expected_attend)
-    assert torch.equal(masked, ~expected_attend)
+    assert torch.equal(keep, expected_attend)
     # every query attends to at least its own position (causal diagonal)
     diag = torch.arange(seqlen)
-    assert attended[:, :, diag, diag].all()
+    assert keep[:, :, diag, diag].all()
