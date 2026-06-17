@@ -376,3 +376,45 @@ def test_make_magi_attn_func_matches_sdpa_causal():
         mu.set_active_cp_group(None)
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+@pytest.fixture(autouse=True)
+def _reset_spec_guard():
+    """Reset the module-global consumption-guard state around each test."""
+    mu._SPEC_ARMED = False
+    mu._SPEC_CONSUMED = False
+    yield
+    mu._SPEC_ARMED = False
+    mu._SPEC_CONSUMED = False
+
+
+class TestAttnSpecOnModule:
+    def test_stamps_only_attention_modules(self):
+        model = _VLM()
+        spec = AttnMaskSpec.causal(8)
+        mu._set_attn_spec_on_attention(model, spec)
+        # language-backbone attention is stamped; the (Linear) vision tower is not.
+        assert model.language_model.self_attn._magi_attn_spec is spec
+        assert not hasattr(model.visual, "_magi_attn_spec")
+        # a non-None spec arms the guard, not yet consumed.
+        assert mu._SPEC_ARMED is True
+        assert mu._SPEC_CONSUMED is False
+
+    def test_none_clears_and_does_not_arm(self):
+        model = _LM()
+        mu._set_attn_spec_on_attention(model, None)
+        assert model.self_attn._magi_attn_spec is None
+        assert mu._SPEC_ARMED is False
+
+    def test_guard_raises_when_armed_spec_not_consumed(self):
+        model = _LM()
+        mu._set_attn_spec_on_attention(model, AttnMaskSpec.causal(8))  # arm, never consume
+        with pytest.raises(RuntimeError, match="no magi attention consumed it"):
+            mu._set_attn_spec_on_attention(model, AttnMaskSpec.causal(8))
+
+    def test_guard_passes_when_consumed(self):
+        model = _LM()
+        mu._set_attn_spec_on_attention(model, AttnMaskSpec.causal(8))
+        mu._mark_attn_spec_consumed()  # a magi forward read it
+        mu._set_attn_spec_on_attention(model, AttnMaskSpec.causal(8))  # next step must not raise
+        assert mu._SPEC_ARMED is True
