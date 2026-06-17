@@ -46,6 +46,10 @@ class _SharedKVStates:
     (``__getitem__`` / ``__setitem__`` / ``__contains__``). Crucially it is *not*
     a ``dict``/``list``/``tuple``, so ``torch.utils._pytree`` treats it as a leaf
     and FSDP2's forward-input cast does not reconstruct it.
+
+    Mirrors ``gemma4_moe._FSDPSafeSharedKVStates`` (#2566), which solves the same
+    problem in-model for gemma4; gemma3n is native HF so we inject the holder via
+    a forward pre-hook instead (see ``install_kv_sharing_holder``).
     """
 
     __slots__ = ("_d",)
@@ -76,12 +80,24 @@ class _SharedKVStates:
 
 
 def _kv_sharing_stacks(model):
-    """Yield (module, layers) for each decoder stack that uses KV sharing."""
+    """Yield (module, layers) for each gemma3n decoder stack that uses KV sharing.
+
+    Scoped to gemma3n on purpose. gemma3n is a native HF model whose
+    ``Gemma3nTextModel.forward`` builds a plain ``shared_kv_states`` dict that we
+    cannot edit in place, so we swap in an FSDP2-safe holder via a forward
+    pre-hook. Other kv-sharing models (e.g. gemma4) already make their own
+    shared store FSDP2-safe in-model (``gemma4_moe`` model.py, #2566) and may
+    thread a caller-supplied store (the speculative drafter via
+    ``gemma4_drafter`` composite); injecting our holder onto their layers would
+    clobber it and break that path, so we leave them alone.
+    """
     for module in model.modules():
         layers = getattr(module, "layers", None)
         cfg = getattr(module, "config", None)
         text_cfg = getattr(cfg, "text_config", None) or cfg
         if layers is None or getattr(text_cfg, "num_kv_shared_layers", 0) <= 0:
+            continue
+        if not str(getattr(text_cfg, "model_type", "")).startswith("gemma3n"):
             continue
         try:
             layer_list = list(layers)

@@ -69,9 +69,11 @@ class _Layer(nn.Module):
 class _TextModel(nn.Module):
     """Tiny stand-in for Gemma3nTextModel: stores K/V at layer 1, reads at 2."""
 
-    def __init__(self, num_kv_shared_layers=2):
+    def __init__(self, num_kv_shared_layers=2, model_type="gemma3n_text"):
         super().__init__()
-        self.config = SimpleNamespace(num_hidden_layers=3, num_kv_shared_layers=num_kv_shared_layers)
+        self.config = SimpleNamespace(
+            num_hidden_layers=3, num_kv_shared_layers=num_kv_shared_layers, model_type=model_type
+        )
         self.layers = nn.ModuleList(
             [
                 _Layer(_Attn(0, is_shared=False, kv_idx=None, store_full=False)),
@@ -166,6 +168,18 @@ def test_should_install_false_without_kv_sharing():
     model = _TextModel(num_kv_shared_layers=0)
     assert should_install_kv_sharing_holder([model]) is False
     assert install_kv_sharing_holder([model]) == 0
+
+
+def test_skips_non_gemma3n_kv_sharing_models():
+    """Other kv-sharing models (e.g. gemma4) manage their own FSDP2-safe store
+    in-model and may thread a caller-supplied store (the drafter). Injecting our
+    holder there would clobber it (regressed test_..._gemma4_joint_drafter), so
+    such models must be skipped."""
+    model = _TextModel(num_kv_shared_layers=2, model_type="gemma4_text")
+    assert should_install_kv_sharing_holder([model]) is False
+    assert install_kv_sharing_holder([model]) == 0
+    # Layers are untouched: the caller-supplied dict still flows through.
+    assert not getattr(model.layers[0], "_kv_sharing_holder_installed", False)
 
 
 def test_install_is_idempotent_per_stack():
