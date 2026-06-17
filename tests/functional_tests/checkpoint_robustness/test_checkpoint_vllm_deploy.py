@@ -108,6 +108,10 @@ def _resolve_args(custom_args):
         model_path = custom_args["deploy_model_path"]
         adapter_path = custom_args.get("adapter_path")
 
+    # Normalize trailing slash so HF's dynamic-module cache name isn't empty (os.path.basename).
+    if isinstance(model_path, str):
+        model_path = model_path.rstrip("/") or model_path
+
     # -- tokenizer --
     if "tokenizer" in custom_args:
         tokenizer = custom_args["tokenizer"]

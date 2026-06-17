@@ -360,6 +360,45 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
             snapshot_download(pretrained_model_name_or_path)
 
 
+def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs):
+    """Populate HF's dynamic-module (custom code) cache on global rank 0 first.
+
+    When many ranks reload a trust_remote_code / ``auto_map`` checkpoint from a shared
+    filesystem, they race to copy ``modeling_*.py`` and its relative imports into the
+    shared ``transformers_modules`` cache; a peer can read a partially-copied tree and
+    die with ``FileNotFoundError`` on a transitively-imported file. Resolving the
+    classes once under ``FirstRankPerNode`` fills the cache before peers read it.
+    Best-effort: any failure falls through to HF's own (un-serialized) resolution.
+    """
+    if not pretrained_model_name_or_path or not os.path.isdir(str(pretrained_model_name_or_path)):
+        return
+    auto_map = getattr(hf_config, "auto_map", None)
+    if not isinstance(auto_map, dict) or not auto_map:
+        return
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    except Exception:
+        return
+    refs: list = []
+    for value in auto_map.values():
+        refs.extend(value if isinstance(value, (list, tuple)) else [value])
+    with dist_utils.FirstRankPerNode():
+        for ref in refs:
+            if not isinstance(ref, str) or "." not in ref:
+                continue
+            try:
+                get_class_from_dynamic_module(
+                    ref,
+                    pretrained_model_name_or_path,
+                    revision=kwargs.get("revision"),
+                    code_revision=kwargs.get("code_revision"),
+                    cache_dir=kwargs.get("cache_dir"),
+                    local_files_only=kwargs.get("local_files_only", False),
+                )
+            except Exception:
+                pass
+
+
 def _setup_bnb_loading_kwargs(kwargs: dict) -> None:
     """Configure kwargs for HF from_pretrained to work with BitsAndBytes quantization.
 
@@ -869,6 +908,8 @@ def __init_model(
 
     # 3. fallback to HF model class wrapped with mixin
     model = None
+    # Serialize HF custom-code cache population across ranks to avoid a partial-copy race.
+    _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs)
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
         _setup_bnb_loading_kwargs(kwargs)
