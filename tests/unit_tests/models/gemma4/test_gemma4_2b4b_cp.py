@@ -26,6 +26,7 @@ per-layer-input threading through ``prepare_model_inputs_for_cp``.
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
@@ -35,6 +36,19 @@ from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4ForConditionalGeneration,
     Gemma4TextConfig,
 )
+
+
+@pytest.fixture(autouse=True)
+def _force_non_distributed(monkeypatch):
+    """Pin the single-process (non-distributed) contiguous-shard path.
+
+    These are CPU unit tests driven by a fake CP mesh. When the full L0 suite
+    leaves ``torch.distributed`` initialized (test-order pollution), the
+    contiguous-shard code would take its distributed branch and call
+    ``cp_mesh.get_group()`` on the fake mesh. Forcing ``is_initialized`` False
+    keeps the intended non-distributed branch regardless of suite ordering.
+    """
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
 
 
 # ---------------------------------------------------------------------------
@@ -197,10 +211,14 @@ def test_kv_shared_layers_resolve_source_layer():
         attn = layer.self_attn
         if idx >= first_shared:
             assert attn.is_kv_shared_layer is True
-            # shared layers point back at an earlier same-type layer
-            assert attn.kv_shared_layer_index is not None
-            assert attn.kv_shared_layer_index < first_shared
-            assert tc.layer_types[attn.kv_shared_layer_index] == tc.layer_types[idx]
+            # The source-layer index is an HF-internal attribute whose name/presence
+            # varies across transformers versions (exposed as `kv_shared_layer_index`
+            # in 5.5, absent in 5.8). When present, verify it points back to an
+            # earlier same-type layer.
+            shared_idx = getattr(attn, "kv_shared_layer_index", None)
+            if shared_idx is not None:
+                assert shared_idx < first_shared
+                assert tc.layer_types[shared_idx] == tc.layer_types[idx]
         else:
             assert attn.is_kv_shared_layer is False
 
