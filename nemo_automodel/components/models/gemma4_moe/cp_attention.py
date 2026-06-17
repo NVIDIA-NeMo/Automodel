@@ -137,8 +137,6 @@ def _cached_block_mask(key, build):
 def _compiled_flex_attention(attention_module: torch.nn.Module):
     compiled = getattr(attention_module, "_gemma4_cp_compiled_flex_attn", None)
     if compiled is None:
-        from torch.nn.attention.flex_attention import flex_attention
-
         # Disable duck-shape specialization before compiling. With variable-length
         # (unpacked) batches the compiled flex kernel otherwise guards on incidental
         # dim-equalities (e.g. ``block_mask.kv_indices.size()[2] == key.size()[1]``)
@@ -146,6 +144,7 @@ def _compiled_flex_attention(attention_module: torch.nn.Module):
         # ~warmup speed. Packed (fixed-length) runs hit one shape so they were
         # unaffected; this only bites variable-length data.
         from torch.fx.experimental import _config as _fx_config
+        from torch.nn.attention.flex_attention import flex_attention
 
         _fx_config.use_duck_shape = False
 

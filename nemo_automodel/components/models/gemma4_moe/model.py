@@ -123,6 +123,8 @@ class _Gemma4KVShareHolder:
 def _kv_sharing_active(text_config) -> bool:
     """True if the (dense) text config uses gemma4 kv-sharing (E2B/E4B)."""
     return int(getattr(text_config, "num_kv_shared_layers", 0) or 0) > 0
+
+
 from .state_dict_adapter import Gemma4MoEStateDictAdapter
 
 
