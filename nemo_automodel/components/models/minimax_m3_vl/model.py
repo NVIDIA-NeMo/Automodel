@@ -389,12 +389,14 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         """Declared parallelism capabilities for this model class.
 
         Mirrors the MiniMax M2 backbone: PP + EP are validated; TP is unsupported
-        by the custom MoE parallelizer. Context parallelism for the block-sparse
-        DSA attention is a separate (CP-aware) implementation, so it stays off here.
+        by the custom MoE parallelizer. Context parallelism is supported via the
+        CP-aware block-sparse DSA attention (dense layers use the standard CP
+        path; sparse layers gather K/V and rebuild the global block-sparse mask
+        using FlexAttention).
         """
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
 
