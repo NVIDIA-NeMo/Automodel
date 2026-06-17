@@ -290,41 +290,13 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
 
         new_fqn = fqn
         value = tensor
-        mtp_gate_up_match = re.match(r"mtp\.layers\.(\d+)\.mlp\.experts\.gate_and_up_projs$", fqn)
-        mtp_down_match = re.match(r"mtp\.layers\.(\d+)\.mlp\.experts\.down_projs$", fqn)
-        if mtp_gate_up_match:
-            layer_num = mtp_gate_up_match.group(1)
-            splits, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
-                tensor, self.moe_config.n_routed_experts
-            )
-            result = []
-            inter_dim = self.moe_config.moe_inter_dim
-            for expert_tensor, expert_id in zip(splits, expert_ids):
-                gate = expert_tensor[:, :inter_dim].transpose(0, 1)
-                up = expert_tensor[:, inter_dim:].transpose(0, 1)
-                if not state_dict_utils.is_dtensor(gate):
-                    gate = gate.contiguous()
-                if not state_dict_utils.is_dtensor(up):
-                    up = up.contiguous()
-                result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.gate_proj.weight", gate))
-                result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.up_proj.weight", up))
-            if exclude_key_regex:
-                result = [(key, val) for key, val in result if not re.match(exclude_key_regex, key)]
-            return result
-        if mtp_down_match:
-            layer_num = mtp_down_match.group(1)
-            splits, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
-                tensor, self.moe_config.n_routed_experts
-            )
-            result = []
-            for expert_tensor, expert_id in zip(splits, expert_ids):
-                down = expert_tensor.transpose(0, 1)
-                if not state_dict_utils.is_dtensor(down):
-                    down = down.contiguous()
-                result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.down_proj.weight", down))
-            if exclude_key_regex:
-                result = [(key, val) for key, val in result if not re.match(exclude_key_regex, key)]
-            return result
+        # MTP experts use the SAME grouped layout as the main decoder layers in the
+        # HF checkpoint (e.g. ``mtp.layers.0.mlp.experts.{gate_up_proj,down_proj}``),
+        # so they fall through to the generic grouped handling below. Splitting them
+        # into per-expert keys here produced destinations like
+        # ``mtp.layers.0.mlp.experts.224.down_proj.weight`` that don't exist in the
+        # checkpoint, raising "Missing key in checkpoint state_dict" on load under
+        # expert parallelism (AM-442).
         if ".mlp.experts.gate_and_up_projs" in fqn:
             new_fqn = fqn.replace(".mlp.experts.gate_and_up_projs", ".mlp.experts.gate_up_proj")
             value = tensor.transpose(1, 2)
