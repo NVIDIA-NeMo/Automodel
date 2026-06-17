@@ -94,10 +94,60 @@ def gemma4_vision_group_ids(mm_token_type_ids: torch.Tensor) -> torch.Tensor:
     return torch.where(is_vision, group_ids, torch.full_like(group_ids, -1))
 
 
+# Block masks built by create_block_mask are independent of the K/V *values*: they
+# depend only on the attention type (sliding window), the local/chunk sequence
+# geometry, and the position-level metadata (packing / padding / vision groups).
+# Within a single training step the metadata content is fixed by *position*, so for
+# a given (layer-type, chunk geometry) every one of E4B's 42 layers builds an
+# identical mask -- and create_block_mask costs ~7.6ms/call, dominating short-seq CP
+# step time (~66%). We cache on the position scalars only (never on tensor storage
+# -- the CUDA allocator recycles addresses, so a data_ptr key could alias distinct
+# content and return a stale mask). Correctness across steps is preserved by
+# clearing the cache whenever the batch's metadata object changes; the object is
+# held as the generation token so its identity can't be recycled while it is live.
+_BLOCK_MASK_CACHE: dict = {}
+# [data_ptr, held-tensor]: the metadata tensor is re-wrapped into a fresh Python
+# object every layer but shares one storage within a step (and the detached
+# backward metadata shares it too), so we detect a new batch by its data_ptr.
+# The tensor is held so the allocator cannot recycle that address mid-step, which
+# would otherwise let a later step's distinct content collide on the same pointer.
+_BLOCK_MASK_GEN: list = [None, None]
+
+
+def _block_mask_set_generation(gen_tensor) -> None:
+    """Reset the per-step block-mask cache when a new batch (new metadata) arrives."""
+    ptr = None if gen_tensor is None else gen_tensor.data_ptr()
+    if ptr != _BLOCK_MASK_GEN[0]:
+        _BLOCK_MASK_CACHE.clear()
+        _BLOCK_MASK_GEN[0] = ptr
+        _BLOCK_MASK_GEN[1] = gen_tensor  # pin the storage for the duration of the step
+
+
+def _cached_block_mask(key, build):
+    cached = _BLOCK_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    mask = build()
+    if len(_BLOCK_MASK_CACHE) >= 256:  # bound the gen=None (metadata-free) varying-seqlen case
+        _BLOCK_MASK_CACHE.pop(next(iter(_BLOCK_MASK_CACHE)))
+    _BLOCK_MASK_CACHE[key] = mask
+    return mask
+
+
 def _compiled_flex_attention(attention_module: torch.nn.Module):
     compiled = getattr(attention_module, "_gemma4_cp_compiled_flex_attn", None)
     if compiled is None:
         from torch.nn.attention.flex_attention import flex_attention
+
+        # Disable duck-shape specialization before compiling. With variable-length
+        # (unpacked) batches the compiled flex kernel otherwise guards on incidental
+        # dim-equalities (e.g. ``block_mask.kv_indices.size()[2] == key.size()[1]``)
+        # and recompiles on every new sequence length, collapsing throughput to
+        # ~warmup speed. Packed (fixed-length) runs hit one shape so they were
+        # unaffected; this only bites variable-length data.
+        from torch.fx.experimental import _config as _fx_config
+
+        _fx_config.use_duck_shape = False
 
         compiled = torch.compile(flex_attention, dynamic=True)
         attention_module._gemma4_cp_compiled_flex_attn = compiled
@@ -276,15 +326,43 @@ def _run_gemma4_flex_chunk(
 
             block_mask_batch = None
 
-        block_mask = create_block_mask(
-            cp_mask,
-            B=block_mask_batch,
-            H=None,
-            Q_LEN=ctx.seq_local,
-            KV_LEN=key_chunk.shape[2],
-            device=query.device,
-            BLOCK_SIZE=flex_block_size,
+        def _build_block_mask():
+            return create_block_mask(
+                cp_mask,
+                B=block_mask_batch,
+                H=None,
+                Q_LEN=ctx.seq_local,
+                KV_LEN=key_chunk.shape[2],
+                device=query.device,
+                BLOCK_SIZE=flex_block_size,
+            )
+
+        # Reset the cache when the batch changes (new metadata object => new step),
+        # then key purely on the position scalars. Within a step the metadata content
+        # is a function of position, so (layer-type, query/chunk geometry) uniquely
+        # identifies the mask -- shared by all 42 same-type layers, both ring chunks,
+        # and (since both pin the same captured metadata) forward and backward.
+        gen_obj = None
+        for _gen_key in ("mm_token_type_ids", "_packed_seq_ids", "padding_mask"):
+            _cand = ctx.metadata.get(_gen_key)
+            if _cand is not None:
+                gen_obj = _cand
+                break
+        _block_mask_set_generation(gen_obj)
+        block_mask_key = (
+            getattr(attention_module, "sliding_window", None),
+            bool(ctx.is_causal),
+            int(ctx.seq_global_start),
+            int(kv_global_start),
+            int(ctx.seq_local),
+            int(key_chunk.shape[2]),
+            flex_block_size,
+            block_mask_batch,
+            bool(use_vision_bidirectional),
+            query.device.type,
+            query.device.index,
         )
+        block_mask = _cached_block_mask(block_mask_key, _build_block_mask)
 
         query_for_flex = query
         key_for_flex = key_chunk
