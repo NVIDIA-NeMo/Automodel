@@ -463,11 +463,14 @@ class TestMTPLossDispatch:
         assert len(calls) == len(mtp_per_depth_h), (
             f"expected {len(mtp_per_depth_h)} fused-kernel calls, got {len(calls)}"
         )
-        # Each call must receive the lm_head weight of shape [vocab, hidden] and
-        # the rolled labels of shape [B, S].
+        # Each call must receive the lm_head weight of shape [vocab, hidden].
+        # FusedLinearCrossEntropy flattens hidden states and labels to a single
+        # token axis ([N, H] / [N]) before the fused kernel so the loss is layout
+        # agnostic (THD / context-parallel safe); here N == bsz * seq_len.
         for call in calls:
             assert call["weight_shape"] == (config.vocab_size, config.hidden_size)
-            assert call["labels_shape"] == (bsz, seq_len)
+            assert call["hidden_shape"] == (bsz * seq_len, config.hidden_size)
+            assert call["labels_shape"] == (bsz * seq_len,)
             assert call["ignore_index"] == -100
         # Loss is finite scalar. The fused branch normalizes stub_loss by
         # num_label_tokens internally (linear_ce.py:169-171), then
