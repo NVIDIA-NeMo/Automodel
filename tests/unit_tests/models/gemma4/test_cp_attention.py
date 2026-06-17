@@ -727,3 +727,115 @@ def test_manual_attention_entry_sets_gqa_when_head_counts_differ(monkeypatch):
         kwargs={},
     )
     assert out.shape == q.shape
+
+
+# ---------------------------------------------------------------------------
+# _patch_fsdp_accumulated_grad_guard
+# ---------------------------------------------------------------------------
+def test_fsdp_guard_skips_uninitialized_and_runs_orig_and_is_idempotent(monkeypatch):
+    """The guard wraps FSDPParam.to_accumulated_grad_if_needed so it skips params
+    with no _unsharded_param (returns None) and otherwise calls the original."""
+    import sys
+    import types
+
+    calls = {"n": 0}
+
+    class FakeFSDPParam:
+        def to_accumulated_grad_if_needed(self):
+            calls["n"] += 1
+            return "ran"
+
+    fake_mod = types.ModuleType("torch.distributed.fsdp._fully_shard._fsdp_param")
+    fake_mod.FSDPParam = FakeFSDPParam
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp._fully_shard._fsdp_param", fake_mod)
+
+    cpa._patch_fsdp_accumulated_grad_guard()
+
+    p = FakeFSDPParam()
+    # No _unsharded_param -> guarded wrapper returns None without calling orig.
+    assert p.to_accumulated_grad_if_needed() is None
+    assert calls["n"] == 0
+    # With _unsharded_param -> original runs.
+    p._unsharded_param = object()
+    assert p.to_accumulated_grad_if_needed() == "ran"
+    assert calls["n"] == 1
+    # Marked guarded; a second patch is a no-op (does not double-wrap).
+    assert FakeFSDPParam.to_accumulated_grad_if_needed._gemma4_guarded is True
+    wrapped = FakeFSDPParam.to_accumulated_grad_if_needed
+    cpa._patch_fsdp_accumulated_grad_guard()
+    assert FakeFSDPParam.to_accumulated_grad_if_needed is wrapped
+
+
+def test_fsdp_guard_noop_when_import_unavailable(monkeypatch):
+    """If the FSDP internal module can't be imported, the patch returns quietly."""
+    import sys
+
+    # Setting the module to None makes `from ... import FSDPParam` raise ImportError,
+    # which the guard swallows.
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp._fully_shard._fsdp_param", None)
+    cpa._patch_fsdp_accumulated_grad_guard()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# _install_gemma4_cp_ring_sdpa: dense _cp_dense_metadata fallback in the pre-hook
+# ---------------------------------------------------------------------------
+def test_pre_hook_falls_back_to_dense_metadata(monkeypatch):
+    """Dense Gemma4 doesn't thread metadata to self_attn kwargs; the pre-hook must
+    fall back to module._cp_dense_metadata for keys the caller didn't pass."""
+    import torch.nn.functional as F
+
+    captured = {}
+
+    def fake_ring(module, query, key, value, *, cp_mesh, attn_mask, dropout_p, is_causal, scale, enable_gqa, kwargs):
+        captured["meta"] = dict(module._cp_manual_metadata)
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(cpa, "_gemma4_cp_manual_attention", fake_ring)
+
+    class _Attn(torch.nn.Module):
+        def forward(self, q, k, v, **kw):
+            return F.scaled_dot_product_attention(q, k, v)
+
+    attn = _Attn()
+    cpa.attach_gemma4_cp_ring_attention(attn)
+    attn.setup_cp_attention(object())
+
+    packed = torch.tensor([[1, 1, 2, 2]])
+    # Dense forward stashes metadata on the module; the call passes no metadata kwargs.
+    attn._cp_dense_metadata = {
+        "_packed_seq_ids": packed,
+        "mm_token_type_ids": None,
+        "padding_mask": None,
+        "_gemma4_vision_group_ids": None,
+    }
+    q = torch.randn(1, 2, 4, 8)
+    attn(q, q.clone(), q.clone())
+    assert torch.equal(captured["meta"]["_packed_seq_ids"], packed)
+
+
+def test_pre_hook_kwarg_takes_precedence_over_dense_fallback(monkeypatch):
+    """An explicit kwarg value must not be overwritten by the _cp_dense_metadata fallback."""
+    import torch.nn.functional as F
+
+    captured = {}
+
+    def fake_ring(module, query, key, value, *, cp_mesh, attn_mask, dropout_p, is_causal, scale, enable_gqa, kwargs):
+        captured["meta"] = dict(module._cp_manual_metadata)
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(cpa, "_gemma4_cp_manual_attention", fake_ring)
+
+    class _Attn(torch.nn.Module):
+        def forward(self, q, k, v, **kw):
+            return F.scaled_dot_product_attention(q, k, v)
+
+    attn = _Attn()
+    cpa.attach_gemma4_cp_ring_attention(attn)
+    attn.setup_cp_attention(object())
+
+    kwarg_packed = torch.tensor([[3, 3, 3, 3]])
+    stale_fallback = torch.tensor([[9, 9, 9, 9]])
+    attn._cp_dense_metadata = {"_packed_seq_ids": stale_fallback}
+    q = torch.randn(1, 2, 4, 8)
+    attn(q, q.clone(), q.clone(), _packed_seq_ids=kwarg_packed)
+    assert torch.equal(captured["meta"]["_packed_seq_ids"], kwarg_packed)

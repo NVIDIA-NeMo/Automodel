@@ -295,7 +295,27 @@ def apply_ac(
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
 
+    # Weight-tied (use_repeated_layer) MTP head blocks must NOT be activation
+    # checkpointed: the single physical block is recomputed once per MTP depth in
+    # backward, and FSDP2 cannot re-unshard the *shared* EP-sharded experts param
+    # group on the 2nd+ recompute (the 1st recompute's post_backward reshards it, and
+    # the 2nd recompute's pre_forward unshard does not re-gather it) -> the experts
+    # weight is read in the resharded Shard(1) state and grouped_gemm raises
+    # "Expected hidden_in == a.size(1)". The MTP head is tiny (1 physical block), so
+    # skipping its recompute costs negligible activation memory. Non-tied MTP heads
+    # (each physical block recomputed exactly once) are unaffected and keep AC.
+    mtp_module = getattr(model, "mtp", None)
+    mtp_block_ids: set[int] = set()
+    mtp_repeated = False
+    if mtp_module is not None and hasattr(mtp_module, "layers"):
+        mtp_block_ids = {id(b) for b in mtp_module.layers.children()}
+        mtp_repeated = bool(getattr(getattr(mtp_module, "mtp_config", None), "use_repeated_layer", False))
+    if mtp_repeated and mtp_block_ids:
+        logger.info("Skipping activation checkpointing on %d weight-tied MTP head block(s)", len(mtp_block_ids))
+
     for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+        if mtp_repeated and id(block) in mtp_block_ids:
+            continue
         if ignore_router and hasattr(block, "set_activation_checkpointing"):
             block.set_activation_checkpointing(True)
         elif ignore_router:
@@ -308,6 +328,44 @@ def apply_ac(
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
 
         parent_layers.register_module(layer_id, block)
+
+
+def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):
+    """Shard each ``_fp32_params`` holder in ``block`` as its own fp32 FSDP unit.
+
+    Model implementations own the architecture-specific decision to create these
+    holders (for example Qwen3.5/Qwen3-Next GatedDeltaNet ``A_log``/``dt_bias``).
+    FSDP only treats the holder as a dtype-uniform fp32 unit and excludes its params
+    from the block's bf16 FSDP unit.
+
+    Returns the set of holder parameters to exclude from the block's FSDP wrap.
+    Blocks that do not expose ``named_modules`` (e.g. non-``nn.Module`` test
+    stubs) cannot hold fp32 holders, so an empty set is returned.
+    """
+    if not hasattr(block, "named_modules"):
+        return set()
+    fp32_mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.float32,
+        cast_forward_inputs=False,
+    )
+    ignored: set = set()
+    for name, sub in block.named_modules():
+        if not name.endswith("_fp32_params"):
+            continue
+        holder_params = list(sub.parameters(recurse=False))
+        if not holder_params:
+            continue
+        fully_shard(
+            sub,
+            mesh=fsdp_mesh,
+            reshard_after_forward=reshard_after_forward,
+            mp_policy=fp32_mp_policy,
+            offload_policy=offload_policy,
+        )
+        ignored.update(holder_params)
+    return ignored
 
 
 def apply_fsdp(
@@ -356,8 +414,21 @@ def apply_fsdp(
     # Prefer nested text modules when present (VLM models)
     _model = get_text_module(_model)
 
+    # MTP auxiliary-head blocks keep their EP-sharded experts un-resharded
+    # (reshard_after_forward=False) even when the backbone reshards. The MTP head is
+    # tiny (1-2 MoE sublayers) so keeping its experts gathered costs negligible resident
+    # memory, while it removes FSDP2 unshard fragility for the weight-tied head whose
+    # single physical experts param group is used multiple times per step (see apply_ac,
+    # which skips AC on these blocks for the same reason). Bulk backbone experts keep the
+    # configured reshard_after_forward.
+    mtp_module = getattr(model, "mtp", None)
+    mtp_block_ids = set()
+    if mtp_module is not None and hasattr(mtp_module, "layers"):
+        mtp_block_ids = {id(b) for b in mtp_module.layers.children()}
+
     for block in _iter_moe_blocks(model, _model):
         moe_module = _get_moe_module(block)
+        experts_reshard_after_forward = False if id(block) in mtp_block_ids else reshard_after_forward
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
@@ -369,7 +440,7 @@ def apply_fsdp(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=_moe_shard_placement,
-                reshard_after_forward=reshard_after_forward,
+                reshard_after_forward=experts_reshard_after_forward,
                 mp_policy=mp_policy,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
@@ -381,6 +452,12 @@ def apply_fsdp(
         ignored_params = None
         if isinstance(moe_module, MoE) and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())
+
+        # Shard model-owned fp32 holders on their own and exclude their params from
+        # the block's FSDP unit to keep the block dtype-uniform.
+        fp32_ignored = _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy)
+        if fp32_ignored:
+            ignored_params = (ignored_params or set()) | fp32_ignored
         fully_shard_default(block, ignored_params=ignored_params)
 
     # Re-establish weight tying before detecting it: a device/dtype move during

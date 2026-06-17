@@ -101,6 +101,17 @@ def _uses_magi_attention(model: "nn.Module") -> bool:
     return getattr(backend, "attn", None) == "magi"
 
 
+def _is_deepseek_v4(model: "nn.Module") -> bool:
+    """True when the model is a DeepSeek V4 custom model.
+
+    DSV4 owns its context-parallel attention (Miles-style contiguous query shard
+    plus all-gathered K/V), so its CP support is gated on the TileLang attention
+    backend rather than the generic TE/SDPA/Magi paths.
+    """
+    config = getattr(model, "config", None)
+    return getattr(config, "model_type", None) == "deepseek_v4" or type(model).__name__.startswith("DeepseekV4")
+
+
 def _is_hybrid(model: "nn.Module") -> bool:
     """True when the model mixes attention with non-attention layers (e.g. Mamba/SSM).
 
@@ -112,6 +123,10 @@ def _is_hybrid(model: "nn.Module") -> bool:
     inner = getattr(model, "language_model", None)
     if inner is not None:
         candidates.append(getattr(inner, "config", None))
+    # VLM configs nest the decoder config under ``text_config``.
+    for c in list(candidates):
+        if c is not None:
+            candidates.append(getattr(c, "text_config", None))
     for config in candidates:
         if config is None:
             continue
@@ -120,6 +135,11 @@ def _is_hybrid(model: "nn.Module") -> bool:
             if pattern and any(str(c).upper() == "M" for c in pattern):
                 return True
         if getattr(config, "is_hybrid_model", False) is True:
+            return True
+        # Qwen3.5 / Qwen3-Next style: per-layer ``layer_types`` mixing
+        # ``linear_attention`` (gated-delta / SSM) with ``full_attention``.
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types and any(str(t) == "linear_attention" for t in layer_types):
             return True
     return False
 
@@ -212,6 +232,10 @@ class ModelSupports:
         +------------------+----------------+---------+
         """
         if _has_backend(self._model):
+            if _is_deepseek_v4(self._model):
+                # DSV4 owns its CP attention (Miles-style); gated on TileLang.
+                backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+                return backend_attn == "tilelang"
             if _is_hybrid(self._model):
                 backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
                 return backend_attn in ("te", "sdpa")
@@ -348,6 +372,15 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
                 f"modify distributed YAML config section:\n"
                 f"distributed:\n"
                 f"  cp_size: 1"
+            )
+        elif _is_deepseek_v4(model):
+            errors.append(
+                f"Context parallelism (cp_size={cp_size}) for {arch} requires "
+                f"the TileLang attention backend (backend.attn='tilelang').\n"
+                f"Please re-run with --distributed.cp_size=1 or switch to TileLang attention:\n"
+                f"model:\n"
+                f"  backend:\n"
+                f"    attn: tilelang"
             )
         elif _has_backend(model):
             errors.append(

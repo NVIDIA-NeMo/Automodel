@@ -354,9 +354,13 @@ class TestModelRuntimePatches:
             self.config = types.SimpleNamespace(architectures=architectures)
 
     def test_apply_model_runtime_patches_dispatches_by_architecture(self):
+        # The registry mechanism is exercised with a temporary test entry — the
+        # built-in registry no longer ships any entries (Qwen3.5 builds its
+        # CP/fp32-gate modules at construction instead of patching at load time).
+        import nemo_automodel._transformers.kernel_patches as kp
         from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
 
-        model = self._DummyModel(["Qwen3_5ForCausalLM"])
+        model = self._DummyModel(["FakeArchForCausalLM"])
         mesh = types.SimpleNamespace(cp_size=1)
         calls = []
 
@@ -365,20 +369,23 @@ class TestModelRuntimePatches:
             return model
 
         fake_module = types.SimpleNamespace(apply_model_runtime_patches=fake_hook)
+        test_registry = {"FakeArchForCausalLM": ("fake.module.path", "apply_model_runtime_patches")}
 
-        with patch(
+        with patch.object(kp, "_MODEL_RUNTIME_PATCHES", test_registry), patch(
             "nemo_automodel._transformers.kernel_patches.importlib.import_module",
             return_value=fake_module,
         ) as mock_import:
             assert apply_model_runtime_patches(model, mesh) is model
 
-        mock_import.assert_called_once_with("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn")
+        mock_import.assert_called_once_with("fake.module.path")
         assert calls == [(model, mesh)]
 
     def test_apply_model_runtime_patches_deduplicates_hook_specs(self):
+        # Two architectures sharing one hook spec must invoke the hook once.
+        import nemo_automodel._transformers.kernel_patches as kp
         from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
 
-        model = self._DummyModel(["Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"])
+        model = self._DummyModel(["FakeArchA", "FakeArchB"])
         mesh = types.SimpleNamespace(cp_size=2)
         calls = []
 
@@ -387,8 +394,10 @@ class TestModelRuntimePatches:
             return model
 
         fake_module = types.SimpleNamespace(apply_model_runtime_patches=fake_hook)
+        shared_spec = ("fake.module.path", "apply_model_runtime_patches")
+        test_registry = {"FakeArchA": shared_spec, "FakeArchB": shared_spec}
 
-        with patch(
+        with patch.object(kp, "_MODEL_RUNTIME_PATCHES", test_registry), patch(
             "nemo_automodel._transformers.kernel_patches.importlib.import_module",
             return_value=fake_module,
         ):

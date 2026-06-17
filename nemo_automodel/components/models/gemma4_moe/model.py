@@ -19,7 +19,8 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
-from typing import Any, Optional, Union
+from collections.abc import MutableMapping
+from typing import Any, Iterator, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -87,6 +88,60 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
 from .cp_batch import make_contiguous_shard_cp_batch_and_ctx
 from .state_dict_adapter import Gemma4MoEStateDictAdapter
+
+
+class _FSDPSafeSharedKVStates(MutableMapping):
+    """A dict-like store for Gemma4 key/value sharing that is safe to pass through FSDP2.
+
+    What Gemma4 needs:
+        In Gemma4, the later "kv-shared" attention layers do not compute their
+        own keys/values -- they reuse the keys/values produced by an earlier
+        layer. HuggingFace implements this by passing ONE shared key/value store
+        into every decoder layer's ``forward()``: the earlier layer writes its
+        keys/values into the store, and the later layers read them back out. This
+        only works if every layer is handed the *same* store object.
+
+    Why a plain ``dict`` breaks under FSDP2:
+        With FSDP2 each decoder layer is wrapped as its own unit, and the default
+        mixed-precision setting (``cast_forward_inputs=True``) makes FSDP2 look at
+        every argument passed to a layer and cast its float tensors to bf16. It
+        does this with torch's ``_apply_to_tensors``, which, whenever it sees a
+        ``dict`` (or ``list``/``tuple``/``set``/...), builds a brand-new copy of
+        it. So if the shared store is a plain ``dict``, each layer receives its
+        own private copy: the earlier layer's writes land in a copy that is thrown
+        away, and the later layers read from an empty copy -- which raises
+        ``KeyError: 'sliding_attention'``.
+
+    Why this class fixes it:
+        ``_apply_to_tensors`` only copies the specific types it knows about
+        (``dict``, ``OrderedDict``, ``list``, ``tuple``, ``set``, namedtuples,
+        dataclasses, ``PackedSequence``); any other object it leaves alone and
+        passes straight through. This class behaves like a dict (it implements
+        ``MutableMapping``) but is deliberately NOT a ``dict`` subclass, so FSDP2
+        hands the SAME instance to every layer and the writes are preserved.
+
+        Note: this dict-based sharing is how transformers 5.8.x works. In 5.5 the
+        shared keys/values were stored on the ``Cache`` object instead (which
+        FSDP2 also passes through untouched), so this problem did not exist there.
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def __getitem__(self, key: str) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._store[key]
+
+    def __setitem__(self, key: str, value: tuple[torch.Tensor, torch.Tensor]) -> None:
+        self._store[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self._store[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._store)
+
+    def __len__(self) -> int:
+        return len(self._store)
 
 
 # ---------------------------------------------------------------------------
@@ -615,9 +670,13 @@ class Gemma4MoETextModelBackend(nn.Module):
         for layer_type in set(self.config.layer_types):
             position_embeddings[layer_type] = self.rotary_emb(hidden_states, position_ids, layer_type)
 
-        # Single dict shared across all layers so kv-sharing layers can reuse the
-        # full-length keys/values cached by earlier layers (HF contract).
-        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        # One shared key/value store passed to every layer: the later kv-shared
+        # layers reuse the keys/values that earlier layers write here. It must be
+        # an _FSDPSafeSharedKVStates and NOT a plain dict -- under FSDP2 each
+        # layer is wrapped separately and FSDP2's input casting makes a fresh copy
+        # of any plain dict per layer, so the writes would be lost. See
+        # _FSDPSafeSharedKVStates for the full explanation.
+        shared_kv_states = _FSDPSafeSharedKVStates()
         for decoder_layer in self.layers.values():
             hidden_states = decoder_layer(
                 hidden_states,
@@ -711,12 +770,14 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 supports_ep=True,
             )
         if getattr(config, "audio_config", None) is not None:
-            # Dense + audio variant: gemma-4-E2B-it, gemma-4-E4B-it
+            # Dense + audio variant: gemma-4-E2B-it, gemma-4-E4B-it.
+            # CP not yet supported here: kv-sharing + per-layer-inputs are not
+            # wired through the p2p ring. Tracked separately from this 31B PR.
             return ModelCapabilities()
         # Plain dense variant: gemma-4-31B-it
         return ModelCapabilities(
             supports_tp=True,
-            supports_cp=False,
+            supports_cp=True,
             supports_pp=True,
             supports_ep=False,
         )
@@ -737,6 +798,40 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             raise UnavailableError("transformers.models.gemma4 is not available.")
         config = Gemma4Config.from_pretrained(pretrained_model_name_or_path)
         return cls.from_config(config, *model_args, **kwargs)
+
+    def setup_cp_attention(self, cp_mesh) -> None:
+        """Install Gemma4's model-owned p2p ring CP attention (dense path).
+
+        Idempotent: flips the ``_cp_enabled`` flag the forward reads and installs
+        the ring on every self-attn module (each was given a per-module
+        ``setup_cp_attention`` by ``attach_gemma4_cp_ring_attention`` at
+        construction). Invoked from Gemma4's own batch-sharding callable
+        (``_cp_shard_batch``) the first time the recipe hands it the CP submesh, so
+        the install is fully model-owned -- no framework dispatch is required.
+        """
+        if getattr(self, "_cp_enabled", False):
+            return
+        self._cp_enabled = True
+        for module in self.modules():
+            if module is self:
+                continue
+            module_setup = getattr(module, "setup_cp_attention", None)
+            if callable(module_setup):
+                module_setup(cp_mesh)
+
+    def _cp_shard_batch(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+        """Gemma4-owned CP batch sharder that also self-installs the ring.
+
+        Attached to the batch as ``_cp_make_batch_fn`` by
+        ``prepare_model_inputs_for_cp``. ``cp_utils.make_cp_batch_and_ctx`` calls it
+        with the CP submesh, which is the one place Gemma4 receives ``cp_mesh`` on a
+        model-owned path -- so install the ring here (idempotent) before sharding,
+        rather than depending on the framework to call ``setup_cp_attention``.
+        """
+        self.setup_cp_attention(cp_mesh)
+        return make_contiguous_shard_cp_batch_and_ctx(
+            cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id
+        )
 
     def __init__(
         self,
@@ -793,7 +888,12 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         self.pad_token_id = pad_token_id if pad_token_id is not None else -1
 
         if not enable_moe:
-            # Dense Gemma4 — keep vanilla HF model, nothing else to do.
+            # Dense Gemma4 — keep vanilla HF model. Attach the model-owned p2p ring
+            # CP attention to each HF self-attn so setup_cp_attention can install it
+            # when CP is enabled. (The MoE path attaches it per Gemma4MoEDecoderLayer.)
+            for module in self.modules():
+                if isinstance(module, Gemma4Attention):
+                    attach_gemma4_cp_ring_attention(module)
             return
 
         # --- MoE path: replace the text model ---
@@ -882,6 +982,23 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 logits_to_keep = kwargs.pop("logits_to_keep", logits_to_keep)
                 kwargs.pop("labels", None)
 
+                # Dense Gemma4 rides HF's decoder layers, which don't thread the
+                # CP/vision metadata down to self_attn (the MoE backend passes it via
+                # kwargs). Stash the CP-sharded metadata on each ring-hooked attention
+                # module so the ring builds the vision-bidirectional / packed masks
+                # rather than a plain causal mask (which corrupts multimodal attention).
+                cp_meta = {
+                    "mm_token_type_ids": mm_token_type_ids,
+                    "padding_mask": padding_mask,
+                    "_packed_seq_ids": kwargs.get("_packed_seq_ids"),
+                    "_gemma4_vision_group_ids": kwargs.get("_gemma4_vision_group_ids"),
+                }
+                # Left set (not cleared) so the activation-checkpoint recompute in
+                # backward sees the same metadata; each CP forward overwrites it.
+                for _mod in self.modules():
+                    if getattr(_mod, "_cp_uses_attention_hook", False):
+                        _mod._cp_dense_metadata = cp_meta
+
                 text_outputs = self.model.language_model(
                     input_ids=None,
                     inputs_embeds=inputs_embeds,
@@ -922,6 +1039,20 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             # Dense path — delegate to HF forward (which already supports
             # logits_to_keep + output_hidden_states and returns a ModelOutput
             # carrying logits and hidden_states).
+            #
+            # Gemma4 HF transformers shares keys/values between attention layers by passing
+            # one shared key/value store into every decoder layer (earlier layers
+            # write it, later "kv-shared" layers read it). NOTE: this dict-based
+            # design is new in transformers 5.8.x; 5.5 stored the shared
+            # keys/values on the Cache object instead.
+            #
+            # Under FSDP2 each layer is wrapped separately and the input-casting
+            # step (cast_forward_inputs) makes a fresh copy of any plain dict
+            # before each layer runs, so the earlier layer's writes never reach
+            # the later layers -> KeyError. Pass an _FSDPSafeSharedKVStates
+            # instead, which FSDP2 leaves as one shared object. setdefault avoids
+            # overwriting a store a caller already provided (e.g. the drafter).
+            kwargs.setdefault("shared_kv_states", _FSDPSafeSharedKVStates())
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -1049,7 +1180,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             "mm_token_type_ids": mm_token_type_ids
             if mm_token_type_ids is not None
             else special_image_mask.to(torch.long),
-            "_cp_make_batch_fn": make_contiguous_shard_cp_batch_and_ctx,
+            "_cp_make_batch_fn": self._cp_shard_batch,
             "_gemma4_vision_group_ids": gemma4_vision_group_ids(
                 mm_token_type_ids if mm_token_type_ids is not None else special_image_mask.to(torch.long)
             ),

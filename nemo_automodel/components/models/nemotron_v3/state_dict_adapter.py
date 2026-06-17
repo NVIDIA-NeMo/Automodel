@@ -184,7 +184,9 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             for key, value in mtp_state_dict.items():
                 stripped_key = key[len("mtp.") :] if key.startswith("mtp.") else key
                 stripped[stripped_key] = value
-            merged_mtp = self._from_hf_w_merged_experts(stripped, device_mesh)
+            # reset_view_loaded_keys=False: this is the second merge of a single from_hf (after the
+            # backbone merge above), so accumulate MTP view-loaded keys onto the backbone's record.
+            merged_mtp = self._from_hf_w_merged_experts(stripped, device_mesh, reset_view_loaded_keys=False)
             for key, value in merged_mtp.items():
                 merged[f"mtp.{key}"] = value
 

@@ -43,17 +43,27 @@ class TestRouteToFp32Holder:
             _route_to_fp32_holder("model.language_model.layers.0.linear_attn.A_log")
             == "model.language_model.layers.0.linear_attn._fp32_params.A_log"
         )
+        assert (
+            _route_to_fp32_holder("model.language_model.layers.0.linear_attn.dt_bias")
+            == "model.language_model.layers.0.linear_attn._fp32_params.dt_bias"
+        )
 
     def test_passes_through_already_routed_keys(self):
         key = "model.language_model.layers.0.linear_attn._fp32_params.A_log"
         assert _route_to_fp32_holder(key) == key
 
-    def test_does_not_route_non_a_log_keys(self):
-        for key in (
-            "model.language_model.layers.0.linear_attn.dt_bias",
-            "model.language_model.layers.0.linear_attn.norm.weight",
-        ):
-            assert _route_to_fp32_holder(key) == key
+    def test_routes_bare_dt_bias_to_holder(self):
+        # Both SSM-gating master weights (A_log and dt_bias) live in the fp32
+        # ``_fp32_params`` holder, so dt_bias is routed the same as A_log.
+        assert (
+            _route_to_fp32_holder("model.language_model.layers.0.linear_attn.dt_bias")
+            == "model.language_model.layers.0.linear_attn._fp32_params.dt_bias"
+        )
+
+    def test_does_not_route_other_linear_attn_keys(self):
+        # Non SSM-gating params (e.g. the GatedDeltaNet norm) stay in place.
+        key = "model.language_model.layers.0.linear_attn.norm.weight"
+        assert _route_to_fp32_holder(key) == key
 
     def test_does_not_route_a_log_outside_linear_attn(self):
         # Defensive: only linear_attn.A_log should be routed.
@@ -68,7 +78,9 @@ class TestAdapter:
     def _sample_state_dict(self):
         return {
             "model.language_model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4),
+            "model.language_model.layers.0.linear_attn._fp32_params.dt_bias": torch.zeros(4),
             "model.language_model.layers.1.linear_attn._fp32_params.A_log": torch.ones(4),
+            "model.language_model.layers.1.linear_attn._fp32_params.dt_bias": torch.ones(4),
             "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2),
             "model.language_model.embed_tokens.weight": torch.zeros(8, 2),
         }
@@ -90,6 +102,21 @@ class TestAdapter:
         # Number of keys preserved.
         assert len(out) == len(sd)
 
+    def test_to_hf_upcasts_gdn_fp32_params_saved_as_bf16(self):
+        sd = {
+            "model.language_model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.linear_attn._fp32_params.dt_bias": torch.ones(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+        }
+
+        out = self.adapter.to_hf(sd)
+
+        assert out["model.language_model.layers.0.linear_attn.A_log"].dtype == torch.float32
+        assert out["model.language_model.layers.0.linear_attn.dt_bias"].dtype == torch.float32
+        q_proj_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        assert out[q_proj_key] is sd[q_proj_key]
+        assert out[q_proj_key].dtype == torch.bfloat16
+
     def test_to_hf_accepts_kwargs(self):
         # Save callsites pass exclude_key_regex, quantization, device_mesh, etc.
         out = self.adapter.to_hf(
@@ -103,6 +130,7 @@ class TestAdapter:
     def test_from_hf_routes_a_log_to_holder(self):
         hf_sd = {
             "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4),
+            "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(4),
             "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2),
         }
         out = self.adapter.from_hf(hf_sd)
@@ -110,11 +138,45 @@ class TestAdapter:
             "model.language_model.layers.0.linear_attn._fp32_params.A_log" in out
             and "model.language_model.layers.0.linear_attn.A_log" not in out
         )
+        assert (
+            "model.language_model.layers.0.linear_attn._fp32_params.dt_bias" in out
+            and "model.language_model.layers.0.linear_attn.dt_bias" not in out
+        )
         assert "model.language_model.layers.0.self_attn.q_proj.weight" in out
+
+    def test_from_hf_upcasts_gdn_fp32_params_loaded_as_bf16(self):
+        hf_sd = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+        }
+
+        out = self.adapter.from_hf(hf_sd)
+
+        a_log_key = "model.language_model.layers.0.linear_attn._fp32_params.A_log"
+        dt_bias_key = "model.language_model.layers.0.linear_attn._fp32_params.dt_bias"
+        q_proj_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        assert out[a_log_key].dtype == torch.float32
+        assert out[dt_bias_key].dtype == torch.float32
+        assert out[q_proj_key] is hf_sd[q_proj_key]
+        assert out[q_proj_key].dtype == torch.bfloat16
+
+    def test_from_hf_upcasts_bare_gdn_fp32_params_for_unpatched_model(self):
+        hf_sd = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.bfloat16),
+        }
+        adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=False)
+
+        out = adapter.from_hf(hf_sd)
+
+        assert out["model.language_model.layers.0.linear_attn.A_log"].dtype == torch.float32
+        assert out["model.language_model.layers.0.linear_attn.dt_bias"].dtype == torch.float32
 
     def test_from_hf_keeps_bare_a_log_when_configured_for_unpatched_model(self):
         hf_sd = {
             "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4),
+            "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(4),
             "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2),
         }
         adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=False)
@@ -123,10 +185,13 @@ class TestAdapter:
 
         assert "model.language_model.layers.0.linear_attn.A_log" in out
         assert "model.language_model.layers.0.linear_attn._fp32_params.A_log" not in out
+        assert "model.language_model.layers.0.linear_attn.dt_bias" in out
+        assert "model.language_model.layers.0.linear_attn._fp32_params.dt_bias" not in out
 
     def test_from_hf_routes_a_log_when_configured_for_patched_model(self):
         hf_sd = {
             "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4),
+            "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(4),
             "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2),
         }
         adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=True)
@@ -135,6 +200,8 @@ class TestAdapter:
 
         assert "model.language_model.layers.0.linear_attn._fp32_params.A_log" in out
         assert "model.language_model.layers.0.linear_attn.A_log" not in out
+        assert "model.language_model.layers.0.linear_attn._fp32_params.dt_bias" in out
+        assert "model.language_model.layers.0.linear_attn.dt_bias" not in out
 
     def test_round_trip_is_identity(self):
         sd = self._sample_state_dict()
@@ -149,6 +216,18 @@ class TestAdapter:
             "model.language_model.layers.0.linear_attn._fp32_params.A_log", t
         )
         assert out == [("model.language_model.layers.0.linear_attn.A_log", t)]
+        out = self.adapter.convert_single_tensor_to_hf(
+            "model.language_model.layers.0.linear_attn._fp32_params.dt_bias", t
+        )
+        assert out == [("model.language_model.layers.0.linear_attn.dt_bias", t)]
+
+    def test_convert_single_tensor_to_hf_upcasts_gdn_fp32_params(self):
+        t = torch.zeros(4, dtype=torch.bfloat16)
+        out = self.adapter.convert_single_tensor_to_hf(
+            "model.language_model.layers.0.linear_attn._fp32_params.A_log", t
+        )
+        assert out[0][0] == "model.language_model.layers.0.linear_attn.A_log"
+        assert out[0][1].dtype == torch.float32
 
     def test_convert_single_tensor_passthrough(self):
         t = torch.zeros(2, 2)
