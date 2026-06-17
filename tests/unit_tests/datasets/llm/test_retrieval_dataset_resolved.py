@@ -15,6 +15,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 import sys
 import types
 
@@ -40,10 +41,49 @@ if "torchvision" not in sys.modules and importlib.util.find_spec("torchvision") 
 
 import nemo_automodel.components.datasets.llm.retrieval_dataset_resolved as rdr
 from tools.retrieval import prepare_resolved_vl_retrieval_data as prep
+from tools.retrieval import warm_retrieval_hf_cache as warm
 
 
 def _write_jsonl(path, records):
     path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+
+class _DummyImage:
+    size = (2, 2)
+
+
+class _DummyRetrievalDataset:
+    def __init__(self):
+        self.examples = [
+            {"question": "Q0", "doc_text": ["P0", "N0"], "doc_image": [_DummyImage(), ""]},
+            {"question": "Q1", "doc_text": ["P1", "N1"], "doc_image": ["", _DummyImage()]},
+        ]
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[idx]
+
+
+def _write_warm_cache_config(path, dataset_target):
+    path.write_text(
+        "\n".join(
+            [
+                "dataloader:",
+                "  dataset:",
+                f"    _target_: {dataset_target}",
+                "    data_dir_list:",
+                "      - /tmp/train.json",
+                "    model_type: bi_encoder",
+                "    data_type: train",
+                "    n_passages: 2",
+                "    seed: 123",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def test_resolved_retrieval_dataset_opens_relative_images(tmp_path):
@@ -119,6 +159,73 @@ def test_resolved_retrieval_dataset_rejects_wrong_passage_count(tmp_path):
 
     with pytest.raises(ValueError, match="expected 2"):
         next(iter(dataset))
+
+
+def test_warm_retrieval_hf_cache_builds_original_dataset_from_config(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    _write_warm_cache_config(config_path, "nemo_automodel.components.datasets.llm.make_retrieval_dataset")
+    cache_dir = tmp_path / "hf_cache"
+    report_path = tmp_path / "report.json"
+    captured_kwargs = {}
+    old_env = {name: os.environ.get(name) for name in warm._configure_hf_cache(None)}
+
+    def dataset_factory(
+        data_dir_list,
+        model_type="bi_encoder",
+        data_type="train",
+        n_passages=5,
+        seed=42,
+        do_shuffle=False,
+        max_train_samples=None,
+    ):
+        captured_kwargs.update(
+            {
+                "data_dir_list": data_dir_list,
+                "model_type": model_type,
+                "data_type": data_type,
+                "n_passages": n_passages,
+                "seed": seed,
+                "do_shuffle": do_shuffle,
+                "max_train_samples": max_train_samples,
+            }
+        )
+        return _DummyRetrievalDataset()
+
+    try:
+        report = warm.warm_retrieval_hf_cache(
+            str(config_path),
+            cache_dir=str(cache_dir),
+            touch_samples=2,
+            max_train_samples=1,
+            report_path=str(report_path),
+            dataset_factory=dataset_factory,
+        )
+    finally:
+        for name, value in old_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    assert captured_kwargs["data_dir_list"] == ["/tmp/train.json"]
+    assert captured_kwargs["n_passages"] == 2
+    assert captured_kwargs["seed"] == 123
+    assert captured_kwargs["max_train_samples"] == 1
+    assert report["dataset_length"] == 2
+    assert report["touched_documents"] == 4
+    assert report["touched_images"] == 2
+    assert json.loads(report_path.read_text(encoding="utf-8"))["touch_samples"] == 2
+
+
+def test_warm_retrieval_hf_cache_rejects_resolved_dataset_config(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    _write_warm_cache_config(config_path, "nemo_automodel.components.datasets.llm.make_resolved_retrieval_dataset")
+
+    with pytest.raises(ValueError, match="only supports the original retrieval dataset"):
+        warm.warm_retrieval_hf_cache(
+            str(config_path),
+            dataset_factory=lambda data_dir_list: _DummyRetrievalDataset(),
+        )
 
 
 def test_prepare_resolved_vl_retrieval_data_writes_jsonl_and_images(tmp_path, monkeypatch):
