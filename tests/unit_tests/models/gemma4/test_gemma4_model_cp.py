@@ -30,6 +30,8 @@ from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4ForConditionalGeneration,
     Gemma4TextConfig,
     _build_packed_gemma4_causal_mask_mapping,
+    _Gemma4KVShareHolder,
+    _kv_sharing_active,
 )
 
 
@@ -612,3 +614,30 @@ def test_forward_dense_cp_stashes_metadata_on_ring_modules():
         meta = m._cp_dense_metadata
         assert set(meta) == {"mm_token_type_ids", "padding_mask", "_packed_seq_ids", "_gemma4_vision_group_ids"}
         assert torch.equal(meta["_packed_seq_ids"], packed)
+
+
+# ---------------------------------------------------------------------------
+# _Gemma4KVShareHolder / _kv_sharing_active
+# (cache-free kv-sharing under use_cache=False / CP, gated to E2B/E4B)
+# ---------------------------------------------------------------------------
+def test_kv_share_holder_is_cache_free_passthrough():
+    h = _Gemma4KVShareHolder()
+    assert h.shared_layers == {}
+    # Satisfies HF's `past_key_values is not None` gate without acting like a cache:
+    # zero cache offset and a pass-through update (no per-token accumulation).
+    assert h.get_seq_length() == 0
+    assert h.get_seq_length(0, foo=1) == 0
+    assert h.get_mask_sizes(13) == (13, 0)
+    assert h.get_mask_sizes(7, layer_idx=3) == (7, 0)
+    k = torch.randn(1, 2, 4, 8)
+    v = torch.randn(1, 2, 4, 8)
+    out_k, out_v = h.update(k, v, layer_idx=0)
+    assert out_k is k and out_v is v
+
+
+def test_kv_sharing_active_thresholds():
+    assert _kv_sharing_active(SimpleNamespace(num_kv_shared_layers=18)) is True
+    assert _kv_sharing_active(SimpleNamespace(num_kv_shared_layers=1)) is True
+    assert _kv_sharing_active(SimpleNamespace(num_kv_shared_layers=0)) is False
+    assert _kv_sharing_active(SimpleNamespace(num_kv_shared_layers=None)) is False
+    assert _kv_sharing_active(SimpleNamespace()) is False  # attribute absent -> not kv-sharing
