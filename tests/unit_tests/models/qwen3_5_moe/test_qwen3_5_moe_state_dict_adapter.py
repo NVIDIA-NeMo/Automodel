@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from unittest.mock import Mock
 
 import pytest
@@ -662,24 +663,36 @@ class TestConvertSingleTensorToHf:
         assert result == [("mtp.fc.weight", tensor)]
 
     def test_mtp_expert_key_conversion(self, adapter):
+        # MTP experts convert to the GROUPED HF layout, identical to the main
+        # decoder layers — not per-expert keys (AM-442).
         tensor = torch.randn(4, 64, 128)
         result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.gate_and_up_projs", tensor)
 
-        assert len(result) == 8
-        out = dict(result)
-        assert "mtp.layers.0.mlp.experts.0.gate_proj.weight" in out
-        assert "mtp.layers.0.mlp.experts.0.up_proj.weight" in out
-        torch.testing.assert_close(out["mtp.layers.0.mlp.experts.0.gate_proj.weight"], tensor[0, :, :64].T)
-        torch.testing.assert_close(out["mtp.layers.0.mlp.experts.0.up_proj.weight"], tensor[0, :, 64:].T)
+        assert len(result) == 1
+        key, value = result[0]
+        assert key == "mtp.layers.0.mlp.experts.gate_up_proj"
+        torch.testing.assert_close(value, tensor.transpose(1, 2))
+        # No per-expert keys are emitted.
+        assert not any(".experts.0." in k for k, _ in result)
 
     def test_mtp_down_expert_key_conversion(self, adapter):
         tensor = torch.randn(4, 64, 32)
         result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.down_projs", tensor)
 
-        assert len(result) == 4
-        out = dict(result)
-        assert "mtp.layers.0.mlp.experts.0.down_proj.weight" in out
-        torch.testing.assert_close(out["mtp.layers.0.mlp.experts.0.down_proj.weight"], tensor[0].T)
+        assert len(result) == 1
+        key, value = result[0]
+        assert key == "mtp.layers.0.mlp.experts.down_proj"
+        torch.testing.assert_close(value, tensor.transpose(1, 2))
+
+    def test_mtp_experts_emit_no_per_expert_keys(self, adapter):
+        """AM-442 regression: to_hf must not fabricate per-expert MTP keys that are
+        absent from the grouped checkpoint (e.g. ``...experts.224.down_proj.weight``)."""
+        for native in ("mtp.layers.0.mlp.experts.gate_and_up_projs", "mtp.layers.0.mlp.experts.down_projs"):
+            result = adapter.convert_single_tensor_to_hf(native, torch.randn(4, 64, 32))
+            assert len(result) == 1
+            key = result[0][0]
+            assert key in ("mtp.layers.0.mlp.experts.gate_up_proj", "mtp.layers.0.mlp.experts.down_proj")
+            assert not re.search(r"\.experts\.\d+\.", key)
 
 
 # ---------------------------------------------------------------------------
