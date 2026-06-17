@@ -29,6 +29,7 @@ from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4Config,
     Gemma4ForConditionalGeneration,
     Gemma4TextConfig,
+    HFGemma4ForConditionalGeneration,
     _build_packed_gemma4_causal_mask_mapping,
     _Gemma4KVShareHolder,
     _kv_sharing_active,
@@ -641,3 +642,38 @@ def test_kv_sharing_active_thresholds():
     assert _kv_sharing_active(SimpleNamespace(num_kv_shared_layers=0)) is False
     assert _kv_sharing_active(SimpleNamespace(num_kv_shared_layers=None)) is False
     assert _kv_sharing_active(SimpleNamespace()) is False  # attribute absent -> not kv-sharing
+
+
+# ---------------------------------------------------------------------------
+# Non-CP dense forward: kv-share holder injection (gated to E2B/E4B)
+# ---------------------------------------------------------------------------
+def test_forward_dense_noncp_injects_kv_share_holder():
+    # kv-sharing active + dense + NOT cp-enabled -> the non-CP dense path passes a
+    # cache-free _Gemma4KVShareHolder as past_key_values to the HF super().forward.
+    cfg = _cfg(enable_moe_block=False, num_kv_shared_layers=2)
+    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
+    captured = {}
+
+    def fake_super_forward(_self, *args, **kwargs):
+        captured["pkv"] = kwargs.get("past_key_values")
+        return "OUT"
+
+    with mock.patch.object(HFGemma4ForConditionalGeneration, "forward", fake_super_forward):
+        out = model(input_ids=torch.tensor([[1, 2, 3, 4]]))
+    assert out == "OUT"
+    assert isinstance(captured["pkv"], _Gemma4KVShareHolder)
+
+
+def test_forward_dense_noncp_no_holder_without_kv_sharing():
+    # No kv-sharing -> no holder injected (preserves prior behavior; 31B/MoE path).
+    cfg = _cfg(enable_moe_block=False, num_kv_shared_layers=0)
+    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
+    captured = {}
+
+    def fake_super_forward(_self, *args, **kwargs):
+        captured["pkv"] = kwargs.get("past_key_values")
+        return "OUT"
+
+    with mock.patch.object(HFGemma4ForConditionalGeneration, "forward", fake_super_forward):
+        model(input_ids=torch.tensor([[1, 2, 3, 4]]))
+    assert captured["pkv"] is None

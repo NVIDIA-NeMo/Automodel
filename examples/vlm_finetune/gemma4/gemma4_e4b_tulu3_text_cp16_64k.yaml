@@ -90,7 +90,7 @@ loss_fn:
 
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_meta_dataset
-  path_or_dataset: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/evee/Automodel/logs/gemma4_tulu3_seqpack_cp/data/tulu3_train_meta.json
+  path_or_dataset: logs/gemma4_tulu3_seqpack_cp/data/tulu3_train_meta.json
   split: train
   truncate: false
   inject_fake_images: false

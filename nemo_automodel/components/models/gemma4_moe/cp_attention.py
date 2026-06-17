@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 from dataclasses import dataclass, replace
@@ -137,20 +138,33 @@ def _cached_block_mask(key, build):
 def _compiled_flex_attention(attention_module: torch.nn.Module):
     compiled = getattr(attention_module, "_gemma4_cp_compiled_flex_attn", None)
     if compiled is None:
-        # Disable duck-shape specialization before compiling. With variable-length
-        # (unpacked) batches the compiled flex kernel otherwise guards on incidental
-        # dim-equalities (e.g. ``block_mask.kv_indices.size()[2] == key.size()[1]``)
-        # and recompiles on every new sequence length, collapsing throughput to
-        # ~warmup speed. Packed (fixed-length) runs hit one shape so they were
-        # unaffected; this only bites variable-length data.
-        from torch.fx.experimental import _config as _fx_config
         from torch.nn.attention.flex_attention import flex_attention
-
-        _fx_config.use_duck_shape = False
 
         compiled = torch.compile(flex_attention, dynamic=True)
         attention_module._gemma4_cp_compiled_flex_attn = compiled
     return compiled
+
+
+@contextlib.contextmanager
+def _duck_shape_disabled():
+    """Locally disable flex duck-shape specialization for the wrapped flex call.
+
+    With variable-length (unpacked) batches the compiled flex kernel otherwise
+    guards on incidental dim-equalities (e.g. ``block_mask.kv_indices.size()[2] ==
+    key.size()[1]``) and recompiles on every new sequence length, collapsing
+    throughput to ~warmup speed. ``use_duck_shape`` is read by dynamo at (re)trace
+    time -- which happens inside the flex call -- so scoping it to the call window
+    is sufficient and, unlike setting it once at compile time, does not leave the
+    process-global ``torch.fx`` config mutated for unrelated ``torch.compile`` users.
+    """
+    from torch.fx.experimental import _config as _fx_config
+
+    prev = _fx_config.use_duck_shape
+    _fx_config.use_duck_shape = False
+    try:
+        yield
+    finally:
+        _fx_config.use_duck_shape = prev
 
 
 def _base_gemma4_cp_mask(attention_module: torch.nn.Module, ctx: Any, q_idx, kv_idx, kv_global_start: int = 0):
@@ -388,18 +402,19 @@ def _run_gemma4_flex_chunk(
                 "num_warps": 4,
             }
 
-        try:
-            out, lse = _compiled_flex_attention(attention_module)(
-                query_for_flex.contiguous(), key_for_flex, value_for_flex, return_lse=True, **flex_kwargs
-            )
-        except TypeError as exc:
-            if "kernel_options" in str(exc) and "kernel_options" in flex_kwargs:
-                flex_kwargs.pop("kernel_options")
+        with _duck_shape_disabled():
+            try:
                 out, lse = _compiled_flex_attention(attention_module)(
                     query_for_flex.contiguous(), key_for_flex, value_for_flex, return_lse=True, **flex_kwargs
                 )
-            else:
-                raise
+            except TypeError as exc:
+                if "kernel_options" in str(exc) and "kernel_options" in flex_kwargs:
+                    flex_kwargs.pop("kernel_options")
+                    out, lse = _compiled_flex_attention(attention_module)(
+                        query_for_flex.contiguous(), key_for_flex, value_for_flex, return_lse=True, **flex_kwargs
+                    )
+                else:
+                    raise
 
         if empty_query_rows is not None and empty_query_rows.any():
             out = out.masked_fill(empty_query_rows[:, None, :, None], 0)
