@@ -151,6 +151,34 @@ def test_resolved_retrieval_dataset_num_samples_caps_iteration(tmp_path):
     assert [example["question"] for example in dataset] == ["Q0", "Q1", "Q2", "Q0", "Q1", "Q2"]
 
 
+def test_resolved_retrieval_dataset_shuffle_buffer(tmp_path):
+    data_path = tmp_path / "shard-00000.jsonl"
+    _write_jsonl(
+        data_path,
+        [{"question": f"Q{i}", "doc_text": [f"P{i}"], "doc_image": [""]} for i in range(10)],
+    )
+
+    dataset = rdr.make_resolved_retrieval_dataset(
+        str(data_path),
+        n_passages=1,
+        decode_images=False,
+        shuffle_buffer_size=3,
+        seed=123,
+    )
+
+    questions = [example["question"] for example in dataset]
+    assert sorted(questions) == [f"Q{i}" for i in range(10)]
+    assert questions != [f"Q{i}" for i in range(10)]
+
+
+def test_resolved_retrieval_dataset_rejects_bad_shuffle_buffer(tmp_path):
+    data_path = tmp_path / "shard-00000.jsonl"
+    _write_jsonl(data_path, [{"question": "Q", "doc_text": ["P"], "doc_image": [""]}])
+
+    with pytest.raises(ValueError, match="shuffle_buffer_size must be >= 0"):
+        rdr.make_resolved_retrieval_dataset(str(data_path), n_passages=1, shuffle_buffer_size=-1)
+
+
 def test_resolved_retrieval_dataset_rejects_wrong_passage_count(tmp_path):
     data_path = tmp_path / "shard-00000.jsonl"
     _write_jsonl(data_path, [{"question": "Q", "doc_text": ["P"], "doc_image": [""]}])
@@ -398,6 +426,59 @@ def test_resolved_retrieval_parquet_dataset_rank_sharding(tmp_path, monkeypatch)
 
     assert [example["question"] for example in dataset] == ["Q1", "Q3"]
     assert [example["doc_image"] for example in dataset] == [["packed:0"], ["packed:0"]]
+
+
+def test_resolved_retrieval_parquet_dataset_row_sharding_inside_row_group(tmp_path, monkeypatch):
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pyarrow.parquet")
+    image_mod = pytest.importorskip("PIL.Image")
+
+    monkeypatch.setattr(
+        prep, "load_datasets", lambda data_dir_list, concatenate, seed: ([{"idx": i} for i in range(4)], {})
+    )
+
+    def _transform_func(item, num_neg_docs, corpus_dict, use_dataset_instruction):
+        idx = item["idx"]
+        return {
+            "question": f"Q{idx}",
+            "doc_text": [f"P{idx}"],
+            "doc_image": [image_mod.new("RGB", (2, 2), color="blue")],
+            "query_instruction": "",
+            "passage_instruction": "",
+        }
+
+    monkeypatch.setattr(prep, "_transform_func", _transform_func)
+    output_dir = tmp_path / "resolved"
+    prep.resolve_dataset(
+        data_dir_list=["train.json"],
+        output_dir=output_dir,
+        n_passages=1,
+        samples_per_shard=10,
+        seed=42,
+        max_samples=None,
+        use_dataset_instruction=False,
+        jpeg_quality=90,
+        image_storage="parquet",
+        parquet_row_group_size=4,
+    )
+    monkeypatch.setattr(rdr, "_get_dist_info", lambda: (1, 2))
+
+    dataset = rdr.make_resolved_retrieval_dataset(
+        data_dir_list=str(output_dir),
+        n_passages=1,
+        decode_images=False,
+        parquet_sharding="row",
+    )
+
+    assert [example["question"] for example in dataset] == ["Q1", "Q3"]
+
+
+def test_resolved_retrieval_parquet_dataset_rejects_bad_sharding(tmp_path):
+    data_path = tmp_path / "shard-00000.jsonl"
+    _write_jsonl(data_path, [{"question": "Q", "doc_text": ["P"], "doc_image": [""]}])
+
+    with pytest.raises(ValueError, match="parquet_sharding must be one of"):
+        rdr.make_resolved_retrieval_dataset(str(data_path), n_passages=1, parquet_sharding="sample")
 
 
 def test_prepare_resolved_vl_retrieval_data_parallel_build_shard(tmp_path, monkeypatch):

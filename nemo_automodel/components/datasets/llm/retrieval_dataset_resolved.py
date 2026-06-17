@@ -42,9 +42,11 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
 from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import flatten_bi_encoder_to_cross_encoder
+from nemo_automodel.components.datasets.reservoir_sampler import ReservoirSampler
 from nemo_automodel.shared.import_utils import safe_import
 
 _VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
+_VALID_PARQUET_SHARDING = ("row_group", "row")
 
 logger = logging.getLogger(__name__)
 
@@ -301,11 +303,17 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
         model_type: str = "bi_encoder",
         num_samples: int | None = None,
         expected_n_passages: int | None = None,
+        shuffle_buffer_size: int = 0,
+        parquet_sharding: str = "row_group",
     ) -> None:
         if model_type not in _VALID_MODEL_TYPES:
             raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
+        if parquet_sharding not in _VALID_PARQUET_SHARDING:
+            raise ValueError(f"parquet_sharding must be one of {_VALID_PARQUET_SHARDING}, got {parquet_sharding!r}")
         if repeat < 1:
             raise ValueError(f"repeat must be >= 1, got {repeat}")
+        if shuffle_buffer_size < 0:
+            raise ValueError(f"shuffle_buffer_size must be >= 0, got {shuffle_buffer_size}")
 
         self.paths = _coerce_path_list(data_path)
         self.image_root = Path(image_root) if image_root is not None else None
@@ -315,6 +323,8 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
         self.decode_images = decode_images
         self.model_type = model_type
         self.expected_n_passages = expected_n_passages
+        self.shuffle_buffer_size = int(shuffle_buffer_size)
+        self.parquet_sharding = parquet_sharding
         self.epoch = 0
         total_records = _count_resolved_records(self.paths)
         if num_samples is None:
@@ -426,23 +436,89 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
                 break
             row_group_rows = int(parquet_file.metadata.row_group(row_group_idx).num_rows)
             rows_to_consume = min(row_group_rows, self._num_records - state["records_seen_this_repeat"])
-            if state["parquet_group_idx"] % world_size == rank:
-                emit = state["parquet_local_group_idx_for_rank"] % num_workers == worker_id
-                state["parquet_local_group_idx_for_rank"] += 1
+            if self.parquet_sharding == "row_group":
+                if state["parquet_group_idx"] % world_size == rank:
+                    emit = state["parquet_local_group_idx_for_rank"] % num_workers == worker_id
+                    state["parquet_local_group_idx_for_rank"] += 1
+                else:
+                    emit = False
+                state["parquet_group_idx"] += 1
+                state["records_seen_this_repeat"] += rows_to_consume
+                if not emit:
+                    continue
+
+                emit_row_indices = range(rows_to_consume)
             else:
-                emit = False
-            state["parquet_group_idx"] += 1
-            state["records_seen_this_repeat"] += rows_to_consume
-            if not emit:
-                continue
+                emit_row_indices = []
+                for row_idx in range(rows_to_consume):
+                    if state["global_idx"] % world_size == rank:
+                        emit = state["local_idx_for_rank"] % num_workers == worker_id
+                        state["local_idx_for_rank"] += 1
+                    else:
+                        emit = False
+                    state["global_idx"] += 1
+                    state["records_seen_this_repeat"] += 1
+                    if emit:
+                        emit_row_indices.append(row_idx)
+                state["parquet_group_idx"] += 1
+                if not emit_row_indices:
+                    continue
 
             table = parquet_file.read_row_group(row_group_idx, columns=["record_json", "image_jpeg"])
             record_json_col = table.column("record_json").combine_chunks()
             image_col = table.column("image_jpeg").combine_chunks()
-            for row_idx in range(rows_to_consume):
+            for row_idx in emit_row_indices:
                 record_json = record_json_col[row_idx].as_py()
                 image_values = image_col[row_idx].as_py()
                 yield _parse_sqlite_record(record_json), _parquet_images_to_dict(image_values)
+
+    def _iter_raw_records_for_repeat(
+        self,
+        repeat_idx: int,
+        *,
+        state: dict[str, int],
+        rank: int,
+        world_size: int,
+        worker_id: int,
+        num_workers: int,
+    ) -> Iterable[tuple[dict[str, Any], dict[int, bytes] | None, Path]]:
+        state["records_seen_this_repeat"] = 0
+        for path in self._iter_paths(repeat_idx):
+            record_dir = path.parent
+            if _is_parquet_path(path):
+                record_iter = self._iter_parquet_records(
+                    path,
+                    state=state,
+                    rank=rank,
+                    world_size=world_size,
+                    worker_id=worker_id,
+                    num_workers=num_workers,
+                )
+            elif _is_sqlite_path(path):
+                record_iter = self._iter_sqlite_records(
+                    path,
+                    state=state,
+                    rank=rank,
+                    world_size=world_size,
+                    worker_id=worker_id,
+                    num_workers=num_workers,
+                )
+            else:
+                record_iter = self._iter_jsonl_records(
+                    path,
+                    state=state,
+                    rank=rank,
+                    world_size=world_size,
+                    worker_id=worker_id,
+                    num_workers=num_workers,
+                )
+            for record, packed_images in record_iter:
+                yield record, packed_images, record_dir
+            if state["records_seen_this_repeat"] >= self._num_records:
+                break
+
+    def _shuffle_seed(self, repeat_idx: int, rank: int, worker_id: int) -> int:
+        return self.seed + self.epoch * 1_000_003 + repeat_idx * 10_007 + rank * 101 + worker_id
 
     def __iter__(self) -> Iterable[dict[str, Any]]:
         worker = get_worker_info()
@@ -458,48 +534,31 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
             "records_seen_this_repeat": 0,
         }
         for repeat_idx in range(self.repeat):
-            state["records_seen_this_repeat"] = 0
-            for path in self._iter_paths(repeat_idx):
-                record_dir = path.parent
-                if _is_parquet_path(path):
-                    record_iter = self._iter_parquet_records(
-                        path,
-                        state=state,
-                        rank=rank,
-                        world_size=world_size,
-                        worker_id=worker_id,
-                        num_workers=num_workers,
-                    )
-                elif _is_sqlite_path(path):
-                    record_iter = self._iter_sqlite_records(
-                        path,
-                        state=state,
-                        rank=rank,
-                        world_size=world_size,
-                        worker_id=worker_id,
-                        num_workers=num_workers,
-                    )
-                else:
-                    record_iter = self._iter_jsonl_records(
-                        path,
-                        state=state,
-                        rank=rank,
-                        world_size=world_size,
-                        worker_id=worker_id,
-                        num_workers=num_workers,
-                    )
-                for record, packed_images in record_iter:
-                    yield _normalize_resolved_record(
-                        record,
-                        image_root=self.image_root,
-                        record_dir=record_dir,
-                        decode_images=self.decode_images,
-                        model_type=self.model_type,
-                        expected_n_passages=self.expected_n_passages,
-                        packed_images=packed_images,
-                    )
-                if state["records_seen_this_repeat"] >= self._num_records:
-                    break
+            raw_records = self._iter_raw_records_for_repeat(
+                repeat_idx,
+                state=state,
+                rank=rank,
+                world_size=world_size,
+                worker_id=worker_id,
+                num_workers=num_workers,
+            )
+            if self.shuffle_buffer_size > 0:
+                raw_records = ReservoirSampler(
+                    raw_records,
+                    buffer_size=self.shuffle_buffer_size,
+                    seed=self._shuffle_seed(repeat_idx, rank, worker_id),
+                )
+
+            for record, packed_images, record_dir in raw_records:
+                yield _normalize_resolved_record(
+                    record,
+                    image_root=self.image_root,
+                    record_dir=record_dir,
+                    decode_images=self.decode_images,
+                    model_type=self.model_type,
+                    expected_n_passages=self.expected_n_passages,
+                    packed_images=packed_images,
+                )
 
 
 def make_resolved_retrieval_dataset(
@@ -515,6 +574,8 @@ def make_resolved_retrieval_dataset(
     num_samples: int | None = None,
     data_dir_list: str | Sequence[str] | None = None,
     do_shuffle: bool | None = None,
+    shuffle_buffer_size: int | None = None,
+    parquet_sharding: str = "row_group",
 ) -> ResolvedRetrievalJsonlDataset:
     """Build a streaming resolved retrieval dataset.
 
@@ -531,6 +592,10 @@ def make_resolved_retrieval_dataset(
         num_samples: Optional cap on the number of JSONL records to stream per repeat.
         data_dir_list: Alias for ``data_path`` to match existing retrieval configs.
         do_shuffle: Compatibility alias for existing retrieval configs; maps to ``shuffle_files`` when set.
+        shuffle_buffer_size: Number of already-sharded examples to buffer for streaming row-level shuffle.
+            If omitted, ``do_shuffle=True`` uses a conservative buffer of 128 examples.
+        parquet_sharding: ``"row_group"`` keeps Parquet reads efficient by assigning row groups to ranks/workers.
+            ``"row"`` matches JSONL/SQLite row-level sharding but may duplicate Parquet reads across ranks.
 
     Returns:
         A rank/worker-sharded ``IterableDataset`` yielding retrieval examples.
@@ -547,6 +612,8 @@ def make_resolved_retrieval_dataset(
         raise ValueError("data_path or data_dir_list is required")
     if shuffle_files is None:
         shuffle_files = bool(do_shuffle)
+    if shuffle_buffer_size is None:
+        shuffle_buffer_size = 128 if (do_shuffle or shuffle_files) else 0
     return ResolvedRetrievalJsonlDataset(
         data_path=data_path,
         image_root=image_root,
@@ -557,4 +624,6 @@ def make_resolved_retrieval_dataset(
         model_type=model_type,
         num_samples=num_samples,
         expected_n_passages=n_passages,
+        shuffle_buffer_size=shuffle_buffer_size,
+        parquet_sharding=parquet_sharding,
     )

@@ -32,7 +32,7 @@ python tools/retrieval/warm_retrieval_hf_cache.py \
 
 ## Resolved VL Retrieval Data
 
-`prepare_resolved_vl_retrieval_data.py` creates portable JSONL, SQLite, or Parquet shards by resolving corpus IDs into document text and image bytes ahead of training.
+`prepare_resolved_vl_retrieval_data.py` creates portable JSONL, SQLite, or Parquet shards by resolving corpus IDs into document text and image bytes ahead of training. Unlike a Hugging Face cache directory, the resolved output is an explicit dataset artifact: it can be inspected with common tools, copied to another cluster, and subsetted by copying a few shard files.
 
 This format is useful when:
 
@@ -41,7 +41,7 @@ This format is useful when:
 - a small, self-contained reproduction dataset is needed;
 - CPU-only preprocessing is desired for debugging data internals.
 
-It is not currently recommended as a steady-state speed replacement for the original `make_retrieval_dataset` path. In Nemotron VL retrieval profiling, the original HF/map-style dataset path had similar median step time but fewer long-tail 8-node steps than resolved JSONL/SQLite/Parquet. The likely reason is different shuffle/sharding behavior: original training uses a map-style dataset and sampler, while resolved data is streamed as an `IterableDataset`.
+For steady-state training, prefer Parquet over JSONL+loose JPEGs or SQLite when a portable resolved dataset is needed. Parquet is a common interchange format for large datasets, avoids many small image files, and can be consumed by pyarrow, pandas, Spark, and Hugging Face Datasets. The native AutoModel loader reads Parquet sequentially and supports bounded-memory row shuffle through `shuffle_buffer_size`, so it does not require building a second Arrow cache before training.
 
 Example:
 
@@ -56,3 +56,20 @@ CPUS_PER_TASK=32 \
 EXTRA_CONTAINER_MOUNTS=/path/to/source_data:/path/to/source_data \
 tools/retrieval/submit_prepare_resolved_vl_retrieval_data_cpu_array.sh
 ```
+
+Training from resolved Parquet:
+
+```yaml
+dataloader:
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.make_resolved_retrieval_dataset
+    data_dir_list: /path/to/resolved_vl_retrieval
+    model_type: bi_encoder
+    data_type: train
+    n_passages: 5
+    do_shuffle: true
+    shuffle_buffer_size: 1024
+  shuffle: false
+```
+
+`dataloader.shuffle` must stay `false` because resolved data is an `IterableDataset`; row-level approximate shuffle happens inside the dataset via `shuffle_buffer_size`. The default Parquet sharding mode assigns row groups to ranks/workers for efficient sequential reads. For small diagnostics that need exact row-level rank sharding inside a row group, set `parquet_sharding: row`, but this can duplicate Parquet reads and is not the recommended production default.
