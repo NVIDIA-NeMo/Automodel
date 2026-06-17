@@ -5,8 +5,6 @@
 # validates the per-document CP-sparse masking at full scale and is directly
 # comparable to the no-packing 8k run (loss magnitude / grad / mem should be sane;
 # exact loss differs because the data is multi-document packs vs a single 8k doc).
-#
-# Submit by pointing launch_sft_ep32pp4_16nodes_genai.sub's CONFIG at this file (16 nodes).
 
 recipe: FinetuneRecipeForVLM
 seed: 1234

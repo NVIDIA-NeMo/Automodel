@@ -14,10 +14,6 @@
 # cross-check (CP x EP x PP at full depth), NOT a learning/accuracy run. Each sample
 # is a single 8k sequence (no multi-document packing -- packed multi-doc + CP is a
 # known-incorrect path until cu_seqlens-aware per-document masking lands).
-#
-# Submit by pointing the launcher's CONFIG at this file (16 nodes):
-#   examples/vlm_finetune/minimax_m3/launch_sft_ep32pp4_16nodes_genai.sub
-# (set CONFIG=examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_cp4_full_8k.yaml).
 
 recipe: FinetuneRecipeForVLM
 seed: 1234
