@@ -24,7 +24,9 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.models.deepseek_v4 import layers as dsv4_layers
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v4.cp import build_dsv4_cp_causal_padding_mask
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
     DeepseekV4GroupedLinear,
@@ -52,6 +54,43 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     is_dsv4_kernel_available,
     sinkhorn_normalize_torch,
 )
+
+
+def _miles_q_positions(seqlen_local: int, cp_rank: int, device: torch.device) -> torch.Tensor:
+    start = cp_rank * seqlen_local
+    return torch.arange(start, start + seqlen_local, device=device)
+
+
+def _miles_window_topk_idxs(
+    q_positions: torch.Tensor,
+    *,
+    window_size: int,
+    cp_size: int,
+    batch_size: int,
+) -> torch.Tensor:
+    seqlen_local = q_positions.shape[0]
+    seqlen_global = seqlen_local * cp_size
+    base = q_positions.unsqueeze(1)
+    offsets = torch.arange(min(seqlen_global, window_size), device=q_positions.device)
+    k_pos = (base - window_size + 1).clamp(0) + offsets
+    topk = torch.where(k_pos > base, torch.full_like(k_pos, -1), k_pos)
+    return topk.unsqueeze(0).expand(batch_size, -1, -1)
+
+
+def _miles_compress_topk_idxs(
+    q_positions: torch.Tensor,
+    *,
+    ratio: int,
+    cp_size: int,
+    batch_size: int,
+) -> torch.Tensor:
+    seqlen_local = q_positions.shape[0]
+    seqlen_global = seqlen_local * cp_size
+    offset = seqlen_global
+    group_idx = torch.arange(seqlen_global // ratio, device=q_positions.device).repeat(seqlen_local, 1)
+    first_invalid = (q_positions + 1).unsqueeze(1) // ratio
+    compressed = torch.where(group_idx >= first_invalid, torch.full_like(group_idx, -1), group_idx + offset)
+    return compressed.unsqueeze(0).expand(batch_size, -1, -1)
 
 
 def _run_forward_backward(fn, inputs, grad_output):
@@ -98,6 +137,137 @@ class TestDeepseekV4AttentionMask:
         assert (topk >= 6).sum().item() == 0
         assert topk[0, 0, -2].item() == 4
         assert topk[0, 0, -1].item() == -1
+
+    def test_sparse_topk_builder_uses_global_query_positions_for_cp(self):
+        topk = build_dsv4_sparse_topk_indices(
+            batch_size=1,
+            seq_len=2,
+            key_len=10,
+            vanilla_key_len=8,
+            window_size=4,
+            device=torch.device("cpu"),
+            compress_ratio=4,
+            n_pooled=2,
+            q_positions=torch.tensor([[4, 5]]),
+        )
+
+        torch.testing.assert_close(topk[0, 0], torch.tensor([1, 2, 3, 4, 8, -1]))
+        torch.testing.assert_close(topk[0, 1], torch.tensor([2, 3, 4, 5, 8, -1]))
+
+    def test_cp_causal_mask_uses_local_queries_and_global_keys(self):
+        mask = build_dsv4_cp_causal_padding_mask(
+            position_ids=torch.tensor([[4, 5]]),
+            key_len=8,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            cp_group=None,
+            sliding_window=3,
+        )
+
+        min_val = torch.finfo(torch.float32).min
+        expected = torch.full((1, 1, 2, 8), min_val)
+        expected[0, 0, 0, 2:5] = 0
+        expected[0, 0, 1, 3:6] = 0
+        torch.testing.assert_close(mask, expected)
+
+    def test_query_positions_match_miles_contiguous_cp(self, monkeypatch):
+        cp_group = object()
+        monkeypatch.setattr(dsv4_layers, "dsv4_cp_enabled", lambda group: group is cp_group)
+        monkeypatch.setattr(dsv4_layers, "dsv4_cp_rank", lambda group: 2)
+
+        actual = dsv4_layers._query_positions(
+            None,
+            batch=3,
+            seq_len=5,
+            device=torch.device("cpu"),
+            cp_group=cp_group,
+        )
+        expected = _miles_q_positions(5, cp_rank=2, device=torch.device("cpu")).unsqueeze(0).expand(3, -1)
+
+        torch.testing.assert_close(actual, expected)
+
+    @pytest.mark.parametrize("cp_size", [1, 2, 4])
+    @pytest.mark.parametrize("cp_rank", [0, 1])
+    def test_sparse_topk_window_matches_miles_cp_formula(self, cp_size, cp_rank):
+        if cp_rank >= cp_size:
+            pytest.skip("rank does not exist for this cp_size")
+        batch_size, seqlen_local, window_size = 2, 6, 5
+        q_positions = _miles_q_positions(seqlen_local, cp_rank=cp_rank, device=torch.device("cpu"))
+        expected = _miles_window_topk_idxs(
+            q_positions,
+            window_size=window_size,
+            cp_size=cp_size,
+            batch_size=batch_size,
+        )
+
+        actual = build_dsv4_sparse_topk_indices(
+            batch_size=batch_size,
+            seq_len=seqlen_local,
+            key_len=seqlen_local * cp_size,
+            vanilla_key_len=seqlen_local * cp_size,
+            window_size=window_size,
+            device=torch.device("cpu"),
+            q_positions=q_positions,
+        )
+
+        torch.testing.assert_close(actual, expected)
+
+    @pytest.mark.parametrize("cp_size", [1, 2, 4])
+    @pytest.mark.parametrize("cp_rank", [0, 1])
+    def test_sparse_topk_compressed_tail_matches_miles_cp_formula(self, cp_size, cp_rank):
+        if cp_rank >= cp_size:
+            pytest.skip("rank does not exist for this cp_size")
+        batch_size, seqlen_local, ratio, window_size = 2, 8, 4, 3
+        seqlen_global = seqlen_local * cp_size
+        n_pooled = seqlen_global // ratio
+        q_positions = _miles_q_positions(seqlen_local, cp_rank=cp_rank, device=torch.device("cpu"))
+        expected_compressed = _miles_compress_topk_idxs(
+            q_positions,
+            ratio=ratio,
+            cp_size=cp_size,
+            batch_size=batch_size,
+        )
+
+        actual = build_dsv4_sparse_topk_indices(
+            batch_size=batch_size,
+            seq_len=seqlen_local,
+            key_len=seqlen_global + n_pooled,
+            vanilla_key_len=seqlen_global,
+            window_size=window_size,
+            device=torch.device("cpu"),
+            compress_ratio=ratio,
+            n_pooled=n_pooled,
+            q_positions=q_positions,
+        )
+
+        torch.testing.assert_close(actual[..., window_size:], expected_compressed)
+
+    def test_overlap_transform_with_cp_matches_miles_global_boundary(self, monkeypatch):
+        cp_group = object()
+        batch, local_windows, ratio, head_dim = 1, 2, 4, 3
+        rank0 = torch.arange(batch * local_windows * ratio * 2 * head_dim, dtype=torch.float32).view(
+            batch, local_windows, ratio, 2 * head_dim
+        )
+        rank1 = rank0 + 1000
+        full = torch.cat([rank0, rank1], dim=1)
+        expected = dsv4_layers._overlap_transform(full, head_dim=head_dim, fill_value=-99.0)[:, local_windows:]
+
+        monkeypatch.setattr(dsv4_layers, "dsv4_cp_enabled", lambda group: group is cp_group)
+        monkeypatch.setattr(dsv4_layers, "dsv4_cp_rank", lambda group: 1)
+        monkeypatch.setattr(
+            dsv4_layers,
+            "dsv4_cp_all_gather",
+            lambda tensor, *, dim, cp_group: full,
+        )
+
+        actual = dsv4_layers._overlap_transform_with_cp(
+            rank1,
+            head_dim=head_dim,
+            fill_value=-99.0,
+            cp_group=cp_group,
+        )
+
+        torch.testing.assert_close(actual, expected)
 
     def test_packed_topk_uses_padded_lengths_for_tail_padding(self):
         seq_len = 8

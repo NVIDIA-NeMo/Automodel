@@ -459,3 +459,153 @@ def test_prepare_model_inputs_threads_per_layer_inputs(monkeypatch):
     prepared = model.prepare_model_inputs_for_cp(input_ids=torch.tensor([[1, 42, 3, 4]]))
     assert "per_layer_inputs" in prepared
     assert prepared["per_layer_inputs"].shape == (1, 4, 8)
+
+
+# ---------------------------------------------------------------------------
+# get_capabilities: dense 31B supports CP; E2B/E4B (audio) does not; MoE does
+# ---------------------------------------------------------------------------
+def test_get_capabilities_plain_dense_supports_cp():
+    caps = Gemma4ForConditionalGeneration.get_capabilities(_cfg(enable_moe_block=False))
+    assert caps.supports_cp is True
+    assert caps.supports_tp is True
+    assert caps.supports_pp is True
+    assert caps.supports_ep is False
+
+
+def test_get_capabilities_dense_audio_variant_no_cp():
+    # E2B/E4B: dense + audio_config present -> CP intentionally unsupported
+    # (kv-sharing + per-layer-inputs not yet wired through the ring).
+    cfg = _cfg(enable_moe_block=False)
+    cfg.audio_config = {}  # non-None marks the dense+audio variant (E2B/E4B)
+    caps = Gemma4ForConditionalGeneration.get_capabilities(cfg)
+    assert caps.supports_cp is False
+
+
+def test_get_capabilities_moe_supports_cp_and_ep():
+    caps = Gemma4ForConditionalGeneration.get_capabilities(_cfg(enable_moe_block=True))
+    assert caps.supports_cp is True
+    assert caps.supports_ep is True
+    assert caps.supports_tp is False
+
+
+# ---------------------------------------------------------------------------
+# Dense __init__ attaches the model-owned ring to each self-attention module
+# ---------------------------------------------------------------------------
+def test_dense_init_attaches_ring_to_self_attention():
+    model = Gemma4ForConditionalGeneration(_cfg(enable_moe_block=False), backend=_backend())
+    hooked = [m for m in model.modules() if getattr(m, "_cp_manual_metadata_keys", None)]
+    # one per dense decoder layer
+    assert len(hooked) == model.config.text_config.num_hidden_layers
+    for m in hooked:
+        assert m._cp_manual_metadata_keys == (
+            "mm_token_type_ids",
+            "_packed_seq_ids",
+            "padding_mask",
+            "_gemma4_vision_group_ids",
+        )
+        assert callable(m.setup_cp_attention)
+
+
+# ---------------------------------------------------------------------------
+# setup_cp_attention: model-level seam, idempotent, fans out to submodules
+# ---------------------------------------------------------------------------
+def test_setup_cp_attention_sets_flag_and_calls_submodules():
+    model = Gemma4ForConditionalGeneration(_cfg(enable_moe_block=False), backend=_backend())
+    calls = {"n": 0}
+    seen_mesh = []
+    for m in model.modules():
+        if m is model:
+            continue
+        if hasattr(m, "setup_cp_attention"):
+
+            def _stub(mesh, _calls=calls, _seen=seen_mesh):
+                _calls["n"] += 1
+                _seen.append(mesh)
+
+            m.setup_cp_attention = _stub
+    mesh = object()
+    model.setup_cp_attention(mesh)
+    assert model._cp_enabled is True
+    assert calls["n"] == model.config.text_config.num_hidden_layers
+    assert all(s is mesh for s in seen_mesh)
+
+
+def test_setup_cp_attention_idempotent():
+    model = Gemma4ForConditionalGeneration(_cfg(enable_moe_block=False), backend=_backend())
+    calls = {"n": 0}
+    for m in model.modules():
+        if m is model:
+            continue
+        if hasattr(m, "setup_cp_attention"):
+            m.setup_cp_attention = lambda mesh, _c=calls: _c.__setitem__("n", _c["n"] + 1)
+    model.setup_cp_attention(object())
+    first = calls["n"]
+    assert first > 0
+    # second call returns early via the _cp_enabled guard -> no extra submodule calls
+    model.setup_cp_attention(object())
+    assert calls["n"] == first
+
+
+# ---------------------------------------------------------------------------
+# _cp_shard_batch: installs the ring (idempotent) then delegates to the sharder
+# ---------------------------------------------------------------------------
+def test_cp_shard_batch_installs_ring_then_delegates(monkeypatch):
+    model = Gemma4ForConditionalGeneration(_cfg(enable_moe_block=False), backend=_backend())
+    installed = {"mesh": None}
+    monkeypatch.setattr(model, "setup_cp_attention", lambda mesh: installed.__setitem__("mesh", mesh))
+
+    sentinel = ("ctx", {"sharded": True})
+    seen = {}
+
+    def fake_shard(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+        seen.update(
+            cp_mesh=cp_mesh, tp_mesh=tp_mesh, batch=batch, loss_mask=loss_mask, padding_token_id=padding_token_id
+        )
+        return sentinel
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.models.gemma4_moe.model.make_contiguous_shard_cp_batch_and_ctx",
+        fake_shard,
+    )
+
+    cp_mesh, tp_mesh, batch = object(), object(), {"input_ids": torch.tensor([[1, 2]])}
+    out = model._cp_shard_batch(cp_mesh, tp_mesh, batch, loss_mask="lm", padding_token_id=7)
+    assert out is sentinel
+    assert installed["mesh"] is cp_mesh  # ring installed with the CP submesh
+    assert seen["cp_mesh"] is cp_mesh and seen["tp_mesh"] is tp_mesh
+    assert seen["loss_mask"] == "lm" and seen["padding_token_id"] == 7
+
+
+def test_prepare_model_inputs_attaches_cp_shard_batch_fn():
+    model = Gemma4ForConditionalGeneration(_cfg(enable_moe_block=False), backend=_backend()).to(torch.bfloat16)
+    prepared = model.prepare_model_inputs_for_cp(input_ids=torch.tensor([[1, 2, 3, 4]]))
+    # The model attaches its own bound batch-sharding callable (model-owned install seam).
+    assert prepared["_cp_make_batch_fn"] == model._cp_shard_batch
+
+
+# ---------------------------------------------------------------------------
+# Dense CP forward stashes CP-sharded metadata on the ring-hooked self_attn modules
+# ---------------------------------------------------------------------------
+def test_forward_dense_cp_stashes_metadata_on_ring_modules():
+    cfg = _cfg(enable_moe_block=False, final_logit_softcapping=30.0)
+    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
+    model.setup_cp_attention(object())  # installs ring -> _cp_uses_attention_hook on self_attn
+
+    batch, seq = 1, 4
+    hidden = torch.randn(batch, seq, cfg.text_config.hidden_size, dtype=torch.bfloat16)
+    packed = torch.tensor([[1, 1, 2, 2]])
+    with mock.patch.object(
+        model.model.language_model,
+        "forward",
+        return_value=SimpleNamespace(
+            last_hidden_state=hidden, past_key_values=None, hidden_states=None, attentions=None
+        ),
+    ):
+        model(input_ids=torch.tensor([[1, 2, 3, 4]]), _packed_seq_ids=packed)
+
+    hooked = [m for m in model.modules() if getattr(m, "_cp_uses_attention_hook", False)]
+    assert hooked, "expected ring-hooked self_attn modules"
+    for m in hooked:
+        meta = m._cp_dense_metadata
+        assert set(meta) == {"mm_token_type_ids", "padding_mask", "_packed_seq_ids", "_gemma4_vision_group_ids"}
+        assert torch.equal(meta["_packed_seq_ids"], packed)

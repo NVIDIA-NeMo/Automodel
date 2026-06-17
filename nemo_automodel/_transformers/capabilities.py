@@ -101,6 +101,17 @@ def _uses_magi_attention(model: "nn.Module") -> bool:
     return getattr(backend, "attn", None) == "magi"
 
 
+def _is_deepseek_v4(model: "nn.Module") -> bool:
+    """True when the model is a DeepSeek V4 custom model.
+
+    DSV4 owns its context-parallel attention (Miles-style contiguous query shard
+    plus all-gathered K/V), so its CP support is gated on the TileLang attention
+    backend rather than the generic TE/SDPA/Magi paths.
+    """
+    config = getattr(model, "config", None)
+    return getattr(config, "model_type", None) == "deepseek_v4" or type(model).__name__.startswith("DeepseekV4")
+
+
 def _is_hybrid(model: "nn.Module") -> bool:
     """True when the model mixes attention with non-attention layers (e.g. Mamba/SSM).
 
@@ -221,6 +232,10 @@ class ModelSupports:
         +------------------+----------------+---------+
         """
         if _has_backend(self._model):
+            if _is_deepseek_v4(self._model):
+                # DSV4 owns its CP attention (Miles-style); gated on TileLang.
+                backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+                return backend_attn == "tilelang"
             backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
             # Hybrids, and custom models that ship their own CP-aware attention and opt in
             # via ``_supports_cp_sdpa``, may run CP on either TE or SDPA attention.
@@ -359,6 +374,15 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
                 f"modify distributed YAML config section:\n"
                 f"distributed:\n"
                 f"  cp_size: 1"
+            )
+        elif _is_deepseek_v4(model):
+            errors.append(
+                f"Context parallelism (cp_size={cp_size}) for {arch} requires "
+                f"the TileLang attention backend (backend.attn='tilelang').\n"
+                f"Please re-run with --distributed.cp_size=1 or switch to TileLang attention:\n"
+                f"model:\n"
+                f"  backend:\n"
+                f"    attn: tilelang"
             )
         elif _has_backend(model):
             errors.append(
