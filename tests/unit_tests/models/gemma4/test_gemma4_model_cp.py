@@ -617,6 +617,25 @@ def test_forward_dense_cp_stashes_metadata_on_ring_modules():
         assert torch.equal(meta["_packed_seq_ids"], packed)
 
 
+def test_forward_dense_cp_injects_kv_share_holder():
+    # CP dense path + kv-sharing active -> the cache-free _Gemma4KVShareHolder is
+    # injected and threaded to the language model (mirrors the non-CP path).
+    cfg = _cfg(enable_moe_block=False, num_kv_shared_layers=2)
+    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
+    model.setup_cp_attention(object())  # flips _cp_enabled -> CP forward branch
+
+    hidden = torch.randn(1, 4, cfg.text_config.hidden_size, dtype=torch.bfloat16)
+    captured = {}
+
+    def fake_lm_forward(*args, **kwargs):
+        captured["pkv"] = kwargs.get("past_key_values")
+        return SimpleNamespace(last_hidden_state=hidden, past_key_values=None, hidden_states=None, attentions=None)
+
+    with mock.patch.object(model.model.language_model, "forward", side_effect=fake_lm_forward):
+        model(input_ids=torch.tensor([[1, 2, 3, 4]]))
+    assert isinstance(captured["pkv"], _Gemma4KVShareHolder)
+
+
 # ---------------------------------------------------------------------------
 # _Gemma4KVShareHolder / _kv_sharing_active
 # (cache-free kv-sharing under use_cache=False / CP, gated to E2B/E4B)
