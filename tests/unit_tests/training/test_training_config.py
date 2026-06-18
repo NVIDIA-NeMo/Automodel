@@ -27,6 +27,7 @@ class TestStepSchedulerConfig:
         assert cfg.save_checkpoint_every_epoch is True
         assert cfg.val_every_steps is None
         assert cfg.log_remote_every_steps == 1
+        assert cfg.loss_average_window_steps == 50
         assert cfg.gc_every_steps is None
         assert cfg.start_step == 0
         assert cfg.start_epoch == 0
@@ -38,6 +39,7 @@ class TestStepSchedulerConfig:
             max_steps=1000,
             ckpt_every_steps=200,
             val_every_steps=50,
+            loss_average_window_steps=25,
             gc_every_steps=10,
         )
         assert cfg.global_batch_size == 64
@@ -45,6 +47,7 @@ class TestStepSchedulerConfig:
         assert cfg.max_steps == 1000
         assert cfg.ckpt_every_steps == 200
         assert cfg.val_every_steps == 50
+        assert cfg.loss_average_window_steps == 25
         assert cfg.gc_every_steps == 10
 
     def test_resume_fields(self):

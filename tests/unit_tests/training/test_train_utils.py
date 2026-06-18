@@ -12,17 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import Mock, patch
-
-import pytest
-import torch
+from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.training.utils import move_to_device, ScopedModuleOffloading
-from nemo_automodel.components.training.utils import clip_grad_norm, count_tail_padding, scale_grads_and_clip_grad_norm
+from nemo_automodel.components.training.utils import (
+    ScopedModuleOffloading,
+    clip_grad_norm,
+    count_tail_padding,
+    move_to_device,
+    scale_grads_and_clip_grad_norm,
+)
 
 
 def test_docstring_example():
@@ -123,6 +125,31 @@ def test_clip_grad_norm_works_without_pp():
     assert grad_norm > 0
 
 
+def test_clip_grad_norm_uses_torch_fast_path_when_requested(monkeypatch):
+    model = torch.nn.Linear(10, 10)
+    model.weight.grad = torch.randn_like(model.weight)
+
+    clip_grad_norm_mock = Mock(return_value=torch.tensor(3.0))
+    clip_grads_with_norm_mock = Mock()
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", clip_grad_norm_mock)
+    monkeypatch.setattr(torch.nn.utils, "clip_grads_with_norm_", clip_grads_with_norm_mock)
+
+    grad_norm = clip_grad_norm(
+        max_grad_norm=1.0,
+        model_parts=[model],
+        pp_enabled=False,
+        foreach=True,
+        use_torch_clip_grad_norm=True,
+    )
+
+    assert grad_norm == 3.0
+    clip_grad_norm_mock.assert_called_once()
+    assert clip_grad_norm_mock.call_args.kwargs["norm_type"] == 2.0
+    assert clip_grad_norm_mock.call_args.kwargs["error_if_nonfinite"] is False
+    assert clip_grad_norm_mock.call_args.kwargs["foreach"] is True
+    clip_grads_with_norm_mock.assert_not_called()
+
+
 def test_clip_grad_norm_returns_zero_when_max_grad_norm_is_none():
     model = torch.nn.Linear(10, 10)
     model.weight.grad = torch.randn_like(model.weight)
@@ -165,9 +192,7 @@ def test_clip_grad_norm_actually_clips():
     model.weight.grad = torch.ones_like(model.weight) * 10.0
     model.bias.grad = torch.ones_like(model.bias) * 10.0
 
-    initial_norm = torch.nn.utils.clip_grad_norm_(
-        [model.weight, model.bias], float("inf")
-    ).item()
+    initial_norm = torch.nn.utils.clip_grad_norm_([model.weight, model.bias], float("inf")).item()
 
     # Reset gradients
     model.weight.grad = torch.ones_like(model.weight) * 10.0

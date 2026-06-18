@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from unittest.mock import Mock
 
 import pytest
@@ -673,24 +674,36 @@ class TestConvertSingleTensorToHf:
         assert result == [("mtp.fc.weight", tensor)]
 
     def test_mtp_expert_key_conversion(self, adapter):
+        # MTP experts convert to the GROUPED HF layout, identical to the main
+        # decoder layers — not per-expert keys (AM-442).
         tensor = torch.randn(4, 64, 128)
         result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.gate_and_up_projs", tensor)
 
-        assert len(result) == 8
-        out = dict(result)
-        assert "mtp.layers.0.mlp.experts.0.gate_proj.weight" in out
-        assert "mtp.layers.0.mlp.experts.0.up_proj.weight" in out
-        torch.testing.assert_close(out["mtp.layers.0.mlp.experts.0.gate_proj.weight"], tensor[0, :, :64].T)
-        torch.testing.assert_close(out["mtp.layers.0.mlp.experts.0.up_proj.weight"], tensor[0, :, 64:].T)
+        assert len(result) == 1
+        key, value = result[0]
+        assert key == "mtp.layers.0.mlp.experts.gate_up_proj"
+        torch.testing.assert_close(value, tensor.transpose(1, 2))
+        # No per-expert keys are emitted.
+        assert not any(".experts.0." in k for k, _ in result)
 
     def test_mtp_down_expert_key_conversion(self, adapter):
         tensor = torch.randn(4, 64, 32)
         result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.down_projs", tensor)
 
-        assert len(result) == 4
-        out = dict(result)
-        assert "mtp.layers.0.mlp.experts.0.down_proj.weight" in out
-        torch.testing.assert_close(out["mtp.layers.0.mlp.experts.0.down_proj.weight"], tensor[0].T)
+        assert len(result) == 1
+        key, value = result[0]
+        assert key == "mtp.layers.0.mlp.experts.down_proj"
+        torch.testing.assert_close(value, tensor.transpose(1, 2))
+
+    def test_mtp_experts_emit_no_per_expert_keys(self, adapter):
+        """AM-442 regression: to_hf must not fabricate per-expert MTP keys that are
+        absent from the grouped checkpoint (e.g. ``...experts.224.down_proj.weight``)."""
+        for native in ("mtp.layers.0.mlp.experts.gate_and_up_projs", "mtp.layers.0.mlp.experts.down_projs"):
+            result = adapter.convert_single_tensor_to_hf(native, torch.randn(4, 64, 32))
+            assert len(result) == 1
+            key = result[0][0]
+            assert key in ("mtp.layers.0.mlp.experts.gate_up_proj", "mtp.layers.0.mlp.experts.down_proj")
+            assert not re.search(r"\.experts\.\d+\.", key)
 
 
 # ---------------------------------------------------------------------------
@@ -861,3 +874,65 @@ class TestFp32ParamRouting:
         assert "model.language_model.layers.0.linear_attn._fp32_params.A_log" in out
         assert "model.language_model.layers.0.linear_attn._fp32_params.dt_bias" in out
         assert "model.language_model.layers.0.linear_attn.A_log" not in out
+
+    def test_to_hf_strips_a_log_holder(self, adapter):
+        sd = {"model.language_model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4)}
+        out = adapter.to_hf(sd)
+        assert "model.language_model.layers.0.linear_attn.A_log" in out
+        assert all("_fp32_params" not in k for k in out)
+
+    def test_to_hf_strips_dt_bias_holder(self, adapter):
+        sd = {"model.language_model.layers.2.linear_attn._fp32_params.dt_bias": torch.ones(4)}
+        out = adapter.to_hf(sd)
+        assert "model.language_model.layers.2.linear_attn.dt_bias" in out
+        assert all("_fp32_params" not in k for k in out)
+
+    def test_to_hf_upcasts_gdn_fp32_params_saved_as_bf16(self, adapter):
+        sd = {
+            "model.language_model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.linear_attn._fp32_params.dt_bias": torch.ones(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+        }
+
+        out = adapter.to_hf(sd)
+
+        assert out["model.language_model.layers.0.linear_attn.A_log"].dtype == torch.float32
+        assert out["model.language_model.layers.0.linear_attn.dt_bias"].dtype == torch.float32
+        q_proj_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        assert out[q_proj_key] is sd[q_proj_key]
+        assert out[q_proj_key].dtype == torch.bfloat16
+
+    def test_convert_single_tensor_strips_holder(self, adapter):
+        result = adapter.convert_single_tensor_to_hf(
+            "model.language_model.layers.1.linear_attn._fp32_params.A_log", torch.zeros(4)
+        )
+        assert [k for k, _ in result] == ["model.language_model.layers.1.linear_attn.A_log"]
+
+    def test_convert_single_tensor_upcasts_gdn_fp32_params(self, adapter):
+        result = adapter.convert_single_tensor_to_hf(
+            "model.language_model.layers.1.linear_attn._fp32_params.dt_bias",
+            torch.zeros(4, dtype=torch.bfloat16),
+        )
+        assert result[0][0] == "model.language_model.layers.1.linear_attn.dt_bias"
+        assert result[0][1].dtype == torch.float32
+
+    def test_bare_key_unchanged(self, adapter):
+        result = adapter.convert_single_tensor_to_hf("model.language_model.layers.0.linear_attn.A_log", torch.zeros(4))
+        assert [k for k, _ in result] == ["model.language_model.layers.0.linear_attn.A_log"]
+
+    def test_from_hf_routes_and_upcasts_gdn_fp32_params_loaded_as_bf16(self, adapter):
+        hf_state = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        a_log_key = "model.language_model.layers.0.linear_attn._fp32_params.A_log"
+        dt_bias_key = "model.language_model.layers.0.linear_attn._fp32_params.dt_bias"
+        q_proj_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        assert out[a_log_key].dtype == torch.float32
+        assert out[dt_bias_key].dtype == torch.float32
+        assert out[q_proj_key] is hf_state[q_proj_key]
+        assert out[q_proj_key].dtype == torch.bfloat16

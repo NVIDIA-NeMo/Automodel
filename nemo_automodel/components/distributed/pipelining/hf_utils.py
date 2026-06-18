@@ -318,6 +318,15 @@ def create_pipeline_forward_gemma4_text() -> Callable:
 
         hidden_states = inputs_embeds
         config_layer_types = getattr(self.config, "layer_types", None)
+        # HF transfomers v5.8.1+ Gemma4 attention threads a single mutable mapping through every decoder
+        # layer for kv-sharing: "full-length" layers (store_full_length_kv) write their
+        # keys/values into it and kv-shared layers (is_kv_shared_layer) read them back.
+        # The decoder-layer kwarg defaults to None, so a store layer would execute
+        # ``None[layer_type] = ...`` -> TypeError. Create one per stage and thread it,
+        # mirroring HF's Gemma4TextModel.forward. gemma-4-31B, 26B-A4B have num_kv_shared_layers=0
+        # (no readers, store is a harmless no-op write); for a kv-sharing model split
+        # across PP stages only within-stage sharing would work here.
+        shared_kv_states: dict = {}
         if hasattr(self, "layers") and self.layers is not None:
             layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
             for decoder_layer in layer_iter:
@@ -340,6 +349,7 @@ def create_pipeline_forward_gemma4_text() -> Callable:
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                     padding_mask=padding_mask,
+                    shared_kv_states=shared_kv_states,
                 )
                 hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
 

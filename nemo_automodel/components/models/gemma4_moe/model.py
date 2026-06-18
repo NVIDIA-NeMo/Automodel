@@ -19,7 +19,8 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
-from typing import Any, Optional, Union
+from collections.abc import MutableMapping
+from typing import Any, Iterator, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -126,6 +127,60 @@ def _kv_sharing_active(text_config) -> bool:
 
 
 from .state_dict_adapter import Gemma4MoEStateDictAdapter
+
+
+class _FSDPSafeSharedKVStates(MutableMapping):
+    """A dict-like store for Gemma4 key/value sharing that is safe to pass through FSDP2.
+
+    What Gemma4 needs:
+        In Gemma4, the later "kv-shared" attention layers do not compute their
+        own keys/values -- they reuse the keys/values produced by an earlier
+        layer. HuggingFace implements this by passing ONE shared key/value store
+        into every decoder layer's ``forward()``: the earlier layer writes its
+        keys/values into the store, and the later layers read them back out. This
+        only works if every layer is handed the *same* store object.
+
+    Why a plain ``dict`` breaks under FSDP2:
+        With FSDP2 each decoder layer is wrapped as its own unit, and the default
+        mixed-precision setting (``cast_forward_inputs=True``) makes FSDP2 look at
+        every argument passed to a layer and cast its float tensors to bf16. It
+        does this with torch's ``_apply_to_tensors``, which, whenever it sees a
+        ``dict`` (or ``list``/``tuple``/``set``/...), builds a brand-new copy of
+        it. So if the shared store is a plain ``dict``, each layer receives its
+        own private copy: the earlier layer's writes land in a copy that is thrown
+        away, and the later layers read from an empty copy -- which raises
+        ``KeyError: 'sliding_attention'``.
+
+    Why this class fixes it:
+        ``_apply_to_tensors`` only copies the specific types it knows about
+        (``dict``, ``OrderedDict``, ``list``, ``tuple``, ``set``, namedtuples,
+        dataclasses, ``PackedSequence``); any other object it leaves alone and
+        passes straight through. This class behaves like a dict (it implements
+        ``MutableMapping``) but is deliberately NOT a ``dict`` subclass, so FSDP2
+        hands the SAME instance to every layer and the writes are preserved.
+
+        Note: this dict-based sharing is how transformers 5.8.x works. In 5.5 the
+        shared keys/values were stored on the ``Cache`` object instead (which
+        FSDP2 also passes through untouched), so this problem did not exist there.
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def __getitem__(self, key: str) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._store[key]
+
+    def __setitem__(self, key: str, value: tuple[torch.Tensor, torch.Tensor]) -> None:
+        self._store[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self._store[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._store)
+
+    def __len__(self) -> int:
+        return len(self._store)
 
 
 # ---------------------------------------------------------------------------
@@ -654,9 +709,13 @@ class Gemma4MoETextModelBackend(nn.Module):
         for layer_type in set(self.config.layer_types):
             position_embeddings[layer_type] = self.rotary_emb(hidden_states, position_ids, layer_type)
 
-        # Single dict shared across all layers so kv-sharing layers can reuse the
-        # full-length keys/values cached by earlier layers (HF contract).
-        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        # One shared key/value store passed to every layer: the later kv-shared
+        # layers reuse the keys/values that earlier layers write here. It must be
+        # an _FSDPSafeSharedKVStates and NOT a plain dict -- under FSDP2 each
+        # layer is wrapped separately and FSDP2's input casting makes a fresh copy
+        # of any plain dict per layer, so the writes would be lost. See
+        # _FSDPSafeSharedKVStates for the full explanation.
+        shared_kv_states = _FSDPSafeSharedKVStates()
         for decoder_layer in self.layers.values():
             hidden_states = decoder_layer(
                 hidden_states,
@@ -1065,6 +1124,20 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             # Dense path — delegate to HF forward (which already supports
             # logits_to_keep + output_hidden_states and returns a ModelOutput
             # carrying logits and hidden_states).
+            #
+            # Gemma4 HF transformers shares keys/values between attention layers by passing
+            # one shared key/value store into every decoder layer (earlier layers
+            # write it, later "kv-shared" layers read it). NOTE: this dict-based
+            # design is new in transformers 5.8.x; 5.5 stored the shared
+            # keys/values on the Cache object instead.
+            #
+            # Under FSDP2 each layer is wrapped separately and the input-casting
+            # step (cast_forward_inputs) makes a fresh copy of any plain dict
+            # before each layer runs, so the earlier layer's writes never reach
+            # the later layers -> KeyError. Pass an _FSDPSafeSharedKVStates
+            # instead, which FSDP2 leaves as one shared object. setdefault avoids
+            # overwriting a store a caller already provided (e.g. the drafter).
+            kwargs.setdefault("shared_kv_states", _FSDPSafeSharedKVStates())
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
