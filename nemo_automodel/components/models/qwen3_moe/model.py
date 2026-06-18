@@ -232,6 +232,16 @@ class Qwen3MoeModel(nn.Module):
 
 
 class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    # Skip patch_hf_model_for_pp: this model's own forward already handles
+    # pipeline-parallel stage routing (embed_tokens/norm/lm_head are None off the
+    # owning stage; hidden states arrive in the input_ids slot) AND context
+    # parallelism + THD via the native freqs_cis path
+    # (position_ids_to_freqs_cis + apply_rotary_emb_qk with cu_seqlens/cp_*).
+    # The generic HF pipeline forward assumes the HF rotary API
+    # (rotary_emb(x, position_ids) -> cos/sin) and crashes on the freqs_cis /
+    # THD / CP path, so it must not clobber our forward.
+    _pp_keep_self_forward: bool = True
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
