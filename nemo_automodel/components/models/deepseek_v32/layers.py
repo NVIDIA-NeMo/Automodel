@@ -111,10 +111,11 @@ def _to_additive_key_mask(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tenso
     swamps the (scaled) score differences and collapses attention toward uniform. A mask that is
     already additive (values <= 0) is returned unchanged.
     """
+    neg = torch.finfo(dtype).min  # SDPA-safe large-negative (NOT -inf, which breaks F.sdpa kernels)
     if mask.dtype == torch.bool:
-        return torch.zeros_like(mask, dtype=dtype).masked_fill(~mask, float("-inf"))
-    if mask.max() > 0:  # {0,1} keep-mask -> additive (kept -> 0, masked -> -inf)
-        return torch.zeros_like(mask, dtype=dtype).masked_fill(mask <= 0, float("-inf"))
+        return torch.zeros_like(mask, dtype=dtype).masked_fill(~mask, neg)
+    if mask.max() > 0:  # {0,1} keep-mask -> additive (kept -> 0, masked -> neg)
+        return torch.zeros_like(mask, dtype=dtype).masked_fill(mask <= 0, neg)
     return mask.to(dtype)
 
 
@@ -457,12 +458,16 @@ class DeepseekV32MLA(nn.Module):
                 - [1, n_heads, T, T] for thd format
         """
         device = topk_indices.device
+        # SDPA-safe masked value: F.scaled_dot_product_attention mishandles -inf float masks
+        # (its fused kernels corrupt the softmax); transformers/HF use finfo.min for exactly this.
+        # TE's core_attention_bias tolerates -inf, which is why only the SDPA path was affected.
+        neg = torch.finfo(dtype).min
 
         if qkv_format == "thd":
             num_tokens = topk_indices.shape[0]
             # Create mask directly in final shape [1, n_heads, T, T]
             # All heads share the same mask, so we create [T, T] and expand
-            sparse_mask = torch.full((num_tokens, num_tokens), float("-inf"), device=device, dtype=dtype).scatter_(
+            sparse_mask = torch.full((num_tokens, num_tokens), neg, device=device, dtype=dtype).scatter_(
                 -1, topk_indices, 0.0
             )
             # expand creates a view, contiguous makes a copy
@@ -470,7 +475,7 @@ class DeepseekV32MLA(nn.Module):
         else:
             if union_across_batches:
                 # For TE: create [B, S, S], scatter, union via max, then expand
-                sparse_mask = torch.full((bsz, seq_len, seq_len), float("-inf"), device=device, dtype=dtype).scatter_(
+                sparse_mask = torch.full((bsz, seq_len, seq_len), neg, device=device, dtype=dtype).scatter_(
                     -1, topk_indices, 0.0
                 )
                 # Union: max(0, -inf) = 0 for any position selected in any batch
@@ -478,7 +483,7 @@ class DeepseekV32MLA(nn.Module):
                 sparse_mask = sparse_mask.view(1, 1, seq_len, seq_len).expand(1, n_heads, -1, -1).contiguous()
             else:
                 # For SDPA: create [B, S, S], scatter, expand (no contiguous needed)
-                sparse_mask = torch.full((bsz, seq_len, seq_len), float("-inf"), device=device, dtype=dtype).scatter_(
+                sparse_mask = torch.full((bsz, seq_len, seq_len), neg, device=device, dtype=dtype).scatter_(
                     -1, topk_indices, 0.0
                 )
                 sparse_mask = sparse_mask.unsqueeze(1).expand(-1, n_heads, -1, -1)
@@ -489,7 +494,7 @@ class DeepseekV32MLA(nn.Module):
         # without it the DSA attention is bidirectional and leaks the next token.
         q_len, k_len = sparse_mask.shape[-2], sparse_mask.shape[-1]
         causal_bool = torch.ones(q_len, k_len, dtype=torch.bool, device=sparse_mask.device).triu(1)
-        sparse_mask = sparse_mask.masked_fill(causal_bool, float("-inf"))
+        sparse_mask = sparse_mask.masked_fill(causal_bool, neg)
 
         # Combine with the attention mask if provided. Convert a {0,1} keep-mask to an additive
         # key mask (kept -> 0, padding -> -inf) and broadcast it over the key axis; adding a raw
@@ -498,7 +503,9 @@ class DeepseekV32MLA(nn.Module):
             am = _to_additive_key_mask(attention_mask, sparse_mask.dtype)
             while am.dim() < sparse_mask.dim():  # [B, S_key] -> [B, 1, 1, S_key]
                 am = am.unsqueeze(1)
-            sparse_mask = sparse_mask + am
+            # Clamp so doubly-masked positions (top-k/causal AND padding) don't sum past finfo.min
+            # into -inf, which would reintroduce the SDPA -inf problem.
+            sparse_mask = (sparse_mask + am).clamp_min(neg)
 
         return sparse_mask
 
@@ -572,7 +579,8 @@ class DeepseekV32MLA(nn.Module):
                 qkv_format,
                 bsz,
                 n_heads=1,
-                dtype=torch.float32,
+                dtype=x.dtype,  # model (bf16) dtype, matching HF: an fp32 finfo.min mask downcasts
+                # to -inf in bf16 inside F.sdpa -> NaN; a bf16 finfo.min mask is representable.
                 attention_mask=attention_mask,
                 union_across_batches=False,
             )
