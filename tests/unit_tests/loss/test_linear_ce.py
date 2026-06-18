@@ -201,6 +201,8 @@ def test_fused_cross_entropy_thd_shape_reconciliation(monkeypatch):
     ``[1, T] != [B, S]`` and raises. The forward must collapse both to a single
     token axis (``[N, H]`` / ``[N]``) first.
     """
+    if not torch.cuda.is_available():
+        pytest.skip("This test requires a GPU")
     from nemo_automodel.components.loss import linear_ce as linear_ce_mod
 
     monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
