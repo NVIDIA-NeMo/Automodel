@@ -19,10 +19,12 @@ weights, applying config overrides, and instantiating the model.
 """
 
 import gc
+import glob
 import inspect
 import json
 import logging
 import os
+import shutil
 import threading
 from contextlib import contextmanager
 
@@ -361,13 +363,16 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
 
 
 def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs):
-    """Populate HF's dynamic-module (custom code) cache on global rank 0 first.
+    """Fully populate HF's dynamic-module (custom code) cache on global rank 0 first.
 
-    When many ranks reload a trust_remote_code / ``auto_map`` checkpoint from a shared
-    filesystem, they race to copy ``modeling_*.py`` and its relative imports into the
-    shared ``transformers_modules`` cache; a peer can read a partially-copied tree and
-    die with ``FileNotFoundError`` on a transitively-imported file. Resolving the
-    classes once under ``FirstRankPerNode`` fills the cache before peers read it.
+    ``get_cached_module_file`` copies a custom-code file plus its *direct* relative
+    imports, but ``get_class_in_module`` later validates the *transitive* closure. A
+    checkpoint whose ``modeling_*.py`` reaches a shim only transitively (e.g. DeciLM:
+    ``modeling_decilm -> configuration_decilm -> transformers_4_44_2__configuration_llama``)
+    then dies with ``FileNotFoundError`` because that file was never copied into the
+    model's cache dir; multi-rank reloads from a shared filesystem also race on the
+    partial copy. Copy every ``.py`` from the checkpoint dir into the resolved cache
+    dir under ``FirstRankPerNode`` so the closure is complete before any rank reads it.
     Best-effort: any failure falls through to HF's own (un-serialized) resolution.
     """
     if not pretrained_model_name_or_path or not os.path.isdir(str(pretrained_model_name_or_path)):
@@ -376,25 +381,25 @@ def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwa
     if not isinstance(auto_map, dict) or not auto_map:
         return
     try:
-        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+        from transformers.dynamic_module_utils import HF_MODULES_CACHE, get_cached_module_file
     except Exception:
         return
-    refs: list = []
+    src_dir = str(pretrained_model_name_or_path)
+    module_files = set()
     for value in auto_map.values():
-        refs.extend(value if isinstance(value, (list, tuple)) else [value])
+        for ref in value if isinstance(value, (list, tuple)) else [value]:
+            if isinstance(ref, str) and "." in ref:
+                module_files.add(ref.rsplit(".", 1)[0] + ".py")
+    src_py = glob.glob(os.path.join(src_dir, "*.py"))
     with dist_utils.FirstRankPerNode():
-        for ref in refs:
-            if not isinstance(ref, str) or "." not in ref:
-                continue
+        for module_file in module_files:
             try:
-                get_class_from_dynamic_module(
-                    ref,
-                    pretrained_model_name_or_path,
-                    revision=kwargs.get("revision"),
-                    code_revision=kwargs.get("code_revision"),
-                    cache_dir=kwargs.get("cache_dir"),
-                    local_files_only=kwargs.get("local_files_only", False),
-                )
+                cached = get_cached_module_file(src_dir, module_file)
+                cache_dir = os.path.dirname(os.path.join(HF_MODULES_CACHE, cached))
+                for src in src_py:
+                    dst = os.path.join(cache_dir, os.path.basename(src))
+                    if not os.path.exists(dst):
+                        shutil.copy2(src, dst)
             except Exception:
                 pass
 
