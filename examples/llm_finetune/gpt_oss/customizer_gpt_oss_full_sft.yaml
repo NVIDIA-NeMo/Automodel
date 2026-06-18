@@ -15,7 +15,8 @@ model:
   attn_implementation: sdpa
   backend:
     _target_: nemo_automodel.components.models.common.utils.BackendConfig
-    dispatcher: torch
+    experts: gmm
+    dispatcher: deepep
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: 8
