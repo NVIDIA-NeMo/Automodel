@@ -131,6 +131,34 @@ class TestNemotronV3Model:
         assert model.layers["0"].block_type == "attention"
         assert model.layers["1"].block_type == "mlp"
 
+    def test_dense_model_builds_with_no_moe_config(self, backend):
+        """Dense Nemotron-H (no 'moe' layers, expert fields absent) builds with
+        moe_config=None and runs forward. Regression guard for issue #2004."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+
+        config = MockNemotronV3Config(layers_block_type=["attention", "mlp"])
+        # Real dense configs (e.g. NVIDIA-Nemotron-3-Nano-4B-BF16) omit the MoE fields.
+        for attr in (
+            "n_routed_experts",
+            "num_experts_per_tok",
+            "n_group",
+            "topk_group",
+            "routed_scaling_factor",
+            "moe_intermediate_size",
+            "norm_topk_prob",
+            "moe_shared_expert_intermediate_size",
+        ):
+            delattr(config, attr)
+
+        model = NemotronV3Model(config, backend=backend).to(torch.bfloat16)
+        assert model.moe_config is None
+        assert len(model.layers) == config.num_hidden_layers
+
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+        output = model(input_ids)
+        assert output.shape == (batch_size, seq_len, config.hidden_size)
+
     def test_model_embedding_dimensions(self, config, backend):
         """Test that embeddings have correct dimensions."""
         from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model

@@ -85,34 +85,50 @@ class NemotronV3Model(nn.Module):
         self.backend = backend or BackendConfig()
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
-        moe_defaults = dict(
-            n_routed_experts=config.n_routed_experts,
-            n_shared_experts=1,  # NemotronV3 has 1 shared expert
-            n_activated_experts=config.num_experts_per_tok,
-            n_expert_groups=config.n_group,
-            n_limited_groups=config.topk_group,
-            train_gate=True,
-            gate_bias_update_factor=0.0,
-            aux_loss_coeff=0.0,  # No aux loss for NemotronV3
-            score_func="sigmoid",  # NemotronV3 uses sigmoid scoring
-            route_scale=config.routed_scaling_factor,
-            dim=config.hidden_size,
-            inter_dim=config.intermediate_size,  # For shared expert
-            moe_inter_dim=config.moe_intermediate_size,  # For routed experts
-            norm_topk_prob=config.norm_topk_prob,
-            router_bias=False,
-            expert_bias=config.mlp_bias,
-            expert_activation="relu2",  # NemotronV3 uses ReLU² activation
-            dtype=config.torch_dtype,
-            shared_expert_gate=False,
-            shared_expert_inter_dim=config.moe_shared_expert_intermediate_size,
-            shared_expert_activation="relu2",  # Use ReLU² for shared experts
-            force_e_score_correction_bias=True,  # NemotronV3 checkpoint has this buffer
-            moe_latent_size=getattr(config, "moe_latent_size", None),
+        # Dense Nemotron-H variants (e.g. the Nano 4B / 9B / 12B BF16 models) have no MoE
+        # layers, and their HF config omits the n_routed_experts / moe_* fields, so eagerly
+        # building a MoEConfig would raise AttributeError. Only construct it when the model
+        # actually has MoE layers (or one was supplied explicitly). A dense model carries
+        # moe_config=None, which NemotronV3Block only ever dereferences in its "moe" branch
+        # (never reached for mamba/attention/mlp layers).
+        layer_block_types = getattr(config, "layers_block_type", None) or []
+        has_moe = (
+            moe_config is not None
+            or moe_overrides is not None
+            or "moe" in layer_block_types
+            or getattr(config, "n_routed_experts", None) is not None
         )
-        if moe_overrides:
-            moe_defaults.update(moe_overrides)
-        self.moe_config = moe_config or MoEConfig(**moe_defaults)
+        if not has_moe:
+            self.moe_config = None
+        else:
+            moe_defaults = dict(
+                n_routed_experts=config.n_routed_experts,
+                n_shared_experts=1,  # NemotronV3 has 1 shared expert
+                n_activated_experts=config.num_experts_per_tok,
+                n_expert_groups=config.n_group,
+                n_limited_groups=config.topk_group,
+                train_gate=True,
+                gate_bias_update_factor=0.0,
+                aux_loss_coeff=0.0,  # No aux loss for NemotronV3
+                score_func="sigmoid",  # NemotronV3 uses sigmoid scoring
+                route_scale=config.routed_scaling_factor,
+                dim=config.hidden_size,
+                inter_dim=config.intermediate_size,  # For shared expert
+                moe_inter_dim=config.moe_intermediate_size,  # For routed experts
+                norm_topk_prob=config.norm_topk_prob,
+                router_bias=False,
+                expert_bias=config.mlp_bias,
+                expert_activation="relu2",  # NemotronV3 uses ReLU² activation
+                dtype=config.torch_dtype,
+                shared_expert_gate=False,
+                shared_expert_inter_dim=config.moe_shared_expert_intermediate_size,
+                shared_expert_activation="relu2",  # Use ReLU² for shared experts
+                force_e_score_correction_bias=True,  # NemotronV3 checkpoint has this buffer
+                moe_latent_size=getattr(config, "moe_latent_size", None),
+            )
+            if moe_overrides:
+                moe_defaults.update(moe_overrides)
+            self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         # Embeddings
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)

@@ -59,11 +59,14 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
     def __init__(
         self,
         config,
-        moe_config: MoEConfig,
+        moe_config: MoEConfig | None,
         backend: BackendConfig,
         dtype: torch.dtype = torch.bfloat16,
     ):
         self.config = config
+        # moe_config is None for dense Nemotron-H variants (no MoE layers); the
+        # expert merge/split paths below are only reached for ``.mixer.experts.`` keys,
+        # which dense checkpoints never contain.
         self.moe_config = moe_config
         self.backend = backend
         self.dtype = dtype
@@ -175,8 +178,14 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
 
             renamed_state_dict[new_key] = value
 
-        # Then merge experts using the mixin method
-        merged = self._from_hf_w_merged_experts(renamed_state_dict, device_mesh)
+        # Then merge experts using the mixin method. Dense Nemotron-H variants have no
+        # experts (moe_config is None) and no '.mixer.experts.' keys, so the merge is a
+        # pure pass-through — skip it; the mixin would otherwise dereference
+        # moe_config.n_routed_experts.
+        if self.moe_config is None:
+            merged = renamed_state_dict
+        else:
+            merged = self._from_hf_w_merged_experts(renamed_state_dict, device_mesh)
 
         # Re-route MTP keys through the standard merge with prefix stripped.
         if mtp_state_dict:
@@ -215,8 +224,13 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
                 result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
             return result
 
-        # Try to convert merged expert weights to split experts
-        expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
+        # Try to convert merged expert weights to split experts. Dense variants have no
+        # experts (moe_config is None), so skip straight to the standard rename path.
+        expert_result = (
+            None
+            if self.moe_config is None
+            else self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
+        )
         if expert_result is not None:
             result = expert_result
         else:

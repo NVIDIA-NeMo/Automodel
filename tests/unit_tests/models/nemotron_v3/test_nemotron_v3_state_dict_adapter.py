@@ -113,6 +113,55 @@ class TestNemotronV3StateDictAdapter:
         assert "model.layers.{}.mixer.experts.{}.down_proj.weight" in adapter.from_hf_map
 
 
+class TestNemotronV3AdapterDense:
+    """Dense Nemotron-H adapter (moe_config=None) — issue #2004.
+
+    Dense checkpoints carry no '.mixer.experts.' keys, so from_hf/to_hf reduce to
+    pure renames (backbone<->model, norm_f<->norm, embeddings<->embed_tokens) and
+    must not dereference moe_config.
+    """
+
+    @pytest.fixture
+    def backend(self):
+        return BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", enable_deepep=False)
+
+    @pytest.fixture
+    def adapter(self, backend):
+        return NemotronV3StateDictAdapter(config=MockNemotronV3Config(), moe_config=None, backend=backend)
+
+    def test_init_accepts_none_moe_config(self, adapter):
+        assert adapter.moe_config is None
+
+    def test_from_hf_renames_without_experts(self, adapter):
+        hf_sd = {
+            "backbone.embeddings.weight": torch.randn(100, 256),
+            "backbone.layers.0.mixer.A_log": torch.randn(4),
+            "backbone.layers.1.mixer.up_proj.weight": torch.randn(512, 256),
+            "backbone.norm_f.weight": torch.randn(256),
+            "lm_head.weight": torch.randn(100, 256),
+        }
+        native = adapter.from_hf(dict(hf_sd))
+
+        assert "model.embed_tokens.weight" in native
+        assert "model.norm.weight" in native
+        assert "model.layers.0.mixer.A_log" in native
+        assert "model.layers.1.mixer.up_proj.weight" in native
+        assert "lm_head.weight" in native
+        assert not any(k.startswith("backbone.") for k in native)
+        assert not any(k.endswith("norm_f.weight") for k in native)
+
+    def test_round_trip_dense(self, adapter):
+        hf_sd = {
+            "backbone.embeddings.weight": torch.randn(100, 256),
+            "backbone.layers.0.mixer.up_proj.weight": torch.randn(512, 256),
+            "backbone.norm_f.weight": torch.randn(256),
+        }
+        native = adapter.from_hf(dict(hf_sd))
+        back = adapter.to_hf(dict(native))
+
+        assert set(back.keys()) == set(hf_sd.keys())
+
+
 class TestNemotronV3AdapterToHf:
     """Test to_hf conversion."""
 
