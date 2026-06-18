@@ -52,6 +52,7 @@ model:
     rms_norm: torch_fp32
     rope_fusion: false
     enable_deepep: true
+    gate_precision: float32  # match HF/DeepSeek-V3 fp32 router; stabilizes top-k routing
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
