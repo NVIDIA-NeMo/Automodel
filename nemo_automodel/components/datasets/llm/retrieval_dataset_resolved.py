@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import torch
-from torch.utils.data import IterableDataset, get_worker_info
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import flatten_bi_encoder_to_cross_encoder
 from nemo_automodel.components.datasets.reservoir_sampler import ReservoirSampler
@@ -74,12 +74,42 @@ def _coerce_path_list(data_path: str | Sequence[str]) -> list[Path]:
     return paths
 
 
+def _coerce_arrow_path_list(data_path: str | Sequence[str]) -> list[Path]:
+    if isinstance(data_path, (str, os.PathLike)):
+        entries = [data_path]
+    else:
+        entries = list(data_path)
+
+    paths: list[Path] = []
+    for entry in entries:
+        path = Path(entry)
+        if path.is_dir():
+            paths.extend(sorted(path.glob("*.arrow")))
+        elif path.is_file() and _is_arrow_path(path):
+            paths.append(path)
+        elif not path.exists():
+            raise FileNotFoundError(f"Resolved retrieval data path does not exist: {path}")
+
+    return paths
+
+
 def _is_sqlite_path(path: Path) -> bool:
     return path.suffix == ".sqlite"
 
 
 def _is_parquet_path(path: Path) -> bool:
     return path.suffix == ".parquet"
+
+
+def _is_arrow_path(path: Path) -> bool:
+    return path.suffix == ".arrow"
+
+
+def _import_datasets():
+    has_datasets, datasets = safe_import("datasets")
+    if not has_datasets:
+        raise ImportError("datasets is required to read resolved retrieval Arrow shards. Install datasets.")
+    return datasets
 
 
 def _import_pyarrow_parquet():
@@ -288,6 +318,79 @@ def _parquet_images_to_dict(image_values: Sequence[Any] | None) -> dict[int, byt
     }
 
 
+class ResolvedRetrievalArrowDataset(Dataset):
+    """Map-style resolved retrieval dataset backed by Hugging Face Arrow shards."""
+
+    def __init__(
+        self,
+        data_path: str | Sequence[str],
+        *,
+        image_root: str | None = None,
+        repeat: int = 1,
+        decode_images: bool = True,
+        model_type: str = "bi_encoder",
+        num_samples: int | None = None,
+        expected_n_passages: int | None = None,
+    ) -> None:
+        if model_type not in _VALID_MODEL_TYPES:
+            raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
+        if repeat < 1:
+            raise ValueError(f"repeat must be >= 1, got {repeat}")
+
+        self.paths = _coerce_arrow_path_list(data_path)
+        if not self.paths:
+            raise ValueError(f"No Arrow files found in resolved retrieval data path: {data_path}")
+
+        datasets = _import_datasets()
+        shards = [datasets.Dataset.from_file(str(path)) for path in self.paths]
+        self._dataset = shards[0] if len(shards) == 1 else datasets.concatenate_datasets(shards)
+        self.image_root = Path(image_root) if image_root is not None else None
+        self.repeat = int(repeat)
+        self.decode_images = decode_images
+        self.model_type = model_type
+        self.expected_n_passages = expected_n_passages
+
+        total_records = len(self._dataset)
+        if num_samples is None:
+            self._num_records = total_records
+        else:
+            requested_records = int(num_samples)
+            if requested_records < 1:
+                raise ValueError(f"num_samples must be >= 1, got {requested_records}")
+            if requested_records > total_records:
+                logger.warning(
+                    "Requested %d resolved retrieval samples but only found %d row(s). Using all.",
+                    requested_records,
+                    total_records,
+                )
+            self._num_records = min(requested_records, total_records)
+        if self._num_records < 1:
+            raise ValueError(f"Resolved retrieval Arrow dataset is empty: {data_path}")
+
+    def __len__(self) -> int:
+        return self._num_records * self.repeat
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+
+        row = self._dataset[int(idx) % self._num_records]
+        record = json.loads(row["record_json"])
+        if not isinstance(record, dict):
+            raise ValueError(f"Resolved retrieval Arrow record must be an object, got {type(record).__name__}")
+        return _normalize_resolved_record(
+            record,
+            image_root=self.image_root,
+            record_dir=Path("."),
+            decode_images=self.decode_images,
+            model_type=self.model_type,
+            expected_n_passages=self.expected_n_passages,
+            packed_images=_parquet_images_to_dict(row.get("image_jpeg")),
+        )
+
+
 class ResolvedRetrievalJsonlDataset(IterableDataset):
     """Stream resolved retrieval JSONL/SQLite/Parquet shards across ranks and DataLoader workers."""
 
@@ -305,6 +408,7 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
         expected_n_passages: int | None = None,
         shuffle_buffer_size: int = 0,
         parquet_sharding: str = "row_group",
+        shuffle_row_groups: bool = False,
     ) -> None:
         if model_type not in _VALID_MODEL_TYPES:
             raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
@@ -325,6 +429,7 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
         self.expected_n_passages = expected_n_passages
         self.shuffle_buffer_size = int(shuffle_buffer_size)
         self.parquet_sharding = parquet_sharding
+        self.shuffle_row_groups = bool(shuffle_row_groups)
         self.epoch = 0
         total_records = _count_resolved_records(self.paths)
         if num_samples is None:
@@ -472,6 +577,59 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
                 image_values = image_col[row_idx].as_py()
                 yield _parse_sqlite_record(record_json), _parquet_images_to_dict(image_values)
 
+    def _parquet_row_group_shuffle_seed(self, repeat_idx: int) -> int:
+        return self.seed + self.epoch * 1_000_003 + repeat_idx * 10_007
+
+    def _iter_shuffled_parquet_row_group_records(
+        self,
+        paths: Sequence[Path],
+        *,
+        repeat_idx: int,
+        rank: int,
+        world_size: int,
+        worker_id: int,
+        num_workers: int,
+    ) -> Iterable[tuple[dict[str, Any], dict[int, bytes], Path]]:
+        pq = _import_pyarrow_parquet()
+        row_groups: list[tuple[Path, int, int]] = []
+        records_seen_this_repeat = 0
+        for path in paths:
+            parquet_file = pq.ParquetFile(path)
+            for row_group_idx in range(parquet_file.num_row_groups):
+                if records_seen_this_repeat >= self._num_records:
+                    break
+                row_group_rows = int(parquet_file.metadata.row_group(row_group_idx).num_rows)
+                rows_to_consume = min(row_group_rows, self._num_records - records_seen_this_repeat)
+                row_groups.append((path, row_group_idx, rows_to_consume))
+                records_seen_this_repeat += rows_to_consume
+            if records_seen_this_repeat >= self._num_records:
+                break
+
+        rng = random.Random(self._parquet_row_group_shuffle_seed(repeat_idx))
+        rng.shuffle(row_groups)
+
+        parquet_files: dict[Path, Any] = {}
+        local_group_idx_for_rank = 0
+        for global_group_idx, (path, row_group_idx, rows_to_consume) in enumerate(row_groups):
+            if global_group_idx % world_size != rank:
+                continue
+            emit = local_group_idx_for_rank % num_workers == worker_id
+            local_group_idx_for_rank += 1
+            if not emit:
+                continue
+
+            parquet_file = parquet_files.get(path)
+            if parquet_file is None:
+                parquet_file = pq.ParquetFile(path)
+                parquet_files[path] = parquet_file
+            table = parquet_file.read_row_group(row_group_idx, columns=["record_json", "image_jpeg"])
+            record_json_col = table.column("record_json").combine_chunks()
+            image_col = table.column("image_jpeg").combine_chunks()
+            for row_idx in range(rows_to_consume):
+                record_json = record_json_col[row_idx].as_py()
+                image_values = image_col[row_idx].as_py()
+                yield _parse_sqlite_record(record_json), _parquet_images_to_dict(image_values), path.parent
+
     def _iter_raw_records_for_repeat(
         self,
         repeat_idx: int,
@@ -483,7 +641,23 @@ class ResolvedRetrievalJsonlDataset(IterableDataset):
         num_workers: int,
     ) -> Iterable[tuple[dict[str, Any], dict[int, bytes] | None, Path]]:
         state["records_seen_this_repeat"] = 0
-        for path in self._iter_paths(repeat_idx):
+        paths = self._iter_paths(repeat_idx)
+        if (
+            self.parquet_sharding == "row_group"
+            and self.shuffle_row_groups
+            and all(_is_parquet_path(path) for path in paths)
+        ):
+            yield from self._iter_shuffled_parquet_row_group_records(
+                paths,
+                repeat_idx=repeat_idx,
+                rank=rank,
+                world_size=world_size,
+                worker_id=worker_id,
+                num_workers=num_workers,
+            )
+            return
+
+        for path in paths:
             record_dir = path.parent
             if _is_parquet_path(path):
                 record_iter = self._iter_parquet_records(
@@ -576,11 +750,12 @@ def make_resolved_retrieval_dataset(
     do_shuffle: bool | None = None,
     shuffle_buffer_size: int | None = None,
     parquet_sharding: str = "row_group",
-) -> ResolvedRetrievalJsonlDataset:
-    """Build a streaming resolved retrieval dataset.
+    shuffle_row_groups: bool | None = None,
+) -> ResolvedRetrievalArrowDataset | ResolvedRetrievalJsonlDataset:
+    """Build a resolved retrieval dataset.
 
     Args:
-        data_path: JSONL/SQLite/Parquet file, directory of shards, or list of files/directories.
+        data_path: JSONL/SQLite/Parquet/Arrow file, directory of shards, or list of files/directories.
         model_type: ``"bi_encoder"`` or ``"cross_encoder"``.
         data_type: Accepted for YAML parity with ``make_retrieval_dataset``.
         n_passages: Optional validation check for the number of docs per row.
@@ -596,9 +771,11 @@ def make_resolved_retrieval_dataset(
             If omitted, ``do_shuffle=True`` uses a conservative buffer of 128 examples.
         parquet_sharding: ``"row_group"`` keeps Parquet reads efficient by assigning row groups to ranks/workers.
             ``"row"`` matches JSONL/SQLite row-level sharding but may duplicate Parquet reads across ranks.
+        shuffle_row_groups: Shuffle Parquet row groups before rank/worker sharding. If omitted,
+            ``do_shuffle=True`` enables row-group shuffle for Parquet row-group sharding.
 
     Returns:
-        A rank/worker-sharded ``IterableDataset`` yielding retrieval examples.
+        A map-style dataset for Arrow shards, otherwise a rank/worker-sharded ``IterableDataset``.
     """
     if data_type not in {"train", "eval"}:
         raise ValueError(f"Invalid data type: {data_type}")
@@ -610,10 +787,25 @@ def make_resolved_retrieval_dataset(
         data_path = data_dir_list
     if data_path is None:
         raise ValueError("data_path or data_dir_list is required")
+
+    arrow_paths = _coerce_arrow_path_list(data_path)
+    if arrow_paths:
+        return ResolvedRetrievalArrowDataset(
+            data_path=data_path,
+            image_root=image_root,
+            repeat=repeat,
+            decode_images=decode_images,
+            model_type=model_type,
+            num_samples=num_samples,
+            expected_n_passages=n_passages,
+        )
+
     if shuffle_files is None:
         shuffle_files = bool(do_shuffle)
     if shuffle_buffer_size is None:
         shuffle_buffer_size = 128 if (do_shuffle or shuffle_files) else 0
+    if shuffle_row_groups is None:
+        shuffle_row_groups = bool(do_shuffle or shuffle_files)
     return ResolvedRetrievalJsonlDataset(
         data_path=data_path,
         image_root=image_root,
@@ -626,4 +818,5 @@ def make_resolved_retrieval_dataset(
         expected_n_passages=n_passages,
         shuffle_buffer_size=shuffle_buffer_size,
         parquet_sharding=parquet_sharding,
+        shuffle_row_groups=shuffle_row_groups,
     )
