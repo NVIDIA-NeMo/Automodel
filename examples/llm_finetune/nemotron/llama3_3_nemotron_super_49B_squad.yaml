@@ -119,7 +119,7 @@ lr_scheduler:
 ci:
   recipe_owner: akoumpa
   nodes: 2
-  time: "00:45:00"
+  time: "02:00:00"  # 49B robustness (Phase 1-4 reloads of a 49B on 2 nodes) needs >45min
   vllm_deploy: true
   vllm_smoke_test: true  # 49B exceeds 1 GPU; use vLLM's native nemotron-nas backend (no HF reference load)
   vllm_deploy_gpus: 4  # expose 4 of the node's 8 GPUs for tensor-parallel vLLM load
