@@ -75,6 +75,49 @@ from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Conf
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
+def _apply_index_rope_half_split(x: torch.Tensor, freqs_cis: torch.Tensor, qkv_format: str) -> torch.Tensor:
+    """Apply NON-interleaved (half-split) RoPE to the indexer's rope slice.
+
+    The DSA indexer uses half-split RoPE (``rotate_half``: pair dim ``j`` with ``j + d/2``),
+    unlike the main MLA attention which uses interleaved RoPE. ``freqs_cis`` is the same
+    complex tensor used by the MLA (``exp(i * theta_j * pos)`` for ``j in [0, d/2)``); we read
+    its real/imag parts as cos/sin so the angles match exactly.
+
+    Args:
+        x: rope slice, ``[B, S, H, d]`` / ``[B, S, d]`` (bshd) or ``[T, H, d]`` / ``[T, d]`` (thd).
+        freqs_cis: complex RoPE table with trailing dim ``d/2``.
+        qkv_format: ``"bshd"`` or ``"thd"``.
+    """
+    d = x.shape[-1]
+    half = d // 2
+    if qkv_format == "thd":
+        fc = freqs_cis.reshape(x.shape[0], *([1] * (x.dim() - 2)), half)
+    else:
+        fc = freqs_cis.reshape(x.shape[0], x.shape[1], *([1] * (x.dim() - 3)), half)
+    cos = fc.real.to(x.dtype)
+    sin = fc.imag.to(x.dtype)
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+
+def _to_additive_key_mask(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Convert a ``{0,1}`` keep-mask (1=attend, 0=mask) to an ADDITIVE key mask (0 / -inf).
+
+    HF builds the attention bias with ``create_causal_mask``, which masks padding to ``-inf``.
+    The recipe, however, hands the model a 2D ``{0,1}`` padding mask; adding it to the scores
+    raw (the previous behaviour) both fails to mask padding (0 -> +0 instead of -inf) AND adds
+    ``+1.0`` to every kept key, which is only softmax-invariant in fp32 — in bf16 the ``+1.0``
+    swamps the (scaled) score differences and collapses attention toward uniform. A mask that is
+    already additive (values <= 0) is returned unchanged.
+    """
+    if mask.dtype == torch.bool:
+        return torch.zeros_like(mask, dtype=dtype).masked_fill(~mask, float("-inf"))
+    if mask.max() > 0:  # {0,1} keep-mask -> additive (kept -> 0, masked -> -inf)
+        return torch.zeros_like(mask, dtype=dtype).masked_fill(mask <= 0, float("-inf"))
+    return mask.to(dtype)
+
+
 def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply Hadamard rotation activation.
 
@@ -141,8 +184,8 @@ class DeepseekV32Indexer(nn.Module):
             dtype=dtype,
         )
 
-        # LayerNorm for K (official uses LayerNorm, not RMSNorm)
-        self.k_norm = nn.LayerNorm(self.head_dim, dtype=dtype)
+        # LayerNorm for K (official uses LayerNorm, not RMSNorm). eps=1e-6 matches the reference / HF.
+        self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6, dtype=dtype)
 
         # Per-head weight projection from hidden states
         self.weights_proj = initialize_linear_module(
@@ -189,77 +232,70 @@ class DeepseekV32Indexer(nn.Module):
         else:
             q = q.view(bsz, seq_len, self.num_heads, self.head_dim)
 
-        # Split Q into nope and pe parts (nope first, then pe - matching training code)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # Split Q into pe and nope parts. The indexer lays out the rope slice FIRST
+        # ([rope, nope]) — unlike the MLA path ([nope, rope]) — matching the DSA reference / HF.
+        q_pe, q_nope = torch.split(q, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1)
 
         # Project K from hidden states
         k = self.k_norm(self.wk(x))
 
-        # Split K into nope and pe parts
-        k_nope, k_pe = torch.split(k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # Split K into pe and nope parts (rope slice first, matching Q)
+        k_pe, k_nope = torch.split(k, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1)
 
-        # Apply RoPE to the pe parts
-        head_unsqueeze_dim = 2 if qkv_format == "bshd" else 1
-        q_pe = apply_rotary_emb(q_pe, freqs_cis, qkv_format=qkv_format)
-        k_pe = apply_rotary_emb(k_pe, freqs_cis, qkv_format=qkv_format, unsqueeze_dim=head_unsqueeze_dim)
-        k_pe = k_pe.squeeze(head_unsqueeze_dim)
+        # Apply NON-interleaved (half-split) RoPE to the pe parts. The indexer uses half-split
+        # RoPE (matching the DSA reference / HF), unlike the interleaved RoPE of the MLA path.
+        q_pe = _apply_index_rope_half_split(q_pe, freqs_cis, qkv_format)
+        k_pe = _apply_index_rope_half_split(k_pe, freqs_cis, qkv_format)
 
-        # Combine nope and pe parts (nope first, matching training code)
-        q = torch.cat([q_nope, q_pe], dim=-1)
-        k = torch.cat([k_nope, k_pe], dim=-1)
+        # Combine pe and nope parts (rope slice first, matching the reference layout)
+        q = torch.cat([q_pe, q_nope], dim=-1)
+        k = torch.cat([k_pe, k_nope], dim=-1)
 
-        # Apply optional Hadamard rotation (if fast_hadamard_transform is available)
-        q = _rotate_activation(q)
-        k = _rotate_activation(k)
+        # NOTE: the reference Indexer applies a Hadamard rotation (`rotate_activation`) only as part
+        # of its FP8 scoring kernel. The Hadamard transform is orthogonal, so it leaves the q·k index
+        # scores unchanged; in this bf16/fp32 path we skip it (matching HF) to avoid adding rounding
+        # noise that would perturb the top-k selection at near-tie boundaries.
 
-        # Compute per-head weights from hidden states
+        # Per-head weights from hidden states. Match the reference op order exactly: the
+        # (n_heads ** -0.5) factor goes here and softmax_scale is applied to the q·k scores
+        # below (relu(scale * x) == scale * relu(x)), then the head reduction is a matmul.
         # weights: [B, S, H] or [T, H]
-        # Scale: (n_heads ** -0.5) * softmax_scale
-        weights = self.weights_proj(x).float() * (self.num_heads**-0.5) * self.softmax_scale
+        weights = self.weights_proj(x).float() * (self.num_heads**-0.5)
 
-        # Expand K to all heads
+        # Per-head q·k scores with K kept single-head (no expand-to-heads), mirroring HF so the
+        # index scores — and therefore the top-k selection — track the reference as closely as
+        # floating point allows.
         if qkv_format == "thd":
-            k = k.unsqueeze(1).expand(num_tokens, self.num_heads, self.head_dim)
+            # q: [T, H, D], k: [T, D]  ->  [T, H, T]
+            scores = torch.matmul(q.float(), k.float().transpose(-1, -2))
         else:
-            k = k.unsqueeze(2).expand(bsz, seq_len, self.num_heads, self.head_dim)
+            # q: [B, S, H, D], k: [B, S, D]  ->  [B, S, H, T]
+            scores = torch.matmul(q.float(), k.float().transpose(-1, -2).unsqueeze(1))
+        scores = torch.relu(scores * self.softmax_scale)
 
-        # Compute attention scores: Q @ K^T with ReLU activation
-        if qkv_format == "thd":
-            # [T, H, D] -> [H, T, D]
-            q = q.transpose(0, 1)
-            k = k.transpose(0, 1)
-            # scores: [H, T, T]
-            scores = torch.bmm(q.float(), k.float().transpose(-2, -1))
-            # Apply ReLU activation (per training implementation)
-            scores = torch.relu(scores)
-            # Apply per-head weights: [T, H] -> [H, T, 1]
-            weights = weights.transpose(0, 1).unsqueeze(-1)
-            scores = scores * weights  # [H, T, T]
-            # Sum over heads
-            scores = scores.sum(dim=0)  # [T, T]
-        else:
-            # [B, S, H, D] -> [B, H, S, D]
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            # scores: [B, H, S, S]
-            scores = torch.matmul(q.float(), k.float().transpose(-2, -1))
-            # Apply ReLU activation (per training implementation)
-            scores = torch.relu(scores)
-            # Apply per-head weights: [B, S, H] -> [B, H, S, 1]
-            weights = weights.transpose(1, 2).unsqueeze(-1)
-            scores = scores * weights  # [B, H, S, S]
-            # Sum over heads
-            scores = scores.sum(dim=1)  # [B, S, S]
+        # Head-weighted sum via matmul: weights[..., 1, H] @ scores[..., H, T] -> [..., 1, T].
+        scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)  # [T, T] or [B, S, T]
 
-        # Apply attention mask if provided
+        # Apply attention mask if provided. Convert a {0,1} keep-mask to an additive key mask
+        # (kept -> 0, padding -> -inf) so padding keys are excluded from the top-k selection,
+        # instead of biasing kept keys by +1 (the previous raw-add behaviour).
         if attention_mask is not None:
-            if qkv_format == "bshd":
-                scores = scores + attention_mask.squeeze(1)
-            else:
-                if attention_mask.dim() == 4:
-                    scores = scores + attention_mask.squeeze(0).squeeze(0)
-                else:
-                    scores = scores + attention_mask
+            am = _to_additive_key_mask(attention_mask, scores.dtype)
+            if am.dim() == 4:  # [B, 1, S_q, S_k] additive
+                scores = scores + am.squeeze(1) if qkv_format == "bshd" else scores + am.squeeze(0).squeeze(0)
+            elif qkv_format == "bshd":  # scores [B, S_q, S_k]; am [B, S_k] -> broadcast over queries
+                scores = scores + am.unsqueeze(1)
+            else:  # thd: scores [S_q, S_k]; am [S_k]
+                scores = scores + am
+
+        # Causal masking: the DSA model is a causal LM, so a query may select only keys at
+        # positions <= its own. Without this, when seq_len <= index_topk the top-k picks ALL
+        # tokens (including future), which (combined with the is_causal=False sparse-attention
+        # path) makes attention bidirectional and leaks the next token. Matches the reference,
+        # which causal-masks the index scores. Combines with any additive attention_mask above.
+        q_len, k_len = scores.shape[-2], scores.shape[-1]
+        causal = torch.ones(q_len, k_len, dtype=torch.bool, device=scores.device).triu(1)
+        scores = scores.masked_fill(causal, float("-inf"))
 
         # Select top-k indices
         actual_topk = min(self.index_topk, seq_len)
@@ -283,9 +319,21 @@ class DeepseekV32MLA(nn.Module):
     to attend to.
     """
 
-    def __init__(self, config: DeepseekV32Config, backend: BackendConfig):
+    def __init__(self, config: DeepseekV32Config, backend: BackendConfig, skip_topk: bool = False):
+        """Initialize MLA with an optional sparse-attention indexer.
+
+        Args:
+            config: Model config carrying MLA and indexer dimensions.
+            backend: Backend selection for attention/linear/norm kernels.
+            skip_topk: When ``True``, this layer owns no indexer and instead reuses the
+                top-k selection of the previous "full" indexer layer (GLM IndexShare).
+                ``forward`` then requires ``prev_topk_indices`` to be supplied. Defaults
+                to ``False`` (the layer runs its own indexer), preserving the DeepSeek
+                V3.2 behaviour where every layer is a full indexer layer.
+        """
         super().__init__()
 
+        self.skip_topk = skip_topk
         self.n_heads = config.num_attention_heads
         self.q_lora_rank = config.q_lora_rank
         self.kv_lora_rank = config.kv_lora_rank
@@ -368,8 +416,9 @@ class DeepseekV32MLA(nn.Module):
             softmax_scale=self.softmax_scale,
         )
 
-        # Initialize the Indexer
-        self.indexer = DeepseekV32Indexer(config, backend)
+        # Initialize the Indexer. "shared" layers (GLM IndexShare) own no indexer and
+        # reuse the previous full layer's top-k indices passed in via `prev_topk_indices`.
+        self.indexer = None if skip_topk else DeepseekV32Indexer(config, backend)
 
     def _build_sparse_mask(
         self,
@@ -434,9 +483,22 @@ class DeepseekV32MLA(nn.Module):
                 )
                 sparse_mask = sparse_mask.unsqueeze(1).expand(-1, n_heads, -1, -1)
 
-        # Combine with existing attention mask if provided
+        # Enforce causality independently of the top-k selection: a query attends only to keys
+        # at positions <= its own. Required because at seq_len <= index_topk the top-k selects
+        # every token (including future) and the SDPA path consumes this mask with is_causal=False;
+        # without it the DSA attention is bidirectional and leaks the next token.
+        q_len, k_len = sparse_mask.shape[-2], sparse_mask.shape[-1]
+        causal_bool = torch.ones(q_len, k_len, dtype=torch.bool, device=sparse_mask.device).triu(1)
+        sparse_mask = sparse_mask.masked_fill(causal_bool, float("-inf"))
+
+        # Combine with the attention mask if provided. Convert a {0,1} keep-mask to an additive
+        # key mask (kept -> 0, padding -> -inf) and broadcast it over the key axis; adding a raw
+        # {0,1} mask would bias kept keys by +1 (bf16-lossy) and leave padding unmasked.
         if attention_mask is not None:
-            sparse_mask = attention_mask + sparse_mask
+            am = _to_additive_key_mask(attention_mask, sparse_mask.dtype)
+            while am.dim() < sparse_mask.dim():  # [B, S_key] -> [B, 1, 1, S_key]
+                am = am.unsqueeze(1)
+            sparse_mask = sparse_mask + am
 
         return sparse_mask
 
@@ -445,8 +507,25 @@ class DeepseekV32MLA(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        prev_topk_indices: torch.Tensor | None = None,
+        return_topk_indices: bool = False,
         **attn_kwargs: Any,
     ):
+        """Run MLA with (optionally shared) DSA sparse attention.
+
+        Args:
+            x: Hidden states ``[B, S, hidden]`` (bshd) or ``[T, hidden]`` (thd).
+            freqs_cis: RoPE frequencies.
+            attention_mask: Optional additive attention mask.
+            prev_topk_indices: Top-k indices from the most recent "full" indexer layer.
+                Required (and only used) when this is a "shared" layer (``skip_topk=True``).
+            return_topk_indices: When ``True``, return ``(attn_out, topk_indices)`` so the
+                caller can thread the selection to subsequent shared layers (GLM IndexShare).
+                When ``False`` (default), return just ``attn_out`` — the DeepSeek V3.2 contract.
+
+        Returns:
+            ``attn_out`` tensor, or ``(attn_out, topk_indices)`` when ``return_topk_indices``.
+        """
         if len(x.shape) == 2:
             qkv_format = "thd"
             num_tokens = x.shape[0]
@@ -459,8 +538,17 @@ class DeepseekV32MLA(nn.Module):
         # Compute q_resid for indexer and main attention path
         q_resid = self.q_a_layernorm(self.q_a_proj(x))
 
-        # Get top-k indices from indexer
-        topk_indices = self.indexer(x, q_resid, freqs_cis, attention_mask, **attn_kwargs)
+        # Get top-k indices: run our own indexer ("full" layer), or reuse the previous
+        # full layer's selection ("shared" layer, GLM IndexShare).
+        if self.indexer is not None:
+            topk_indices = self.indexer(x, q_resid, freqs_cis, attention_mask, **attn_kwargs)
+        else:
+            if prev_topk_indices is None:
+                raise ValueError(
+                    "Shared DSA layers (skip_topk=True) require top-k indices from a previous "
+                    "full indexer layer; got prev_topk_indices=None."
+                )
+            topk_indices = prev_topk_indices
 
         # Build sparse bias/mask from top-k indices based on backend
         if self.backend.attn == "te":
@@ -547,6 +635,8 @@ class DeepseekV32MLA(nn.Module):
 
         flatten_dim = 2 if qkv_format == "bshd" else 1
         x = self.o_proj(x.flatten(flatten_dim))
+        if return_topk_indices:
+            return x, topk_indices
         return x
 
     def init_weights(self, _buffer_device: torch.device, init_std: float = 0.02):
@@ -565,5 +655,6 @@ class DeepseekV32MLA(nn.Module):
         for norm in norms:
             norm.reset_parameters()
 
-        # Initialize indexer weights
-        self.indexer.init_weights(init_std)
+        # Initialize indexer weights ("shared" layers own no indexer).
+        if self.indexer is not None:
+            self.indexer.init_weights(init_std)
