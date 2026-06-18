@@ -108,6 +108,9 @@ def test_consolidate_writes_output_safetensors_without_append(tmp_path, monkeypa
         fqn_to_index_mapping={"weight": 1},
     )
 
+    # Stop tracking before verifying output to avoid counting the read-open from load_file().
+    monkeypatch.setattr(builtins, "open", real_open)
+
     output_tensors = load_file(output_file)
     torch.testing.assert_close(output_tensors["weight"], tensors["weight"])
     assert output_modes == ["wb"]
