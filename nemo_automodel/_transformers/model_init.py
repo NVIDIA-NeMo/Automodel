@@ -209,10 +209,17 @@ def _is_config_compatible_with_custom_model(arch_name: str, config) -> bool:
     Returns:
         True if the config is compatible with our custom implementation, False otherwise
     """
-    # NemotronHForCausalLM: Our custom implementation is for v3 (MoE model)
-    # v3 requires n_routed_experts, v2 does not have this attribute
+    # NemotronHForCausalLM is shared by the MoE ("v3", has n_routed_experts) and the
+    # dense ("v2"-style, e.g. Nano 4B/9B/12B BF16) Nemotron-H variants. The custom
+    # implementation now handles both, so accept any config carrying the Nemotron-H
+    # hybrid layer pattern (layers_block_type / hybrid_override_pattern). A config with
+    # neither is not a hybrid Nemotron-H we recognize, so it falls back to HF.
     if arch_name == "NemotronHForCausalLM":
-        return hasattr(config, "n_routed_experts") and config.n_routed_experts is not None
+        if getattr(config, "n_routed_experts", None) is not None:
+            return True
+        return bool(getattr(config, "layers_block_type", None)) or bool(
+            getattr(config, "hybrid_override_pattern", None)
+        )
 
     # All other architectures are assumed compatible
     return True
