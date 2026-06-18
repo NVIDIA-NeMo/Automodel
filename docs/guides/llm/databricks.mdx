@@ -83,7 +83,6 @@ To run training on a single GPU, use this command:
 !automodel llama3_2_1b_squad.yaml \
     --step_scheduler.max_steps 20 \
     --checkpoint.checkpoint_dir /Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints_single/ \
-    --checkpoint.staging_dir /local_disk0/checkpoints_single/ \
     --checkpoint.is_async True
 ```
 
@@ -91,7 +90,7 @@ In addition to specifying the configuration file, we also use these options:
 
 - `--step_scheduler.max_steps`: Limits the number of training steps taken. Again, this is for example purposes – adapt for your actual use case as needed.
 - `--checkpoint.checkpoint_dir`: Tells AutoModel where to [save model checkpoints](/development/checkpointing) from training. We recommend saving model checkpoints in a Databricks Unity Catalog [volume](https://docs.databricks.com/aws/en/volumes/).
-- `--checkpoint.staging_dir`: Specifies a temporary staging location for model checkpoints. Files will be temporarily saved to this location before being moved to the final `checkpoint_dir` location. This is needed when saving checkpoints in Unity Catalog. 
+- `--checkpoint.staging_dir`: Optional. Specifies a temporary local staging location for checkpoint consolidation before completed files are copied to the final `checkpoint_dir` location.
 - `--checkpoint.is_async`: Uses asynchronous checkpointing. 
 
 Looking at GPU metrics in Databricks, we see our single GPU is being well utilized (\~95% utilization).
@@ -106,7 +105,6 @@ To utilize all four GPUs available on this `g6e.12xlarge` instance, add `--nproc
 !automodel --nproc-per-node=4 llama3_2_1b_squad.yaml \
     --step_scheduler.max_steps 20 \
     --checkpoint.checkpoint_dir /Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints_multi/ \
-    --checkpoint.staging_dir /local_disk0/checkpoints_multi/ \
     --checkpoint.is_async True
 ```
 
@@ -155,7 +153,6 @@ args = [
     "--config", "llama3_2_1b_squad.yaml",
     "--step_scheduler.max_steps", "20",
     "--checkpoint.checkpoint_dir", "/Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints_dist/",
-    "--checkpoint.staging_dir", "/local_disk0/checkpoints_dist/",
     "--checkpoint.is_async", "True",
 ]
 distributor.run(train_file, *args)
