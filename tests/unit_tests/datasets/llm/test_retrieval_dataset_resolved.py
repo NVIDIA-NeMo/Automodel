@@ -19,6 +19,7 @@ import sys
 import types
 
 import pytest
+from torch.utils.data import IterableDataset
 
 if "torchvision" not in sys.modules and importlib.util.find_spec("torchvision") is None:
     torchvision = types.ModuleType("torchvision")
@@ -280,6 +281,55 @@ def test_prepare_resolved_vl_retrieval_data_writes_parquet_packed_images(tmp_pat
     assert example["doc_image"][1] == ""
 
 
+def test_prepare_resolved_vl_retrieval_data_writes_arrow_packed_images(tmp_path, monkeypatch):
+    pytest.importorskip("datasets")
+    pytest.importorskip("datasets.arrow_writer")
+    image_mod = pytest.importorskip("PIL.Image")
+
+    monkeypatch.setattr(prep, "load_datasets", lambda data_dir_list, concatenate, seed: ([{"raw": "row"}], {}))
+    monkeypatch.setattr(
+        prep,
+        "_transform_func",
+        lambda item, num_neg_docs, corpus_dict, use_dataset_instruction: {
+            "question": "Q",
+            "doc_text": ["P", "N"],
+            "doc_image": [image_mod.new("RGB", (2, 2), color="blue"), ""],
+            "doc_id": ["p", "n"],
+            "query_instruction": "",
+            "passage_instruction": "",
+        },
+    )
+
+    output_dir = tmp_path / "resolved"
+    metadata = prep.resolve_dataset(
+        data_dir_list=["train.json"],
+        output_dir=output_dir,
+        n_passages=2,
+        samples_per_shard=10,
+        seed=42,
+        max_samples=None,
+        use_dataset_instruction=False,
+        jpeg_quality=90,
+        image_storage="arrow",
+    )
+
+    assert metadata["format"] == "nemo_automodel_resolved_vl_retrieval_arrow"
+    assert metadata["image_storage"] == "arrow"
+    assert metadata["num_records"] == 1
+    assert metadata["shards"] == ["shard-00000.arrow"]
+    assert not (output_dir / "images").exists()
+
+    dataset = rdr.make_resolved_retrieval_dataset(data_dir_list=str(output_dir), n_passages=2)
+    assert not isinstance(dataset, IterableDataset)
+    assert len(dataset) == 1
+    example = dataset[0]
+    assert example["question"] == "Q"
+    assert example["doc_text"] == ["P", "N"]
+    assert example["doc_id"] == ["p", "n"]
+    assert example["doc_image"][0].mode == "RGB"
+    assert example["doc_image"][1] == ""
+
+
 def test_resolved_retrieval_parquet_dataset_rank_sharding(tmp_path, monkeypatch):
     pytest.importorskip("pyarrow")
     pytest.importorskip("pyarrow.parquet")
@@ -319,6 +369,93 @@ def test_resolved_retrieval_parquet_dataset_rank_sharding(tmp_path, monkeypatch)
 
     assert [example["question"] for example in dataset] == ["Q1", "Q3"]
     assert [example["doc_image"] for example in dataset] == [["packed:0"], ["packed:0"]]
+
+
+def test_resolved_retrieval_arrow_dataset_is_map_style_not_rank_sharded(tmp_path, monkeypatch):
+    pytest.importorskip("datasets")
+    pytest.importorskip("datasets.arrow_writer")
+    image_mod = pytest.importorskip("PIL.Image")
+
+    monkeypatch.setattr(
+        prep, "load_datasets", lambda data_dir_list, concatenate, seed: ([{"idx": i} for i in range(4)], {})
+    )
+
+    def _transform_func(item, num_neg_docs, corpus_dict, use_dataset_instruction):
+        idx = item["idx"]
+        return {
+            "question": f"Q{idx}",
+            "doc_text": [f"P{idx}"],
+            "doc_image": [image_mod.new("RGB", (2, 2), color="blue")],
+            "query_instruction": "",
+            "passage_instruction": "",
+        }
+
+    monkeypatch.setattr(prep, "_transform_func", _transform_func)
+    output_dir = tmp_path / "resolved"
+    prep.resolve_dataset(
+        data_dir_list=["train.json"],
+        output_dir=output_dir,
+        n_passages=1,
+        samples_per_shard=2,
+        seed=42,
+        max_samples=None,
+        use_dataset_instruction=False,
+        jpeg_quality=90,
+        image_storage="arrow",
+    )
+    monkeypatch.setattr(rdr, "_get_dist_info", lambda: (1, 2))
+
+    dataset = rdr.make_resolved_retrieval_dataset(data_dir_list=str(output_dir), n_passages=1, decode_images=False)
+
+    assert not isinstance(dataset, IterableDataset)
+    assert len(dataset) == 4
+    assert [dataset[idx]["question"] for idx in range(len(dataset))] == ["Q0", "Q1", "Q2", "Q3"]
+    assert [dataset[idx]["doc_image"] for idx in range(len(dataset))] == [["packed:0"]] * 4
+
+
+def test_resolved_retrieval_parquet_dataset_shuffles_row_groups_before_rank_sharding(tmp_path, monkeypatch):
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pyarrow.parquet")
+    image_mod = pytest.importorskip("PIL.Image")
+
+    monkeypatch.setattr(
+        prep, "load_datasets", lambda data_dir_list, concatenate, seed: ([{"idx": i} for i in range(8)], {})
+    )
+
+    def _transform_func(item, num_neg_docs, corpus_dict, use_dataset_instruction):
+        idx = item["idx"]
+        return {
+            "question": f"Q{idx}",
+            "doc_text": [f"P{idx}"],
+            "doc_image": [image_mod.new("RGB", (2, 2), color="blue")],
+            "query_instruction": "",
+            "passage_instruction": "",
+        }
+
+    monkeypatch.setattr(prep, "_transform_func", _transform_func)
+    output_dir = tmp_path / "resolved"
+    prep.resolve_dataset(
+        data_dir_list=["train.json"],
+        output_dir=output_dir,
+        n_passages=1,
+        samples_per_shard=10,
+        seed=42,
+        max_samples=None,
+        use_dataset_instruction=False,
+        jpeg_quality=90,
+        image_storage="parquet",
+        parquet_row_group_size=1,
+    )
+    monkeypatch.setattr(rdr, "_get_dist_info", lambda: (1, 2))
+
+    dataset = rdr.make_resolved_retrieval_dataset(
+        data_dir_list=str(output_dir),
+        n_passages=1,
+        decode_images=False,
+        shuffle_row_groups=True,
+    )
+
+    assert [example["question"] for example in dataset] == ["Q4", "Q7", "Q5", "Q1"]
 
 
 def test_resolved_retrieval_parquet_dataset_row_sharding_inside_row_group(tmp_path, monkeypatch):

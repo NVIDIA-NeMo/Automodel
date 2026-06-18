@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Resolve corpus-id VL retrieval data into streamable JSONL shards.
+"""Resolve corpus-id VL retrieval data into reusable training shards.
 
 Example:
 
@@ -243,6 +243,79 @@ class ParquetShardWriter:
         self._close_current_shard()
 
 
+class ArrowShardWriter:
+    """Write records and image bytes into fixed-size Hugging Face Arrow shards."""
+
+    def __init__(
+        self,
+        output_dir: Path,
+        samples_per_shard: int,
+        *,
+        filename_prefix: str = "shard",
+        writer_batch_size: int = 100,
+    ) -> None:
+        if samples_per_shard < 1:
+            raise ValueError(f"samples_per_shard must be >= 1, got {samples_per_shard}")
+        has_datasets, datasets = safe_import("datasets")
+        has_arrow_writer, arrow_writer = safe_import("datasets.arrow_writer")
+        if not has_datasets or not has_arrow_writer:
+            raise ImportError("datasets is required for --image-storage arrow. Install datasets.")
+
+        self.output_dir = output_dir
+        self.samples_per_shard = samples_per_shard
+        self.filename_prefix = filename_prefix
+        self.writer_batch_size = writer_batch_size
+        self._arrow_writer_cls = arrow_writer.ArrowWriter
+        self._features = datasets.Features(
+            {
+                "id": datasets.Value("int64"),
+                "record_json": datasets.Value("string"),
+                "image_jpeg": datasets.Sequence(datasets.Value("binary")),
+            }
+        )
+        self._writer = None
+        self._current_shard_idx = -1
+        self._records_in_shard = 0
+        self.num_records = 0
+        self.shard_paths: list[str] = []
+
+    def _open_next_shard(self) -> None:
+        self._close_current_shard()
+        self._current_shard_idx += 1
+        self._records_in_shard = 0
+        path = self.output_dir / f"{self.filename_prefix}-{self._current_shard_idx:05d}.arrow"
+        self.shard_paths.append(path.name)
+        self._writer = self._arrow_writer_cls(
+            features=self._features,
+            path=str(path),
+            writer_batch_size=self.writer_batch_size,
+        )
+
+    def _close_current_shard(self) -> None:
+        if self._writer is not None:
+            self._writer.finalize()
+            self._writer = None
+
+    def write(self, record: dict[str, Any], image_blobs: dict[int, bytes]) -> None:
+        if self.num_records % self.samples_per_shard == 0:
+            self._open_next_shard()
+        assert self._writer is not None
+        record_id = self._records_in_shard
+        doc_images = record.get("doc_image", [])
+        self._writer.write(
+            {
+                "id": record_id,
+                "record_json": json.dumps(record, ensure_ascii=False),
+                "image_jpeg": [image_blobs.get(doc_idx, b"") for doc_idx in range(len(doc_images))],
+            }
+        )
+        self.num_records += 1
+        self._records_in_shard += 1
+
+    def close(self) -> None:
+        self._close_current_shard()
+
+
 def _image_to_jpeg_bytes(image: Any, jpeg_quality: int) -> bytes:
     if not hasattr(image, "save"):
         raise ValueError(f"Unsupported image object type for resolved retrieval export: {type(image).__name__}")
@@ -316,6 +389,7 @@ def _prepare_output_dir(
     existing_shards = list(output_dir.glob(f"{filename_prefix}-*.jsonl"))
     existing_shards.extend(output_dir.glob(f"{filename_prefix}-*.sqlite"))
     existing_shards.extend(output_dir.glob(f"{filename_prefix}-*.parquet"))
+    existing_shards.extend(output_dir.glob(f"{filename_prefix}-*.arrow"))
     metadata_path = output_dir / metadata_name
     if existing_shards or metadata_path.exists():
         raise FileExistsError(
@@ -386,8 +460,8 @@ def resolve_dataset(
     """Resolve corpus-id retrieval examples and write streamable JSONL shards."""
     if n_passages < 1:
         raise ValueError(f"n_passages must be >= 1, got {n_passages}")
-    if image_storage not in {"files", "sqlite", "parquet"}:
-        raise ValueError(f"image_storage must be 'files', 'sqlite', or 'parquet', got {image_storage!r}")
+    if image_storage not in {"files", "sqlite", "parquet", "arrow"}:
+        raise ValueError(f"image_storage must be 'files', 'sqlite', 'parquet', or 'arrow', got {image_storage!r}")
     _validate_build_shard_args(num_build_shards, build_shard_index)
     filename_prefix, metadata_name, image_rel_dir = _artifact_layout(num_build_shards, build_shard_index)
     images_dir = _prepare_output_dir(
@@ -403,13 +477,15 @@ def resolve_dataset(
         writer = JsonlShardWriter(output_dir, samples_per_shard, filename_prefix=filename_prefix)
     elif image_storage == "sqlite":
         writer = SqliteShardWriter(output_dir, samples_per_shard, filename_prefix=filename_prefix)
-    else:
+    elif image_storage == "parquet":
         writer = ParquetShardWriter(
             output_dir,
             samples_per_shard,
             filename_prefix=filename_prefix,
             row_group_size=parquet_row_group_size,
         )
+    else:
+        writer = ArrowShardWriter(output_dir, samples_per_shard, filename_prefix=filename_prefix)
 
     try:
         for sample_idx, item in enumerate(dataset):
@@ -495,9 +571,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jpeg-quality", type=int, default=95, help="JPEG quality for materialized images")
     parser.add_argument(
         "--image-storage",
-        choices=("files", "sqlite", "parquet"),
+        choices=("files", "sqlite", "parquet", "arrow"),
         default="files",
-        help="Store images as loose JPEG files, packed SQLite BLOB shards, or packed Parquet shards.",
+        help="Store images as loose JPEG files, packed SQLite BLOB shards, packed Parquet shards, or HF Arrow shards.",
     )
     parser.add_argument(
         "--parquet-row-group-size",
