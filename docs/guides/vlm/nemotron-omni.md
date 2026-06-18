@@ -140,7 +140,7 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: false
+    dispatcher: torch
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 

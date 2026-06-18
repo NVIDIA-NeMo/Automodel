@@ -97,7 +97,7 @@ class TestNemotronV3Model:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -328,7 +328,7 @@ class TestNemotronHForCausalLM:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -762,7 +762,7 @@ class TestNemotronV3KVCache:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -960,7 +960,7 @@ class TestNemotronV3MambaCacheGPU:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -1118,7 +1118,7 @@ class TestNemotronV3ModelWithMoE:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=True,  # Use fake balanced gate for deterministic testing
             enable_hf_state_dict_adapter=False,
         )
@@ -1143,7 +1143,7 @@ class TestNemotronV3ModelWithMoE:
             linear=backend.linear,
             attn=backend.attn,
             rms_norm=backend.rms_norm,
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
