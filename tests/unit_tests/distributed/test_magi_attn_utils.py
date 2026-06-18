@@ -418,3 +418,54 @@ class TestAttnSpecOnModule:
         mu._mark_attn_spec_consumed()  # a magi forward read it
         mu._set_attn_spec_on_attention(model, AttnMaskSpec.causal(8))  # next step must not raise
         assert mu._SPEC_ARMED is True
+
+
+class TestHFForwardKeySelection:
+    """The registered "magi" HF forward picks its dist key from module state.
+
+    magi_attention is stubbed so register_magi_attention() and the forward run on
+    CPU; the key builders are spied to assert which branch is taken.
+    """
+
+    def _register_with_stub(self, monkeypatch):
+        import sys
+        import types
+
+        api = types.ModuleType("magi_attention.api")
+        api.calc_attn = lambda q, k, v, key, **kw: (q,)  # echo q; shape-preserving
+        api.get_most_recent_key = lambda cp_group: "RECENT_KEY"
+        monkeypatch.setitem(sys.modules, "magi_attention", types.ModuleType("magi_attention"))
+        monkeypatch.setitem(sys.modules, "magi_attention.api", api)
+        monkeypatch.setattr(mu, "_MAGI_REGISTERED", False)
+
+        picked = {}
+        monkeypatch.setattr(mu, "_flex_key_for", lambda *a, **k: picked.setdefault("flex", 0) or picked.update(flex=1))
+        monkeypatch.setattr(mu, "_self_key_for", lambda *a, **k: picked.update(self_key=1))
+
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        mu.register_magi_attention()
+        return ALL_ATTENTION_FUNCTIONS["magi"], picked
+
+    def test_module_spec_selects_flex_key_and_marks_consumed(self, monkeypatch):
+        fwd, picked = self._register_with_stub(monkeypatch)
+        module = nn.Module()
+        module.cp_group = _FakeGroup(1)
+        module._magi_attn_spec = AttnMaskSpec.causal(3)
+        q = torch.randn(1, 2, 3, 4)  # [b, nh, s, hd]
+        out, _ = fwd(module, q, q, q, scaling=0.5)
+        assert picked.get("flex") == 1
+        assert "self_key" not in picked
+        assert mu._SPEC_CONSUMED is True  # forward consumed the armed spec
+        assert tuple(out.shape) == (1, 3, 8)  # [b, s, nh*hd]
+
+    def test_no_spec_falls_back_to_dispatched_key(self, monkeypatch):
+        fwd, picked = self._register_with_stub(monkeypatch)
+        module = nn.Module()
+        module.cp_group = _FakeGroup(2)
+        # no _magi_attn_spec, no _magi_self_key -> get_most_recent_key path
+        q = torch.randn(1, 2, 3, 4)
+        fwd(module, q, q, q, scaling=0.5)
+        assert "flex" not in picked
+        assert "self_key" not in picked
+        assert mu._SPEC_CONSUMED is False
