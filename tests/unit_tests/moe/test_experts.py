@@ -1042,6 +1042,11 @@ class TestNonGatedActivations:
 class TestGroupedExpertsTE:
     """Test GroupedExpertsTE module using Transformer Engine's GroupedLinear."""
 
+    def _grouped_weight(self, linear):
+        weight = getattr(linear, "weight", None)
+        assert weight is not None
+        return weight
+
     @pytest.fixture
     def te_moe_config(self):
         """Create MoE config for TE tests."""
@@ -1100,7 +1105,6 @@ class TestGroupedExpertsTE:
 
         config = experts.config
         gate_up_out_features = config.moe_inter_dim * 2 if experts.is_gated else config.moe_inter_dim
-        # Re-create on actual device
         experts.gate_up_linear = GroupedLinear(
             num_gemms=experts.num_local_experts,
             in_features=config.dim,
@@ -1108,6 +1112,7 @@ class TestGroupedExpertsTE:
             bias=experts.expert_bias,
             params_dtype=config.dtype,
             device=device,
+            single_grouped_parameter=True,
         )
         experts.down_linear = GroupedLinear(
             num_gemms=experts.num_local_experts,
@@ -1116,6 +1121,7 @@ class TestGroupedExpertsTE:
             bias=experts.expert_bias,
             params_dtype=config.dtype,
             device=device,
+            single_grouped_parameter=True,
         )
 
     def test_grouped_experts_te_init(self, te_moe_config):
@@ -1497,9 +1503,8 @@ class TestGroupedExpertsTE:
 
         # Initialize weights with specific values
         with torch.no_grad():
-            for i in range(experts1.gate_up_linear.num_gemms):
-                getattr(experts1.gate_up_linear, f"weight{i}").normal_(0, 0.02)
-                getattr(experts1.down_linear, f"weight{i}").normal_(0, 0.02)
+            self._grouped_weight(experts1.gate_up_linear).normal_(0, 0.02)
+            self._grouped_weight(experts1.down_linear).normal_(0, 0.02)
 
         # Get state dict
         state = experts1.state_dict()
@@ -1722,9 +1727,8 @@ class TestGroupedExpertsTE:
         experts1 = GroupedExpertsTE(config)
         self._materialize_weights(experts1, device)
         with torch.no_grad():
-            for i in range(experts1.gate_up_linear.num_gemms):
-                getattr(experts1.gate_up_linear, f"weight{i}").normal_(0, 0.02)
-                getattr(experts1.down_linear, f"weight{i}").normal_(0, 0.02)
+            self._grouped_weight(experts1.gate_up_linear).normal_(0, 0.02)
+            self._grouped_weight(experts1.down_linear).normal_(0, 0.02)
 
         state = experts1.state_dict()
 
