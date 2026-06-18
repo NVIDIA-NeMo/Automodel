@@ -19,7 +19,8 @@
 set -xeuo pipefail
 
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
-export CUDA_VISIBLE_DEVICES="0"
+# Expose ci.vllm_deploy_gpus GPUs (default 1) so large models can tensor-parallel.
+export CUDA_VISIBLE_DEVICES="$(python3 -c "import yaml; cfg = yaml.safe_load(open('$CONFIG_PATH')) or {}; n = int((cfg.get('ci') or {}).get('vllm_deploy_gpus', 1) or 1); print(','.join(map(str, range(n))))" 2>/dev/null || echo 0)"
 
 cd /opt/Automodel
 
