@@ -130,4 +130,5 @@ optimizer:
 ci:
   # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
   recipe_owner: hemildesai
+  time: "00:20:00"
   nodes: 4
