@@ -380,6 +380,24 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         return model
 
 
+def _nemotronh_decoder_blocks(model: nn.Module) -> tuple[nn.Module, list[nn.Module]]:
+    """Return ``(container, blocks)`` for a NemotronH model's decoder blocks.
+
+    Two distinct classes share the name ``NemotronHForCausalLM``:
+
+    * the HF model keeps its blocks in ``model.backbone.layers`` (an ``nn.ModuleList``), while
+    * the native Nemotron-V3 model (``NemotronV3Model``) keeps them in ``model.model.layers``
+      (an ``nn.ModuleDict`` keyed ``"0".."N-1"``).
+
+    ``container`` is the underlying ``ModuleList``/``ModuleDict`` (so callers can write rewrapped
+    blocks back into the model), and ``blocks`` is the ordered list of block modules.
+    """
+    inner = model.backbone if hasattr(model, "backbone") else model.model
+    container = inner.layers
+    blocks = list(container.values()) if isinstance(container, nn.ModuleDict) else list(container)
+    return container, blocks
+
+
 class NemotronHParallelizationStrategy(ParallelizationStrategy):
     """Specialized parallelization strategy for NemotronH models."""
 
@@ -401,7 +419,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         assert not sequence_parallel, "Sequence parallelism is not supported for NemotronHForCausalLM"
         logger.info("Custom parallel plan is not supported for NemotronHForCausalLM. Using NemotronH-specific TP plan.")
 
-        layers: torch.nn.ModuleList = model.backbone.layers
+        block_container, layers = _nemotronh_decoder_blocks(model)
         tp_mesh = device_mesh[tp_mesh_name]
         if tp_mesh.size() > 1:
             model_tp_plan: dict[str, ParallelStyle] = {
@@ -415,7 +433,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
             parallelize_module(model, tp_mesh, model_tp_plan)
 
-            for layer in model.backbone.layers:
+            for layer in layers:
                 if layer.block_type == "mlp":
                     parallelize_module(layer, tp_mesh, mlp_tp_plan)
 
@@ -450,12 +468,16 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                         )
 
         if activation_checkpointing:
-            for i in range(len(layers)):
-                if layers[i].block_type == "mlp":
-                    layers[i] = checkpoint_wrapper(layers[i])
-
-                if layers[i].block_type == "mamba":
-                    layers[i] = checkpoint_wrapper(layers[i])
+            # Write rewrapped blocks back into the real container (ModuleList -> int key,
+            # ModuleDict -> str key) so the model, not just the local handle, is updated.
+            block_items = (
+                block_container.items() if isinstance(block_container, nn.ModuleDict) else enumerate(block_container)
+            )
+            for key, layer in list(block_items):
+                if getattr(layer, "block_type", None) in ("mlp", "mamba"):
+                    block_container[key] = checkpoint_wrapper(layer)
+            # Refresh the local handle so the FSDP wrap below sees the wrapped blocks.
+            _, layers = _nemotronh_decoder_blocks(model)
 
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
 
@@ -1531,7 +1553,7 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         ],
     }
     LLM_MODEL_CLS_TO_LAYERS = {
-        "NemotronHForCausalLM": ["backbone.layers"],
+        "NemotronHForCausalLM": ["backbone.layers", "model.layers"],
         GPT2LMHeadModel: ["transformer.h"],
     }
 
