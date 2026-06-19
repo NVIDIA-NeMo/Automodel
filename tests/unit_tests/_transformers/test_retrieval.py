@@ -15,6 +15,7 @@
 """Functional tests for retrieval backbone extraction."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -175,6 +176,78 @@ def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_support
     with torch.no_grad():
         outputs = backbone(input_ids=input_ids, attention_mask=attention_mask)
     assert outputs.last_hidden_state.shape == (2, 8, backbone.config.hidden_size)
+
+
+def test_replace_submodel_ministral_embedding_returns_full_vlm_with_bidirectional_language_model(tmp_path):
+    """Replacing the text tower keeps the full VLM parent for multimodal bi-encoder use."""
+    from nemo_automodel._transformers import retrieval
+
+    model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "ministral3")
+
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="embedding",
+        replace_submodel="language_model",
+        pooling="avg",
+    )
+
+    assert backbone.__class__.__name__ == "Mistral3Model"
+    assert isinstance(backbone.language_model, Ministral3BidirectionalModel)
+    assert backbone.language_model.config.model_type == "ministral3_bidirec"
+    assert backbone.config.text_config.model_type == "ministral3_bidirec"
+    assert backbone.config.text_config.pooling == "avg"
+    _assert_state_dict_equal(language_state_dict, backbone.language_model.state_dict())
+
+
+def test_replace_submodel_rejects_extract_submodel_at_same_time(tmp_path):
+    from nemo_automodel._transformers import retrieval
+
+    model_dir, _ = _save_tiny_vlm(tmp_path, "ministral3")
+
+    with pytest.raises(ValueError, match="Only one of extract_submodel and replace_submodel"):
+        retrieval.build_encoder_backbone(
+            model_name_or_path=str(model_dir),
+            task="embedding",
+            extract_submodel="language_model",
+            replace_submodel="language_model",
+        )
+
+
+def test_biencoder_full_vlm_forwards_image_inputs_after_submodel_replacement(tmp_path, monkeypatch):
+    """The bi-encoder wrapper pools the full parent VLM and preserves image inputs."""
+    from nemo_automodel._transformers import retrieval
+    from nemo_automodel._transformers.retrieval import BiEncoderModel
+
+    model_dir, _ = _save_tiny_vlm(tmp_path, "ministral3")
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="embedding",
+        replace_submodel="language_model",
+    )
+    captured = {}
+
+    def fake_get_image_features(pixel_values, image_sizes, return_dict=True, **kwargs):
+        captured["pixel_values"] = pixel_values
+        captured["image_sizes"] = image_sizes
+        hidden_size = backbone.language_model.config.hidden_size
+        return SimpleNamespace(pooler_output=(torch.ones(1, hidden_size, dtype=torch.float32),))
+
+    monkeypatch.setattr(backbone, "get_image_features", fake_get_image_features)
+
+    encoder = BiEncoderModel(backbone, pooling="avg", l2_normalize=False)
+    image_token_id = backbone.config.image_token_id
+    embeddings = encoder(
+        {
+            "input_ids": torch.tensor([[image_token_id, 1, 2]]),
+            "attention_mask": torch.ones(1, 3, dtype=torch.long),
+            "pixel_values": torch.zeros(1, 3, 4, 4),
+            "image_sizes": torch.tensor([[4, 4]], dtype=torch.long),
+        }
+    )
+
+    assert embeddings.shape == (1, backbone.language_model.config.hidden_size)
+    assert torch.equal(captured["pixel_values"], torch.zeros(1, 3, 4, 4))
+    assert torch.equal(captured["image_sizes"], torch.tensor([[4, 4]], dtype=torch.long))
 
 
 def test_extract_submodel_llama_score_from_local_vlm_converts_to_supported_cross_encoder(tmp_path):

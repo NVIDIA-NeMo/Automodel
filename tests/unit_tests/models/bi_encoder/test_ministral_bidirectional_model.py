@@ -19,6 +19,8 @@ import json
 import pytest
 import torch
 import torch.nn as nn
+from PIL import Image
+from transformers.processing_utils import ProcessorMixin
 
 pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not available in this transformers version")
 
@@ -28,6 +30,7 @@ from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
 )
+from nemo_automodel.components.models.ministral_bidirectional.processor import Ministral3BiEncoderProcessor
 
 
 def tiny_bidirectional_config() -> Ministral3BidirectionalConfig:
@@ -48,11 +51,176 @@ def tiny_bidirectional_config() -> Ministral3BidirectionalConfig:
     return cfg
 
 
+class FakePixtralTokenizer:
+    def __init__(self):
+        self.model_input_names = ["input_ids", "attention_mask"]
+        self.model_max_length = 99
+        self.padding_side = "right"
+        self.init_kwargs = {}
+        self.calls = []
+
+    def convert_tokens_to_ids(self, token):
+        return {"[IMG]": 10, "[IMG_BREAK]": 11, "[IMG_END]": 12}.get(token, 1)
+
+    def __call__(self, texts, **kwargs):
+        if isinstance(texts, str):
+            texts = [texts]
+        self.calls.append({"texts": list(texts), "kwargs": kwargs})
+
+        input_ids = [self._tokenize_text(text) for text in texts]
+        if kwargs.get("padding"):
+            max_length = max(len(ids) for ids in input_ids)
+            for ids in input_ids:
+                ids.extend([0] * (max_length - len(ids)))
+        attention_mask = [[1 if token_id != 0 else 0 for token_id in ids] for ids in input_ids]
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    def _tokenize_text(self, text):
+        token_ids = []
+        idx = 0
+        special_tokens = [("[IMG_BREAK]", 11), ("[IMG_END]", 12), ("[IMG]", 10)]
+        while idx < len(text):
+            matched_special = False
+            for token, token_id in special_tokens:
+                if text.startswith(token, idx):
+                    token_ids.append(token_id)
+                    idx += len(token)
+                    matched_special = True
+                    break
+            if matched_special:
+                continue
+            if text[idx].isspace():
+                idx += 1
+                continue
+            while idx < len(text) and not text[idx].isspace():
+                if any(text.startswith(token, idx) for token, _ in special_tokens):
+                    break
+                idx += 1
+            token_ids.append(1)
+        return token_ids or [1]
+
+
+class FakePixtralImageProcessor:
+    model_input_names = ["pixel_values"]
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, images, **kwargs):
+        if not isinstance(images, list):
+            images = [images]
+        self.calls.append({"images": images, "kwargs": kwargs})
+        image_sizes = [[image.height, image.width] for image in images]
+        return {
+            "pixel_values": torch.ones(len(images), 3, 4, 4),
+            "image_sizes": image_sizes,
+        }
+
+
+@pytest.fixture
+def pixtral_processor(monkeypatch):
+    monkeypatch.setattr(ProcessorMixin, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    return Ministral3BiEncoderProcessor(
+        image_processor=FakePixtralImageProcessor(),
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+        q_max_length=7,
+        p_max_length=64,
+        pad_to_multiple_of=4,
+        query_prefix="query:",
+        passage_prefix="passage:",
+    )
+
+
 def test_ministral3_bidirectional_config_fields():
     cfg = Ministral3BidirectionalConfig(pooling="cls", temperature=0.5, vocab_size=100)
     assert cfg.pooling == "cls"
     assert isinstance(cfg.temperature, float)
     assert cfg.model_type == "ministral3_bidirec"
+
+
+def test_ministral3_biencoder_processor_processes_queries(pixtral_processor):
+    output = pixtral_processor.process_queries(["What is shown?"])
+
+    assert set(output) == {"input_ids", "attention_mask"}
+    assert output["input_ids"].shape[0] == 1
+    assert pixtral_processor.tokenizer.padding_side == "right"
+    call = pixtral_processor.tokenizer.calls[-1]
+    assert call["texts"] == ["query: What is shown?"]
+    assert call["kwargs"] == {
+        "padding": True,
+        "pad_to_multiple_of": 4,
+        "truncation": True,
+        "max_length": 7,
+        "return_tensors": None,
+    }
+
+
+def test_ministral3_biencoder_processor_processes_text_only_documents(pixtral_processor):
+    output = pixtral_processor.process_documents({"images": ["", None], "texts": ["Document A", "Document B"]})
+
+    assert set(output) == {"input_ids", "attention_mask", "pixel_values", "image_sizes"}
+    assert output["pixel_values"] is None
+    assert output["image_sizes"] is None
+    call = pixtral_processor.tokenizer.calls[-1]
+    assert call["texts"] == ["passage: Document A", "passage: Document B"]
+    assert call["kwargs"]["max_length"] == 64
+
+
+def test_ministral3_biencoder_processor_processes_mixed_image_text_documents(pixtral_processor):
+    image = Image.new("RGB", (4, 4), (255, 0, 0))
+
+    output = pixtral_processor.process_documents({"images": [image, ""], "texts": ["Image doc", "Text doc"]})
+
+    assert set(output) == {"input_ids", "attention_mask", "pixel_values", "image_sizes"}
+    assert output["pixel_values"].shape == (1, 3, 4, 4)
+    assert output["image_sizes"].tolist() == [[4, 4]]
+    call = pixtral_processor.tokenizer.calls[-1]
+    assert call["texts"][0].startswith("passage: [IMG]")
+    assert call["texts"][0].endswith("[IMG_END] Image doc")
+    assert call["texts"][1] == "passage: Text doc"
+
+
+def test_ministral3_biencoder_processor_forwards_image_longest_edge(monkeypatch):
+    monkeypatch.setattr(ProcessorMixin, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    image_processor = FakePixtralImageProcessor()
+    processor = Ministral3BiEncoderProcessor(
+        image_processor=image_processor,
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+        image_longest_edge=448,
+        passage_prefix="passage:",
+    )
+    image = Image.new("RGB", (4, 4), (255, 0, 0))
+
+    processor.process_documents({"images": [image], "texts": ["Image doc"]})
+
+    assert image_processor.calls[-1]["kwargs"]["size"] == {"longest_edge": 448}
+
+
+def test_ministral3_biencoder_processor_merges_biencoder_batch(pixtral_processor):
+    image = Image.new("RGB", (4, 4), (255, 0, 0))
+    features = [
+        {"question": "Question 0", "doc_text": ["Doc 0", "Doc 1"], "doc_image": [image, ""]},
+        {"question": "Question 1", "doc_text": ["Doc 2", "Doc 3"], "doc_image": ["", image]},
+    ]
+
+    output = pixtral_processor.process_queries_documents_biencoder(features)
+
+    assert set(output) == {
+        "q_input_ids",
+        "q_attention_mask",
+        "d_input_ids",
+        "d_attention_mask",
+        "d_pixel_values",
+        "d_image_sizes",
+        "labels",
+    }
+    assert output["q_input_ids"].shape[0] == 2
+    assert output["d_input_ids"].shape[0] == 4
+    assert output["d_pixel_values"].shape[0] == 2
+    assert output["d_image_sizes"].tolist() == [[4, 4], [4, 4]]
+    assert torch.equal(output["labels"], torch.zeros(2, dtype=torch.long))
 
 
 def test_ministral3_bidirectional_model_init_and_mask():
@@ -142,8 +310,11 @@ def test_encoder_build_ministral3_registry_path(tmp_path, monkeypatch):
         def from_pretrained(cls, *args, **kwargs):
             return cls(hidden=16)
 
-    ModelRegistry.model_arch_name_to_cls["Ministral3BidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    monkeypatch.setattr(
+        ModelRegistry,
+        "model_arch_name_to_cls",
+        {"Ministral3BidirectionalModel": FakeBidirectionalModel},
+    )
 
     model_dir = tmp_path / "model"
     model_dir.mkdir()
@@ -164,13 +335,17 @@ def test_encoder_build_ministral3_registry_path(tmp_path, monkeypatch):
 @pytest.mark.parametrize("top_level_model_type", ["ministral3", "ministral3_bidirec"])
 def test_encoder_build_ministral_supported_model_types(tmp_path, monkeypatch, top_level_model_type):
     """Hub / local text configs use ministral3; saved bidirectional checkpoints use ministral3_bidirec."""
+
     class FakeBidirectionalModel(FakeLM):
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
             return cls(hidden=16)
 
-    ModelRegistry.model_arch_name_to_cls["Ministral3BidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    monkeypatch.setattr(
+        ModelRegistry,
+        "model_arch_name_to_cls",
+        {"Ministral3BidirectionalModel": FakeBidirectionalModel},
+    )
 
     model_dir = tmp_path / "hub" / "checkpoint"
     model_dir.mkdir(parents=True)
