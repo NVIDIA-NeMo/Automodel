@@ -102,11 +102,13 @@ def _apply_index_rope_half_split(x: torch.Tensor, freqs_cis: torch.Tensor, qkv_f
 
 
 def _to_additive_key_mask(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Convert a ``{0,1}`` keep-mask (1=attend, 0=mask) to an ADDITIVE key mask (0 / -inf).
+    """Convert a ``{0,1}`` keep-mask (1=attend, 0=mask) to an ADDITIVE key mask (0 / finfo.min).
 
-    HF builds the attention bias with ``create_causal_mask``, which masks padding to ``-inf``.
+    Masked positions use ``finfo.min`` rather than ``-inf``: F.scaled_dot_product_attention
+    mishandles ``-inf`` float masks (its fused kernels corrupt the softmax). HF builds the
+    attention bias with ``create_causal_mask``, which likewise masks padding to ``finfo.min``.
     The recipe, however, hands the model a 2D ``{0,1}`` padding mask; adding it to the scores
-    raw (the previous behaviour) both fails to mask padding (0 -> +0 instead of -inf) AND adds
+    raw (the previous behaviour) both fails to mask padding (0 -> +0 instead of finfo.min) AND adds
     ``+1.0`` to every kept key, which is only softmax-invariant in fp32 — in bf16 the ``+1.0``
     swamps the (scaled) score differences and collapses attention toward uniform. A mask that is
     already additive (values <= 0) is returned unchanged.
