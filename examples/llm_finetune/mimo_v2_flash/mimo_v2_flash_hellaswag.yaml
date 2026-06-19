@@ -68,7 +68,7 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    dispatcher: deepep
+    dispatcher: hybridep
     experts: torch_mm
     gate_precision: float32
     enable_hf_state_dict_adapter: true
