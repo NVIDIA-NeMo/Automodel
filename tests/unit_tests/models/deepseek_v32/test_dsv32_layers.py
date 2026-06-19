@@ -12,38 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import sys
 import types
-import importlib.util
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, patch, MagicMock
 
 # Check if fast_hadamard_transform is available
 HADAMARD_AVAILABLE = False
 try:
     from fast_hadamard_transform import hadamard_transform  # noqa: F401
+
     HADAMARD_AVAILABLE = True
 except ImportError:
     # Mock fast_hadamard_transform before importing deepseek_v32 modules
-    if 'fast_hadamard_transform' not in sys.modules:
-        mock_hadamard = types.ModuleType('fast_hadamard_transform')
-        mock_hadamard.__spec__ = importlib.util.spec_from_loader('fast_hadamard_transform', loader=None)
+    if "fast_hadamard_transform" not in sys.modules:
+        mock_hadamard = types.ModuleType("fast_hadamard_transform")
+        mock_hadamard.__spec__ = importlib.util.spec_from_loader("fast_hadamard_transform", loader=None)
         mock_hadamard.hadamard_transform = lambda x, scale: x
-        sys.modules['fast_hadamard_transform'] = mock_hadamard
+        sys.modules["fast_hadamard_transform"] = mock_hadamard
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
 from nemo_automodel.components.models.deepseek_v32.layers import (
     DeepseekV32Indexer,
     DeepseekV32MLA,
     _rotate_activation,
+    _to_additive_key_mask,
 )
-from nemo_automodel.components.models.common import BackendConfig
 
 # Skip Transformer Engine tests by default unless explicitly enabled
 TE_AVAILABLE = False
 try:
     import transformer_engine  # noqa: F401
+
     TE_AVAILABLE = True
 except ImportError:
     pass
@@ -117,7 +121,7 @@ class TestDeepseekV32IndexerInit:
         indexer = DeepseekV32Indexer(config, backend)
 
         # Should have k_norm as LayerNorm
-        assert hasattr(indexer, 'k_norm')
+        assert hasattr(indexer, "k_norm")
         assert isinstance(indexer.k_norm, torch.nn.LayerNorm)
 
     @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
@@ -131,9 +135,9 @@ class TestDeepseekV32IndexerInit:
         indexer = DeepseekV32Indexer(config, backend)
 
         # Should have wq_b, wk, and weights_proj
-        assert hasattr(indexer, 'wq_b')
-        assert hasattr(indexer, 'wk')
-        assert hasattr(indexer, 'weights_proj')
+        assert hasattr(indexer, "wq_b")
+        assert hasattr(indexer, "wk")
+        assert hasattr(indexer, "weights_proj")
 
 
 class TestDeepseekV32MLAInit:
@@ -174,18 +178,18 @@ class TestDeepseekV32MLAInit:
         mla = DeepseekV32MLA(config, backend)
 
         # V3.2 always uses q_lora
-        assert hasattr(mla, 'q_a_proj')
-        assert hasattr(mla, 'q_b_proj')
-        assert hasattr(mla, 'q_a_layernorm')
+        assert hasattr(mla, "q_a_proj")
+        assert hasattr(mla, "q_b_proj")
+        assert hasattr(mla, "q_a_layernorm")
 
         # Check other components
-        assert hasattr(mla, 'kv_a_proj_with_mqa')
-        assert hasattr(mla, 'kv_a_layernorm')
-        assert hasattr(mla, 'kv_b_proj')
-        assert hasattr(mla, 'o_proj')
+        assert hasattr(mla, "kv_a_proj_with_mqa")
+        assert hasattr(mla, "kv_a_layernorm")
+        assert hasattr(mla, "kv_b_proj")
+        assert hasattr(mla, "o_proj")
 
         # Check indexer
-        assert hasattr(mla, 'indexer')
+        assert hasattr(mla, "indexer")
         assert isinstance(mla.indexer, DeepseekV32Indexer)
 
     @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
@@ -217,15 +221,8 @@ class TestDeepseekV32MLAInit:
     @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func")
     def test_mla_with_rope_scaling(self, mock_init_attn, mock_init_rms, mock_init_linear, mock_yarn_get_mscale):
         """Test MLA with rope_scaling configuration."""
-        rope_scaling = {
-            "factor": 2.0,
-            "mscale": 1.0,
-            "original_max_position_embeddings": 4096
-        }
-        config = self.create_mock_config(
-            rope_scaling=rope_scaling,
-            max_position_embeddings=8192
-        )
+        rope_scaling = {"factor": 2.0, "mscale": 1.0, "original_max_position_embeddings": 4096}
+        config = self.create_mock_config(rope_scaling=rope_scaling, max_position_embeddings=8192)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
         mock_init_linear.return_value = Mock()
@@ -352,6 +349,118 @@ class TestDeepseekV32MLASparseMask:
         # For thd format, shape should be [1, n_heads, T, T]
         assert sparse_mask.shape == (1, 8, num_tokens, num_tokens)
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
+    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func")
+    def test_build_sparse_mask_uses_finfo_min_not_inf(self, mock_init_attn, mock_init_rms, mock_init_linear, dtype):
+        """Masked positions must be finfo.min, never -inf.
+
+        Regression test: F.scaled_dot_product_attention mishandles -inf float masks (its fused
+        kernels corrupt the softmax), and an fp32 finfo.min mask downcasts to -inf in bf16 inside
+        F.sdpa -> NaN. The mask must use finfo.min in the requested dtype, with no inf anywhere.
+        """
+        config = self.create_mock_config()
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
+        mock_init_linear.return_value = Mock()
+        mock_init_rms.return_value = Mock()
+        mock_init_attn.return_value = (Mock(), Mock())
+        mla = DeepseekV32MLA(config, backend)
+
+        bsz, seq_len, topk = 2, 16, 4
+        topk_indices = torch.randint(0, seq_len, (bsz, seq_len, topk))
+
+        sparse_mask = mla._build_sparse_mask(
+            topk_indices,
+            seq_len,
+            qkv_format="bshd",
+            bsz=bsz,
+            n_heads=1,
+            dtype=dtype,
+            union_across_batches=False,
+        )
+
+        assert sparse_mask.dtype == dtype
+        # No -inf (the value that breaks F.sdpa) anywhere in the mask.
+        assert not torch.isinf(sparse_mask).any()
+        # Masked positions take exactly finfo.min for the requested dtype, and the value is
+        # representable (finite) in that dtype -- an fp32 finfo.min would become -inf in bf16.
+        neg = torch.finfo(dtype).min
+        assert torch.isfinite(torch.tensor(neg, dtype=dtype))
+        masked = sparse_mask[sparse_mask < 0]
+        if masked.numel():
+            assert torch.equal(masked, torch.full_like(masked, neg))
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
+    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func")
+    def test_build_sparse_mask_clamps_doubly_masked(self, mock_init_attn, mock_init_rms, mock_init_linear, dtype):
+        """Positions masked by BOTH top-k/causal AND padding must clamp to finfo.min, not overflow.
+
+        Adding two finfo.min values overflows to -inf; the combination is clamped back to finfo.min
+        so the SDPA -inf problem is not reintroduced for doubly-masked positions (padded keys that
+        are also outside the causal/top-k set).
+        """
+        config = self.create_mock_config()
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
+        mock_init_linear.return_value = Mock()
+        mock_init_rms.return_value = Mock()
+        mock_init_attn.return_value = (Mock(), Mock())
+        mla = DeepseekV32MLA(config, backend)
+
+        bsz, seq_len, topk = 2, 16, 4
+        topk_indices = torch.randint(0, seq_len, (bsz, seq_len, topk))
+        # {0,1} keep-mask with the last key position padded out for every query.
+        attention_mask = torch.ones(bsz, seq_len)
+        attention_mask[:, -1] = 0
+
+        sparse_mask = mla._build_sparse_mask(
+            topk_indices,
+            seq_len,
+            qkv_format="bshd",
+            bsz=bsz,
+            n_heads=1,
+            dtype=dtype,
+            attention_mask=attention_mask,
+            union_across_batches=False,
+        )
+
+        neg = torch.finfo(dtype).min
+        assert not torch.isinf(sparse_mask).any()
+        # The padded key column is masked for every query, and never below finfo.min.
+        assert torch.equal(sparse_mask[:, :, :, -1], torch.full_like(sparse_mask[:, :, :, -1], neg))
+        assert sparse_mask.min().item() == neg
+
+
+class TestToAdditiveKeyMask:
+    """Unit tests for the _to_additive_key_mask helper (SDPA-safe mask conversion)."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_bool_mask_converts_to_finfo_min(self, dtype):
+        """A bool keep-mask -> additive: kept->0, masked->finfo.min (not -inf)."""
+        mask = torch.tensor([[True, True, False]])
+        out = _to_additive_key_mask(mask, dtype)
+        neg = torch.finfo(dtype).min
+        assert out.dtype == dtype
+        assert not torch.isinf(out).any()
+        assert torch.equal(out, torch.tensor([[0.0, 0.0, neg]], dtype=dtype))
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_binary_keep_mask_converts_to_finfo_min(self, dtype):
+        """A {0,1} keep-mask -> additive: 1->0, 0->finfo.min (not -inf)."""
+        mask = torch.tensor([[1, 0, 1]])
+        out = _to_additive_key_mask(mask, dtype)
+        neg = torch.finfo(dtype).min
+        assert not torch.isinf(out).any()
+        assert torch.equal(out, torch.tensor([[0.0, neg, 0.0]], dtype=dtype))
+
+    def test_already_additive_mask_passthrough(self):
+        """An already-additive mask (values <= 0) is returned unchanged (cast to dtype)."""
+        mask = torch.tensor([[0.0, -1.0, -2.5]])
+        out = _to_additive_key_mask(mask, torch.float32)
+        assert torch.equal(out, mask.to(torch.float32))
+
 
 class TestDeepseekV32MLAInitWeights:
     def create_mock_config(self, **overrides):
@@ -380,10 +489,13 @@ class TestDeepseekV32MLAInitWeights:
         config = self.create_mock_config()
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
-        with patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module") as mock_init_linear, \
-             patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module") as mock_init_rms, \
-             patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func") as mock_init_attn:
-
+        with (
+            patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module") as mock_init_linear,
+            patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module") as mock_init_rms,
+            patch(
+                "nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func"
+            ) as mock_init_attn,
+        ):
             mock_linear = Mock()
             mock_linear.weight = torch.randn(64, 256)
             mock_linear.reset_parameters = Mock()
@@ -733,11 +845,15 @@ class TestBuildSparseMaskWithAttentionMask:
         # Result should combine both masks
         assert sparse_mask.shape == (bsz, 1, seq_len, seq_len)
 
-        # Check that causal structure is preserved (upper triangle should be -inf)
+        # Check that causal structure is preserved (upper triangle is masked). The masked value is
+        # finfo.min, NOT -inf: F.scaled_dot_product_attention mishandles -inf float masks, so the
+        # combination is clamped to finfo.min even when the input attention_mask carries -inf.
+        neg = torch.finfo(torch.float32).min
+        assert not torch.isinf(sparse_mask).any()
         for b in range(bsz):
             for i in range(seq_len):
                 for j in range(i + 1, seq_len):
-                    assert sparse_mask[b, 0, i, j] == float("-inf")
+                    assert sparse_mask[b, 0, i, j] == neg
 
 
 class TestHadamardTransformFallback:
