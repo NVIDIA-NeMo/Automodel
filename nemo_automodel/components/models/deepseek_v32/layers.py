@@ -280,7 +280,7 @@ class DeepseekV32Indexer(nn.Module):
         scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)  # [T, T] or [B, S, T]
 
         # Apply attention mask if provided. Convert a {0,1} keep-mask to an additive key mask
-        # (kept -> 0, padding -> -inf) so padding keys are excluded from the top-k selection,
+        # (kept -> 0, padding -> finfo.min) so padding keys are excluded from the top-k selection,
         # instead of biasing kept keys by +1 (the previous raw-add behaviour).
         if attention_mask is not None:
             am = _to_additive_key_mask(attention_mask, scores.dtype)
@@ -499,7 +499,7 @@ class DeepseekV32MLA(nn.Module):
         sparse_mask = sparse_mask.masked_fill(causal_bool, neg)
 
         # Combine with the attention mask if provided. Convert a {0,1} keep-mask to an additive
-        # key mask (kept -> 0, padding -> -inf) and broadcast it over the key axis; adding a raw
+        # key mask (kept -> 0, padding -> finfo.min) and broadcast it over the key axis; adding a raw
         # {0,1} mask would bias kept keys by +1 (bf16-lossy) and leave padding unmasked.
         if attention_mask is not None:
             am = _to_additive_key_mask(attention_mask, sparse_mask.dtype)
