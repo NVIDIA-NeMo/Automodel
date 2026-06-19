@@ -1,0 +1,130 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Gemma 4 E4B (small dense, ~8B, kv-sharing + per-layer-inputs) text-only SFT on
+# Tulu-3, sequence-packed to 64k, MULTINODE: 2 nodes (16 GPUs), dp1 x cp16 -> CP
+# shards 64k to 4k tokens/rank via the model-owned p2p ring. Peak ~54 GiB/GPU;
+# step-0 loss ~1 (correct, matches the use_cache=true reference).
+#
+# E4B-specific settings (each validated; do NOT carry these to the 31B recipe):
+#   1. text_config.use_cache=false + the model-owned cache-free kv-share holder
+#      (_Gemma4KVShareHolder in gemma4_moe/model.py). E4B shares K/V across its
+#      trailing layers via past_key_values.shared_layers; HF gates that read on
+#      `past_key_values is not None`, so with use_cache=false the shared layers
+#      fall back to dead K/V projections and the loss inflates ~4x. The holder
+#      restores HF's kv-sharing without a per-token cache (gated to E2B/E4B only).
+#   2. activation_checkpointing=false. E4B's kv-sharing is incompatible with
+#      gradient checkpointing (the shared-layer read breaks under recompute), so
+#      AC is OFF -- 64k OOMs single-node without AC, hence 2 nodes / cp16 (4k
+#      tokens/rank, the same local footprint a single-node cp8 run has at 32k).
+#   3. inject_fake_images=false. The VLM pipeline otherwise injects a fake image
+#      into text-only samples; E4B's vision patch-embedder then builds a ~54 GiB
+#      position one-hot and OOMs. The vision tower is frozen, so they're unneeded.
+#   4. NO thinking-prefix hook -- E4B is not a reasoning model and can't predict
+#      the injected <|channel>thought tokens (the 31B is the opposite).
+#   5. FusedLinearCrossEntropy -- avoids materializing the full [S, 262k] logits.
+#
+# Dense CP requires attn_implementation=sdpa (the ring swaps SDPA) and no TE
+# backend. TP is unavailable for E2B/E4B (HF per-layer-input merge crashes under
+# DTensor), so scale with dp_shard x cp only.
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 1
+  local_batch_size: 1
+  ckpt_every_steps: 999999
+  val_every_steps: 999999
+  max_steps: 20
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: google/gemma-4-E4B-it
+  torch_dtype: torch.bfloat16
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  text_config:
+    use_cache: false
+    output_hidden_states: true
+
+processor:
+  padding_side: right
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 16
+  sequence_parallel: false
+  activation_checkpointing: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  logit_softcapping: 30.0
+  reduction: sum
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_meta_dataset
+  path_or_dataset: logs/gemma4_tulu3_seqpack_cp/data/tulu3_train_meta.json
+  split: train
+  truncate: false
+  inject_fake_images: false
+
+packed_sequence:
+  pretokenize: true
+  max_length: 65536
+  pack_size: 65536
+  collate_max_length: 65536
+  packing_ratio: 0.9
+  drop_long_samples: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+wandb:
+  project: huiyingl_workspace
+  entity: Nemo-automodel
+  name: gemma4_e4b_tulu3_text_cp16_64k_2node
+  group: gemma4_e4b_tulu3_text_cp16_64k
+  tags: [gemma4-e4b, tulu3, text-only, dense, cp16, 64k, 2node]
+  dir: logs/gemma4_e4b_tulu3_text_cp16_64k/wandb
