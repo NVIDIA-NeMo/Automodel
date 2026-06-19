@@ -114,6 +114,10 @@ optimizer:
   lr: 1.0e-5
   weight_decay: 0.1
 
+ci:
+  env_vars:
+    MAX_STEPS: 10
+
 # wandb:
 #   project: your_wandb_project
 #   entity: your_wandb_entity

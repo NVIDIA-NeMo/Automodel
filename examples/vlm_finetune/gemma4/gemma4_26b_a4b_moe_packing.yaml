@@ -101,6 +101,10 @@ freeze_config:
   freeze_audio_tower: true
   freeze_language_model: false
 
+ci:
+  env_vars:
+    MAX_STEPS: 10
+
 # wandb:
 #   project: <your-project>
 #   entity: <your-entity>
