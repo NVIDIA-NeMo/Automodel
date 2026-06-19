@@ -377,10 +377,16 @@ jobs:
           - test-name: L0_Unit_Tests_CPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: true
+            # Diagnostic bump: the suite was timing out at the default 10 min before
+            # pytest could emit its --durations report. Raised so the run completes and
+            # we can read per-test timings. Revert to the default once slow tests are fixed.
+            timeout: 20
           - test-name: L0_Unit_Tests_GPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
-            timeout: 30
+            # Diagnostic bump: GPU unit suite never finished within 30 min, so --durations
+            # was never emitted. Raised to capture per-test timings. Revert after fixing.
+            timeout: 60
     needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
