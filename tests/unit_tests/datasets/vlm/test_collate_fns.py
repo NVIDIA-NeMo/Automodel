@@ -73,6 +73,7 @@ class DummyDefaultProcessor:
         truncation=False,
         return_tensors,
         return_dict=True,
+        processor_kwargs=None,
     ):
         assert tokenize and return_tensors == "pt" and return_dict
         batch_size = len(conv_list)
@@ -694,9 +695,11 @@ def test_default_collate_fn_with_max_length(collate_mod, fake_qwen_utils, monkey
     processor = MaxLengthProcessor()
     collate_mod.default_collate_fn([{"conversation": CONVERSATION}], processor, max_length=512)
 
-    assert captured_kwargs.get("max_length") == 512
-    assert captured_kwargs.get("padding") == "max_length"
-    assert captured_kwargs.get("truncation") is True
+    # processing kwargs are now nested under processor_kwargs (transformers>=5)
+    proc_kwargs = captured_kwargs.get("processor_kwargs", {})
+    assert proc_kwargs.get("max_length") == 512
+    assert proc_kwargs.get("padding") == "max_length"
+    assert proc_kwargs.get("truncation") is True
 
 
 def test_default_collate_fn_without_max_length(collate_mod, fake_qwen_utils, monkeypatch):
@@ -718,8 +721,9 @@ def test_default_collate_fn_without_max_length(collate_mod, fake_qwen_utils, mon
     processor = NoMaxLengthProcessor()
     collate_mod.default_collate_fn([{"conversation": CONVERSATION}], processor)
 
-    assert "max_length" not in captured_kwargs
-    assert captured_kwargs.get("padding") is True
+    proc_kwargs = captured_kwargs.get("processor_kwargs", {})
+    assert "max_length" not in proc_kwargs
+    assert proc_kwargs.get("padding") is True
 
 
 def test_kimi_vl_collate_fn_registered(collate_mod):
@@ -2712,9 +2716,10 @@ def test_default_collate_fn_truncation_by_default(collate_mod, fake_qwen_utils, 
         max_length=512,
     )
 
-    assert captured_kwargs.get("truncation") is True
-    assert captured_kwargs.get("max_length") == 512
-    assert captured_kwargs.get("padding") == "max_length"
+    proc_kwargs = captured_kwargs.get("processor_kwargs", {})
+    assert proc_kwargs.get("truncation") is True
+    assert proc_kwargs.get("max_length") == 512
+    assert proc_kwargs.get("padding") == "max_length"
 
 
 def test_default_collate_fn_no_truncation_with_drop_overlong(collate_mod, fake_qwen_utils, monkeypatch):
@@ -2745,9 +2750,10 @@ def test_default_collate_fn_no_truncation_with_drop_overlong(collate_mod, fake_q
         drop_overlong=True,
     )
 
-    assert captured_kwargs.get("truncation") is False
-    assert captured_kwargs.get("max_length") == 512
-    assert captured_kwargs.get("padding") == "max_length"
+    proc_kwargs = captured_kwargs.get("processor_kwargs", {})
+    assert proc_kwargs.get("truncation") is False
+    assert proc_kwargs.get("max_length") == 512
+    assert proc_kwargs.get("padding") == "max_length"
 
 
 def test_estimate_media_tokens_with_pil_image(collate_mod):
