@@ -122,6 +122,7 @@ freeze_config:
   freeze_language_model: false
 
 wandb:
+  enable: false
   project: huiyingl_workspace
   entity: Nemo-automodel
   name: gemma4_e4b_tulu3_text_cp16_64k_2node

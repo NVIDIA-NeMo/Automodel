@@ -1,6 +1,7 @@
 seed: 42
 
 wandb:
+  enable: false
   project: flux2-finetuning
   mode: online
   name: flux2_finetune_run
