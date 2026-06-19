@@ -436,11 +436,12 @@ class DeepseekV32MLA(nn.Module):
     ) -> torch.Tensor:
         """Build a sparse attention mask/bias from top-k indices.
 
-        Creates a mask tensor where non-top-k positions are set to -inf.
+        Creates a mask tensor where non-top-k positions are set to finfo.min.
         Works for both TE (core_attention_bias) and SDPA (attn_mask).
 
-        Uses the same efficient pattern as the official DeepSeek inference code:
-        `torch.full(..., -inf).scatter_(-1, topk_indices, 0)`
+        Uses the same efficient pattern as the official DeepSeek inference code, but with
+        finfo.min instead of -inf (F.sdpa mishandles -inf float masks):
+        `torch.full(..., finfo.min).scatter_(-1, topk_indices, 0)`
 
         Args:
             topk_indices: Indices of top-k positions [B, S, topk] or [T, topk]
@@ -480,7 +481,7 @@ class DeepseekV32MLA(nn.Module):
                 sparse_mask = torch.full((bsz, seq_len, seq_len), neg, device=device, dtype=dtype).scatter_(
                     -1, topk_indices, 0.0
                 )
-                # Union: max(0, -inf) = 0 for any position selected in any batch
+                # Union: max(0, finfo.min) = 0 for any position selected in any batch
                 sparse_mask = sparse_mask.max(dim=0, keepdim=True).values
                 sparse_mask = sparse_mask.view(1, 1, seq_len, seq_len).expand(1, n_heads, -1, -1).contiguous()
             else:
