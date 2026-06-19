@@ -74,7 +74,7 @@ class TestNemotronV3StateDictAdapter:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
         )
 
     def test_adapter_init(self, config, moe_config, backend):
@@ -228,7 +228,7 @@ class TestNemotronV3AdapterFromHf:
                 "lm_head.weight": torch.randn(100, 256),
             }
 
-            result = adapter.from_hf(hf_state_dict)
+            adapter.from_hf(hf_state_dict)
 
             # Check that _from_hf_w_merged_experts was called with renamed state dict
             call_args = mock_merge.call_args[0][0]
@@ -486,7 +486,10 @@ class TestNemotronV3AdapterMixerExperts:
 
         with patch.object(adapter, "_validate_expert_availability"):
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
-                with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
+                with patch(
+                    "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
+                    side_effect=lambda x, *args: x,
+                ):
                     result = adapter._from_hf_w_merged_experts(hf_state_dict)
 
         # Should have created merged expert tensors with mixer.experts path

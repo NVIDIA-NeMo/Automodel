@@ -14,7 +14,6 @@
 
 import importlib.util
 import logging
-import warnings
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -176,7 +175,8 @@ class BackendConfig:
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
             and allocate dispatched tensors on the communication stream.
-        enable_deepep: Deprecated. Use dispatcher="deepep" and experts="gmm" instead.
+        enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
+            and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
             that assigns tokens to experts without learned routing weights.
         fake_gate_noise: Noise level [0, 1] for FakeBalancedGate. When > 0, uses
@@ -210,7 +210,7 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
-    enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
+    enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
     # 0.0→1.00x, 0.1→~1.2x, 0.3→~1.6x, 0.5→~2.0x, 1.0→~2.8x.
@@ -235,21 +235,17 @@ class BackendConfig:
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
 
-        # Handle deprecated enable_deepep parameter
+        # enable_deepep was removed. It is no longer honored; warn (once, on rank 0) if a stale
+        # config still sets it so the user migrates to explicit dispatcher/experts. The field is
+        # retained only so loading an old config does not crash this kw_only dataclass.
         if self.enable_deepep is not None:
-            warnings.warn(
-                "enable_deepep is deprecated and will be removed in a future release. "
-                "Use experts='gmm' and dispatcher='deepep' instead of enable_deepep=True, "
-                "or dispatcher='torch' instead of enable_deepep=False.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if self.enable_deepep:
-                self.experts = "gmm"
-                self.dispatcher = "deepep"
-            else:
-                self.dispatcher = "torch"
-            # Clear the deprecated field after conversion
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                logger.warning(
+                    "enable_deepep is no longer supported and is ignored. "
+                    "Set 'dispatcher' (deepep/hybridep/torch) and 'experts' explicitly instead. "
+                    "Previously enable_deepep=True was equivalent to experts=gmm + dispatcher=deepep, "
+                    "and enable_deepep=False to dispatcher=torch."
+                )
             self.enable_deepep = None
 
         # Backward compatibility
