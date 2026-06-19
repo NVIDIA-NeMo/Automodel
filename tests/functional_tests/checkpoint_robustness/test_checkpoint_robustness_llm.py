@@ -362,6 +362,36 @@ def _barrier():
         dist.barrier()
 
 
+def _release_recipe_memory(recipe) -> None:
+    """Release a recipe's GPU-resident state between checkpoint-robustness phases.
+
+    Each phase builds a full FSDP2 model + optimizer. A bare ``del`` is not
+    enough: the per-part optimizers are reachable from the model (they are built
+    over ``model.parts``), so the optimizer state (Adam moments are the bulk)
+    lingers. Clear the optimizer state in place and drop the recipe's references,
+    then collect — letting the prior phase's model + optimizer be reclaimed
+    before the next phase allocates its own, keeping the inter-phase baseline low.
+    """
+    if recipe is None:
+        return
+    optimizers = getattr(recipe, "optimizer", None)
+    if not isinstance(optimizers, (list, tuple)):
+        optimizers = [optimizers] if optimizers is not None else []
+    for opt in optimizers:
+        try:
+            opt.state.clear()
+            opt.param_groups.clear()
+        except Exception:
+            pass
+    recipe.model_parts = None
+    recipe.optimizer = None
+    if getattr(recipe, "lr_scheduler", None) is not None:
+        recipe.lr_scheduler = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def test_checkpoint_robustness():
     """Train -> checkpoint -> reload automodel from consolidated -> reload vanilla HF, compare logits."""
     custom_args, config_argv = _extract_custom_args(sys.argv[1:])
@@ -438,9 +468,8 @@ def test_checkpoint_robustness():
     else:
         original_quantization_config = _raw_qc
 
+    _release_recipe_memory(trainer)
     del trainer
-    gc.collect()
-    torch.cuda.empty_cache()
 
     # Phantom key check: scan consolidated safetensors for leaked quantization keys
     if check_phantom_keys and _rank0():
@@ -493,9 +522,8 @@ def test_checkpoint_robustness():
     )
 
     # Phase 4: Load into vanilla HF (rank 0 only)
+    _release_recipe_memory(restored_trainer)
     del restored_trainer
-    gc.collect()
-    torch.cuda.empty_cache()
     _barrier()  # ensure all ranks free memory before rank 0 loads HF model
 
     if skip_hf_reload:
@@ -652,9 +680,8 @@ def test_checkpoint_robustness():
             f"max per-token KL = {max_kl_cross_tp:.6e} > threshold {cross_tp_kl_threshold:.6e}"
         )
 
+        _release_recipe_memory(cross_tp_trainer)
         del cross_tp_trainer
-        gc.collect()
-        torch.cuda.empty_cache()
         _barrier()
 
     # Phase 6 (optional): Training resumption — verify loss continuity
@@ -693,9 +720,8 @@ def test_checkpoint_robustness():
                     if entry["step"] >= original_max_steps:
                         baseline_losses[entry["step"]] = entry["loss"]
 
+        _release_recipe_memory(baseline_trainer)
         del baseline_trainer
-        gc.collect()
-        torch.cuda.empty_cache()
         shutil.rmtree(baseline_dir, ignore_errors=True)
 
         # Resume: reload from Phase 1 checkpoint and train to resume_max_steps.
@@ -739,9 +765,8 @@ def test_checkpoint_robustness():
             )
             print(f"[Phase 6] Training resumption verified ({matched_steps} steps compared) ✓")
 
+        _release_recipe_memory(resume_trainer)
         del resume_trainer
-        gc.collect()
-        torch.cuda.empty_cache()
         _barrier()
 
     # Skip the atexit-registered destroy_process_group() call. MoE models with expert
