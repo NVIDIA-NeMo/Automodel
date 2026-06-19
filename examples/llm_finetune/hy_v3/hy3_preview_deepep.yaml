@@ -138,4 +138,5 @@ ci:
   # Verified on cw (H100-80GB): trains at ~42 GiB/GPU. Note pp4*ep8=32 (4 nodes) OOMs
   # at the first optimizer.step, and dp does not shard the experts (only pp*ep does),
   # so the fix is more pp, not more dp; ep stays 8 to keep DeepEP intra-node.
+  time: "00:20:00"
   nodes: 8
