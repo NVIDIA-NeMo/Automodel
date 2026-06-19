@@ -35,6 +35,20 @@ from nemo_automodel.components.models.gemma4_moe.model import (
     _kv_sharing_active,
 )
 
+# Run only on the GPU job and build everything under the CUDA device context.
+# HF weight init (_init_weights -> torch.Tensor.normal_) on bf16 CPU tensors has a
+# large fixed per-call cost (~12s for even this tiny model, ~150x slower than GPU),
+# which made this file ~149s on the CPU unit-test job. Constructing on-device keeps
+# that init on the GPU.
+pytestmark = pytest.mark.run_only_on("GPU")
+
+
+@pytest.fixture(autouse=True)
+def _build_on_cuda():
+    """Build the models/tensors in these GPU-only tests on CUDA (see note above)."""
+    with torch.device("cuda"):
+        yield
+
 
 def _text_config(**overrides):
     defaults = dict(
