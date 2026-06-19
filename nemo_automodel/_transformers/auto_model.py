@@ -1064,6 +1064,8 @@ class _NeMoAutoModelForRetrievalBase:
         build_kwargs.pop("tp_size", None)
         build_kwargs.pop("cp_size", None)
         build_kwargs.pop("has_packed_sequence", None)
+        if "dtype" not in build_kwargs:
+            build_kwargs["torch_dtype"] = torch_dtype
 
         setup = _resolve_distributed_setup(
             distributed_setup=distributed_setup,
@@ -1089,7 +1091,6 @@ class _NeMoAutoModelForRetrievalBase:
         model = encoder_cls.build(
             model_name_or_path=pretrained_model_name_or_path,
             attn_implementation=attn_implementation,
-            torch_dtype=torch_dtype,
             **build_kwargs,
         )
 

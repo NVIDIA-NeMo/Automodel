@@ -20,9 +20,11 @@ from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase, Proce
 from transformers.file_utils import PaddingStrategy
 
 from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
+from nemo_automodel.components.models.ministral_bidirectional import Ministral3BiEncoderProcessor
 
 MODELS_WITH_PROCESSOR = {
     "llama_nemotron_vl": LlamaNemotronVLProcessor,
+    "ministral3": Ministral3BiEncoderProcessor,
 }
 
 

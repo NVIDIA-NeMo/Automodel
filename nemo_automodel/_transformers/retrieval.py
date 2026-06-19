@@ -45,6 +45,15 @@ def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedMode
     return extracted_model
 
 
+def _get_submodule_parent_and_attr(model: nn.Module, submodule_path: str) -> tuple[nn.Module, str]:
+    """Return the parent module and final attribute name for a dotted submodule path."""
+    attrs = submodule_path.split(".")
+    parent = model
+    for attr in attrs[:-1]:
+        parent = getattr(parent, attr)
+    return parent, attrs[-1]
+
+
 def _get_supported_backbone_class(model_type: str, task: str) -> type[nn.Module] | None:
     """Return the registered retrieval backbone class for a model type and task."""
     task_map = SUPPORTED_BACKBONES.get(model_type.lower())
@@ -139,6 +148,44 @@ def _build_backbone_from_extracted_submodel(
     return _load_from_extracted_state(backbone_class, config, extracted_model)
 
 
+def _sync_parent_config_after_submodel_replacement(
+    parent_model: PreTrainedModel,
+    replace_submodel: str,
+    replacement_model: PreTrainedModel,
+) -> None:
+    """Keep the parent config aligned with a replaced text submodule."""
+    parent_config = getattr(parent_model, "config", None)
+    replacement_config = getattr(replacement_model, "config", None)
+    if parent_config is None or replacement_config is None:
+        return
+
+    if replace_submodel.endswith("language_model") and hasattr(parent_config, "text_config"):
+        parent_config.text_config = replacement_config
+
+
+def _replace_submodel_with_retrieval_backbone(
+    parent_model: PreTrainedModel,
+    replace_submodel: str,
+    task: str,
+    pooling: Optional[str],
+    num_labels: Optional[int],
+    temperature: Optional[float],
+) -> PreTrainedModel:
+    """Replace a nested parent submodule with its retrieval-specific backbone."""
+    extracted_model = _extract_submodel(parent_model, replace_submodel)
+    replacement_model = _build_backbone_from_extracted_submodel(
+        extracted_model,
+        task=task,
+        pooling=pooling,
+        num_labels=num_labels,
+        temperature=temperature,
+    )
+    parent, attr = _get_submodule_parent_and_attr(parent_model, replace_submodel)
+    setattr(parent, attr, replacement_model)
+    _sync_parent_config_after_submodel_replacement(parent_model, replace_submodel, replacement_model)
+    return parent_model
+
+
 def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_type: str) -> torch.Tensor:
     """
     Pool hidden states using the specified pooling method.
@@ -173,6 +220,67 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
         raise ValueError(f"pool_type {pool_type} not supported")
 
     return emb
+
+
+def _get_module_device_dtype(module: nn.Module) -> tuple[torch.device, torch.dtype]:
+    """Return a real device/dtype pair from a module's parameters or buffers."""
+    for parameter in module.parameters():
+        return parameter.device, parameter.dtype
+    for buffer in module.buffers():
+        return buffer.device, buffer.dtype
+    return torch.device("cpu"), torch.float32
+
+
+def _sum_nested_tensors(value) -> torch.Tensor | None:
+    """Sum tensors from nested model outputs so they can contribute a zero gradient."""
+    if isinstance(value, torch.Tensor):
+        return value.sum()
+    if isinstance(value, (list, tuple)):
+        total = None
+        for item in value:
+            item_sum = _sum_nested_tensors(item)
+            if item_sum is not None:
+                total = item_sum if total is None else total + item_sum
+        return total
+    return None
+
+
+def _dummy_vision_sum(model: nn.Module) -> torch.Tensor | None:
+    """Run a one-image dummy vision path for VLMs that expose get_image_features()."""
+    if not hasattr(model, "get_image_features") or not hasattr(model, "vision_tower"):
+        return None
+
+    vision_tower = model.vision_tower
+    device, dtype = _get_module_device_dtype(vision_tower)
+    patch_size = getattr(vision_tower, "patch_size", None)
+    if patch_size is None:
+        patch_size = getattr(getattr(vision_tower, "config", None), "patch_size", 16)
+    spatial_merge_size = getattr(getattr(model, "config", None), "spatial_merge_size", 1)
+    if isinstance(patch_size, (list, tuple)):
+        patch_height, patch_width = patch_size
+    else:
+        patch_height = patch_width = patch_size
+    if isinstance(spatial_merge_size, (list, tuple)):
+        spatial_merge_height, spatial_merge_width = spatial_merge_size
+    else:
+        spatial_merge_height = spatial_merge_width = spatial_merge_size
+
+    # HF Mistral3 squeezes projected image features; keep more than one merged token
+    # so that the token dimension survives before its split-by-image step.
+    image_height = int(patch_height) * int(spatial_merge_height) * 2
+    image_width = int(patch_width) * int(spatial_merge_width) * 2
+
+    dummy_pixels = torch.zeros(1, 3, image_height, image_width, device=device, dtype=dtype)
+    dummy_image_sizes = torch.tensor([[image_height, image_width]], device=device, dtype=torch.long)
+    dummy_outputs = model.get_image_features(
+        pixel_values=dummy_pixels,
+        image_sizes=dummy_image_sizes,
+        return_dict=True,
+    )
+    dummy_sum = _sum_nested_tensors(getattr(dummy_outputs, "pooler_output", None))
+    if dummy_sum is None:
+        dummy_sum = _sum_nested_tensors(dummy_outputs)
+    return dummy_sum
 
 
 def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
@@ -210,6 +318,7 @@ def build_encoder_backbone(
     trust_remote_code: bool = False,
     pooling: Optional[str] = None,
     extract_submodel: Optional[str] = None,
+    replace_submodel: Optional[str] = None,
     num_labels: Optional[int] = None,
     temperature: Optional[float] = None,
     **hf_kwargs,
@@ -238,6 +347,8 @@ def build_encoder_backbone(
             (e.g. Qwen3) loaded via ``AutoModel``; those only receive ``**hf_kwargs``.
         extract_submodel: Dotted attribute path to extract from the loaded model
             (e.g. ``"language_model"`` to extract the text backbone from a VLM).
+        replace_submodel: Dotted attribute path to replace on the loaded parent model
+            with a retrieval-specific backbone. The parent model is returned.
         num_labels: Number of labels for reranking/classification backbones.
         temperature: Optional retrieval score temperature for custom retrieval backbones.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
@@ -249,6 +360,9 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
+    if extract_submodel is not None and replace_submodel is not None:
+        raise ValueError("Only one of extract_submodel and replace_submodel can be set.")
+
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
     model_type = getattr(config, "model_type", "")
 
@@ -256,8 +370,21 @@ def build_encoder_backbone(
         logger.info(f"Loading {model_name_or_path} with HuggingFace Auto classes to extract {extract_submodel}")
         model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
         extracted_model = _extract_submodel(model, extract_submodel)
-        return _build_backbone_from_extracted_submodel(
+        extracted_model = _build_backbone_from_extracted_submodel(
             extracted_model,
+            task=task,
+            pooling=pooling,
+            num_labels=num_labels,
+            temperature=temperature,
+        )
+        return extracted_model
+
+    if replace_submodel is not None:
+        logger.info(f"Loading {model_name_or_path} with HuggingFace Auto classes to replace {replace_submodel}")
+        model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+        return _replace_submodel_with_retrieval_backbone(
+            model,
+            replace_submodel=replace_submodel,
             task=task,
             pooling=pooling,
             num_labels=num_labels,
@@ -429,6 +556,10 @@ class BiEncoderModel(nn.Module):
         model_inputs = {k: v for k, v in input_dict.items() if k not in ["kd_labels", "run_dummy_vision"]}
         if "run_dummy_vision" in forward_args and "run_dummy_vision" in input_dict:
             model_inputs["run_dummy_vision"] = input_dict["run_dummy_vision"]
+        dummy_vision_sum = None
+        if "run_dummy_vision" not in forward_args and input_dict.get("run_dummy_vision") is not False:
+            if self.training and model_inputs.get("pixel_values") is None:
+                dummy_vision_sum = _dummy_vision_sum(self.model)
 
         outputs = self.model(
             **model_inputs,
@@ -440,6 +571,8 @@ class BiEncoderModel(nn.Module):
             hidden_state = outputs.last_hidden_state
         else:
             hidden_state = outputs.hidden_states[-1]
+        if dummy_vision_sum is not None:
+            hidden_state = hidden_state + dummy_vision_sum.to(hidden_state.dtype) * 0.0
 
         embeds = pool(
             last_hidden_states=hidden_state,
