@@ -245,7 +245,7 @@ class TestMoE:
     def test_empty_moe_dict_uses_defaults(self):
         result = parse_distributed_section({"ep_size": 2, "moe": {}})
         assert isinstance(result["moe_parallel_config"], MoEParallelizerConfig)
-        assert result["moe_parallel_config"].ignore_router_for_ac is False
+        assert result["moe_parallel_config"].ignore_router_for_ac is True
 
     def test_mp_policy_none_when_omitted(self):
         result = parse_distributed_section({"ep_size": 2, "moe": {}})
