@@ -55,6 +55,11 @@ distributed:
   pp_size: 8
 
   sequence_parallel: false
+  # 70B is activation-bound on 80GB H100: model states are ~18GB/GPU (PP=8/dp=4
+  # FSDP-sharded) but the interleaved-1f1b warmup retains ~57GB of block activations
+  # and OOMs in the first forward. pp_microbatch_size alone can't close that gap;
+  # recompute block activations so the warmup peak fits.
+  activation_checkpointing: true
 
   pipeline:
     pp_schedule: interleaved1f1b
