@@ -684,6 +684,7 @@ class GroupedExpertsDeepEP(nn.Module):
         super().__init__()
 
         self.config = config
+        self.backend = backend
         # "torch_mm_mxfp8" dispatches identically to "torch_mm" but routes the grouped
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
@@ -727,6 +728,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_expert_rank_capacity_factor=getattr(self.backend, "moe_expert_rank_capacity_factor", None),
         )
 
         self.n_routed_experts = self.config.n_routed_experts
@@ -931,6 +933,7 @@ class GroupedExpertsTE(nn.Module):
         super().__init__()
 
         self.config = config
+        self.backend = backend
         self.num_local_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
         self.dim = config.dim
@@ -1250,6 +1253,7 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_expert_rank_capacity_factor=getattr(self.backend, "moe_expert_rank_capacity_factor", None),
         )
 
         local_expert_indices_offset = self.ep_rank * self.num_local_experts

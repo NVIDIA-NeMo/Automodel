@@ -67,6 +67,9 @@ model:
     rope_fusion: false
     experts: torch_mm
     dispatcher: hybridep
+    # Static per-rank token budget so HybridEP's num_permuted_tokens is rank-uniform; every EP
+    # rank sizes its permute buffer identically, fixing the PP+EP NCCL deadlock at ~step 12.
+    moe_expert_rank_capacity_factor: 2.0
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true

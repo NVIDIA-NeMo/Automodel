@@ -210,6 +210,11 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
+    # Static per-rank permuted-token budget for the HybridEP dispatcher (mirrors Megatron-LM's
+    # moe_expert_rank_capacity_factor). When set, HybridEP's num_permuted_tokens becomes a
+    # rank-uniform CPU int so every EP rank sizes its permute buffer identically (fixes the PP+EP
+    # NCCL deadlock). None keeps the dynamic, data-dependent count.
+    moe_expert_rank_capacity_factor: float | None = None
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
