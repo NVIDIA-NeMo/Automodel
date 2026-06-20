@@ -317,10 +317,10 @@ def apply_ac(
 def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):
     """Shard each ``_fp32_params`` holder in ``block`` as its own fp32 FSDP unit.
 
-    Qwen3.5 GatedDeltaNet keeps its SSM-gating params (A_log/dt_bias) in fp32
-    storage, isolated in a ``_fp32_params`` holder submodule. FSDP2 requires a
-    dtype-uniform parameter group, so these are sharded separately with an fp32
-    mixed-precision policy and excluded from the block's (bf16) FSDP unit.
+    Model implementations own the architecture-specific decision to create these
+    holders (for example Qwen3.5/Qwen3-Next GatedDeltaNet ``A_log``/``dt_bias``).
+    FSDP only treats the holder as a dtype-uniform fp32 unit and excludes its params
+    from the block's bf16 FSDP unit.
 
     Returns the set of holder parameters to exclude from the block's FSDP wrap.
     Blocks that do not expose ``named_modules`` (e.g. non-``nn.Module`` test
@@ -437,10 +437,8 @@ def apply_fsdp(
         if isinstance(moe_module, MoE) and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())
 
-        # Isolate the linear_attn SSM-gating params (A_log/dt_bias), which are kept
-        # in fp32 storage, into their own fp32 FSDP group so the rest of the block
-        # stays dtype-uniform (FSDP2 requires uniform dtype within a group). Shard
-        # the holder on its own and exclude its params from the block's FSDP unit.
+        # Shard model-owned fp32 holders on their own and exclude their params from
+        # the block's FSDP unit to keep the block dtype-uniform.
         fp32_ignored = _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy)
         if fp32_ignored:
             ignored_params = (ignored_params or set()) | fp32_ignored
