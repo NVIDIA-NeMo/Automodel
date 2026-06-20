@@ -17,10 +17,13 @@
 #   automodel examples/llm_finetune/devstral/devstral2_small_2512_squad_peft.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 #
-# This recipe uses the stock HF Mistral3ForConditionalGeneration loader
-# (force_hf: true). The custom Devstral FP8 path was removed in the
-# mistral3_vlm refactor; the FP8 checkpoint is dequantized on load via
-# transformers.FineGrainedFP8Config(dequantize=true).
+# Devstral-Small-2-24B-Instruct-2512 is a per-tensor FP8 checkpoint
+# (Mistral3ForConditionalGeneration / ministral3 text backbone, same family as
+# Ministral-3). Automodel's custom Mistral3FP8VLMForConditionalGeneration claims
+# it via the mistral3_vlm resolver hook and dequantizes FP8 -> bf16 inside the
+# DCP load via its state_dict_adapter; LoRA then attaches to the resulting bf16
+# Linears. This avoids HF's FineGrainedFP8 loader, which breaks on per-tensor
+# (scalar) scales under transformers 5.8.1.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -43,10 +46,6 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: mistralai/Devstral-Small-2-24B-Instruct-2512
-  force_hf: true
-  quantization_config:
-    _target_: transformers.FineGrainedFP8Config
-    dequantize: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
