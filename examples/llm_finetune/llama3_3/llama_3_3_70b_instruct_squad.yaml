@@ -55,19 +55,16 @@ distributed:
   pp_size: 8
 
   sequence_parallel: false
-  # 70B is activation-bound on 80GB H100: model states are ~18GB/GPU (PP=8/dp=4
-  # FSDP-sharded) but the interleaved-1f1b warmup retains ~57GB of block activations
-  # and OOMs in the first forward. pp_microbatch_size alone can't close that gap;
-  # recompute block activations so the warmup peak fits.
+  # This recipe was tuned for 141GB H200; on 80GB H100 it OOMs in the first step.
+  # Recompute block activations to cut the interleaved-1f1b activation peak.
   activation_checkpointing: true
 
   pipeline:
     pp_schedule: interleaved1f1b
-    # microbatch=2 (not 4) so the activation peak fits 80GB H100s; the activation
-    # memory of this PP=8/dp=4 run scales with pp_microbatch_size, and 4 overflows
-    # H100 (it was tuned for 141GB H200). global_batch_size is unchanged, and
-    # local_batch_size(32) / 2 = 16 microbatches still satisfies >= pp_size(8).
-    pp_microbatch_size: 2
+    # microbatch=1 (was 4, tuned for 141GB H200): smallest per-microbatch fwd +
+    # recompute + grad activation so the step fits 80GB H100, on top of activation
+    # checkpointing above. local_batch_size(32) / 1 = 32 microbatches >= pp_size(8).
+    pp_microbatch_size: 1
     scale_grads_in_schedule: false
 
 loss_fn:
