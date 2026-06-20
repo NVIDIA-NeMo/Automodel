@@ -342,7 +342,6 @@ class _HybridEPManager(_DispatchManager):
         router_topk: int,
         permute_fusion: bool = False,
         moe_hybridep_num_sms: int = 24,
-        moe_expert_rank_capacity_factor: Optional[float] = None,
     ):
         self.group = group
         self.num_local_experts = num_local_experts
@@ -350,7 +349,6 @@ class _HybridEPManager(_DispatchManager):
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
-        self.moe_expert_rank_capacity_factor = moe_expert_rank_capacity_factor
         self.num_permuted_tokens = None
 
         # Metadata
@@ -407,19 +405,9 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
-        # When a static per-rank token budget is configured (moe_expert_rank_capacity_factor),
-        # num_permuted_tokens is a rank-uniform CPU int, so HybridEP dispatch runs non-blocking and
-        # every EP rank sizes the permute buffer identically -- this avoids the data-dependent
-        # buffer (re)allocation that otherwise desyncs the EP group under pipeline parallelism.
-        # Otherwise reset to None (avoids reusing cached state from a prior dispatch under
-        # non-reentrant activation checkpointing) and fall back to the dynamic count after dispatch.
-        if self.moe_expert_rank_capacity_factor is not None:
-            num_tokens = self.routing_map.shape[0]
-            budget = int(num_tokens * self.router_topk * self.moe_expert_rank_capacity_factor)
-            budget += -budget % 256  # round up to CUTLASS/grouped-GEMM alignment
-            self.num_permuted_tokens = budget
-        else:
-            self.num_permuted_tokens = None
+        # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
+        # This can happen in non-reentrant activation checkpointing mode.
+        self.num_permuted_tokens = None
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
@@ -435,9 +423,7 @@ class _HybridEPManager(_DispatchManager):
         )
 
         self.tokens_per_expert = tokens_per_expert
-        if self.num_permuted_tokens is None:
-            # No static budget configured: fall back to the dynamic (data-dependent) count.
-            self.num_permuted_tokens = self.tokens_per_expert.sum()
+        self.num_permuted_tokens = self.tokens_per_expert.sum()
 
         return dispatched_hidden
 
@@ -507,13 +493,6 @@ class TokenDispatcherConfig:
 
     moe_hybridep_num_sms: int = 24
     """Number of SMs to use for HybridEP dispatch and combine APIs."""
-
-    moe_expert_rank_capacity_factor: Optional[float] = None
-    """Static per-rank permuted-token budget for the HybridEP backend (mirrors Megatron-LM's
-    moe_expert_rank_capacity_factor). When set, the number of permuted tokens passed to HybridEP
-    dispatch is a rank-uniform CPU int (= num_local_tokens * router_topk * factor), so every EP
-    rank sizes its permute buffer identically and dispatch runs non-blocking. None keeps the
-    dynamic, data-dependent count (a per-rank tokens_per_expert.sum())."""
 
     moe_share_token_dispatcher: bool = True
     """Share one communication manager instance across MoE layers for the configured backend."""
@@ -621,7 +600,6 @@ class MoEFlexTokenDispatcher:
                         router_topk=self.tp_size * self.config.moe_router_topk,
                         permute_fusion=self.config.moe_permute_fusion,
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
-                        moe_expert_rank_capacity_factor=self.config.moe_expert_rank_capacity_factor,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
             else:
@@ -632,7 +610,6 @@ class MoEFlexTokenDispatcher:
                     router_topk=self.tp_size * self.config.moe_router_topk,
                     permute_fusion=self.config.moe_permute_fusion,
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
-                    moe_expert_rank_capacity_factor=self.config.moe_expert_rank_capacity_factor,
                 )
         else:
             raise ValueError(
