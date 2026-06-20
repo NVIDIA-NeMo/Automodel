@@ -112,6 +112,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 wandb:
+  enable: false
   project: huiyingl_workspace
   entity: Nemo-automodel
   name: devstral_24b_squad_peft
