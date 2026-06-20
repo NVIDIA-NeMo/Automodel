@@ -51,9 +51,12 @@ class TestNemotronHCompatibilityGate:
     def test_moe_is_still_compatible(self):
         assert _is_config_compatible_with_custom_model("NemotronHForCausalLM", _moe_cfg()) is True
 
-    def test_hybrid_override_pattern_also_accepted(self):
+    def test_hybrid_override_pattern_only_falls_back(self):
+        # A config with only a raw hybrid_override_pattern and no layers_block_type is not
+        # something the custom model can build (it never normalizes the pattern), so it
+        # should fall back to HF rather than route to the custom model and crash.
         cfg = SimpleNamespace(architectures=["NemotronHForCausalLM"], hybrid_override_pattern="M-M*-")
-        assert _is_config_compatible_with_custom_model("NemotronHForCausalLM", cfg) is True
+        assert _is_config_compatible_with_custom_model("NemotronHForCausalLM", cfg) is False
 
     def test_nemotron_without_hybrid_signal_falls_back(self):
         # Neither expert fields nor a hybrid pattern: not a Nemotron-H we recognize,
