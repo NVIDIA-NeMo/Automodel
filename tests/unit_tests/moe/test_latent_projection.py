@@ -15,7 +15,7 @@
 """Tests for MoE latent projection layers (fc1_latent_proj, fc2_latent_proj)."""
 
 from functools import partial
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -230,34 +230,18 @@ class TestMoELatentProjectionForward:
                 batch_size * seq_len, moe_config.dim, dtype=torch.bfloat16, device=device
             )
 
-            with (
-                patch("torch.cuda.Stream") as mock_stream_class,
-                patch("torch.cuda.current_stream") as mock_current_stream,
-                patch("torch.cuda.stream") as mock_stream_context,
-                # The shared-expert fork/join calls Tensor.record_stream with the
-                # mocked stream; no-op the helper so the mock isn't passed to it.
-                patch("nemo_automodel.components.moe.layers._record_stream_safe"),
-            ):
-                mock_stream = Mock()
-                mock_stream.wait_stream = Mock()
-                mock_stream_class.return_value = mock_stream
-                mock_current_stream.return_value = Mock()
-                mock_context = Mock()
-                mock_context.__enter__ = Mock(return_value=None)
-                mock_context.__exit__ = Mock(return_value=None)
-                mock_stream_context.return_value = mock_context
+            # Shared experts run inline on the main stream (no side-stream overlap).
+            output = moe(x)
 
-                output = moe(x)
+            assert output.shape == x.shape
 
-                assert output.shape == x.shape
+            # Routed experts should get latent-dim input
+            experts_input = mock_experts.call_args[0][0]
+            assert experts_input.shape[-1] == moe_config.moe_latent_size
 
-                # Routed experts should get latent-dim input
-                experts_input = mock_experts.call_args[0][0]
-                assert experts_input.shape[-1] == moe_config.moe_latent_size
-
-                # Shared experts should get original-dim input
-                shared_input = mock_shared.call_args[0][0]
-                assert shared_input.shape[-1] == moe_config.dim
+            # Shared experts should get original-dim input
+            shared_input = mock_shared.call_args[0][0]
+            assert shared_input.shape[-1] == moe_config.dim
 
     def test_forward_no_latent_experts_receive_original_dim(self, moe_config, backend_config, device):
         """Test that without latent projections, experts receive original dim input."""
