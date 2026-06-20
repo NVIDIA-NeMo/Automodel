@@ -68,7 +68,10 @@ distributed:
     scale_grads_in_schedule: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  # FusedLinearCrossEntropy fuses the lm_head matmul with CE and computes it in
+  # chunks, so the full [seq, vocab=128256] logits are never materialized on the
+  # last pipeline stage (the stage that OOMs once AC + microbatch=1 fit stages 0-6).
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 # SQuAD instruction tuning dataset (5% train split for quick runs)
 dataset:
