@@ -776,6 +776,44 @@ class TestNemotronHForCausalLM:
         assert output_ids.shape[1] >= prompt_len
         assert output_ids.shape[1] <= prompt_len + max_new_tokens
 
+    def test_dense_causal_lm_build_and_generate(self, config, backend):
+        """Dense Nemotron-H end-to-end: the CausalLM builds with moe_config=None and no
+        MTP, and .generate() produces tokens. Covers the issue #2004 inference path."""
+        from transformers import PretrainedConfig
+
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        hf_config = PretrainedConfig(is_encoder_decoder=False, eos_token_id=1, pad_token_id=0)
+        for attr, val in vars(config).items():
+            setattr(hf_config, attr, val)
+        # Make it dense: no 'moe' layers, and drop the MoE/expert fields entirely
+        # (real dense configs like NVIDIA-Nemotron-3-Nano-4B-BF16 omit them).
+        hf_config.layers_block_type = ["attention", "mlp"]
+        for attr in (
+            "n_routed_experts",
+            "num_experts_per_tok",
+            "n_group",
+            "topk_group",
+            "routed_scaling_factor",
+            "moe_intermediate_size",
+            "norm_topk_prob",
+            "moe_shared_expert_intermediate_size",
+        ):
+            if hasattr(hf_config, attr):
+                delattr(hf_config, attr)
+
+        model = NemotronHForCausalLM(hf_config, backend=backend).to(torch.bfloat16)
+        model.eval()
+        assert model.model.moe_config is None
+        assert model.mtp is None
+
+        batch_size, prompt_len, max_new_tokens = 1, 4, 3
+        input_ids = torch.randint(2, config.vocab_size, (batch_size, prompt_len))
+        output_ids = model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False)
+
+        assert output_ids.shape[0] == batch_size
+        assert prompt_len <= output_ids.shape[1] <= prompt_len + max_new_tokens
+
 
 class TestNemotronV3KVCache:
     """Test NemotronHybridCache and cached generation."""
