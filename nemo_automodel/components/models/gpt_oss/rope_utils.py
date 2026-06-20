@@ -33,8 +33,13 @@ def apply_rotary_emb(
         cos: Cosine tensor (..., rotary_dim // 2)
         sin: Sine tensor (..., rotary_dim // 2)
     """
-    cos = cos.unsqueeze(-2).to(x.dtype)
-    sin = sin.unsqueeze(-2).to(x.dtype)
+    # Keep the RoPE rotation in fp32. Downcasting cos/sin to x.dtype (bf16) before the rotation
+    # zeroes ~16 mantissa bits of the fp32 freqs and perturbs every rotated q/k by ~0.5% (p99 ~3.6%).
+    # Rotate in fp32, then cast the result back to the input dtype.
+    in_dtype = x.dtype
+    cos = cos.unsqueeze(-2).float()
+    sin = sin.unsqueeze(-2).float()
+    x = x.float()
 
     # Handle partial rotary embeddings
     # cos/sin have dimension rotary_dim//2, so full rotary_dim is cos.shape[-1] * 2
@@ -45,13 +50,13 @@ def apply_rotary_emb(
         x1, x2 = torch.chunk(x_rot, 2, dim=-1)
         o1 = x1 * cos - x2 * sin
         o2 = x2 * cos + x1 * sin
-        return torch.cat((o1, o2, x_pass), dim=-1)
+        return torch.cat((o1, o2, x_pass), dim=-1).to(in_dtype)
     else:
         # Standard full rotary embeddings
         x1, x2 = torch.chunk(x, 2, dim=-1)
         o1 = x1 * cos - x2 * sin
         o2 = x2 * cos + x1 * sin
-        return torch.cat((o1, o2), dim=-1)
+        return torch.cat((o1, o2), dim=-1).to(in_dtype)
 
 
 class RotaryEmbedding(torch.nn.Module):
