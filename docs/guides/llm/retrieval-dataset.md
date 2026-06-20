@@ -105,3 +105,35 @@ dataloader:
 
 - `pos_doc` must be **non-empty**.
 - If training requests negatives (e.g., `n_passages > 1`), `neg_doc` must contain **at least one** document.
+
+## Normalized VL Retrieval Data
+
+For large vision-language retrieval corpora, the default corpus-id path can spend a long time building Hugging Face
+Arrow caches before training starts. To make this preprocessing explicit and portable, create a normalized Arrow bundle
+in a CPU job:
+
+```bash
+python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
+  --config /path/to/retrieval_config.yaml \
+  --output-dir /path/to/normalized_vl_retrieval \
+  --resume
+```
+
+The normalized bundle keeps the same corpus-id data model as the original dataset:
+
+- `train/*.arrow` stores query rows and positive/negative document IDs.
+- `corpus/*/*.arrow` stores each referenced document/image once.
+- Training still resolves `doc_id -> document` through the same retrieval transform.
+
+This avoids rebuilding Hugging Face caches in every GPU job and avoids duplicating document/image payload in every
+training row.
+
+Train from the normalized output by replacing the dataset factory:
+
+```yaml
+dataloader:
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.make_normalized_retrieval_dataset
+    data_dir_list: /path/to/normalized_vl_retrieval
+    n_passages: 5
+```

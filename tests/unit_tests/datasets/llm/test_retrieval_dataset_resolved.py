@@ -40,11 +40,22 @@ if "torchvision" not in sys.modules and importlib.util.find_spec("torchvision") 
     sys.modules["torchvision.transforms.functional"] = functional
 
 import nemo_automodel.components.datasets.llm.retrieval_dataset_resolved as rdr
+from nemo_automodel.components.datasets.llm import retrieval_dataset_normalized as nd
+from tools.retrieval import prepare_normalized_vl_retrieval_data as prep_norm
 from tools.retrieval import prepare_resolved_vl_retrieval_data as prep
 
 
 def _write_jsonl(path, records):
     path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+
+class _FakeCorpusInfo:
+    def __init__(self, docs):
+        self.metadata = {"corpus_id": "test", "query_instruction": "query:", "passage_instruction": "passage:"}
+        self.docs = docs
+
+    def get_document_by_id(self, doc_id):
+        return self.docs[doc_id]
 
 
 def test_resolved_retrieval_dataset_opens_relative_images(tmp_path):
@@ -328,6 +339,94 @@ def test_prepare_resolved_vl_retrieval_data_writes_arrow_packed_images(tmp_path,
     assert example["doc_id"] == ["p", "n"]
     assert example["doc_image"][0].mode == "RGB"
     assert example["doc_image"][1] == ""
+
+
+def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_path, monkeypatch):
+    pytest.importorskip("datasets")
+    pytest.importorskip("datasets.arrow_writer")
+    image_mod = pytest.importorskip("PIL.Image")
+
+    image = image_mod.new("RGB", (2, 2), color="blue")
+    monkeypatch.setattr(
+        prep_norm,
+        "load_datasets",
+        lambda data_dir_list, concatenate, seed: (
+            [
+                {
+                    "question_id": "q0",
+                    "question": "Q",
+                    "corpus_id": "test",
+                    "pos_doc": [{"id": "p"}],
+                    "neg_doc": [{"id": "n"}],
+                },
+                {
+                    "question_id": "q1",
+                    "question": "Q again",
+                    "corpus_id": "test",
+                    "pos_doc": [{"id": "p"}],
+                    "neg_doc": [{"id": "n2"}],
+                },
+            ],
+            {
+                "test": _FakeCorpusInfo(
+                    {
+                        "p": {"text": "positive", "image": image},
+                        "n": {"text": "negative", "image": ""},
+                        "n2": {"text": "negative two", "image": ""},
+                    }
+                )
+            },
+        ),
+    )
+
+    output_dir = tmp_path / "normalized"
+    metadata = prep_norm.prepare_normalized_dataset(
+        data_dir_list=["train.json"],
+        output_dir=output_dir,
+        samples_per_shard=10,
+        docs_per_shard=10,
+        seed=42,
+        max_samples=None,
+        jpeg_quality=90,
+    )
+
+    assert metadata["format"] == "nemo_automodel_normalized_vl_retrieval_arrow"
+    assert metadata["num_records"] == 2
+    assert metadata["train_shards"] == ["train/train-00000.arrow"]
+    assert metadata["corpora"][0]["num_docs"] == 3
+    assert (output_dir / "metadata.json").is_file()
+
+    dataset = nd.make_normalized_retrieval_dataset(
+        data_dir_list=str(output_dir),
+        n_passages=2,
+        use_dataset_instruction=True,
+    )
+
+    assert len(dataset) == 2
+    example = dataset[0]
+    assert example["question"] == "Q"
+    assert example["doc_text"] == ["positive", "negative"]
+    assert example["doc_id"] == ["p", "n"]
+    assert example["query_instruction"] == "query:"
+    assert example["passage_instruction"] == "passage:"
+    assert example["doc_image"][0].mode == "RGB"
+    assert example["doc_image"][1] == ""
+
+    for shard in (output_dir / "corpus" / "test").glob("*.arrow"):
+        shard.unlink()
+    resumed_metadata = prep_norm.prepare_normalized_dataset(
+        data_dir_list=["train.json"],
+        output_dir=output_dir,
+        samples_per_shard=10,
+        docs_per_shard=10,
+        seed=42,
+        max_samples=None,
+        jpeg_quality=90,
+        resume=True,
+    )
+
+    assert resumed_metadata["num_records"] == 2
+    assert resumed_metadata["corpora"][0]["num_docs"] == 3
 
 
 def test_resolved_retrieval_parquet_dataset_rank_sharding(tmp_path, monkeypatch):
