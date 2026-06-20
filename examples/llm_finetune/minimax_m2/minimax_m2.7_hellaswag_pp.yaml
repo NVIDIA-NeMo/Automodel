@@ -38,7 +38,7 @@ distributed:
   dp_replicate_size: 1
   ep_size: 16
   sequence_parallel: false
-  activation_checkpointing: true
+  activation_checkpointing: false  # DIAGNOSTIC: AC=true correlates with garbage loss (3.18->13.6); test if AC corrupts the MoE forward
 
   pipeline:
     pp_schedule: interleaved1f1b
