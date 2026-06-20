@@ -68,7 +68,7 @@ model:
     # unfused); same TE fused-RoPE hazard seen on Moonlight. rope_fusion=false trains correctly.
     rope_fusion: false
     dispatcher: hybridep
-    experts: gmm
+    experts: torch_mm  # DIAGNOSTIC: gmm gives garbage loss (~15) in every config; torch_mm isolates ops.gmm-kernel vs M2.1-cache
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
