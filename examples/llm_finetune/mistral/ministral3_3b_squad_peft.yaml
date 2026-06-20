@@ -37,12 +37,17 @@ rng:
   ranked: true
 
 model:
+  # mistralai/Ministral-3-3B-Instruct-2512 is a per-tensor FP8 checkpoint
+  # (Mistral3ForConditionalGeneration / ministral3 text backbone). Automodel's
+  # custom Mistral3FP8VLMForConditionalGeneration claims it via the mistral3_vlm
+  # resolver hook and dequantizes FP8 -> bf16 inside the DCP load via its
+  # state_dict_adapter; LoRA then attaches to the resulting bf16 Linears. No
+  # explicit quantization_config is needed -- passing one would force HF's
+  # FineGrainedFP8 loader, which breaks on per-tensor (scalar) scales under
+  # transformers 5.8.1.
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512
   torch_dtype: bf16
-  quantization_config:
-    _target_: transformers.FineGrainedFP8Config
-    dequantize: true
 
 checkpoint:
   enabled: true
