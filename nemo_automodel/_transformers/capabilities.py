@@ -29,6 +29,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import weakref
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -137,12 +138,23 @@ class ModelSupports:
         model.supports.pp   # ...
     """
 
-    __slots__ = ("_model", "_model_cls", "_mesh")
+    __slots__ = ("_model_ref", "_model_cls", "_mesh")
 
     def __init__(self, model: "nn.Module", mesh: "MeshContext | None" = None) -> None:
-        self._model = model
+        # Hold the model weakly. ``ModelSupports`` is attached back onto the model
+        # as ``model._supports``; a strong reference here would form a
+        # ``model <-> _supports`` cycle, so the capability descriptor must never be
+        # the reason a (multi-GiB) model stays resident after its owner is dropped.
+        self._model_ref = weakref.ref(model)
         self._model_cls = type(model)
         self._mesh = mesh
+
+    @property
+    def _model(self) -> "nn.Module":
+        model = self._model_ref()
+        if model is None:
+            raise ReferenceError("ModelSupports: underlying model has been garbage-collected")
+        return model
 
     def __repr__(self) -> str:
         names = (
