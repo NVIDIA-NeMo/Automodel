@@ -717,6 +717,10 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(Qwen3ForSequenceClassification): _parallelize_qwen_classification,
     # Hard-coded qualname to avoid eagerly importing transformers.models.qwen3_5.
     "transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5ForConditionalGeneration": _parallelize_qwen3_5_vlm,
+    # NeMo-native Qwen3.5 dense (custom-model port): same plan — shard self_attn +
+    # MLP, leave the GatedDeltaNet (linear_attn) replicated.
+    "nemo_automodel.components.models.qwen3_5.model.Qwen3_5ForConditionalGeneration": _parallelize_qwen3_5_vlm,
+    "nemo_automodel.components.models.qwen3_5.model.Qwen3_5ForCausalLM": _parallelize_qwen3_5_vlm,
     # Falcon-H1 (hybrid Transformer + Mamba2). HF ships only a minimal
     # _tp_plan ({"lm_head": "colwise_gather_output"}) and names its MLP
     # "feed_forward", so the generic fallback plan leaves feed_forward replicated

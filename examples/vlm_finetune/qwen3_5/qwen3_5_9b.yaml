@@ -37,6 +37,12 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.5-9B
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch
+    rope_fusion: false
   attn_implementation: sdpa
 
 

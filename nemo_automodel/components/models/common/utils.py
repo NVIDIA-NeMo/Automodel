@@ -451,7 +451,9 @@ def get_rope_config(config) -> tuple[float, dict, float]:
     return rope_theta, rope_parameters, partial_rotary_factor
 
 
-def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -> None:
+def cast_model_to_dtype(
+    model: nn.Module, dtype: torch.dtype = torch.bfloat16, skip_modules: tuple[str, ...] = ()
+) -> None:
     """Cast model parameters to the target dtype, keeping fp32 modules in full precision.
 
     Respects ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` on
@@ -465,10 +467,34 @@ def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -
     Args:
         model: The model whose parameters should be cast.
         dtype: Target dtype (e.g. ``torch.bfloat16``).
+        skip_modules: Names of immediate submodules to leave entirely untouched
+            (kept at their current dtype). Unlike the ``_keep_in_fp32_modules``
+            restore path, these are *detached* during the cast so ``model.to()``
+            never visits them — the only reliable way to preserve an fp32
+            parameter once it is FSDP2-sharded (post-shard ``.data`` reassignment
+            does not stick). The caller must guarantee each skipped submodule is
+            its own dtype-uniform FSDP group (e.g. Qwen3.5's ``_fp32_params``
+            holder, sharded separately in fp32), so leaving it fp32 cannot break
+            FSDP's uniform-dtype rule.
     """
     fp32_keywords = _get_fp32_module_keywords(model)
 
-    model.to(dtype)
+    # Detach skip_modules so ``model.to(dtype)`` does not descend into them. This
+    # preserves their exact dtype (e.g. fp32 master weights) through the cast.
+    detached: list[tuple[nn.Module, str, nn.Module]] = []
+    if skip_modules:
+        for _, parent in model.named_modules():
+            for child_name, child in list(parent._modules.items()):
+                if child is not None and child_name in skip_modules:
+                    detached.append((parent, child_name, child))
+                    parent._modules[child_name] = None
+
+    try:
+        model.to(dtype)
+    finally:
+        for parent, child_name, child in detached:
+            parent._modules[child_name] = child
+
     if fp32_keywords:
         if _has_dtensor_params(model):
             logger.warning(
