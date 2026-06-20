@@ -129,6 +129,7 @@ optimizer:
   weight_decay: 0.1
 
 wandb:
+  enable: false
   project: automodel-mimo-v2-flash
   name: mimo_v2_flash_hellaswag_16n
   mode: online
