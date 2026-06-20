@@ -64,7 +64,9 @@ model:
     attn: te
     linear: te
     rms_norm: torch_fp32
-    rope_fusion: true
+    # fused RoPE corrupts the forward on MiniMax QK-norm attention -> garbage loss (~15 vs ~3
+    # unfused); same TE fused-RoPE hazard seen on Moonlight. rope_fusion=false trains correctly.
+    rope_fusion: false
     dispatcher: hybridep
     experts: gmm
     fake_balanced_gate: false
