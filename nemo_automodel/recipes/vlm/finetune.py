@@ -45,6 +45,7 @@ from nemo_automodel._transformers import (
     NeMoAutoModelForImageTextToText,
     NeMoAutoModelForMultimodalLM,
 )
+from nemo_automodel._transformers.kernel_patches import eval_safe_sdpa_kernel
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
@@ -1189,7 +1190,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
                 labels = batch.pop("labels")
-                with train_ctx():
+                # Constrain SDPA to non-cuDNN backends for the validation forward:
+                # the cuDNN fused-MHA backend can fail ``is_good()`` on validation
+                # shapes and custom models (e.g. Qwen3.5) don't go through
+                # ``_patch_attention``. Under CP, ``train_ctx`` already enters a
+                # cuDNN-free sdpa_kernel (flash/efficient only, MATH excluded for
+                # DTensor), so skip the extra guard there. See NVBugs 6293238.
+                sdpa_ctx = nullcontext() if _cp_active else eval_safe_sdpa_kernel()
+                with train_ctx(), sdpa_ctx:
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                         out = self.model_parts[0](logits_to_keep=1, **batch)
