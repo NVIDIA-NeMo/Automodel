@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 4 nodes(8xh200)
+# 4 nodes (8xH100 or 8xH200)
 # To run this recipe:
 #   automodel examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
@@ -58,7 +58,11 @@ distributed:
 
   pipeline:
     pp_schedule: interleaved1f1b
-    pp_microbatch_size: 4
+    # microbatch=2 (not 4) so the activation peak fits 80GB H100s; the activation
+    # memory of this PP=8/dp=4 run scales with pp_microbatch_size, and 4 overflows
+    # H100 (it was tuned for 141GB H200). global_batch_size is unchanged, and
+    # local_batch_size(32) / 2 = 16 microbatches still satisfies >= pp_size(8).
+    pp_microbatch_size: 2
     scale_grads_in_schedule: false
 
 loss_fn:
