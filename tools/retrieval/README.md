@@ -2,19 +2,58 @@
 
 This directory contains offline data utilities for retrieval training.
 
-There are two separate preprocessing paths:
+## Recommendation
 
-| Path | What it writes | Training dataset target | Best for | Portability |
-| --- | --- | --- | --- | --- |
-| Hugging Face cache warmup | HF `datasets` Arrow cache under `HF_DATASETS_CACHE` | Original `make_retrieval_dataset` | Keeping training behavior exactly unchanged while moving first-load cache construction to CPU nodes | Fragile across users/configs unless the cache dir, source path strings, and dataset code match exactly |
-| Resolved VL retrieval data | Explicit JSONL, SQLite, or Parquet shards with resolved document text and image bytes | `make_resolved_retrieval_dataset` | Sharing/copying a self-contained dataset, reproducing on another cluster, avoiding corpus lookup at training time | Portable as normal files; copy the output directory or a subset of shards |
-| Normalized VL retrieval data | Arrow train shards plus deduplicated Arrow corpus shards | `make_normalized_retrieval_dataset` | Portable full VL retrieval datasets that should keep corpus-id semantics and avoid duplicated image payload | Portable as one explicit bundle directory |
+For large VL retrieval training, use **normalized Arrow**:
 
-Use HF cache warmup when the goal is to run the original config faster on the same cluster. Use normalized Arrow when the goal is to create a reusable full-dataset artifact without duplicating corpus images in every training row. Use resolved shards when a fully materialized sample-level dataset is useful for debugging, inspection, or small portable repros. These CPU tools read the original retrieval config, but the normalized and resolved paths change the GPU training dataset target.
+```bash
+python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
+  --config /path/to/original_retrieval_config.yaml \
+  --output-dir /path/to/normalized_vl_retrieval \
+  --resume
+```
+
+Then train with:
+
+```yaml
+dataloader:
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.make_normalized_retrieval_dataset
+    data_dir_list: /path/to/normalized_vl_retrieval
+    model_type: bi_encoder
+    data_type: train
+    n_passages: 5
+    do_shuffle: true
+```
+
+Normalized Arrow keeps the original corpus-id retrieval model but stores the referenced corpus locally:
+
+- `train/*.arrow` stores query rows and positive/negative document IDs.
+- `corpus/*/*.arrow` stores each referenced document/image once.
+- Training still resolves `doc_id -> document` through the normal retrieval transform.
+
+This is the recommended portable format because it avoids hidden Hugging Face cache rebuilds and avoids duplicating
+image payload in every training row.
+
+## Storage Comparison
+
+Measured on the Nemotron VL 1B image-retrieval training set used in debugging, with 262,197 train rows:
+
+| Path | What it stores | Size observed | Recommendation |
+| --- | --- | ---: | --- |
+| Original HF cache | Hugging Face cache fingerprints and materialized source corpora under `HF_DATASETS_CACHE` | `3.7T` in the active cache dir | Fast when warm, but not portable and can grow with each fingerprint/config/path variant |
+| Resolved Arrow | Fully materialized train rows with document/image payload repeated per row | `508G` | Keep only for small self-contained repro/debug datasets |
+| Normalized Arrow | Train refs plus deduplicated local corpus Arrow shards | `176G` | Recommended full-dataset portable format |
+
+The exact HF cache size can vary because Hugging Face Datasets may keep multiple fingerprints, source downloads,
+intermediate Arrow files, and old variants. Normalized Arrow is an explicit dataset artifact, so the size is much more
+predictable.
 
 ## Warm Hugging Face Dataset Cache
 
-For production training that already uses `make_retrieval_dataset`, prefer warming the Hugging Face `datasets` cache on CPU nodes before launching GPU jobs. This keeps the training data path identical to the normal AutoModel config while moving expensive `datasets.load_dataset(...)` materialization out of the GPU allocation.
+Use this only when you want to keep the original `make_retrieval_dataset` training path unchanged on the same cluster.
+It moves expensive `datasets.load_dataset(...)` cache construction to CPU nodes, but it does not create a portable
+dataset artifact.
 
 ```bash
 CONFIG=/path/to/original_retrieval_config.yaml \
@@ -27,11 +66,12 @@ EXTRA_CONTAINER_MOUNTS=/path/to/source_data:/path/to/source_data \
 tools/retrieval/submit_warm_retrieval_hf_cache_cpu.sh
 ```
 
-The same `CACHE_DIR` should be mounted into GPU training and exported as `HF_HOME`, `HF_DATASETS_CACHE`, `HUGGINGFACE_HUB_CACHE`, and `TRANSFORMERS_CACHE`.
+The same `CACHE_DIR` should be mounted into GPU training and exported as `HF_HOME`, `HF_DATASETS_CACHE`,
+`HUGGINGFACE_HUB_CACHE`, and `TRANSFORMERS_CACHE`.
 
-HF cache reuse is exact-key based. A warm cache is reused only when the later training run uses the same cache directory and the same effective dataset fingerprint. In practice, the fingerprint can change if the same source data is referenced through a different mount alias, symlink, or config path, for example `/lustre/fsw/...` versus `/lustre/fs11/...`. If the fingerprint changes, HF `datasets` will build a second Arrow cache instead of reusing the previous one. If the fingerprint matches, the warmup is fast and skips the expensive Arrow materialization.
-
-This path does not create a portable dataset artifact. It only pre-populates the cache expected by the existing training dataset.
+HF cache reuse is exact-key based. A warm cache is reused only when the later training run uses the same cache
+directory and the same effective dataset fingerprint. The fingerprint can change if the same source data is referenced
+through a different mount alias, symlink, or config path, for example `/lustre/fsw/...` versus `/lustre/fs11/...`.
 
 For local/non-Slurm use:
 
@@ -42,24 +82,22 @@ python tools/retrieval/warm_retrieval_hf_cache.py \
   --touch-samples 128
 ```
 
-`--touch-samples` reads transformed examples to validate corpus lookup and image decoding. It is not required to build the Arrow cache, and decoded images are not persisted.
+`--touch-samples` reads transformed examples to validate corpus lookup and image decoding. Decoded images are not
+persisted.
 
-## Resolved VL Retrieval Data
+## Resolved Arrow Debug Data
 
-`prepare_resolved_vl_retrieval_data.py` creates portable JSONL, SQLite, or Parquet shards by resolving corpus IDs into document text and image bytes ahead of training. Unlike a Hugging Face cache directory, the resolved output is an explicit dataset artifact: it can be inspected with common tools, copied to another cluster, and subsetted by copying a few shard files.
+`prepare_resolved_vl_retrieval_data.py` writes packed Arrow shards where every training row already contains the
+selected document text and image bytes. This avoids corpus lookup during training, but it duplicates payload whenever
+the same document appears in multiple rows.
 
-Resolved data is not an HF cache. It is a new training input format. After generating it once, GPU training should point `dataloader.dataset._target_` to `make_resolved_retrieval_dataset` and `dataloader.dataset.data_dir_list` to the resolved output directory. This path avoids the original corpus lookup and HF Arrow cache construction during training, but it does intentionally change the dataset loader used by training.
+Use resolved Arrow for:
 
-This path does not rely on the original HF cache during training. It reads the resolved shard files directly.
+- small self-contained repro datasets;
+- debugging exact post-transform samples;
+- copying a tiny subset to another cluster.
 
-This format is useful when:
-
-- the dataset needs to be copied to another cluster;
-- corpus lookup paths are not available in the target environment;
-- a small, self-contained reproduction dataset is needed;
-- CPU-only preprocessing is desired for debugging data internals.
-
-For steady-state training, prefer Parquet over JSONL+loose JPEGs or SQLite when a portable resolved dataset is needed. Parquet is a common interchange format for large datasets, avoids many small image files, and can be consumed by pyarrow, pandas, Spark, and Hugging Face Datasets. The native AutoModel loader reads Parquet sequentially and supports bounded-memory row shuffle through `shuffle_buffer_size`, so it does not require building a second Arrow cache before training.
+Do not use it as the default full-dataset format when normalized Arrow is available.
 
 Example:
 
@@ -75,7 +113,7 @@ EXTRA_CONTAINER_MOUNTS=/path/to/source_data:/path/to/source_data \
 tools/retrieval/submit_prepare_resolved_vl_retrieval_data_cpu_array.sh
 ```
 
-Training from resolved Parquet:
+Training from resolved Arrow:
 
 ```yaml
 dataloader:
@@ -85,44 +123,18 @@ dataloader:
     model_type: bi_encoder
     data_type: train
     n_passages: 5
-    do_shuffle: true
-    shuffle_buffer_size: 1024
-  shuffle: false
 ```
 
-`dataloader.shuffle` must stay `false` because resolved data is an `IterableDataset`; row-level approximate shuffle happens inside the dataset via `shuffle_buffer_size`. The default Parquet sharding mode assigns row groups to ranks/workers for efficient sequential reads. For small diagnostics that need exact row-level rank sharding inside a row group, set `parquet_sharding: row`, but this can duplicate Parquet reads and is not the recommended production default.
+Resolved Arrow is map-style, so normal DataLoader sampler/shuffle behavior applies.
 
-## Normalized VL Retrieval Data
+## Adding More Data
 
-`prepare_normalized_vl_retrieval_data.py` creates a portable Arrow bundle while keeping the original corpus-id retrieval model. Train rows store query text plus positive/negative document IDs, and corpus shards store each referenced document or image once. Training still resolves `doc_id -> document` through the normal retrieval transform, but it reads from local Arrow shards instead of the original HF/source corpus paths.
+For both normalized and resolved prep, new corpus schemas still use the original AutoModel extension point:
 
-This path is useful when:
+1. Add an `AbstractDataset` implementation with `get_document_by_id()` and `get_all_ids()`.
+2. Register it in `DATASETS`.
+3. Add the source JSON to the original retrieval config.
+4. Run the prep tool into a new output directory.
 
-- the full VL retrieval dataset should be copied to another cluster;
-- HF cache rebuilds are too expensive or too large;
-- the corpus-id training semantics should stay close to the original loader;
-- duplicated image payload in resolved sample rows would be too large.
-
-Example:
-
-```bash
-python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
-  --config /path/to/original_retrieval_config.yaml \
-  --output-dir /path/to/normalized_vl_retrieval \
-  --resume
-```
-
-`--resume` reuses readable train shards and complete corpus directories from an interrupted run. It does not append a new dataset into an already-finalized bundle; when changing the input data list, write to a new output directory.
-
-Training from normalized Arrow:
-
-```yaml
-dataloader:
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_normalized_retrieval_dataset
-    data_dir_list: /path/to/normalized_vl_retrieval
-    model_type: bi_encoder
-    data_type: train
-    n_passages: 5
-    do_shuffle: true
-```
+`--resume` on normalized prep reuses readable train shards and complete corpus directories from an interrupted run. It
+does not append a new source into an already-finalized bundle; when the input data list changes, write a new bundle.
