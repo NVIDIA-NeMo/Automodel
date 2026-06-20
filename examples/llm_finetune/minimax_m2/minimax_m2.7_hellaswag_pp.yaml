@@ -33,7 +33,8 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 2
+  pp_size: 4  # was 2; ep_size=16 puts 2x expert params/GPU vs ep32 siblings -> OOM in backward.
+              # pp4*ep16=64 (8 nodes) -> fsdp dp 2->1; halves per-GPU expert+layer memory.
   dp_replicate_size: 1
   ep_size: 16
   sequence_parallel: false
