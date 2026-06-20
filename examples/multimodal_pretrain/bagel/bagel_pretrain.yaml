@@ -166,6 +166,7 @@ ema:
   implementation: auto
 
 wandb:
+  enable: false
   project: bagel-pretraining
   mode: disabled
   name: bagel_mot_pretrain
