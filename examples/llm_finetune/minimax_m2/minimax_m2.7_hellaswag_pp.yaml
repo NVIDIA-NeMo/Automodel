@@ -33,12 +33,10 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 4  # was 2; ep_size=16 puts 2x expert params/GPU vs ep32 siblings -> OOM in backward.
-              # pp4*ep16=64 (8 nodes) -> fsdp dp 2->1; halves per-GPU expert+layer memory.
+  pp_size: 2
   dp_replicate_size: 1
-  ep_size: 16
+  ep_size: 32  # REVERSE DIAGNOSTIC: good m2.7 is ep16; does ep32 break it too?
   sequence_parallel: false
-  activation_checkpointing: false  # DIAGNOSTIC: AC=true correlates with garbage loss (3.18->13.6); test if AC corrupts the MoE forward
 
   pipeline:
     pp_schedule: interleaved1f1b
@@ -50,7 +48,6 @@ distributed:
     layers_per_stage: 2
 
   moe:
-    ignore_router_for_ac: true
     reshard_after_forward: false
     wrap_outer_model: false
 
@@ -85,7 +82,6 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
-  pad_to_max_length: true
 
 packed_sequence:
   packed_sequence_size: 0
@@ -101,7 +97,6 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
-  pad_to_max_length: true
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
