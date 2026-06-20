@@ -139,19 +139,25 @@ def test_make_cord_v2_dataset(monkeypatch, stub_json2token, ground_key, wrapper)
 
 
 def test_make_medpix_dataset(monkeypatch):
-    """End-to-end sanity check for `make_medpix_dataset`."""
-    fake_ds = [
-        {
-            "image_id": "medpix_001.jpg",
-            "question": "What is shown in this medical image?",
-            "answer": "This is a chest X-ray showing normal lung fields.",
-        },
-        {
-            "image_id": "medpix_002.jpg",
-            "question": "Describe the findings in this image.",
-            "answer": "The image shows a fracture in the left femur.",
-        },
+    """End-to-end sanity check for `make_medpix_dataset`.
+
+    ``make_medpix_dataset`` defers formatting via ``with_transform`` and decodes
+    images lazily, so ``load_dataset`` is mocked with a real HF ``Dataset`` whose
+    ``image_id`` is an ``Image`` column (matching the production dataset).
+    """
+    from datasets import Dataset, Features, Value
+    from datasets import Image as HFImage
+
+    images = [Image.new("RGB", (8, 8), (255, 0, 0)), Image.new("RGB", (8, 8), (0, 255, 0))]
+    questions = ["What is shown in this medical image?", "Describe the findings in this image."]
+    answers = [
+        "This is a chest X-ray showing normal lung fields.",
+        "The image shows a fracture in the left femur.",
     ]
+    fake_ds = Dataset.from_dict(
+        {"image_id": images, "question": questions, "answer": answers},
+        features=Features({"image_id": HFImage(), "question": Value("string"), "answer": Value("string")}),
+    )
 
     # Patch `load_dataset` so no network call is issued.
     monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: fake_ds)
@@ -159,23 +165,25 @@ def test_make_medpix_dataset(monkeypatch):
     result = ds.make_medpix_dataset()
 
     assert len(result) == len(fake_ds)
-    for sample, src in zip(result, fake_ds, strict=True):
+    for i in range(len(result)):
+        sample = result[i]
         assert list(sample) == ["conversation"]
 
         conversation = sample["conversation"]
         assert len(conversation) == 2
 
-        # user turn
+        # user turn -- image decode is deferred, so it surfaces as a lazy PIL handle
         user_turn = conversation[0]
         assert user_turn["role"] == "user"
-        assert user_turn["content"][0] == {"type": "image", "image": src["image_id"]}
-        assert user_turn["content"][1] == {"type": "text", "text": src["question"]}
+        image_item = user_turn["content"][0]
+        assert image_item["type"] == "image"
+        assert isinstance(image_item["image"], Image.Image)
+        assert user_turn["content"][1] == {"type": "text", "text": questions[i]}
 
         # assistant turn
         assistant_turn = conversation[1]
         assert assistant_turn["role"] == "assistant"
-        assistant_payload = assistant_turn["content"][0]
-        assert assistant_payload == {"type": "text", "text": src["answer"]}
+        assert assistant_turn["content"][0] == {"type": "text", "text": answers[i]}
 
 
 class _FakeHFDataset:
