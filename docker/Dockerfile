@@ -78,9 +78,12 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
 # Install HybridEP / DeepEP. Build with apt rdma-core v60 (so build==runtime libibverbs)
 # and RDMA_CORE_HOME symlinked to the system install; create the libnvshmem_host.so->.so.3
 # symlink required for DeepEP fabric handle ops; use the nvshmem wheel 3.6.5 and pin
-# DEEPEP_COMMIT to 17cfb817.
+# DEEPEP_COMMIT to 42144303 (== 17cfb817 + DeepEP #638), which pads the HybridEP
+# max_num_of_tokens_per_rank up to the combine-kernel chunk size so a per-rank token
+# count that is not a multiple of 64 (e.g. 672) no longer fails the combine-kernel
+# static_assert (MAX_NUM_OF_TOKENS_PER_RANK % NUM_OF_TOKENS_PER_CHUNK == 0).
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG DEEPEP_COMMIT=17cfb817bccec3a9c247013360cc550c2bac441e
+ARG DEEPEP_COMMIT=42144303752422ade37f24bca9e2dde12df70e09
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
