@@ -31,7 +31,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
-from nemo_automodel.components.models.deepseek_v32.layers import DeepseekV32MLA
+from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
@@ -42,7 +42,12 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 class Block(nn.Module):
     def __init__(self, layer_idx: int, config: GlmMoeDsaConfig, moe_config: MoEConfig, backend: BackendConfig):
         super().__init__()
-        self.self_attn = DeepseekV32MLA(config, backend)
+        # IndexShare: per-layer indexer mode from `config.indexer_types`. A "shared" layer
+        # owns no indexer and reuses the previous "full" layer's top-k selection. Absent the
+        # field (e.g. GLM-5.1, which runs a full indexer every layer), every layer is "full".
+        indexer_types = getattr(config, "indexer_types", None)
+        self.skip_topk = indexer_types is not None and indexer_types[layer_idx] == "shared"
+        self.self_attn = GlmMoeDsaMLA(config, backend, skip_topk=self.skip_topk)
 
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
@@ -75,22 +80,31 @@ class Block(nn.Module):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        prev_topk_indices: torch.Tensor | None = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the block and return ``(hidden_states, topk_indices)``.
+
+        ``topk_indices`` is this layer's DSA selection — freshly computed on "full" layers,
+        or ``prev_topk_indices`` passed through on "shared" layers — so the caller can thread
+        it to subsequent shared layers (GLM IndexShare).
+        """
         if attention_mask is not None and padding_mask is None:
             padding_mask = attention_mask.bool().logical_not()
 
-        attn_out = self.self_attn(
+        attn_out, topk_indices = self.self_attn(
             x=self.input_layernorm(x),
             freqs_cis=freqs_cis,
             attention_mask=attention_mask,
+            prev_topk_indices=prev_topk_indices,
+            return_topk_indices=True,
             **attn_kwargs,
         )
         x = x + attn_out
 
         mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
         x = x + mlp_out
-        return x
+        return x, topk_indices
 
     def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
         if isinstance(self.mlp, MLP):
@@ -183,8 +197,16 @@ class GlmMoeDsaModel(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        prev_topk_indices: torch.Tensor | None = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the decoder stack, returning ``(hidden_states, topk_indices)``.
+
+        ``prev_topk_indices`` seeds the IndexShare running selection (used under pipeline
+        parallelism, where an earlier "full" layer lives on the previous stage); it is ``None``
+        in the single-process path. The returned ``topk_indices`` is the running selection at the
+        end of this stage's layers, so it can be carried to the next pipeline stage.
+        """
         if position_ids is None:
             position_ids = (
                 torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
@@ -200,17 +222,22 @@ class GlmMoeDsaModel(nn.Module):
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
+        # IndexShare: thread the most recent "full" layer's top-k selection forward so the
+        # following "shared" layers can reuse it. Seeded from `prev_topk_indices` (carried from
+        # the previous pipeline stage); `None` on the first stage / all-"full" configs (GLM-5.1).
+        topk_indices = prev_topk_indices
         for layer in self.layers.values():
-            h = layer(
+            h, topk_indices = layer(
                 x=h,
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
+                prev_topk_indices=topk_indices,
                 **attn_kwargs,
             )
 
         h = self.norm(h) if self.norm else h
-        return h
+        return h, topk_indices
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -295,34 +322,85 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def _is_pipeline_parallel_stage(self) -> bool:
+        """True when this module is a trimmed pipeline-parallel stage (not the whole model)."""
+        if self.lm_head is None:
+            return True
+        if self.model.embed_tokens is None:
+            return True
+        try:
+            return len(self.model.layers) != int(self.config.num_hidden_layers)
+        except TypeError:
+            return False
+
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Declare PP inter-stage I/O metas, threading the IndexShare top-k as a carry tensor.
+
+        Non-first stages additionally receive the previous "full" layer's top-k selection, and
+        non-last stages emit the running selection, so a stage that begins with a "shared" layer
+        has the top-k it needs (correct at any sequence length).
+        """
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        topk = min(int(self.config.index_topk), seq_len)
+
+        def meta(shape: tuple[int, ...], dt: torch.dtype) -> torch.Tensor:
+            return torch.empty(*shape, device="meta", dtype=dt)
+
+        # Top-k indices are small integers, but they cross the pipeline boundary as float32:
+        # torch.distributed.pipelining calls ``requires_grad_(True)`` on recv buffers and int
+        # dtypes can't require grad. float32 represents these index values losslessly; the
+        # receiving stage casts back to int64 in ``forward``.
+        topk_meta = meta((microbatch_size, seq_len, topk), torch.float32)
+
+        if is_first:
+            inputs_meta = (meta((microbatch_size, seq_len), torch.long),)
+        else:
+            inputs_meta = (meta((microbatch_size, seq_len, hidden_size), dtype), topk_meta)
+
+        if self.lm_head is not None:
+            outputs_meta = (meta((microbatch_size, seq_len, vocab_size), dtype),)
+        else:
+            outputs_meta = (meta((microbatch_size, seq_len, hidden_size), dtype), topk_meta)
+
+        return inputs_meta, outputs_meta
+
     def forward(
         self,
         input_ids: torch.Tensor,
-        *,
+        *carry: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> CausalLMOutputWithPast:
-        """Forward pass returning :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`.
+    ) -> CausalLMOutputWithPast | tuple[torch.Tensor, ...] | torch.Tensor:
+        """Forward pass.
+
+        Single process (no pipeline parallelism): returns
+        :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`, threading the IndexShare
+        top-k internally (seeded ``None``).
+
+        Pipeline parallelism: ``input_ids`` is the upstream hidden state on non-first stages and
+        ``*carry`` holds the previous stage's running top-k selection. Non-last stages return
+        ``(hidden_states, topk_indices)`` and the last stage returns the ``logits`` tensor.
 
         Args:
-            input_ids: Input token IDs. BSHD: ``[B, S]``; THD: ``[1, T]`` (squeezed internally).
-            position_ids: Optional position indices.
-            attention_mask: Optional attention mask.
-            padding_mask: Optional padding mask.
-            logits_to_keep: If ``0`` (default), compute logits for all positions; otherwise
-                compute logits only for the last ``logits_to_keep`` positions (avoids
-                materialising the full logit matrix during generation / fused CE).
-            output_hidden_states: When set, the returned output carries the final hidden states
-                (the input to ``lm_head``) so fused linear cross-entropy can recompute logits.
+            input_ids: Token IDs (BSHD ``[B, S]`` / THD ``[1, T]``) on the first stage, or the
+                upstream hidden state on later pipeline stages.
+            carry: Optional ``(topk_indices,)`` carried from the previous pipeline stage.
+            position_ids / attention_mask / padding_mask: Optional masks / positions.
+            logits_to_keep: If ``0``, project all positions; else only the last ``logits_to_keep``.
+            output_hidden_states: When set (single-process), carry final hidden states on the output.
             **attn_kwargs: Additional arguments forwarded to the base model.
-
-        Returns:
-            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with ``logits`` and,
-            when ``output_hidden_states`` is set, the final ``hidden_states``.
         """
         output_hidden_states = (
             output_hidden_states
@@ -330,20 +408,48 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             else getattr(self.config, "output_hidden_states", False)
         )
 
+        # Carry-in arrives as float32 (see get_pipeline_stage_metas, where the pipeline recv
+        # buffer must be a grad-capable dtype); restore the int64 index values.
+        carry_in = carry[0] if carry else None
+        prev_topk_indices = carry_in.to(torch.int64) if carry_in is not None else None
+        is_first_stage = self.model.embed_tokens is not None
+
+        # THD squeezing operates on real token ids (first stage only); later stages already
+        # carry [B, S, H] hidden states.
         is_thd = attn_kwargs.get("qkv_format") == "thd"
-        if is_thd:
+        if is_thd and is_first_stage:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
             attention_mask = None
 
-        hidden = self.model(
+        hidden, topk_indices = self.model(
             input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
+            prev_topk_indices=prev_topk_indices,
             **attn_kwargs,
         )
+
+        if self._is_pipeline_parallel_stage():
+            # The top-k carry is non-differentiable (integer indices transported as float32), but
+            # torch.distributed.pipelining treats every float inter-stage tensor as an activation
+            # and demands a gradient for it on backward. We add zero-weight autograd links so the
+            # carry it RECEIVES and the carry it SENDS both get a DEFINED (zero) gradient instead of
+            # ``None`` — values are unchanged (``+ x.sum() * 0.0``).
+            if self.lm_head is not None:
+                # Last stage: emit logits for the pipeline loss.
+                logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
+                if carry_in is not None:
+                    logits = logits + (carry_in.float().sum() * 0.0).to(logits.dtype)
+                return logits
+            # Non-last stage: emit (hidden, float32 top-k carry) to the next stage.
+            zero_from_hidden = hidden.float().sum() * 0.0  # connected to grad-bearing hidden
+            carry_out = topk_indices.to(torch.float32) + zero_from_hidden  # requires grad, value unchanged
+            if carry_in is not None:
+                hidden = hidden + (carry_in.float().sum() * 0.0).to(hidden.dtype)  # defines grad(carry_in)
+            return hidden, carry_out
 
         return compute_lm_head_logits(
             self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
