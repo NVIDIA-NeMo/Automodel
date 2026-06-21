@@ -13,6 +13,8 @@
 # limitations under the License.
 
 # Recipe validated on 4 × H100 nodes (32x 80 GB GPUs) under Slurm.
+# Uses gradient accumulation on 32 H100s to leave enough workspace headroom for
+# the Nemotron-Ultra MoE grouped-GEMM backward path.
 #
 # To run on a 4-node Slurm allocation, drive torchrun from inside an
 # ``srun`` step that resolves MASTER_ADDR from the allocation and forwards
@@ -32,7 +34,7 @@ step_scheduler:
   num_epochs: 1
   max_steps: 100
   global_batch_size: 128
-  local_batch_size: 4
+  local_batch_size: 2
   ckpt_every_steps: 20
   val_every_steps: 20
 
