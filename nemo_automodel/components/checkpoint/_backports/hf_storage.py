@@ -19,6 +19,7 @@
 import dataclasses
 import json
 import logging
+import mmap
 import os
 import queue
 import re
@@ -286,27 +287,84 @@ class _HuggingFaceStorageReader(FsspecReader):
             per_file.setdefault(file_name, []).append(read_item)
 
         for file_name, reqs in per_file.items():
-            with self.fs.create_stream(file_name, "rb") as stream:
-                for req in reqs:
-                    item_md = self.storage_data[req.storage_index]
+            # Prefer mmap for local files: each request copies out only its narrowed slice,
+            # so only those pages fault in -- and they are file-backed (reclaimable) rather
+            # than anonymous host RAM. The previous path read every full tensor into a host
+            # bytearray (plus a second copy), which host-OOM-kills very large checkpoints
+            # (e.g. a 355B fp8 model with 8 ranks/node). Falls back to the streaming read for
+            # remote/non-local files.
+            mm = None
+            mfile = None
+            try:
+                if os.path.isfile(file_name):
+                    mfile = open(file_name, "rb")  # noqa: SIM115
+                    mm = mmap.mmap(mfile.fileno(), 0, prot=mmap.PROT_READ)
+            except (OSError, ValueError):
+                if mm is not None:
+                    mm.close()
+                    mm = None
+                if mfile is not None:
+                    mfile.close()
+                    mfile = None
 
-                    stream.seek(item_md.offset)
-                    tensor_bytes = bytearray(stream.read(item_md.length))
+            try:
+                if mm is not None:
+                    view = memoryview(mm)
+                    for req in reqs:
+                        item_md = self.storage_data[req.storage_index]
+                        # torch.frombuffer is zero-copy but requires the byte offset to be
+                        # aligned to the dtype; safetensors headers can misalign (e.g. bf16),
+                        # so copy just that one tensor's bytes when unaligned.
+                        if item_md.offset % item_md.dtype.itemsize == 0:
+                            numel = item_md.length // item_md.dtype.itemsize
+                            tensor = torch.frombuffer(
+                                view, dtype=item_md.dtype, count=numel, offset=item_md.offset
+                            ).reshape(item_md.shape)
+                        else:
+                            tensor = torch.frombuffer(
+                                bytearray(view[item_md.offset : item_md.offset + item_md.length]),
+                                dtype=item_md.dtype,
+                            ).reshape(item_md.shape)
+                        tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
+                        target_tensor = planner.resolve_tensor(req).detach()
 
-                    tensor = torch.frombuffer(
-                        tensor_bytes,
-                        dtype=item_md.dtype,
-                    )
-                    tensor = tensor.reshape(item_md.shape)
-                    tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
-                    target_tensor = planner.resolve_tensor(req).detach()
+                        assert target_tensor.size() == tensor.size(), (
+                            f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
+                        )
 
-                    assert target_tensor.size() == tensor.size(), (
-                        f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
-                    )
+                        # copy_ from a pageable host buffer is synchronous, so the mmap can be
+                        # released right after this loop without racing an in-flight H2D copy.
+                        target_tensor.copy_(tensor)
+                        planner.commit_tensor(req, target_tensor)
+                        del tensor
+                    view.release()
+                else:
+                    with self.fs.create_stream(file_name, "rb") as stream:
+                        for req in reqs:
+                            item_md = self.storage_data[req.storage_index]
 
-                    target_tensor.copy_(tensor)
-                    planner.commit_tensor(req, target_tensor)
+                            stream.seek(item_md.offset)
+                            tensor_bytes = bytearray(stream.read(item_md.length))
+
+                            tensor = torch.frombuffer(
+                                tensor_bytes,
+                                dtype=item_md.dtype,
+                            )
+                            tensor = tensor.reshape(item_md.shape)
+                            tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
+                            target_tensor = planner.resolve_tensor(req).detach()
+
+                            assert target_tensor.size() == tensor.size(), (
+                                f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
+                            )
+
+                            target_tensor.copy_(tensor)
+                            planner.commit_tensor(req, target_tensor)
+            finally:
+                if mm is not None:
+                    mm.close()
+                if mfile is not None:
+                    mfile.close()
 
         fut: Future = Future()
         fut.set_result(None)

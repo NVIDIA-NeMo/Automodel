@@ -662,6 +662,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         if _os.environ.get("RANK", "0") == "0":
             _fh.dump_traceback_later(int(_os.environ.get("PROFILE_STARTUP_INTERVAL", "30")), repeat=True)
+
+            import threading as _th
+            import time as _ti
+
+            def _rss_logger():
+                _iv = int(_os.environ.get("PROFILE_STARTUP_INTERVAL", "30"))
+                while True:
+                    try:
+                        with open("/proc/self/status") as _f:
+                            _kb = next((int(_l.split()[1]) for _l in _f if _l.startswith("VmRSS")), 0)
+                        _g = torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0.0
+                        print(f"[RSS] host_VmRSS={_kb // 1024}MB gpu_reserved={_g:.1f}GB", flush=True)
+                    except Exception:
+                        pass
+                    _ti.sleep(_iv)
+
+            _th.Thread(target=_rss_logger, daemon=True).start()
         # --- end startup profiler ---
         torch.cuda.reset_peak_memory_stats()
         self.dist_env = initialize_distributed(
