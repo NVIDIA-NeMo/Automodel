@@ -57,6 +57,8 @@ except ImportError:
         return hadamard_transform_torch(x, scale)
 
 
+from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
+
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
     postprocess_output_for_attn,
@@ -71,7 +73,6 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
     yarn_get_mscale,
 )
-from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 

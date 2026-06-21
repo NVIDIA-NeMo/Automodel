@@ -172,9 +172,10 @@ class TestGlmMoeDsaIndexer:
     def test_init_weights_resets_projections_and_norm(self, config, sdpa_backend):
         indexer = GlmMoeDsaIndexer(config, sdpa_backend)
 
-        with patch("torch.nn.init.trunc_normal_") as trunc_normal, patch.object(
-            indexer.k_norm, "reset_parameters"
-        ) as reset_norm:
+        with (
+            patch("torch.nn.init.trunc_normal_") as trunc_normal,
+            patch.object(indexer.k_norm, "reset_parameters") as reset_norm,
+        ):
             indexer.init_weights(init_std=0.01)
 
         assert trunc_normal.call_count == 3
