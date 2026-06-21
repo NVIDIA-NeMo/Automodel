@@ -81,6 +81,10 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
     cacheable = attention_mask is None
     cache_key = (inputs_embeds.shape[1], inputs_embeds.dtype, inputs_embeds.device)
     cache = getattr(module, "_pp_causal_mask_cache", None)
+    if cache is not None and not isinstance(cache, dict):
+        # unittest.mock.Mock fabricates missing attributes on demand; only a
+        # real dict is a cache we should inspect or reuse.
+        cache = None
     if cacheable and cache is not None and cache_key in cache:
         return cache[cache_key]
 
@@ -94,7 +98,8 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
         "position_ids": position_ids,
     }
     causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
-    if getattr(module, "has_sliding_layers", False):
+    has_sliding_layers = getattr(module, "has_sliding_layers", False)
+    if isinstance(has_sliding_layers, bool) and has_sliding_layers:
         causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
     if cacheable:
