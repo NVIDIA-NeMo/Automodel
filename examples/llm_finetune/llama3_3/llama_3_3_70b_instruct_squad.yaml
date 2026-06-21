@@ -21,7 +21,10 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 256
-  local_batch_size: 32
+  # local_batch=8 with dp8 -> 4 grad-accum micro-steps/optimizer-step (was 32 with
+  # the old layout). Each is a full-model fwd/bwd over an [8 x 1024, 8192] GEMM --
+  # large enough for good H100 utilization, unlike the old pp_microbatch_size=1.
+  local_batch_size: 8
   ckpt_every_steps: 50
   val_every_steps: 1000
   max_steps: 100
@@ -49,15 +52,16 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
-  # This recipe was tuned for 141GB H200. To fit 80GB H100, shard the 70B with
-  # tensor parallelism (tp=4) -- this shards every layer's weights AND the lm_head
-  # 4 ways (the FSDP dp path alone did not, leaving ~70GB of model states/rank and
-  # OOMing the last PP stage). Layout dp2 x tp4 x pp4 = 32 GPUs, mirroring the
-  # proven examples/llm_pretrain/llama3_70b_pretrain.yaml on the same 4-node footprint.
-  dp_size: 2
+  # Dense 70B fits with tensor parallelism + FSDP and does NOT need pipeline
+  # parallelism. PP was the cause of the pathological ~50s/step: local_batch/
+  # pp_microbatch_size(1) gave ~128 tiny microbatch passes per optimizer step, plus
+  # pipeline bubbles and a per-step causal-mask recompute on non-first PP stages.
+  # tp4 (intra-node NVLink, shards every layer's weights + lm_head 4x) x dp8 (FSDP)
+  # = 32 GPUs. The standard non-PP forward computes the causal mask once per step.
+  dp_size: 8
   tp_size: 4
   cp_size: 1
-  pp_size: 4
+  pp_size: 1
 
   sequence_parallel: false
   activation_checkpointing: true
@@ -68,14 +72,6 @@ distributed:
     reduce_dtype: float32
     output_dtype: bfloat16
     cast_forward_inputs: true
-
-  pipeline:
-    pp_schedule: interleaved1f1b
-    pp_microbatch_size: 1
-    layers_per_stage: 4
-    round_virtual_stages_to_pp_multiple: up
-    scale_grads_in_schedule: false
-    dtype: bf16
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -128,3 +124,6 @@ lr_scheduler:
 ci:
   recipe_owner: akoumpa
   nodes: 4
+  # sbatch --time (default 00:10:00 is too short for 70B load + the CI step count);
+  # generous headroom -- with the tp4xdp8 (no-PP) layout steps are far faster.
+  time: "00:30:00"
