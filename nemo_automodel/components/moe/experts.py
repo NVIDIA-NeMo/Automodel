@@ -799,6 +799,43 @@ class GroupedExpertsDeepEP(nn.Module):
         gate_and_up_projs = self.gate_and_up_projs.to_local().to(compute_dtype)
         down_projs = self.down_projs.to_local().to(compute_dtype)
 
+        # --- DIAG (remove): dump loaded expert weights once on global rank 0 to compare
+        # ep16 vs ep32 LOADED weights for the same checkpoint. Gathers all non-expert mesh
+        # dims (e.g. ep_shard) so each rank sees its local experts at FULL width; rank0 holds
+        # global experts 0..N-1 at both ep degrees, so [EXPERT_W] gexp=k must match across runs.
+        if not globals().get("_EXPERT_W_DUMPED", False):
+            try:
+                import torch.distributed as _dist
+
+                _rk = _dist.get_rank() if _dist.is_initialized() else 0
+            except Exception:
+                _rk = 0
+            if _rk == 0:
+                globals()["_EXPERT_W_DUMPED"] = True
+                try:
+                    from torch.distributed.tensor import DTensor as _DT
+                    from torch.distributed.tensor import Replicate as _Rep
+                    from torch.distributed.tensor import Shard as _Sh
+
+                    def _full_local(t):
+                        if isinstance(t, _DT):
+                            pls = [p if (isinstance(p, _Sh) and p.dim == 0) else _Rep() for p in t.placements]
+                            return t.redistribute(placements=pls).to_local().double()
+                        return t.to_local().double() if hasattr(t, "to_local") else t.double()
+
+                    _gu = _full_local(self.gate_and_up_projs)
+                    _dn = _full_local(self.down_projs)
+                    for _i in range(min(_gu.shape[0], 8)):
+                        print(
+                            f"[EXPERT_W] gexp={_i} gu_shape={tuple(_gu[_i].shape)} "
+                            f"gu_sum={_gu[_i].sum().item():.6f} gu_absmax={_gu[_i].abs().max().item():.6f} "
+                            f"gu_v0={_gu[_i].flatten()[0].item():.6f} dn_sum={_dn[_i].sum().item():.6f}",
+                            flush=True,
+                        )
+                except Exception as _e:
+                    print(f"[EXPERT_W] dump failed: {_e!r}", flush=True)
+        # --- end DIAG ---
+
         if torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
                 tokens_per_expert_gpu = tokens_per_expert.to(
