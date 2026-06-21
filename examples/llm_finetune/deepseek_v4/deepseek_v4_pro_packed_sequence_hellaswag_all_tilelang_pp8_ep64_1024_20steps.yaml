@@ -130,3 +130,6 @@ ci:
   # pp_size(8) * ep_size(64) = 512 GPUs => 64 nodes (8 H100/node).
   recipe_owner: hemildesai
   nodes: 64
+  # Cold multi-node start + TileLang JIT (sinkhorn / sparse-MLA / indexer) runs
+  # well past the 00:10:00 default before step 0; give it adequate wall-clock.
+  time: "01:30:00"
