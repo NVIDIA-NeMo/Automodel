@@ -804,27 +804,25 @@ class GroupedExpertsDeepEP(nn.Module):
         # dims (e.g. ep_shard) so each rank sees its local experts at FULL width; rank0 holds
         # global experts 0..N-1 at both ep degrees, so [EXPERT_W] gexp=k must match across runs.
         if not globals().get("_EXPERT_W_DUMPED", False):
+            globals()["_EXPERT_W_DUMPED"] = True
             try:
                 import torch.distributed as _dist
+                from torch.distributed.tensor import DTensor as _DT
+                from torch.distributed.tensor import Replicate as _Rep
+                from torch.distributed.tensor import Shard as _Sh
 
+                def _full_local(t):
+                    # redistribute is a COLLECTIVE: every rank of the mesh must call it,
+                    # so run it on ALL ranks (only rank0 prints below) to avoid deadlock at ep_shard>1.
+                    if isinstance(t, _DT):
+                        pls = [p if (isinstance(p, _Sh) and p.dim == 0) else _Rep() for p in t.placements]
+                        return t.redistribute(placements=pls).to_local().double()
+                    return t.to_local().double() if hasattr(t, "to_local") else t.double()
+
+                _gu = _full_local(self.gate_and_up_projs)
+                _dn = _full_local(self.down_projs)
                 _rk = _dist.get_rank() if _dist.is_initialized() else 0
-            except Exception:
-                _rk = 0
-            if _rk == 0:
-                globals()["_EXPERT_W_DUMPED"] = True
-                try:
-                    from torch.distributed.tensor import DTensor as _DT
-                    from torch.distributed.tensor import Replicate as _Rep
-                    from torch.distributed.tensor import Shard as _Sh
-
-                    def _full_local(t):
-                        if isinstance(t, _DT):
-                            pls = [p if (isinstance(p, _Sh) and p.dim == 0) else _Rep() for p in t.placements]
-                            return t.redistribute(placements=pls).to_local().double()
-                        return t.to_local().double() if hasattr(t, "to_local") else t.double()
-
-                    _gu = _full_local(self.gate_and_up_projs)
-                    _dn = _full_local(self.down_projs)
+                if _rk == 0:
                     for _i in range(min(_gu.shape[0], 8)):
                         print(
                             f"[EXPERT_W] gexp={_i} gu_shape={tuple(_gu[_i].shape)} "
@@ -832,8 +830,8 @@ class GroupedExpertsDeepEP(nn.Module):
                             f"gu_v0={_gu[_i].flatten()[0].item():.6f} dn_sum={_dn[_i].sum().item():.6f}",
                             flush=True,
                         )
-                except Exception as _e:
-                    print(f"[EXPERT_W] dump failed: {_e!r}", flush=True)
+            except Exception as _e:
+                globals()["_EXPERT_W_DUMP_ERR"] = repr(_e)
         # --- end DIAG ---
 
         if torch.count_nonzero(tokens_per_expert) > 0:
