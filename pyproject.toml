@@ -123,6 +123,14 @@ cuda = [
 cuda_source = [
     "bitsandbytes",
 ]
+# DeepSeek-V4 TileLang kernels (enable backend.attn="tilelang": sparse MLA
+# attention, lightning indexer, and the MHC sinkhorn path). Installed into the
+# container by docker/Dockerfile. The external DeepSeek ``tile_kernels`` package
+# (MHC sinkhorn) is git-pinned and installed there too; it is not resolvable from
+# PyPI, so like ``deep_ep`` it is not declared as a resolvable dependency here.
+tilelang = [
+    "tilelang>=0.1.11",
+]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
 fla = [
