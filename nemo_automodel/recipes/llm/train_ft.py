@@ -653,6 +653,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Raises:
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
+        # --- startup profiler (glm investigation): on rank 0, dump all-thread Python stacks
+        # every PROFILE_STARTUP_INTERVAL s (default 30) to stderr. Reveals where the slow
+        # pre-training startup (dist init / checkpoint load / fp8 dequant / DCP / PP setup)
+        # actually spends its time. Sampling profiler; remove before merge.
+        import faulthandler as _fh
+        import os as _os
+
+        if _os.environ.get("RANK", "0") == "0":
+            _fh.dump_traceback_later(int(_os.environ.get("PROFILE_STARTUP_INTERVAL", "30")), repeat=True)
+        # --- end startup profiler ---
         torch.cuda.reset_peak_memory_stats()
         self.dist_env = initialize_distributed(
             backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
