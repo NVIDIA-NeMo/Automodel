@@ -50,7 +50,7 @@ model:
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: gmm
+    experts: torch_mm  # gmm's blocking D2H sync amplifies the PP<->EP deadlock; torch_mm avoids it (m2.5 trains)
     dispatcher: hybridep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
