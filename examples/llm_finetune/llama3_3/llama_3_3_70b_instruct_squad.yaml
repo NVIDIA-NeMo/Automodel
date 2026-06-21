@@ -49,28 +49,33 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
-  dp_size: none
-  tp_size: 1
+  # This recipe was tuned for 141GB H200. To fit 80GB H100, shard the 70B with
+  # tensor parallelism (tp=4) -- this shards every layer's weights AND the lm_head
+  # 4 ways (the FSDP dp path alone did not, leaving ~70GB of model states/rank and
+  # OOMing the last PP stage). Layout dp2 x tp4 x pp4 = 32 GPUs, mirroring the
+  # proven examples/llm_pretrain/llama3_70b_pretrain.yaml on the same 4-node footprint.
+  dp_size: 2
+  tp_size: 4
   cp_size: 1
-  pp_size: 8
+  pp_size: 4
 
   sequence_parallel: false
-  # This recipe was tuned for 141GB H200; the knobs below make it fit 80GB H100.
-  # Primary fix: under PP, reshard_after_forward defaults to False, so every layer's
-  # full (un-sharded) weights stay gathered across the 1F1B window -- ~16GB/rank on
-  # top of the dp_shard=4 sharded state, which is what OOMs the last stage. Force
-  # per-layer resharding back to the shard after forward.
-  reshard_after_forward: true
-  # Recompute block activations to further cut the interleaved-1f1b activation peak.
   activation_checkpointing: true
+
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: true
 
   pipeline:
     pp_schedule: interleaved1f1b
-    # microbatch=1 (was 4, tuned for 141GB H200): smallest per-microbatch fwd +
-    # recompute + grad activation so the step fits 80GB H100, on top of activation
-    # checkpointing above. local_batch_size(32) / 1 = 32 microbatches >= pp_size(8).
     pp_microbatch_size: 1
+    layers_per_stage: 4
+    round_virtual_stages_to_pp_multiple: up
     scale_grads_in_schedule: false
+    dtype: bf16
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -100,11 +105,20 @@ validation_dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
 optimizer:
-  _target_: torch.optim.Adam
-  betas: [0.9, 0.999]
-  eps: 1e-8
+  # TE FusedAdam with master_weights + store_param_remainders keeps an fp32 master
+  # at ~bf16 cost (bf16 weight + 16-bit remainder) instead of a full fp32 copy --
+  # lower optimizer-state memory than torch.optim.Adam here, and the precision path
+  # the startup warning recommends. Matches llm_pretrain/llama3_70b_pretrain.yaml.
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   lr: 1.0e-5
+  betas: [0.9, 0.999]
   weight_decay: 0
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
 
 # AutoPipeline configuration for PP scheduling
 lr_scheduler:
