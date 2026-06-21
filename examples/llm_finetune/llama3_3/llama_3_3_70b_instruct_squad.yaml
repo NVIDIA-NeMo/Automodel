@@ -55,8 +55,13 @@ distributed:
   pp_size: 8
 
   sequence_parallel: false
-  # This recipe was tuned for 141GB H200; on 80GB H100 it OOMs in the first step.
-  # Recompute block activations to cut the interleaved-1f1b activation peak.
+  # This recipe was tuned for 141GB H200; the knobs below make it fit 80GB H100.
+  # Primary fix: under PP, reshard_after_forward defaults to False, so every layer's
+  # full (un-sharded) weights stay gathered across the 1F1B window -- ~16GB/rank on
+  # top of the dp_shard=4 sharded state, which is what OOMs the last stage. Force
+  # per-layer resharding back to the shard after forward.
+  reshard_after_forward: true
+  # Recompute block activations to further cut the interleaved-1f1b activation peak.
   activation_checkpointing: true
 
   pipeline:
@@ -68,10 +73,7 @@ distributed:
     scale_grads_in_schedule: false
 
 loss_fn:
-  # FusedLinearCrossEntropy fuses the lm_head matmul with CE and computes it in
-  # chunks, so the full [seq, vocab=128256] logits are never materialized on the
-  # last pipeline stage (the stage that OOMs once AC + microbatch=1 fit stages 0-6).
-  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 # SQuAD instruction tuning dataset (5% train split for quick runs)
 dataset:
