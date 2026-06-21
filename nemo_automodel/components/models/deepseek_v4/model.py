@@ -111,6 +111,35 @@ class DeepseekV4CausalLMOutput(CausalLMOutputWithPast):
     mtp_loss_scaling_factor: Optional[float] = None
 
 
+def _packed_seq_lens_from_attn_kwargs(attn_kwargs: dict[str, Any], *, device: torch.device) -> torch.Tensor:
+    """Return padded per-document lengths for DSV4 packed THD attention."""
+    seq_lens = attn_kwargs.get("seq_lens_padded")
+    if seq_lens is None:
+        seq_lens = attn_kwargs.get("seq_lens")
+    if seq_lens is not None:
+        seq_lens = seq_lens.to(device=device, dtype=torch.long)
+        return torch.where(seq_lens > 0, seq_lens, torch.zeros((), device=device, dtype=torch.long))
+
+    cu_seqlens = attn_kwargs.get("cu_seqlens_padded")
+    if cu_seqlens is None:
+        cu_seqlens = attn_kwargs.get("cu_seqlens")
+    if cu_seqlens is None:
+        raise ValueError("DeepSeek V4 THD packed attention requires cu_seqlens or seq_lens boundaries.")
+
+    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.long)
+    if cu_seqlens.dim() == 1:
+        valid = cu_seqlens[cu_seqlens >= 0]
+        if valid.numel() < 2:
+            raise ValueError("DeepSeek V4 THD packed attention received fewer than two cu_seqlens boundaries.")
+        return (valid[1:] - valid[:-1]).unsqueeze(0)
+    if cu_seqlens.dim() == 2:
+        starts = cu_seqlens[:, :-1]
+        ends = cu_seqlens[:, 1:]
+        valid = (starts >= 0) & (ends >= 0)
+        return torch.where(valid, ends - starts, torch.zeros_like(starts))
+    raise ValueError(f"Unsupported cu_seqlens rank for DeepSeek V4 THD attention: {cu_seqlens.dim()}")
+
+
 class DeepseekV4Block(nn.Module):
     """Single transformer block for DeepSeek V4.
 
@@ -478,12 +507,12 @@ class DeepseekV4Model(nn.Module):
         sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
         packed_seq_lens = None
         if attn_kwargs.get("qkv_format") == "thd":
-            # THD packing uses seq_lens_padded to keep pack/CP padding inside a
-            # valid block. Using only seq_lens leaves trailing pad query rows
-            # with no legal keys, which the sparse TileLang path cannot execute.
-            packed_seq_lens = attn_kwargs.get("seq_lens_padded")
-            if packed_seq_lens is None:
-                packed_seq_lens = attn_kwargs.get("seq_lens")
+            # THD packing uses padded sequence lengths to keep pack/CP padding
+            # inside a valid block. The THD preprocessing path emits cumulative
+            # ``cu_seqlens*`` boundaries, so derive lengths from those instead
+            # of silently falling back to one global causal sequence.
+            packed_seq_lens = _packed_seq_lens_from_attn_kwargs(attn_kwargs, device=shape_ref.device)
+            attn_kwargs["_dsv4_packed_seq_lens"] = packed_seq_lens
         cp_group = attn_kwargs.get("_dsv4_cp_group")
         cp_active = dsv4_cp_enabled(cp_group)
         if cp_active and packed_seq_lens is not None:
