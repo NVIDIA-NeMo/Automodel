@@ -347,6 +347,33 @@ class TestDeepseekV4AttentionMask:
         torch.testing.assert_close(pool_local_idxs.cpu(), torch.tensor([[0, 1, 0, 1]]))
 
     @_REQUIRES_CUDA
+    def test_packed_pool_windows_keeps_static_compressed_capacity_cuda(self):
+        device = torch.device("cuda")
+        ratio, head_dim = 4, 8
+        kv = torch.arange(1 * 12 * head_dim, device=device, dtype=torch.float32).view(1, 12, head_dim)
+        gate = torch.zeros_like(kv)
+        ape = torch.zeros(ratio, head_dim, device=device)
+        seq_lens = torch.tensor([[6, 6]], device=device)
+        position_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5]], device=device)
+
+        actual, pool_positions, pool_doc_ids, pool_local_idxs = dsv4_layers._pool_windows_packed(
+            kv,
+            gate,
+            ape,
+            ratio,
+            head_dim,
+            seq_lens,
+            overlap=False,
+            position_ids=position_ids,
+        )
+
+        assert actual.shape == (1, 3, head_dim)
+        torch.testing.assert_close(pool_positions.cpu(), torch.tensor([[0, 0, 0]]))
+        torch.testing.assert_close(pool_doc_ids.cpu(), torch.tensor([[0, 1, -1]]))
+        torch.testing.assert_close(pool_local_idxs.cpu(), torch.tensor([[0, 0, -1]]))
+        torch.testing.assert_close(actual[:, 2], torch.zeros_like(actual[:, 2]))
+
+    @_REQUIRES_CUDA
     def test_packed_sparse_topk_compressed_range_is_doc_local_cuda(self):
         device = torch.device("cuda")
         seq_lens = torch.tensor([[8, 8]], device=device)

@@ -546,7 +546,10 @@ def _pool_windows_packed(
     pos_per_batch: list[torch.Tensor] = []
     doc_per_batch: list[torch.Tensor] = []
     local_per_batch: list[torch.Tensor] = []
-    max_pooled = 0
+    # Keep the compressed sequence length static for TileLang. Values from
+    # incomplete per-document tails are omitted, then represented by masked
+    # zero slots at the end of the packed pool.
+    max_pooled = kv.shape[1] // ratio
     for batch_idx in range(batch):
         offset = 0
         pooled_docs: list[torch.Tensor] = []
@@ -590,7 +593,8 @@ def _pool_windows_packed(
         pos_per_batch.append(pos_b)
         doc_per_batch.append(doc_b)
         local_per_batch.append(local_b)
-        max_pooled = max(max_pooled, pooled_b.shape[0])
+        if pooled_b.shape[0] > max_pooled:
+            raise ValueError(f"Packed pooled windows ({pooled_b.shape[0]}) exceed static capacity ({max_pooled})")
 
     pooled = kv.new_zeros((batch, max_pooled, head_dim))
     pool_positions = torch.zeros((batch, max_pooled), device=kv.device, dtype=torch.long)
