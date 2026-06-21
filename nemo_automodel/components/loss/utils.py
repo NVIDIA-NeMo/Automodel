@@ -85,7 +85,14 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     if isinstance(loss_fn, FusedLinearCrossEntropy):
         model = kwargs.pop("model")
         labels = kwargs.pop("labels")
-        lm_head = _get_lm_head_weight(model)
+        # Reuse a caller-materialized LM head when provided so a single
+        # full_tensor() all-gather is shared across the main loss and every MTP
+        # depth (see calculate_mtp_loss). Re-gathering the (vocab x hidden) head
+        # per call leaves a copy retained for backward each time; they accumulate
+        # on-device and OOM large-vocab MoE (e.g. Nemotron-Ultra, 256k vocab).
+        lm_head = kwargs.pop("lm_weight", None)
+        if lm_head is None:
+            lm_head = _get_lm_head_weight(model)
         loss_fn_kwargs.update(
             {
                 "hidden_states": kwargs.pop("hidden_states"),
@@ -94,6 +101,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
             }
         )
     else:
+        kwargs.pop("lm_weight", None)  # logit-based losses do not need the LM head
         loss_fn_kwargs.update(
             {
                 "logits": kwargs.pop("logits"),
