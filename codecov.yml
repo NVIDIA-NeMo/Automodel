@@ -18,6 +18,7 @@ coverage:
           - "!nemo_automodel/components/models/bagel/**"
           - "!nemo_automodel/recipes/multimodal/**"
           - "!nemo_automodel/components/training/ema.py"
+          - "!nemo_automodel/components/models/glm_moe_dsa/kernels/**"
           - "!examples/multimodal_finetune/**"
           - "!examples/multimodal_pretrain/**"
       retrieval:
