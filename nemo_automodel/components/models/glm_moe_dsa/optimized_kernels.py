@@ -110,6 +110,8 @@ def tilelang_indexer_topk(
     head_weights: torch.Tensor,
     cu_seqlens: torch.Tensor,
     index_topk: int,
+    query_indices: torch.Tensor | None = None,
+    cu_seqlens_padded: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused lighting-indexer top-k selection (THD/varlen).
 
@@ -122,12 +124,26 @@ def tilelang_indexer_topk(
             index_head_dim**-0.5``.
         cu_seqlens: ``[num_seq + 1]`` cumulative sequence lengths of the packed batch.
         index_topk: number of keys to keep (e.g. ``2048``).
+        query_indices: Optional global THD token indices for the local query
+            rows. Used by context parallelism when ``index_q`` is sharded but
+            ``index_k`` has been all-gathered in global token order.
+        cu_seqlens_padded: Optional cumulative lengths in the padded THD token
+            layout. CP-packed datasets pad each document to a CP multiple, so
+            local query indices address this padded layout rather than the
+            compact ``cu_seqlens`` layout.
 
     Returns:
         ``topk_indices`` ``[T, 1, index_topk]`` int32 (``-1`` for invalid/causal-masked),
         matching the layout the sparse-MLA kernel expects.
     """
-    starts, ends = _slime_generate_varlen_mask_params(cu_seqlens)
+    if cu_seqlens_padded is not None and not torch.equal(cu_seqlens_padded, cu_seqlens):
+        starts, ends = _generate_padded_varlen_mask_params(cu_seqlens, cu_seqlens_padded)
+    else:
+        starts, ends = _slime_generate_varlen_mask_params(cu_seqlens)
+    if query_indices is not None:
+        query_indices = query_indices.flatten().to(device=starts.device, dtype=torch.long)
+        starts = starts.index_select(0, query_indices)
+        ends = ends.index_select(0, query_indices)
     _, topk_indices = _slime_lighting_indexer(
         index_q,
         index_k,
@@ -137,6 +153,33 @@ def tilelang_indexer_topk(
         index_topk,
     )
     return topk_indices.to(torch.int32).unsqueeze(1).contiguous()
+
+
+def _generate_padded_varlen_mask_params(
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build per-query key windows for padded THD layout.
+
+    ``cu_seqlens`` stores real document lengths compactly. ``cu_seqlens_padded``
+    stores their offsets in the actual flattened token tensor, including CP
+    padding between documents. TileLang top-k indices refer to the flattened
+    token tensor, so starts/ends must be in the padded coordinate space while
+    still excluding CP padding keys for real query tokens.
+    """
+    cu_seqlens = cu_seqlens.to(torch.int32)
+    cu_seqlens_padded = cu_seqlens_padded.to(torch.int32)
+    padded_total = int(cu_seqlens_padded[-1].item())
+    q_indices = torch.arange(0, padded_total, device=cu_seqlens_padded.device, dtype=torch.int32)
+    seq_indices = torch.searchsorted(cu_seqlens_padded, q_indices, right=True) - 1
+    seq_indices = seq_indices.clamp(min=0, max=cu_seqlens_padded.numel() - 2)
+
+    starts = cu_seqlens_padded[seq_indices]
+    real_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    real_ends = starts + real_lengths[seq_indices]
+    ends = torch.minimum(q_indices + 1, real_ends)
+    ends = torch.maximum(ends, starts + 1)
+    return starts, ends
 
 
 def tilelang_sparse_attention(

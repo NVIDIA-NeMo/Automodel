@@ -73,6 +73,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
     yarn_get_mscale,
 )
+from nemo_automodel.components.models.glm_moe_dsa.cp import glm_dsa_cp_all_gather, glm_dsa_cp_enabled
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import (
     is_dsa_kernel_available,
     should_use_tilelang,
@@ -265,6 +266,12 @@ class GlmMoeDsaIndexer(nn.Module):
         # Combine pe and nope parts (rope slice first, matching the reference layout)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
+        cp_group = attn_kwargs.get("_glm_dsa_cp_group")
+        cp_enabled = glm_dsa_cp_enabled(cp_group)
+        if cp_enabled:
+            if qkv_format != "thd":
+                raise ValueError("GLM DSA context parallelism requires THD/packed sequences.")
+            k = glm_dsa_cp_all_gather(k, dim=0, cp_group=cp_group)
 
         # TileLang sparse path (opt-in via backend.attn == "tilelang"): the fused lighting-indexer
         # kernel computes logits + top-k directly, avoiding the dense [T, T_kv] score tensor. THD only.
@@ -292,7 +299,16 @@ class GlmMoeDsaIndexer(nn.Module):
                 head_weights.contiguous(),
                 cu_seqlens.flatten().to(torch.int32),
                 self.index_topk,
+                query_indices=attn_kwargs.get("glm_dsa_cp_query_indices"),
+                cu_seqlens_padded=(
+                    attn_kwargs["cu_seqlens_padded"].flatten().to(torch.int32)
+                    if "cu_seqlens_padded" in attn_kwargs
+                    else None
+                ),
             )
+
+        if cp_enabled:
+            raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
 
         # NOTE: the reference Indexer applies a Hadamard rotation (`rotate_activation`) only as part
         # of its FP8 scoring kernel. The Hadamard transform is orthogonal, so it leaves the q·k index
@@ -629,6 +645,13 @@ class GlmMoeDsaMLA(nn.Module):
 
         # Remove the head dimension we added to k_pe
         k_pe = k_pe.squeeze(head_unsqueeze_dim)
+        cp_group = attn_kwargs.get("_glm_dsa_cp_group")
+        cp_enabled = glm_dsa_cp_enabled(cp_group)
+        if cp_enabled:
+            if qkv_format != "thd":
+                raise ValueError("GLM DSA context parallelism requires THD/packed sequences.")
+            kv = glm_dsa_cp_all_gather(kv, dim=0, cp_group=cp_group)
+            k_pe = glm_dsa_cp_all_gather(k_pe, dim=0, cp_group=cp_group)
 
         # TileLang sparse path (opt-in via backend.attn == "tilelang"): run the gather-top-k sparse
         # MLA kernel on the absorbed latent representation. The k_nope up-projection is folded into
