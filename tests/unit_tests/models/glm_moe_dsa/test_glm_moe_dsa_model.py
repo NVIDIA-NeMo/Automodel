@@ -21,7 +21,7 @@ import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
-# Mock fast_hadamard_transform before importing deepseek_v32 modules
+# Mock fast_hadamard_transform before importing GLM DSA modules
 try:
     import fast_hadamard_transform  # noqa: F401
 except ImportError:
@@ -483,9 +483,9 @@ class TestIndexShare:
             assert (block.self_attn.indexer is None) is skip
 
     def test_shared_mla_requires_prev_topk(self, config, backend_config, device):
-        from nemo_automodel.components.models.deepseek_v32.layers import DeepseekV32MLA
+        from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA
 
-        mla = DeepseekV32MLA(config, backend_config, skip_topk=True).to(device)
+        mla = GlmMoeDsaMLA(config, backend_config, skip_topk=True).to(device)
         assert mla.indexer is None
 
         x = torch.randn(1, 3, config.hidden_size, device=device).to(torch.bfloat16)

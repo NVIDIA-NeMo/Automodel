@@ -31,7 +31,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
-from nemo_automodel.components.models.deepseek_v32.layers import DeepseekV32MLA
+from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
@@ -47,7 +47,7 @@ class Block(nn.Module):
         # field (e.g. GLM-5.1, which runs a full indexer every layer), every layer is "full".
         indexer_types = getattr(config, "indexer_types", None)
         self.skip_topk = indexer_types is not None and indexer_types[layer_idx] == "shared"
-        self.self_attn = DeepseekV32MLA(config, backend, skip_topk=self.skip_topk)
+        self.self_attn = GlmMoeDsaMLA(config, backend, skip_topk=self.skip_topk)
 
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
