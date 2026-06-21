@@ -55,6 +55,8 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     sinkhorn_normalize_torch,
 )
 
+_REQUIRES_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
 
 def _miles_q_positions(seqlen_local: int, cp_rank: int, device: torch.device) -> torch.Tensor:
     start = cp_rank * seqlen_local
@@ -308,6 +310,161 @@ class TestDeepseekV4AttentionMask:
 
         assert (real_topk[0, 5:] >= 0).sum(dim=-1).eq(0).all()
         assert (padded_topk[0, 5:] >= 0).sum(dim=-1).gt(0).all()
+
+    @_REQUIRES_CUDA
+    def test_packed_pool_windows_overlap_is_doc_local_cuda(self):
+        device = torch.device("cuda")
+        ratio, head_dim = 4, 8
+        kv = torch.arange(1 * 16 * 2 * head_dim, device=device, dtype=torch.float32).view(1, 16, 2 * head_dim)
+        gate = torch.zeros_like(kv)
+        ape = torch.zeros(ratio, 2 * head_dim, device=device)
+        seq_lens = torch.tensor([[8, 8]], device=device)
+        position_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7]], device=device)
+
+        actual, pool_positions, pool_doc_ids, pool_local_idxs = dsv4_layers._pool_windows_packed(
+            kv,
+            gate,
+            ape,
+            ratio,
+            head_dim,
+            seq_lens,
+            overlap=True,
+            position_ids=position_ids,
+        )
+        expected = torch.cat(
+            [
+                dsv4_layers._pool_windows(kv[:, :8], gate[:, :8], ape, ratio, head_dim, overlap=True),
+                dsv4_layers._pool_windows(kv[:, 8:], gate[:, 8:], ape, ratio, head_dim, overlap=True),
+            ],
+            dim=1,
+        )
+        global_pooled = dsv4_layers._pool_windows(kv, gate, ape, ratio, head_dim, overlap=True)
+
+        torch.testing.assert_close(actual, expected)
+        assert not torch.allclose(actual[:, 2], global_pooled[:, 2])
+        torch.testing.assert_close(pool_positions.cpu(), torch.tensor([[0, 4, 0, 4]]))
+        torch.testing.assert_close(pool_doc_ids.cpu(), torch.tensor([[0, 0, 1, 1]]))
+        torch.testing.assert_close(pool_local_idxs.cpu(), torch.tensor([[0, 1, 0, 1]]))
+
+    @_REQUIRES_CUDA
+    def test_packed_pool_windows_keeps_static_compressed_capacity_cuda(self):
+        device = torch.device("cuda")
+        ratio, head_dim = 4, 8
+        kv = torch.arange(1 * 12 * head_dim, device=device, dtype=torch.float32).view(1, 12, head_dim)
+        gate = torch.zeros_like(kv)
+        ape = torch.zeros(ratio, head_dim, device=device)
+        seq_lens = torch.tensor([[6, 6]], device=device)
+        position_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5]], device=device)
+
+        actual, pool_positions, pool_doc_ids, pool_local_idxs = dsv4_layers._pool_windows_packed(
+            kv,
+            gate,
+            ape,
+            ratio,
+            head_dim,
+            seq_lens,
+            overlap=False,
+            position_ids=position_ids,
+        )
+
+        assert actual.shape == (1, 3, head_dim)
+        torch.testing.assert_close(pool_positions.cpu(), torch.tensor([[0, 0, 0]]))
+        torch.testing.assert_close(pool_doc_ids.cpu(), torch.tensor([[0, 1, -1]]))
+        torch.testing.assert_close(pool_local_idxs.cpu(), torch.tensor([[0, 0, -1]]))
+        torch.testing.assert_close(actual[:, 2], torch.zeros_like(actual[:, 2]))
+
+    @_REQUIRES_CUDA
+    def test_packed_sparse_topk_compressed_range_is_doc_local_cuda(self):
+        device = torch.device("cuda")
+        seq_lens = torch.tensor([[8, 8]], device=device)
+        seq_len, ratio, n_pooled = 16, 4, 4
+        base_mask = build_packed_causal_padding_mask(
+            seq_lens,
+            seq_len=seq_len,
+            dtype=torch.float32,
+            device=device,
+            sliding_window=4,
+        )
+        valid_start, valid_end, _, _ = dsv4_layers._packed_compressed_bounds(
+            seq_lens,
+            seq_len=seq_len,
+            batch=1,
+            ratio=ratio,
+            device=device,
+        )
+        p_pos = torch.arange(n_pooled, device=device).view(1, 1, n_pooled)
+        min_val = torch.finfo(torch.float32).min
+        compressed_mask = torch.where(
+            (p_pos >= valid_start.unsqueeze(-1)) & (p_pos < valid_end.unsqueeze(-1)),
+            torch.zeros((), device=device),
+            torch.full((), min_val, device=device),
+        )
+        attention_mask = torch.cat([base_mask, compressed_mask.unsqueeze(1)], dim=-1)
+
+        topk = build_dsv4_sparse_topk_indices(
+            batch_size=1,
+            seq_len=seq_len,
+            key_len=seq_len + n_pooled,
+            window_size=4,
+            device=device,
+            attention_mask=attention_mask,
+            compress_ratio=ratio,
+            n_pooled=n_pooled,
+            vanilla_key_len=seq_len,
+            q_positions=torch.arange(seq_len, device=device).unsqueeze(0),
+        )
+
+        assert (topk[0, 8, 4:] >= 0).sum().item() == 0
+        assert (seq_len + 2) in topk[0, 12, 4:].tolist()
+        assert (seq_len + 0) not in topk[0, 12, 4:].tolist()
+        assert (seq_len + 1) not in topk[0, 12, 4:].tolist()
+
+    @_REQUIRES_CUDA
+    def test_packed_indexer_topk_mask_intersects_doc_local_range_cuda(self):
+        device = torch.device("cuda")
+        seq_lens = torch.tensor([[8, 8]], device=device)
+        seq_len, ratio, n_pooled = 16, 4, 4
+        base_mask = build_packed_causal_padding_mask(
+            seq_lens,
+            seq_len=seq_len,
+            dtype=torch.float32,
+            device=device,
+            sliding_window=4,
+        )
+        valid_start, valid_end, _, _ = dsv4_layers._packed_compressed_bounds(
+            seq_lens,
+            seq_len=seq_len,
+            batch=1,
+            ratio=ratio,
+            device=device,
+        )
+        p_pos = torch.arange(n_pooled, device=device).view(1, 1, n_pooled)
+        min_val = torch.finfo(torch.float32).min
+        compressed_mask = torch.where(
+            (p_pos >= valid_start.unsqueeze(-1)) & (p_pos < valid_end.unsqueeze(-1)),
+            torch.zeros((), device=device),
+            torch.full((), min_val, device=device),
+        )
+        attention_mask = torch.cat([base_mask, compressed_mask.unsqueeze(1)], dim=-1)
+        compressed_topk = torch.full((1, seq_len, 2), -1, device=device, dtype=torch.long)
+        compressed_topk[0, 12] = torch.tensor([0, 2], device=device)
+
+        topk = build_dsv4_sparse_topk_indices(
+            batch_size=1,
+            seq_len=seq_len,
+            key_len=seq_len + n_pooled,
+            window_size=4,
+            device=device,
+            attention_mask=attention_mask,
+            compress_ratio=ratio,
+            compressed_topk=compressed_topk,
+            n_pooled=n_pooled,
+            vanilla_key_len=seq_len,
+            q_positions=torch.arange(seq_len, device=device).unsqueeze(0),
+        )
+
+        assert (seq_len + 0) not in topk[0, 12, -2:].tolist()
+        assert (seq_len + 2) in topk[0, 12, -2:].tolist()
 
     def test_short_hca_training_window_stays_disabled_without_group_hca(self):
         """All-short groups should keep the original no-HCA path and grad=None semantics."""

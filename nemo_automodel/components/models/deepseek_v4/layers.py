@@ -451,6 +451,165 @@ def _pool_windows(
     return (kv_w * gate_w.softmax(dim=2)).sum(dim=2)
 
 
+def _normalize_packed_seq_lens(
+    packed_seq_lens: torch.Tensor,
+    *,
+    batch: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if packed_seq_lens.dim() == 1:
+        packed_seq_lens = packed_seq_lens.unsqueeze(0)
+    packed_seq_lens = packed_seq_lens.to(device=device, dtype=torch.long)
+    if packed_seq_lens.shape[0] == 1 and batch > 1:
+        packed_seq_lens = packed_seq_lens.expand(batch, -1)
+    if packed_seq_lens.shape[0] != batch:
+        raise ValueError(
+            f"Packed sequence lengths batch ({packed_seq_lens.shape[0]}) must match hidden batch ({batch})"
+        )
+    return torch.where(
+        packed_seq_lens > 0,
+        packed_seq_lens,
+        torch.zeros((), device=device, dtype=torch.long),
+    )
+
+
+def _packed_doc_bounds(
+    packed_seq_lens: torch.Tensor,
+    *,
+    seq_len: int,
+    batch: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    seq_lens = _normalize_packed_seq_lens(packed_seq_lens, batch=batch, device=device)
+    positions = torch.arange(seq_len, device=device, dtype=torch.long).expand(batch, -1)
+    ends = seq_lens.cumsum(dim=-1)
+    starts = ends - seq_lens
+    total = ends[:, -1:]
+    doc_ids = torch.searchsorted(ends.contiguous(), positions.contiguous(), right=True)
+    valid = positions < total
+    safe_doc_ids = doc_ids.clamp(max=max(seq_lens.shape[1] - 1, 0))
+    doc_starts = torch.gather(starts, dim=-1, index=safe_doc_ids)
+    doc_ends = torch.gather(ends, dim=-1, index=safe_doc_ids)
+    local_pos = positions - doc_starts
+    doc_ids = torch.where(valid, doc_ids, torch.full_like(doc_ids, -1))
+    doc_starts = torch.where(valid, doc_starts, torch.zeros_like(doc_starts))
+    doc_ends = torch.where(valid, doc_ends, torch.zeros_like(doc_ends))
+    local_pos = torch.where(valid, local_pos, torch.zeros_like(local_pos))
+    return doc_ids, doc_starts, doc_ends, local_pos
+
+
+def _packed_compressed_bounds(
+    packed_seq_lens: torch.Tensor,
+    *,
+    seq_len: int,
+    batch: int,
+    ratio: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    seq_lens = _normalize_packed_seq_lens(packed_seq_lens, batch=batch, device=device)
+    doc_ids, _, _, local_pos = _packed_doc_bounds(seq_lens, seq_len=seq_len, batch=batch, device=device)
+    doc_windows = seq_lens // ratio
+    comp_ends_by_doc = doc_windows.cumsum(dim=-1)
+    comp_starts_by_doc = comp_ends_by_doc - doc_windows
+    safe_doc_ids = doc_ids.clamp(min=0, max=max(seq_lens.shape[1] - 1, 0))
+    comp_starts = torch.gather(comp_starts_by_doc, dim=-1, index=safe_doc_ids)
+    doc_window_counts = torch.gather(doc_windows, dim=-1, index=safe_doc_ids)
+    comp_ends = comp_starts + ((local_pos + 1) // ratio).clamp(max=doc_window_counts)
+    invalid = doc_ids < 0
+    comp_starts = torch.where(invalid, torch.zeros_like(comp_starts), comp_starts)
+    comp_ends = torch.where(invalid, torch.zeros_like(comp_ends), comp_ends)
+    return comp_starts, comp_ends, doc_ids, local_pos
+
+
+def _pool_windows_packed(
+    kv: torch.Tensor,
+    gate: torch.Tensor,
+    ape: torch.Tensor,
+    ratio: int,
+    head_dim: int,
+    packed_seq_lens: torch.Tensor,
+    *,
+    overlap: bool = False,
+    position_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pool complete windows independently inside each packed document."""
+    batch, _, _ = kv.shape
+    seq_lens = _normalize_packed_seq_lens(packed_seq_lens, batch=batch, device=kv.device)
+    if position_ids is not None:
+        if position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+        position_ids = position_ids.to(device=kv.device, dtype=torch.long)
+        if position_ids.shape[0] == 1 and batch > 1:
+            position_ids = position_ids.expand(batch, -1)
+
+    pooled_per_batch: list[torch.Tensor] = []
+    pos_per_batch: list[torch.Tensor] = []
+    doc_per_batch: list[torch.Tensor] = []
+    local_per_batch: list[torch.Tensor] = []
+    # Keep the compressed sequence length static for TileLang. Values from
+    # incomplete per-document tails are omitted, then represented by masked
+    # zero slots at the end of the packed pool.
+    max_pooled = kv.shape[1] // ratio
+    for batch_idx in range(batch):
+        offset = 0
+        pooled_docs: list[torch.Tensor] = []
+        pos_docs: list[torch.Tensor] = []
+        doc_docs: list[torch.Tensor] = []
+        local_docs: list[torch.Tensor] = []
+        for doc_idx, length_t in enumerate(seq_lens[batch_idx]):
+            length = int(length_t.item())
+            usable = (length // ratio) * ratio
+            if usable > 0:
+                doc_pooled = _pool_windows(
+                    kv[batch_idx : batch_idx + 1, offset : offset + usable],
+                    gate[batch_idx : batch_idx + 1, offset : offset + usable],
+                    ape,
+                    ratio,
+                    head_dim,
+                    overlap=overlap,
+                ).squeeze(0)
+                pooled_docs.append(doc_pooled)
+                n_doc_pooled = doc_pooled.shape[0]
+                if position_ids is not None:
+                    pool_positions = position_ids[batch_idx, offset : offset + usable : ratio][:n_doc_pooled]
+                else:
+                    pool_positions = torch.arange(0, usable, ratio, device=kv.device, dtype=torch.long)
+                pos_docs.append(pool_positions)
+                doc_docs.append(torch.full((n_doc_pooled,), doc_idx, device=kv.device, dtype=torch.long))
+                local_docs.append(torch.arange(n_doc_pooled, device=kv.device, dtype=torch.long))
+            offset += length
+
+        if pooled_docs:
+            pooled_b = torch.cat(pooled_docs, dim=0)
+            pos_b = torch.cat(pos_docs, dim=0)
+            doc_b = torch.cat(doc_docs, dim=0)
+            local_b = torch.cat(local_docs, dim=0)
+        else:
+            pooled_b = kv.new_zeros((0, head_dim))
+            pos_b = torch.empty((0,), device=kv.device, dtype=torch.long)
+            doc_b = torch.empty((0,), device=kv.device, dtype=torch.long)
+            local_b = torch.empty((0,), device=kv.device, dtype=torch.long)
+        pooled_per_batch.append(pooled_b)
+        pos_per_batch.append(pos_b)
+        doc_per_batch.append(doc_b)
+        local_per_batch.append(local_b)
+        if pooled_b.shape[0] > max_pooled:
+            raise ValueError(f"Packed pooled windows ({pooled_b.shape[0]}) exceed static capacity ({max_pooled})")
+
+    pooled = kv.new_zeros((batch, max_pooled, head_dim))
+    pool_positions = torch.zeros((batch, max_pooled), device=kv.device, dtype=torch.long)
+    pool_doc_ids = torch.full((batch, max_pooled), -1, device=kv.device, dtype=torch.long)
+    pool_local_idxs = torch.full((batch, max_pooled), -1, device=kv.device, dtype=torch.long)
+    for batch_idx, pooled_b in enumerate(pooled_per_batch):
+        n_pooled = pooled_b.shape[0]
+        if n_pooled:
+            pooled[batch_idx, :n_pooled] = pooled_b
+            pool_positions[batch_idx, :n_pooled] = pos_per_batch[batch_idx]
+            pool_doc_ids[batch_idx, :n_pooled] = doc_per_batch[batch_idx]
+            pool_local_idxs[batch_idx, :n_pooled] = local_per_batch[batch_idx]
+    return pooled, pool_positions, pool_doc_ids, pool_local_idxs
+
+
 def _rope_pool_positions(
     pool_length: int, pool_base: int, ratio: int, device: torch.device, batch: int
 ) -> torch.Tensor:
@@ -655,6 +814,7 @@ class DeepseekV4Indexer(nn.Module):
         start_pos: int,
         position_ids: torch.Tensor | None = None,
         cp_group=None,
+        packed_seq_lens: torch.Tensor | None = None,
     ) -> torch.LongTensor:
         input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
@@ -662,29 +822,50 @@ class DeepseekV4Indexer(nn.Module):
         hidden_states_fp32 = hidden_states.float()
         kv = self.wkv(hidden_states_fp32)
         gate = self.wgate(hidden_states_fp32)
-        ready_kv, ready_gate, pool_base = cache.accumulate_windows(
-            kv, gate, layer_idx, "indexer_state", self.compress_ratio, start_pos
-        )
-        new_pooled = self.kv_norm(
-            _pool_windows(
-                ready_kv,
-                ready_gate,
+        if packed_seq_lens is not None:
+            if cp_active:
+                raise NotImplementedError("DeepSeek V4 packed THD indexer does not support context parallelism.")
+            pooled_raw, pool_positions, _, _ = _pool_windows_packed(
+                kv,
+                gate,
                 self.ape_param(hidden_states_fp32),
                 self.compress_ratio,
                 self.head_dim,
+                packed_seq_lens,
                 overlap=self.overlap,
-                cp_group=cp_group,
-            ).to(input_dtype)
-        )
-        if new_pooled.shape[1] > 0:
-            positions = _rope_pool_positions(
-                new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, new_pooled.shape[0]
+                position_ids=position_ids,
             )
-            cos, sin = rotary(new_pooled, positions)
-            new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
-        pooled_kv = cache.update_pool(new_pooled, layer_idx, "indexer_state")
-        if cp_active:
-            pooled_kv = dsv4_cp_all_gather(pooled_kv, dim=1, cp_group=cp_group)
+            new_pooled = self.kv_norm(pooled_raw.to(input_dtype))
+            if new_pooled.shape[1] > 0:
+                cos, sin = rotary(new_pooled, pool_positions)
+                new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
+            pooled_kv = new_pooled
+        else:
+            ready_kv, ready_gate, pool_base = cache.accumulate_windows(
+                kv, gate, layer_idx, "indexer_state", self.compress_ratio, start_pos
+            )
+            new_pooled = self.kv_norm(
+                _pool_windows(
+                    ready_kv,
+                    ready_gate,
+                    self.ape_param(hidden_states_fp32),
+                    self.compress_ratio,
+                    self.head_dim,
+                    overlap=self.overlap,
+                    cp_group=cp_group,
+                ).to(input_dtype)
+            )
+            if new_pooled.shape[1] > 0:
+                positions = _rope_pool_positions(
+                    new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, new_pooled.shape[0]
+                )
+                cos, sin = rotary(new_pooled, positions)
+                new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
+            pooled_kv = cache.update_pool(new_pooled, layer_idx, "indexer_state")
+            if cp_active:
+                pooled_kv = dsv4_cp_all_gather(pooled_kv, dim=1, cp_group=cp_group)
+        if pooled_kv.shape[1] == 0:
+            return torch.empty((batch, seq_len, 0), device=hidden_states.device, dtype=torch.long)
 
         cos, sin = position_embeddings
         q = self.wq_b(q_residual).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -702,13 +883,25 @@ class DeepseekV4Indexer(nn.Module):
             query_start=query_start,
             query_total_len=query_total_len,
         )
-        q_positions = _query_positions(
-            position_ids, batch=batch, seq_len=seq_len, device=hidden_states.device, cp_group=cp_group
-        )
-        valid_end = ((q_positions + 1) // self.compress_ratio).unsqueeze(-1)
         pooled_pos = torch.arange(pooled_kv.shape[1], device=hidden_states.device).view(1, 1, -1)
+        if packed_seq_lens is not None:
+            valid_start, valid_end, _, _ = _packed_compressed_bounds(
+                packed_seq_lens,
+                seq_len=seq_len,
+                batch=batch,
+                ratio=self.compress_ratio,
+                device=hidden_states.device,
+            )
+            valid_start = valid_start.unsqueeze(-1)
+            valid_end = valid_end.unsqueeze(-1)
+            valid = (pooled_pos >= valid_start) & (pooled_pos < valid_end)
+        else:
+            q_positions = _query_positions(
+                position_ids, batch=batch, seq_len=seq_len, device=hidden_states.device, cp_group=cp_group
+            )
+            valid = pooled_pos < ((q_positions + 1) // self.compress_ratio).unsqueeze(-1)
         index_scores = torch.where(
-            pooled_pos < valid_end,
+            valid,
             index_scores,
             torch.full((), float("-inf"), dtype=index_scores.dtype, device=index_scores.device),
         )
@@ -788,57 +981,79 @@ class DeepseekV4Compressor(nn.Module):
         enable_hca_fsdp_graph_alignment: bool = False,
         position_ids: torch.Tensor | None = None,
         cp_group=None,
-    ) -> torch.Tensor:
+        packed_seq_lens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.LongTensor | None]:
         input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
         cp_active = dsv4_cp_enabled(cp_group)
         hidden_states_fp32 = hidden_states.float()
         kv = self.wkv(hidden_states_fp32)
         gate = self.wgate(hidden_states_fp32)
-        ready_kv, ready_gate, pool_base = cache.accumulate_windows(
-            kv, gate, layer_idx, "compressor_state", self.compress_ratio, start_pos
-        )
-        local_has_complete_hca_window = ready_kv.shape[1] > 0
-        fsdp_group_has_complete_hca_window = (
-            self._compute_fsdp_group_has_complete_hca_window(local_has_complete_hca_window, kv.device)
-            if enable_hca_fsdp_graph_alignment
-            else local_has_complete_hca_window
-        )
-        needs_masked_synthetic_hca_window = (
-            enable_hca_fsdp_graph_alignment
-            and self.indexer is None
-            and fsdp_group_has_complete_hca_window
-            and not local_has_complete_hca_window
-            and 0 < kv.shape[1] < self.compress_ratio
-        )
-        if needs_masked_synthetic_hca_window:
-            # A mixed short/long HCA parameter sync group needs every rank to
-            # create the same compressor autograd edges. All-short groups keep
-            # the original no-HCA path so optimizer semantics stay at
-            # grad=None. Zero-length local HCA inputs are outside this narrow
-            # training fix.
-            pad_len = self.compress_ratio - kv.shape[1]
-            pad_shape = (batch, pad_len, kv.shape[-1])
-            ready_kv = torch.cat([kv, kv.new_zeros(pad_shape)], dim=1)
-            ready_gate = torch.cat([gate, gate.new_zeros(pad_shape)], dim=1)
-            pool_base = max(0, start_pos)
-        new_pooled = self.kv_norm(
-            _pool_windows(
-                ready_kv,
-                ready_gate,
+        if packed_seq_lens is not None:
+            if cp_active:
+                raise NotImplementedError("DeepSeek V4 packed THD compressor does not support context parallelism.")
+            pooled_raw, pool_positions, _, _ = _pool_windows_packed(
+                kv,
+                gate,
                 self.ape_param(hidden_states_fp32),
                 self.compress_ratio,
                 self.head_dim,
+                packed_seq_lens,
                 overlap=self.overlap,
-                cp_group=cp_group,
-            ).to(input_dtype)
-        )
-        positions = _rope_pool_positions(new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, batch)
-        cos, sin = rotary(new_pooled, positions)
-        new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
-        pooled = cache.update_pool(new_pooled, layer_idx, "compressor_state").unsqueeze(1)
-        if cp_active:
-            pooled = dsv4_cp_all_gather(pooled, dim=2, cp_group=cp_group)
+                position_ids=position_ids,
+            )
+            new_pooled = self.kv_norm(pooled_raw.to(input_dtype))
+            if new_pooled.shape[1] > 0:
+                cos, sin = rotary(new_pooled, pool_positions)
+                new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
+            pooled = new_pooled.unsqueeze(1)
+        else:
+            ready_kv, ready_gate, pool_base = cache.accumulate_windows(
+                kv, gate, layer_idx, "compressor_state", self.compress_ratio, start_pos
+            )
+            local_has_complete_hca_window = ready_kv.shape[1] > 0
+            fsdp_group_has_complete_hca_window = (
+                self._compute_fsdp_group_has_complete_hca_window(local_has_complete_hca_window, kv.device)
+                if enable_hca_fsdp_graph_alignment
+                else local_has_complete_hca_window
+            )
+            needs_masked_synthetic_hca_window = (
+                enable_hca_fsdp_graph_alignment
+                and self.indexer is None
+                and fsdp_group_has_complete_hca_window
+                and not local_has_complete_hca_window
+                and 0 < kv.shape[1] < self.compress_ratio
+            )
+            if needs_masked_synthetic_hca_window:
+                # A mixed short/long HCA parameter sync group needs every rank to
+                # create the same compressor autograd edges. All-short groups keep
+                # the original no-HCA path so optimizer semantics stay at
+                # grad=None. Zero-length local HCA inputs are outside this narrow
+                # training fix.
+                pad_len = self.compress_ratio - kv.shape[1]
+                pad_shape = (batch, pad_len, kv.shape[-1])
+                ready_kv = torch.cat([kv, kv.new_zeros(pad_shape)], dim=1)
+                ready_gate = torch.cat([gate, gate.new_zeros(pad_shape)], dim=1)
+                pool_base = max(0, start_pos)
+            new_pooled = self.kv_norm(
+                _pool_windows(
+                    ready_kv,
+                    ready_gate,
+                    self.ape_param(hidden_states_fp32),
+                    self.compress_ratio,
+                    self.head_dim,
+                    overlap=self.overlap,
+                    cp_group=cp_group,
+                ).to(input_dtype)
+            )
+            positions = _rope_pool_positions(
+                new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, batch
+            )
+            cos, sin = rotary(new_pooled, positions)
+            new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
+            pooled = cache.update_pool(new_pooled, layer_idx, "compressor_state").unsqueeze(1)
+            if cp_active:
+                pooled = dsv4_cp_all_gather(pooled, dim=2, cp_group=cp_group)
 
         # Indexer narrows the attended compressed positions per query.  The
         # caller (DSV4Attention) is responsible for turning ``indexer_topk``
@@ -867,12 +1082,25 @@ class DeepseekV4Compressor(nn.Module):
                 start_pos,
                 position_ids=position_ids,
                 cp_group=cp_group,
+                packed_seq_lens=packed_seq_lens,
             )
-            q_positions = _query_positions(
-                position_ids, batch=batch, seq_len=seq_len, device=raw_topk.device, cp_group=cp_group
-            )
-            threshold = ((q_positions + 1) // self.compress_ratio).unsqueeze(-1)
-            causal_invalid = raw_topk >= threshold
+            if packed_seq_lens is not None:
+                valid_start, valid_end, _, _ = _packed_compressed_bounds(
+                    packed_seq_lens,
+                    seq_len=seq_len,
+                    batch=batch,
+                    ratio=self.compress_ratio,
+                    device=raw_topk.device,
+                )
+                valid_start = valid_start.unsqueeze(-1)
+                valid_end = valid_end.unsqueeze(-1)
+                causal_invalid = (raw_topk < valid_start) | (raw_topk >= valid_end)
+            else:
+                q_positions = _query_positions(
+                    position_ids, batch=batch, seq_len=seq_len, device=raw_topk.device, cp_group=cp_group
+                )
+                threshold = ((q_positions + 1) // self.compress_ratio).unsqueeze(-1)
+                causal_invalid = raw_topk >= threshold
             indexer_topk = torch.where(causal_invalid, torch.full_like(raw_topk, -1), raw_topk)
         return pooled, indexer_topk
 
@@ -1092,6 +1320,13 @@ class DeepseekV4Attention(nn.Module):
             device=hidden_states.device,
             cp_group=cp_group,
         )
+        packed_seq_lens = kwargs.get("_dsv4_packed_seq_lens")
+        if packed_seq_lens is not None:
+            flat_query_positions = (
+                torch.arange(seq_len, device=hidden_states.device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+            )
+        else:
+            flat_query_positions = query_positions
         # IMPORTANT: for compress_ratio>0 layers the released DSV4-Flash uses
         # the compress-rope (theta=160000 + YaRN) for the MAIN attention Q/KV
         # too, NOT just for the compressor sub-module.  Reference at
@@ -1145,6 +1380,7 @@ class DeepseekV4Attention(nn.Module):
                 ),
                 position_ids=position_ids,
                 cp_group=cp_group,
+                packed_seq_lens=packed_seq_lens,
             )
             n_pooled = pooled.shape[2]
             full_kv = torch.cat([full_kv, pooled], dim=2)
@@ -1169,10 +1405,38 @@ class DeepseekV4Attention(nn.Module):
                     # with valid index 0, and scatter_'s duplicate-index order
                     # is unspecified, so use count-then-threshold instead.
                     compressed_mask = _build_indexer_topk_compressed_mask(attention_mask, indexer_topk, n_pooled)
+                    if packed_seq_lens is not None:
+                        valid_start, valid_end, _, _ = _packed_compressed_bounds(
+                            packed_seq_lens,
+                            seq_len=seq_len,
+                            batch=batch,
+                            ratio=self.compress_ratio,
+                            device=full_kv.device,
+                        )
+                        p_pos = torch.arange(n_pooled, device=full_kv.device).view(1, 1, n_pooled)
+                        allowed = (p_pos >= valid_start.unsqueeze(-1)) & (p_pos < valid_end.unsqueeze(-1))
+                        range_mask = torch.where(
+                            allowed,
+                            torch.zeros((), dtype=attention_mask.dtype, device=full_kv.device),
+                            torch.full((), min_val, dtype=attention_mask.dtype, device=full_kv.device),
+                        )
+                        compressed_mask = torch.minimum(compressed_mask, range_mask)
                 else:
                     p_pos = torch.arange(n_pooled, device=full_kv.device)
-                    threshold = (query_positions + 1) // self.compress_ratio
-                    allowed = p_pos.view(1, 1, n_pooled) < threshold.unsqueeze(-1)  # [B, S, P]
+                    if packed_seq_lens is not None:
+                        valid_start, valid_end, _, _ = _packed_compressed_bounds(
+                            packed_seq_lens,
+                            seq_len=seq_len,
+                            batch=batch,
+                            ratio=self.compress_ratio,
+                            device=full_kv.device,
+                        )
+                        allowed = (p_pos.view(1, 1, n_pooled) >= valid_start.unsqueeze(-1)) & (
+                            p_pos.view(1, 1, n_pooled) < valid_end.unsqueeze(-1)
+                        )
+                    else:
+                        threshold = (query_positions + 1) // self.compress_ratio
+                        allowed = p_pos.view(1, 1, n_pooled) < threshold.unsqueeze(-1)  # [B, S, P]
                     compressed_mask = torch.where(
                         allowed,
                         torch.zeros((), dtype=attention_mask.dtype, device=full_kv.device),
@@ -1199,7 +1463,7 @@ class DeepseekV4Attention(nn.Module):
                 compressed_topk=indexer_topk,
                 n_pooled=n_pooled,
                 vanilla_key_len=vanilla_key_len,
-                q_positions=query_positions,
+                q_positions=flat_query_positions,
             )
             attn_output = dsv4_sparse_attention(
                 q.transpose(1, 2).contiguous(),

@@ -542,6 +542,56 @@ class TestDeepseekV4ModelSmoke:
         assert out.logits.shape == (1, 8, cfg.vocab_size)
 
     @_REQUIRES_CUDA
+    def test_thd_mask_prefers_cu_seqlens_padded(self, monkeypatch):
+        """THD preprocessing emits cu_seqlens, not seq_lens, so DSV4 must derive lengths."""
+        cfg = _tiny_config(num_hidden_layers=0, compress_ratios=[])
+        model = _make_model(cfg).cuda()
+        captured = {}
+        original = dsv4_model_module.build_packed_causal_padding_mask
+
+        def record_packed_mask(seq_lens, *args, **kwargs):
+            captured["seq_lens"] = seq_lens.detach().cpu()
+            return original(seq_lens, *args, **kwargs)
+
+        monkeypatch.setattr(dsv4_model_module, "build_packed_causal_padding_mask", record_packed_mask)
+
+        input_ids = torch.ones(1, 8, dtype=torch.long, device="cuda")
+        position_ids = torch.arange(8, dtype=torch.long, device="cuda").unsqueeze(0)
+
+        with torch.no_grad():
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                cu_seqlens=torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda"),
+                cu_seqlens_padded=torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda"),
+            )
+
+        assert out.logits.shape == (1, 8, cfg.vocab_size)
+        torch.testing.assert_close(captured["seq_lens"], torch.tensor([[4, 4]]))
+
+    @_REQUIRES_CUDA
+    def test_thd_compressed_layer_forward_cuda(self):
+        cfg = _tiny_config(num_hidden_layers=1, compress_ratios=[4], sliding_window=4)
+        model = _make_model(cfg).cuda()
+
+        input_ids = torch.randint(0, cfg.vocab_size, (1, 16), device="cuda")
+        position_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7]], device="cuda")
+
+        with torch.no_grad():
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                cu_seqlens=torch.tensor([0, 8, 16], dtype=torch.int32, device="cuda"),
+                cu_seqlens_padded=torch.tensor([0, 8, 16], dtype=torch.int32, device="cuda"),
+            )
+
+        assert out.logits.shape == (1, 16, cfg.vocab_size)
+        assert torch.isfinite(out.logits).all()
+        torch._dynamo.reset()
+
+    @_REQUIRES_CUDA
     def test_forward_shape(self):
         """Forward pass produces logits of the right shape."""
         cfg = _tiny_config()
