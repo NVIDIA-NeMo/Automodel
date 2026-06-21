@@ -425,7 +425,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         if attn_implementation == "ffpa":
             if mesh.cp_size > 1:
                 raise ValueError(
-                    f"attn_implementation='ffpa' is incompatible with cp_size>1 (got cp_size={mesh.cp_size})."
+                    "attn_implementation='ffpa' cannot be combined with context parallelism "
+                    f"(got cp_size={mesh.cp_size}): the HF 'ffpa' backend calls the FFPA op directly and "
+                    "bypasses the F.scaled_dot_product_attention swap that ring CP installs, so the "
+                    "cross-rank K/V rotation never runs. For CP + FFPA, keep attn_implementation='sdpa' "
+                    "and set text_config.cp_full_attn_backend='ffpa', which routes the ring's head_dim=512 "
+                    "full-attention chunks through the FFPA CuTeDSL kernel."
                 )
             if has_packed_sequence:
                 raise ValueError("attn_implementation='ffpa' is incompatible with packed sequences.")

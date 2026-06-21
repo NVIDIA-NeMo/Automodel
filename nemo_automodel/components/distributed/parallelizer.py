@@ -64,6 +64,7 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     apply_selective_checkpointing_to_layers,
     apply_submodule_checkpointing,
     detect_kv_sharing_and_maybe_disable_cache,
+    ffpa_selective_checkpoint_policy,
     is_selective_activation_checkpointing,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
@@ -235,6 +236,7 @@ def _apply_bagel_full_layer_activation_checkpointing(model: nn.Module) -> bool:
     logger.info("Applied BAGEL full-layer activation checkpointing to %d layers", wrapped_count)
     return wrapped_count > 0
 
+
 def _detect_ffpa_impl(model) -> bool:
     """Return True iff ``model`` (or its ``text_config``) sets ``_attn_implementation="ffpa"``."""
     cfg = getattr(model, "config", None)
@@ -382,8 +384,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
                     apply_activation_checkpointing,
                 )
-
-                from nemo_automodel._transformers.ffpa_attention import ffpa_selective_checkpoint_policy
 
                 layer_classes = tuple({type(layer) for layer in layers})
                 apply_activation_checkpointing(

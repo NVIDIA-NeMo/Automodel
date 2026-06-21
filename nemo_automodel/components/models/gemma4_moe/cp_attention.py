@@ -26,6 +26,13 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel._transformers.ffpa_attention import (
+    _FFPA_HEAD_DIM,
+    _ffpa_varlen_bwd,
+    _ffpa_varlen_fwd,
+    _ffpa_varlen_ready,
+)
+
 logger = logging.getLogger(__name__)
 _GEMMA4_CP_FLEX_RING_OK_LOGGED = False
 
@@ -240,6 +247,44 @@ def _direct_exchange(
     ops = send_ops + recv_ops if cp_rank % 2 == 0 else recv_ops + send_ops
     for req in torch.distributed.batch_isend_irecv(ops):
         req.wait()
+
+
+def _route_kv_grads_to_owners(
+    grad_key_by_owner: dict[int, torch.Tensor],
+    grad_value_by_owner: dict[int, torch.Tensor],
+    *,
+    cp_group: Any,
+    cp_rank: int,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sum each KV owner's dK/dV from every rank whose queries attended it.
+
+    In the ring forward, rank ``r``'s queries attend the chunks owned by ranks
+    ``r, r-1, ..., 0``, so backward produces a dK/dV contribution for each of those
+    owners on rank ``r``. This sends each owner's contribution back to that owner
+    (p2p) and sums them, returning the local rank's accumulated ``(grad_key,
+    grad_value)``. Shared by the Flex and FFPA-varlen ring backward passes.
+    """
+    grad_key = grad_key_by_owner[cp_rank].contiguous()
+    grad_value = grad_value_by_owner[cp_rank].contiguous()
+    for distance in range(1, cp_size):
+        send_owner = (cp_rank - distance) % cp_size
+        recv_query_rank = (cp_rank + distance) % cp_size
+        recv_grad_key = torch.empty_like(grad_key)
+        recv_grad_value = torch.empty_like(grad_value)
+        _direct_exchange(
+            [
+                (grad_key_by_owner[send_owner], recv_grad_key),
+                (grad_value_by_owner[send_owner], recv_grad_value),
+            ],
+            cp_group=cp_group,
+            cp_rank=cp_rank,
+            send_cp_rank=send_owner,
+            recv_cp_rank=recv_query_rank,
+        )
+        grad_key = grad_key + recv_grad_key
+        grad_value = grad_value + recv_grad_value
+    return grad_key, grad_value
 
 
 def _merge_flex_chunk(
@@ -508,6 +553,346 @@ def _zero_if_none(grad: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor
     return torch.zeros_like(like) if grad is None else grad
 
 
+# ---------------------------------------------------------------------------
+# FFPA CuTeDSL *varlen* ring path (packed/padded head_dim=512 full-attention).
+# Per ring KV chunk: per-document varlen segments (from the always-present
+# ``_packed_seq_ids``) -> gather to THD -> ``_varlen_{fwd,bwd}_cute`` -> online-merge.
+# Other layers/batches (sliding-window, no kernel) use compiled FlexAttention.
+# ---------------------------------------------------------------------------
+
+
+def _ffpa_varlen_ring_available() -> bool:
+    """Whether the FFPA CuTeDSL *varlen* ops are ready (CPU-test monkeypatch seam)."""
+    return _ffpa_varlen_ready()
+
+
+def _build_packed_ring_segments(q_ids: torch.Tensor, k_ids: torch.Tensor) -> dict[str, Any] | None:
+    """Per-document varlen segments shared between a query shard and one KV chunk.
+
+    ``q_ids``/``k_ids`` are the ``[B, S]`` ``_packed_seq_ids`` (``0`` = pad, ``>0`` =
+    global doc id). For each doc present in *both* shards, pair its query and key
+    tokens into one segment; returns flat gather indices into ``B*S`` + int32
+    ``cu_seqlens`` (``cu_q[i]`` pairs ``cu_k[i]``), or ``None`` when no doc is shared.
+    """
+    B, Sq = q_ids.shape
+    Sk = k_ids.shape[1]
+    device = q_ids.device
+    q_index: list[int] = []
+    k_index: list[int] = []
+    cu_q: list[int] = [0]
+    cu_k: list[int] = [0]
+    max_q = 0
+    max_k = 0
+    # One device->host sync per shard (the id maps are tiny [B, S] int tensors);
+    # everything below is plain Python so we never sync per document.
+    q_ids_cpu = q_ids.tolist()
+    k_ids_cpu = k_ids.tolist()
+    for b in range(B):
+        qrow = q_ids_cpu[b]
+        krow = k_ids_cpu[b]
+        k_by_doc: dict[int, list[int]] = {}
+        for pos, d in enumerate(krow):
+            if d > 0:
+                k_by_doc.setdefault(d, []).append(pos + b * Sk)
+        q_by_doc: dict[int, list[int]] = {}  # dict preserves first-occurrence (== ascending position) order
+        for pos, d in enumerate(qrow):
+            if d > 0:
+                q_by_doc.setdefault(d, []).append(pos + b * Sq)
+        for d, qpos in q_by_doc.items():
+            kpos = k_by_doc.get(d)
+            if not kpos:
+                continue
+            q_index.extend(qpos)
+            k_index.extend(kpos)
+            cu_q.append(cu_q[-1] + len(qpos))
+            cu_k.append(cu_k[-1] + len(kpos))
+            max_q = max(max_q, len(qpos))
+            max_k = max(max_k, len(kpos))
+    if not q_index:
+        return None
+    return {
+        "q_index": torch.tensor(q_index, dtype=torch.long, device=device),
+        "k_index": torch.tensor(k_index, dtype=torch.long, device=device),
+        "cu_q": torch.tensor(cu_q, dtype=torch.int32, device=device),
+        "cu_k": torch.tensor(cu_k, dtype=torch.int32, device=device),
+        "max_q": max_q,
+        "max_k": max_k,
+    }
+
+
+# Ring segments depend only on the doc maps + ring geometry (cp_rank, owner,
+# cp_size) -- never on the layer or the Q/K/V values -- and are identical in the
+# forward and backward passes. Like the FlexAttention block masks above, build
+# them once per step and reuse across every head_dim=512 global layer (all of
+# which share the local q doc map within a step), so the ``.tolist()`` D->H sync
+# + Python pairing loop in ``_build_packed_ring_segments`` runs once per ring
+# chunk per step instead of once per chunk per layer per pass. Reset keys on the
+# local q doc map's data_ptr (pinned so the allocator can't recycle the address
+# mid-step and alias distinct content).
+_RING_SEGMENT_CACHE: dict = {}
+_RING_SEGMENT_GEN: list = [None, None]
+
+
+def _ring_segment_set_generation(gen_tensor: torch.Tensor) -> None:
+    """Clear the ring-segment cache when a new batch (new q doc map) arrives."""
+    ptr = gen_tensor.data_ptr()
+    if ptr != _RING_SEGMENT_GEN[0]:
+        _RING_SEGMENT_CACHE.clear()
+        _RING_SEGMENT_GEN[0] = ptr
+        _RING_SEGMENT_GEN[1] = gen_tensor  # pin the storage for the duration of the step
+
+
+def _cached_ring_segments(
+    q_ids: torch.Tensor, k_ids: torch.Tensor, *, cp_rank: int, owner: int, cp_size: int
+) -> dict[str, Any] | None:
+    """Per-step cache around :func:`_build_packed_ring_segments`.
+
+    ``owner`` uniquely identifies the rotated k doc map within a step (each rank's
+    shard is visited exactly once), so ``(cp_rank, owner, cp_size, B, Sq, Sk)``
+    keyed under the current q-doc-map generation uniquely identifies the segment.
+    ``None`` (no shared document) is cached too.
+    """
+    _ring_segment_set_generation(q_ids)
+    key = (cp_rank, owner, cp_size, q_ids.shape[0], q_ids.shape[1], k_ids.shape[1])
+    if key in _RING_SEGMENT_CACHE:
+        return _RING_SEGMENT_CACHE[key]
+    seg = _build_packed_ring_segments(q_ids, k_ids)
+    if len(_RING_SEGMENT_CACHE) >= 256:
+        _RING_SEGMENT_CACHE.pop(next(iter(_RING_SEGMENT_CACHE)))
+    _RING_SEGMENT_CACHE[key] = seg
+    return seg
+
+
+def _gather_thd(t_bhsd: torch.Tensor, flat_index: torch.Tensor) -> torch.Tensor:
+    """``[B, H, S, D]`` -> packed ``[T, H, D]`` at flat ``b*S + pos`` indices."""
+    B, H, S, D = t_bhsd.shape
+    return t_bhsd.transpose(1, 2).reshape(B * S, H, D).index_select(0, flat_index)
+
+
+def _scatter_thd(packed: torch.Tensor, flat_index: torch.Tensor, B: int, H: int, S: int) -> torch.Tensor:
+    """Inverse of :func:`_gather_thd`: ``[T, H, D]`` -> ``[B, H, S, D]`` (0 elsewhere)."""
+    D = packed.shape[-1]
+    out = torch.zeros(B * S, H, D, dtype=packed.dtype, device=packed.device)
+    out.index_copy_(0, flat_index, packed)
+    return out.view(B, S, H, D).transpose(1, 2)
+
+
+def _scatter_lse(lse_pack: torch.Tensor, flat_index: torch.Tensor, B: int, Hq: int, S: int) -> torch.Tensor:
+    """Varlen LSE ``[Hq, T]`` -> dense ``[B, Hq, S]`` (``-inf`` for non-participating rows)."""
+    flat = torch.full((B * S, Hq), float("-inf"), dtype=torch.float32, device=lse_pack.device)
+    flat.index_copy_(0, flat_index, lse_pack.transpose(0, 1).to(torch.float32))
+    return flat.view(B, S, Hq).permute(0, 2, 1).contiguous()
+
+
+def _gather_lse(lse_dense: torch.Tensor, flat_index: torch.Tensor) -> torch.Tensor:
+    """Dense ``[B, Hq, S]`` -> packed ``[Hq, T]`` (inverse of :func:`_scatter_lse`)."""
+    B, Hq, S = lse_dense.shape
+    return lse_dense.permute(0, 2, 1).reshape(B * S, Hq).index_select(0, flat_index).transpose(0, 1).contiguous()
+
+
+def _merge_ffpa_packed_chunk(
+    out_acc: torch.Tensor | None,
+    lse_acc: torch.Tensor | None,
+    out_step: torch.Tensor,
+    lse_step: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``-inf``-safe online-softmax merge: like :func:`_merge_flex_chunk` but rows where
+    both inputs are ``-inf`` (pad queries no chunk covered) keep 0 instead of ``NaN``.
+    """
+    if out_acc is None or lse_acc is None:
+        return out_step, lse_step
+    lse_next = torch.logaddexp(lse_acc, lse_step)
+    finite = ~torch.isneginf(lse_next)
+    old_scale = torch.where(finite, torch.exp(lse_acc - lse_next), torch.zeros_like(lse_acc)).unsqueeze(-1)
+    new_scale = torch.where(finite, torch.exp(lse_step - lse_next), torch.zeros_like(lse_step)).unsqueeze(-1)
+    return out_acc * old_scale + out_step * new_scale, lse_next
+
+
+def _ffpa_varlen_forward_chunk(
+    q_pack: torch.Tensor,
+    k_pack: torch.Tensor,
+    v_pack: torch.Tensor,
+    seg: dict[str, Any],
+    *,
+    scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One ring KV chunk via the FFPA varlen forward. Returns ``(out[T,Hq,D], lse[Hq,T])``."""
+    return _ffpa_varlen_fwd(
+        q_pack, k_pack, v_pack, seg["cu_q"], seg["cu_k"], seg["max_q"], seg["max_k"], scale=scale, causal=causal
+    )
+
+
+def _ffpa_varlen_backward_chunk(
+    grad_out_pack: torch.Tensor,
+    q_pack: torch.Tensor,
+    k_pack: torch.Tensor,
+    v_pack: torch.Tensor,
+    out_pack: torch.Tensor,
+    lse_pack: torch.Tensor,
+    seg: dict[str, Any],
+    *,
+    scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-chunk FFPA varlen backward using the *global* merged out/lse (packed)."""
+    return _ffpa_varlen_bwd(
+        grad_out_pack,
+        q_pack,
+        k_pack,
+        v_pack,
+        out_pack,
+        lse_pack,
+        seg["cu_q"],
+        seg["cu_k"],
+        seg["max_q"],
+        seg["max_k"],
+        scale=scale,
+        causal=causal,
+    )
+
+
+def _ring_use_ffpa_varlen(attention_module: torch.nn.Module, ctx: Any) -> bool:
+    """Whether this ring attention call may use the FFPA *varlen* ring path.
+
+    The decision gates collective p2p exchanges so it must be rank-uniform: it
+    depends only on the per-layer config, the head_dim / dtype / scale, and
+    *whether* ``_packed_seq_ids`` is present (a batch-level fact) -- never on
+    per-rank slice content. This path *requires* ``_packed_seq_ids`` (the document
+    map drives the varlen ``cu_seqlens``); Gemma4's manual CP batch always attaches
+    one, so it is the sole FFPA path real CP training takes.
+    """
+    if not getattr(attention_module, "_gemma4_cp_use_ffpa", False):
+        return False
+    if not ctx.is_causal:
+        return False
+    if getattr(attention_module, "sliding_window", None) is not None:
+        return False
+    if ctx.metadata.get("_packed_seq_ids") is None:
+        return False
+    if ctx.query.shape[-1] != _FFPA_HEAD_DIM:
+        return False
+    if ctx.query.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if ctx.scale is None:
+        return False
+    return _ffpa_varlen_ring_available()
+
+
+def _run_gemma4_cp_ffpa_varlen_ring_forward(
+    ctx: Any, *, seg_sink: dict[int, Any] | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward of the FFPA varlen ring: rotate K/V, per-document varlen FFPA, online-merge.
+
+    Returns ``(out_final[B,Hq,S,D] fp32, lse_final[B,Hq,S] fp32)``. ``owner > cp_rank``
+    chunks are causally masked and skipped; chunks sharing no document with the local
+    query shard contribute nothing. Pad/empty query rows (doc id 0) participate in no
+    segment, so they stay 0 / ``-inf`` and the merged output is 0 there.
+
+    When ``seg_sink`` is given, each processed ``owner``'s varlen segment is recorded
+    into it (``owner -> seg``) so the backward pass can reuse it without rebuilding.
+    """
+    q = ctx.query
+    B, Hq, S, _D = q.shape
+    q_ids = ctx.metadata.get("_packed_seq_ids")
+    if q_ids is None:
+        raise RuntimeError("Gemma4 CP FFPA varlen ring requires _packed_seq_ids in metadata.")
+    out_acc = None
+    lse_acc = None
+    for owner, key_chunk, value_chunk, meta in _collect_ring_kv_chunks(ctx):
+        if owner > ctx.cp_rank:
+            continue
+        seg = _cached_ring_segments(
+            q_ids, meta.get("_packed_seq_ids"), cp_rank=ctx.cp_rank, owner=owner, cp_size=ctx.cp_size
+        )
+        if seg_sink is not None:
+            seg_sink[owner] = seg
+        if seg is None:
+            continue
+        q_pack = _gather_thd(q, seg["q_index"])
+        k_pack = _gather_thd(key_chunk, seg["k_index"])
+        v_pack = _gather_thd(value_chunk, seg["k_index"])
+        causal = owner == ctx.cp_rank
+        out_pack, lse_pack = _ffpa_varlen_forward_chunk(q_pack, k_pack, v_pack, seg, scale=ctx.scale, causal=causal)
+        out_step = _scatter_thd(out_pack.to(torch.float32), seg["q_index"], B, Hq, S)
+        lse_step = _scatter_lse(lse_pack, seg["q_index"], B, Hq, S)
+        out_acc, lse_acc = _merge_ffpa_packed_chunk(out_acc, lse_acc, out_step, lse_step)
+    if out_acc is None or lse_acc is None:
+        # All-pad query shard (no shared doc): return 0/-inf, never raise -- a one-rank
+        # raise desyncs the ring p2p and hangs the job. Mirrors the Flex path.
+        out_acc = torch.zeros(B, Hq, S, _D, dtype=torch.float32, device=q.device)
+        lse_acc = torch.full((B, Hq, S), float("-inf"), dtype=torch.float32, device=q.device)
+    return out_acc, lse_acc
+
+
+class _Gemma4FFPAVarlenRingAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(autograd_ctx, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, ring_ctx: Any):
+        runtime_ctx = replace(ring_ctx, query=query, key=key, value=value)
+        seg_by_owner: dict[int, Any] = {}
+        out_final, lse_final = _run_gemma4_cp_ffpa_varlen_ring_forward(runtime_ctx, seg_sink=seg_by_owner)
+        out = out_final.to(query.dtype)
+        autograd_ctx.save_for_backward(query, key, value, out, lse_final)
+        autograd_ctx.ring_segments = seg_by_owner
+        autograd_ctx.ring_ctx = replace(
+            ring_ctx,
+            query=None,
+            key=None,
+            value=None,
+            metadata=_detach_metadata(ring_ctx.metadata),
+        )
+        return out
+
+    @staticmethod
+    def backward(autograd_ctx, grad_output: torch.Tensor):
+        query, key, value, out_final, lse_final = autograd_ctx.saved_tensors
+        ring_ctx = autograd_ctx.ring_ctx
+        cp_size = ring_ctx.cp_size
+        cp_rank = ring_ctx.cp_rank
+        B, Hq, S, _D = query.shape
+        Hkv = key.shape[1]
+        seg_by_owner = autograd_ctx.ring_segments
+
+        collect_ctx = replace(ring_ctx, query=query, key=key, value=value)
+        grad_query = torch.zeros_like(query, dtype=torch.float32)
+        grad_key_by_owner = {owner: torch.zeros_like(key) for owner in range(cp_size)}
+        grad_value_by_owner = {owner: torch.zeros_like(value) for owner in range(cp_size)}
+
+        for owner, key_chunk, value_chunk, _meta in _collect_ring_kv_chunks(collect_ctx):
+            if owner > cp_rank:
+                continue
+            seg = seg_by_owner.get(owner)
+            if seg is None:
+                continue
+            q_index = seg["q_index"]
+            k_index = seg["k_index"]
+            q_pack = _gather_thd(query, q_index)
+            k_pack = _gather_thd(key_chunk, k_index)
+            v_pack = _gather_thd(value_chunk, k_index)
+            out_pack = _gather_thd(out_final, q_index)
+            grad_out_pack = _gather_thd(grad_output, q_index)
+            lse_pack = _gather_lse(lse_final, q_index)
+            causal = owner == cp_rank
+            dq_pack, dk_pack, dv_pack = _ffpa_varlen_backward_chunk(
+                grad_out_pack, q_pack, k_pack, v_pack, out_pack, lse_pack, seg, scale=ring_ctx.scale, causal=causal
+            )
+            grad_query = grad_query + _scatter_thd(dq_pack.to(torch.float32), q_index, B, Hq, S)
+            grad_key_by_owner[owner] = grad_key_by_owner[owner] + _scatter_thd(
+                dk_pack.to(key.dtype), k_index, B, Hkv, S
+            )
+            grad_value_by_owner[owner] = grad_value_by_owner[owner] + _scatter_thd(
+                dv_pack.to(value.dtype), k_index, B, Hkv, S
+            )
+
+        # All-pad shard: grads stay 0; do NOT raise (the dK/dV p2p below is rank-uniform,
+        # so a one-rank raise desyncs the ring). Forward returned 0 for these rows too.
+
+        grad_key, grad_value = _route_kv_grads_to_owners(
+            grad_key_by_owner, grad_value_by_owner, cp_group=ring_ctx.cp_group, cp_rank=cp_rank, cp_size=cp_size
+        )
+        return grad_query.to(query.dtype), grad_key, grad_value, None
+
+
 class _Gemma4FlexRingAttention(torch.autograd.Function):
     @staticmethod
     def forward(autograd_ctx, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, ring_ctx: Any):
@@ -579,31 +964,30 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
             owner: _zero_if_none(grads[1 + num_chunks + idx], value_reqs[idx]) for idx, owner in enumerate(owners)
         }
 
-        grad_key = grad_key_by_owner[ring_ctx.cp_rank].contiguous()
-        grad_value = grad_value_by_owner[ring_ctx.cp_rank].contiguous()
-        for distance in range(1, ring_ctx.cp_size):
-            send_owner = (ring_ctx.cp_rank - distance) % ring_ctx.cp_size
-            recv_query_rank = (ring_ctx.cp_rank + distance) % ring_ctx.cp_size
-            recv_grad_key = torch.empty_like(grad_key)
-            recv_grad_value = torch.empty_like(grad_value)
-            _direct_exchange(
-                [
-                    (grad_key_by_owner[send_owner], recv_grad_key),
-                    (grad_value_by_owner[send_owner], recv_grad_value),
-                ],
-                cp_group=ring_ctx.cp_group,
-                cp_rank=ring_ctx.cp_rank,
-                send_cp_rank=send_owner,
-                recv_cp_rank=recv_query_rank,
-            )
-            grad_key = grad_key + recv_grad_key
-            grad_value = grad_value + recv_grad_value
-
+        grad_key, grad_value = _route_kv_grads_to_owners(
+            grad_key_by_owner,
+            grad_value_by_owner,
+            cp_group=ring_ctx.cp_group,
+            cp_rank=ring_ctx.cp_rank,
+            cp_size=ring_ctx.cp_size,
+        )
         return grad_query, grad_key, grad_value, None
 
 
 def _run_gemma4_cp_ring_attention(attention_module: torch.nn.Module, ctx: Any) -> torch.Tensor:
-    """Run Gemma4 local-query/ring-key CP attention with FlexAttention."""
+    """Run Gemma4 local-query/ring-key CP attention.
+
+    Full-attention (global) head_dim=512 layers run their per-chunk attention
+    through the FFPA CuTeDSL *varlen* ``_varlen_fwd_cute`` kernel, driven by the
+    ``_packed_seq_ids`` document map (``_ring_use_ffpa_varlen``). The manual CP batch
+    always attaches that map (``cp_batch._synthesize_single_document_seq_ids`` injects
+    a trivial single-document map when the batch is not packed), so this is the path
+    real CP training -- packed or unpacked -- always takes. Every other layer / batch
+    (sliding-window, no kernel, wrong dtype/head_dim) keeps using compiled
+    FlexAttention.
+    """
+    if _ring_use_ffpa_varlen(attention_module, ctx):
+        return _Gemma4FFPAVarlenRingAttention.apply(ctx.query, ctx.key, ctx.value, ctx)
     return _Gemma4FlexRingAttention.apply(ctx.query, ctx.key, ctx.value, ctx)
 
 
@@ -729,14 +1113,20 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
     attention_module.register_forward_hook(_post_hook, always_call=True)
 
 
-def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module) -> None:
+def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module, *, use_ffpa: bool = False) -> None:
     """Register Gemma4's model-owned p2p ring CP attention on a self-attention module.
 
     Declares the metadata keys the ring needs and exposes ``setup_cp_attention(cp_mesh)``
     -- the model-owned CP-attention seam the parallelizer calls (with the CP mesh)
     instead of cp_utils' generic SDPA hooks. ``run_cp_manual_attention`` is also bound
     as the ring entry point.
+
+    ``use_ffpa`` opts the (full-attention, head_dim=512) ring chunks into the FFPA
+    CuTeDSL kernel; ``_ring_use_ffpa_varlen`` still verifies per-call eligibility, so
+    this is a no-op for sliding-window layers, non-512 head_dim, wrong dtype, or when
+    the FFPA kernel is unavailable.
     """
+    attention_module._gemma4_cp_use_ffpa = bool(use_ffpa)
     attention_module._cp_manual_metadata_keys = (
         "mm_token_type_ids",
         "_packed_seq_ids",

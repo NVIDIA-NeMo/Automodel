@@ -253,6 +253,31 @@ def make_selective_checkpoint_context_fn():
     return selective_checkpointing_context_fn
 
 
+def ffpa_selective_checkpoint_policy():
+    """Return a ``context_fn`` factory marking FFPA forward ops as ``MUST_SAVE``.
+
+    Applied under full activation checkpointing for ``attn_implementation="ffpa"``
+    models so the CuTeDSL FFPA forward kernels are saved (not replayed) in backward
+    while the rest of the layer is recomputed.
+    """
+    from nemo_automodel._transformers.ffpa_attention import _ffpa_low_level_ready
+
+    _ffpa_low_level_ready()
+    must_save_ops = set()
+    for name in ("_fwd_cute", "_varlen_fwd_cute"):
+        try:
+            must_save_ops.add(getattr(torch.ops.ffpa_attn, name).default)
+        except Exception:
+            pass
+
+    def _policy_fn(ctx, op, *args, **kwargs):
+        if op in must_save_ops:
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    return lambda: create_selective_checkpoint_contexts(_policy_fn)
+
+
 # Marker set on whole-block selective-AC wrappers so the per-layer compile step
 # compiles the wrapper itself (compile OUTER, SAC INNER) instead of unwrapping
 # to the inner decoder layer. Compiling outer lets AOT autograd's partitioner

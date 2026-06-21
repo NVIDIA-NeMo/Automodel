@@ -87,6 +87,92 @@ def _ffpa_low_level_ready() -> bool:
     return _FFPA_LOW_LEVEL_READY
 
 
+def _ffpa_varlen_ready() -> bool:
+    """Whether the FFPA CuTeDSL *varlen* ops are importable and registered."""
+    if not _ffpa_low_level_ready():
+        return False
+    try:
+        _ = torch.ops.ffpa_attn._varlen_fwd_cute
+        _ = torch.ops.ffpa_attn._varlen_bwd_cute
+        return True
+    except Exception:
+        return False
+
+
+def _ffpa_varlen_fwd(
+    q_pack: torch.Tensor,
+    k_pack: torch.Tensor,
+    v_pack: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    *,
+    scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FFPA CuTeDSL varlen forward on packed THD inputs. Returns ``(out[T,Hq,D], lse[Hq,T])``.
+
+    Wraps ``torch.ops.ffpa_attn._varlen_fwd_cute`` with the fixed no-window /
+    no-softcap / no-pack-gqa sentinels so callers pass only the attention args.
+    """
+    return torch.ops.ffpa_attn._varlen_fwd_cute(
+        q_pack.contiguous(),
+        k_pack.contiguous(),
+        v_pack.contiguous(),
+        cu_q,
+        cu_k,
+        int(max_q),
+        int(max_k),
+        float(scale),
+        bool(causal),
+        _VARLEN_WIN_NONE,
+        _VARLEN_WIN_NONE,
+        0.0,
+        False,
+    )
+
+
+def _ffpa_varlen_bwd(
+    grad_out_pack: torch.Tensor,
+    q_pack: torch.Tensor,
+    k_pack: torch.Tensor,
+    v_pack: torch.Tensor,
+    out_pack: torch.Tensor,
+    lse_pack: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    *,
+    scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FFPA CuTeDSL varlen backward using the *caller-supplied* out/lse. Returns ``(dq, dk, dv)``.
+
+    Exposed as an explicit op call (not the package's varlen autograd) because the
+    ring backward feeds the globally merged out/lse, not a chunk-local one.
+    """
+    return torch.ops.ffpa_attn._varlen_bwd_cute(
+        q_pack.contiguous(),
+        k_pack.contiguous(),
+        v_pack.contiguous(),
+        out_pack.contiguous(),
+        grad_out_pack.contiguous(),
+        lse_pack.contiguous(),
+        cu_q,
+        cu_k,
+        int(max_q),
+        int(max_k),
+        float(scale),
+        bool(causal),
+        _VARLEN_WIN_NONE,
+        _VARLEN_WIN_NONE,
+        0.0,
+        None,
+    )
+
+
 def _get_ffpa_high_level() -> tuple[Callable | None, Any]:
     global _FFPA_FN, _CUTEDSL_BACKEND
     if _FFPA_FN is None:
@@ -99,26 +185,6 @@ def _get_ffpa_high_level() -> tuple[Callable | None, Any]:
         except Exception:
             return None, None
     return _FFPA_FN, _CUTEDSL_BACKEND
-
-
-def ffpa_selective_checkpoint_policy():
-    """Return a ``context_fn`` factory marking FFPA forward ops as ``MUST_SAVE``."""
-    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
-
-    _ffpa_low_level_ready()
-    must_save_ops = set()
-    for name in ("_fwd_cute", "_varlen_fwd_cute"):
-        try:
-            must_save_ops.add(getattr(torch.ops.ffpa_attn, name).default)
-        except Exception:
-            pass
-
-    def _policy_fn(ctx, op, *args, **kwargs):
-        if op in must_save_ops:
-            return CheckpointPolicy.MUST_SAVE
-        return CheckpointPolicy.PREFER_RECOMPUTE
-
-    return lambda: create_selective_checkpoint_contexts(_policy_fn)
 
 
 def ffpa_mask(
@@ -234,21 +300,7 @@ def ffpa_attention_forward(
         q_pack, k_pack, v_pack, indices_q, (cu_q, cu_k), (max_q, max_k) = _upad_input(
             query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), attention_mask, S, _unpad_input
         )
-        out_pack, _ = torch.ops.ffpa_attn._varlen_fwd_cute(
-            q_pack.contiguous(),
-            k_pack.contiguous(),
-            v_pack.contiguous(),
-            cu_q,
-            cu_k,
-            int(max_q),
-            int(max_k),
-            float(scaling),
-            True,
-            _VARLEN_WIN_NONE,
-            _VARLEN_WIN_NONE,
-            0.0,
-            False,
-        )
+        out_pack, _ = _ffpa_varlen_fwd(q_pack, k_pack, v_pack, cu_q, cu_k, max_q, max_k, scale=scaling, causal=True)
         return _pad_input(out_pack, indices_q, B, S), None
 
     ffpa_fn, backend = _get_ffpa_high_level()
@@ -295,6 +347,5 @@ def register_ffpa_attention() -> bool:
 __all__ = [
     "ffpa_attention_forward",
     "ffpa_mask",
-    "ffpa_selective_checkpoint_policy",
     "register_ffpa_attention",
 ]
