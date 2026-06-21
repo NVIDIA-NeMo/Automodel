@@ -33,6 +33,7 @@ distributed:
     layers_per_stage: 2
 
   moe:
+    ignore_router_for_ac: true
     reshard_after_forward: false
     wrap_outer_model: false
 
@@ -66,6 +67,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
+  pad_to_max_length: true
 
 packed_sequence:
   packed_sequence_size: 0
@@ -81,6 +83,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
+  pad_to_max_length: true
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
