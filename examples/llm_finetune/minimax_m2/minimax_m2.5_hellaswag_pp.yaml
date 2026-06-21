@@ -35,7 +35,7 @@ distributed:
   cp_size: 1
   pp_size: 2
   dp_replicate_size: 1
-  ep_size: 16  # DIAGNOSTIC: m2.5 ep32 -> loss 15.7; m2.7 (good, loss 3) is ep16. Test if ep32 EP-path corrupts the forward.
+  ep_size: 32  # RETRY ep32 with DeepEP 42144303 (#2678 token-padding fix); old deepep 17cfb817 -> loss 15.7 at ep32, 3.2 at ep16
   sequence_parallel: false
 
   pipeline:
