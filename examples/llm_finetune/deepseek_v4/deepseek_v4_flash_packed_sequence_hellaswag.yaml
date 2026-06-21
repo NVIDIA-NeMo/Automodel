@@ -131,3 +131,7 @@ ci:
   # Cold multi-node start + TileLang JIT (sinkhorn / sparse-MLA / indexer) runs
   # well past the 00:10:00 default before step 0; give it adequate wall-clock.
   time: "01:00:00"
+  # [debug] one-step load-stat check (throwaway branch): dump expert weight stats, run 1 step
+  env_vars:
+    DSV4_WEIGHT_DEBUG: "1"
+    MAX_STEPS: "1"

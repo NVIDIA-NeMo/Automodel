@@ -831,6 +831,42 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if attn_kwargs.pop("_pre_embed_only", False):
             return self.prepare_model_inputs_for_cp(input_ids=input_ids)
 
+        # [WDBG] one-shot post-load weight-load check (env-gated; throwaway debug branch).
+        # FP4 (e2m1) routed experts, if loaded, are discrete -> few unique values per 32-col
+        # block; random-init is continuous (uniq64 ~ 64). embed_tokens is a loaded-but-unquantized
+        # positive control. Compares loaded experts vs random-init signature.
+        import os as _os
+
+        if _os.environ.get("DSV4_WEIGHT_DEBUG") and not getattr(self, "_wdbg_done", False):
+            self._wdbg_done = True
+            import torch.distributed as _dist
+
+            _r = _dist.get_rank() if _dist.is_initialized() else 0
+            if _r in (0, 1):
+                for _n, _p in self.named_parameters():
+                    if not any(
+                        _k in _n
+                        for _k in (
+                            "experts.gate_and_up_projs",
+                            "experts.down_projs",
+                            "embed_tokens.weight",
+                            "self_attn.wkv.weight",
+                        )
+                    ):
+                        continue
+                    _t = _p.to_local() if hasattr(_p, "to_local") else _p
+                    _t = _t.detach().float().flatten()
+                    if _t.numel() == 0:
+                        print(f"[WDBG] r{_r} {_n}: EMPTY local shard", flush=True)
+                        continue
+                    _sl = _t[: min(64, _t.numel())]
+                    print(
+                        f"[WDBG] r{_r} {_n} numel={_t.numel()} mean={_t.mean().item():.4e} "
+                        f"std={_t.std().item():.4e} absmax={_t.abs().max().item():.4e} "
+                        f"uniq={int(_sl.unique().numel())}/{_sl.numel()}",
+                        flush=True,
+                    )
+
         if output_hidden_states is None:
             output_hidden_states = getattr(getattr(self, "config", None), "output_hidden_states", False)
 
