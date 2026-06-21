@@ -53,7 +53,7 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/glm52/glm52_fixed_config
+  pretrained_model_name_or_path: zai-org/GLM-5.2
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: tilelang
@@ -83,7 +83,7 @@ dataset:
   padding: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/glm52/glm52_fixed_config
+    pretrained_model_name_or_path: zai-org/GLM-5.2
 
 packed_sequence:
   packed_sequence_size: 4096
