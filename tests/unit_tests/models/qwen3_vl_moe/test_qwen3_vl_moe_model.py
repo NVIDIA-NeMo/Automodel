@@ -861,16 +861,15 @@ class TestQwen3VLMoeForConditionalGenerationPPGuard:
 
 @_requires_cuda
 class TestQwen3VLMoeFromPretrainedAndModelClass:
-    def test_from_pretrained_classmethod(self):
-        cfg = Qwen3VLMoeConfig()
-        cfg.text_config.rope_parameters = {
-            "rope_theta": 10000.0,
-            "rope_type": "default",
-            "mrope_section": [1, 1, 1],
-            "partial_rotary_factor": 1.0,
-        }
-        # Add pad_token_id required by transformers v5
-        cfg.text_config.pad_token_id = 0
+    def test_from_pretrained_classmethod(self, vl_config):
+        # Use the tiny `vl_config` fixture instead of the default ``Qwen3VLMoeConfig()``,
+        # which describes the full model (24 layers, 60 experts, 151K vocab) and takes
+        # ~100s to materialize on GPU. The classmethod's delegation behaviour is
+        # independent of model size.
+        # `vl_config` already carries a valid tiny rope/pad setup (it is the same
+        # config every other test in this module builds and runs forward with), so no
+        # extra rope_parameters/pad_token_id massaging is required here.
+        cfg = vl_config
 
         with (
             patch(
