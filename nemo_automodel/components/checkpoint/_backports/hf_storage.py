@@ -298,7 +298,9 @@ class _HuggingFaceStorageReader(FsspecReader):
             try:
                 if os.path.isfile(file_name):
                     mfile = open(file_name, "rb")  # noqa: SIM115
-                    mm = mmap.mmap(mfile.fileno(), 0, prot=mmap.PROT_READ)
+                    # Copy-on-write mmap keeps pages file-backed unless mutated, while
+                    # giving torch.frombuffer a writable view so it does not warn.
+                    mm = mmap.mmap(mfile.fileno(), 0, access=mmap.ACCESS_COPY)
             except (OSError, ValueError):
                 if mm is not None:
                     mm.close()
