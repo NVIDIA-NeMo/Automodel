@@ -138,3 +138,6 @@ ci:
   # Cold multi-node start + TileLang JIT (sinkhorn / sparse-MLA / indexer) runs
   # well past the 00:10:00 default before step 0; give it adequate wall-clock.
   time: "01:00:00"
+  # [debug] BSHD baseline: 1 step to read step-0 loss (vs THD-packed 7.13)
+  env_vars:
+    MAX_STEPS: "1"
