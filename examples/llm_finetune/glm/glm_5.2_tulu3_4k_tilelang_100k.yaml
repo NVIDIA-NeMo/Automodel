@@ -12,27 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# GLM-5.2 (IndexShare DSA) SFT with the TileLang sparse DSA kernels enabled
-# (fused lighting-indexer + gather-top-k SparseMLA). The TileLang path is THD/varlen
-# only, so this recipe packs sequences (packed_sequence_thd_collater) and uses
-# packed_sequence_size > index_topk (2048) to actually exercise sparse selection.
-# Mirrors glm_5.2_hellaswag_pp.yaml; the only functional change is the kernel backend.
-#
-# Requires: tilelang (pip install "tilelang==0.1.11" "apache-tvm-ffi==0.1.11"; the newer
-# apache-tvm-ffi 0.1.12 breaks `import tilelang`).
-
 recipe: TrainFinetuneRecipeForNextTokenPrediction
-
 seed: 1234
 
 step_scheduler:
   global_batch_size: 256
   local_batch_size: 4
-  ckpt_every_steps: 1000
-  val_every_steps: 1000
+  ckpt_every_steps: 100000
+  val_every_steps: 100000
   gc_every_steps: 10
-  num_epochs: 1
-  max_steps: 20
+  num_epochs: 2
+  max_steps: 100
 
 distributed:
   strategy: fsdp2
@@ -40,7 +30,6 @@ distributed:
   cp_size: 1
   pp_size: 4
   ep_size: 64
-
   sequence_parallel: false
   activation_checkpointing: true
 
@@ -49,8 +38,6 @@ distributed:
     pp_microbatch_size: 1
     round_virtual_stages_to_pp_multiple: down
     scale_grads_in_schedule: false
-    # GLM-5.2 threads the DSA top-k selection through the pipeline; the generic causal-LM
-    # forward wrappers collide with that extra carry, so disable them.
     patch_inner_model: false
     patch_causal_lm_model: false
     layers_per_stage: 2
@@ -58,23 +45,23 @@ distributed:
   moe:
     reshard_after_forward: false
     wrap_outer_model: false
+    ignore_router_for_ac: true
 
 dist_env:
   backend: nccl
-  timeout_minutes: 30
+  timeout_minutes: 10
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: zai-org/GLM-5.2
+  pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/glm52/glm52_fixed_config
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: tilelang  # opt-in TileLang sparse DSA kernels (indexer + SparseMLA); THD-only
-    linear: torch   # the absorbed-MLA path reads kv_b_proj.weight directly; torch linear is the
-                    # validated layout (TE linear should also work but is not yet validated here)
+    attn: tilelang
+    linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
     enable_deepep: true
-    gate_precision: float32  # match HF/DeepSeek-V3 fp32 router; stabilizes top-k routing
+    gate_precision: float32
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -87,12 +74,17 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
-  split: train
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[:100000]
+  shuffle_seed: 42
+  truncation: true
+  seq_length: 4096
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/glm52/glm52_fixed_config
 
-# THD packing is required by the TileLang kernels. packed_sequence_size (4096) > index_topk
-# (2048) so the SparseMLA kernel attends to a strict subset of keys (real sparsity).
 packed_sequence:
   packed_sequence_size: 4096
 
@@ -110,5 +102,7 @@ optimizer:
   lr: 1e-5
   weight_decay: 0
 
-ci:
-  nodes: 32
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
