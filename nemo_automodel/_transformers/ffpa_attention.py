@@ -113,8 +113,7 @@ def _ffpa_varlen_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """FFPA CuTeDSL varlen forward on packed THD inputs. Returns ``(out[T,Hq,D], lse[Hq,T])``.
 
-    Wraps ``torch.ops.ffpa_attn._varlen_fwd_cute`` with the fixed no-window /
-    no-softcap / no-pack-gqa sentinels so callers pass only the attention args.
+    Wraps ``_varlen_fwd_cute`` with the fixed no-window/no-softcap/no-pack-gqa sentinels.
     """
     return torch.ops.ffpa_attn._varlen_fwd_cute(
         q_pack.contiguous(),
@@ -171,6 +170,47 @@ def _ffpa_varlen_bwd(
         0.0,
         None,
     )
+
+
+def _ffpa_dense_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FFPA CuTeDSL *dense* forward on ``[B, H, N, D]`` SDPA-layout tensors.
+
+    Returns ``(out[B, Hq, Nq, D], lse[B, Hq, Nq] fp32)``; handles GQA and causal/non-causal
+    internally. Exposed (not via the autograd ``ffpa_attn_func``) so the ring gets the
+    per-chunk ``lse`` for its online-softmax merge.
+    """
+    from ffpa_attn.cute import _ffpa_attn_forward_cute
+
+    return _ffpa_attn_forward_cute(q, k, v, float(scale), bool(causal), return_lse=True)
+
+
+def _ffpa_dense_bwd(
+    grad_out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FFPA CuTeDSL *dense* backward using the *caller-supplied* out/lse.
+
+    Returns ``(dq, dk, dv)`` all in ``[B, H, N, D]`` SDPA layout (dK/dV reduced to
+    ``Hkv`` for GQA). Exposed as an explicit call (not the package's autograd) so
+    the ring backward can feed the globally merged out/lse, not a chunk-local one.
+    """
+    from ffpa_attn.cute import _ffpa_attn_backward_cute
+
+    return _ffpa_attn_backward_cute(grad_out, q, k, v, out, lse, float(scale), bool(causal))
 
 
 def _get_ffpa_high_level() -> tuple[Callable | None, Any]:
@@ -348,4 +388,6 @@ __all__ = [
     "ffpa_attention_forward",
     "ffpa_mask",
     "register_ffpa_attention",
+    "_ffpa_dense_fwd",
+    "_ffpa_dense_bwd",
 ]
