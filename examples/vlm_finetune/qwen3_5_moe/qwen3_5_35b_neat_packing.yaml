@@ -49,7 +49,8 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: true
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -130,6 +131,8 @@ optimizer:
 
 ci:
   time: "00:15:00"
+  env_vars:
+    MAX_STEPS: 10
 
 # wandb:
 #   project: <your_wandb_project>

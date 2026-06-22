@@ -129,7 +129,7 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -656,8 +656,12 @@ class TestQwen3_5MoeForConditionalGeneration:
 # from_pretrained / ModelClass export tests
 # ---------------------------------------------------------------------------
 class TestQwen3_5MoeFromPretrainedAndModelClass:
-    def test_from_pretrained_classmethod(self):
-        cfg = Qwen3_5MoeConfig()
+    def test_from_pretrained_classmethod(self, vl_config):
+        # Use the tiny `vl_config` fixture instead of the default ``Qwen3_5MoeConfig()``,
+        # which describes the full ~30B model (40 layers, 256 experts, 248K vocab) and
+        # takes minutes to materialize on GPU. The classmethod's delegation behaviour is
+        # identical regardless of model size.
+        cfg = vl_config
         cfg.text_config.pad_token_id = 0
 
         with (

@@ -87,6 +87,45 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
 from .cp_batch import make_contiguous_shard_cp_batch_and_ctx
+
+
+class _Gemma4KVShareHolder:
+    """Cache-free holder that lets HF gemma4 kv-sharing fire under ``use_cache=False``.
+
+    E2B/E4B share K/V across the trailing ``num_kv_shared_layers`` layers: each shared
+    layer reads its source layer's K/V from ``past_key_values.shared_layers`` (see HF
+    ``Gemma4Attention.forward``). HF gates that read on ``past_key_values is not None``,
+    which is ``None`` whenever ``use_cache=False`` -- and ``use_cache`` is forced off by
+    activation checkpointing and the model-owned CP path. The shared layers then fall
+    back to their (frozen, unused) K/V projections and produce garbage, inflating the
+    loss ~4x.
+
+    Passing this lightweight object as ``past_key_values`` satisfies the gate so HF's
+    own kv-sharing logic runs: source layers populate ``shared_layers`` and shared
+    layers read it. ``update`` is a pass-through (no per-token accumulation, so no cache
+    memory growth), and ``get_seq_length`` returns 0 so the causal mask is built with a
+    zero cache offset (correct for a training forward).
+    """
+
+    def __init__(self) -> None:
+        self.shared_layers: dict = {}
+
+    def get_seq_length(self, *args, **kwargs) -> int:
+        return 0
+
+    def get_mask_sizes(self, query_length: int, layer_idx=None) -> tuple[int, int]:
+        # (kv_length, kv_offset): no cache -> kv spans the current query, zero offset.
+        return query_length, 0
+
+    def update(self, key_states, value_states, layer_idx, *args, **kwargs):
+        return key_states, value_states
+
+
+def _kv_sharing_active(text_config) -> bool:
+    """True if the (dense) text config uses gemma4 kv-sharing (E2B/E4B)."""
+    return int(getattr(text_config, "num_kv_shared_layers", 0) or 0) > 0
+
+
 from .state_dict_adapter import Gemma4MoEStateDictAdapter
 
 
@@ -771,9 +810,36 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             )
         if getattr(config, "audio_config", None) is not None:
             # Dense + audio variant: gemma-4-E2B-it, gemma-4-E4B-it.
-            # CP not yet supported here: kv-sharing + per-layer-inputs are not
-            # wired through the p2p ring. Tracked separately from this 31B PR.
-            return ModelCapabilities()
+            # CP supported; TP/PP/EP off. Two features beyond plain-dense 31B were
+            # exercised:
+            #   * per-layer inputs (``hidden_size_per_layer_input``): under CP,
+            #     computed on the full sequence in ``prepare_model_inputs_for_cp``
+            #     and sharded contiguously on the seq dim alongside
+            #     ``inputs_embeds`` (the 4D ``per_layer_inputs`` tensor is a known
+            #     key in cp_batch); the HF dense forward applies the token-local
+            #     projection per shard (verified bit-identical to non-CP prep).
+            #   * KV-sharing: when the KV cache is active each shared layer reads
+            #     its source layer's CP-local sharded K/V from
+            #     ``DynamicCache.shared_layers`` and rotates it through the same
+            #     ring as any other K/V. Under the activation checkpointing that
+            #     CP training uses HF disables the cache, so shared layers
+            #     recompute their own K/V -- identical between CP and non-CP, so
+            #     parity holds either way (the dead shared-layer K/V projections
+            #     are frozen by ``freeze_unused_kv_sharing_params``).
+            # TP is intentionally OFF: HF's ``Gemma4Model.forward`` builds the
+            # per-layer inputs via ``torch.where(multimodal_mask, pad_embedding,
+            # inputs_embeds)`` where ``pad_embedding`` is sliced from the (TP-
+            # sharded) embedding weight. Under DTensor this raises "mixed
+            # torch.Tensor and DTensor" -- an HF-side limitation we cannot fix
+            # without patching frozen transformers source. (Plain-dense 31B has
+            # no ``hidden_size_per_layer_input`` so it skips this branch and TP
+            # works there.)
+            return ModelCapabilities(
+                supports_tp=False,
+                supports_cp=True,
+                supports_pp=False,
+                supports_ep=False,
+            )
         # Plain dense variant: gemma-4-31B-it
         return ModelCapabilities(
             supports_tp=True,
@@ -982,6 +1048,14 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 logits_to_keep = kwargs.pop("logits_to_keep", logits_to_keep)
                 kwargs.pop("labels", None)
 
+                # E2B/E4B only: under use_cache=False (forced by CP + activation
+                # checkpointing) HF's kv-sharing read is disabled and the trailing
+                # shared layers fall back to their dead K/V projections. Inject a
+                # cache-free holder so HF's own kv-sharing fires. 31B (no kv-sharing)
+                # is unaffected: the holder is not created. See _Gemma4KVShareHolder.
+                if past_key_values is None and _kv_sharing_active(text_config):
+                    past_key_values = _Gemma4KVShareHolder()
+
                 # Dense Gemma4 rides HF's decoder layers, which don't thread the
                 # CP/vision metadata down to self_attn (the MoE backend passes it via
                 # kwargs). Stash the CP-sharded metadata on each ring-hooked attention
@@ -1036,6 +1110,17 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 ref = input_ids if input_ids is not None else inputs_embeds
                 mm_token_type_ids = torch.zeros(ref.shape[:2], dtype=torch.long, device=ref.device)
 
+            # E2B/E4B only: same cache-free kv-sharing holder as the CP path above,
+            # so the trailing shared layers read their source K/V even when the HF
+            # cache is off (use_cache=False / activation checkpointing). 31B and other
+            # non-kv-sharing variants get None here, preserving the prior behavior.
+            kv_share_holder = (
+                _Gemma4KVShareHolder()
+                if (kwargs.get("past_key_values") is None and _kv_sharing_active(text_config))
+                else kwargs.pop("past_key_values", None)
+            )
+            kwargs.pop("past_key_values", None)
+
             # Dense path — delegate to HF forward (which already supports
             # logits_to_keep + output_hidden_states and returns a ModelOutput
             # carrying logits and hidden_states).
@@ -1064,6 +1149,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 mm_token_type_ids=mm_token_type_ids,
                 logits_to_keep=logits_to_keep,
                 output_hidden_states=output_hidden_states,
+                past_key_values=kv_share_holder,
                 **kwargs,
             )
 

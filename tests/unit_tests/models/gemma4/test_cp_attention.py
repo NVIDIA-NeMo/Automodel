@@ -238,6 +238,57 @@ def test_compiled_flex_attention_is_cached():
 
 
 # ---------------------------------------------------------------------------
+# block-mask cache: _cached_block_mask / _block_mask_set_generation
+# ---------------------------------------------------------------------------
+def _reset_block_mask_cache():
+    cpa._BLOCK_MASK_CACHE.clear()
+    cpa._BLOCK_MASK_GEN[0] = None
+    cpa._BLOCK_MASK_GEN[1] = None
+
+
+def test_cached_block_mask_builds_once_then_hits():
+    _reset_block_mask_cache()
+    calls = []
+
+    def build():
+        calls.append(1)
+        return "MASK"
+
+    assert cpa._cached_block_mask(("k",), build) == "MASK"
+    assert cpa._cached_block_mask(("k",), build) == "MASK"  # cache hit, no rebuild
+    assert len(calls) == 1
+
+
+def test_cached_block_mask_evicts_above_cap():
+    _reset_block_mask_cache()
+    for i in range(300):
+        cpa._cached_block_mask((i,), lambda i=i: i)
+    assert len(cpa._BLOCK_MASK_CACHE) <= 256  # bounded for the gen=None varying-seqlen case
+
+
+def test_block_mask_generation_clears_only_on_new_data_ptr():
+    _reset_block_mask_cache()
+    t1 = torch.zeros(8)
+    cpa._block_mask_set_generation(t1)  # None -> t1: clears, pins t1
+    cpa._cached_block_mask(("k2",), lambda: "M2")
+    cpa._block_mask_set_generation(t1)  # same data_ptr -> no clear
+    assert ("k2",) in cpa._BLOCK_MASK_CACHE
+
+    t2 = torch.ones(8)
+    cpa._block_mask_set_generation(t2)  # different storage -> clears + re-pins
+    assert len(cpa._BLOCK_MASK_CACHE) == 0
+    assert cpa._BLOCK_MASK_GEN[1] is t2  # tensor held so its data_ptr can't be recycled
+
+
+def test_block_mask_generation_none_is_stable():
+    _reset_block_mask_cache()
+    cpa._cached_block_mask(("k",), lambda: "M")
+    cpa._block_mask_set_generation(None)  # None == initial None -> no clear
+    cpa._block_mask_set_generation(None)
+    assert ("k",) in cpa._BLOCK_MASK_CACHE
+
+
+# ---------------------------------------------------------------------------
 # _collect_ring_kv_chunks  (cp_size == 1 takes no exchange path)
 # ---------------------------------------------------------------------------
 def test_collect_ring_kv_chunks_single_rank_no_exchange():

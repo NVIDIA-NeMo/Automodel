@@ -246,11 +246,26 @@ class StepScheduler(Stateful):
     @property
     def is_last_step(self):
         """
-        Returns whether the training is finished.
+        Returns whether the current step is the final training step.
+
+        Training stops at whichever comes first: reaching ``max_steps`` or
+        exhausting the configured number of epochs (see ``__iter__`` and
+        ``epochs``). ``max_steps`` alone is therefore not enough to detect the
+        end -- a small dataset can run out of epochs long before ``max_steps``
+        is hit (e.g. ``max_steps=100`` with only 60 steps' worth of data). In
+        that case the last batch of the last epoch is the final step. Detect it
+        so the final checkpoint and consolidated export -- which key off this
+        flag (see ``is_ckpt_step`` and the recipes' ``is_final_checkpoint``) --
+        are still written.
         """
         # we +1 here because the step is incremented after
         # the batch is yielded in the tail handling of __iter__
-        return self.step + 1 >= self.max_steps
+        if self.step + 1 >= self.max_steps:
+            return True
+        # Last batch of the last epoch when epochs are exhausted before max_steps.
+        if self.num_epochs is not None and self.epoch + 1 >= self.num_epochs:
+            return self.is_last_batch
+        return False
 
     @property
     def is_last_batch(self):

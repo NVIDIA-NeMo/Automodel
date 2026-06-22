@@ -253,6 +253,18 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     kwargs = kwargs.copy()
     trust_remote_code = kwargs.pop("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
     hf_config = kwargs.get("config", None)
+    # A plain-dict ``config`` (e.g. from CLI ``--model.config.num_hidden_layers 16``,
+    # which the config loader materializes as a dict, not a PretrainedConfig) is a set
+    # of config *overrides*, not a finished config object. Treat it as such: drop it
+    # from ``config`` and fold its keys into the kwargs that AutoConfig.from_pretrained
+    # applies as overrides. Returning the raw dict instead would break every downstream
+    # consumer that expects a config object (e.g. get_architectures -> the custom-model
+    # resolver, which would then mis-dispatch to the stock-HF path and reject custom
+    # kwargs like ``backend``).
+    if isinstance(hf_config, dict):
+        kwargs.pop("config", None)
+        kwargs.update(hf_config)
+        hf_config = None
     if hf_config is None:
         # Filter out nested dict kwargs before passing to AutoConfig.from_pretrained.
         # Nested dicts (e.g. text_config={"key": val}) would replace entire sub-configs
@@ -799,6 +811,13 @@ def __init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
+    # A plain-dict ``config`` override (e.g. from ``--model.config.num_hidden_layers``)
+    # has already been folded into ``hf_config`` by ``get_hf_config`` above. Drop it from
+    # kwargs so it is not also forwarded into the model constructor / HF from_pretrained
+    # (custom path passes ``hf_config`` positionally as ``config`` -> would collide;
+    # stock-HF path does not accept a dict ``config``).
+    if isinstance(kwargs.get("config"), dict):
+        kwargs.pop("config", None)
     architectures = get_architectures(hf_config)
 
     # Propagate the user-requested dtype to the top-level config and every nested

@@ -133,3 +133,8 @@ lr_scheduler:
   lr_decay_style: cosine
   lr_warmup_steps: 10
   min_lr: 1.0e-5
+
+ci:
+  # pp_size(1) * ep_size(16) = 16 GPUs => 4 nodes (4 GB200/node).
+  recipe_owner: adil-a
+  nodes: 4
