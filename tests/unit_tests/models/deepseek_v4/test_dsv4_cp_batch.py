@@ -241,10 +241,39 @@ def test_contiguous_shard_position_ids_3d():
 
 def test_contiguous_shard_packed_sequence_guards():
     base = {"input_ids": torch.arange(8).view(1, 8), "labels": torch.arange(8).view(1, 8)}
-    with pytest.raises(NotImplementedError, match="packed sequences"):
+    with pytest.raises(NotImplementedError, match="pre-flattened `cu_seqlens`"):
         _shard({**base, "cu_seqlens": torch.tensor([0, 8])}, cp_size=2, local_rank=0)
-    with pytest.raises(NotImplementedError, match="packed sequences"):
+    with pytest.raises(KeyError, match="requires `seq_lens`"):
         _shard({**base, "qkv_format": "thd"}, cp_size=2, local_rank=0)
+
+
+def test_contiguous_shard_packed_sequence_pads_each_doc_before_cp_slice():
+    batch = {
+        "input_ids": torch.arange(8).view(1, 8),
+        "labels": torch.arange(8).view(1, 8),
+        "qkv_format": "thd",
+        "seq_lens": torch.tensor([[3, 2]]),
+        "seq_lens_padded": torch.tensor([[3, 5]]),
+    }
+
+    _, rank0 = _shard({k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()}, cp_size=2, local_rank=0, pad_multiple=4, padding_token_id=99)
+    _, rank1 = _shard({k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()}, cp_size=2, local_rank=1, pad_multiple=4, padding_token_id=99)
+
+    torch.testing.assert_close(rank0["input_ids"], torch.tensor([[0, 1, 2, 99]]))
+    torch.testing.assert_close(rank0["labels"], torch.tensor([[0, 1, 2, -100]]))
+    torch.testing.assert_close(rank0["position_ids"], torch.tensor([[0, 1, 2, 3]]))
+    torch.testing.assert_close(rank0["padding_mask"], torch.tensor([[False, False, False, True]]))
+    torch.testing.assert_close(rank0["packed_seq_ids"], torch.tensor([[1, 1, 1, 1]]))
+
+    torch.testing.assert_close(rank1["input_ids"], torch.tensor([[3, 4, 99, 99]]))
+    torch.testing.assert_close(rank1["labels"], torch.tensor([[3, 4, -100, -100]]))
+    torch.testing.assert_close(rank1["position_ids"], torch.tensor([[0, 1, 2, 3]]))
+    torch.testing.assert_close(rank1["padding_mask"], torch.tensor([[False, False, True, True]]))
+    torch.testing.assert_close(rank1["packed_seq_ids"], torch.tensor([[2, 2, 2, 2]]))
+
+    torch.testing.assert_close(rank0["seq_lens"], torch.tensor([[3, 2]]))
+    torch.testing.assert_close(rank0["seq_lens_padded"], torch.tensor([[4, 4]]))
+    assert rank0["qkv_format"] == "thd"
 
 
 def test_contiguous_shard_requires_exactly_one_primary_key():

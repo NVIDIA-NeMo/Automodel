@@ -64,6 +64,8 @@ from nemo_automodel.components.models.common.utils import (
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import (
     build_dsv4_cp_causal_padding_mask,
+    build_dsv4_cp_packed_causal_padding_mask,
+    build_packed_seq_ids,
     dsv4_cp_enabled,
     dsv4_cp_local_seq_multiple,
     dsv4_cp_size,
@@ -486,10 +488,34 @@ class DeepseekV4Model(nn.Module):
                 packed_seq_lens = attn_kwargs.get("seq_lens")
         cp_group = attn_kwargs.get("_dsv4_cp_group")
         cp_active = dsv4_cp_enabled(cp_group)
-        if cp_active and packed_seq_lens is not None:
-            raise NotImplementedError("DeepSeek V4 context parallelism with packed sequences is not implemented yet.")
+        packed_seq_ids = attn_kwargs.get("packed_seq_ids")
+        if packed_seq_ids is None and packed_seq_lens is not None and not cp_active:
+            packed_seq_ids = build_packed_seq_ids(
+                packed_seq_lens,
+                seq_len=shape_ref.shape[1],
+                device=shape_ref.device,
+            )
+            attn_kwargs["packed_seq_ids"] = packed_seq_ids
+        elif packed_seq_ids is not None:
+            packed_seq_ids = packed_seq_ids.to(device=shape_ref.device, dtype=torch.long)
+            if packed_seq_ids.dim() == 1:
+                packed_seq_ids = packed_seq_ids.unsqueeze(0)
+            attn_kwargs["packed_seq_ids"] = packed_seq_ids
 
-        if cp_active:
+        if cp_active and packed_seq_ids is not None:
+            cp_padding_mask = padding_mask
+            if cp_padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
+                cp_padding_mask = attention_mask.bool().logical_not()
+            attention_mask_4d = build_dsv4_cp_packed_causal_padding_mask(
+                position_ids=position_ids,
+                packed_seq_ids=packed_seq_ids,
+                dtype=shape_ref.dtype,
+                device=shape_ref.device,
+                cp_group=cp_group,
+                padding_mask=cp_padding_mask,
+                sliding_window=sliding_window,
+            )
+        elif cp_active:
             cp_padding_mask = padding_mask
             if cp_padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
                 cp_padding_mask = attention_mask.bool().logical_not()
