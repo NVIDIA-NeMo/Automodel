@@ -40,7 +40,7 @@ export WANDB_API_KEY=your_wandb_key
 
 srun --output=output.out \
      --error=output.err \
-     --container-image /your/path/to/automodel26.02.image.sqsh --no-container-mount-home bash -c "
+     --container-image /your/path/to/automodel26.04.image.sqsh --no-container-mount-home bash -c "
   CUDA_DEVICE_MAX_CONNECTIONS=1 automodel \
   examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml \
   --nproc-per-node=8 \

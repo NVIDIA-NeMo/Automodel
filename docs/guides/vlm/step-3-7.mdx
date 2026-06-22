@@ -56,7 +56,7 @@ export WANDB_API_KEY=your_wandb_key
 
 srun --output=output.out \
      --error=output.err \
-     --container-image /path/to/automodel26.02.image.sqsh \
+     --container-image /path/to/automodel26.04.image.sqsh \
      --no-container-mount-home bash -c "
   CUDA_DEVICE_MAX_CONNECTIONS=1 automodel \
   /path/to/step_3_7_flash_recipe.yaml \
