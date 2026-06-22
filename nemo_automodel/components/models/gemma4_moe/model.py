@@ -140,6 +140,48 @@ class _FSDPSafeSharedKVStates(MutableMapping):
         return len(self._store)
 
 
+class _Gemma4KVShareHolder:
+    """Cache-free holder that lets HF gemma4 kv-sharing fire under ``use_cache=False``.
+
+    E2B/E4B share K/V across the trailing ``num_kv_shared_layers`` layers: each shared
+    layer reads its source layer's K/V from ``past_key_values.shared_layers`` (see HF
+    ``Gemma4Attention.forward``). HF gates that read on ``past_key_values is not None``,
+    which is ``None`` whenever ``use_cache=False`` -- and ``use_cache`` is forced off by
+    activation checkpointing and the model-owned CP path. The shared layers then fall
+    back to their (frozen, unused) K/V projections and produce garbage, inflating the
+    loss ~4x.
+
+    Passing this lightweight object as ``past_key_values`` satisfies the gate so HF's
+    own kv-sharing logic runs: source layers populate ``shared_layers`` and shared
+    layers read it. ``update`` is a pass-through (no per-token accumulation, so no cache
+    memory growth), and ``get_seq_length`` returns 0 so the causal mask is built with a
+    zero cache offset (correct for a training forward).
+
+    It also avoids the OOM where, under ``use_cache=True`` with no ``past_key_values``
+    supplied, HF builds a real ``DynamicCache`` that accumulates per-layer K/V across the
+    whole training forward -- wasted memory that fragments the allocator and OOMs the
+    FSDP2 gradient reduce-scatter on E4B.
+    """
+
+    def __init__(self) -> None:
+        self.shared_layers: dict = {}
+
+    def get_seq_length(self, *args, **kwargs) -> int:
+        return 0
+
+    def get_mask_sizes(self, query_length: int, layer_idx=None) -> tuple[int, int]:
+        # (kv_length, kv_offset): no cache -> kv spans the current query, zero offset.
+        return query_length, 0
+
+    def update(self, key_states, value_states, layer_idx, *args, **kwargs):
+        return key_states, value_states
+
+
+def _kv_sharing_active(text_config) -> bool:
+    """True if the (dense) text config uses gemma4 kv-sharing (E2B/E4B)."""
+    return int(getattr(text_config, "num_kv_shared_layers", 0) or 0) > 0
+
+
 # ---------------------------------------------------------------------------
 # Gemma4-specific router that outputs NeMo-compatible (weights, indices)
 # ---------------------------------------------------------------------------
@@ -788,6 +830,20 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             # the later layers -> KeyError. Pass an _FSDPSafeSharedKVStates
             # instead, which FSDP2 leaves as one shared object. setdefault avoids
             # overwriting a store a caller already provided (e.g. the drafter).
+            # E2B/E4B kv-sharing: pass a cache-free pass-through holder as
+            # past_key_values for kv-sharing variants. Without it, use_cache=True
+            # makes HF build a real DynamicCache that accumulates per-layer K/V
+            # across the training forward -- wasted memory that fragments the
+            # allocator and OOMs the FSDP2 grad reduce-scatter on E4B. The holder
+            # also keeps kv-sharing correct when use_cache is off (activation
+            # checkpointing). Non-kv-sharing variants (e.g. 31B) get None,
+            # preserving prior behavior. See _Gemma4KVShareHolder.
+            kv_share_holder = (
+                _Gemma4KVShareHolder()
+                if (kwargs.get("past_key_values") is None and _kv_sharing_active(text_config))
+                else kwargs.pop("past_key_values", None)
+            )
+            kwargs.pop("past_key_values", None)
             kwargs.setdefault("shared_kv_states", _FSDPSafeSharedKVStates())
             return super().forward(
                 input_ids=input_ids,
@@ -800,6 +856,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 mm_token_type_ids=mm_token_type_ids,
                 logits_to_keep=logits_to_keep,
                 output_hidden_states=output_hidden_states,
+                past_key_values=kv_share_holder,
                 **kwargs,
             )
 
