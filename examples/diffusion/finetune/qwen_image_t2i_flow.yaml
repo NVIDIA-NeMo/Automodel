@@ -72,6 +72,7 @@ checkpoint:
   restore_from: null
 
 wandb:
+  enable: false
   project: qwen-image-finetuning
   mode: online
   name: qwen_image_finetune_run_1

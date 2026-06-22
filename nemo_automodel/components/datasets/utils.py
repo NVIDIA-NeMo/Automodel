@@ -248,8 +248,13 @@ def default_collater(batch, pad_seq_len_divisible=None):
     # convert to tensors
     result = {k: batchify(torch.LongTensor(v)) for k, v in ans.items()}
 
-    # Add padding_mask similar to cp_utils.py
-    if "input_ids" in result:
+    # Add padding_mask. Prefer the real attention_mask: matching the pad token *value*
+    # (input_ids == pad_token_id) misclassifies real tokens as padding whenever pad_token_id
+    # collides with a content token (e.g. pad_token_id == eos_token_id), which masks real
+    # eos/separator tokens out of the MoE experts -> near-random outputs on chat data.
+    if "attention_mask" in result:
+        result["padding_mask"] = ~result["attention_mask"].bool()
+    elif "input_ids" in result:
         input_ids_pad_token = get_pad_token_from_key("input_ids", pad_token_ids) or 0
         result["padding_mask"] = (result["input_ids"] == input_ids_pad_token).bool()
 

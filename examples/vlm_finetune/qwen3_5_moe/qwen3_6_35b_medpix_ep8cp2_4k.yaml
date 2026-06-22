@@ -113,6 +113,7 @@ lr_scheduler:
   lr_decay_style: constant
 
 wandb:
+  enable: false
   project: huiyingl_workspace
   entity: Nemo-automodel
   name: qwen3_6_35b_medpix_ep8cp2_4k_100steps
