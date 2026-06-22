@@ -47,7 +47,45 @@ def _is_arrow_path(path: Path) -> bool:
     return path.suffix == ".arrow"
 
 
-def _coerce_arrow_path_list(data_path: str | Sequence[str]) -> list[Path]:
+def _parse_data_entries(
+    data_path: str | os.PathLike[str] | Sequence[Any],
+) -> list[tuple[str | os.PathLike[str], int | None]]:
+    if isinstance(data_path, (str, os.PathLike)):
+        entries = [data_path]
+    elif isinstance(data_path, dict):
+        entries = [data_path]
+    else:
+        entries = list(data_path)
+
+    parsed = []
+    for entry in entries:
+        if isinstance(entry, (str, os.PathLike)):
+            parsed.append((entry, None))
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "Resolved retrieval data entries must be paths or dictionaries with 'path' and optional "
+                f"'num_samples', got {type(entry).__name__}"
+            )
+        allowed_keys = {"path", "num_samples"}
+        unknown_keys = set(entry) - allowed_keys
+        if unknown_keys:
+            raise ValueError(f"Unsupported resolved retrieval data entry field(s): {sorted(unknown_keys)}")
+        if "path" not in entry:
+            raise ValueError("Resolved retrieval data entry dictionaries must contain a 'path' field")
+        num_samples = entry.get("num_samples")
+        if num_samples is not None:
+            if isinstance(num_samples, bool) or not isinstance(num_samples, int):
+                raise ValueError(f"num_samples must be an integer or None, got {type(num_samples).__name__}")
+            if num_samples < 1:
+                raise ValueError(f"num_samples must be >= 1, got {num_samples}")
+        parsed.append((entry["path"], num_samples))
+    if not parsed:
+        raise ValueError("Resolved retrieval data expects at least one Arrow path")
+    return parsed
+
+
+def _coerce_arrow_path_list(data_path: str | os.PathLike[str] | Sequence[str | os.PathLike[str]]) -> list[Path]:
     if isinstance(data_path, (str, os.PathLike)):
         entries = [data_path]
     else:
@@ -243,10 +281,27 @@ class ResolvedRetrievalArrowDataset(Dataset):
         if repeat < 1:
             raise ValueError(f"repeat must be >= 1, got {repeat}")
 
-        self.paths = _coerce_arrow_path_list(data_path)
+        data_entries = _parse_data_entries(data_path)
         datasets = _import_datasets()
-        shards = [datasets.Dataset.from_file(str(path)) for path in self.paths]
-        self._dataset = shards[0] if len(shards) == 1 else datasets.concatenate_datasets(shards)
+        source_datasets = []
+        self.paths = []
+        for source_path, source_num_samples in data_entries:
+            source_paths = _coerce_arrow_path_list(source_path)
+            self.paths.extend(source_paths)
+            shards = [datasets.Dataset.from_file(str(path)) for path in source_paths]
+            source_dataset = shards[0] if len(shards) == 1 else datasets.concatenate_datasets(shards)
+            if source_num_samples is not None:
+                if source_num_samples > len(source_dataset):
+                    logger.warning(
+                        "Requested %d resolved retrieval samples but only found %d row(s). Using all.",
+                        source_num_samples,
+                        len(source_dataset),
+                    )
+                source_dataset = source_dataset.select(range(min(source_num_samples, len(source_dataset))))
+            source_datasets.append(source_dataset)
+        self._dataset = (
+            source_datasets[0] if len(source_datasets) == 1 else datasets.concatenate_datasets(source_datasets)
+        )
         self.image_root = Path(image_root) if image_root is not None else None
         self.repeat = int(repeat)
         self.decode_images = decode_images

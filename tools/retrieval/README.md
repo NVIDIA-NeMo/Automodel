@@ -38,10 +38,27 @@ dataloader:
     do_shuffle: true
 ```
 
+Normalized prep keeps each `data_dir_list` entry as a separate source bundle under `sources/`. Training can use the
+top-level bundle, or choose prepared sources explicitly and apply per-source sample caps:
+
+```yaml
+dataloader:
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.make_normalized_retrieval_dataset
+    data_dir_list:
+      - path: /path/to/normalized_vl_retrieval/sources/source-00000
+        num_samples: 10000
+      - path: /path/to/normalized_vl_retrieval/sources/source-00001
+        num_samples: null
+    model_type: bi_encoder
+    data_type: train
+    n_passages: 5
+```
+
 Normalized Arrow keeps the original corpus-id retrieval model but stores the referenced corpus locally:
 
-- `train/*.arrow` stores query rows and positive/negative document IDs.
-- `corpus/*/*.arrow` stores each referenced document/image once.
+- `sources/source-*/train/*.arrow` stores query rows and positive/negative document IDs.
+- `sources/source-*/corpus/*/*.arrow` stores each referenced document/image once.
 - Training still resolves `doc_id -> document` through the normal retrieval transform.
 
 This is the recommended portable format because it avoids hidden Hugging Face cache rebuilds and avoids duplicating

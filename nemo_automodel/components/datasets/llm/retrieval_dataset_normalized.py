@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
@@ -53,19 +54,50 @@ def _import_datasets():
     return datasets
 
 
-def _coerce_bundle_root(data_path: str | Path | Sequence[str | Path]) -> Path:
-    if isinstance(data_path, (str, Path)):
-        path = Path(data_path)
-    else:
-        entries = list(data_path)
-        if len(entries) != 1:
-            raise ValueError("Normalized retrieval data expects one bundle directory")
-        path = Path(entries[0])
+def _coerce_bundle_root(data_path: str | Path | os.PathLike[str]) -> Path:
+    path = Path(data_path)
     if path.is_file() and path.name == "metadata.json":
         path = path.parent
     if not path.is_dir():
         raise FileNotFoundError(f"Normalized retrieval bundle does not exist: {path}")
     return path
+
+
+def _parse_data_entries(data_path: str | Path | os.PathLike[str] | Sequence[Any]) -> list[tuple[Path, int | None]]:
+    if isinstance(data_path, (str, Path, os.PathLike)):
+        return [(_coerce_bundle_root(data_path), None)]
+    if isinstance(data_path, dict):
+        entries = [data_path]
+    else:
+        entries = list(data_path)
+
+    if not entries:
+        raise ValueError("Normalized retrieval data expects at least one bundle directory")
+
+    parsed = []
+    for entry in entries:
+        if isinstance(entry, (str, Path, os.PathLike)):
+            parsed.append((_coerce_bundle_root(entry), None))
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "Normalized retrieval data entries must be paths or dictionaries with 'path' and optional "
+                f"'num_samples', got {type(entry).__name__}"
+            )
+        allowed_keys = {"path", "num_samples"}
+        unknown_keys = set(entry) - allowed_keys
+        if unknown_keys:
+            raise ValueError(f"Unsupported normalized retrieval data entry field(s): {sorted(unknown_keys)}")
+        if "path" not in entry:
+            raise ValueError("Normalized retrieval data entry dictionaries must contain a 'path' field")
+        num_samples = entry.get("num_samples")
+        if num_samples is not None:
+            if isinstance(num_samples, bool) or not isinstance(num_samples, int):
+                raise ValueError(f"num_samples must be an integer or None, got {type(num_samples).__name__}")
+            if num_samples < 1:
+                raise ValueError(f"num_samples must be >= 1, got {num_samples}")
+        parsed.append((_coerce_bundle_root(entry["path"]), num_samples))
+    return parsed
 
 
 def _load_arrow_shards(paths: Sequence[Path]):
@@ -177,6 +209,76 @@ def _load_corpus_dict(bundle_root: Path, metadata: dict[str, Any]) -> dict[str, 
     return corpus_dict
 
 
+def _merge_corpus_dicts(corpus_dicts: Sequence[dict[str, CorpusInfo]]) -> dict[str, CorpusInfo]:
+    datasets = _import_datasets()
+    merged: dict[str, CorpusInfo] = {}
+    for corpus_dict in corpus_dicts:
+        for corpus_id, corpus_info in corpus_dict.items():
+            if corpus_id not in merged:
+                merged[corpus_id] = corpus_info
+                continue
+
+            existing = merged[corpus_id]
+            if not isinstance(existing.corpus, NormalizedArrowCorpusDataset) or not isinstance(
+                corpus_info.corpus, NormalizedArrowCorpusDataset
+            ):
+                raise TypeError(f"Cannot merge non-normalized corpus dataset for corpus_id={corpus_id!r}")
+            combined_dataset = datasets.concatenate_datasets([existing.corpus.data, corpus_info.corpus.data])
+            corpus_metadata = dict(existing.metadata)
+            merged[corpus_id] = CorpusInfo(
+                corpus_metadata,
+                NormalizedArrowCorpusDataset(
+                    combined_dataset,
+                    path=f"{existing.path},{corpus_info.path}",
+                ),
+            )
+    return merged
+
+
+def _select_source_samples(dataset: Any, num_samples: int | None, *, seed: int) -> Any:
+    if num_samples is None:
+        return dataset
+    if num_samples > len(dataset):
+        logger.warning(
+            "Requested %d normalized retrieval samples but only found %d row(s). Using all.",
+            num_samples,
+            len(dataset),
+        )
+        return dataset
+    return dataset.shuffle(seed=seed).select(range(num_samples))
+
+
+def _load_normalized_bundle_components(
+    bundle_root: Path,
+    *,
+    num_samples: int | None,
+    seed: int,
+) -> tuple[Any, dict[str, CorpusInfo]]:
+    metadata = _load_metadata(bundle_root)
+    if "sources" in metadata:
+        datasets = _import_datasets()
+        source_datasets = []
+        source_corpus_dicts = []
+        for source in metadata["sources"]:
+            source_dataset, source_corpus_dict = _load_normalized_bundle_components(
+                bundle_root / source["path"],
+                num_samples=None,
+                seed=seed,
+            )
+            source_datasets.append(source_dataset)
+            source_corpus_dicts.append(source_corpus_dict)
+        if not source_datasets:
+            raise ValueError(f"Normalized retrieval bundle has no sources: {bundle_root}")
+        dataset = source_datasets[0] if len(source_datasets) == 1 else datasets.concatenate_datasets(source_datasets)
+        return _select_source_samples(dataset, num_samples, seed=seed), _merge_corpus_dicts(source_corpus_dicts)
+
+    train_paths = [bundle_root / shard for shard in metadata.get("train_shards", [])]
+    dataset = _load_arrow_shards(train_paths)
+    dataset = _select_source_samples(dataset, num_samples, seed=seed)
+    logger.info("Loaded normalized retrieval dataset with %d examples from %s", len(dataset), bundle_root)
+    return dataset, _load_corpus_dict(bundle_root, metadata)
+
+
 def _build_transform(
     dataset: Any,
     corpus_dict: dict[str, CorpusInfo],
@@ -204,7 +306,7 @@ def _build_transform(
 
 
 def make_normalized_retrieval_dataset(
-    data_path: str | Path | Sequence[str | Path] | None = None,
+    data_path: str | Path | os.PathLike[str] | Sequence[Any] | None = None,
     model_type: str = "bi_encoder",
     data_type: str = "train",
     n_passages: int = 5,
@@ -215,7 +317,7 @@ def make_normalized_retrieval_dataset(
     train_data_select_offset: int = 0,
     use_dataset_instruction: bool = False,
     cycle_positive_docs: bool = False,
-    data_dir_list: str | Path | Sequence[str | Path] | None = None,
+    data_dir_list: str | Path | os.PathLike[str] | Sequence[Any] | None = None,
 ) -> Any:
     """Build a normalized portable retrieval dataset from a local Arrow bundle."""
     if data_path is not None and data_dir_list is not None:
@@ -232,11 +334,20 @@ def make_normalized_retrieval_dataset(
     if n_passages < 1:
         raise ValueError(f"n_passages must be >= 1, got {n_passages}")
 
-    bundle_root = _coerce_bundle_root(data_path)
-    metadata = _load_metadata(bundle_root)
-    train_paths = [bundle_root / shard for shard in metadata.get("train_shards", [])]
-    dataset = _load_arrow_shards(train_paths)
-    logger.info("Loaded normalized retrieval dataset with %d examples from %s", len(dataset), bundle_root)
+    data_entries = _parse_data_entries(data_path)
+    source_datasets = []
+    source_corpus_dicts = []
+    for source_path, num_samples in data_entries:
+        source_dataset, source_corpus_dict = _load_normalized_bundle_components(
+            source_path,
+            num_samples=num_samples,
+            seed=seed,
+        )
+        source_datasets.append(source_dataset)
+        source_corpus_dicts.append(source_corpus_dict)
+
+    datasets = _import_datasets()
+    dataset = source_datasets[0] if len(source_datasets) == 1 else datasets.concatenate_datasets(source_datasets)
 
     if data_type == "train" and max_train_samples is not None:
         if do_shuffle:
@@ -245,7 +356,7 @@ def make_normalized_retrieval_dataset(
         stop = min(start + max_train_samples, len(dataset))
         dataset = dataset.select(range(start, stop))
 
-    corpus_dict = _load_corpus_dict(bundle_root, metadata)
+    corpus_dict = _merge_corpus_dicts(source_corpus_dicts)
     transform = _build_transform(
         dataset,
         corpus_dict,

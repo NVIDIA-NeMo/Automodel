@@ -188,6 +188,32 @@ def _prepare_output_dir(output_dir: Path, *, resume: bool = False) -> None:
     (output_dir / "corpus").mkdir(exist_ok=resume)
 
 
+def _prepare_multi_source_output_dir(output_dir: Path, *, resume: bool = False) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = output_dir / "metadata.json"
+    if not resume and (
+        metadata_path.exists()
+        or (output_dir / "sources").exists()
+        or (output_dir / "train").exists()
+        or (output_dir / "corpus").exists()
+    ):
+        raise FileExistsError(
+            f"Output directory already contains normalized retrieval artifacts: {output_dir}. "
+            "Choose a new directory or remove old artifacts explicitly."
+        )
+    (output_dir / "sources").mkdir(exist_ok=resume)
+
+
+def _split_data_dir_list(data_dir_list: Any) -> list[Any]:
+    if isinstance(data_dir_list, (str, dict)):
+        return [data_dir_list]
+    if isinstance(data_dir_list, list):
+        if not data_dir_list:
+            raise ValueError("data_dir_list must contain at least one source")
+        return data_dir_list
+    raise ValueError(f"Unsupported data_dir_list type: {type(data_dir_list).__name__}")
+
+
 def _safe_corpus_dir_name(corpus_id: str) -> str:
     return corpus_id.replace("/", "__")
 
@@ -409,7 +435,7 @@ def _write_corpus_shards(
     return corpus_metadata
 
 
-def prepare_normalized_dataset(
+def _prepare_single_normalized_dataset(
     data_dir_list: list[Any],
     output_dir: Path,
     *,
@@ -460,6 +486,69 @@ def prepare_normalized_dataset(
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     logger.info("Wrote normalized retrieval bundle with %d train records to %s", num_records, output_dir)
+    return metadata
+
+
+def prepare_normalized_dataset(
+    data_dir_list: list[Any],
+    output_dir: Path,
+    *,
+    samples_per_shard: int,
+    docs_per_shard: int,
+    seed: int,
+    max_samples: int | None,
+    jpeg_quality: int,
+    resume: bool = False,
+) -> dict[str, Any]:
+    """Write a normalized portable Arrow retrieval bundle."""
+    source_entries = _split_data_dir_list(data_dir_list)
+    _prepare_multi_source_output_dir(output_dir, resume=resume)
+    source_metadata = []
+    total_records = 0
+    for source_idx, source_entry in enumerate(source_entries):
+        source_dir = output_dir / "sources" / f"source-{source_idx:05d}"
+        metadata = _prepare_single_normalized_dataset(
+            data_dir_list=[source_entry],
+            output_dir=source_dir,
+            samples_per_shard=samples_per_shard,
+            docs_per_shard=docs_per_shard,
+            seed=seed,
+            max_samples=max_samples,
+            jpeg_quality=jpeg_quality,
+            resume=resume,
+        )
+        total_records += metadata["num_records"]
+        source_metadata.append(
+            {
+                "source_index": source_idx,
+                "source_entry": source_entry,
+                "path": str(source_dir.relative_to(output_dir)),
+                "num_records": metadata["num_records"],
+            }
+        )
+
+    if max_samples is not None and len(source_entries) > 1:
+        logger.warning(
+            "--max-samples is applied to each normalized source independently. "
+            "Use per-source num_samples in the original config or at training time for source-specific caps."
+        )
+
+    metadata = {
+        "format": "nemo_automodel_normalized_vl_retrieval_arrow",
+        "version": 3,
+        "data_dir_list": data_dir_list,
+        "num_records": total_records,
+        "samples_per_shard": samples_per_shard,
+        "docs_per_shard": docs_per_shard,
+        "sources": source_metadata,
+    }
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    logger.info(
+        "Wrote normalized retrieval bundle with %d source(s), %d total train records to %s",
+        len(source_metadata),
+        total_records,
+        output_dir,
+    )
     return metadata
 
 

@@ -94,7 +94,7 @@ def _write_warm_cache_config(path, dataset_target):
     )
 
 
-def _patch_resolved_source(monkeypatch, image_mod, *, num_examples=1, n_passages=2):
+def _patch_resolved_source(monkeypatch, image_mod, *, num_examples=1, n_passages=2, question_prefix=""):
     monkeypatch.setattr(
         prep, "load_datasets", lambda data_dir_list, concatenate, seed: ([{"idx": i} for i in range(num_examples)], {})
     )
@@ -103,7 +103,7 @@ def _patch_resolved_source(monkeypatch, image_mod, *, num_examples=1, n_passages
         idx = item["idx"]
         doc_count = n_passages
         return {
-            "question": f"Q{idx}",
+            "question": f"{question_prefix}Q{idx}",
             "doc_text": [f"D{idx}-{doc_idx}" for doc_idx in range(doc_count)],
             "doc_image": [image_mod.new("RGB", (2, 2), color="blue")] + [""] * (doc_count - 1),
             "doc_id": [f"d{idx}-{doc_idx}" for doc_idx in range(doc_count)],
@@ -112,6 +112,45 @@ def _patch_resolved_source(monkeypatch, image_mod, *, num_examples=1, n_passages
         }
 
     monkeypatch.setattr(prep, "_transform_func", _transform_func)
+
+
+def _patch_normalized_source(monkeypatch, image_mod):
+    image = image_mod.new("RGB", (2, 2), color="blue")
+
+    def fake_load_datasets(data_dir_list, concatenate, seed):
+        entry = data_dir_list[0]
+        source_path = entry["path"] if isinstance(entry, dict) else entry
+        source_name = "a" if "source_a" in str(source_path) else "b"
+        return (
+            [
+                {
+                    "question_id": f"{source_name}-q0",
+                    "question": f"{source_name} Q0",
+                    "corpus_id": "test",
+                    "pos_doc": [{"id": f"{source_name}-p0"}],
+                    "neg_doc": [{"id": f"{source_name}-n0"}],
+                },
+                {
+                    "question_id": f"{source_name}-q1",
+                    "question": f"{source_name} Q1",
+                    "corpus_id": "test",
+                    "pos_doc": [{"id": f"{source_name}-p1"}],
+                    "neg_doc": [{"id": f"{source_name}-n1"}],
+                },
+            ],
+            {
+                "test": _FakeCorpusInfo(
+                    {
+                        f"{source_name}-p0": {"text": f"{source_name} positive 0", "image": image},
+                        f"{source_name}-n0": {"text": f"{source_name} negative 0", "image": ""},
+                        f"{source_name}-p1": {"text": f"{source_name} positive 1", "image": ""},
+                        f"{source_name}-n1": {"text": f"{source_name} negative 1", "image": ""},
+                    }
+                )
+            },
+        )
+
+    monkeypatch.setattr(prep_norm, "load_datasets", fake_load_datasets)
 
 
 def test_warm_retrieval_hf_cache_builds_original_dataset_from_config(tmp_path):
@@ -314,10 +353,16 @@ def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_p
     )
 
     assert metadata["format"] == "nemo_automodel_normalized_vl_retrieval_arrow"
+    assert metadata["version"] == 3
     assert metadata["num_records"] == 2
-    assert metadata["train_shards"] == ["train/train-00000.arrow"]
-    assert metadata["corpora"][0]["num_docs"] == 3
+    assert metadata["sources"] == [
+        {"source_index": 0, "source_entry": "train.json", "path": "sources/source-00000", "num_records": 2}
+    ]
     assert (output_dir / "metadata.json").is_file()
+    source_dir = output_dir / "sources" / "source-00000"
+    source_metadata = json.loads((source_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert source_metadata["train_shards"] == ["train/train-00000.arrow"]
+    assert source_metadata["corpora"][0]["num_docs"] == 3
 
     dataset = nd.make_normalized_retrieval_dataset(
         data_dir_list=str(output_dir),
@@ -335,7 +380,7 @@ def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_p
     assert example["doc_image"][0].mode == "RGB"
     assert example["doc_image"][1] == ""
 
-    for shard in (output_dir / "corpus" / "test").glob("*.arrow"):
+    for shard in (source_dir / "corpus" / "test").glob("*.arrow"):
         shard.unlink()
     resumed_metadata = prep_norm.prepare_normalized_dataset(
         data_dir_list=["train.json"],
@@ -349,7 +394,47 @@ def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_p
     )
 
     assert resumed_metadata["num_records"] == 2
-    assert resumed_metadata["corpora"][0]["num_docs"] == 3
+    resumed_source_metadata = json.loads((source_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert resumed_source_metadata["corpora"][0]["num_docs"] == 3
+
+
+def test_prepare_normalized_vl_retrieval_data_preserves_source_bundles(tmp_path, monkeypatch):
+    pytest.importorskip("datasets")
+    pytest.importorskip("datasets.arrow_writer")
+    image_mod = pytest.importorskip("PIL.Image")
+    _patch_normalized_source(monkeypatch, image_mod)
+
+    output_dir = tmp_path / "normalized_multi"
+    metadata = prep_norm.prepare_normalized_dataset(
+        data_dir_list=[{"path": "source_a.json", "num_samples": None}, {"path": "source_b.json", "num_samples": None}],
+        output_dir=output_dir,
+        samples_per_shard=10,
+        docs_per_shard=10,
+        seed=42,
+        max_samples=None,
+        jpeg_quality=90,
+    )
+
+    assert metadata["version"] == 3
+    assert metadata["num_records"] == 4
+    assert [source["path"] for source in metadata["sources"]] == ["sources/source-00000", "sources/source-00001"]
+
+    dataset = nd.make_normalized_retrieval_dataset(data_dir_list=str(output_dir), n_passages=2)
+    assert len(dataset) == 4
+    assert sorted(dataset[idx]["question"] for idx in range(len(dataset))) == ["a Q0", "a Q1", "b Q0", "b Q1"]
+
+    sampled_dataset = nd.make_normalized_retrieval_dataset(
+        data_dir_list=[
+            {"path": str(output_dir / "sources" / "source-00000"), "num_samples": 1},
+            {"path": str(output_dir / "sources" / "source-00001"), "num_samples": None},
+        ],
+        n_passages=2,
+        seed=42,
+    )
+    questions = [sampled_dataset[idx]["question"] for idx in range(len(sampled_dataset))]
+    assert len(questions) == 3
+    assert sum(question.startswith("a ") for question in questions) == 1
+    assert sum(question.startswith("b ") for question in questions) == 2
 
 
 def test_prepare_resolved_vl_retrieval_data_parallel_build_shard(tmp_path, monkeypatch):
@@ -381,3 +466,47 @@ def test_prepare_resolved_vl_retrieval_data_parallel_build_shard(tmp_path, monke
     dataset = rdr.make_resolved_retrieval_dataset(data_dir_list=str(output_dir), n_passages=2, decode_images=False)
     assert [dataset[idx]["question"] for idx in range(len(dataset))] == ["Q1", "Q3"]
     assert dataset[0]["doc_image"] == ["packed:0", ""]
+
+
+def test_resolved_retrieval_arrow_dataset_accepts_source_list_num_samples(tmp_path, monkeypatch):
+    pytest.importorskip("datasets")
+    pytest.importorskip("datasets.arrow_writer")
+    image_mod = pytest.importorskip("PIL.Image")
+
+    output_a = tmp_path / "resolved_a"
+    _patch_resolved_source(monkeypatch, image_mod, num_examples=2, n_passages=1, question_prefix="A")
+    prep.resolve_dataset(
+        data_dir_list=["source_a.json"],
+        output_dir=output_a,
+        n_passages=1,
+        samples_per_shard=10,
+        seed=42,
+        max_samples=None,
+        use_dataset_instruction=False,
+        jpeg_quality=90,
+    )
+
+    output_b = tmp_path / "resolved_b"
+    _patch_resolved_source(monkeypatch, image_mod, num_examples=2, n_passages=1, question_prefix="B")
+    prep.resolve_dataset(
+        data_dir_list=["source_b.json"],
+        output_dir=output_b,
+        n_passages=1,
+        samples_per_shard=10,
+        seed=42,
+        max_samples=None,
+        use_dataset_instruction=False,
+        jpeg_quality=90,
+    )
+
+    dataset = rdr.make_resolved_retrieval_dataset(
+        data_dir_list=[
+            {"path": str(output_a), "num_samples": 1},
+            {"path": str(output_b), "num_samples": None},
+        ],
+        n_passages=1,
+        decode_images=False,
+    )
+
+    assert len(dataset) == 3
+    assert [dataset[idx]["question"] for idx in range(len(dataset))] == ["AQ0", "BQ0", "BQ1"]
