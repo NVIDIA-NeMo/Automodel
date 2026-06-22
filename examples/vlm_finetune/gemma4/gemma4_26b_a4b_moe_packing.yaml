@@ -102,6 +102,7 @@ freeze_config:
   freeze_language_model: false
 
 ci:
+  time: "00:20:00"
   env_vars:
     MAX_STEPS: 10
 
