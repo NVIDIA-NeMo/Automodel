@@ -307,6 +307,15 @@ def get_decilm_nemotron_tp_plan(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+def _parallelize_decilm_nemotron(
+    model,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    if getattr(getattr(model, "config", None), "model_type", None) != "nemotron-nas":
+        raise ValueError("DeciLM TP plan is only registered for Nemotron-NAS checkpoints")
+    return get_decilm_nemotron_tp_plan(sequence_parallel=sequence_parallel)
+
+
 def _parallelize_baichuan(
     model: BaichuanForCausalLM | None,
     sequence_parallel: bool = False,
@@ -747,5 +756,6 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(CustomQwen2ForCausalLM): _parallelize_qwen,
     # trust_remote_code models — matched by bare class __name__ in parallelizer
     # because their qualname includes a snapshot-hash-bearing module path.
+    "DeciLMForCausalLM": _parallelize_decilm_nemotron,
     "NemotronLabsDiffusionModel": _parallelize_nemotron_labs_diffusion,
 }
