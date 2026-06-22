@@ -75,29 +75,40 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install HybridEP
-## Dependency: RDMA Core
-RUN git clone https://github.com/linux-rdma/rdma-core.git && \
-    cd rdma-core && git checkout tags/v60.0 && sh build.sh
-ENV RDMA_CORE_HOME=/opt/rdma-core/build
-## Use stub of libnvidia-ml-dev during build only
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends libnvidia-ml-dev
+# Install HybridEP / DeepEP. Build with apt rdma-core v60 (so build==runtime libibverbs)
+# and RDMA_CORE_HOME symlinked to the system install; create the libnvshmem_host.so->.so.3
+# symlink required for DeepEP fabric handle ops; use the nvshmem wheel 3.6.5 and pin
+# DEEPEP_COMMIT to 42144303 (== 17cfb817 + DeepEP #638), which pads the HybridEP
+# max_num_of_tokens_per_rank up to the combine-kernel chunk size so a per-rank token
+# count that is not a multiple of 64 (e.g. 672) no longer fails the combine-kernel
+# static_assert (MAX_NUM_OF_TOKENS_PER_RANK % NUM_OF_TOKENS_PER_CHUNK == 0).
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG DEEPEP_COMMIT=7febc6e25660af0f54d95dd781ecdcd62265ecca
-RUN git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+ARG DEEPEP_COMMIT=42144303752422ade37f24bca9e2dde12df70e09
 ENV HYBRID_EP_MULTINODE=1
-RUN cd DeepEP && \
+ENV RDMA_CORE_HOME=/opt/rdma-core/build
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
+RUN apt-get update && apt-get install -y --allow-change-held-packages \
+        rdma-core libibverbs-dev && \
+    apt-get clean && \
+    ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH) && \
+    test -f /usr/lib/${ARCH_LIB}/libmlx5.so || \
+        ln -sf /usr/lib/${ARCH_LIB}/libmlx5.so.1 /usr/lib/${ARCH_LIB}/libmlx5.so && \
+    mkdir -p ${RDMA_CORE_HOME} && \
+    ln -sfn /usr/include ${RDMA_CORE_HOME}/include && \
+    ln -sfn /usr/lib/${ARCH_LIB} ${RDMA_CORE_HOME}/lib && \
+    git clone https://github.com/deepseek-ai/DeepEP.git && \
+    cd DeepEP && \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
-    pip install --no-cache-dir nvidia-nvshmem-cu13==3.4.5 && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 pip install --no-build-isolation . && \
-    apt-get purge -y libnvidia-ml-dev && \
-    apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/* && \
-    rm -rf /opt/deepep.patch && \
-    cd / && rm -rf DeepEP rdma-core
+    pip install --no-cache-dir nvidia-nvshmem-cu13==3.6.5 && \
+    NVSHMEM_LIB_PATH=$(pip show nvidia-nvshmem-cu13 | grep "Location:" | cut -d' ' -f2)/nvidia/nvshmem/lib && \
+    ln -sf ${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3 ${NVSHMEM_LIB_PATH}/libnvshmem_host.so && \
+    apt-get update && apt-get install -y --no-install-recommends libnvidia-ml-dev && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
+    apt-get purge -y libnvidia-ml-dev && apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* /opt/deepep.patch && \
+    cd / && rm -rf DeepEP
 
 # Install Bitsandbytes
 ARG INSTALL_BITSANDBYTES=True

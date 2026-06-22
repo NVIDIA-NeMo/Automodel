@@ -135,3 +135,37 @@ def test_is_hybrid_inner_language_model_with_no_config():
     inner_lm = SimpleNamespace(config=None)
     model = _DummyModel(config=outer_cfg, language_model=inner_lm)
     assert _is_hybrid(model) is False
+
+
+def test_is_hybrid_via_layer_types_linear_attention():
+    """Qwen3.5 / Qwen3-Next style: per-layer ``layer_types`` mixing
+    ``linear_attention`` with ``full_attention`` marks the model hybrid."""
+    cfg = SimpleNamespace(layer_types=["full_attention", "linear_attention", "full_attention"])
+    model = _DummyModel(config=cfg)
+    assert _is_hybrid(model) is True
+
+
+def test_not_hybrid_when_layer_types_all_full_attention():
+    """``layer_types`` present but with no ``linear_attention`` is not hybrid."""
+    cfg = SimpleNamespace(layer_types=["full_attention", "full_attention"])
+    model = _DummyModel(config=cfg)
+    assert _is_hybrid(model) is False
+
+
+def test_is_hybrid_via_nested_text_config_layer_types():
+    """VLM configs nest the decoder config under ``text_config``; the hybrid
+    marker (``layer_types``) lives there, so ``_is_hybrid`` must drill into it."""
+    text_cfg = SimpleNamespace(layer_types=["full_attention", "linear_attention"])
+    outer_cfg = SimpleNamespace(text_config=text_cfg)
+    model = _DummyModel(config=outer_cfg)
+    assert _is_hybrid(model) is True
+
+
+def test_is_hybrid_via_language_model_nested_text_config():
+    """language_model.config.text_config carries the hybrid ``layer_types``."""
+    text_cfg = SimpleNamespace(layer_types=["linear_attention"])
+    inner_cfg = SimpleNamespace(text_config=text_cfg)
+    inner_lm = SimpleNamespace(config=inner_cfg)
+    outer_cfg = SimpleNamespace()
+    model = _DummyModel(config=outer_cfg, language_model=inner_lm)
+    assert _is_hybrid(model) is True

@@ -125,7 +125,11 @@ class DistributedSetup:
 class MoEParallelizerConfig:
     """Configuration for MoE model parallelization (EP + FSDP settings)."""
 
-    ignore_router_for_ac: bool = False
+    # Default True: under activation checkpointing the MoE router output must be saved
+    # rather than recomputed. Recomputing the router can route a different number of tokens
+    # per expert than the forward pass, which makes torch.utils.checkpoint raise a
+    # CheckpointError on the backward recompute.
+    ignore_router_for_ac: bool = True
     reshard_after_forward: bool = False
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
     wrap_outer_model: bool = True
@@ -176,6 +180,10 @@ class FSDP2Config:
             full activation checkpointing behavior. ``"selective"`` wraps transformer blocks with PyTorch selective
             activation checkpointing.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
+        reshard_after_forward (Optional[bool]): Override layer-level FSDP2 resharding.
+            If ``None`` (default), AutoModel reshards all but the last layer outside
+            pipeline parallelism. Set ``False`` for a ZeRO-2-like benchmark where
+            gathered parameters stay resident after forward.
         enable_async_tensor_parallel (bool): Enable async tensor parallelism via
             ``torch._inductor.config._micro_pipeline_tp``.  Overlaps ReduceScatter with
             compute in row-parallel layers.  Requires ``sequence_parallel=True`` (forced
@@ -209,6 +217,7 @@ class FSDP2Config:
     autocast_dtype: Optional[torch.dtype] = None
     activation_checkpointing: ActivationCheckpointingMode = False
     defer_fsdp_grad_sync: bool = True
+    reshard_after_forward: Optional[bool] = None
     enable_async_tensor_parallel: bool = False
     enable_compile: bool = False
     enable_fsdp2_prefetch: bool = False
@@ -296,10 +305,22 @@ class DDPConfig:
         activation_checkpointing (bool): Enable activation checkpointing if True.
         find_unused_parameters (bool): Forwarded to PyTorch DDP for models with
             conditionally unused trainable parameters.
+        broadcast_buffers (bool): Synchronize module buffers before each forward.
+        static_graph (bool): Tell DDP the used/unused parameter set is stable.
+        bucket_cap_mb (Optional[float]): DDP gradient bucket size in MiB. ``None`` uses PyTorch's default.
+        gradient_as_bucket_view (bool): Make gradients views into DDP buckets after the first iteration.
+        autocast_dtype (Optional[torch.dtype]): If set, recipes can wrap the forward pass in
+            ``torch.autocast(device_type="cuda", dtype=autocast_dtype)``. Set to ``None`` to disable.
+            Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
     """
 
     activation_checkpointing: bool = False
+    broadcast_buffers: bool = False
     find_unused_parameters: bool = False
+    static_graph: bool = False
+    bucket_cap_mb: Optional[float] = None
+    gradient_as_bucket_view: bool = False
+    autocast_dtype: Optional[torch.dtype] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""

@@ -129,7 +129,7 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -493,9 +493,14 @@ class TestQwen3_5MoeForConditionalGeneration:
     def test_initialization_configures_backend_components(self, vl_config, backend_config, moe_config):
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
 
-        assert model.backend is backend_config
+        assert model.backend is not backend_config
+        assert model.backend.attn == backend_config.attn
+        assert model.backend.linear == backend_config.linear
+        assert model.backend.rms_norm == backend_config.rms_norm
+        assert model.backend.rope_fusion is False
         assert isinstance(model.model, Qwen3_5MoeModel)
         assert isinstance(model.model.language_model, Qwen3_5MoeTextModelBackend)
+        assert model.model.language_model.backend is model.backend
         assert model.model.moe_config is model.model.language_model.moe_config
 
         vision_model = getattr(model.model, "visual")
@@ -651,8 +656,12 @@ class TestQwen3_5MoeForConditionalGeneration:
 # from_pretrained / ModelClass export tests
 # ---------------------------------------------------------------------------
 class TestQwen3_5MoeFromPretrainedAndModelClass:
-    def test_from_pretrained_classmethod(self):
-        cfg = Qwen3_5MoeConfig()
+    def test_from_pretrained_classmethod(self, vl_config):
+        # Use the tiny `vl_config` fixture instead of the default ``Qwen3_5MoeConfig()``,
+        # which describes the full ~30B model (40 layers, 256 experts, 248K vocab) and
+        # takes minutes to materialize on GPU. The classmethod's delegation behaviour is
+        # identical regardless of model size.
+        cfg = vl_config
         cfg.text_config.pad_token_id = 0
 
         with (
@@ -1012,7 +1021,11 @@ class TestFromConfigDirect:
         model = Qwen3_5MoeForConditionalGeneration.from_config(vl_config, moe_config=moe_config, backend=backend_config)
 
         assert isinstance(model, Qwen3_5MoeForConditionalGeneration)
-        assert model.backend is backend_config
+        assert model.backend is not backend_config
+        assert model.backend.attn == backend_config.attn
+        assert model.backend.linear == backend_config.linear
+        assert model.backend.rms_norm == backend_config.rms_norm
+        assert model.backend.rope_fusion is False
 
 
 # ---------------------------------------------------------------------------

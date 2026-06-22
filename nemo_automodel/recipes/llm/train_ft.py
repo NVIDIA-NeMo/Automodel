@@ -59,6 +59,7 @@ from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
@@ -583,6 +584,15 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             val_ds_name = "default"
         return val_ds_name
 
+    # Pack the validation set the same way as training when the attention backend
+    # consumes a THD/cu_seqlens layout. Besides TE, the magi backend also packs (and,
+    # at cp>1, shards) THD sequences; leaving validation unpacked would feed magi tiny
+    # per-example sequences that cp-sharding splits degenerately, inflating val loss.
+    _magi_backend = (
+        str(cfg.get("model.backend.attn", "")) == "magi" or str(cfg.get("model.attn_implementation", "")) == "magi"
+    )
+    _pack_val = (_uses_te_dot_product_attention(cfg.model) or _magi_backend) and _uses_thd_collater(cfg.dataloader)
+
     # Build validation dataloader if the config provides it
     val_dataloaders = {}
     for val_ds_name in filter(lambda x: x.startswith("validation_dataset"), cfg.to_dict().keys()):
@@ -592,9 +602,7 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             val_ds_cfg,
             cfg.validation_dataloader,
             cfg.model,
-            cfg_ps=cfg.get("packed_sequence", None)
-            if _uses_te_dot_product_attention(cfg.model) and _uses_thd_collater(cfg.dataloader)
-            else None,
+            cfg_ps=cfg.get("packed_sequence", None) if _pack_val else None,
             seed=cfg.get("seed", 42),
             local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
             global_batch_size=cfg.get("step_scheduler.global_batch_size", 1),
@@ -620,6 +628,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
     This class orchestrates training, from setup to main training loop.
     """
+
+    # MagiAttention is disabled until setup() resolves it from config; this
+    # disabled default keeps _forward_backward_step working if setup() is skipped
+    # (e.g. unit tests that exercise the step directly). It is read-only.
+    magi = MagiState()
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -669,6 +682,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
         )
 
+        # MagiAttention (FFA / context-parallel) backend, enabled via
+        # model.attn_implementation="magi" (HF) or model.backend.attn="magi" (custom).
+        self.magi = setup_magi(self.cfg, self.device_mesh)
+
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
@@ -692,6 +709,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build loss_fn (will be set on pipeline_config if PP enabled)
         self.loss_fn = self.cfg.loss_fn.build()
+        if self.magi.hf_dispatch and isinstance(self.loss_fn, FusedLinearCrossEntropy):  # pragma: no cover
+            raise ValueError(
+                "The magi HF backend needs full logits and is incompatible with "
+                "FusedLinearCrossEntropy; use a logits-based loss (e.g. MaskedCrossEntropy)."
+            )
 
         # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
         if self.pp_enabled:
@@ -1117,13 +1139,32 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream.
         _use_te_value = _thd_collater
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
-        train_ctx, batch = make_cp_batch_and_ctx(
-            self.device_mesh,
-            batch,
-            use_te=_use_te_value,
-            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-            num_chunks=_num_chunks_value,
-        )
+        cp_size = getattr(getattr(self, "dist_setup", None), "cp_size", self.cfg.get("distributed.cp_size", 1))
+        if self.magi.enabled:
+            train_ctx, batch = self.magi.prepare_llm_batch(  # pragma: no cover - requires GPU + magi_attention
+                self.model_parts[0] if hasattr(self, "model_parts") else None,
+                batch,
+                device_mesh=self.device_mesh,
+                is_thd=_thd_collater,
+                pad_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
+                num_chunks=_num_chunks_value,
+            )
+        else:
+            # Model-owned context parallelism: if the model exposes a CP input-prep
+            # hook, let it attach its own batch-sharding callable (``_cp_make_batch_fn``)
+            # before make_cp_batch_and_ctx shards the batch, instead of the default
+            # load-balanced context_parallel path. DSV4 uses this for its Miles-style
+            # contiguous query shard + all-gathered K/V.
+            _model_cp = self.model_parts[0] if hasattr(self, "model_parts") else None
+            if cp_size > 1 and _model_cp is not None and hasattr(_model_cp, "prepare_model_inputs_for_cp"):
+                batch.update(_model_cp.prepare_model_inputs_for_cp(input_ids=batch["input_ids"]))
+            train_ctx, batch = make_cp_batch_and_ctx(
+                self.device_mesh,
+                batch,
+                use_te=_use_te_value,
+                padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
+                num_chunks=_num_chunks_value,
+            )
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
@@ -1225,6 +1266,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
                         cu_seqlens=batch.get("cu_seqlens"),
                     )
+                # Model-owned CP (e.g. DSV4) can request a zero-valued full-logits
+                # term so every CP rank's backward reaches all parameters even when
+                # its local loss is fully masked (avoids FSDP2 unused-parameter hangs).
+                if is_train and batch.get("_cp_full_logits_grad_touch"):
+                    logits = getattr(out, "logits", out)
+                    if isinstance(logits, torch.Tensor):
+                        # Promote to fp32 before summing: bf16 logits over a large
+                        # vocab (e.g. DSV4's 129280) overflow to inf, and inf * 0.0
+                        # would be nan, poisoning local_loss and the backward pass.
+                        local_loss = local_loss + logits.float().sum() * 0.0
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()

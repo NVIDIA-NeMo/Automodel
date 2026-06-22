@@ -76,6 +76,7 @@ checkpoint:
   restore_from: null
 
 wandb:
+  enable: false
   project: hunyuan-video-training
   mode: online
   name: 720p_t2v_run

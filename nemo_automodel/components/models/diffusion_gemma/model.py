@@ -75,6 +75,7 @@ except (ModuleNotFoundError, ImportError):
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 
@@ -349,6 +350,10 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
     config_class = DiffusionGemmaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
+    # RoPE inv_freq must stay fp32: initialize_weights casts the model to bf16 and
+    # nn.Module.to rounds floating buffers; cast_model_to_dtype restores keep-fp32
+    # modules afterwards (see llama/rope_utils.py).
+    _keep_in_fp32_modules = ["rotary_emb"]
     _no_split_modules = ["DiffusionGemmaMoEDecoderLayer"]
     _tied_weights_keys = ["lm_head.weight"]
 
@@ -503,7 +508,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         with buffer_device:
             for layer in self.model.layers.values():
                 layer.moe.init_weights(buffer_device)
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
 
     def _softcap_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.lm_head(hidden_states).to(torch.float32)

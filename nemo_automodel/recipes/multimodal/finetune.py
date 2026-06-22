@@ -522,12 +522,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 seed=self.global_seed,
                 cfg_fp8=self.cfg.get("fp8", None),
                 cfg_compile=self.cfg.get("compile", None),
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                distributed_config=self.distributed_config,
-                pipeline_config=self.pipeline_config,
-                cfg_moe=self.moe_parallel_config,
-                activation_checkpointing=self.activation_checkpointing,
+                distributed_setup=self.distributed_setup,
             )
         else:
             raise ValueError(f"Unsupported model.init_mode={model_init_mode!r}; expected 'auto' or 'hf_backbones'.")

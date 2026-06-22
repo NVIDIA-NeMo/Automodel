@@ -144,13 +144,21 @@ fi
 echo "============================================"
 echo "[finetune] Running finetuning..."
 echo "============================================"
+# The recipe rejects configs that contain both 'fsdp' and 'ddp' sections, and
+# a --fsdp.* CLI override injects an 'fsdp' section. Only pass it for FSDP
+# recipes; DDP replicates across all ranks and needs no dp_size.
+DIST_OVERRIDE="--fsdp.dp_size ${NPROC_PER_NODE}"
+if grep -qE '^ddp:' "/opt/Automodel/${CONFIG_PATH}"; then
+    DIST_OVERRIDE=""
+fi
+
 CONFIG="--config /opt/Automodel/${CONFIG_PATH} \
     --data.dataloader.cache_dir $DATA_DIR/cache \
     --checkpoint.checkpoint_dir $CKPT_DIR \
     --step_scheduler.max_steps ${MAX_STEPS:-100} \
     --step_scheduler.ckpt_every_steps 100 \
     --step_scheduler.save_checkpoint_every_epoch false \
-    --fsdp.dp_size ${NPROC_PER_NODE} \
+    ${DIST_OVERRIDE} \
     --wandb.mode disabled"
 
 CMD="uv run --extra diffusion torchrun --nproc-per-node=${NPROC_PER_NODE} \

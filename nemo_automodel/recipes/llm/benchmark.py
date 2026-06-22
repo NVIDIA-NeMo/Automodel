@@ -159,6 +159,16 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         flops = flops_formula(self.model_parts[0].config, gbs=global_batch_size, seq_len=seq_len)
         self.tflops = flops / (10**12)
 
+        # Add Multi-Token-Prediction (MTP) head FLOPs (e.g. Nemotron-3 Ultra). The backbone
+        # FLOPs formula omits the MTP head, and the HF config retains only the physical depth
+        # count, so read the effective settings (depths run, repeated-layer flag, per-depth
+        # block types) from the built model.
+        backbone_tflops = self.tflops
+        mtp_tflops = self._mtp_tflops(global_batch_size, seq_len)
+        self.tflops += mtp_tflops
+        if self.dist_env.is_main:
+            logger.info(f"MTP TFLOPs/GPU: {mtp_tflops:.6f} (backbone {backbone_tflops:.6f}, total {self.tflops:.6f})")
+
         if hasattr(self.cfg, "peft"):
             # Calculate trainable vs non-trainable parameters
             # Need to get these before autopipeline splits the model across PP ranks
@@ -211,6 +221,40 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             reset=True,
             barrier=True,
         )
+
+    def _mtp_tflops(self, global_batch_size, seq_len):
+        """TFLOPs added by a Multi-Token-Prediction (MTP) head, if the model has one.
+
+        The backbone FLOPs formula omits the MTP head, and the HF config retains only the
+        physical depth count (and no per-depth block pattern). So read the EFFECTIVE settings
+        from the built model: ``mtp_config.num_layers`` (depths actually run),
+        ``mtp_config.use_repeated_layer``, and the per-sublayer ``block_type`` from
+        ``mtp.layers``. Returns 0.0 when the model has no enabled MTP head.
+        """
+        from nemo_automodel.components.utils.flops_utils import _nemotronh_mtp_flops
+
+        for mp in self.model_parts:
+            mtp_cfg = getattr(mp, "mtp_config", None)
+            mtp = getattr(mp, "mtp", None)
+            layers = getattr(mtp, "layers", None) if mtp is not None else None
+            if mtp_cfg is None or not getattr(mtp_cfg, "enabled", False) or layers is None:
+                continue
+            block_types = [getattr(s, "block_type", "moe") for s in layers]
+            flops = _nemotronh_mtp_flops(
+                mp.config,
+                global_batch_size,
+                seq_len,
+                mtp_cfg.num_layers,
+                block_types,
+                mtp_cfg.use_repeated_layer,
+            )
+            if self.dist_env.is_main:
+                logger.info(
+                    f"MTP head FLOPs: N={mtp_cfg.num_layers} repeated={mtp_cfg.use_repeated_layer} "
+                    f"blocks={block_types} -> +{flops / (10**12):.6f} TFLOPs"
+                )
+            return flops / (10**12)
+        return 0.0
 
     def run_benchmark(self):
         """Run the benchmarking loop.

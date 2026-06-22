@@ -87,9 +87,25 @@ class TestParsing:
         assert result["strategy_config"].zero_dp_strategy == 3
 
     def test_ddp(self):
-        result = parse_distributed_section({"strategy": "ddp"})
+        result = parse_distributed_section(
+            {
+                "strategy": "ddp",
+                "broadcast_buffers": True,
+                "find_unused_parameters": True,
+                "static_graph": True,
+                "bucket_cap_mb": 64,
+                "gradient_as_bucket_view": True,
+                "autocast_dtype": "bfloat16",
+            }
+        )
         assert isinstance(result["strategy_config"], DDPConfig)
         assert result["strategy_config"].activation_checkpointing is False
+        assert result["strategy_config"].broadcast_buffers is True
+        assert result["strategy_config"].find_unused_parameters is True
+        assert result["strategy_config"].static_graph is True
+        assert result["strategy_config"].bucket_cap_mb == 64
+        assert result["strategy_config"].gradient_as_bucket_view is True
+        assert result["strategy_config"].autocast_dtype == torch.bfloat16
 
     def test_all_parallelism_keys(self):
         cfg = {
@@ -100,6 +116,7 @@ class TestParsing:
             "cp_size": 2,
             "ep_size": 2,
             "dp_replicate_size": 2,
+            "pipeline": {},  # pp_size>1 requires a pipeline block (empty = defaults)
         }
         result = parse_distributed_section(cfg)
         assert result["dp_size"] == 4
@@ -156,21 +173,32 @@ class TestPipeline:
         assert result["pipeline_config"].pp_schedule == "1f1b"
 
     def test_pp_enabled_true_when_pp_gt_1(self):
-        assert parse_distributed_section({"pp_size": 2})["pp_enabled"] is True
+        assert parse_distributed_section({"pp_size": 2, "pipeline": {}})["pp_enabled"] is True
 
-    def test_default_pipeline_config_created_when_pp_gt_1_and_no_pipeline_dict(self):
-        """pp_size > 1 without a pipeline section must still yield a PipelineConfig."""
-        result = parse_distributed_section({"pp_size": 4})
-        assert result["pp_enabled"] is True
-        assert isinstance(result["pipeline_config"], PipelineConfig)
-        assert result["pipeline_config"].pp_schedule == "1f1b"
+    def test_pp_gt_1_without_pipeline_raises(self):
+        """pp_size > 1 with no pipeline section is an unambiguous misconfiguration
+        (PP requested but schedule/microbatch unspecified), so it must raise. An
+        explicit empty `pipeline: {}` opts into defaults instead."""
+        with pytest.raises(ValueError, match="pipeline"):
+            parse_distributed_section({"pp_size": 4})
 
     def test_pp_enabled_false_when_pp_eq_1(self):
         assert parse_distributed_section({"pp_size": 1})["pp_enabled"] is False
 
+    def test_pipeline_with_pp_le_1_warns_and_is_dropped(self, caplog):
+        """A pipeline block with pp_size<=1 is inert: it is dropped (not an error) and a
+        warning is logged. Recipes legitimately keep the section as a reference and toggle
+        pp_size via CLI (e.g. ep8/pp1 vs ep4/pp2 parity debugging)."""
+        cfg = {"pp_size": 1, "pipeline": {"pp_schedule": "1f1b", "pp_microbatch_size": 4}}
+        with caplog.at_level("WARNING"):
+            result = parse_distributed_section(cfg)
+        assert result["pipeline_config"] is None
+        assert result["pp_enabled"] is False
+        assert "pipeline parallelism is disabled" in caplog.text
+
     def test_pipeline_dtype_defaults_to_mp_policy_output_dtype(self):
         """Unset pipeline.dtype is derived from the FSDP mp_policy output dtype (bf16 default)."""
-        result = parse_distributed_section({"pp_size": 2})
+        result = parse_distributed_section({"pp_size": 2, "pipeline": {}})
         assert result["pipeline_config"].dtype == torch.bfloat16
 
     def test_pipeline_dtype_explicit_match_kept(self, caplog):
@@ -217,7 +245,7 @@ class TestMoE:
     def test_empty_moe_dict_uses_defaults(self):
         result = parse_distributed_section({"ep_size": 2, "moe": {}})
         assert isinstance(result["moe_parallel_config"], MoEParallelizerConfig)
-        assert result["moe_parallel_config"].ignore_router_for_ac is False
+        assert result["moe_parallel_config"].ignore_router_for_ac is True
 
     def test_mp_policy_none_when_omitted(self):
         result = parse_distributed_section({"ep_size": 2, "moe": {}})
@@ -375,14 +403,14 @@ class TestValidation:
             parse_distributed_section({"strategy": "unknown"})
 
     def test_pipeline_requires_pp_gt_1(self):
-        """Pipeline section is silently discarded when pp_size <= 1
+        """Pipeline section is discarded (with a warning) when pp_size <= 1
         (common when a YAML template is overridden via CLI)."""
         result = parse_distributed_section({"pp_size": 1, "pipeline": {"pp_schedule": "1f1b"}})
         assert result["pipeline_config"] is None
         assert result["pp_enabled"] is False
 
     def test_pipeline_rejects_default_pp_size(self):
-        """Pipeline section is silently discarded when pp_size defaults to 1."""
+        """Pipeline section is discarded (with a warning) when pp_size defaults to 1."""
         result = parse_distributed_section({"pipeline": {"pp_schedule": "1f1b"}})
         assert result["pipeline_config"] is None
         assert result["pp_enabled"] is False

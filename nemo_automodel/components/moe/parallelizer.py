@@ -210,7 +210,7 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
 
 def apply_ac(
     model: nn.Module,
-    ignore_router: bool = False,
+    ignore_router: bool = True,
     hidden_size: int | None = None,
     num_experts: int | None = None,
     selective: bool = False,
@@ -219,7 +219,9 @@ def apply_ac(
 
     Args:
         model: The model to apply activation checkpointing to.
-        ignore_router: If True, uses selective checkpointing that saves router outputs.
+        ignore_router: If True (the default), saves the MoE router output so the dispatch
+            is not recomputed under activation checkpointing (avoids a CheckpointError from
+            non-deterministic re-routing on recompute). If False, a warning is emitted.
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
         num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
             first, then falls back to model.config attributes.
@@ -228,6 +230,16 @@ def apply_ac(
             ``ignore_router``; the shared policy already saves expert-parallel communication
             collectives and ``topk``, so it composes with expert parallelism.
     """
+    if not selective and not ignore_router:
+        logger.warning(
+            "Activation checkpointing is enabled with ignore_router_for_ac=False. The MoE "
+            "router/dispatch will be recomputed in the backward pass, which can route a "
+            "different number of tokens per expert than the forward pass and crash with "
+            "torch.utils.checkpoint.CheckpointError ('Recomputed values ... have different "
+            "metadata'). Set ignore_router_for_ac=True (the default) to save the router "
+            "output and keep routing consistent across recompute."
+        )
+
     if selective:
         # Reuse the dense FSDP2 selective policy so the save-op set (attention,
         # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
@@ -295,7 +307,27 @@ def apply_ac(
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
 
+    # Weight-tied (use_repeated_layer) MTP head blocks must NOT be activation
+    # checkpointed: the single physical block is recomputed once per MTP depth in
+    # backward, and FSDP2 cannot re-unshard the *shared* EP-sharded experts param
+    # group on the 2nd+ recompute (the 1st recompute's post_backward reshards it, and
+    # the 2nd recompute's pre_forward unshard does not re-gather it) -> the experts
+    # weight is read in the resharded Shard(1) state and grouped_gemm raises
+    # "Expected hidden_in == a.size(1)". The MTP head is tiny (1 physical block), so
+    # skipping its recompute costs negligible activation memory. Non-tied MTP heads
+    # (each physical block recomputed exactly once) are unaffected and keep AC.
+    mtp_module = getattr(model, "mtp", None)
+    mtp_block_ids: set[int] = set()
+    mtp_repeated = False
+    if mtp_module is not None and hasattr(mtp_module, "layers"):
+        mtp_block_ids = {id(b) for b in mtp_module.layers.children()}
+        mtp_repeated = bool(getattr(getattr(mtp_module, "mtp_config", None), "use_repeated_layer", False))
+    if mtp_repeated and mtp_block_ids:
+        logger.info("Skipping activation checkpointing on %d weight-tied MTP head block(s)", len(mtp_block_ids))
+
     for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+        if mtp_repeated and id(block) in mtp_block_ids:
+            continue
         if ignore_router and hasattr(block, "set_activation_checkpointing"):
             block.set_activation_checkpointing(True)
         elif ignore_router:
@@ -308,6 +340,44 @@ def apply_ac(
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
 
         parent_layers.register_module(layer_id, block)
+
+
+def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):
+    """Shard each ``_fp32_params`` holder in ``block`` as its own fp32 FSDP unit.
+
+    Model implementations own the architecture-specific decision to create these
+    holders (for example Qwen3.5/Qwen3-Next GatedDeltaNet ``A_log``/``dt_bias``).
+    FSDP only treats the holder as a dtype-uniform fp32 unit and excludes its params
+    from the block's bf16 FSDP unit.
+
+    Returns the set of holder parameters to exclude from the block's FSDP wrap.
+    Blocks that do not expose ``named_modules`` (e.g. non-``nn.Module`` test
+    stubs) cannot hold fp32 holders, so an empty set is returned.
+    """
+    if not hasattr(block, "named_modules"):
+        return set()
+    fp32_mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.float32,
+        cast_forward_inputs=False,
+    )
+    ignored: set = set()
+    for name, sub in block.named_modules():
+        if not name.endswith("_fp32_params"):
+            continue
+        holder_params = list(sub.parameters(recurse=False))
+        if not holder_params:
+            continue
+        fully_shard(
+            sub,
+            mesh=fsdp_mesh,
+            reshard_after_forward=reshard_after_forward,
+            mp_policy=fp32_mp_policy,
+            offload_policy=offload_policy,
+        )
+        ignored.update(holder_params)
+    return ignored
 
 
 def apply_fsdp(
@@ -356,8 +426,21 @@ def apply_fsdp(
     # Prefer nested text modules when present (VLM models)
     _model = get_text_module(_model)
 
+    # MTP auxiliary-head blocks keep their EP-sharded experts un-resharded
+    # (reshard_after_forward=False) even when the backbone reshards. The MTP head is
+    # tiny (1-2 MoE sublayers) so keeping its experts gathered costs negligible resident
+    # memory, while it removes FSDP2 unshard fragility for the weight-tied head whose
+    # single physical experts param group is used multiple times per step (see apply_ac,
+    # which skips AC on these blocks for the same reason). Bulk backbone experts keep the
+    # configured reshard_after_forward.
+    mtp_module = getattr(model, "mtp", None)
+    mtp_block_ids = set()
+    if mtp_module is not None and hasattr(mtp_module, "layers"):
+        mtp_block_ids = {id(b) for b in mtp_module.layers.children()}
+
     for block in _iter_moe_blocks(model, _model):
         moe_module = _get_moe_module(block)
+        experts_reshard_after_forward = False if id(block) in mtp_block_ids else reshard_after_forward
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
@@ -369,7 +452,7 @@ def apply_fsdp(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=_moe_shard_placement,
-                reshard_after_forward=reshard_after_forward,
+                reshard_after_forward=experts_reshard_after_forward,
                 mp_policy=mp_policy,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
@@ -381,6 +464,12 @@ def apply_fsdp(
         ignored_params = None
         if isinstance(moe_module, MoE) and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())
+
+        # Shard model-owned fp32 holders on their own and exclude their params from
+        # the block's FSDP unit to keep the block dtype-uniform.
+        fp32_ignored = _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy)
+        if fp32_ignored:
+            ignored_params = (ignored_params or set()) | fp32_ignored
         fully_shard_default(block, ignored_params=ignored_params)
 
     # Re-establish weight tying before detecting it: a device/dtype move during
@@ -478,29 +567,41 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     # Prefer nested text modules when present (VLM models)
     _model = get_text_module(_model)
 
-    # Set model-level flag so the forward pass can null out attention_mask.
+    # Set CP flags so wrapper and text-module forward paths can prepare
+    # full-sequence embeddings and null out local attention masks.
     # With CP the mask is not sharded along the sequence dim and TE asserts
     # "Padding mask not supported with context parallelism!".
+    model._cp_enabled = True
     _model._cp_enabled = True
 
+    # Route each attention block's CP setup by capability:
+    #   * TE DotProductAttention -> TE's own context-parallel group;
+    #   * a module exposing setup_cp_attention (e.g. Gemma4's p2p ring) -> installs
+    #     its own CP attention + mask handling (model-owned, like TE/DSV4).
+    # Any other (non-TE, non-model-owned) attention is not supported under CP here.
     for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
         if layer_type in ("full_attention", "sliding_attention"):
-            attn_module = block.self_attn.attn_module
-            if not isinstance(attn_module, DotProductAttention):
-                logger.warning(
-                    "Skipping CP setup for block with non-TE attention module: %s",
-                    type(attn_module).__name__,
+            attn_module = getattr(block.self_attn, "attn_module", None)
+            if isinstance(attn_module, DotProductAttention):
+                attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
+                attn_module.set_context_parallel_group(
+                    cp_mesh.get_group(),
+                    torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
+                    _get_cp_stream(),
+                    cp_comm_type=attn_cp_comm_type,
                 )
-                continue
-            attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
-            attn_module.set_context_parallel_group(
-                cp_mesh.get_group(),
-                torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
-                _get_cp_stream(),
-                cp_comm_type=attn_cp_comm_type,
-            )
+            elif hasattr(block.self_attn, "setup_cp_attention"):
+                # Model-owned CP attention (e.g. Gemma4's p2p ring): the model
+                # installs its own SDPA hook + mask handling.
+                block.self_attn.setup_cp_attention(cp_mesh)
+            else:
+                logger.warning(
+                    "Skipping CP setup for block with unsupported attention module "
+                    "(neither TE DotProductAttention nor model-owned setup_cp_attention): %s",
+                    type(attn_module).__name__ if attn_module is not None else type(block.self_attn).__name__,
+                )
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
 
@@ -541,7 +642,7 @@ def parallelize_model(
     ep_axis_name: str | None = None,
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool | str = False,
-    ignore_router_for_ac: bool = False,
+    ignore_router_for_ac: bool = True,
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,

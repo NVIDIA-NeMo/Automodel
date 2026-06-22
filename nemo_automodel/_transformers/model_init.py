@@ -60,6 +60,10 @@ import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
+from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
+    has_gated_delta_net_fp32_checkpoint_contract,
+    is_gated_delta_net_fp32_param_key,
+)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
 from nemo_automodel.shared.utils import dtype_from_str
@@ -247,6 +251,18 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     kwargs = kwargs.copy()
     trust_remote_code = kwargs.pop("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
     hf_config = kwargs.get("config", None)
+    # A plain-dict ``config`` (e.g. from CLI ``--model.config.num_hidden_layers 16``,
+    # which the config loader materializes as a dict, not a PretrainedConfig) is a set
+    # of config *overrides*, not a finished config object. Treat it as such: drop it
+    # from ``config`` and fold its keys into the kwargs that AutoConfig.from_pretrained
+    # applies as overrides. Returning the raw dict instead would break every downstream
+    # consumer that expects a config object (e.g. get_architectures -> the custom-model
+    # resolver, which would then mis-dispatch to the stock-HF path and reject custom
+    # kwargs like ``backend``).
+    if isinstance(hf_config, dict):
+        kwargs.pop("config", None)
+        kwargs.update(hf_config)
+        hf_config = None
     if hf_config is None:
         # Filter out nested dict kwargs before passing to AutoConfig.from_pretrained.
         # Nested dicts (e.g. text_config={"key": val}) would replace entire sub-configs
@@ -662,6 +678,7 @@ def _restore_loaded_model_dtype(
     if not checkpoint_dtypes:
         return
 
+    preserve_gdn_fp32_params = has_gated_delta_net_fp32_checkpoint_contract(hf_config)
     restored_dtype_by_tensor_id: dict[int, torch.dtype] = {}
     restored_count = 0
     for name, checkpoint_dtype in checkpoint_dtypes.items():
@@ -669,22 +686,34 @@ def _restore_loaded_model_dtype(
         if tensor is None:
             continue
 
+        effective_checkpoint_dtype = (
+            torch.float32
+            if checkpoint_dtype.is_floating_point
+            and preserve_gdn_fp32_params
+            and is_gated_delta_net_fp32_param_key(name)
+            else checkpoint_dtype
+        )
+
         # Record the checkpoint's original dtype on the tensor as the compute-dtype
         # hint. Storage may be upcast below (fp32 master weights), which erases the
         # dtype HF intended for compute; downstream sharding (fully_shard_by_dtype)
         # reads ``_hf_compute_dtype`` to keep intrinsically-fp32 params (e.g. ``A_log``)
         # computing in fp32 while the bulk computes in mp_policy.param_dtype.
-        if checkpoint_dtype.is_floating_point and tensor.dtype.is_floating_point:
-            tensor._hf_compute_dtype = checkpoint_dtype
+        if effective_checkpoint_dtype.is_floating_point and tensor.dtype.is_floating_point:
+            tensor._hf_compute_dtype = effective_checkpoint_dtype
 
         # Pick the unification target. For an explicit floating request, take the
         # wider of (checkpoint, requested) so explicit fp32 is honored as master
         # weights while intrinsically-fp32 checkpoint params survive a bf16 request.
         # For "auto" (requested_dtype is None) or non-floating tensors, mirror the
         # checkpoint dtype exactly (preserves today's behavior).
-        target_dtype = checkpoint_dtype
-        if requested_dtype is not None and checkpoint_dtype.is_floating_point and tensor.dtype.is_floating_point:
-            target_dtype = torch.promote_types(checkpoint_dtype, requested_dtype)
+        target_dtype = effective_checkpoint_dtype
+        if (
+            requested_dtype is not None
+            and effective_checkpoint_dtype.is_floating_point
+            and tensor.dtype.is_floating_point
+        ):
+            target_dtype = torch.promote_types(effective_checkpoint_dtype, requested_dtype)
 
         if tensor.dtype == target_dtype:
             continue
@@ -738,6 +767,13 @@ def __init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
+    # A plain-dict ``config`` override (e.g. from ``--model.config.num_hidden_layers``)
+    # has already been folded into ``hf_config`` by ``get_hf_config`` above. Drop it from
+    # kwargs so it is not also forwarded into the model constructor / HF from_pretrained
+    # (custom path passes ``hf_config`` positionally as ``config`` -> would collide;
+    # stock-HF path does not accept a dict ``config``).
+    if isinstance(kwargs.get("config"), dict):
+        kwargs.pop("config", None)
     architectures = get_architectures(hf_config)
 
     # Propagate the user-requested dtype to the top-level config and every nested

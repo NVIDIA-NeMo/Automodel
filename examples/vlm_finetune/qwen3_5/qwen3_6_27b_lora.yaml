@@ -39,6 +39,12 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.6-27B
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch
+    rope_fusion: false
   attn_implementation: sdpa
   torch_dtype: bfloat16
 
@@ -120,6 +126,10 @@ optimizer:
   eps: 1e-8
   lr: 1.0e-4
   weight_decay: 0.01
+
+ci:
+  env_vars:
+    MAX_STEPS: 10
 
 # wandb:
 #   project: <your_wandb_project>

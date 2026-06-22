@@ -63,7 +63,7 @@ model:
     linear: te
     rms_norm: te
     experts: gmm
-    dispatcher: deepep
+    dispatcher: hybridep
     fake_balanced_gate: false
     enable_fsdp_optimizations: false
 
@@ -133,3 +133,8 @@ lr_scheduler:
   lr_decay_style: cosine
   lr_warmup_steps: 10
   min_lr: 1.0e-5
+
+ci:
+  # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
+  recipe_owner: adil-a
+  nodes: 4

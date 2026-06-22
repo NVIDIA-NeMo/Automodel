@@ -33,6 +33,8 @@ model:
   # directory as a sidecar.
   # vae_path: /path/to/ae.safetensors
   # max_latent_size: 64
+  # Set to 0 to encode the whole image batch at once.
+  vae_encode_micro_batch_size: 1
 
 checkpoint:
   enabled: false
@@ -163,6 +165,7 @@ ema:
   decay: 0.9999
 
 wandb:
+  enable: false
   project: bagel-finetuning
   mode: disabled
   name: bagel_7b_mot_sft

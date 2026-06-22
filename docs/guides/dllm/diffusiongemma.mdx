@@ -1,7 +1,5 @@
----
-title: "Fine-Tuning DiffusionGemma with NeMo AutoModel"
-description: ""
----
+# Fine-Tune DiffusionGemma
+
 ## Introduction
 
 **DiffusionGemma** is a block-diffusion language model. Unlike an autoregressive (AR)
@@ -16,7 +14,7 @@ with both **full fine-tuning** and **LoRA**.
 The released checkpoint is available on the Hugging Face Hub:
 [`google/diffusiongemma-26B-A4B-it`](https://huggingface.co/google/diffusiongemma-26B-A4B-it).
 
-### Workflow overview
+### Workflow Overview
 
 | Step | What you do |
 |------|-------------|
@@ -30,7 +28,7 @@ The released checkpoint is available on the Hugging Face Hub:
 DiffusionGemma couples a **causal encoder** with a **bidirectional decoder**:
 
 - **Encoder** reads the clean prompt + response sequence with causal attention.
-- **Decoder** denoises the **canvas** — the response region — with bidirectional
+- **Decoder** denoises the **canvas** (the response region) with bidirectional
   (block-causal) attention, predicting the clean token at every canvas position.
 
 Key training mechanics, all handled by the `DiffusionGemmaSFTRecipe`:
@@ -42,11 +40,11 @@ Key training mechanics, all handled by the `DiffusionGemmaSFTRecipe`:
 - **Self-conditioning.** The decoder optionally conditions on its own previous prediction,
   mixed in per example during training.
 - **Frozen router.** The MoE router is kept frozen during SFT; experts and dense layers
-  are trained (full SFT) or adapted via LoRA.
+  are trained (full SFT) or adapted using LoRA.
 - **Single-turn SFT.** The loss supervises the final response turn; multi-turn histories
   are masked.
 
-The recipe runs with **FSDP2 + expert parallelism (EP=8)** and **mixed precision**
+The recipe uses **FSDP2 with expert parallelism (EP=8)** and **mixed precision**
 (fp32 master weights, bf16 compute), with a canvas length of 256.
 
 ## Launch Training
@@ -90,16 +88,22 @@ The SFT and LoRA training curves on GSM8K (first 200 steps) are shown below.
 
 **SFT**
 
-![DiffusionGemma SFT training curves](./diffusiongemma_sft.png)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/dllm/diffusiongemma_sft.png" alt="DiffusionGemma SFT training curves" width="900">
+</p>
 
 **LoRA**
 
-![DiffusionGemma LoRA training curves](./diffusiongemma_lora.png)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/dllm/diffusiongemma_lora.png" alt="DiffusionGemma LoRA training curves" width="900">
+</p>
 
 
 ## Requirements
 
 > **Note:** This recipe requires `transformers >= 5.11.0` — the `DiffusionGemma`
 > model was only added to `transformers` in 5.11, so earlier versions can't load
-> the checkpoint. Please install a compatible `transformers` version in your
+> **Note:** This recipe requires `transformers >= 5.11.0`. The `DiffusionGemma`
+> model was only added to `transformers` in 5.11, so earlier versions cannot load
+> the checkpoint. Install a compatible `transformers` version in your
 > environment before running this recipe.

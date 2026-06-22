@@ -202,6 +202,18 @@ def _default_init_device() -> torch.device:
     return torch.device("cpu")
 
 
+def _qwen3_5_moe_backend(backend: BackendConfig | None = None) -> BackendConfig:
+    """Return a Qwen3.5-MoE backend with TE fused RoPE disabled.
+
+    The Qwen3.5 full-attention blocks reuse Qwen3-Next attention, and VLM/packed
+    execution can present THD-shaped q/k tensors. TE fused RoPE expects 4D inputs
+    in this path, so use non-fused RoPE while preserving the rest of the backend.
+    """
+    resolved = copy.copy(backend) if backend is not None else BackendConfig()
+    resolved.rope_fusion = False
+    return resolved
+
+
 def build_mtp_config_from_hf(
     config: Any,
     *,
@@ -726,7 +738,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     ):
         if not _QWEN3_5_MOE_HF_AVAILABLE:
             raise UnavailableError("transformers.models.qwen3_5_moe is not available.")
-        backend = backend or BackendConfig()
+        backend = _qwen3_5_moe_backend(backend)
 
         # _init_model() only overrides the top-level hf_config.torch_dtype; for
         # VL configs the nested text_config / vision_config keep their original
@@ -785,6 +797,16 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Expose moe_config for FSDP sync mixin
         self.model.moe_config = self.model.language_model.moe_config
+
+        # Keep the SSM-gating params (A_log/dt_bias) — isolated in each
+        # linear_attn ``_fp32_params`` holder at construction — in fp32 storage
+        # even when the model's bulk dtype is bf16, matching the intrinsically-fp32
+        # dtype Qwen3.5 checkpoints store them in. cast_model_to_dtype() (called
+        # from initialize_weights) honors this list.
+        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
+        if "_fp32_params" not in keep_fp32:
+            keep_fp32.append("_fp32_params")
+        self._keep_in_fp32_modules = keep_fp32
 
         self.vocab_size = text_config.vocab_size
         pad_token_id = getattr(text_config, "pad_token_id", None)
@@ -1073,7 +1095,11 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 for sublayer in mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)
 
-        cast_model_to_dtype(self, dtype)
+        # Skip the SSM-gating holders so they keep fp32 storage (master weights):
+        # cast_model_to_dtype cannot reliably restore fp32 once FSDP2-sharded, so it
+        # detaches them and never casts them. Each holder is its own fp32 FSDP group
+        # (moe/parallelizer._shard_fp32_param_holders), so this is dtype-uniform-safe.
+        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
         with buffer_device:
             self.model.language_model.rotary_emb.device = buffer_device
