@@ -309,13 +309,8 @@ requires-dist = ["torch", "packaging", "ninja", "setuptools"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-# Per-test timeout (pytest-timeout) so a single hung test fails fast with an
-# all-thread traceback instead of silently consuming the whole CI step budget.
-# The slowest known unit test is ~75s, so 600s leaves a wide margin while still
-# being far below the CI step timeout. "thread" method reliably aborts even when
-# a test is stuck in a non-interruptible native (e.g. CUDA) call, where the
-# default signal method cannot deliver SIGALRM.
-timeout = 600
+# 60sec ought to be enough
+timeout = 60
 timeout_method = "thread"
 
 [tool.coverage.paths]
