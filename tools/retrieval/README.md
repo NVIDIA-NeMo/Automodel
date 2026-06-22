@@ -6,6 +6,11 @@ This directory contains offline data utilities for retrieval training.
 
 For large VL retrieval training, use **normalized Arrow**:
 
+| Format | Layout | Add new source later |
+| --- | --- | --- |
+| Normalized Arrow | One top-level bundle with `sources/source-*` subdirectories | Run normalized prep with `APPEND=1`; exact duplicate `source_entry` values are skipped |
+| Resolved Arrow | One flat set of fully materialized Arrow shards per output directory | Prepare a new output directory, then list multiple resolved directories in training `data_dir_list` |
+
 ```bash
 python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
   --config /path/to/original_retrieval_config.yaml \
