@@ -202,20 +202,15 @@ RUN git clone --depth 1 --branch v0.17.0 --recurse-submodules --shallow-submodul
 
 # DeepSeek-V4 TileLang kernels (backend.attn="tilelang": sparse MLA attention,
 # lightning indexer, and the MHC sinkhorn path used by the deepseek_v4_* recipes).
-# Installed AFTER `uv sync` (like torchao above) so the packages are not pruned and
-# so tile_kernels builds/links against the image's final torch. tilelang ships
-# CUDA-agnostic abi3 wheels (x86_64 + aarch64) and JIT-compiles its kernels at
-# RUNTIME via NVRTC, so the CUDA 13.2 -devel base (nvcc/nvrtc/headers) is what is
-# required at runtime; nothing is compiled here. tile_kernels is the external
-# DeepSeek "TileKernels" package (MHC sinkhorn) -- not vendored in AutoModel and not
-# on PyPI -- so it is git-pinned; install it AFTER tilelang with --no-build-isolation
-# so pip does not pull a fresh torch/tilelang over the in-image builds.
-ARG INSTALL_TILELANG=True
-ARG TILELANG_VERSION=0.1.11
+# tilelang is resolved by the cuda extra during `uv sync`. tile_kernels is the
+# external DeepSeek "TileKernels" package (MHC sinkhorn) -- not vendored in
+# AutoModel and not on PyPI -- so it is git-pinned here. Install it into the uv
+# environment without dependencies so it reuses the already-resolved tilelang and
+# torch builds instead of adding duplicate system-site packages.
+ARG INSTALL_TILEKERNELS=True
 ARG TILEKERNELS_COMMIT=36d9e45d38e204ebb87e6f6e833821eee0482fe5
-RUN if [ "$INSTALL_TILELANG" = "True" ]; then \
-        pip install --no-cache-dir "tilelang==${TILELANG_VERSION}" && \
-        pip install --no-cache-dir --no-build-isolation \
+RUN if [ "$INSTALL_TILEKERNELS" = "True" ]; then \
+        uv pip install --no-cache --no-deps --no-build-isolation \
             "git+https://github.com/deepseek-ai/TileKernels@${TILEKERNELS_COMMIT}"; \
     fi
 

@@ -29,13 +29,13 @@ TileLang-backed paths are sourced from:
   ``nemo_automodel/components/models/deepseek_v4/kernels/__init__.py`` for
   the per-file attribution.
 
-Those packages are imported with ``safe_import`` so environments without
-TileLang still import the model and use the existing torch path.
+Those packages are imported lazily so environments without TileLang still
+import the model and use the existing torch path.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 
@@ -45,62 +45,98 @@ Dsv4SparseAttentionBackend = Literal["torch", "sparse_torch", "tilelang", "auto"
 Dsv4IndexerBackend = Literal["torch", "tilelang", "auto"]
 Dsv4SinkhornBackend = Literal["torch", "tilelang", "auto"]
 
-_HAS_TILE_KERNELS_SINKHORN, _tile_kernels_sinkhorn = safe_import_from(
-    "tile_kernels.modeling.mhc.ops",
-    "sinkhorn_normalize",
-    msg="TileKernels sinkhorn is unavailable. Install tile_kernels and tilelang to use backend.attn='tilelang'.",
-)
-_HAS_TILE_KERNELS_SINKHORN_FWD, _tile_kernels_sinkhorn_fwd = safe_import_from(
-    "tile_kernels.mhc.sinkhorn_kernel",
-    "_mhc_sinkhorn_fwd",
-    msg="TileKernels low-level sinkhorn forward kernel is unavailable.",
-)
-_HAS_TILE_KERNELS_SINKHORN_BWD, _tile_kernels_sinkhorn_bwd = safe_import_from(
-    "tile_kernels.mhc.sinkhorn_kernel",
-    "_mhc_sinkhorn_bwd",
-    msg="TileKernels low-level sinkhorn backward kernel is unavailable.",
-)
-_HAS_MILES_SPARSE_ATTN, _miles_sparse_attn_tilelang = safe_import_from(
-    "nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention",
-    "sparse_attn_tilelang",
-    msg="Vendored Miles DeepSeek V4 sparse attention is unavailable. Install tilelang to use backend.attn='tilelang'.",
-)
-_HAS_MILES_SPARSE_ATTN_CHUNKED, _miles_sparse_attn_tilelang_head_chunked = safe_import_from(
-    "nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention",
-    "sparse_attn_tilelang_head_chunked",
-    msg="Vendored Miles DeepSeek V4 chunked sparse attention is unavailable. Install tilelang to use "
-    "backend.attn='tilelang'.",
-)
-_HAS_MILES_INDEXER, _miles_batched_indexer_fwd = safe_import_from(
-    "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd",
-    "batched_indexer_fwd",
-    msg="Vendored Miles DeepSeek V4 indexer is unavailable. Install tilelang to use backend.attn='tilelang'.",
-)
-_HAS_MILES_CU_SEQLENS, _miles_make_causal_cu_seqlens = safe_import_from(
-    "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd",
-    "_make_causal_cu_seqlens",
-    msg="Vendored Miles DeepSeek V4 indexer cu-seqlens helper is unavailable.",
-)
-_HAS_MILES_INDEXER_AUTOGRAD, _miles_v4_lighting_indexer = safe_import_from(
-    "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer",
-    "v4_lighting_indexer",
-    msg="Vendored Miles DeepSeek V4 autograd indexer is unavailable.",
-)
+_OPTIONAL_IMPORTS: dict[tuple[str, str], tuple[bool, Any]] = {}
+
+
+def _lazy_import_from(module: str, symbol: str, *, msg: str) -> tuple[bool, Any]:
+    key = (module, symbol)
+    if key not in _OPTIONAL_IMPORTS:
+        _OPTIONAL_IMPORTS[key] = safe_import_from(module, symbol, msg=msg)
+    return _OPTIONAL_IMPORTS[key]
+
+
+def _load_tile_kernels_sinkhorn() -> tuple[bool, Any, bool, Any, bool, Any]:
+    has_sinkhorn, sinkhorn = _lazy_import_from(
+        "tile_kernels.modeling.mhc.ops",
+        "sinkhorn_normalize",
+        msg="TileKernels sinkhorn is unavailable. Install tile_kernels and tilelang to use backend.attn='tilelang'.",
+    )
+    has_fwd, fwd = _lazy_import_from(
+        "tile_kernels.mhc.sinkhorn_kernel",
+        "_mhc_sinkhorn_fwd",
+        msg="TileKernels low-level sinkhorn forward kernel is unavailable.",
+    )
+    has_bwd, bwd = _lazy_import_from(
+        "tile_kernels.mhc.sinkhorn_kernel",
+        "_mhc_sinkhorn_bwd",
+        msg="TileKernels low-level sinkhorn backward kernel is unavailable.",
+    )
+    return has_sinkhorn, sinkhorn, has_fwd, fwd, has_bwd, bwd
+
+
+def _load_miles_sparse_attention() -> tuple[bool, Any, bool, Any]:
+    has_sparse_attn, sparse_attn = _lazy_import_from(
+        "nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention",
+        "sparse_attn_tilelang",
+        msg="Vendored Miles DeepSeek V4 sparse attention is unavailable. Install tilelang to use backend.attn='tilelang'.",
+    )
+    has_chunked, sparse_attn_chunked = _lazy_import_from(
+        "nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention",
+        "sparse_attn_tilelang_head_chunked",
+        msg="Vendored Miles DeepSeek V4 chunked sparse attention is unavailable. Install tilelang to use "
+        "backend.attn='tilelang'.",
+    )
+    return has_sparse_attn, sparse_attn, has_chunked, sparse_attn_chunked
+
+
+def _load_miles_indexer() -> tuple[bool, Any, bool, Any, bool, Any]:
+    has_indexer, batched_indexer_fwd = _lazy_import_from(
+        "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd",
+        "batched_indexer_fwd",
+        msg="Vendored Miles DeepSeek V4 indexer is unavailable. Install tilelang to use backend.attn='tilelang'.",
+    )
+    has_cu_seqlens, make_causal_cu_seqlens = _lazy_import_from(
+        "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd",
+        "_make_causal_cu_seqlens",
+        msg="Vendored Miles DeepSeek V4 indexer cu-seqlens helper is unavailable.",
+    )
+    has_indexer_autograd, v4_lighting_indexer = _lazy_import_from(
+        "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer",
+        "v4_lighting_indexer",
+        msg="Vendored Miles DeepSeek V4 autograd indexer is unavailable.",
+    )
+    return (
+        has_indexer,
+        batched_indexer_fwd,
+        has_cu_seqlens,
+        make_causal_cu_seqlens,
+        has_indexer_autograd,
+        v4_lighting_indexer,
+    )
 
 
 def is_dsv4_kernel_available(name: Literal["sinkhorn", "sparse_attn", "indexer"]) -> bool:
     """Return whether the optional TileLang kernel package for ``name`` is importable."""
     if name == "sinkhorn":
-        return _HAS_TILE_KERNELS_SINKHORN and _HAS_TILE_KERNELS_SINKHORN_FWD and _HAS_TILE_KERNELS_SINKHORN_BWD
+        has_sinkhorn, _, has_fwd, _, has_bwd, _ = _load_tile_kernels_sinkhorn()
+        return has_sinkhorn and has_fwd and has_bwd
     if name == "sparse_attn":
-        return _HAS_MILES_SPARSE_ATTN
+        has_sparse_attn, _, _, _ = _load_miles_sparse_attention()
+        return has_sparse_attn
     if name == "indexer":
-        return _HAS_MILES_INDEXER and _HAS_MILES_CU_SEQLENS and _HAS_MILES_INDEXER_AUTOGRAD
+        has_indexer, _, has_cu_seqlens, _, has_indexer_autograd, _ = _load_miles_indexer()
+        return has_indexer and has_cu_seqlens and has_indexer_autograd
     raise ValueError(f"Unknown DeepSeek V4 kernel name: {name}")
 
 
 def _all_cuda(*tensors: torch.Tensor) -> bool:
     return all(tensor.is_cuda for tensor in tensors)
+
+
+def _tilelang_inputs_ready(tensors: tuple[torch.Tensor, ...], *, require_bf16: bool = False) -> bool:
+    if not _all_cuda(*tensors):
+        return False
+    return not require_bf16 or all(tensor.dtype == torch.bfloat16 for tensor in tensors)
 
 
 def _should_use_tilelang(
@@ -156,8 +192,9 @@ class _Dsv4TileKernelsSinkhorn(torch.autograd.Function):
         flat_x = x.contiguous().view(-1, *x.shape[-2:])
         hidden_size = flat_x.shape[1]
         flat_output = torch.empty_like(flat_x)
-        fwd_kernel = _tile_kernels_sinkhorn_fwd(hidden_size, 1, repeat, eps)
-        bwd_kernel = _tile_kernels_sinkhorn_bwd(hidden_size, 32, repeat, eps)
+        _, _, _, fwd_kernel_factory, _, bwd_kernel_factory = _load_tile_kernels_sinkhorn()
+        fwd_kernel = fwd_kernel_factory(hidden_size, 1, repeat, eps)
+        bwd_kernel = bwd_kernel_factory(hidden_size, 32, repeat, eps)
         fwd_kernel(flat_x, flat_output)
         ctx.save_for_backward(flat_x)
         ctx.bwd_kernel = bwd_kernel
@@ -177,9 +214,12 @@ class _Dsv4TileKernelsSinkhorn(torch.autograd.Function):
 
 
 def _tile_kernels_sinkhorn_contiguous_grad(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
-    if _HAS_TILE_KERNELS_SINKHORN_FWD and _HAS_TILE_KERNELS_SINKHORN_BWD:
+    has_sinkhorn, sinkhorn, has_fwd, _, has_bwd, _ = _load_tile_kernels_sinkhorn()
+    if has_fwd and has_bwd:
         return _Dsv4TileKernelsSinkhorn.apply(x, repeat, eps)
-    return _tile_kernels_sinkhorn(x.contiguous(), repeat=repeat, eps=eps)
+    if has_sinkhorn:
+        return sinkhorn(x.contiguous(), repeat=repeat, eps=eps)
+    raise RuntimeError("TileKernels sinkhorn is unavailable")
 
 
 def dsv4_sinkhorn_normalize(
@@ -190,9 +230,14 @@ def dsv4_sinkhorn_normalize(
     eps: float,
 ) -> torch.Tensor:
     """Normalize HyperConnection combination logits with torch or TileKernels."""
+    if backend == "torch":
+        return sinkhorn_normalize_torch(x, repeat=repeat, eps=eps)
+
+    inputs_ready = _tilelang_inputs_ready((x,))
+    available = is_dsv4_kernel_available("sinkhorn") if inputs_ready else False
     if _should_use_tilelang(
         backend,
-        available=is_dsv4_kernel_available("sinkhorn"),
+        available=available,
         kernel_name="sinkhorn",
         tensors=(x,),
     ):
@@ -330,9 +375,16 @@ def dsv4_sparse_attention(
     backend: Dsv4SparseAttentionBackend,
 ) -> torch.Tensor:
     """Run DSV4 sparse attention through Miles TileLang kernels or torch fallback."""
+    if backend == "torch" or backend == "sparse_torch":
+        return sparse_attention_torch(q, kv, sinks, topk_idxs.long(), sm_scale)
+
+    inputs_ready = _tilelang_inputs_ready((q, kv), require_bf16=True)
+    has_sparse_attn, sparse_attn_tilelang, has_chunked, sparse_attn_tilelang_head_chunked = (
+        _load_miles_sparse_attention() if inputs_ready else (False, None, False, None)
+    )
     use_tilelang = _should_use_tilelang(
         backend,
-        available=_HAS_MILES_SPARSE_ATTN,
+        available=has_sparse_attn,
         kernel_name="sparse attention",
         tensors=(q, kv),
         require_bf16=True,
@@ -355,11 +407,11 @@ def dsv4_sparse_attention(
         # fwd/bwd kernels and lets autograd sum the per-chunk KV gradients.
         max_heads_per_kernel = 16 if q.shape[-1] >= 256 else 64
         if q.shape[2] > max_heads_per_kernel:
-            if not _HAS_MILES_SPARSE_ATTN_CHUNKED:
+            if not has_chunked:
                 raise RuntimeError("Chunked Miles DeepSeek V4 sparse attention is unavailable")
-            output = _miles_sparse_attn_tilelang_head_chunked(q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale)
+            output = sparse_attn_tilelang_head_chunked(q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale)
         else:
-            output = _miles_sparse_attn_tilelang(q, kv, sinks, topk_idxs, sm_scale)
+            output = sparse_attn_tilelang(q, kv, sinks, topk_idxs, sm_scale)
         return output[:, :, :original_heads, :]
     return sparse_attention_torch(q, kv, sinks, topk_idxs.long(), sm_scale)
 
@@ -396,9 +448,16 @@ def dsv4_indexer_scores(
     query_total_len: int | None = None,
 ) -> torch.Tensor:
     """Run DSV4 C4 indexer scores through Miles TileLang kernels or torch fallback."""
+    if backend == "torch":
+        return indexer_scores_torch(q, pooled_kv, weights, softmax_scale)
+
+    inputs_ready = _tilelang_inputs_ready((q, pooled_kv), require_bf16=True)
+    has_indexer, batched_indexer_fwd, has_cu_seqlens, make_causal_cu_seqlens, _, _ = (
+        _load_miles_indexer() if inputs_ready else (False, None, False, None, False, None)
+    )
     if _should_use_tilelang(
         backend,
-        available=_HAS_MILES_INDEXER and _HAS_MILES_CU_SEQLENS,
+        available=has_indexer and has_cu_seqlens,
         kernel_name="indexer",
         tensors=(q, pooled_kv),
         require_bf16=True,
@@ -406,11 +465,11 @@ def dsv4_indexer_scores(
         seq_len = q.shape[1]
         seq_len_kv = pooled_kv.shape[1]
         query_total_len = seq_len if query_total_len is None else query_total_len
-        cu_ks, cu_ke = _miles_make_causal_cu_seqlens(query_total_len, seq_len_kv, compress_ratio, q.device)
+        cu_ks, cu_ke = make_causal_cu_seqlens(query_total_len, seq_len_kv, compress_ratio, q.device)
         if query_start or query_total_len != seq_len:
             cu_ks = cu_ks[query_start : query_start + seq_len]
             cu_ke = cu_ke[query_start : query_start + seq_len]
-        return _miles_batched_indexer_fwd(
+        return batched_indexer_fwd(
             q.transpose(0, 1).contiguous(),
             pooled_kv.transpose(0, 1).contiguous(),
             (weights * softmax_scale).transpose(0, 1).contiguous(),
@@ -431,14 +490,22 @@ def dsv4_indexer_topk_scores(
     backend: Dsv4IndexerBackend,
 ) -> torch.Tensor:
     """Run DSV4 C4 top-k indexer scores through Miles autograd kernels or torch fallback."""
+    if backend == "torch":
+        logits = indexer_scores_torch(q, pooled_kv, weights, softmax_scale)
+        return extract_indexer_topk_scores_torch(logits, topk_indices.long())
+
+    inputs_ready = _tilelang_inputs_ready((q, pooled_kv), require_bf16=True)
+    _, _, _, _, has_indexer_autograd, v4_lighting_indexer = (
+        _load_miles_indexer() if inputs_ready else (False, None, False, None, False, None)
+    )
     if _should_use_tilelang(
         backend,
-        available=_HAS_MILES_INDEXER_AUTOGRAD,
+        available=has_indexer_autograd,
         kernel_name="indexer autograd",
         tensors=(q, pooled_kv),
         require_bf16=True,
     ):
-        scores, _ = _miles_v4_lighting_indexer(
+        scores, _ = v4_lighting_indexer(
             q.transpose(0, 1).contiguous(),
             pooled_kv.transpose(0, 1).contiguous(),
             (weights * softmax_scale).transpose(0, 1).contiguous(),
