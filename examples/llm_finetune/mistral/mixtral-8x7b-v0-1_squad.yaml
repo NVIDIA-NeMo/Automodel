@@ -102,5 +102,10 @@ lr_scheduler:
 
 ci:
   recipe_owner: HuiyingLi
-  time: "00:20:00"
+  time: "00:30:00"
   nodes: 2
+  release:
+    step_scheduler.global_batch_size: 64
+    step_scheduler.local_batch_size: 8
+    step_scheduler.max_steps: 5
+    distributed.pipeline.pp_microbatch_size: 1
