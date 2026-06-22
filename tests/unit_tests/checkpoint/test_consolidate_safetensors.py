@@ -117,6 +117,87 @@ def test_consolidate_writes_output_safetensors_without_append(tmp_path, monkeypa
 
 
 @pytest.mark.run_only_on("CPU")
+def test_consolidate_preserves_semantics_for_multi_shard_outputs_without_append(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    expected_tensors = {
+        "linear.weight": torch.arange(12, dtype=torch.float32).reshape(4, 3),
+        "norm.weight": torch.arange(4, dtype=torch.float32).to(torch.float16),
+    }
+    save_file(
+        {
+            "linear.weight": expected_tensors["linear.weight"][:2].contiguous(),
+            "norm.weight": expected_tensors["norm.weight"],
+        },
+        input_dir / "model-00001-of-00002.safetensors",
+        metadata={
+            CUSTOM_METADATA_KEY: json.dumps(
+                {
+                    "linear.weight": {"saved_offsets": [0, 0]},
+                    "norm.weight": {"saved_offsets": [0]},
+                }
+            )
+        },
+    )
+    save_file(
+        {"linear.weight": expected_tensors["linear.weight"][2:].contiguous()},
+        input_dir / "model-00002-of-00002.safetensors",
+        metadata={CUSTOM_METADATA_KEY: json.dumps({"linear.weight": {"saved_offsets": [2, 0]}})},
+    )
+
+    expected_weight_map = {
+        "linear.weight": "model-00001-of-00002.safetensors",
+        "norm.weight": "model-00002-of-00002.safetensors",
+    }
+    output_paths = {os.fspath(output_dir / file_name) for file_name in expected_weight_map.values()}
+    real_open = builtins.open
+    output_modes: dict[str, list[str]] = {}
+
+    def tracking_open(file, mode="r", *args, **kwargs):
+        file_path = os.fspath(file)
+        if file_path in output_paths:
+            output_modes.setdefault(os.path.basename(file_path), []).append(mode)
+            if "a" in mode:
+                raise AssertionError(f"Output safetensors file was opened in append mode: {mode}")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+
+    consolidate_safetensors_files(
+        input_dir=str(input_dir),
+        output_dir=str(output_dir),
+        fqn_to_index_mapping={"linear.weight": 1, "norm.weight": 2},
+        num_threads=2,
+    )
+
+    # Stop tracking before verifying output to avoid counting read-opens from load_file().
+    monkeypatch.setattr(builtins, "open", real_open)
+
+    output_tensors = {}
+    for file_name in expected_weight_map.values():
+        output_tensors.update(load_file(output_dir / file_name))
+
+    assert set(output_tensors) == set(expected_tensors)
+    for name, expected_tensor in expected_tensors.items():
+        assert output_tensors[name].shape == expected_tensor.shape
+        assert output_tensors[name].dtype is expected_tensor.dtype
+        torch.testing.assert_close(output_tensors[name], expected_tensor)
+
+    with open(output_dir / "model.safetensors.index.json", "r") as f:
+        index = json.load(f)
+    assert index["weight_map"] == expected_weight_map
+    expected_total_size = sum(tensor.numel() * tensor.element_size() for tensor in expected_tensors.values())
+    assert index["metadata"]["total_size"] == expected_total_size
+    assert output_modes == {
+        "model-00001-of-00002.safetensors": ["wb"],
+        "model-00002-of-00002.safetensors": ["wb"],
+    }
+
+
+@pytest.mark.run_only_on("CPU")
 def test_consolidate_casts_float_tensors_only_when_cast_dtype_is_set(tmp_path, caplog):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
