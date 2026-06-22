@@ -644,6 +644,16 @@ class MoESplitExpertsStateDictMixin:
         # rebuild path: never mark these keys in-place-loaded when ``quantization`` is set.
         quantization = kwargs.get("quantization", False)
 
+        # Same non-aliasing hazard, but quantization-independent: GroupedExpertsTE
+        # (backend.experts == "te") exposes gate_and_up_projs/down_projs as a torch.stack COPY of
+        # TE's per-expert weight{i} params — it does NOT alias the model's grouped storage. An
+        # in-place DCP copy_ would write that throwaway and leave the TE experts at random init,
+        # silently (strict=False), even for a bf16 (non-quantized) checkpoint -> garbage/NaN loss
+        # (nvbug 6350293). Force the rebuild path (-> _load_from_state_dict -> _set_stacked_weight)
+        # for it. Other expert backends keep a real aliasing stacked Parameter, so they are
+        # unaffected. (#2682 closed only the quantization sub-case of this same hazard.)
+        experts_alias_grouped_storage = getattr(getattr(self, "backend", None), "experts", None) != "te"
+
         from nemo_automodel.components.moe.state_dict_utils import (
             is_dtensor,
             validate_dtensor_expert_sharding,
@@ -658,7 +668,13 @@ class MoESplitExpertsStateDictMixin:
             splits = self._split_experts_weights(tensor, n_experts)
 
             # In-place views only engage when splits are plain (ep_shard==1).
-            inplace_ok = is_dtensor(tensor) and len(splits) > 0 and not is_dtensor(splits[0]) and not quantization
+            inplace_ok = (
+                is_dtensor(tensor)
+                and len(splits) > 0
+                and not is_dtensor(splits[0])
+                and not quantization
+                and experts_alias_grouped_storage
+            )
             if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)
 
@@ -700,7 +716,13 @@ class MoESplitExpertsStateDictMixin:
                 validate_dtensor_expert_sharding(tensor, n_experts, f"down_projs (DeepEP) layer {layer_num}")
 
             splits = self._split_experts_weights(tensor, n_experts)
-            inplace_ok = is_dtensor(tensor) and len(splits) > 0 and not is_dtensor(splits[0]) and not quantization
+            inplace_ok = (
+                is_dtensor(tensor)
+                and len(splits) > 0
+                and not is_dtensor(splits[0])
+                and not quantization
+                and experts_alias_grouped_storage
+            )
             if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)
 

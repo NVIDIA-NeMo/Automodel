@@ -128,3 +128,10 @@ optimizer:
 
 ci:
   recipe_owner: hemildesai
+  # GB200/oci_hsg has 4 GPUs/node. ep_size=8 needs world 8, so spread 4 procs
+  # across 2 nodes (local_rank 0..3 -> the 4 GPUs). Set nodes/nproc explicitly
+  # rather than node_multiplier: the multiplier gate in
+  # .base_sbatch_template_launcher reads the before_script NPROC_PER_NODE
+  # (=8 on oci_hsg, the non-lyris/pretyche else-branch) and so never triggers.
+  nodes: 2
+  nproc_per_node: 4
