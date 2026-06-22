@@ -61,7 +61,9 @@ class TextToVideoDataset(BaseMultiresolutionDataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Load a single video sample from its .meta file."""
         item = self.metadata[idx]
-        cache_file = Path(item["cache_file"])
+        cache_file = Path(item["cache_file"]).resolve()
+        cache_dir = Path(self.cache_dir).resolve()
+        cache_file.relative_to(cache_dir)
 
         with open(cache_file, "rb") as f:
             data = torch.load(f, weights_only=True)
