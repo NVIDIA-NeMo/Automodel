@@ -138,6 +138,7 @@ ci:
   recipe_owner: adil-a
   nodes: 32
   time: "00:30:00"
+  max_steps: 17
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
     NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "8"

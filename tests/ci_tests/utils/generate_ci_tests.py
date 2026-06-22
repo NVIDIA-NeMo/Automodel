@@ -120,6 +120,7 @@ CI_KEY_TO_VAR = {
     "time": "TIME",
     "nodes": "TEST_NODE_COUNT",
     "node_multiplier": "NODE_MULTIPLIER",
+    "max_steps": "MAX_STEPS",
     "local_batch_size": "LOCAL_BATCH_SIZE",
     "ep_size": "EP_SIZE",
     "recipe_owner": "RECIPE_OWNER",
