@@ -52,6 +52,7 @@ model:
     rms_norm: torch_fp32
     experts: te
     dispatcher: hybridep
+    rope_fusion: false  # fused TE RoPE NaNs the backward on THD/packed seqs (issue #2674, fix mirrors PR #2687)
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
