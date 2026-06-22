@@ -877,11 +877,42 @@ class TestDeepseekV4OptimizedKernels:
         dsv4_indexer_scores(q, kv, weights, compress_ratio=2, softmax_scale=8**-0.5, backend="auto")
         dsv4_indexer_topk_scores(q, kv, weights, topk_idxs, compress_ratio=2, softmax_scale=8**-0.5, backend="auto")
 
+    def test_tile_kernels_availability_is_opt_in_by_default(self, monkeypatch):
+        dsv4_optimized_kernels._OPTIONAL_IMPORTS.clear()
+        monkeypatch.delenv(dsv4_optimized_kernels._ENABLE_TILE_KERNELS_IMPORT_ENV, raising=False)
+
+        def fail_import(*args, **kwargs):
+            raise AssertionError("TileKernels import should require an explicit opt-in")
+
+        monkeypatch.setattr(dsv4_optimized_kernels, "safe_import_from", fail_import)
+
+        assert not is_dsv4_kernel_available("sinkhorn")
+
+    def test_tile_kernels_availability_imports_when_opted_in(self, monkeypatch):
+        dsv4_optimized_kernels._OPTIONAL_IMPORTS.clear()
+        monkeypatch.setenv(dsv4_optimized_kernels._ENABLE_TILE_KERNELS_IMPORT_ENV, "1")
+        monkeypatch.setattr(dsv4_optimized_kernels, "_tile_kernels_import_is_unsafe", lambda: False)
+        calls = []
+
+        def fake_import(module, symbol, *, msg):
+            calls.append((module, symbol))
+            return True, object()
+
+        monkeypatch.setattr(dsv4_optimized_kernels, "safe_import_from", fake_import)
+
+        assert is_dsv4_kernel_available("sinkhorn")
+        assert calls == [
+            ("tile_kernels.modeling.mhc.ops", "sinkhorn_normalize"),
+            ("tile_kernels.mhc.sinkhorn_kernel", "_mhc_sinkhorn_fwd"),
+            ("tile_kernels.mhc.sinkhorn_kernel", "_mhc_sinkhorn_bwd"),
+        ]
+
     def test_tile_kernels_availability_is_guarded_after_tvm_ffi_load(self, monkeypatch):
         import sys
         import types
 
         dsv4_optimized_kernels._OPTIONAL_IMPORTS.clear()
+        monkeypatch.setenv(dsv4_optimized_kernels._ENABLE_TILE_KERNELS_IMPORT_ENV, "1")
         monkeypatch.setitem(sys.modules, "tvm_ffi.core", types.ModuleType("tvm_ffi.core"))
         monkeypatch.delitem(sys.modules, "tilelang", raising=False)
 

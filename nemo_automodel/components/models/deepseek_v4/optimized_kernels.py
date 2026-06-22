@@ -35,6 +35,7 @@ import the model and use the existing torch path.
 
 from __future__ import annotations
 
+import os
 import sys
 from typing import Any, Literal
 
@@ -47,28 +48,50 @@ Dsv4IndexerBackend = Literal["torch", "tilelang", "auto"]
 Dsv4SinkhornBackend = Literal["torch", "tilelang", "auto"]
 
 _OPTIONAL_IMPORTS: dict[tuple[str, str], tuple[bool, Any]] = {}
+_ENABLE_TILE_KERNELS_IMPORT_ENV = "NEMO_AUTOMODEL_ENABLE_TILE_KERNELS_IMPORT"
 
 
 def _lazy_import_from(module: str, symbol: str, *, msg: str) -> tuple[bool, Any]:
     key = (module, symbol)
     if key not in _OPTIONAL_IMPORTS:
-        if module.startswith("tile_kernels") and _tile_kernels_import_is_unsafe():
-            _OPTIONAL_IMPORTS[key] = (
-                False,
-                UnavailableMeta(
-                    symbol,
-                    (),
-                    {
-                        "_msg": (
-                            f"{msg} TileKernels imports tilelang's vendored TVM; importing it after tvm_ffi.core "
-                            "has already been loaded can abort the Python process."
-                        )
-                    },
-                ),
-            )
-            return _OPTIONAL_IMPORTS[key]
+        if module.startswith("tile_kernels"):
+            if not _tile_kernels_import_enabled():
+                _OPTIONAL_IMPORTS[key] = (
+                    False,
+                    UnavailableMeta(
+                        symbol,
+                        (),
+                        {
+                            "_msg": (
+                                f"{msg} TileKernels imports tilelang's vendored TVM and is disabled by default to "
+                                f"avoid collection-time native aborts. Set {_ENABLE_TILE_KERNELS_IMPORT_ENV}=1 to "
+                                "enable this optional import."
+                            )
+                        },
+                    ),
+                )
+                return _OPTIONAL_IMPORTS[key]
+            if _tile_kernels_import_is_unsafe():
+                _OPTIONAL_IMPORTS[key] = (
+                    False,
+                    UnavailableMeta(
+                        symbol,
+                        (),
+                        {
+                            "_msg": (
+                                f"{msg} TileKernels imports tilelang's vendored TVM; importing it after tvm_ffi.core "
+                                "has already been loaded can abort the Python process."
+                            )
+                        },
+                    ),
+                )
+                return _OPTIONAL_IMPORTS[key]
         _OPTIONAL_IMPORTS[key] = safe_import_from(module, symbol, msg=msg)
     return _OPTIONAL_IMPORTS[key]
+
+
+def _tile_kernels_import_enabled() -> bool:
+    return os.environ.get(_ENABLE_TILE_KERNELS_IMPORT_ENV) == "1"
 
 
 def _tile_kernels_import_is_unsafe() -> bool:
