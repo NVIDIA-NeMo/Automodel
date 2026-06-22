@@ -17,6 +17,7 @@ from transformers.image_processing_utils_fast import BaseImageProcessorFast, div
 from transformers.image_utils import (
     ChannelDimension,
     ImageInput,
+    PILImageResampling,
     SizeDict,
     get_image_size,
     make_list_of_images,
@@ -167,6 +168,7 @@ class LlamaNemotronVLImageProcessor(BaseImageProcessorFast):
         use_thumbnail: bool = True,
         dynamic_image_size: bool = True,
         norm_type: str = "siglip",
+        resample: Optional[Union[PILImageResampling, int]] = None,
         **kwargs,
     ):
         if norm_type == "imagenet":
@@ -181,6 +183,7 @@ class LlamaNemotronVLImageProcessor(BaseImageProcessorFast):
         kwargs.setdefault("do_normalize", True)
         kwargs.setdefault("image_mean", image_mean)
         kwargs.setdefault("image_std", image_std)
+        kwargs.setdefault("resample", resample if resample is not None else PILImageResampling.BICUBIC)
 
         super().__init__(**kwargs)
         self.image_size = image_size
@@ -195,8 +198,10 @@ class LlamaNemotronVLImageProcessor(BaseImageProcessorFast):
         image_size: int = 512,
         max_num_tiles: int = 6,
         use_thumbnail: bool = True,
+        resample: Optional[Union[PILImageResampling, int]] = None,
     ) -> List[torch.Tensor]:
         """Split one channel-first image tensor into dynamically sized square tiles."""
+        resample = resample if resample is not None else self.resample
         orig_height, orig_width = get_image_size(image, channel_dim=ChannelDimension.FIRST)
         aspect_ratio = orig_width / orig_height
 
@@ -218,10 +223,10 @@ class LlamaNemotronVLImageProcessor(BaseImageProcessorFast):
 
         target_width = image_size * target_aspect_ratio[0]
         target_height = image_size * target_aspect_ratio[1]
-        resized_img = self.resize(image, SizeDict(height=target_height, width=target_width))
+        resized_img = self.resize(image, SizeDict(height=target_height, width=target_width), resample=resample)
         patches = divide_to_patches(resized_img, image_size)
         if use_thumbnail and len(patches) != 1:
-            patches.append(self.resize(image, SizeDict(height=image_size, width=image_size)))
+            patches.append(self.resize(image, SizeDict(height=image_size, width=image_size), resample=resample))
 
         return patches
 
@@ -233,6 +238,11 @@ class LlamaNemotronVLImageProcessor(BaseImageProcessorFast):
         use_thumbnail: Optional[bool] = None,
         dynamic_image_size: Optional[bool] = None,
         do_rescale: Optional[bool] = None,
+        rescale_factor: Optional[float] = None,
+        do_normalize: Optional[bool] = None,
+        image_mean: Optional[Union[float, List[float]]] = None,
+        image_std: Optional[Union[float, List[float]]] = None,
+        resample: Optional[Union[PILImageResampling, int]] = None,
         return_tensors: Optional[Union[str, TensorType]] = None,
         **kwargs,
     ) -> BatchFeature:
@@ -241,14 +251,19 @@ class LlamaNemotronVLImageProcessor(BaseImageProcessorFast):
         use_thumbnail = use_thumbnail if use_thumbnail is not None else self.use_thumbnail
         dynamic_image_size = dynamic_image_size if dynamic_image_size is not None else self.dynamic_image_size
         do_rescale = do_rescale if do_rescale is not None else self.do_rescale
+        rescale_factor = rescale_factor if rescale_factor is not None else self.rescale_factor
+        do_normalize = do_normalize if do_normalize is not None else self.do_normalize
+        image_mean = image_mean if image_mean is not None else self.image_mean
+        image_std = image_std if image_std is not None else self.image_std
+        resample = resample if resample is not None else self.resample
 
         all_patches = []
         num_patches = []
         for image in make_list_of_images(images):
             if dynamic_image_size:
-                patches = self.dynamic_preprocess(image, image_size, max_num_tiles, use_thumbnail)
+                patches = self.dynamic_preprocess(image, image_size, max_num_tiles, use_thumbnail, resample=resample)
             else:
-                patches = [self.resize(image, SizeDict(height=image_size, width=image_size))]
+                patches = [self.resize(image, SizeDict(height=image_size, width=image_size), resample=resample)]
             all_patches.extend(patches)
             num_patches.append(len(patches))
 
@@ -256,10 +271,10 @@ class LlamaNemotronVLImageProcessor(BaseImageProcessorFast):
         pixel_values = self.rescale_and_normalize(
             pixel_values,
             do_rescale,
-            self.rescale_factor,
-            do_normalize=self.do_normalize,
-            image_mean=self.image_mean,
-            image_std=self.image_std,
+            rescale_factor,
+            do_normalize=do_normalize,
+            image_mean=image_mean,
+            image_std=image_std,
         )
 
         return BatchFeature(data={"pixel_values": pixel_values, "num_patches": num_patches}, tensor_type=return_tensors)
