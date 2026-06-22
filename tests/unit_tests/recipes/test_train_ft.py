@@ -541,6 +541,51 @@ def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatc
     assert ds._shuffle_calls and ds._shuffle_calls[-1] == (8, 123)
 
 
+def test_build_dataloader_prepacked_sequence_skips_recipe_packing(monkeypatch):
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
+            "tokenizer": None,
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+        }
+    )
+    cfg_model = ConfigNode({})
+    cfg_ps = ConfigNode({"packed_sequence_size": 8, "prepacked": True})
+
+    class _PackedModel(nn.Module):
+        def forward(self, input_ids, seq_lens=None):
+            return input_ids
+
+    dl, tok = _build_dataloader(
+        cfg_ds=cfg_ds,
+        cfg_dl=cfg_dl,
+        cfg_model=cfg_model,
+        cfg_ps=cfg_ps,
+        seed=123,
+        local_batch_size=2,
+        global_batch_size=4,
+        max_steps=None,
+        val_check_interval=None,
+        dp_rank=0,
+        dp_world_size=1,
+        pp_enabled=False,
+        cp_size=1,
+        model=_PackedModel(),
+    )
+
+    assert dl == "dl"
+    assert tok is None
+    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
+    ds = mod.dl_factory_capture.captured["dataset"]
+    assert ds.__class__.__name__ == "DummyIterableDataset"
+    assert ds._shuffle_calls == []
+
+
 class _FlagCM(AbstractContextManager):
     """Simple context manager that flips a flag on enter/exit."""
 
@@ -2201,8 +2246,9 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
             self.lin = nn.Linear(4, 8192)
             self.prepared = False
 
-        def prepare_model_inputs_for_cp(self, input_ids):
+        def prepare_model_inputs_for_cp(self, input_ids, **kwargs):
             self.prepared = True
+            self.num_chunks = kwargs.get("num_chunks")
             return {"_cp_full_logits_grad_touch": True}
 
         def forward(self, **batch):
