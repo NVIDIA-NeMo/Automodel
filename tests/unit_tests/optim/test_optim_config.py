@@ -360,6 +360,8 @@ class TestLRSchedulerConfig:
         cfg = LRSchedulerConfig()
         assert cfg.lr_decay_style == "cosine"
         assert cfg.lr_warmup_steps is None
+        assert cfg.init_lr_ratio == pytest.approx(0.1)
+        assert cfg.min_lr_ratio == pytest.approx(0.01)
         assert cfg.use_checkpoint_opt_param_scheduler is True
         assert cfg.override_opt_param_scheduler is False
 
@@ -421,3 +423,42 @@ class TestLRSchedulerConfig:
         ss = self._step_scheduler(epoch_len=100, num_epochs=10, max_steps=20)
         scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
         assert scheds[0].lr_decay_steps == 20  # min(num_epochs*epoch_len=1000, max_steps=20)
+
+    def test_build_from_total_steps_uses_optimizer_base_values_and_ratios(self):
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.2, weight_decay=0.03)
+
+        sched = LRSchedulerConfig(
+            lr_warmup_steps=2,
+            init_lr_ratio=0.2,
+            min_lr_ratio=0.05,
+        ).build_from_total_steps(opt, 10)[0]
+
+        assert sched.init_lr == pytest.approx(0.04)
+        assert sched.max_lr == pytest.approx(0.2)
+        assert sched.min_lr == pytest.approx(0.01)
+        assert sched.lr_decay_steps == 10
+        assert sched.wd_incr_steps == 10
+        assert sched.start_wd == pytest.approx(0.03)
+        assert sched.end_wd == pytest.approx(0.03)
+
+    def test_build_from_total_steps_absolute_lr_fields_override_ratios(self):
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.2)
+
+        sched = LRSchedulerConfig(
+            lr_warmup_steps=1,
+            init_lr=1e-5,
+            max_lr=3e-4,
+            min_lr=1e-6,
+            init_lr_ratio=0.5,
+            min_lr_ratio=0.5,
+        ).build_from_total_steps(opt, 10)[0]
+
+        assert sched.init_lr == pytest.approx(1e-5)
+        assert sched.max_lr == pytest.approx(3e-4)
+        assert sched.min_lr == pytest.approx(1e-6)
+
+    def test_build_from_total_steps_rejects_nonpositive_steps(self):
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+
+        with pytest.raises(ValueError, match="total_steps"):
+            LRSchedulerConfig().build_from_total_steps(opt, 0)
