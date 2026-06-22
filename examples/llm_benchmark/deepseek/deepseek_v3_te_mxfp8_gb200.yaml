@@ -116,6 +116,7 @@ optimizer:
 ci:
   time: "04:00:00"
   nodes: 16
+  cluster_tag: gb200
   ep_size: 64
   env_vars:
     RDZV_TIMEOUT: "900"
