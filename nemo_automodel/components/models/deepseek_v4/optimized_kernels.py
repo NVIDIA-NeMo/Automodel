@@ -35,11 +35,12 @@ import the model and use the existing torch path.
 
 from __future__ import annotations
 
+import sys
 from typing import Any, Literal
 
 import torch
 
-from nemo_automodel.shared.import_utils import safe_import_from
+from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
 
 Dsv4SparseAttentionBackend = Literal["torch", "sparse_torch", "tilelang", "auto"]
 Dsv4IndexerBackend = Literal["torch", "tilelang", "auto"]
@@ -51,8 +52,27 @@ _OPTIONAL_IMPORTS: dict[tuple[str, str], tuple[bool, Any]] = {}
 def _lazy_import_from(module: str, symbol: str, *, msg: str) -> tuple[bool, Any]:
     key = (module, symbol)
     if key not in _OPTIONAL_IMPORTS:
+        if module.startswith("tile_kernels") and _tile_kernels_import_is_unsafe():
+            _OPTIONAL_IMPORTS[key] = (
+                False,
+                UnavailableMeta(
+                    symbol,
+                    (),
+                    {
+                        "_msg": (
+                            f"{msg} TileKernels imports tilelang's vendored TVM; importing it after tvm_ffi.core "
+                            "has already been loaded can abort the Python process."
+                        )
+                    },
+                ),
+            )
+            return _OPTIONAL_IMPORTS[key]
         _OPTIONAL_IMPORTS[key] = safe_import_from(module, symbol, msg=msg)
     return _OPTIONAL_IMPORTS[key]
+
+
+def _tile_kernels_import_is_unsafe() -> bool:
+    return "tvm_ffi.core" in sys.modules and "tilelang" not in sys.modules
 
 
 def _load_tile_kernels_sinkhorn() -> tuple[bool, Any, bool, Any, bool, Any]:

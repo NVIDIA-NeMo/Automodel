@@ -877,6 +877,21 @@ class TestDeepseekV4OptimizedKernels:
         dsv4_indexer_scores(q, kv, weights, compress_ratio=2, softmax_scale=8**-0.5, backend="auto")
         dsv4_indexer_topk_scores(q, kv, weights, topk_idxs, compress_ratio=2, softmax_scale=8**-0.5, backend="auto")
 
+    def test_tile_kernels_availability_is_guarded_after_tvm_ffi_load(self, monkeypatch):
+        import sys
+        import types
+
+        dsv4_optimized_kernels._OPTIONAL_IMPORTS.clear()
+        monkeypatch.setitem(sys.modules, "tvm_ffi.core", types.ModuleType("tvm_ffi.core"))
+        monkeypatch.delitem(sys.modules, "tilelang", raising=False)
+
+        def fail_import(*args, **kwargs):
+            raise AssertionError("unsafe TileKernels import should be guarded")
+
+        monkeypatch.setattr(dsv4_optimized_kernels, "safe_import_from", fail_import)
+
+        assert not is_dsv4_kernel_available("sinkhorn")
+
     @pytest.mark.skipif(
         not torch.cuda.is_available() or not is_dsv4_kernel_available("sinkhorn"),
         reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
