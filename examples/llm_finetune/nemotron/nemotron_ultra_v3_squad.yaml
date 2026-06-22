@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# FULL supervised fine-tune of Nemotron-3-Ultra-550B-A55B across 16 x H100 nodes
-# (128 GPUs, PP=2, EP=64).
+# FULL supervised fine-tune of Nemotron-3-Ultra-550B-A55B across 32 x H100 nodes
+# (256 GPUs, PP=4, EP=64).
 # Mirrors nemotron_ultra_v3_hellaswag_peft.yaml but trains ALL parameters (no `peft:` block),
-# scaled up for the full-FT memory footprint (16 nodes, PP=2, EP=64, activation checkpointing, full
+# scaled up for the full-FT memory footprint (32 nodes, PP=4, EP=64, activation checkpointing, full
 # Adam optimizer state). Real router (fake_balanced_gate=false), HybridEP dispatch,
 # and the repeated MTP head are kept.
 #
-# To run on a 16-node Slurm allocation, drive torchrun from an srun step:
+# To run on a 32-node Slurm allocation, drive torchrun from an srun step:
 #
 #   MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-#   srun --ntasks-per-node=1 --nodes=16 bash -c '
-#     torchrun --nnodes=16 --nproc-per-node=8 \
+#   srun --ntasks-per-node=1 --nodes=32 bash -c '
+#     torchrun --nnodes=32 --nproc-per-node=8 \
 #       --rdzv-backend=c10d --rdzv-endpoint="$MASTER_ADDR":29500 \
 #       --node-rank=$SLURM_NODEID \
 #       examples/llm_finetune/finetune.py \
@@ -34,8 +34,8 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 step_scheduler:
   num_epochs: 3
   max_steps: 100
-  global_batch_size: 128  # local_batch_size(2) * dp_size(64) -> no grad accumulation.
-  local_batch_size: 2
+  global_batch_size: 256  # local_batch_size(4) * dp_size(64) -> no grad accumulation.
+  local_batch_size: 4
   ckpt_every_steps: 50
   val_every_steps: 50
 
@@ -77,14 +77,14 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 2
+  pp_size: 4
   ep_size: 64
   activation_checkpointing: true
 
   pipeline:
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 1
-    layers_per_stage: 27  # 108 layers / 4 virtual stages = 2 virtual stages per PP rank.
+    layers_per_stage: 14  # 108 layers / 8 virtual stages = 2 virtual stages per PP rank.
     round_virtual_stages_to_pp_multiple: down
     scale_grads_in_schedule: false
     patch_inner_model: false
@@ -134,10 +134,12 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
-  # pp_size(2) * ep_size(64) = 128 GPUs => 16 nodes (8 H100/node).
+  # pp_size(4) * ep_size(64) = 256 GPUs => 32 nodes (8 H100/node).
   recipe_owner: adil-a
-  nodes: 16
+  nodes: 32
+  time: "04:00:00"
   env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
     NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "8"
     NUM_OF_STAGES_G2S_COMBINE_API: "4"
 
