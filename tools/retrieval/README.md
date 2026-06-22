@@ -2,14 +2,27 @@
 
 This directory contains offline data utilities for retrieval training.
 
-## Recommendation
+## Choose A Data Path
 
-For large VL retrieval training, use **normalized Arrow**:
+There are three supported ways to avoid spending GPU job time on expensive source dataset and corpus setup:
 
-| Format | Layout | Add new source later |
-| --- | --- | --- |
-| Normalized Arrow | One top-level bundle with `sources/source-*` subdirectories | Run normalized prep with `APPEND=1`; exact duplicate `source_entry` values are skipped |
-| Resolved Arrow | One flat set of fully materialized Arrow shards per output directory | Prepare a new output directory, then list multiple resolved directories in training `data_dir_list` |
+| Option | Use when | What it creates | Add new source later |
+| --- | --- | --- | --- |
+| Normalized Arrow | Default for large VL retrieval training | Portable top-level bundle with `sources/source-*` subdirectories | Run normalized prep with `APPEND=1`; exact duplicate `source_entry` values are skipped |
+| Warm HF cache | Keep the original `make_retrieval_dataset` path unchanged on one cluster | Hugging Face cache files under a shared cache directory | Rerun cache warmup with the updated original config |
+| Resolved Arrow | Build small self-contained repro/debug datasets | Flat fully materialized Arrow shards per output directory | Prepare a new output directory, then list multiple resolved directories in training `data_dir_list` |
+
+For large VL retrieval training, use **normalized Arrow**. It keeps the original corpus-id retrieval model but stores
+the referenced corpus locally:
+
+- `sources/source-*/train/*.arrow` stores query rows and positive/negative document IDs.
+- `sources/source-*/corpus/*/*.arrow` stores each referenced document/image once.
+- Training still resolves `doc_id -> document` through the normal retrieval transform.
+
+This is the recommended portable format because it avoids hidden Hugging Face cache rebuilds and avoids duplicating
+image payload in every training row.
+
+## Normalized Arrow Workflow
 
 ```bash
 python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
@@ -76,14 +89,26 @@ Append mode stages each new source in a temporary directory and updates the top-
 sources finish. It skips exact duplicate source entries already present in metadata. It does not deduplicate documents
 across different sources, so do not re-list old sources under a modified path or config entry.
 
-Normalized Arrow keeps the original corpus-id retrieval model but stores the referenced corpus locally:
+## Adding More Data
 
-- `sources/source-*/train/*.arrow` stores query rows and positive/negative document IDs.
-- `sources/source-*/corpus/*/*.arrow` stores each referenced document/image once.
-- Training still resolves `doc_id -> document` through the normal retrieval transform.
+For existing corpus schemas:
 
-This is the recommended portable format because it avoids hidden Hugging Face cache rebuilds and avoids duplicating
-image payload in every training row.
+- **Normalized Arrow:** run prep with a config containing only the new source(s), the same `OUT_DIR`, and `APPEND=1`.
+- **Resolved Arrow:** prepare the new source into a new output directory, then list both old and new resolved
+  directories in training `data_dir_list`.
+- **Warm HF cache:** rerun cache warmup with the updated original config and the same shared cache directory.
+
+For new corpus schemas, use the original AutoModel extension point:
+
+1. Add an `AbstractDataset` implementation with `get_document_by_id()` and `get_all_ids()`.
+2. Register it in `DATASETS`.
+3. Add the source JSON to the original retrieval config.
+4. Run one of the prep paths above.
+
+`--resume` on normalized prep reuses readable train shards and complete corpus directories from an interrupted run.
+Use `APPEND=1` to add new sources to an existing normalized bundle. Resolved prep writes flat materialized Arrow
+shards and does not append into an existing output directory; to mix resolved datasets, prepare each one into its own
+directory and list those directories in `data_dir_list`.
 
 ## Storage Comparison
 
@@ -176,17 +201,3 @@ dataloader:
 ```
 
 Resolved Arrow is map-style, so normal DataLoader sampler/shuffle behavior applies.
-
-## Adding More Data
-
-For both normalized and resolved prep, new corpus schemas still use the original AutoModel extension point:
-
-1. Add an `AbstractDataset` implementation with `get_document_by_id()` and `get_all_ids()`.
-2. Register it in `DATASETS`.
-3. Add the source JSON to the original retrieval config.
-4. Run the prep tool into a new output directory.
-
-`--resume` on normalized prep reuses readable train shards and complete corpus directories from an interrupted run.
-Use `APPEND=1` to add new sources to an existing normalized bundle. Resolved prep writes flat materialized Arrow
-shards and does not append into an existing output directory; to mix resolved datasets, prepare each one into its own
-directory and list those directories in `data_dir_list`.
