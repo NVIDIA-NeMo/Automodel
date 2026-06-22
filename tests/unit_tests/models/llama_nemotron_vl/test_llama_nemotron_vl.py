@@ -16,6 +16,7 @@ import pytest
 import torch
 import torch.nn as nn
 from PIL import Image
+from transformers.image_utils import PILImageResampling
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.processing_utils import ProcessorMixin
@@ -26,6 +27,7 @@ from nemo_automodel.components.models.llama_nemotron_vl.model import (
     LlamaNemotronVLModel,
 )
 from nemo_automodel.components.models.llama_nemotron_vl.processor import (
+    LlamaNemotronVLImageProcessor,
     LlamaNemotronVLProcessor,
     dynamic_preprocess,
     find_closest_aspect_ratio,
@@ -449,6 +451,70 @@ def test_dynamic_preprocess_adds_thumbnail_only_for_multi_tile_images():
     assert len(square_tiles) == 1
     assert len(wide_tiles) == 3
     assert [tile.size for tile in wide_tiles] == [(4, 4), (4, 4), (4, 4)]
+
+
+def test_fast_image_processor_uses_bicubic_resize_by_default(monkeypatch):
+    image_processor = LlamaNemotronVLImageProcessor(image_size=4, max_num_tiles=2)
+    seen_resample = []
+
+    def fake_resize(image, size, resample=None, **kwargs):
+        seen_resample.append(resample)
+        return torch.zeros((3, size.height, size.width), dtype=image.dtype)
+
+    monkeypatch.setattr(image_processor, "resize", fake_resize)
+
+    patches = image_processor.dynamic_preprocess(
+        torch.zeros((3, 4, 8)),
+        image_size=4,
+        max_num_tiles=2,
+        use_thumbnail=True,
+    )
+
+    assert len(patches) == 3
+    assert seen_resample == [PILImageResampling.BICUBIC, PILImageResampling.BICUBIC]
+
+
+def test_fast_image_processor_preprocess_honors_image_kwargs(monkeypatch):
+    image_processor = LlamaNemotronVLImageProcessor(image_size=4)
+    captured = {}
+
+    def fake_resize(image, size, resample=None, **kwargs):
+        captured["resample"] = resample
+        return torch.ones((3, size.height, size.width), dtype=image.dtype)
+
+    def fake_rescale_and_normalize(pixel_values, do_rescale, rescale_factor, do_normalize, image_mean, image_std):
+        captured["do_rescale"] = do_rescale
+        captured["rescale_factor"] = rescale_factor
+        captured["do_normalize"] = do_normalize
+        captured["image_mean"] = image_mean
+        captured["image_std"] = image_std
+        return pixel_values
+
+    monkeypatch.setattr(image_processor, "resize", fake_resize)
+    monkeypatch.setattr(image_processor, "rescale_and_normalize", fake_rescale_and_normalize)
+
+    output = image_processor._preprocess(
+        [torch.zeros((3, 4, 4))],
+        image_size=4,
+        dynamic_image_size=False,
+        do_rescale=False,
+        rescale_factor=0.5,
+        do_normalize=False,
+        image_mean=[0.1, 0.2, 0.3],
+        image_std=[0.4, 0.5, 0.6],
+        resample=PILImageResampling.NEAREST,
+        return_tensors="pt",
+    )
+
+    assert output["pixel_values"].shape == (1, 3, 4, 4)
+    assert captured == {
+        "resample": PILImageResampling.NEAREST,
+        "do_rescale": False,
+        "rescale_factor": 0.5,
+        "do_normalize": False,
+        "image_mean": [0.1, 0.2, 0.3],
+        "image_std": [0.4, 0.5, 0.6],
+    }
 
 
 def test_llama_nemotron_vl_config_builds_composed_subconfigs():
