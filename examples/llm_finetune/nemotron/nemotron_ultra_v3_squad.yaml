@@ -32,8 +32,8 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  num_epochs: 3
-  max_steps: 100
+  num_epochs: 1
+  max_steps: 17
   global_batch_size: 256  # local_batch_size(4) * dp_size(64) -> no grad accumulation.
   local_batch_size: 4
   ckpt_every_steps: 50
@@ -137,7 +137,7 @@ ci:
   # pp_size(4) * ep_size(64) = 256 GPUs => 32 nodes (8 H100/node).
   recipe_owner: adil-a
   nodes: 32
-  time: "04:00:00"
+  time: "00:30:00"
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
     NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "8"
