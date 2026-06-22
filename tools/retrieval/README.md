@@ -13,6 +13,18 @@ python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
   --resume
 ```
 
+On Slurm CPU nodes:
+
+```bash
+CONFIG=/path/to/original_retrieval_config.yaml \
+OUT_DIR=/path/to/normalized_vl_retrieval \
+PARTITION=cpu_short \
+TIME=08:00:00 \
+CPUS_PER_TASK=32 \
+EXTRA_CONTAINER_MOUNTS=/path/to/source_data:/path/to/source_data \
+tools/retrieval/submit_prepare_normalized_vl_retrieval_data_cpu.sh
+```
+
 Then train with:
 
 ```yaml
@@ -41,7 +53,7 @@ Measured on the Nemotron VL 1B image-retrieval training set used in debugging, w
 
 | Path | What it stores | Size observed | Recommendation |
 | --- | --- | ---: | --- |
-| Original HF cache | Hugging Face cache fingerprints and materialized source corpora under `HF_DATASETS_CACHE` | `3.7T` in the active cache dir | Fast when warm, but not portable and can grow with each fingerprint/config/path variant |
+| Original HF cache | Hugging Face cache fingerprints and materialized source corpora under `HF_DATASETS_CACHE` | `3.7T` in one observed active cache dir; varies by cache history | Fast when warm, but not portable and can grow with each fingerprint/config/path variant |
 | Resolved Arrow | Fully materialized train rows with document/image payload repeated per row | `508G` | Keep only for small self-contained repro/debug datasets |
 | Normalized Arrow | Train refs plus deduplicated local corpus Arrow shards | `176G` | Recommended full-dataset portable format |
 
