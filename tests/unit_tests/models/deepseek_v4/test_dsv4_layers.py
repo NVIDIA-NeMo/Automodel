@@ -25,7 +25,6 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.models.deepseek_v4 import layers as dsv4_layers
-from nemo_automodel.components.models.deepseek_v4 import optimized_kernels as dsv4_optimized_kernels
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import build_dsv4_cp_causal_padding_mask
 from nemo_automodel.components.models.deepseek_v4.layers import (
@@ -855,37 +854,39 @@ class TestDeepseekV4OptimizedKernels:
         torch.testing.assert_close(actual, expected)
         torch.testing.assert_close(actual_grad, expected_grad)
 
-    def test_tile_kernels_availability_is_phony_by_default(self, monkeypatch):
-        monkeypatch.delenv(dsv4_optimized_kernels._ENABLE_TILE_KERNELS_IMPORT_ENV, raising=False)
+    def test_vendored_tilelang_module_imports_with_phony_decorator(self, monkeypatch):
+        import builtins
+        import importlib
+        import importlib.util
+        import sys
 
-        def fail_import(*args, **kwargs):
-            raise AssertionError("TileKernels should be represented by a placeholder by default")
+        from nemo_automodel.shared.import_utils import UnavailableError
 
-        monkeypatch.setattr(dsv4_optimized_kernels, "safe_import_from", fail_import)
+        helper_name = "nemo_automodel.components.models.deepseek_v4.kernels._tilelang"
+        module_name = "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd"
+        helper_path = dsv4_layers.__file__.rsplit("/", 1)[0] + "/kernels/_tilelang.py"
+        original_import = builtins.__import__
 
-        has_sinkhorn, _ = dsv4_optimized_kernels._optional_tilelang_import_from(
-            "tile_kernels.modeling.mhc.ops",
-            "sinkhorn_normalize",
-            msg="TileKernels sinkhorn is unavailable.",
-        )
+        def block_tilelang(name, globals_=None, locals_=None, fromlist=(), level=0):
+            if name == "tilelang" or name.startswith("tilelang."):
+                raise ImportError("blocked tilelang")
+            return original_import(name, globals_, locals_, fromlist, level)
 
-        assert not has_sinkhorn
+        monkeypatch.setattr(builtins, "__import__", block_tilelang)
+        spec = importlib.util.spec_from_file_location(helper_name, helper_path)
+        helper = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(helper)
+        assert not helper.HAS_TILELANG
 
-    def test_vendored_tilelang_kernels_are_phony_without_tilelang(self, monkeypatch):
-        monkeypatch.setattr(dsv4_optimized_kernels, "_tilelang_available", lambda: False)
-
-        def fail_import(*args, **kwargs):
-            raise AssertionError("vendored TileLang kernels should be represented by placeholders")
-
-        monkeypatch.setattr(dsv4_optimized_kernels, "safe_import_from", fail_import)
-
-        has_sparse_attn, _ = dsv4_optimized_kernels._optional_tilelang_import_from(
-            "nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention",
-            "sparse_attn_tilelang",
-            msg="Vendored Miles DeepSeek V4 sparse attention is unavailable.",
-        )
-
-        assert not has_sparse_attn
+        monkeypatch.setitem(sys.modules, helper_name, helper)
+        sys.modules.pop(module_name, None)
+        try:
+            module = importlib.import_module(module_name)
+            with pytest.raises(UnavailableError):
+                module.tl_indexer_fwd_impl(heads=1, index_dim=8)
+        finally:
+            sys.modules.pop(module_name, None)
 
     @pytest.mark.skipif(
         not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),

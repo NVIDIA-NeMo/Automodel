@@ -29,91 +29,59 @@ TileLang-backed paths are sourced from:
   ``nemo_automodel/components/models/deepseek_v4/kernels/__init__.py`` for
   the per-file attribution.
 
-Those packages use an optional-import shim so environments without TileLang
-still import the model and use the existing torch path.
+Those packages are imported with ``safe_import`` so environments without
+TileLang still import the model and use the existing torch path.
 """
 
 from __future__ import annotations
 
-import importlib.util
-import os
 from typing import Literal
 
 import torch
 
-from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
+from nemo_automodel.shared.import_utils import safe_import_from
 
 Dsv4SparseAttentionBackend = Literal["torch", "sparse_torch", "tilelang", "auto"]
 Dsv4IndexerBackend = Literal["torch", "tilelang", "auto"]
 Dsv4SinkhornBackend = Literal["torch", "tilelang", "auto"]
 
-_ENABLE_TILE_KERNELS_IMPORT_ENV = "NEMO_AUTOMODEL_ENABLE_TILE_KERNELS_IMPORT"
-_VENDORED_TILELANG_KERNEL_PREFIX = "nemo_automodel.components.models.deepseek_v4.kernels"
-
-
-def _optional_tilelang_import_from(module: str, symbol: str, *, msg: str) -> tuple[bool, object]:
-    if module.startswith("tile_kernels") and not _tile_kernels_import_enabled():
-        return _unavailable_optional_import(
-            symbol,
-            (
-                f"{msg} TileKernels imports tilelang during module import; set "
-                f"{_ENABLE_TILE_KERNELS_IMPORT_ENV}=1 to enable this optional import."
-            ),
-        )
-    if module.startswith(_VENDORED_TILELANG_KERNEL_PREFIX) and not _tilelang_available():
-        return _unavailable_optional_import(symbol, f"{msg} tilelang is not installed.")
-    return safe_import_from(module, symbol, msg=msg)
-
-
-def _unavailable_optional_import(symbol: str, msg: str) -> tuple[bool, object]:
-    return False, UnavailableMeta(symbol, (), {"_msg": msg})
-
-
-def _tile_kernels_import_enabled() -> bool:
-    return os.environ.get(_ENABLE_TILE_KERNELS_IMPORT_ENV) == "1"
-
-
-def _tilelang_available() -> bool:
-    return importlib.util.find_spec("tilelang") is not None
-
-
-_HAS_TILE_KERNELS_SINKHORN, _tile_kernels_sinkhorn = _optional_tilelang_import_from(
+_HAS_TILE_KERNELS_SINKHORN, _tile_kernels_sinkhorn = safe_import_from(
     "tile_kernels.modeling.mhc.ops",
     "sinkhorn_normalize",
     msg="TileKernels sinkhorn is unavailable. Install tile_kernels and tilelang to use backend.attn='tilelang'.",
 )
-_HAS_TILE_KERNELS_SINKHORN_FWD, _tile_kernels_sinkhorn_fwd = _optional_tilelang_import_from(
+_HAS_TILE_KERNELS_SINKHORN_FWD, _tile_kernels_sinkhorn_fwd = safe_import_from(
     "tile_kernels.mhc.sinkhorn_kernel",
     "_mhc_sinkhorn_fwd",
     msg="TileKernels low-level sinkhorn forward kernel is unavailable.",
 )
-_HAS_TILE_KERNELS_SINKHORN_BWD, _tile_kernels_sinkhorn_bwd = _optional_tilelang_import_from(
+_HAS_TILE_KERNELS_SINKHORN_BWD, _tile_kernels_sinkhorn_bwd = safe_import_from(
     "tile_kernels.mhc.sinkhorn_kernel",
     "_mhc_sinkhorn_bwd",
     msg="TileKernels low-level sinkhorn backward kernel is unavailable.",
 )
-_HAS_MILES_SPARSE_ATTN, _miles_sparse_attn_tilelang = _optional_tilelang_import_from(
+_HAS_MILES_SPARSE_ATTN, _miles_sparse_attn_tilelang = safe_import_from(
     "nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention",
     "sparse_attn_tilelang",
     msg="Vendored Miles DeepSeek V4 sparse attention is unavailable. Install tilelang to use backend.attn='tilelang'.",
 )
-_HAS_MILES_SPARSE_ATTN_CHUNKED, _miles_sparse_attn_tilelang_head_chunked = _optional_tilelang_import_from(
+_HAS_MILES_SPARSE_ATTN_CHUNKED, _miles_sparse_attn_tilelang_head_chunked = safe_import_from(
     "nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention",
     "sparse_attn_tilelang_head_chunked",
     msg="Vendored Miles DeepSeek V4 chunked sparse attention is unavailable. Install tilelang to use "
     "backend.attn='tilelang'.",
 )
-_HAS_MILES_INDEXER, _miles_batched_indexer_fwd = _optional_tilelang_import_from(
+_HAS_MILES_INDEXER, _miles_batched_indexer_fwd = safe_import_from(
     "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd",
     "batched_indexer_fwd",
     msg="Vendored Miles DeepSeek V4 indexer is unavailable. Install tilelang to use backend.attn='tilelang'.",
 )
-_HAS_MILES_CU_SEQLENS, _miles_make_causal_cu_seqlens = _optional_tilelang_import_from(
+_HAS_MILES_CU_SEQLENS, _miles_make_causal_cu_seqlens = safe_import_from(
     "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd",
     "_make_causal_cu_seqlens",
     msg="Vendored Miles DeepSeek V4 indexer cu-seqlens helper is unavailable.",
 )
-_HAS_MILES_INDEXER_AUTOGRAD, _miles_v4_lighting_indexer = _optional_tilelang_import_from(
+_HAS_MILES_INDEXER_AUTOGRAD, _miles_v4_lighting_indexer = safe_import_from(
     "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer",
     "v4_lighting_indexer",
     msg="Vendored Miles DeepSeek V4 autograd indexer is unavailable.",
