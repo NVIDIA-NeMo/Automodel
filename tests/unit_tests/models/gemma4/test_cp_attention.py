@@ -604,8 +604,8 @@ def _sdpa_flex_surrogate(module, ctx, *, key_chunk, value_chunk, metadata_chunk,
     """
     scale = ctx.scale
     scores = torch.matmul(ctx.query, key_chunk.transpose(-1, -2)) * scale
-    q_global = torch.arange(ctx.seq_local).view(-1, 1) + ctx.seq_global_start
-    kv_global = torch.arange(key_chunk.shape[2]).view(1, -1) + kv_global_start
+    q_global = torch.arange(ctx.seq_local, device=ctx.query.device).view(-1, 1) + ctx.seq_global_start
+    kv_global = torch.arange(key_chunk.shape[2], device=key_chunk.device).view(1, -1) + kv_global_start
     allowed = kv_global <= q_global
     scores = scores.masked_fill(~allowed, float("-inf"))
     lse = torch.logsumexp(scores, dim=-1)
@@ -614,10 +614,14 @@ def _sdpa_flex_surrogate(module, ctx, *, key_chunk, value_chunk, metadata_chunk,
     return out, lse, None, ctx.query.shape[-1]
 
 
-def test_ring_autograd_single_rank_grads_match_sdpa(monkeypatch):
+def test_ring_autograd_single_rank_grads_match_sdpa(monkeypatch, device):
     monkeypatch.setattr(cpa, "_run_gemma4_flex_chunk", _sdpa_flex_surrogate)
     module = _flex_module()
     ctx = _make_ctx(module, seq=6, head_dim=8)
+    if device == "GPU":
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        ctx = cpa.replace(ctx, query=ctx.query.cuda(), key=ctx.key.cuda(), value=ctx.value.cuda())
     q = ctx.query.clone().requires_grad_(True)
     k = ctx.key.clone().requires_grad_(True)
     v = ctx.value.clone().requires_grad_(True)
