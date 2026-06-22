@@ -243,6 +243,11 @@ constraint-dependencies = [
     "pyjwt>=2.12.0",
     "pytest>=8.4.3",
     "pygments>=2.20.0",
+    # tilelang 0.1.11 bundles its own TVM but leaves apache-tvm-ffi unpinned, so it
+    # resolves to 0.1.12, which double-registers TVM FFI TypeAttrs against the
+    # bundled TVM and breaks the tilelang kernels (SIGABRT/instability on the GPU
+    # paths). Upstream capped it to <=0.1.11 (tile-ai/tilelang#2373); mirror that.
+    "apache-tvm-ffi<=0.1.11",
 ]
 override-dependencies = [
     "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
