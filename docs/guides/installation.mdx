@@ -250,19 +250,15 @@ cd Automodel
 # Step 2: Pull a compatible container image (replace the tag as needed).
 docker pull nvcr.io/nvidia/nemo-automodel:26.04.00
 
-# Step 3: Run the container with your local checkout mounted over /opt/Automodel.
+# Step 3: Run the container, sync the mounted checkout, and run a usage example.
 docker run --gpus all --network=host -it --rm \
   --shm-size=32g \
   -v "$(pwd)":/opt/Automodel \
-  nvcr.io/nvidia/nemo-automodel:26.04.00 /bin/bash
-```
-
-Inside the container, patch `pyproject.toml` / `uv.lock` for the PyTorch base image, then re-sync the environment:
-
-```bash
-cd /opt/Automodel
-bash docker/common/update_pyproject_pytorch.sh /opt/Automodel
-uv sync --locked --extra all --all-groups
+  nvcr.io/nvidia/nemo-automodel:26.04.00 /bin/bash -c "\
+    cd /opt/Automodel && \
+    bash docker/common/update_pyproject_pytorch.sh /opt/Automodel && \
+    uv sync --locked --extra all --all-groups && \
+    automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml"
 ```
 
 <Warning>
