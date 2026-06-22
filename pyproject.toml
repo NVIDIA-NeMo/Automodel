@@ -222,6 +222,7 @@ no-build-isolation-package = [
 constraint-dependencies = [
     "aiohttp>=3.13.3", # Address CVE GHSA-6mq8-rvhq-8wgg
     "cryptography>=46.0.7",
+    "diffusers>=0.38.0",
     "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
     "pillow>=12.2.0",
     "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
