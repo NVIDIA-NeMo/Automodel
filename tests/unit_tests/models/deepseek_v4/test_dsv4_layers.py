@@ -855,76 +855,40 @@ class TestDeepseekV4OptimizedKernels:
         torch.testing.assert_close(actual, expected)
         torch.testing.assert_close(actual_grad, expected_grad)
 
-    def test_tilelang_imports_are_deferred_for_torch_and_cpu_auto_paths(self, monkeypatch):
-        dsv4_optimized_kernels._OPTIONAL_IMPORTS.clear()
-
-        def fail_import(*args, **kwargs):
-            raise AssertionError("optional TileLang import should be lazy")
-
-        monkeypatch.setattr(dsv4_optimized_kernels, "safe_import_from", fail_import)
-
-        x = torch.randn(2, 3, 4, 4)
-        dsv4_sinkhorn_normalize(x, backend="torch", repeat=5, eps=1e-6)
-        dsv4_sinkhorn_normalize(x, backend="auto", repeat=5, eps=1e-6)
-
-        q = torch.randn(1, 4, 2, 8)
-        kv = torch.randn(1, 5, 8)
-        sinks = torch.randn(2)
-        topk_idxs = torch.zeros(1, 4, 3, dtype=torch.long)
-        dsv4_sparse_attention(q, kv, sinks, topk_idxs, 8**-0.5, backend="auto")
-
-        weights = torch.randn(1, 4, 2)
-        dsv4_indexer_scores(q, kv, weights, compress_ratio=2, softmax_scale=8**-0.5, backend="auto")
-        dsv4_indexer_topk_scores(q, kv, weights, topk_idxs, compress_ratio=2, softmax_scale=8**-0.5, backend="auto")
-
-    def test_tile_kernels_availability_is_opt_in_by_default(self, monkeypatch):
-        dsv4_optimized_kernels._OPTIONAL_IMPORTS.clear()
+    def test_tile_kernels_availability_is_phony_by_default(self, monkeypatch):
         monkeypatch.delenv(dsv4_optimized_kernels._ENABLE_TILE_KERNELS_IMPORT_ENV, raising=False)
 
         def fail_import(*args, **kwargs):
-            raise AssertionError("TileKernels import should require an explicit opt-in")
+            raise AssertionError("TileKernels should be represented by a placeholder by default")
 
         monkeypatch.setattr(dsv4_optimized_kernels, "safe_import_from", fail_import)
 
-        assert not is_dsv4_kernel_available("sinkhorn")
+        has_sinkhorn, _ = dsv4_optimized_kernels._optional_tilelang_import_from(
+            "tile_kernels.modeling.mhc.ops",
+            "sinkhorn_normalize",
+            msg="TileKernels sinkhorn is unavailable.",
+        )
 
-    def test_tile_kernels_availability_imports_when_opted_in(self, monkeypatch):
-        dsv4_optimized_kernels._OPTIONAL_IMPORTS.clear()
-        monkeypatch.setenv(dsv4_optimized_kernels._ENABLE_TILE_KERNELS_IMPORT_ENV, "1")
-        monkeypatch.setattr(dsv4_optimized_kernels, "_tile_kernels_import_is_unsafe", lambda: False)
-        calls = []
+        assert not has_sinkhorn
 
-        def fake_import(module, symbol, *, msg):
-            calls.append((module, symbol))
-            return True, object()
-
-        monkeypatch.setattr(dsv4_optimized_kernels, "safe_import_from", fake_import)
-
-        assert is_dsv4_kernel_available("sinkhorn")
-        assert calls == [
-            ("tile_kernels.modeling.mhc.ops", "sinkhorn_normalize"),
-            ("tile_kernels.mhc.sinkhorn_kernel", "_mhc_sinkhorn_fwd"),
-            ("tile_kernels.mhc.sinkhorn_kernel", "_mhc_sinkhorn_bwd"),
-        ]
-
-    def test_tile_kernels_availability_is_guarded_after_tvm_ffi_load(self, monkeypatch):
-        import sys
-        import types
-
-        dsv4_optimized_kernels._OPTIONAL_IMPORTS.clear()
-        monkeypatch.setenv(dsv4_optimized_kernels._ENABLE_TILE_KERNELS_IMPORT_ENV, "1")
-        monkeypatch.setitem(sys.modules, "tvm_ffi.core", types.ModuleType("tvm_ffi.core"))
-        monkeypatch.delitem(sys.modules, "tilelang", raising=False)
+    def test_vendored_tilelang_kernels_are_phony_without_tilelang(self, monkeypatch):
+        monkeypatch.setattr(dsv4_optimized_kernels, "_tilelang_available", lambda: False)
 
         def fail_import(*args, **kwargs):
-            raise AssertionError("unsafe TileKernels import should be guarded")
+            raise AssertionError("vendored TileLang kernels should be represented by placeholders")
 
         monkeypatch.setattr(dsv4_optimized_kernels, "safe_import_from", fail_import)
 
-        assert not is_dsv4_kernel_available("sinkhorn")
+        has_sparse_attn, _ = dsv4_optimized_kernels._optional_tilelang_import_from(
+            "nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention",
+            "sparse_attn_tilelang",
+            msg="Vendored Miles DeepSeek V4 sparse attention is unavailable.",
+        )
+
+        assert not has_sparse_attn
 
     @pytest.mark.skipif(
-        not torch.cuda.is_available() or not is_dsv4_kernel_available("sinkhorn"),
+        not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
         reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
     )
     def test_sinkhorn_tilelang_backend_matches_torch(self):
@@ -945,7 +909,7 @@ class TestDeepseekV4OptimizedKernels:
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
 
     @pytest.mark.skipif(
-        not torch.cuda.is_available() or not is_dsv4_kernel_available("sinkhorn"),
+        not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
         reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
     )
     def test_sinkhorn_tilelang_backend_accepts_non_contiguous_grad(self):
@@ -1108,7 +1072,7 @@ class TestDeepseekV4OptimizedKernels:
             torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
 
     @pytest.mark.skipif(
-        not torch.cuda.is_available() or not is_dsv4_kernel_available("sparse_attn"),
+        not is_dsv4_kernel_available("sparse_attn") or not torch.cuda.is_available(),
         reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
     )
     def test_sparse_attention_tilelang_backend_matches_torch(self):
@@ -1153,7 +1117,7 @@ class TestDeepseekV4OptimizedKernels:
             torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
 
     @pytest.mark.skipif(
-        not torch.cuda.is_available() or not is_dsv4_kernel_available("sparse_attn"),
+        not is_dsv4_kernel_available("sparse_attn") or not torch.cuda.is_available(),
         reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
     )
     def test_sparse_attention_tilelang_backend_matches_torch_with_causal_padding_shape(self):
@@ -1301,7 +1265,7 @@ class TestDeepseekV4OptimizedKernels:
             torch.testing.assert_close(actual_grad, expected_grad)
 
     @pytest.mark.skipif(
-        not torch.cuda.is_available() or not is_dsv4_kernel_available("indexer"),
+        not is_dsv4_kernel_available("indexer") or not torch.cuda.is_available(),
         reason="Miles DSV4 indexer kernel is not installed on a CUDA environment",
     )
     def test_indexer_tilelang_backend_matches_torch(self):
@@ -1333,7 +1297,7 @@ class TestDeepseekV4OptimizedKernels:
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.skipif(
-        not torch.cuda.is_available() or not is_dsv4_kernel_available("indexer"),
+        not is_dsv4_kernel_available("indexer") or not torch.cuda.is_available(),
         reason="Vendored Miles DSV4 indexer kernel is not available on a CUDA environment",
     )
     def test_indexer_topk_tilelang_backend_matches_torch(self):
