@@ -119,14 +119,20 @@ cuda = [
     # This is required to prevent ONNX errors arising from TE
     "onnxscript>=0.5.6",
     "transformer-engine[pytorch]>=2.14.1",
-    # DeepSeek-V4 TileLang kernels (enable backend.attn="tilelang": sparse MLA
-    # attention and lightning indexer). The external DeepSeek ``tile_kernels``
-    # package (MHC sinkhorn) is not resolvable from PyPI and is not installed by
-    # default, so that path remains optional.
-    "tilelang>=0.1.11",
 ]
 cuda_source = [
     "bitsandbytes",
+]
+# DeepSeek-V4 TileLang kernels (enable backend.attn="tilelang": sparse MLA
+# attention and lightning indexer). Opt-in ONLY -- intentionally not part of
+# `cuda`/`all`: installing TileLang into the default image destabilizes unrelated
+# GPU code paths (its vendored TVM FFI can abort/hang when other CUDA/JIT
+# toolchains are active in the same process), which silently hangs unrelated unit
+# tests. Install it explicitly (`nemo_automodel[tilelang]`) in a dedicated
+# DeepSeek-V4 image. The external DeepSeek ``tile_kernels`` package (MHC sinkhorn)
+# is not resolvable from PyPI and remains optional.
+tilelang = [
+    "tilelang>=0.1.11",
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]

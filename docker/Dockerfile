@@ -200,10 +200,12 @@ RUN git clone --depth 1 --branch v0.17.0 --recurse-submodules --shallow-submodul
         pip install --no-cache-dir --no-build-isolation /tmp/torchao && \
     rm -rf /tmp/torchao
 
-# DeepSeek-V4 TileLang kernels are resolved by the cuda extra during `uv sync`.
-# The external DeepSeek TileKernels package is intentionally not installed here:
-# its import eagerly imports TileLang's vendored TVM, which can abort when other
-# TVM FFI bindings are already loaded. The MHC sinkhorn path remains optional.
+# DeepSeek-V4 TileLang kernels are an opt-in extra (`nemo_automodel[tilelang]`)
+# and are intentionally NOT installed in this default image: TileLang's vendored
+# TVM FFI can abort/hang when other CUDA/JIT toolchains are active in the same
+# process, which silently hangs unrelated unit tests. Build a dedicated image with
+# `--extra tilelang` for DeepSeek-V4 recipes. The external DeepSeek TileKernels
+# package (MHC sinkhorn) is likewise not installed here and remains optional.
 
 COPY . /opt/Automodel
 
