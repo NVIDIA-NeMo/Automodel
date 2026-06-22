@@ -2189,8 +2189,9 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
 
     captured = {}
 
-    def _fake_calc_loss(loss_fn, *, logits, labels, model, hidden_states, num_label_tokens):
+    def _fake_calc_loss(loss_fn, *, logits, labels, model, hidden_states, lm_weight, num_label_tokens):
         captured["logits_is_tensor"] = isinstance(logits, torch.Tensor)
+        assert lm_weight is None
         # finite base loss (fp32) so any non-finiteness must come from the grad touch
         return logits.float().mean()
 
