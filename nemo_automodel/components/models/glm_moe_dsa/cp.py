@@ -53,7 +53,9 @@ def glm_dsa_cp_all_gather(tensor: torch.Tensor, *, dim: int, cp_group) -> torch.
 
 def _contiguous_cp_indices(total_tokens: int, cp_size: int, cp_rank: int, device: torch.device) -> torch.Tensor:
     if total_tokens % cp_size != 0:
-        raise ValueError(f"Packed GLM DSA CP requires total tokens divisible by cp_size, got {total_tokens=} {cp_size=}")
+        raise ValueError(
+            f"Packed GLM DSA CP requires total tokens divisible by cp_size, got {total_tokens=} {cp_size=}"
+        )
     local_tokens = total_tokens // cp_size
     start = cp_rank * local_tokens
     return torch.arange(start, start + local_tokens, device=device, dtype=torch.long)
