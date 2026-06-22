@@ -74,7 +74,7 @@ class TestNemotronV3StateDictAdapter:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
         )
 
     def test_adapter_init(self, config, moe_config, backend):

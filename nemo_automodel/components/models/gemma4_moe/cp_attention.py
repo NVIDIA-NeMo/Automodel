@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 from dataclasses import dataclass, replace
@@ -27,6 +28,36 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 _GEMMA4_CP_FLEX_RING_OK_LOGGED = False
+
+
+def _patch_fsdp_accumulated_grad_guard() -> None:
+    """Guard ``FSDPParam.to_accumulated_grad_if_needed`` against uninitialized params.
+
+    On some torch builds that method reads ``self._unsharded_param`` (the lazily
+    set unsharded tensor) without first checking it exists. In FSDP2 post-backward
+    under fp32 grad-reduce, frozen / never-unsharded params (e.g. the frozen Gemma4
+    vision tower and embeddings) have no ``_unsharded_param`` yet and it raises
+    ``AttributeError``. Such params carry no grad to upcast anyway, so wrap the
+    method to skip them when uninitialized. No-op once applied / on fixed builds.
+    """
+    try:
+        from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+    except Exception:
+        return
+    orig = FSDPParam.to_accumulated_grad_if_needed
+    if getattr(orig, "_gemma4_guarded", False):
+        return
+
+    def guarded(self):
+        if not hasattr(self, "_unsharded_param"):
+            return
+        return orig(self)
+
+    guarded._gemma4_guarded = True
+    FSDPParam.to_accumulated_grad_if_needed = guarded
+
+
+_patch_fsdp_accumulated_grad_guard()
 
 
 @dataclass(frozen=True)
@@ -64,6 +95,46 @@ def gemma4_vision_group_ids(mm_token_type_ids: torch.Tensor) -> torch.Tensor:
     return torch.where(is_vision, group_ids, torch.full_like(group_ids, -1))
 
 
+# Block masks built by create_block_mask are independent of the K/V *values*: they
+# depend only on the attention type (sliding window), the local/chunk sequence
+# geometry, and the position-level metadata (packing / padding / vision groups).
+# Within a single training step the metadata content is fixed by *position*, so for
+# a given (layer-type, chunk geometry) every one of E4B's 42 layers builds an
+# identical mask -- and create_block_mask costs ~7.6ms/call, dominating short-seq CP
+# step time (~66%). We cache on the position scalars only (never on tensor storage
+# -- the CUDA allocator recycles addresses, so a data_ptr key could alias distinct
+# content and return a stale mask). Correctness across steps is preserved by
+# clearing the cache whenever the batch's metadata object changes; the object is
+# held as the generation token so its identity can't be recycled while it is live.
+_BLOCK_MASK_CACHE: dict = {}
+# [data_ptr, held-tensor]: the metadata tensor is re-wrapped into a fresh Python
+# object every layer but shares one storage within a step (and the detached
+# backward metadata shares it too), so we detect a new batch by its data_ptr.
+# The tensor is held so the allocator cannot recycle that address mid-step, which
+# would otherwise let a later step's distinct content collide on the same pointer.
+_BLOCK_MASK_GEN: list = [None, None]
+
+
+def _block_mask_set_generation(gen_tensor) -> None:
+    """Reset the per-step block-mask cache when a new batch (new metadata) arrives."""
+    ptr = None if gen_tensor is None else gen_tensor.data_ptr()
+    if ptr != _BLOCK_MASK_GEN[0]:
+        _BLOCK_MASK_CACHE.clear()
+        _BLOCK_MASK_GEN[0] = ptr
+        _BLOCK_MASK_GEN[1] = gen_tensor  # pin the storage for the duration of the step
+
+
+def _cached_block_mask(key, build):
+    cached = _BLOCK_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    mask = build()
+    if len(_BLOCK_MASK_CACHE) >= 256:  # bound the gen=None (metadata-free) varying-seqlen case
+        _BLOCK_MASK_CACHE.pop(next(iter(_BLOCK_MASK_CACHE)))
+    _BLOCK_MASK_CACHE[key] = mask
+    return mask
+
+
 def _compiled_flex_attention(attention_module: torch.nn.Module):
     compiled = getattr(attention_module, "_gemma4_cp_compiled_flex_attn", None)
     if compiled is None:
@@ -72,6 +143,28 @@ def _compiled_flex_attention(attention_module: torch.nn.Module):
         compiled = torch.compile(flex_attention, dynamic=True)
         attention_module._gemma4_cp_compiled_flex_attn = compiled
     return compiled
+
+
+@contextlib.contextmanager
+def _duck_shape_disabled():
+    """Locally disable flex duck-shape specialization for the wrapped flex call.
+
+    With variable-length (unpacked) batches the compiled flex kernel otherwise
+    guards on incidental dim-equalities (e.g. ``block_mask.kv_indices.size()[2] ==
+    key.size()[1]``) and recompiles on every new sequence length, collapsing
+    throughput to ~warmup speed. ``use_duck_shape`` is read by dynamo at (re)trace
+    time -- which happens inside the flex call -- so scoping it to the call window
+    is sufficient and, unlike setting it once at compile time, does not leave the
+    process-global ``torch.fx`` config mutated for unrelated ``torch.compile`` users.
+    """
+    from torch.fx.experimental import _config as _fx_config
+
+    prev = _fx_config.use_duck_shape
+    _fx_config.use_duck_shape = False
+    try:
+        yield
+    finally:
+        _fx_config.use_duck_shape = prev
 
 
 def _base_gemma4_cp_mask(attention_module: torch.nn.Module, ctx: Any, q_idx, kv_idx, kv_global_start: int = 0):
@@ -246,15 +339,43 @@ def _run_gemma4_flex_chunk(
 
             block_mask_batch = None
 
-        block_mask = create_block_mask(
-            cp_mask,
-            B=block_mask_batch,
-            H=None,
-            Q_LEN=ctx.seq_local,
-            KV_LEN=key_chunk.shape[2],
-            device=query.device,
-            BLOCK_SIZE=flex_block_size,
+        def _build_block_mask():
+            return create_block_mask(
+                cp_mask,
+                B=block_mask_batch,
+                H=None,
+                Q_LEN=ctx.seq_local,
+                KV_LEN=key_chunk.shape[2],
+                device=query.device,
+                BLOCK_SIZE=flex_block_size,
+            )
+
+        # Reset the cache when the batch changes (new metadata object => new step),
+        # then key purely on the position scalars. Within a step the metadata content
+        # is a function of position, so (layer-type, query/chunk geometry) uniquely
+        # identifies the mask -- shared by all 42 same-type layers, both ring chunks,
+        # and (since both pin the same captured metadata) forward and backward.
+        gen_obj = None
+        for _gen_key in ("mm_token_type_ids", "_packed_seq_ids", "padding_mask"):
+            _cand = ctx.metadata.get(_gen_key)
+            if _cand is not None:
+                gen_obj = _cand
+                break
+        _block_mask_set_generation(gen_obj)
+        block_mask_key = (
+            getattr(attention_module, "sliding_window", None),
+            bool(ctx.is_causal),
+            int(ctx.seq_global_start),
+            int(kv_global_start),
+            int(ctx.seq_local),
+            int(key_chunk.shape[2]),
+            flex_block_size,
+            block_mask_batch,
+            bool(use_vision_bidirectional),
+            query.device.type,
+            query.device.index,
         )
+        block_mask = _cached_block_mask(block_mask_key, _build_block_mask)
 
         query_for_flex = query
         key_for_flex = key_chunk
@@ -281,18 +402,19 @@ def _run_gemma4_flex_chunk(
                 "num_warps": 4,
             }
 
-        try:
-            out, lse = _compiled_flex_attention(attention_module)(
-                query_for_flex.contiguous(), key_for_flex, value_for_flex, return_lse=True, **flex_kwargs
-            )
-        except TypeError as exc:
-            if "kernel_options" in str(exc) and "kernel_options" in flex_kwargs:
-                flex_kwargs.pop("kernel_options")
+        with _duck_shape_disabled():
+            try:
                 out, lse = _compiled_flex_attention(attention_module)(
                     query_for_flex.contiguous(), key_for_flex, value_for_flex, return_lse=True, **flex_kwargs
                 )
-            else:
-                raise
+            except TypeError as exc:
+                if "kernel_options" in str(exc) and "kernel_options" in flex_kwargs:
+                    flex_kwargs.pop("kernel_options")
+                    out, lse = _compiled_flex_attention(attention_module)(
+                        query_for_flex.contiguous(), key_for_flex, value_for_flex, return_lse=True, **flex_kwargs
+                    )
+                else:
+                    raise
 
         if empty_query_rows is not None and empty_query_rows.any():
             out = out.masked_fill(empty_query_rows[:, None, :, None], 0)
@@ -576,7 +698,19 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
         )
 
     def _pre_hook(module, args, kwargs):
-        module._cp_manual_metadata = {name: kwargs.pop(name, None) for name in metadata_keys}
+        captured = {name: kwargs.pop(name, None) for name in metadata_keys}
+        # Dense Gemma4 routes through HF's decoder layers, which do not thread the
+        # CP/vision metadata down to self_attn kwargs (the MoE backend does). The
+        # dense forward stashes it on the module as ``_cp_dense_metadata``; fall
+        # back to that for any key the caller didn't pass so the ring can still
+        # build the vision-bidirectional / packed masks. Persisted across the step
+        # (not cleared by the post-hook) so it survives activation-checkpoint recompute.
+        fallback = getattr(module, "_cp_dense_metadata", None)
+        if fallback:
+            for name in metadata_keys:
+                if captured.get(name) is None:
+                    captured[name] = fallback.get(name)
+        module._cp_manual_metadata = captured
         # Own the CP mask handling (instead of relying on the generic
         # attach_context_parallel_hooks mask-strip): drop any full-sequence 4D
         # attention_mask -- invalid once the sequence is CP-sharded -- and force

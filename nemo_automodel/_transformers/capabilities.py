@@ -29,6 +29,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import weakref
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -101,6 +102,17 @@ def _uses_magi_attention(model: "nn.Module") -> bool:
     return getattr(backend, "attn", None) == "magi"
 
 
+def _is_deepseek_v4(model: "nn.Module") -> bool:
+    """True when the model is a DeepSeek V4 custom model.
+
+    DSV4 owns its context-parallel attention (Miles-style contiguous query shard
+    plus all-gathered K/V), so its CP support is gated on the TileLang attention
+    backend rather than the generic TE/SDPA/Magi paths.
+    """
+    config = getattr(model, "config", None)
+    return getattr(config, "model_type", None) == "deepseek_v4" or type(model).__name__.startswith("DeepseekV4")
+
+
 def _is_hybrid(model: "nn.Module") -> bool:
     """True when the model mixes attention with non-attention layers (e.g. Mamba/SSM).
 
@@ -147,12 +159,23 @@ class ModelSupports:
         model.supports.pp   # ...
     """
 
-    __slots__ = ("_model", "_model_cls", "_mesh")
+    __slots__ = ("_model_ref", "_model_cls", "_mesh")
 
     def __init__(self, model: "nn.Module", mesh: "MeshContext | None" = None) -> None:
-        self._model = model
+        # Hold the model weakly. ``ModelSupports`` is attached back onto the model
+        # as ``model._supports``; a strong reference here would form a
+        # ``model <-> _supports`` cycle, so the capability descriptor must never be
+        # the reason a (multi-GiB) model stays resident after its owner is dropped.
+        self._model_ref = weakref.ref(model)
         self._model_cls = type(model)
         self._mesh = mesh
+
+    @property
+    def _model(self) -> "nn.Module":
+        model = self._model_ref()
+        if model is None:
+            raise ReferenceError("ModelSupports: underlying model has been garbage-collected")
+        return model
 
     def __repr__(self) -> str:
         names = (
@@ -221,6 +244,10 @@ class ModelSupports:
         +------------------+----------------+---------+
         """
         if _has_backend(self._model):
+            if _is_deepseek_v4(self._model):
+                # DSV4 owns its CP attention (Miles-style); gated on TileLang.
+                backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+                return backend_attn == "tilelang"
             if _is_hybrid(self._model):
                 backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
                 return backend_attn in ("te", "sdpa")
@@ -357,6 +384,15 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
                 f"modify distributed YAML config section:\n"
                 f"distributed:\n"
                 f"  cp_size: 1"
+            )
+        elif _is_deepseek_v4(model):
+            errors.append(
+                f"Context parallelism (cp_size={cp_size}) for {arch} requires "
+                f"the TileLang attention backend (backend.attn='tilelang').\n"
+                f"Please re-run with --distributed.cp_size=1 or switch to TileLang attention:\n"
+                f"model:\n"
+                f"  backend:\n"
+                f"    attn: tilelang"
             )
         elif _has_backend(model):
             errors.append(

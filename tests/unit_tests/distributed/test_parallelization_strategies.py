@@ -35,6 +35,8 @@ from nemo_automodel.components.distributed.parallelizer import (
     NemotronHParallelizationStrategy,
     ParallelizationStrategy,
     WanParallelizationStrategy,
+    _extract_model_layers,
+    _nemotronh_decoder_blocks,
     fsdp2_strategy_parallelize,
     get_parallelization_strategy,
 )
@@ -102,6 +104,55 @@ class MockNemotronHModel(nn.Module):
 
     def forward(self, x):
         return x
+
+
+class MockNemotronV3Model(nn.Module):
+    """Mock of the native Nemotron-V3 model: decoder blocks live in ``model.model.layers``
+    as a ``ModuleDict`` (keyed "0".."N-1") and there is no ``backbone`` attribute."""
+
+    def __init__(self, num_layers=4):
+        super().__init__()
+
+        class MockInner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleDict()
+                for i in range(num_layers):
+                    layer = nn.Module()
+                    setattr(layer, "block_type", "mlp" if i % 2 == 0 else "attention")
+                    self.layers[str(i)] = layer
+
+        self.model = MockInner()
+        self.__class__.__name__ = "NemotronHForCausalLM"
+
+    def forward(self, x):
+        return x
+
+
+class TestNemotronHLayoutResolution:
+    """Both classes named ``NemotronHForCausalLM`` must resolve their decoder blocks
+    without an AttributeError (AM-448): the HF model exposes ``backbone.layers``
+    (``ModuleList``) and the native Nemotron-V3 model exposes ``model.layers``
+    (``ModuleDict``)."""
+
+    def test_helper_hf_backbone_modulelist(self):
+        container, blocks = _nemotronh_decoder_blocks(MockNemotronHModel())
+        assert isinstance(container, nn.ModuleList)
+        assert len(blocks) == 2
+
+    def test_helper_native_model_moduledict(self):
+        container, blocks = _nemotronh_decoder_blocks(MockNemotronV3Model(num_layers=4))
+        assert isinstance(container, nn.ModuleDict)
+        assert len(blocks) == 4  # ordered values of the ModuleDict
+
+    def test_extract_model_layers_native_has_no_backbone(self):
+        # Regression for AM-448: the registry still lists "backbone.layers", but the native
+        # model has no `backbone`; _reduce_attrs must skip it and resolve "model.layers"
+        # instead of raising.
+        assert len(_extract_model_layers(MockNemotronV3Model(num_layers=4))) == 4
+
+    def test_extract_model_layers_hf_backbone(self):
+        assert len(_extract_model_layers(MockNemotronHModel())) == 2
 
 
 @pytest.fixture

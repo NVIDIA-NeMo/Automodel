@@ -93,7 +93,7 @@ def _cpu_backend():
         attn="sdpa",
         rms_norm="torch",
         rope_fusion=False,
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=True,
     )

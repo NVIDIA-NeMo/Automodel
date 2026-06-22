@@ -111,6 +111,7 @@ optimizer:
   weight_decay: 0.0
 
 wandb:
+  enable: false
   project: huiyingl_workspace
   entity: Nemo-automodel
   name: mistral4-medpix

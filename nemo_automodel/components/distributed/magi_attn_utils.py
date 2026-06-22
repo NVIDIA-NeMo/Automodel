@@ -749,6 +749,28 @@ class MagiState:
         Returns ``(train_ctx, batch)``. magi does its own CP, so ``train_ctx`` is
         always ``nullcontext`` (no torch-native DTensor CP context).
         """
+        # cp=1 prefix-tree mask: the datasets layer cannot import this module (component
+        # independence), so the collate attaches the tree structure and the spec is built
+        # and activated here, out-of-band, for the magi attn_func. Setting it every step
+        # (a spec or None) is self-clearing, so a stale spec never leaks into the next
+        # batch; plain batches omit "prefix_tree".
+        prefix_tree = batch.pop("prefix_tree", None)
+        if prefix_tree is not None and self.hf_dispatch:
+            # The prefix-tree mask is handed to the attn_func out-of-band (the HF
+            # attention interface has a fixed signature and cannot receive a custom
+            # mask spec argument). Only the custom-model attn_func reads it; the HF
+            # magi backend uses the plain causal varlen key from magi_prepare_batch
+            # and would silently drop the prefix-tree mask. Fail loudly instead.
+            raise NotImplementedError(
+                "The prefix-tree attention mask is only supported on the custom-model magi "
+                "backend (model.backend.attn='magi'), not the HF magi backend "
+                "(model.attn_implementation='magi'). HF's attention interface cannot receive "
+                "the out-of-band AttnMaskSpec, so the mask would be silently dropped. Load a "
+                "model registered in MODEL_ARCH_MAPPING and set model.backend.attn='magi'."
+            )
+        node_lengths, sample_paths = prefix_tree if prefix_tree is not None else (None, None)
+        spec = AttnMaskSpec.prefix_tree(node_lengths, sample_paths)[0] if prefix_tree is not None else None
+        set_active_attn_spec(spec)
         if self.hf_dispatch:
             # HF path: dispatch the (single causal) sequence across the CP group.
             batch, _ = magi_prepare_batch(model, batch, self.cp_group)

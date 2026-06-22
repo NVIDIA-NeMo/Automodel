@@ -6,7 +6,9 @@
 
 step_scheduler:
   global_batch_size: 128
-  local_batch_size: 8
+  # lb 8 backward-OOMs once FLCE removes the logits bottleneck (cp1, unbounded
+  # seqs); 4 keeps global_batch_size via grad-accum. cp2 keeps 8 (CP halves it).
+  local_batch_size: 4
   ckpt_every_steps: 500
   gc_every_steps: 10
   max_steps: 1000
@@ -23,6 +25,9 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  # FusedLinearCrossEntropy fuses the lm_head projection with cross-entropy and
+  # needs the final hidden state instead of the full [bsz, seq, vocab] logits.
+  output_hidden_states: true
   pretrained_model_name_or_path: Qwen/Qwen3-4B-Base
   force_hf: true
 
@@ -51,7 +56,9 @@ distributed:
     layers_per_stage: 2
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  # Avoids the full bf16->fp32 logit upcast that OOMs MaskedCrossEntropy on long
+  # tulu3 samples (truncation: false) on 8xH100-80GB. See PR #1554.
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
