@@ -27,6 +27,7 @@ import torch.nn as nn
 from nemo_automodel.components.models.deepseek_v4 import layers as dsv4_layers
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import build_dsv4_cp_causal_padding_mask
+from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
     DeepseekV4GroupedLinear,
@@ -54,6 +55,38 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     is_dsv4_kernel_available,
     sinkhorn_normalize_torch,
 )
+
+_MILES_INDEXER_REQUIRED_DYNAMIC_SMEM_BYTES = 229376
+
+
+def _cuda_device_capability() -> tuple[int, int]:
+    if not torch.cuda.is_available():
+        return (0, 0)
+    return torch.cuda.get_device_capability()
+
+
+def _cuda_device_optin_shared_memory() -> int:
+    if not torch.cuda.is_available():
+        return 0
+    return getattr(torch.cuda.get_device_properties(0), "shared_memory_per_block_optin", 0)
+
+
+def _can_run_tilelang_sparse_attn() -> bool:
+    return (
+        HAS_TILELANG
+        and is_dsv4_kernel_available("sparse_attn")
+        and torch.cuda.is_available()
+        and _cuda_device_capability() >= (8, 9)
+    )
+
+
+def _can_run_tilelang_indexer() -> bool:
+    return (
+        HAS_TILELANG
+        and is_dsv4_kernel_available("indexer")
+        and torch.cuda.is_available()
+        and _cuda_device_optin_shared_memory() >= _MILES_INDEXER_REQUIRED_DYNAMIC_SMEM_BYTES
+    )
 
 
 def _miles_q_positions(seqlen_local: int, cp_rank: int, device: torch.device) -> torch.Tensor:
@@ -854,6 +887,42 @@ class TestDeepseekV4OptimizedKernels:
         torch.testing.assert_close(actual, expected)
         torch.testing.assert_close(actual_grad, expected_grad)
 
+    def test_vendored_tilelang_module_imports_with_phony_decorator(self, monkeypatch):
+        import builtins
+        import importlib
+        import importlib.util
+        import sys
+
+        from nemo_automodel.shared.import_utils import UnavailableError
+
+        helper_name = "nemo_automodel.components.models.deepseek_v4.kernels._tilelang"
+        module_name = "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd"
+        helper_path = dsv4_layers.__file__.rsplit("/", 1)[0] + "/kernels/_tilelang.py"
+        original_import = builtins.__import__
+        sys.modules.pop("tilelang", None)
+        sys.modules.pop("tilelang.language", None)
+
+        def block_tilelang(name, globals_=None, locals_=None, fromlist=(), level=0):
+            if name == "tilelang" or name.startswith("tilelang."):
+                raise ImportError("blocked tilelang")
+            return original_import(name, globals_, locals_, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", block_tilelang)
+        spec = importlib.util.spec_from_file_location(helper_name, helper_path)
+        helper = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(helper)
+        assert "tilelang" not in sys.modules
+
+        monkeypatch.setitem(sys.modules, helper_name, helper)
+        sys.modules.pop(module_name, None)
+        try:
+            module = importlib.import_module(module_name)
+            with pytest.raises(UnavailableError):
+                module.tl_indexer_fwd_impl(heads=1, index_dim=8)
+        finally:
+            sys.modules.pop(module_name, None)
+
     @pytest.mark.skipif(
         not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
         reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
@@ -1039,7 +1108,7 @@ class TestDeepseekV4OptimizedKernels:
             torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
 
     @pytest.mark.skipif(
-        not is_dsv4_kernel_available("sparse_attn") or not torch.cuda.is_available(),
+        not _can_run_tilelang_sparse_attn(),
         reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
     )
     def test_sparse_attention_tilelang_backend_matches_torch(self):
@@ -1084,7 +1153,7 @@ class TestDeepseekV4OptimizedKernels:
             torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
 
     @pytest.mark.skipif(
-        not is_dsv4_kernel_available("sparse_attn") or not torch.cuda.is_available(),
+        not _can_run_tilelang_sparse_attn(),
         reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
     )
     def test_sparse_attention_tilelang_backend_matches_torch_with_causal_padding_shape(self):
@@ -1232,7 +1301,7 @@ class TestDeepseekV4OptimizedKernels:
             torch.testing.assert_close(actual_grad, expected_grad)
 
     @pytest.mark.skipif(
-        not is_dsv4_kernel_available("indexer") or not torch.cuda.is_available(),
+        not _can_run_tilelang_indexer(),
         reason="Miles DSV4 indexer kernel is not installed on a CUDA environment",
     )
     def test_indexer_tilelang_backend_matches_torch(self):
@@ -1264,7 +1333,7 @@ class TestDeepseekV4OptimizedKernels:
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.skipif(
-        not is_dsv4_kernel_available("indexer") or not torch.cuda.is_available(),
+        not _can_run_tilelang_indexer(),
         reason="Vendored Miles DSV4 indexer kernel is not available on a CUDA environment",
     )
     def test_indexer_topk_tilelang_backend_matches_torch(self):
