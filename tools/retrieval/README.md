@@ -4,7 +4,10 @@ This directory contains CPU-side utilities for preparing retrieval training data
 
 ## Which Option Should I Use?
 
-Use **normalized Arrow** for most large VL retrieval runs.
+Use **normalized Arrow** for most large retrieval runs.
+
+Despite the `vl` in some script names, these tools also support text-only retrieval. Image fields are optional; text-only
+corpus documents are stored with an empty image field.
 
 - **Normalized Arrow:** recommended. Prepare a portable dataset bundle once, then train with
   `nemo_automodel.components.datasets.llm.make_normalized_retrieval_dataset`.
@@ -19,7 +22,7 @@ Normalized Arrow keeps the original retrieval structure, but moves the expensive
 prepared artifact:
 
 - Train rows store query text plus positive/negative document IDs.
-- Local corpus shards store each referenced document/image once.
+- Local corpus shards store each referenced document and optional image once.
 - Training still resolves `doc_id -> document`, but it reads from local Arrow instead of rebuilding Hugging Face cache
   state in the GPU job.
 
@@ -99,6 +102,10 @@ dataloader:
     n_passages: 5
 ```
 
+You can mix top-level bundle roots and individual `sources/source-*` paths in the same list. Avoid overlapping entries,
+for example listing both `/path/to/normalized_vl_retrieval` and
+`/path/to/normalized_vl_retrieval/sources/source-00000`, unless you intentionally want duplicated samples.
+
 ### Add More Normalized Data
 
 There are two supported workflows.
@@ -167,9 +174,9 @@ persisted.
 
 ## Resolved Arrow Debug Data
 
-Resolved Arrow writes packed Arrow shards where every training row already contains the selected document text and image
-bytes. This avoids corpus lookup during training, but it duplicates payload whenever the same document appears in
-multiple rows.
+Resolved Arrow writes packed Arrow shards where every training row already contains the selected document text and
+optional image bytes. This avoids corpus lookup during training, but it duplicates payload whenever the same document
+appears in multiple rows.
 
 Use resolved Arrow for:
 
