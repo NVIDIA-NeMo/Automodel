@@ -36,10 +36,14 @@ The output can be consumed with
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
 import logging
+import os
+import re
 import shutil
+import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -212,6 +216,84 @@ def _split_data_dir_list(data_dir_list: Any) -> list[Any]:
             raise ValueError("data_dir_list must contain at least one source")
         return data_dir_list
     raise ValueError(f"Unsupported data_dir_list type: {type(data_dir_list).__name__}")
+
+
+def _as_data_dir_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _source_entry_key(source_entry: Any) -> str:
+    payload = json.dumps(source_entry, sort_keys=True, default=str)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _source_entry_name(source_entry: Any) -> str:
+    source_path = source_entry.get("path") if isinstance(source_entry, dict) else source_entry
+    name = Path(str(source_path)).stem or "source"
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
+    return name or "source"
+
+
+def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    try:
+        temp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        temp_path.replace(path)
+    except BaseException:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
+
+
+def _load_top_level_metadata(output_dir: Path) -> dict[str, Any]:
+    metadata_path = output_dir / "metadata.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Normalized retrieval metadata not found: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("format") != "nemo_automodel_normalized_vl_retrieval_arrow":
+        raise ValueError(f"Unsupported normalized retrieval format: {metadata.get('format')!r}")
+    if "sources" not in metadata:
+        raise ValueError(
+            f"Cannot append to legacy normalized bundle without top-level sources metadata: {metadata_path}"
+        )
+    return metadata
+
+
+def _source_dir_index(path: Path) -> int | None:
+    if not path.name.startswith("source-"):
+        return None
+    suffix = path.name.removeprefix("source-")
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def _next_source_index(output_dir: Path, metadata: dict[str, Any]) -> int:
+    indices = [
+        int(source["source_index"])
+        for source in metadata.get("sources", [])
+        if isinstance(source, dict) and "source_index" in source
+    ]
+    sources_dir = output_dir / "sources"
+    if sources_dir.exists():
+        indices.extend(index for path in sources_dir.iterdir() if (index := _source_dir_index(path)) is not None)
+    return max(indices, default=-1) + 1
+
+
+def _existing_source_keys(metadata: dict[str, Any]) -> set[str]:
+    keys = set()
+    for source in metadata.get("sources", []):
+        if not isinstance(source, dict):
+            continue
+        if "source_key" in source:
+            keys.add(str(source["source_key"]))
+        elif "source_entry" in source:
+            keys.add(_source_entry_key(source["source_entry"]))
+    return keys
 
 
 def _safe_corpus_dir_name(corpus_id: str) -> str:
@@ -489,24 +571,42 @@ def _prepare_single_normalized_dataset(
     return metadata
 
 
-def prepare_normalized_dataset(
-    data_dir_list: list[Any],
+def _prepare_source_bundle(
+    source_entry: Any,
     output_dir: Path,
+    source_idx: int,
     *,
     samples_per_shard: int,
     docs_per_shard: int,
     seed: int,
     max_samples: int | None,
     jpeg_quality: int,
-    resume: bool = False,
-) -> dict[str, Any]:
-    """Write a normalized portable Arrow retrieval bundle."""
-    source_entries = _split_data_dir_list(data_dir_list)
-    _prepare_multi_source_output_dir(output_dir, resume=resume)
-    source_metadata = []
-    total_records = 0
-    for source_idx, source_entry in enumerate(source_entries):
-        source_dir = output_dir / "sources" / f"source-{source_idx:05d}"
+    resume: bool,
+    staged: bool,
+) -> tuple[dict[str, Any], Path]:
+    sources_dir = output_dir / "sources"
+    source_dir = sources_dir / f"source-{source_idx:05d}"
+    if staged:
+        if source_dir.exists():
+            raise FileExistsError(f"Refusing to overwrite existing normalized source directory: {source_dir}")
+        temp_dir = sources_dir / f".source-{source_idx:05d}.tmp-{uuid.uuid4().hex}"
+        try:
+            metadata = _prepare_single_normalized_dataset(
+                data_dir_list=[source_entry],
+                output_dir=temp_dir,
+                samples_per_shard=samples_per_shard,
+                docs_per_shard=docs_per_shard,
+                seed=seed,
+                max_samples=max_samples,
+                jpeg_quality=jpeg_quality,
+                resume=False,
+            )
+            temp_dir.rename(source_dir)
+        except BaseException:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+            raise
+    else:
         metadata = _prepare_single_normalized_dataset(
             data_dir_list=[source_entry],
             output_dir=source_dir,
@@ -517,15 +617,132 @@ def prepare_normalized_dataset(
             jpeg_quality=jpeg_quality,
             resume=resume,
         )
-        total_records += metadata["num_records"]
-        source_metadata.append(
-            {
-                "source_index": source_idx,
-                "source_entry": source_entry,
-                "path": str(source_dir.relative_to(output_dir)),
-                "num_records": metadata["num_records"],
-            }
+    return (
+        {
+            "source_index": source_idx,
+            "source_name": _source_entry_name(source_entry),
+            "source_key": _source_entry_key(source_entry),
+            "source_entry": source_entry,
+            "path": str(source_dir.relative_to(output_dir)),
+            "num_records": metadata["num_records"],
+        },
+        source_dir,
+    )
+
+
+def _append_normalized_sources(
+    data_dir_list: list[Any],
+    output_dir: Path,
+    *,
+    samples_per_shard: int,
+    docs_per_shard: int,
+    seed: int,
+    max_samples: int | None,
+    jpeg_quality: int,
+) -> dict[str, Any]:
+    metadata = _load_top_level_metadata(output_dir)
+    sources_dir = output_dir / "sources"
+    if not sources_dir.is_dir():
+        raise FileNotFoundError(f"Normalized retrieval sources directory not found: {sources_dir}")
+
+    source_entries = _split_data_dir_list(data_dir_list)
+    next_source_idx = _next_source_index(output_dir, metadata)
+    existing_source_keys = _existing_source_keys(metadata)
+    appended_sources = []
+    appended_dirs = []
+    try:
+        source_idx = next_source_idx
+        for source_entry in source_entries:
+            source_key = _source_entry_key(source_entry)
+            if source_key in existing_source_keys:
+                logger.warning("Skipping duplicate normalized source entry during append: %s", source_entry)
+                continue
+            source_metadata, source_dir = _prepare_source_bundle(
+                source_entry,
+                output_dir,
+                source_idx,
+                samples_per_shard=samples_per_shard,
+                docs_per_shard=docs_per_shard,
+                seed=seed,
+                max_samples=max_samples,
+                jpeg_quality=jpeg_quality,
+                resume=False,
+                staged=True,
+            )
+            appended_sources.append(source_metadata)
+            appended_dirs.append(source_dir)
+            existing_source_keys.add(source_key)
+            source_idx += 1
+
+        if not appended_sources:
+            logger.info("No new normalized retrieval sources to append to %s", output_dir)
+            return metadata
+
+        updated_metadata = dict(metadata)
+        updated_sources = list(metadata.get("sources", [])) + appended_sources
+        updated_metadata["sources"] = updated_sources
+        updated_metadata["data_dir_list"] = _as_data_dir_list(metadata.get("data_dir_list")) + [
+            source["source_entry"] for source in appended_sources
+        ]
+        updated_metadata["num_records"] = sum(int(source["num_records"]) for source in updated_sources)
+        _write_json_atomic(output_dir / "metadata.json", updated_metadata)
+        logger.info(
+            "Appended %d source(s), %d total train records to normalized retrieval bundle %s",
+            len(appended_sources),
+            updated_metadata["num_records"],
+            output_dir,
         )
+        return updated_metadata
+    except BaseException:
+        for source_dir in reversed(appended_dirs):
+            if source_dir.exists():
+                shutil.rmtree(source_dir)
+        raise
+
+
+def prepare_normalized_dataset(
+    data_dir_list: list[Any],
+    output_dir: Path,
+    *,
+    samples_per_shard: int,
+    docs_per_shard: int,
+    seed: int,
+    max_samples: int | None,
+    jpeg_quality: int,
+    resume: bool = False,
+    append: bool = False,
+) -> dict[str, Any]:
+    """Write a normalized portable Arrow retrieval bundle."""
+    if append:
+        return _append_normalized_sources(
+            data_dir_list,
+            output_dir,
+            samples_per_shard=samples_per_shard,
+            docs_per_shard=docs_per_shard,
+            seed=seed,
+            max_samples=max_samples,
+            jpeg_quality=jpeg_quality,
+        )
+
+    source_entries = _split_data_dir_list(data_dir_list)
+    _prepare_multi_source_output_dir(output_dir, resume=resume)
+    source_metadata = []
+    total_records = 0
+    for source_idx, source_entry in enumerate(source_entries):
+        source, _ = _prepare_source_bundle(
+            source_entry,
+            output_dir,
+            source_idx,
+            samples_per_shard=samples_per_shard,
+            docs_per_shard=docs_per_shard,
+            seed=seed,
+            max_samples=max_samples,
+            jpeg_quality=jpeg_quality,
+            resume=resume,
+            staged=False,
+        )
+        total_records += source["num_records"]
+        source_metadata.append(source)
 
     if max_samples is not None and len(source_entries) > 1:
         logger.warning(
@@ -542,7 +759,7 @@ def prepare_normalized_dataset(
         "docs_per_shard": docs_per_shard,
         "sources": source_metadata,
     }
-    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    _write_json_atomic(output_dir / "metadata.json", metadata)
     logger.info(
         "Wrote normalized retrieval bundle with %d source(s), %d total train records to %s",
         len(source_metadata),
@@ -568,6 +785,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=None, help="Optional global train sample cap")
     parser.add_argument("--jpeg-quality", type=int, default=95, help="JPEG quality for packed corpus images")
     parser.add_argument("--resume", action="store_true", help="Reuse complete shards in an existing output directory")
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Append the provided source(s) to an existing top-level normalized bundle.",
+    )
     return parser.parse_args()
 
 
@@ -594,6 +816,7 @@ def main() -> None:
         max_samples=args.max_samples,
         jpeg_quality=args.jpeg_quality,
         resume=args.resume,
+        append=args.append,
     )
     print(json.dumps(metadata, indent=2))
 

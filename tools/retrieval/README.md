@@ -38,8 +38,10 @@ dataloader:
     do_shuffle: true
 ```
 
-Normalized prep keeps each `data_dir_list` entry as a separate source bundle under `sources/`. Training can use the
-top-level bundle, or choose prepared sources explicitly and apply per-source sample caps:
+Normalized prep keeps each `data_dir_list` entry as a separate numeric source bundle under `sources/`. Numeric
+directories keep the artifact portable and avoid path-name collisions; duplicate detection uses the top-level metadata
+instead. The metadata records a readable `source_name`, stable `source_key`, original `source_entry`, and source path.
+Training can use the top-level bundle, or choose prepared sources explicitly and apply per-source sample caps:
 
 ```yaml
 dataloader:
@@ -54,6 +56,20 @@ dataloader:
     data_type: train
     n_passages: 5
 ```
+
+To add a new source later, run prep again with a config that contains only the new source(s), the same `OUT_DIR`, and
+append enabled:
+
+```bash
+CONFIG=/path/to/new_source_only_config.yaml \
+OUT_DIR=/path/to/normalized_vl_retrieval \
+APPEND=1 \
+tools/retrieval/submit_prepare_normalized_vl_retrieval_data_cpu.sh
+```
+
+Append mode stages each new source in a temporary directory and updates the top-level metadata only after all new
+sources finish. It skips exact duplicate source entries already present in metadata. It does not deduplicate documents
+across different sources, so do not re-list old sources under a modified path or config entry.
 
 Normalized Arrow keeps the original corpus-id retrieval model but stores the referenced corpus locally:
 
@@ -165,5 +181,7 @@ For both normalized and resolved prep, new corpus schemas still use the original
 3. Add the source JSON to the original retrieval config.
 4. Run the prep tool into a new output directory.
 
-`--resume` on normalized prep reuses readable train shards and complete corpus directories from an interrupted run. It
-does not append a new source into an already-finalized bundle; when the input data list changes, write a new bundle.
+`--resume` on normalized prep reuses readable train shards and complete corpus directories from an interrupted run.
+Use `APPEND=1` to add new sources to an existing normalized bundle. Resolved prep writes flat materialized Arrow
+shards and does not append into an existing output directory; to mix resolved datasets, prepare each one into its own
+directory and list those directories in `data_dir_list`.

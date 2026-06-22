@@ -27,6 +27,7 @@
 #   DOCS_PER_SHARD=10000
 #   JPEG_QUALITY=95
 #   RESUME=1
+#   APPEND=0
 #   EXTRA_CONTAINER_MOUNTS=/source/data:/source/data,/models:/models
 
 set -euo pipefail
@@ -58,6 +59,7 @@ DOCS_PER_SHARD="${DOCS_PER_SHARD:-10000}"
 SEED="${SEED:-42}"
 JPEG_QUALITY="${JPEG_QUALITY:-95}"
 RESUME="${RESUME:-1}"
+APPEND="${APPEND:-0}"
 EXTRA_PREP_ARGS="${EXTRA_PREP_ARGS:-}"
 
 if [[ -z "${CONFIG}" || -z "${OUT_DIR}" ]]; then
@@ -105,6 +107,11 @@ if [[ "${RESUME}" == "1" ]]; then
     resume_args=(--resume)
 fi
 
+append_args=()
+if [[ "${APPEND}" == "1" ]]; then
+    append_args=(--append)
+fi
+
 account_args=()
 if [[ -n "${ACCOUNT}" ]]; then
     account_args=(--account="${ACCOUNT}")
@@ -129,6 +136,7 @@ docs_per_shard: ${DOCS_PER_SHARD}
 seed: ${SEED}
 jpeg_quality: ${JPEG_QUALITY}
 resume: ${RESUME}
+append: ${APPEND}
 output_dir: ${OUT_DIR}
 container_image: ${CONTAINER_IMAGE}
 extra_container_mounts: ${EXTRA_CONTAINER_MOUNTS}
@@ -191,6 +199,7 @@ srun "\${srun_args[@]}" bash -lc 'set -euo pipefail
         --jpeg-quality "${JPEG_QUALITY}" \
         ${max_samples_args[*]} \
         ${resume_args[*]} \
+        ${append_args[*]} \
         ${EXTRA_PREP_ARGS}
 '
 EOF

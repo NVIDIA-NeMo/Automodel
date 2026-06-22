@@ -114,12 +114,14 @@ def _patch_resolved_source(monkeypatch, image_mod, *, num_examples=1, n_passages
     monkeypatch.setattr(prep, "_transform_func", _transform_func)
 
 
-def _patch_normalized_source(monkeypatch, image_mod):
+def _patch_normalized_source(monkeypatch, image_mod, *, fail_on=None):
     image = image_mod.new("RGB", (2, 2), color="blue")
 
     def fake_load_datasets(data_dir_list, concatenate, seed):
         entry = data_dir_list[0]
         source_path = entry["path"] if isinstance(entry, dict) else entry
+        if fail_on is not None and fail_on in str(source_path):
+            raise RuntimeError(f"failed source: {source_path}")
         source_name = "a" if "source_a" in str(source_path) else "b"
         return (
             [
@@ -355,9 +357,13 @@ def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_p
     assert metadata["format"] == "nemo_automodel_normalized_vl_retrieval_arrow"
     assert metadata["version"] == 3
     assert metadata["num_records"] == 2
-    assert metadata["sources"] == [
-        {"source_index": 0, "source_entry": "train.json", "path": "sources/source-00000", "num_records": 2}
-    ]
+    assert len(metadata["sources"]) == 1
+    assert metadata["sources"][0]["source_index"] == 0
+    assert metadata["sources"][0]["source_name"] == "train"
+    assert metadata["sources"][0]["source_entry"] == "train.json"
+    assert metadata["sources"][0]["path"] == "sources/source-00000"
+    assert metadata["sources"][0]["num_records"] == 2
+    assert metadata["sources"][0]["source_key"]
     assert (output_dir / "metadata.json").is_file()
     source_dir = output_dir / "sources" / "source-00000"
     source_metadata = json.loads((source_dir / "metadata.json").read_text(encoding="utf-8"))
@@ -435,6 +441,76 @@ def test_prepare_normalized_vl_retrieval_data_preserves_source_bundles(tmp_path,
     assert len(questions) == 3
     assert sum(question.startswith("a ") for question in questions) == 1
     assert sum(question.startswith("b ") for question in questions) == 2
+
+
+def test_prepare_normalized_vl_retrieval_data_appends_sources_safely(tmp_path, monkeypatch):
+    pytest.importorskip("datasets")
+    pytest.importorskip("datasets.arrow_writer")
+    image_mod = pytest.importorskip("PIL.Image")
+    _patch_normalized_source(monkeypatch, image_mod)
+
+    output_dir = tmp_path / "normalized_append"
+    prep_norm.prepare_normalized_dataset(
+        data_dir_list=[{"path": "source_a.json", "num_samples": None}],
+        output_dir=output_dir,
+        samples_per_shard=10,
+        docs_per_shard=10,
+        seed=42,
+        max_samples=None,
+        jpeg_quality=90,
+    )
+
+    appended_metadata = prep_norm.prepare_normalized_dataset(
+        data_dir_list=[{"path": "source_b.json", "num_samples": None}],
+        output_dir=output_dir,
+        samples_per_shard=10,
+        docs_per_shard=10,
+        seed=42,
+        max_samples=None,
+        jpeg_quality=90,
+        append=True,
+    )
+
+    assert appended_metadata["num_records"] == 4
+    assert [source["path"] for source in appended_metadata["sources"]] == [
+        "sources/source-00000",
+        "sources/source-00001",
+    ]
+    assert (output_dir / "sources" / "source-00000").is_dir()
+    assert (output_dir / "sources" / "source-00001").is_dir()
+
+    duplicate_metadata = prep_norm.prepare_normalized_dataset(
+        data_dir_list=[{"path": "source_b.json", "num_samples": None}],
+        output_dir=output_dir,
+        samples_per_shard=10,
+        docs_per_shard=10,
+        seed=42,
+        max_samples=None,
+        jpeg_quality=90,
+        append=True,
+    )
+
+    assert duplicate_metadata["num_records"] == 4
+    assert len(duplicate_metadata["sources"]) == 2
+
+    _patch_normalized_source(monkeypatch, image_mod, fail_on="source_c")
+    before_failure_metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    with pytest.raises(RuntimeError, match="failed source"):
+        prep_norm.prepare_normalized_dataset(
+            data_dir_list=[{"path": "source_c.json", "num_samples": None}],
+            output_dir=output_dir,
+            samples_per_shard=10,
+            docs_per_shard=10,
+            seed=42,
+            max_samples=None,
+            jpeg_quality=90,
+            append=True,
+        )
+
+    after_failure_metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert after_failure_metadata == before_failure_metadata
+    assert not (output_dir / "sources" / "source-00002").exists()
+    assert not list((output_dir / "sources").glob(".source-00002.tmp-*"))
 
 
 def test_prepare_resolved_vl_retrieval_data_parallel_build_shard(tmp_path, monkeypatch):
