@@ -15,7 +15,8 @@
 # FULL supervised fine-tune of Nemotron-3-Ultra-550B-A55B across 16 x H100 nodes (128 GPUs, EP=64).
 # Mirrors nemotron_ultra_v3_hellaswag_peft.yaml but trains ALL parameters (no `peft:` block),
 # scaled up for the full-FT memory footprint (16 nodes, EP=64, activation checkpointing, full
-# Adam optimizer state). Real router (fake_balanced_gate=false) and the repeated MTP head are kept.
+# Adam optimizer state). Real router (fake_balanced_gate=false), HybridEP dispatch,
+# and the repeated MTP head are kept.
 #
 # To run on a 16-node Slurm allocation, drive torchrun from an srun step:
 #
@@ -62,7 +63,7 @@ model:
     linear: te
     rms_norm: te
     experts: gmm
-    dispatcher: deepep
+    dispatcher: hybridep
     enable_fsdp_optimizations: false
 
 checkpoint:
