@@ -200,19 +200,10 @@ RUN git clone --depth 1 --branch v0.17.0 --recurse-submodules --shallow-submodul
         pip install --no-cache-dir --no-build-isolation /tmp/torchao && \
     rm -rf /tmp/torchao
 
-# DeepSeek-V4 TileLang kernels (backend.attn="tilelang": sparse MLA attention,
-# lightning indexer, and the MHC sinkhorn path used by the deepseek_v4_* recipes).
-# tilelang is resolved by the cuda extra during `uv sync`. tile_kernels is the
-# external DeepSeek "TileKernels" package (MHC sinkhorn) -- not vendored in
-# AutoModel and not on PyPI -- so it is git-pinned here. Install it into the uv
-# environment without dependencies so it reuses the already-resolved tilelang and
-# torch builds instead of adding duplicate system-site packages.
-ARG INSTALL_TILEKERNELS=True
-ARG TILEKERNELS_COMMIT=36d9e45d38e204ebb87e6f6e833821eee0482fe5
-RUN if [ "$INSTALL_TILEKERNELS" = "True" ]; then \
-        uv pip install --no-cache --no-deps --no-build-isolation \
-            "git+https://github.com/deepseek-ai/TileKernels@${TILEKERNELS_COMMIT}"; \
-    fi
+# DeepSeek-V4 TileLang kernels are resolved by the cuda extra during `uv sync`.
+# The external DeepSeek TileKernels package is intentionally not installed here:
+# its import eagerly imports TileLang's vendored TVM, which can abort when other
+# TVM FFI bindings are already loaded. The MHC sinkhorn path remains optional.
 
 COPY . /opt/Automodel
 

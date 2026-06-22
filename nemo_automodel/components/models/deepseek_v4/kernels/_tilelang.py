@@ -16,65 +16,113 @@
 
 from __future__ import annotations
 
+import importlib.util
 from functools import wraps
 from typing import Any
 
 from nemo_automodel.shared.import_utils import UnavailableError
 
-try:
-    import tilelang
-    from tilelang import language as T
+HAS_TILELANG = importlib.util.find_spec("tilelang") is not None
 
-    HAS_TILELANG = True
-except ImportError as _e:
-    HAS_TILELANG = False
-    _MSG = f"tilelang is required for DeepSeek V4 TileLang kernels: {_e}"
 
-    def _unavailable_kernel(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            raise UnavailableError(_MSG)
+def _load_tilelang() -> tuple[Any, Any]:
+    try:
+        import tilelang as real_tilelang
+        from tilelang import language as real_language
+    except ImportError as exc:
+        raise UnavailableError(f"tilelang is required for DeepSeek V4 TileLang kernels: {exc}") from exc
+    return real_tilelang, real_language
 
-        return wrapper
 
-    def _phony_jit(*args: Any, **kwargs: Any):
-        if len(args) == 1 and callable(args[0]) and not kwargs:
-            return _unavailable_kernel(args[0])
+def _next_power_of_2(value: int) -> int:
+    return 1 << (value - 1).bit_length()
 
-        def decorate(fn):
-            return _unavailable_kernel(fn)
 
-        return decorate
+def _cdiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
 
-    def _identity_decorator(fn):
-        return fn
 
-    def _next_power_of_2(value: int) -> int:
-        return 1 << (value - 1).bit_length()
+def _resolve_pass_configs(real_tilelang: Any, pass_configs: dict[Any, Any] | None) -> dict[Any, Any] | None:
+    if pass_configs is None:
+        return None
+    return {
+        getattr(real_tilelang.PassConfigKey, key) if isinstance(key, str) else key: value
+        for key, value in pass_configs.items()
+    }
 
-    def _cdiv(a: int, b: int) -> int:
-        return (a + b - 1) // b
 
-    class _PassConfigKey:
-        TL_DISABLE_TMA_LOWER = "TL_DISABLE_TMA_LOWER"
-        TL_DISABLE_WARP_SPECIALIZED = "TL_DISABLE_WARP_SPECIALIZED"
-        TL_ENABLE_FAST_MATH = "TL_ENABLE_FAST_MATH"
+def _resolve_jit_kwargs(real_tilelang: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(kwargs)
+    if "pass_configs" in resolved:
+        resolved["pass_configs"] = _resolve_pass_configs(real_tilelang, resolved["pass_configs"])
+    return resolved
 
-    class _Math:
-        next_power_of_2 = staticmethod(_next_power_of_2)
 
-    class _PhonyTileLang:
-        PassConfigKey = _PassConfigKey
-        cdiv = staticmethod(_cdiv)
-        jit = staticmethod(_phony_jit)
-        math = _Math()
+def _lazy_jit(fn, jit_args: tuple[Any, ...], jit_kwargs: dict[str, Any]):
+    compiled = None
 
-    class _PhonyLanguage:
-        bfloat16 = "bfloat16"
-        float = "float"
-        float32 = "float32"
-        int32 = "int32"
-        prim_func = staticmethod(_identity_decorator)
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        nonlocal compiled
+        if compiled is None:
+            real_tilelang, _ = _load_tilelang()
+            resolved_kwargs = _resolve_jit_kwargs(real_tilelang, jit_kwargs)
+            compiled = real_tilelang.jit(*jit_args, **resolved_kwargs)(fn)
+        return compiled(*args, **kwargs)
 
-    tilelang = _PhonyTileLang()
-    T = _PhonyLanguage()
+    return wrapper
+
+
+def _phony_jit(*args: Any, **kwargs: Any):
+    if len(args) == 1 and callable(args[0]) and not kwargs:
+        return _lazy_jit(args[0], (), {})
+
+    def decorate(fn):
+        return _lazy_jit(fn, args, kwargs)
+
+    return decorate
+
+
+class _PassConfigKey:
+    TL_DISABLE_TMA_LOWER = "TL_DISABLE_TMA_LOWER"
+    TL_DISABLE_WARP_SPECIALIZED = "TL_DISABLE_WARP_SPECIALIZED"
+    TL_ENABLE_FAST_MATH = "TL_ENABLE_FAST_MATH"
+
+
+class _Math:
+    next_power_of_2 = staticmethod(_next_power_of_2)
+
+    def __getattr__(self, name: str) -> Any:
+        real_tilelang, _ = _load_tilelang()
+        return getattr(real_tilelang.math, name)
+
+
+class _PhonyTileLang:
+    PassConfigKey = _PassConfigKey
+    cdiv = staticmethod(_cdiv)
+    jit = staticmethod(_phony_jit)
+    math = _Math()
+
+    def __getattr__(self, name: str) -> Any:
+        real_tilelang, _ = _load_tilelang()
+        return getattr(real_tilelang, name)
+
+
+class _PhonyLanguage:
+    bfloat16 = "bfloat16"
+    float = "float"
+    float32 = "float32"
+    int32 = "int32"
+
+    @staticmethod
+    def prim_func(fn):
+        _, real_language = _load_tilelang()
+        return real_language.prim_func(fn)
+
+    def __getattr__(self, name: str) -> Any:
+        _, real_language = _load_tilelang()
+        return getattr(real_language, name)
+
+
+tilelang = _PhonyTileLang()
+T = _PhonyLanguage()

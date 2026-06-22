@@ -866,6 +866,8 @@ class TestDeepseekV4OptimizedKernels:
         module_name = "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd"
         helper_path = dsv4_layers.__file__.rsplit("/", 1)[0] + "/kernels/_tilelang.py"
         original_import = builtins.__import__
+        sys.modules.pop("tilelang", None)
+        sys.modules.pop("tilelang.language", None)
 
         def block_tilelang(name, globals_=None, locals_=None, fromlist=(), level=0):
             if name == "tilelang" or name.startswith("tilelang."):
@@ -877,7 +879,7 @@ class TestDeepseekV4OptimizedKernels:
         helper = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
         spec.loader.exec_module(helper)
-        assert not helper.HAS_TILELANG
+        assert "tilelang" not in sys.modules
 
         monkeypatch.setitem(sys.modules, helper_name, helper)
         sys.modules.pop(module_name, None)

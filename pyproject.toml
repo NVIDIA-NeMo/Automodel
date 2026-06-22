@@ -120,10 +120,9 @@ cuda = [
     "onnxscript>=0.5.6",
     "transformer-engine[pytorch]>=2.14.1",
     # DeepSeek-V4 TileLang kernels (enable backend.attn="tilelang": sparse MLA
-    # attention, lightning indexer, and the MHC sinkhorn path). The external
-    # DeepSeek ``tile_kernels`` package (MHC sinkhorn) is git-pinned in
-    # docker/Dockerfile; it is not resolvable from PyPI, so like ``deep_ep`` it is
-    # not declared as a resolvable dependency here.
+    # attention and lightning indexer). The external DeepSeek ``tile_kernels``
+    # package (MHC sinkhorn) is not resolvable from PyPI and is not installed by
+    # default, so that path remains optional.
     "tilelang>=0.1.11",
 ]
 cuda_source = [
