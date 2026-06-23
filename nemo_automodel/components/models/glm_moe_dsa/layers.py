@@ -668,13 +668,14 @@ class GlmMoeDsaMLA(nn.Module):
             q_absorbed = torch.einsum("thd,hdc->thc", q_nope, w_kc.to(q_nope.dtype))
             q_tl = torch.cat([q_absorbed, q_pe], dim=-1).to(torch.bfloat16)
             kv_latent = torch.cat([kv, k_pe], dim=-1).unsqueeze(1).to(torch.bfloat16)
-            should_use_tilelang(
+            if not should_use_tilelang(
                 "tilelang",
                 available=is_dsa_kernel_available("sparse_attn"),
                 kernel_name="sparse_attn",
                 tensors=(q_tl, kv_latent),
                 require_bf16=True,
-            )
+            ):
+                raise RuntimeError("TileLang sparse attention was selected but did not pass validation.")
             attn_out = tilelang_sparse_attention(q_tl, kv_latent, topk_indices, w_vc.to(q_tl.dtype), self.softmax_scale)
             x = self.o_proj(attn_out.flatten(1))
             if return_topk_indices:

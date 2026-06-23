@@ -16,11 +16,7 @@
 # Adapt from https://github.com/tile-ai/tilelang/blob/4ff81c7d40803d269569e157e847623e84553f78/examples/deepseek_v32/sparse_mla_bwd.py
 import torch
 
-try:
-    import tilelang
-    from tilelang import language as T
-except ImportError as _e:
-    raise ImportError(f"UnavailableError: tilelang is required for {__name__}: {_e}") from _e
+from nemo_automodel.components.models.glm_moe_dsa.kernels._tilelang import T, tilelang
 
 
 @tilelang.jit(out_idx=[-1])

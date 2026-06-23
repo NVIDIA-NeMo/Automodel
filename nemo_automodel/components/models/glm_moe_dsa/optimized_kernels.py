@@ -36,6 +36,7 @@ from typing import Literal
 
 import torch
 
+from nemo_automodel.components.models.glm_moe_dsa.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.shared.import_utils import safe_import_from
 
 # GLM-5.2 only ever resolves to "torch" or "tilelang" (see ``_dsa_kernel_backend``
@@ -63,9 +64,9 @@ _HAS_SLIME_SPARSE_MLA, _slime_sparse_mla = safe_import_from(
 def is_dsa_kernel_available(name: Literal["indexer", "sparse_attn"]) -> bool:
     """Return whether the optional TileLang kernel package for ``name`` is importable."""
     if name == "indexer":
-        return _HAS_SLIME_INDEXER and _HAS_SLIME_VARLEN
+        return HAS_TILELANG and _HAS_SLIME_INDEXER and _HAS_SLIME_VARLEN
     if name == "sparse_attn":
-        return _HAS_SLIME_SPARSE_MLA
+        return HAS_TILELANG and _HAS_SLIME_SPARSE_MLA
     raise ValueError(f"Unknown GLM-5.2 DSA kernel name: {name}")
 
 
