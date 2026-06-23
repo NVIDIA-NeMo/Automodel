@@ -109,7 +109,7 @@ To use all four GPUs on this `g6e.12xlarge` instance, add `--nproc-per-node=4` t
     --checkpoint.is_async True
 ```
 
-The `automodel` CLI uses PyTorch's [Elastic Launch](https://docs.pytorch.org/docs/stable/elastic/run.html) internally to spawn and coordinate multiple training processes on the VM. Each training process runs on a separate GPU, and we can now see all four GPUs are being used (~95% utilization for each GPU).
+The `automodel` CLI uses PyTorch's [Elastic Launch](https://docs.pytorch.org/docs/stable/elastic/run.html) internally to spawn and coordinate multiple training processes on the VM. Each training process runs on a separate GPU, and all four GPUs show approximately 95% utilization.
 
 <Frame caption="Multi-GPU, single-node utilization of ~95% during model training.">
   <img src="./databricks-gpu-metrics-multi.png" alt="Multi-GPU, single-node utilization of ~95% during model training." />
