@@ -21,8 +21,10 @@
 # Everything else (dataset, gate, ep, steps, lr, seed, packing) is IDENTICAL so the
 # train/val loss curves are directly comparable.
 #
+# MXFP8 requires compute capability 10.0+ (GB200); will fail on H100.
+#
 # To run this recipe:
-#   automodel examples/llm_finetune/qwen/qwen3_moe_30b_te_hybridep_mxfp8.yaml --nproc-per-node 8
+#   automodel examples/llm_finetune/qwen/qwen3_moe_30b_te_hybridep_mxfp8_gb200.yaml --nproc-per-node 8
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -126,4 +128,6 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: gb200
+  nodes: 2
   recipe_owner: hemildesai
