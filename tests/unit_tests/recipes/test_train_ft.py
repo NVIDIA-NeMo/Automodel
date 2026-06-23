@@ -233,15 +233,15 @@ def test_build_validation_dataloader_no_validation_keys():
     mock_build.assert_not_called()
 
 
-@pytest.mark.parametrize("attn,expect_packed", [("magi", True), ("te", True), ("sdpa", False)])
-def test_build_validation_dataloader_packs_val_for_thd_backends(monkeypatch, attn, expect_packed):
-    """The validation set is packed (cfg_ps passed) for THD-consuming backends.
+@pytest.mark.parametrize("attn", ["magi", "te", "sdpa"])
+def test_build_validation_dataloader_packs_val_for_thd_collater(monkeypatch, attn):
+    """The validation set is packed (cfg_ps passed) when using the THD collater.
 
-    Regression: previously only TE triggered val packing; the magi backend left
-    validation unpacked, so at cp>1 magi sharded tiny per-example sequences
-    degenerately and inflated the val loss.
+    Regression: validation packing was previously gated by backend, so FA2/SDPA
+    configs with a THD collater left validation unpacked and repeatedly rebuilt
+    pipeline shapes for variable-length examples.
     """
-    # Pretend the (training) dataloader uses the THD packed collater.
+    # Pretend the validation dataloader uses the THD packed collater.
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda _cfg: True)
     cfg = ConfigNode(
         {
@@ -263,7 +263,32 @@ def test_build_validation_dataloader_packs_val_for_thd_backends(monkeypatch, att
     with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader", return_value=("dl", "tok")) as mock_build:
         build_validation_dataloader(cfg, dp_world_size=1, dp_rank=0, pp_enabled=False)
     _, kwargs = mock_build.call_args
-    assert (kwargs["cfg_ps"] is not None) is expect_packed
+    assert kwargs["cfg_ps"] is not None
+
+
+def test_build_validation_dataloader_skips_val_packing_without_pack_size(monkeypatch):
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda _cfg: True)
+    cfg = ConfigNode(
+        {
+            "model": {"backend": {"attn": "sdpa"}},
+            "dataloader": {},
+            "validation_dataloader": {},
+            "packed_sequence": {"packed_sequence_size": 0},
+            "distributed": {"cp_size": 1},
+            "step_scheduler": {
+                "local_batch_size": 1,
+                "global_batch_size": 8,
+                "max_steps": 5,
+                "val_every_steps": 1,
+            },
+            "seed": 42,
+            "validation_dataset": {"some": "cfg"},
+        }
+    )
+    with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader", return_value=("dl", "tok")) as mock_build:
+        build_validation_dataloader(cfg, dp_world_size=1, dp_rank=0, pp_enabled=False)
+    _, kwargs = mock_build.call_args
+    assert kwargs["cfg_ps"] is None
 
 
 def test_build_validation_dataloader_packs_val_when_model_requires_thd(monkeypatch):

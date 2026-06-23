@@ -584,10 +584,8 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             val_ds_name = "default"
         return val_ds_name
 
-    # Pack the validation set the same way as training when the attention backend
-    # consumes a THD/cu_seqlens layout. Besides TE, the magi backend also packs (and,
-    # at cp>1, shards) THD sequences; leaving validation unpacked would feed magi tiny
-    # per-example sequences that cp-sharding splits degenerately, inflating val loss.
+    # Pack validation when it explicitly consumes THD/cu_seqlens metadata, or
+    # when a backend/model requires validation to follow training's THD layout.
     _magi_backend = (
         str(cfg.get("model.backend.attn", "")) == "magi" or str(cfg.get("model.attn_implementation", "")) == "magi"
     )
@@ -596,9 +594,12 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
         and callable(getattr(model, "should_pack_validation_with_training", None))
         and model.should_pack_validation_with_training()
     )
-    _pack_val = (
-        _uses_te_dot_product_attention(cfg.model) or _magi_backend or _model_packs_validation
-    ) and _uses_thd_collater(cfg.dataloader)
+    _backend_packs_validation = _uses_te_dot_product_attention(cfg.model) or _magi_backend or _model_packs_validation
+    _validation_uses_thd = _uses_thd_collater(cfg.validation_dataloader)
+    _training_uses_thd = _uses_thd_collater(cfg.get("dataloader", None))
+    _pack_val = cfg.get("packed_sequence.packed_sequence_size", 0) > 0 and (
+        _validation_uses_thd or (_backend_packs_validation and _training_uses_thd)
+    )
 
     # Build validation dataloader if the config provides it
     val_dataloaders = {}
