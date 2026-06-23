@@ -31,6 +31,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
+from nemo_automodel.components.models.glm_moe_dsa.cp import make_glm_dsa_packed_cp_batch_and_ctx
 from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -260,7 +261,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
 
@@ -326,6 +327,21 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """GLM DSA TileLang kernels require validation to use the THD packed layout."""
         return getattr(self.backend, "attn", None) == "tilelang"
 
+    def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
+        """Attach GLM DSA's packed THD context-parallel batch sharder."""
+        from functools import partial  # noqa: PLC0415
+
+        if getattr(self.backend, "attn", None) != "tilelang":
+            raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
+
+        return {
+            "_cp_make_batch_fn": partial(
+                make_glm_dsa_packed_cp_batch_and_ctx,
+                num_chunks=int(kwargs.get("num_chunks", 1)),
+            ),
+            "_cp_full_logits_grad_touch": True,
+        }
+
     def _is_pipeline_parallel_stage(self) -> bool:
         """True when this module is a trimmed pipeline-parallel stage (not the whole model)."""
         if self.lm_head is None:
@@ -353,7 +369,12 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """
         hidden_size = self.config.hidden_size
         vocab_size = self.config.vocab_size
-        topk = min(int(self.config.index_topk), seq_len)
+        # TileLang's fused indexer always returns ``index_topk`` columns. Under
+        # CP the query length is sharded (for example 4096 / cp8 = 512), while
+        # K/V are gathered inside the model, so capping by the local query
+        # length would under-declare the inter-stage carry shape.
+        index_topk = int(self.config.index_topk)
+        topk = index_topk if self.backend.attn == "tilelang" else min(index_topk, seq_len)
 
         def meta(shape: tuple[int, ...], dt: torch.dtype) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=dt)

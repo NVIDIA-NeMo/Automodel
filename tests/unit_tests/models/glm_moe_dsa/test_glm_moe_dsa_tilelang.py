@@ -22,6 +22,7 @@ import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.glm_moe_dsa import cp as cp_mod
 from nemo_automodel.components.models.glm_moe_dsa import layers as layer_mod
 from nemo_automodel.components.models.glm_moe_dsa import optimized_kernels as ok
 from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaIndexer, GlmMoeDsaMLA
@@ -383,6 +384,61 @@ def test_tilelang_indexer_topk_dispatches_varlen_helpers(monkeypatch):
     assert topk.shape == (4, 1, 2)
     assert topk.dtype == torch.int32
     assert topk.is_contiguous()
+
+
+def test_tilelang_indexer_topk_uses_padded_windows_and_query_indices(monkeypatch):
+    index_q = torch.randn(3, 2, 3)
+    index_k = torch.randn(8, 3)
+    head_weights = torch.randn(3, 2)
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int64)
+    cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int64)
+    query_indices = torch.tensor([1, 4, 6], dtype=torch.int64)
+    captured = {}
+
+    def fake_lighting_indexer(received_q, received_k, received_weights, received_starts, received_ends, topk):
+        captured.update(
+            q=received_q,
+            k=received_k,
+            weights=received_weights,
+            starts=received_starts,
+            ends=received_ends,
+            topk=topk,
+        )
+        return torch.zeros(3, 8), torch.tensor([[1, 0], [4, -1], [6, 5]], dtype=torch.int64)
+
+    monkeypatch.setattr(ok, "_slime_lighting_indexer", fake_lighting_indexer)
+
+    topk = ok.tilelang_indexer_topk(
+        index_q,
+        index_k,
+        head_weights,
+        cu_seqlens,
+        index_topk=2,
+        query_indices=query_indices,
+        cu_seqlens_padded=cu_seqlens_padded,
+    )
+
+    assert captured["q"] is index_q
+    assert captured["k"] is index_k
+    assert captured["weights"] is head_weights
+    assert captured["starts"].tolist() == [0, 4, 4]
+    assert captured["ends"].tolist() == [2, 5, 7]
+    assert captured["starts"].dtype == torch.int32
+    assert captured["ends"].dtype == torch.int32
+    assert captured["topk"] == 2
+    assert topk.tolist() == [[[1, 0]], [[4, -1]], [[6, 5]]]
+
+
+def test_generate_padded_varlen_mask_params_excludes_cp_padding():
+    starts, ends = ok._generate_padded_varlen_mask_params(
+        torch.tensor([0, 2, 5], dtype=torch.int64),
+        torch.tensor([0, 4, 8], dtype=torch.int64),
+    )
+
+    assert starts.tolist() == [0, 0, 0, 0, 4, 4, 4, 4]
+    assert ends.tolist() == [1, 2, 2, 2, 5, 6, 7, 7]
+    assert starts.dtype == torch.int32
+    assert ends.dtype == torch.int32
 
 
 def test_indexer_generates_topk_and_varlen_mask_params(monkeypatch):
@@ -896,18 +952,38 @@ def test_indexer_tilelang_dispatches_topk(monkeypatch):
     expected_topk = torch.zeros(4, 1, config.index_topk, dtype=torch.int32)
     captured = {}
 
-    def fake_tilelang_indexer_topk(q, k, head_weights, cu_seqlens, index_topk):
-        captured.update(q=q, k=k, head_weights=head_weights, cu_seqlens=cu_seqlens, index_topk=index_topk)
+    def fake_tilelang_indexer_topk(
+        q,
+        k,
+        head_weights,
+        cu_seqlens,
+        index_topk,
+        query_indices=None,
+        cu_seqlens_padded=None,
+    ):
+        captured.update(
+            q=q,
+            k=k,
+            head_weights=head_weights,
+            cu_seqlens=cu_seqlens,
+            index_topk=index_topk,
+            query_indices=query_indices,
+            cu_seqlens_padded=cu_seqlens_padded,
+        )
         return expected_topk
 
     monkeypatch.setattr(layer_mod, "tilelang_indexer_topk", fake_tilelang_indexer_topk)
     cu_seqlens = torch.tensor([[0, 4]], dtype=torch.int64)
+    query_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    cu_seqlens_padded = torch.tensor([[0, 4]], dtype=torch.int64)
 
     topk = indexer(
         torch.randn(4, config.hidden_size, dtype=torch.bfloat16),
         torch.randn(4, config.q_lora_rank, dtype=torch.bfloat16),
         _freqs(4, config.qk_rope_head_dim),
         cu_seqlens=cu_seqlens,
+        glm_dsa_cp_query_indices=query_indices,
+        cu_seqlens_padded=cu_seqlens_padded,
     )
 
     assert topk is expected_topk
@@ -918,6 +994,60 @@ def test_indexer_tilelang_dispatches_topk(monkeypatch):
     assert captured["cu_seqlens"].dtype == torch.int32
     assert captured["cu_seqlens"].tolist() == [0, 4]
     assert captured["index_topk"] == config.index_topk
+    assert captured["query_indices"] is query_indices
+    assert captured["cu_seqlens_padded"].tolist() == [0, 4]
+
+
+def test_indexer_cp_gathers_keys_before_tilelang_topk(monkeypatch):
+    config = _small_dsa_config()
+    backend = BackendConfig(attn="tilelang", linear="torch", rms_norm="torch", rope_fusion=False)
+    indexer = GlmMoeDsaIndexer(config, backend)
+    monkeypatch.setattr(layer_mod, "should_use_tilelang", lambda *args, **kwargs: True)
+    monkeypatch.setattr(layer_mod, "glm_dsa_cp_enabled", lambda group: group == "cp-group")
+    captured = {}
+
+    def fake_cp_all_gather(tensor, *, dim, cp_group):
+        captured.setdefault("gathered_shapes", []).append(tuple(tensor.shape))
+        assert cp_group == "cp-group"
+        return torch.cat([tensor, tensor], dim=dim)
+
+    def fake_tilelang_indexer_topk(q, k, head_weights, cu_seqlens, index_topk, **kwargs):
+        captured.update(q=q, k=k, cu_seqlens=cu_seqlens, kwargs=kwargs, index_topk=index_topk)
+        return torch.zeros(q.shape[0], 1, index_topk, dtype=torch.int32)
+
+    monkeypatch.setattr(layer_mod, "glm_dsa_cp_all_gather", fake_cp_all_gather)
+    monkeypatch.setattr(layer_mod, "tilelang_indexer_topk", fake_tilelang_indexer_topk)
+
+    topk = indexer(
+        torch.randn(4, config.hidden_size, dtype=torch.bfloat16),
+        torch.randn(4, config.q_lora_rank, dtype=torch.bfloat16),
+        _freqs(4, config.qk_rope_head_dim),
+        cu_seqlens=torch.tensor([0, 8], dtype=torch.int64),
+        glm_dsa_cp_query_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        cu_seqlens_padded=torch.tensor([0, 8], dtype=torch.int64),
+        _glm_dsa_cp_group="cp-group",
+    )
+
+    assert topk.shape == (4, 1, config.index_topk)
+    assert captured["gathered_shapes"] == [(4, config.index_head_dim)]
+    assert captured["k"].shape == (8, config.index_head_dim)
+    assert captured["kwargs"]["query_indices"].tolist() == [0, 1, 2, 3]
+    assert captured["kwargs"]["cu_seqlens_padded"].tolist() == [0, 8]
+
+
+def test_indexer_cp_rejects_unpacked_bshd(monkeypatch):
+    config = _small_dsa_config()
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
+    indexer = GlmMoeDsaIndexer(config, backend)
+    monkeypatch.setattr(layer_mod, "glm_dsa_cp_enabled", lambda group: True)
+
+    with pytest.raises(ValueError, match="requires THD"):
+        indexer(
+            torch.randn(1, 4, config.hidden_size, dtype=torch.bfloat16),
+            torch.randn(1, 4, config.q_lora_rank, dtype=torch.bfloat16),
+            _freqs(4, config.qk_rope_head_dim).unsqueeze(0),
+            _glm_dsa_cp_group="cp-group",
+        )
 
 
 def test_glm_dsa_tilelang_declares_validation_packing():
@@ -935,7 +1065,7 @@ def test_glm_dsa_tilelang_pipeline_metas_use_thd_shapes():
     model = GlmMoeDsaForCausalLM(config, backend=backend)
     model.lm_head = None
     seq_len = 32
-    topk = min(config.index_topk, seq_len)
+    topk = config.index_topk
 
     inputs_meta, outputs_meta = model.get_pipeline_stage_metas(
         is_first=False,
@@ -952,6 +1082,46 @@ def test_glm_dsa_tilelang_pipeline_metas_use_thd_shapes():
     assert len(outputs_meta) == 2
     assert outputs_meta[0].shape == (seq_len, config.hidden_size)
     assert outputs_meta[1].shape == (seq_len, 1, topk)
+
+
+def test_glm_dsa_sdpa_pipeline_metas_cap_topk_by_seq_len():
+    config = _small_dsa_config()
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
+    model = GlmMoeDsaForCausalLM(config, backend=backend)
+    model.lm_head = None
+    seq_len = 32
+
+    inputs_meta, outputs_meta = model.get_pipeline_stage_metas(
+        is_first=False,
+        microbatch_size=4,
+        seq_len=seq_len,
+        dtype=torch.bfloat16,
+    )
+
+    assert inputs_meta[1].shape == (4, seq_len, seq_len)
+    assert outputs_meta[1].shape == (4, seq_len, seq_len)
+
+
+def test_glm_dsa_prepare_model_inputs_for_cp_binds_batch_sharder():
+    config = _small_dsa_config()
+    backend = BackendConfig(attn="tilelang", linear="torch", rms_norm="torch", rope_fusion=False)
+    model = GlmMoeDsaForCausalLM(config, backend=backend)
+
+    prepared = model.prepare_model_inputs_for_cp(input_ids=torch.arange(8).view(1, 8), num_chunks=3)
+
+    assert prepared["_cp_full_logits_grad_touch"] is True
+    fn = prepared["_cp_make_batch_fn"]
+    assert fn.func is cp_mod.make_glm_dsa_packed_cp_batch_and_ctx
+    assert fn.keywords["num_chunks"] == 3
+
+
+def test_glm_dsa_prepare_model_inputs_for_cp_requires_tilelang():
+    config = _small_dsa_config()
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
+    model = GlmMoeDsaForCausalLM(config, backend=backend)
+
+    with pytest.raises(NotImplementedError, match="backend.attn='tilelang'"):
+        model.prepare_model_inputs_for_cp(input_ids=torch.arange(8).view(1, 8))
 
 
 def test_mla_tilelang_sparse_attention_rejects_bshd_without_kernels():
@@ -1019,6 +1189,44 @@ def test_mla_tilelang_sparse_attention_dispatches_absorbed_thd(monkeypatch):
     assert captured["w_vc"].shape == (config.num_attention_heads, config.v_head_dim, config.kv_lora_rank)
     assert captured["w_vc"].dtype == torch.bfloat16
     assert captured["softmax_scale"] == mla.softmax_scale
+
+
+def test_mla_tilelang_cp_gathers_kv_before_sparse_attention(monkeypatch):
+    config = _small_dsa_config()
+    backend = BackendConfig(attn="tilelang", linear="torch", rms_norm="torch", rope_fusion=False)
+    mla = GlmMoeDsaMLA(config, backend, skip_topk=True)
+    mla.o_proj = torch.nn.Identity()
+    monkeypatch.setattr(layer_mod, "should_use_tilelang", lambda *args, **kwargs: True)
+    monkeypatch.setattr(layer_mod, "glm_dsa_cp_enabled", lambda group: group == "cp-group")
+    gathered = []
+    captured = {}
+
+    def fake_cp_all_gather(tensor, *, dim, cp_group):
+        assert cp_group == "cp-group"
+        gathered.append(tuple(tensor.shape))
+        return torch.cat([tensor, tensor], dim=dim)
+
+    def fake_tilelang_sparse_attention(q, kv_latent, topk_indices, w_vc, softmax_scale):
+        captured.update(q=q, kv_latent=kv_latent, topk_indices=topk_indices, w_vc=w_vc, softmax_scale=softmax_scale)
+        return torch.ones(q.shape[0], config.num_attention_heads, config.v_head_dim, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(layer_mod, "glm_dsa_cp_all_gather", fake_cp_all_gather)
+    monkeypatch.setattr(layer_mod, "tilelang_sparse_attention", fake_tilelang_sparse_attention)
+    x = torch.randn(4, config.hidden_size, dtype=torch.bfloat16)
+    topk_indices = torch.zeros(4, 1, config.index_topk, dtype=torch.int32)
+
+    out = mla(
+        x,
+        _freqs(4, config.qk_rope_head_dim),
+        prev_topk_indices=topk_indices,
+        _glm_dsa_cp_group="cp-group",
+    )
+
+    assert out.shape == (4, config.num_attention_heads * config.v_head_dim)
+    assert gathered == [(4, config.kv_lora_rank), (4, config.qk_rope_head_dim)]
+    assert captured["q"].shape[0] == 4
+    assert captured["kv_latent"].shape == (8, 1, config.kv_lora_rank + config.qk_rope_head_dim)
+    assert captured["topk_indices"] is topk_indices
 
 
 @requires_kernels
