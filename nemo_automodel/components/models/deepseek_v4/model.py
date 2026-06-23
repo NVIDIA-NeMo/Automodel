@@ -436,6 +436,13 @@ class DeepseekV4Model(nn.Module):
                 raise ValueError("First PP stage requires input_ids or inputs_embeds")
             if inputs_embeds is None:
                 inputs_embeds = self.embed_tokens(input_ids)
+            # Packed-sequence (THD) inputs arrive with the batch axis collapsed
+            # (``process_input_for_thd`` flattens ids to ``[T]`` -> embeds ``[T, dim]``).
+            # Restore the leading batch dim so the hc_mult expand below sees the
+            # expected ``[B, S, dim]`` rank, mirroring the output-side THD
+            # ``unsqueeze(0)`` in ``compute_lm_head_logits(is_thd=True)``.
+            if inputs_embeds.dim() == 2:
+                inputs_embeds = inputs_embeds.unsqueeze(0)
             # Expand embeddings to hc_mult copies: [B,S,dim] -> [B,S,hc_mult,dim]
             h = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
             shape_ref = inputs_embeds  # 3D ref for rotary / mask sizing
