@@ -517,6 +517,8 @@ def _pool_windows(
             cp_group=cp_group,
             window_seq_ids=window_seq_ids,
         )
+        all_masked = torch.isneginf(gate_w).all(dim=2, keepdim=True)
+        gate_w = torch.where(all_masked, torch.zeros_like(gate_w), gate_w)
     return (kv_w * gate_w.softmax(dim=2)).sum(dim=2)
 
 

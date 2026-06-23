@@ -302,6 +302,28 @@ class TestDeepseekV4AttentionMask:
 
         torch.testing.assert_close(actual, expected)
 
+    def test_overlap_pool_all_masked_padding_window_is_finite_zero(self):
+        torch.manual_seed(1234)
+        batch, n_windows, ratio, head_dim = 1, 2, 4, 3
+        feat = 2 * head_dim
+        kv = torch.randn(batch, n_windows * ratio, feat)
+        gate = torch.randn(batch, n_windows * ratio, feat)
+        ape = torch.zeros(ratio, feat)
+        window_seq_ids = torch.tensor([[1, 0]])
+
+        pooled = dsv4_layers._pool_windows(
+            kv,
+            gate,
+            ape,
+            ratio=ratio,
+            head_dim=head_dim,
+            overlap=True,
+            window_seq_ids=window_seq_ids,
+        )
+
+        assert torch.isfinite(pooled).all()
+        torch.testing.assert_close(pooled[:, 1], torch.zeros(batch, head_dim))
+
     def test_packed_topk_uses_padded_lengths_for_tail_padding(self):
         seq_len = 8
         real_seq_lens = torch.tensor([[3, 2]], dtype=torch.long)
