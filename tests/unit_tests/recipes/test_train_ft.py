@@ -266,6 +266,40 @@ def test_build_validation_dataloader_packs_val_for_thd_backends(monkeypatch, att
     assert (kwargs["cfg_ps"] is not None) is expect_packed
 
 
+def test_build_validation_dataloader_packs_val_when_model_requires_thd(monkeypatch):
+    """Models with backend-specific packed validation requirements can opt in."""
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda _cfg: True)
+    cfg = ConfigNode(
+        {
+            "model": {"backend": {"attn": "sdpa"}},
+            "dataloader": {},
+            "validation_dataloader": {},
+            "packed_sequence": {"packed_sequence_size": 1024},
+            "distributed": {"cp_size": 1},
+            "step_scheduler": {
+                "local_batch_size": 1,
+                "global_batch_size": 8,
+                "max_steps": 5,
+                "val_every_steps": 1,
+            },
+            "seed": 42,
+            "validation_dataset": {"some": "cfg"},
+        }
+    )
+
+    class ModelRequiresPackedVal:
+        def should_pack_validation_with_training(self):
+            return True
+
+    model = ModelRequiresPackedVal()
+    with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader", return_value=("dl", "tok")) as mock_build:
+        build_validation_dataloader(cfg, dp_world_size=1, dp_rank=0, pp_enabled=False, model=model)
+
+    _, kwargs = mock_build.call_args
+    assert kwargs["cfg_ps"] is cfg.packed_sequence
+    assert kwargs["model"] is model
+
+
 class DummyLinear(nn.Module):
     """Simple linear layer for testing"""
 

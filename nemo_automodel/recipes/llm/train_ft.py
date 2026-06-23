@@ -591,7 +591,14 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
     _magi_backend = (
         str(cfg.get("model.backend.attn", "")) == "magi" or str(cfg.get("model.attn_implementation", "")) == "magi"
     )
-    _pack_val = (_uses_te_dot_product_attention(cfg.model) or _magi_backend) and _uses_thd_collater(cfg.dataloader)
+    _model_packs_validation = bool(
+        model is not None
+        and callable(getattr(model, "should_pack_validation_with_training", None))
+        and model.should_pack_validation_with_training()
+    )
+    _pack_val = (
+        _uses_te_dot_product_attention(cfg.model) or _magi_backend or _model_packs_validation
+    ) and _uses_thd_collater(cfg.dataloader)
 
     # Build validation dataloader if the config provides it
     val_dataloaders = {}
