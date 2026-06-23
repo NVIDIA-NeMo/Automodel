@@ -36,10 +36,15 @@ The output can be consumed with
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
 import logging
+import os
+import re
 import shutil
+import time
+import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -152,9 +157,35 @@ def _normalize_doc_refs(value: Any, *, field_name: str) -> list[dict[str, str]]:
     return refs
 
 
-def _image_to_jpeg_bytes(image: Any, jpeg_quality: int) -> bytes:
-    if image is None or (isinstance(image, str) and not image):
+def _read_existing_image_bytes(path: str | os.PathLike[str]) -> bytes | None:
+    image_path = Path(path)
+    if not image_path.is_file():
+        return None
+    return image_path.read_bytes()
+
+
+def _encoded_image_bytes(image: Any) -> bytes | None:
+    if isinstance(image, (bytes, bytearray, memoryview)):
+        return bytes(image)
+    if isinstance(image, dict):
+        raw_bytes = image.get("bytes")
+        if raw_bytes:
+            return bytes(raw_bytes)
+        image_path = image.get("path")
+        if image_path:
+            return _read_existing_image_bytes(image_path)
         return b""
+    if isinstance(image, str) and image:
+        return _read_existing_image_bytes(image)
+    return None
+
+
+def _image_to_jpeg_bytes(image: Any, jpeg_quality: int) -> tuple[bytes, bool]:
+    if image is None or (isinstance(image, str) and not image):
+        return b"", True
+    encoded = _encoded_image_bytes(image)
+    if encoded is not None:
+        return encoded, True
     if isinstance(image, str):
         has_pil, image_module = safe_import("PIL.Image")
         if not has_pil:
@@ -168,7 +199,119 @@ def _image_to_jpeg_bytes(image: Any, jpeg_quality: int) -> bytes:
 
     buffer = BytesIO()
     image.save(buffer, format="JPEG", quality=jpeg_quality)
-    return buffer.getvalue()
+    return buffer.getvalue(), False
+
+
+def _arrow_rows(dataset: Any, row_idx: int, length: int) -> list[dict[str, Any]] | None:
+    table = getattr(dataset, "data", None)
+    if table is None:
+        table = getattr(dataset, "_data", None)
+    if table is None or length < 1:
+        return None
+
+    sliced = None
+    if hasattr(table, "fast_slice"):
+        try:
+            sliced = table.fast_slice(row_idx, length)
+        except Exception:
+            logger.debug("Could not fast_slice Arrow table rows %d:%d", row_idx, row_idx + length, exc_info=True)
+    if sliced is None and hasattr(table, "slice"):
+        try:
+            sliced = table.slice(row_idx, length)
+        except Exception:
+            logger.debug("Could not slice Arrow table rows %d:%d", row_idx, row_idx + length, exc_info=True)
+    if sliced is None:
+        return None
+
+    try:
+        rows = sliced.to_pylist()
+    except Exception:
+        logger.debug("Could not convert Arrow table rows %d:%d to python", row_idx, row_idx + length, exc_info=True)
+        return None
+    return rows
+
+
+def _arrow_row(dataset: Any, row_idx: int) -> dict[str, Any] | None:
+    rows = _arrow_rows(dataset, row_idx, 1)
+    if not rows:
+        return None
+    return rows[0]
+
+
+def _sequence_value_at(value: Any, idx: int) -> Any:
+    if isinstance(value, (list, tuple)):
+        if idx >= len(value):
+            return None
+        return value[idx]
+    if isinstance(value, dict):
+        item = {}
+        for key, entry in value.items():
+            if isinstance(entry, (list, tuple)):
+                item[key] = entry[idx] if idx < len(entry) else None
+            else:
+                item[key] = entry
+        return item
+    return None
+
+
+def _docmatix_doc_indices(doc_id: str) -> tuple[int, int] | None:
+    try:
+        example_idx, image_idx = (int(part) for part in doc_id.split("_", 1))
+    except ValueError:
+        return None
+    return example_idx, image_idx
+
+
+def _document_from_arrow_storage(
+    corpus_info: Any,
+    doc_id: str,
+) -> dict[str, Any] | None:
+    corpus = getattr(corpus_info, "corpus", None)
+    if corpus is None:
+        return None
+
+    dataset = getattr(corpus, "data", None)
+    if dataset is None:
+        dataset = getattr(corpus, "_data", None)
+    if dataset is None:
+        return None
+
+    if corpus.__class__.__name__ == "DocMatixDataset":
+        indices = _docmatix_doc_indices(doc_id)
+        if indices is None:
+            return None
+        example_idx, image_idx = indices
+        row = _arrow_row(dataset, example_idx)
+        if row is None:
+            return None
+        image = _sequence_value_at(row.get("images"), image_idx)
+        if _encoded_image_bytes(image) is None:
+            return None
+        return {"image": image}
+
+    docid2idx = getattr(corpus, "docid2idx", None)
+    if docid2idx is None:
+        docid2idx = getattr(corpus, "_docid2idx", None)
+    if docid2idx is None or doc_id not in docid2idx:
+        return None
+
+    row = _arrow_row(dataset, docid2idx[doc_id])
+    if row is None:
+        return None
+    image = row.get("image", "")
+    if image and _encoded_image_bytes(image) is None:
+        return None
+    return {
+        "text": row.get("text", ""),
+        "image": image,
+        "nr_ocr": row.get("nr_ocr", ""),
+        "complex_ocr": row.get("complex_ocr", ""),
+    }
+
+
+def _doc_id_sort_key(doc_id: str) -> tuple[Any, ...]:
+    parts = re.split(r"(\d+)", doc_id)
+    return tuple(int(part) if part.isdigit() else part for part in parts)
 
 
 def _corpus_text(doc: dict[str, Any]) -> str:
@@ -186,6 +329,131 @@ def _prepare_output_dir(output_dir: Path, *, resume: bool = False) -> None:
         )
     (output_dir / "train").mkdir(exist_ok=resume)
     (output_dir / "corpus").mkdir(exist_ok=resume)
+
+
+def _prepare_multi_source_output_dir(output_dir: Path, *, resume: bool = False) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = output_dir / "metadata.json"
+    if not resume and (
+        metadata_path.exists()
+        or (output_dir / "sources").exists()
+        or (output_dir / "train").exists()
+        or (output_dir / "corpus").exists()
+    ):
+        raise FileExistsError(
+            f"Output directory already contains normalized retrieval artifacts: {output_dir}. "
+            "Choose a new directory or remove old artifacts explicitly."
+        )
+    (output_dir / "sources").mkdir(exist_ok=resume)
+
+
+def _split_data_dir_list(data_dir_list: Any) -> list[Any]:
+    if isinstance(data_dir_list, (str, dict)):
+        return [data_dir_list]
+    if isinstance(data_dir_list, list):
+        if not data_dir_list:
+            raise ValueError("data_dir_list must contain at least one source")
+        return data_dir_list
+    raise ValueError(f"Unsupported data_dir_list type: {type(data_dir_list).__name__}")
+
+
+def _as_data_dir_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _source_entry_key(source_entry: Any) -> str:
+    payload = json.dumps(source_entry, sort_keys=True, default=str)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _source_entry_name(source_entry: Any) -> str:
+    source_path = source_entry.get("path") if isinstance(source_entry, dict) else source_entry
+    name = Path(str(source_path)).stem or "source"
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
+    return name or "source"
+
+
+def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    try:
+        temp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        temp_path.replace(path)
+    except BaseException:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
+
+
+def _load_top_level_metadata(output_dir: Path) -> dict[str, Any]:
+    metadata_path = output_dir / "metadata.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Normalized retrieval metadata not found: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("format") != "nemo_automodel_normalized_vl_retrieval_arrow":
+        raise ValueError(f"Unsupported normalized retrieval format: {metadata.get('format')!r}")
+    if "sources" not in metadata:
+        raise ValueError(
+            f"Cannot append to legacy normalized bundle without top-level sources metadata: {metadata_path}"
+        )
+    return metadata
+
+
+def _source_dir_index(path: Path) -> int | None:
+    if not path.name.startswith("source-"):
+        return None
+    suffix = path.name.removeprefix("source-")
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def _next_source_index(output_dir: Path, metadata: dict[str, Any]) -> int:
+    indices = [
+        int(source["source_index"])
+        for source in metadata.get("sources", [])
+        if isinstance(source, dict) and "source_index" in source
+    ]
+    sources_dir = output_dir / "sources"
+    if sources_dir.exists():
+        indices.extend(index for path in sources_dir.iterdir() if (index := _source_dir_index(path)) is not None)
+    return max(indices, default=-1) + 1
+
+
+def _source_metadata_from_dir(output_dir: Path, source_idx: int, source_entry: Any) -> dict[str, Any]:
+    source_dir = output_dir / "sources" / f"source-{source_idx:05d}"
+    metadata_path = source_dir / "metadata.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Normalized source metadata not found: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("data_dir_list") != [source_entry]:
+        raise ValueError(
+            f"Normalized source {source_dir} was built from a different source entry. "
+            "Choose a new output directory or rebuild the mismatched source."
+        )
+    return {
+        "source_index": source_idx,
+        "source_name": _source_entry_name(source_entry),
+        "source_key": _source_entry_key(source_entry),
+        "source_entry": source_entry,
+        "path": str(source_dir.relative_to(output_dir)),
+        "num_records": metadata["num_records"],
+    }
+
+
+def _existing_source_keys(metadata: dict[str, Any]) -> set[str]:
+    keys = set()
+    for source in metadata.get("sources", []):
+        if not isinstance(source, dict):
+            continue
+        if "source_key" in source:
+            keys.add(str(source["source_key"]))
+        elif "source_entry" in source:
+            keys.add(_source_entry_key(source["source_entry"]))
+    return keys
 
 
 def _safe_corpus_dir_name(corpus_id: str) -> str:
@@ -381,19 +649,56 @@ def _write_corpus_shards(
             features,
             filename_prefix="corpus",
         )
-        doc_ids = sorted(refs_by_corpus[corpus_id])
+        doc_ids = sorted(refs_by_corpus[corpus_id], key=_doc_id_sort_key)
+        start_time = time.monotonic()
+        lookup_seconds = 0.0
+        image_seconds = 0.0
+        write_seconds = 0.0
+        encoded_image_count = 0
+        decoded_image_count = 0
+        progress_every = max(10000, docs_per_shard)
         try:
             for doc_id in doc_ids:
-                doc = corpus_info.get_document_by_id(doc_id)
+                lookup_start = time.monotonic()
+                doc = _document_from_arrow_storage(corpus_info, doc_id)
+                if doc is None:
+                    doc = corpus_info.get_document_by_id(doc_id)
+                lookup_seconds += time.monotonic() - lookup_start
+                image_start = time.monotonic()
+                image_bytes, used_encoded_image = _image_to_jpeg_bytes(doc.get("image", ""), jpeg_quality)
+                if used_encoded_image:
+                    encoded_image_count += 1
+                else:
+                    decoded_image_count += 1
+                image_seconds += time.monotonic() - image_start
+                write_start = time.monotonic()
                 writer.write(
                     {
                         "id": doc_id,
                         "text": _corpus_text(doc),
-                        "image_jpeg": _image_to_jpeg_bytes(doc.get("image", ""), jpeg_quality),
+                        "image_jpeg": image_bytes,
                         "nr_ocr": "" if doc.get("nr_ocr") is None else str(doc.get("nr_ocr")),
                         "complex_ocr": "" if doc.get("complex_ocr") is None else str(doc.get("complex_ocr")),
                     }
                 )
+                write_seconds += time.monotonic() - write_start
+                if writer.num_records % progress_every == 0:
+                    elapsed = time.monotonic() - start_time
+                    docs_per_second = writer.num_records / elapsed if elapsed > 0 else 0.0
+                    logger.info(
+                        "Wrote %d/%d normalized corpus docs for corpus_id=%s "
+                        "(%.1f docs/s, lookup=%.1fs, image=%.1fs, write=%.1fs, "
+                        "encoded_images=%d, decoded_images=%d)",
+                        writer.num_records,
+                        len(doc_ids),
+                        corpus_id,
+                        docs_per_second,
+                        lookup_seconds,
+                        image_seconds,
+                        write_seconds,
+                        encoded_image_count,
+                        decoded_image_count,
+                    )
         finally:
             writer.close()
         shards = [f"corpus/{corpus_dir_name}/{path}" for path in writer.shard_paths]
@@ -405,11 +710,26 @@ def _write_corpus_shards(
                 "shards": shards,
             }
         )
-        logger.info("Wrote %d normalized corpus docs for corpus_id=%s", writer.num_records, corpus_id)
+        elapsed = time.monotonic() - start_time
+        docs_per_second = writer.num_records / elapsed if elapsed > 0 else 0.0
+        logger.info(
+            "Wrote %d normalized corpus docs for corpus_id=%s "
+            "(%.1f docs/s, elapsed=%.1fs, lookup=%.1fs, image=%.1fs, write=%.1fs, "
+            "encoded_images=%d, decoded_images=%d)",
+            writer.num_records,
+            corpus_id,
+            docs_per_second,
+            elapsed,
+            lookup_seconds,
+            image_seconds,
+            write_seconds,
+            encoded_image_count,
+            decoded_image_count,
+        )
     return corpus_metadata
 
 
-def prepare_normalized_dataset(
+def _prepare_single_normalized_dataset(
     data_dir_list: list[Any],
     output_dir: Path,
     *,
@@ -463,6 +783,262 @@ def prepare_normalized_dataset(
     return metadata
 
 
+def _prepare_source_bundle(
+    source_entry: Any,
+    output_dir: Path,
+    source_idx: int,
+    *,
+    samples_per_shard: int,
+    docs_per_shard: int,
+    seed: int,
+    max_samples: int | None,
+    jpeg_quality: int,
+    resume: bool,
+    staged: bool,
+) -> tuple[dict[str, Any], Path]:
+    sources_dir = output_dir / "sources"
+    source_dir = sources_dir / f"source-{source_idx:05d}"
+    if staged:
+        if source_dir.exists():
+            raise FileExistsError(f"Refusing to overwrite existing normalized source directory: {source_dir}")
+        temp_dir = sources_dir / f".source-{source_idx:05d}.tmp-{uuid.uuid4().hex}"
+        try:
+            metadata = _prepare_single_normalized_dataset(
+                data_dir_list=[source_entry],
+                output_dir=temp_dir,
+                samples_per_shard=samples_per_shard,
+                docs_per_shard=docs_per_shard,
+                seed=seed,
+                max_samples=max_samples,
+                jpeg_quality=jpeg_quality,
+                resume=False,
+            )
+            temp_dir.rename(source_dir)
+        except BaseException:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+            raise
+    else:
+        if resume and source_dir.exists():
+            metadata_path = source_dir / "metadata.json"
+            if metadata_path.is_file():
+                existing_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if existing_metadata.get("data_dir_list") != [source_entry]:
+                    raise ValueError(
+                        f"Cannot resume normalized source {source_dir} with a different source entry. "
+                        "Use --append for new sources, or choose a new output directory."
+                    )
+        metadata = _prepare_single_normalized_dataset(
+            data_dir_list=[source_entry],
+            output_dir=source_dir,
+            samples_per_shard=samples_per_shard,
+            docs_per_shard=docs_per_shard,
+            seed=seed,
+            max_samples=max_samples,
+            jpeg_quality=jpeg_quality,
+            resume=resume,
+        )
+    return (
+        {
+            "source_index": source_idx,
+            "source_name": _source_entry_name(source_entry),
+            "source_key": _source_entry_key(source_entry),
+            "source_entry": source_entry,
+            "path": str(source_dir.relative_to(output_dir)),
+            "num_records": metadata["num_records"],
+        },
+        source_dir,
+    )
+
+
+def _append_normalized_sources(
+    data_dir_list: list[Any],
+    output_dir: Path,
+    *,
+    samples_per_shard: int,
+    docs_per_shard: int,
+    seed: int,
+    max_samples: int | None,
+    jpeg_quality: int,
+) -> dict[str, Any]:
+    metadata = _load_top_level_metadata(output_dir)
+    sources_dir = output_dir / "sources"
+    if not sources_dir.is_dir():
+        raise FileNotFoundError(f"Normalized retrieval sources directory not found: {sources_dir}")
+
+    source_entries = _split_data_dir_list(data_dir_list)
+    next_source_idx = _next_source_index(output_dir, metadata)
+    existing_source_keys = _existing_source_keys(metadata)
+    appended_sources = []
+    appended_dirs = []
+    try:
+        source_idx = next_source_idx
+        for source_entry in source_entries:
+            source_key = _source_entry_key(source_entry)
+            if source_key in existing_source_keys:
+                logger.warning("Skipping duplicate normalized source entry during append: %s", source_entry)
+                continue
+            source_metadata, source_dir = _prepare_source_bundle(
+                source_entry,
+                output_dir,
+                source_idx,
+                samples_per_shard=samples_per_shard,
+                docs_per_shard=docs_per_shard,
+                seed=seed,
+                max_samples=max_samples,
+                jpeg_quality=jpeg_quality,
+                resume=False,
+                staged=True,
+            )
+            appended_sources.append(source_metadata)
+            appended_dirs.append(source_dir)
+            existing_source_keys.add(source_key)
+            source_idx += 1
+
+        if not appended_sources:
+            logger.info("No new normalized retrieval sources to append to %s", output_dir)
+            return metadata
+
+        updated_metadata = dict(metadata)
+        updated_sources = list(metadata.get("sources", [])) + appended_sources
+        updated_metadata["sources"] = updated_sources
+        updated_metadata["data_dir_list"] = _as_data_dir_list(metadata.get("data_dir_list")) + [
+            source["source_entry"] for source in appended_sources
+        ]
+        updated_metadata["num_records"] = sum(int(source["num_records"]) for source in updated_sources)
+        _write_json_atomic(output_dir / "metadata.json", updated_metadata)
+        logger.info(
+            "Appended %d source(s), %d total train records to normalized retrieval bundle %s",
+            len(appended_sources),
+            updated_metadata["num_records"],
+            output_dir,
+        )
+        return updated_metadata
+    except BaseException:
+        for source_dir in reversed(appended_dirs):
+            if source_dir.exists():
+                shutil.rmtree(source_dir)
+        raise
+
+
+def prepare_normalized_source(
+    data_dir_list: list[Any],
+    output_dir: Path,
+    source_index: int,
+    *,
+    samples_per_shard: int,
+    docs_per_shard: int,
+    seed: int,
+    max_samples: int | None,
+    jpeg_quality: int,
+    resume: bool = False,
+) -> dict[str, Any]:
+    """Write one source bundle under a top-level normalized output directory."""
+    source_entries = _split_data_dir_list(data_dir_list)
+    if source_index < 0 or source_index >= len(source_entries):
+        raise ValueError(f"source_index must satisfy 0 <= source_index < {len(source_entries)}, got {source_index}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "sources").mkdir(exist_ok=True)
+    source_metadata, _ = _prepare_source_bundle(
+        source_entries[source_index],
+        output_dir,
+        source_index,
+        samples_per_shard=samples_per_shard,
+        docs_per_shard=docs_per_shard,
+        seed=seed,
+        max_samples=max_samples,
+        jpeg_quality=jpeg_quality,
+        resume=resume,
+        staged=False,
+    )
+    return source_metadata
+
+
+def finalize_normalized_sources(
+    data_dir_list: list[Any],
+    output_dir: Path,
+    *,
+    samples_per_shard: int,
+    docs_per_shard: int,
+) -> dict[str, Any]:
+    """Write top-level metadata for source bundles prepared independently."""
+    source_entries = _split_data_dir_list(data_dir_list)
+    source_metadata = [
+        _source_metadata_from_dir(output_dir, source_idx, source_entry)
+        for source_idx, source_entry in enumerate(source_entries)
+    ]
+    metadata = {
+        "format": "nemo_automodel_normalized_vl_retrieval_arrow",
+        "version": 3,
+        "data_dir_list": data_dir_list,
+        "num_records": sum(int(source["num_records"]) for source in source_metadata),
+        "samples_per_shard": samples_per_shard,
+        "docs_per_shard": docs_per_shard,
+        "sources": source_metadata,
+    }
+    _write_json_atomic(output_dir / "metadata.json", metadata)
+    logger.info(
+        "Finalized normalized retrieval bundle with %d source(s), %d total train records at %s",
+        len(source_metadata),
+        metadata["num_records"],
+        output_dir,
+    )
+    return metadata
+
+
+def prepare_normalized_dataset(
+    data_dir_list: list[Any],
+    output_dir: Path,
+    *,
+    samples_per_shard: int,
+    docs_per_shard: int,
+    seed: int,
+    max_samples: int | None,
+    jpeg_quality: int,
+    resume: bool = False,
+    append: bool = False,
+) -> dict[str, Any]:
+    """Write a normalized portable Arrow retrieval bundle."""
+    if append:
+        return _append_normalized_sources(
+            data_dir_list,
+            output_dir,
+            samples_per_shard=samples_per_shard,
+            docs_per_shard=docs_per_shard,
+            seed=seed,
+            max_samples=max_samples,
+            jpeg_quality=jpeg_quality,
+        )
+
+    source_entries = _split_data_dir_list(data_dir_list)
+    _prepare_multi_source_output_dir(output_dir, resume=resume)
+    for source_idx, _source_entry in enumerate(source_entries):
+        prepare_normalized_source(
+            data_dir_list,
+            output_dir,
+            source_idx,
+            samples_per_shard=samples_per_shard,
+            docs_per_shard=docs_per_shard,
+            seed=seed,
+            max_samples=max_samples,
+            jpeg_quality=jpeg_quality,
+            resume=resume,
+        )
+
+    if max_samples is not None and len(source_entries) > 1:
+        logger.warning(
+            "--max-samples is applied to each normalized source independently. "
+            "Use per-source num_samples in the original config or at training time for source-specific caps."
+        )
+
+    return finalize_normalized_sources(
+        data_dir_list,
+        output_dir,
+        samples_per_shard=samples_per_shard,
+        docs_per_shard=docs_per_shard,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -479,6 +1055,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=None, help="Optional global train sample cap")
     parser.add_argument("--jpeg-quality", type=int, default=95, help="JPEG quality for packed corpus images")
     parser.add_argument("--resume", action="store_true", help="Reuse complete shards in an existing output directory")
+    parser.add_argument(
+        "--source-index",
+        type=int,
+        default=None,
+        help="Prepare only one source from data_dir_list. Use this from Slurm arrays, then run --finalize-sources.",
+    )
+    parser.add_argument(
+        "--finalize-sources",
+        action="store_true",
+        help="Write top-level metadata from independently prepared source directories.",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Append the provided source(s) to an existing top-level normalized bundle.",
+    )
     return parser.parse_args()
 
 
@@ -496,16 +1088,42 @@ def main() -> None:
     else:
         data_dir_list = args.data_dir_list
 
-    metadata = prepare_normalized_dataset(
-        data_dir_list=data_dir_list,
-        output_dir=Path(args.output_dir),
-        samples_per_shard=args.samples_per_shard,
-        docs_per_shard=args.docs_per_shard,
-        seed=args.seed,
-        max_samples=args.max_samples,
-        jpeg_quality=args.jpeg_quality,
-        resume=args.resume,
-    )
+    if args.source_index is not None and args.finalize_sources:
+        raise ValueError("Use only one of --source-index or --finalize-sources")
+    if args.append and (args.source_index is not None or args.finalize_sources):
+        raise ValueError("--append cannot be combined with --source-index or --finalize-sources")
+
+    if args.source_index is not None:
+        metadata = prepare_normalized_source(
+            data_dir_list=data_dir_list,
+            output_dir=Path(args.output_dir),
+            source_index=args.source_index,
+            samples_per_shard=args.samples_per_shard,
+            docs_per_shard=args.docs_per_shard,
+            seed=args.seed,
+            max_samples=args.max_samples,
+            jpeg_quality=args.jpeg_quality,
+            resume=args.resume,
+        )
+    elif args.finalize_sources:
+        metadata = finalize_normalized_sources(
+            data_dir_list=data_dir_list,
+            output_dir=Path(args.output_dir),
+            samples_per_shard=args.samples_per_shard,
+            docs_per_shard=args.docs_per_shard,
+        )
+    else:
+        metadata = prepare_normalized_dataset(
+            data_dir_list=data_dir_list,
+            output_dir=Path(args.output_dir),
+            samples_per_shard=args.samples_per_shard,
+            docs_per_shard=args.docs_per_shard,
+            seed=args.seed,
+            max_samples=args.max_samples,
+            jpeg_quality=args.jpeg_quality,
+            resume=args.resume,
+            append=args.append,
+        )
     print(json.dumps(metadata, indent=2))
 
 

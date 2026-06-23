@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Resolve corpus-id VL retrieval data into reusable training shards.
+"""Resolve corpus-id VL retrieval data into packed Arrow debug shards.
+
+For full portable datasets, prefer
+``tools/retrieval/prepare_normalized_vl_retrieval_data.py``. Resolved Arrow
+stores document/image payload in each training row, so it is mainly useful for
+small, self-contained reproduction datasets.
 
 Example:
 
@@ -34,7 +39,6 @@ import argparse
 import importlib.metadata
 import json
 import logging
-import sqlite3
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -62,189 +66,8 @@ from nemo_automodel.shared.import_utils import safe_import
 logger = logging.getLogger(__name__)
 
 
-class JsonlShardWriter:
-    """Write records into fixed-size JSONL shards."""
-
-    def __init__(self, output_dir: Path, samples_per_shard: int, *, filename_prefix: str = "shard") -> None:
-        if samples_per_shard < 1:
-            raise ValueError(f"samples_per_shard must be >= 1, got {samples_per_shard}")
-        self.output_dir = output_dir
-        self.samples_per_shard = samples_per_shard
-        self.filename_prefix = filename_prefix
-        self._current_file = None
-        self._current_shard_idx = -1
-        self.num_records = 0
-        self.shard_paths: list[str] = []
-
-    def _open_next_shard(self) -> None:
-        if self._current_file is not None:
-            self._current_file.close()
-        self._current_shard_idx += 1
-        path = self.output_dir / f"{self.filename_prefix}-{self._current_shard_idx:05d}.jsonl"
-        self.shard_paths.append(path.name)
-        self._current_file = path.open("w", encoding="utf-8")
-
-    def write(self, record: dict[str, Any]) -> None:
-        if self.num_records % self.samples_per_shard == 0:
-            self._open_next_shard()
-        assert self._current_file is not None
-        self._current_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-        self.num_records += 1
-
-    def close(self) -> None:
-        if self._current_file is not None:
-            self._current_file.close()
-            self._current_file = None
-
-
-class SqliteShardWriter:
-    """Write records and image bytes into fixed-size SQLite shards."""
-
-    def __init__(self, output_dir: Path, samples_per_shard: int, *, filename_prefix: str = "shard") -> None:
-        if samples_per_shard < 1:
-            raise ValueError(f"samples_per_shard must be >= 1, got {samples_per_shard}")
-        self.output_dir = output_dir
-        self.samples_per_shard = samples_per_shard
-        self.filename_prefix = filename_prefix
-        self._conn: sqlite3.Connection | None = None
-        self._current_shard_idx = -1
-        self._records_in_shard = 0
-        self.num_records = 0
-        self.shard_paths: list[str] = []
-
-    def _open_next_shard(self) -> None:
-        self._close_current_shard()
-        self._current_shard_idx += 1
-        self._records_in_shard = 0
-        path = self.output_dir / f"{self.filename_prefix}-{self._current_shard_idx:05d}.sqlite"
-        self.shard_paths.append(path.name)
-        self._conn = sqlite3.connect(path)
-        self._conn.execute("PRAGMA journal_mode=OFF")
-        self._conn.execute("PRAGMA synchronous=OFF")
-        self._conn.execute("CREATE TABLE records (id INTEGER PRIMARY KEY, record_json TEXT NOT NULL)")
-        self._conn.execute(
-            "CREATE TABLE images (record_id INTEGER NOT NULL, doc_idx INTEGER NOT NULL, "
-            "image_jpeg BLOB NOT NULL, PRIMARY KEY (record_id, doc_idx))"
-        )
-
-    def _close_current_shard(self) -> None:
-        if self._conn is not None:
-            self._conn.commit()
-            self._conn.close()
-            self._conn = None
-
-    def write(self, record: dict[str, Any], image_blobs: dict[int, bytes]) -> None:
-        if self.num_records % self.samples_per_shard == 0:
-            self._open_next_shard()
-        assert self._conn is not None
-        record_id = self._records_in_shard
-        self._conn.execute(
-            "INSERT INTO records (id, record_json) VALUES (?, ?)",
-            (record_id, json.dumps(record, ensure_ascii=False)),
-        )
-        self._conn.executemany(
-            "INSERT INTO images (record_id, doc_idx, image_jpeg) VALUES (?, ?, ?)",
-            [(record_id, doc_idx, blob) for doc_idx, blob in image_blobs.items()],
-        )
-        self.num_records += 1
-        self._records_in_shard += 1
-
-    def close(self) -> None:
-        self._close_current_shard()
-
-
-class ParquetShardWriter:
-    """Write records and image bytes into fixed-size Parquet shards."""
-
-    def __init__(
-        self,
-        output_dir: Path,
-        samples_per_shard: int,
-        *,
-        filename_prefix: str = "shard",
-        row_group_size: int = 64,
-    ) -> None:
-        if samples_per_shard < 1:
-            raise ValueError(f"samples_per_shard must be >= 1, got {samples_per_shard}")
-        if row_group_size < 1:
-            raise ValueError(f"row_group_size must be >= 1, got {row_group_size}")
-        has_pa, pa = safe_import("pyarrow")
-        has_pq, pq = safe_import("pyarrow.parquet")
-        if not has_pa or not has_pq:
-            raise ImportError("pyarrow is required for --image-storage parquet. Install pyarrow.")
-
-        self.output_dir = output_dir
-        self.samples_per_shard = samples_per_shard
-        self.filename_prefix = filename_prefix
-        self.row_group_size = row_group_size
-        self._pa = pa
-        self._pq = pq
-        self._schema = pa.schema(
-            [
-                ("id", pa.int64()),
-                ("record_json", pa.string()),
-                ("image_jpeg", pa.list_(pa.binary())),
-            ]
-        )
-        self._writer = None
-        self._current_shard_idx = -1
-        self._records_in_shard = 0
-        self._batch_ids: list[int] = []
-        self._batch_record_json: list[str] = []
-        self._batch_images: list[list[bytes | None]] = []
-        self.num_records = 0
-        self.shard_paths: list[str] = []
-
-    def _open_next_shard(self) -> None:
-        self._close_current_shard()
-        self._current_shard_idx += 1
-        self._records_in_shard = 0
-        path = self.output_dir / f"{self.filename_prefix}-{self._current_shard_idx:05d}.parquet"
-        self.shard_paths.append(path.name)
-        self._writer = self._pq.ParquetWriter(path, self._schema, compression=None, use_dictionary=False)
-
-    def _flush_batch(self) -> None:
-        if self._writer is None or not self._batch_ids:
-            return
-        table = self._pa.table(
-            {
-                "id": self._batch_ids,
-                "record_json": self._batch_record_json,
-                "image_jpeg": self._batch_images,
-            },
-            schema=self._schema,
-        )
-        self._writer.write_table(table, row_group_size=len(self._batch_ids))
-        self._batch_ids = []
-        self._batch_record_json = []
-        self._batch_images = []
-
-    def _close_current_shard(self) -> None:
-        if self._writer is not None:
-            self._flush_batch()
-            self._writer.close()
-            self._writer = None
-
-    def write(self, record: dict[str, Any], image_blobs: dict[int, bytes]) -> None:
-        if self.num_records % self.samples_per_shard == 0:
-            self._open_next_shard()
-        assert self._writer is not None
-        record_id = self._records_in_shard
-        doc_images = record.get("doc_image", [])
-        self._batch_ids.append(record_id)
-        self._batch_record_json.append(json.dumps(record, ensure_ascii=False))
-        self._batch_images.append([image_blobs.get(doc_idx) for doc_idx in range(len(doc_images))])
-        self.num_records += 1
-        self._records_in_shard += 1
-        if len(self._batch_ids) >= self.row_group_size:
-            self._flush_batch()
-
-    def close(self) -> None:
-        self._close_current_shard()
-
-
 class ArrowShardWriter:
-    """Write records and image bytes into fixed-size Hugging Face Arrow shards."""
+    """Write fixed-size resolved retrieval Arrow shards."""
 
     def __init__(
         self,
@@ -259,7 +82,7 @@ class ArrowShardWriter:
         has_datasets, datasets = safe_import("datasets")
         has_arrow_writer, arrow_writer = safe_import("datasets.arrow_writer")
         if not has_datasets or not has_arrow_writer:
-            raise ImportError("datasets is required for --image-storage arrow. Install datasets.")
+            raise ImportError("datasets is required to write resolved retrieval Arrow shards. Install datasets.")
 
         self.output_dir = output_dir
         self.samples_per_shard = samples_per_shard
@@ -280,7 +103,7 @@ class ArrowShardWriter:
         self.shard_paths: list[str] = []
 
     def _open_next_shard(self) -> None:
-        self._close_current_shard()
+        self.close()
         self._current_shard_idx += 1
         self._records_in_shard = 0
         path = self.output_dir / f"{self.filename_prefix}-{self._current_shard_idx:05d}.arrow"
@@ -290,11 +113,6 @@ class ArrowShardWriter:
             path=str(path),
             writer_batch_size=self.writer_batch_size,
         )
-
-    def _close_current_shard(self) -> None:
-        if self._writer is not None:
-            self._writer.finalize()
-            self._writer = None
 
     def write(self, record: dict[str, Any], image_blobs: dict[int, bytes]) -> None:
         if self.num_records % self.samples_per_shard == 0:
@@ -313,7 +131,9 @@ class ArrowShardWriter:
         self._records_in_shard += 1
 
     def close(self) -> None:
-        self._close_current_shard()
+        if self._writer is not None:
+            self._writer.finalize()
+            self._writer = None
 
 
 def _image_to_jpeg_bytes(image: Any, jpeg_quality: int) -> bytes:
@@ -325,35 +145,9 @@ def _image_to_jpeg_bytes(image: Any, jpeg_quality: int) -> bytes:
     return buffer.getvalue()
 
 
-def _save_image(
-    image: Any,
-    images_dir: Path,
-    image_rel_dir: Path,
-    sample_idx: int,
-    doc_idx: int,
-    jpeg_quality: int,
-) -> str:
-    if image is None:
-        return ""
-    if isinstance(image, str):
-        if not image:
-            return ""
-        return image
-    if not hasattr(image, "save"):
-        raise ValueError(f"Unsupported image object type for resolved retrieval export: {type(image).__name__}")
-
-    image = image.convert("RGB") if hasattr(image, "convert") else image
-    rel_path = image_rel_dir / f"{sample_idx:08d}_{doc_idx:02d}.jpg"
-    image.save(images_dir / rel_path.name, format="JPEG", quality=jpeg_quality)
-    return rel_path.as_posix()
-
-
 def _resolve_record_images(
     images: list[Any],
     *,
-    image_storage: str,
-    images_dir: Path | None,
-    image_rel_dir: Path,
     sample_idx: int,
     jpeg_quality: int,
 ) -> tuple[list[str], dict[int, bytes]]:
@@ -363,13 +157,9 @@ def _resolve_record_images(
         if image is None or (isinstance(image, str) and not image):
             image_refs.append("")
             continue
-        if image_storage == "files":
-            assert images_dir is not None
-            image_refs.append(_save_image(image, images_dir, image_rel_dir, sample_idx, doc_idx, jpeg_quality))
-            continue
         if isinstance(image, str):
             raise ValueError(
-                "Packed image storage requires resolved in-memory images, but got a string image reference. "
+                "Resolved Arrow requires resolved in-memory images, but got a string image reference. "
                 f"Sample {sample_idx}, doc {doc_idx}: {image!r}"
             )
         image_refs.append(f"packed:{doc_idx}")
@@ -377,34 +167,15 @@ def _resolve_record_images(
     return image_refs, image_blobs
 
 
-def _prepare_output_dir(
-    output_dir: Path,
-    *,
-    filename_prefix: str,
-    metadata_name: str,
-    image_rel_dir: Path,
-    image_storage: str,
-) -> Path:
+def _prepare_output_dir(output_dir: Path, *, filename_prefix: str, metadata_name: str) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    existing_shards = list(output_dir.glob(f"{filename_prefix}-*.jsonl"))
-    existing_shards.extend(output_dir.glob(f"{filename_prefix}-*.sqlite"))
-    existing_shards.extend(output_dir.glob(f"{filename_prefix}-*.parquet"))
-    existing_shards.extend(output_dir.glob(f"{filename_prefix}-*.arrow"))
+    existing_shards = list(output_dir.glob(f"{filename_prefix}-*.arrow"))
     metadata_path = output_dir / metadata_name
     if existing_shards or metadata_path.exists():
         raise FileExistsError(
             f"Output directory already contains artifacts for build shard prefix {filename_prefix!r}: {output_dir}. "
             "Choose a new directory or remove that shard's old artifacts explicitly."
         )
-    images_dir = output_dir / image_rel_dir
-    if image_storage == "files":
-        if images_dir.exists() and any(images_dir.iterdir()):
-            raise FileExistsError(
-                f"Image directory already contains artifacts for build shard prefix {filename_prefix!r}: {images_dir}. "
-                "Choose a new directory or remove that shard's old artifacts explicitly."
-            )
-        images_dir.mkdir(parents=True, exist_ok=True)
-    return images_dir
 
 
 def _validate_build_shard_args(num_build_shards: int, build_shard_index: int) -> None:
@@ -417,11 +188,11 @@ def _validate_build_shard_args(num_build_shards: int, build_shard_index: int) ->
         )
 
 
-def _artifact_layout(num_build_shards: int, build_shard_index: int) -> tuple[str, str, Path]:
+def _artifact_layout(num_build_shards: int, build_shard_index: int) -> tuple[str, str]:
     if num_build_shards == 1:
-        return "shard", "metadata.json", Path("images")
+        return "shard", "metadata.json"
     build_prefix = f"shard-{build_shard_index:05d}"
-    return build_prefix, f"metadata-build-shard-{build_shard_index:05d}.json", Path("images") / build_prefix
+    return build_prefix, f"metadata-build-shard-{build_shard_index:05d}.json"
 
 
 def _load_dataset_args_from_config(config_path: str) -> tuple[list[Any], int | None]:
@@ -452,40 +223,18 @@ def resolve_dataset(
     max_samples: int | None,
     use_dataset_instruction: bool,
     jpeg_quality: int,
-    image_storage: str = "files",
-    parquet_row_group_size: int = 64,
     num_build_shards: int = 1,
     build_shard_index: int = 0,
 ) -> dict[str, Any]:
-    """Resolve corpus-id retrieval examples and write streamable JSONL shards."""
+    """Resolve corpus-id retrieval examples and write packed Arrow shards."""
     if n_passages < 1:
         raise ValueError(f"n_passages must be >= 1, got {n_passages}")
-    if image_storage not in {"files", "sqlite", "parquet", "arrow"}:
-        raise ValueError(f"image_storage must be 'files', 'sqlite', 'parquet', or 'arrow', got {image_storage!r}")
     _validate_build_shard_args(num_build_shards, build_shard_index)
-    filename_prefix, metadata_name, image_rel_dir = _artifact_layout(num_build_shards, build_shard_index)
-    images_dir = _prepare_output_dir(
-        output_dir,
-        filename_prefix=filename_prefix,
-        metadata_name=metadata_name,
-        image_rel_dir=image_rel_dir,
-        image_storage=image_storage,
-    )
+    filename_prefix, metadata_name = _artifact_layout(num_build_shards, build_shard_index)
+    _prepare_output_dir(output_dir, filename_prefix=filename_prefix, metadata_name=metadata_name)
 
     dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True, seed=seed)
-    if image_storage == "files":
-        writer = JsonlShardWriter(output_dir, samples_per_shard, filename_prefix=filename_prefix)
-    elif image_storage == "sqlite":
-        writer = SqliteShardWriter(output_dir, samples_per_shard, filename_prefix=filename_prefix)
-    elif image_storage == "parquet":
-        writer = ParquetShardWriter(
-            output_dir,
-            samples_per_shard,
-            filename_prefix=filename_prefix,
-            row_group_size=parquet_row_group_size,
-        )
-    else:
-        writer = ArrowShardWriter(output_dir, samples_per_shard, filename_prefix=filename_prefix)
+    writer = ArrowShardWriter(output_dir, samples_per_shard, filename_prefix=filename_prefix)
 
     try:
         for sample_idx, item in enumerate(dataset):
@@ -501,9 +250,6 @@ def resolve_dataset(
             )
             image_refs, image_blobs = _resolve_record_images(
                 resolved["doc_image"],
-                image_storage=image_storage,
-                images_dir=images_dir if image_storage == "files" else None,
-                image_rel_dir=image_rel_dir,
                 sample_idx=sample_idx,
                 jpeg_quality=jpeg_quality,
             )
@@ -516,18 +262,15 @@ def resolve_dataset(
             }
             if "doc_id" in resolved:
                 record["doc_id"] = resolved["doc_id"]
-            if image_storage == "files":
-                writer.write(record)
-            else:
-                writer.write(record, image_blobs)
+            writer.write(record, image_blobs)
     finally:
         writer.close()
 
     dataset_size = len(dataset) if hasattr(dataset, "__len__") else None
     metadata = {
-        "format": f"nemo_automodel_resolved_vl_retrieval_{image_storage if image_storage != 'files' else 'jsonl'}",
+        "format": "nemo_automodel_resolved_vl_retrieval_arrow",
         "version": 1,
-        "image_storage": image_storage,
+        "image_storage": "arrow",
         "data_dir_list": data_dir_list,
         "n_passages": n_passages,
         "dataset_size": dataset_size,
@@ -536,13 +279,11 @@ def resolve_dataset(
         "build_shard_index": build_shard_index,
         "num_records": writer.num_records,
         "samples_per_shard": samples_per_shard,
-        "parquet_row_group_size": parquet_row_group_size if image_storage == "parquet" else None,
         "shards": writer.shard_paths,
-        "image_dir": image_rel_dir.as_posix() if image_storage == "files" else None,
     }
     (output_dir / metadata_name).write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     logger.info(
-        "Wrote %d resolved retrieval records for build shard %d/%d to %s",
+        "Wrote %d resolved Arrow retrieval records for build shard %d/%d to %s",
         writer.num_records,
         build_shard_index,
         num_build_shards,
@@ -560,32 +301,20 @@ def parse_args() -> argparse.Namespace:
         help="AutoModel bi-encoder YAML. Uses dataloader.dataset.data_dir_list and n_passages.",
     )
     parser.add_argument("--data-dir-list", nargs="+", default=None, help="Corpus-id retrieval JSON files to resolve")
-    parser.add_argument("--output-dir", required=True, help="Directory for resolved JSONL shards and images")
+    parser.add_argument("--output-dir", required=True, help="Directory for resolved Arrow shards")
     parser.add_argument("--n-passages", type=int, default=None, help="Number of passages per query")
     parser.add_argument(
-        "--samples-per-shard", type=int, default=10000, help="Number of examples per output JSONL shard"
+        "--samples-per-shard", type=int, default=10000, help="Number of examples per output Arrow shard"
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed used for source sampling, if configured")
     parser.add_argument("--max-samples", type=int, default=None, help="Optional global sample cap for debug exports")
     parser.add_argument("--use-dataset-instruction", action="store_true", help="Write query/passage instructions")
-    parser.add_argument("--jpeg-quality", type=int, default=95, help="JPEG quality for materialized images")
-    parser.add_argument(
-        "--image-storage",
-        choices=("files", "sqlite", "parquet", "arrow"),
-        default="files",
-        help="Store images as loose JPEG files, packed SQLite BLOB shards, packed Parquet shards, or HF Arrow shards.",
-    )
-    parser.add_argument(
-        "--parquet-row-group-size",
-        type=int,
-        default=64,
-        help="Rows per Parquet row group. Smaller groups improve distributed shard balance.",
-    )
+    parser.add_argument("--jpeg-quality", type=int, default=95, help="JPEG quality for packed images")
     parser.add_argument(
         "--num-build-shards",
         type=int,
         default=1,
-        help="Number of parallel CPU build shards. Each shard writes unique JSONL/image outputs.",
+        help="Number of parallel CPU build shards. Each shard writes unique Arrow outputs.",
     )
     parser.add_argument(
         "--build-shard-index",
@@ -624,8 +353,6 @@ def main() -> None:
         max_samples=args.max_samples,
         use_dataset_instruction=args.use_dataset_instruction,
         jpeg_quality=args.jpeg_quality,
-        image_storage=args.image_storage,
-        parquet_row_group_size=args.parquet_row_group_size,
         num_build_shards=args.num_build_shards,
         build_shard_index=args.build_shard_index,
     )

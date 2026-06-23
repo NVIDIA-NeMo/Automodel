@@ -30,7 +30,7 @@ from .retrieval_collator import (  # noqa: F401
 from .retrieval_dataset import make_retrieval_dataset  # noqa: F401
 from .retrieval_dataset_normalized import make_normalized_retrieval_dataset  # noqa: F401
 from .retrieval_dataset_resolved import (  # noqa: F401
-    ResolvedRetrievalJsonlDataset,
+    ResolvedRetrievalArrowDataset,
     make_resolved_retrieval_dataset,
 )
 from .squad import make_squad_dataset  # noqa: F401
@@ -41,7 +41,7 @@ __all__ = [
     "make_squad_dataset",
     "make_retrieval_dataset",
     "make_normalized_retrieval_dataset",
-    "ResolvedRetrievalJsonlDataset",
+    "ResolvedRetrievalArrowDataset",
     "make_resolved_retrieval_dataset",
     "make_xlam_dataset",
     "make_agent_chat_dataset",
