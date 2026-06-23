@@ -322,6 +322,10 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def should_pack_validation_with_training(self) -> bool:
+        """GLM DSA TileLang kernels require validation to use the THD packed layout."""
+        return getattr(self.backend, "attn", None) == "tilelang"
+
     def _is_pipeline_parallel_stage(self) -> bool:
         """True when this module is a trimmed pipeline-parallel stage (not the whole model)."""
         if self.lm_head is None:
@@ -354,21 +358,32 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         def meta(shape: tuple[int, ...], dt: torch.dtype) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=dt)
 
-        # Top-k indices are small integers, but they cross the pipeline boundary as float32:
-        # torch.distributed.pipelining calls ``requires_grad_(True)`` on recv buffers and int
-        # dtypes can't require grad. float32 represents these index values losslessly; the
-        # receiving stage casts back to int64 in ``forward``.
-        topk_meta = meta((microbatch_size, seq_len, topk), torch.float32)
+        # The inter-stage tensor RANK matches the attention backend's data format, so each stage's
+        # forward emits its natural tensors and no per-boundary reshape is needed:
+        #   * TileLang DSA runs in THD (packed; batch folded into the token axis) -> 2D hidden
+        #     ``[T, H]`` and top-k ``[T, 1, topk]`` (the tilelang layout). tilelang implies THD.
+        #   * sdpa/te/eager run dense bshd -> 3D hidden ``[B, S, H]`` and top-k ``[B, S, topk]``.
+        # Top-k indices cross the boundary as float32: torch.distributed.pipelining calls
+        # ``requires_grad_(True)`` on recv buffers and int dtypes can't require grad; float32 holds
+        # the index values losslessly and ``forward`` casts back (int32 for tilelang, int64 dense).
+        thd = self.backend.attn == "tilelang"
+        if thd:
+            hidden_meta = meta((seq_len, hidden_size), dtype)
+            topk_meta = meta((seq_len, 1, topk), torch.float32)
+        else:
+            hidden_meta = meta((microbatch_size, seq_len, hidden_size), dtype)
+            topk_meta = meta((microbatch_size, seq_len, topk), torch.float32)
 
         if is_first:
             inputs_meta = (meta((microbatch_size, seq_len), torch.long),)
         else:
-            inputs_meta = (meta((microbatch_size, seq_len, hidden_size), dtype), topk_meta)
+            inputs_meta = (hidden_meta, topk_meta)
 
         if self.lm_head is not None:
+            # The last stage emits logits; compute_lm_head_logits restores [1, T, V] under THD.
             outputs_meta = (meta((microbatch_size, seq_len, vocab_size), dtype),)
         else:
-            outputs_meta = (meta((microbatch_size, seq_len, hidden_size), dtype), topk_meta)
+            outputs_meta = (hidden_meta, topk_meta)
 
         return inputs_meta, outputs_meta
 
@@ -411,13 +426,25 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # Carry-in arrives as float32 (see get_pipeline_stage_metas, where the pipeline recv
         # buffer must be a grad-capable dtype); restore the int64 index values.
         carry_in = carry[0] if carry else None
-        prev_topk_indices = carry_in.to(torch.int64) if carry_in is not None else None
-        is_first_stage = self.model.embed_tokens is not None
-
-        # THD squeezing operates on real token ids (first stage only); later stages already
-        # carry [B, S, H] hidden states.
         is_thd = attn_kwargs.get("qkv_format") == "thd"
-        if is_thd and is_first_stage:
+
+        prev_topk_indices = None
+        if carry_in is not None:
+            # The carry arrives in the backend's natural top-k layout (THD: [T, 1, topk]; bshd:
+            # [B, S, topk]) as float32. tilelang SparseMLA requires int32 indices; the dense path
+            # uses int64. Only the dtype differs -- no reshape (see get_pipeline_stage_metas).
+            prev_topk_indices = carry_in.to(torch.int32) if is_thd else carry_in.to(torch.int64)
+
+        # THD: squeeze the leading batch dim on EVERY stage. First stage ``input_ids`` is token ids
+        # [1, T]; later stages receive the upstream hidden state [1, T, H] (the 3D pipeline meta).
+        # squeeze_input_for_thd handles both (plain ``.squeeze(0)``) and also squeezes
+        # position_ids / cu_seqlens so the 2D-THD DSA layers get consistent shapes on every stage.
+        if is_thd:
+            # squeeze_input_for_thd mutates attn_kwargs in place; under activation-checkpointing the
+            # stage forward is recomputed for backward, and a mutated (already-squeezed) dict on the
+            # second pass yields different input metadata -> CheckpointError. Pass a fresh copy so
+            # the forward and its recompute are deterministic.
+            attn_kwargs = dict(attn_kwargs)
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
@@ -444,7 +471,11 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 if carry_in is not None:
                     logits = logits + (carry_in.float().sum() * 0.0).to(logits.dtype)
                 return logits
-            # Non-last stage: emit (hidden, float32 top-k carry) to the next stage.
+            # Non-last stage: emit (hidden, float32 top-k carry) to the next stage. The tensors are
+            # already in the backend's natural pipeline shape (THD: [T, H] + [T, 1, topk]; bshd:
+            # [B, S, H] + [B, S, topk]) per get_pipeline_stage_metas, so no reshape is needed.
+            # (THD requires packed_sequence_size >= index_topk so the tilelang top-k width matches
+            # the meta's min(index_topk, seq_len).)
             zero_from_hidden = hidden.float().sum() * 0.0  # connected to grad-bearing hidden
             carry_out = topk_indices.to(torch.float32) + zero_from_hidden  # requires grad, value unchanged
             if carry_in is not None:
