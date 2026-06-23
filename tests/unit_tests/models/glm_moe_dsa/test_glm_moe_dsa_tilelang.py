@@ -13,6 +13,10 @@
 # limitations under the License.
 """Tests for the optional GLM-5.2 DSA TileLang kernels."""
 
+import builtins
+import sys
+from types import ModuleType, SimpleNamespace
+
 import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
@@ -23,6 +27,7 @@ from nemo_automodel.components.models.glm_moe_dsa import layers as layer_mod
 from nemo_automodel.components.models.glm_moe_dsa import optimized_kernels as ok
 from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaIndexer, GlmMoeDsaMLA
 from nemo_automodel.components.models.glm_moe_dsa.model import GlmMoeDsaForCausalLM
+from nemo_automodel.shared.import_utils import UnavailableError
 
 # GLM-5.2 DSA kernel dims (kv_lora_rank + qk_rope_head_dim == 576 is hard-coded in the kernel).
 KV_LORA = 512
@@ -66,6 +71,276 @@ def test_should_use_tilelang_forced_but_unavailable_raises():
         ok.should_use_tilelang("tilelang", available=False, kernel_name="indexer", tensors=tensors)
     with pytest.raises(RuntimeError, match="TileLang backend was requested"):
         ok.should_use_tilelang("tilelang", available=True, kernel_name="indexer", tensors=tensors, require_bf16=True)
+
+
+class _FakeTileLangValue:
+    dtype = "float32"
+
+    def __getitem__(self, _key):
+        return self
+
+    def __setitem__(self, _key, _value):
+        return None
+
+    def __bool__(self):
+        return True
+
+    def __add__(self, _other):
+        return self
+
+    __radd__ = __add__
+
+    def __sub__(self, _other):
+        return self
+
+    __rsub__ = __sub__
+
+    def __mul__(self, _other):
+        return self
+
+    __rmul__ = __mul__
+
+    def __truediv__(self, _other):
+        return self
+
+    __rtruediv__ = __truediv__
+
+    def __itruediv__(self, _other):
+        return self
+
+    def __neg__(self):
+        return self
+
+    def __lt__(self, _other):
+        return self
+
+    def __le__(self, _other):
+        return self
+
+    def __gt__(self, _other):
+        return self
+
+    def __ge__(self, _other):
+        return self
+
+    def __eq__(self, _other):
+        return self
+
+    def __ne__(self, _other):
+        return self
+
+
+class _FakeKernelContext:
+    def __init__(self, axes):
+        self.axes = axes
+
+    def __enter__(self):
+        if len(self.axes) == 1:
+            return 0
+        return tuple(0 for _ in self.axes)
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeTileLangLanguage:
+    bfloat16 = "bfloat16"
+    float = "float"
+    float32 = "float32"
+    int32 = "int32"
+    GemmWarpPolicy = SimpleNamespace(FullCol="FullCol", FullRow="FullRow")
+
+    @staticmethod
+    def Tensor(_shape, _dtype):
+        return _FakeTileLangValue()
+
+    @staticmethod
+    def prim_func(fn):
+        return fn
+
+    @staticmethod
+    def Kernel(*axes, **_kwargs):
+        return _FakeKernelContext(axes)
+
+    @staticmethod
+    def Parallel(*axes):
+        if len(axes) == 1:
+            return [0]
+        return [tuple(0 for _ in axes)]
+
+    @staticmethod
+    def Pipelined(*_args, **_kwargs):
+        return [0]
+
+    @staticmethod
+    def serial(_count):
+        return [0]
+
+    @staticmethod
+    def ceildiv(a, b):
+        if isinstance(a, int) and isinstance(b, int):
+            return (a + b - 1) // b
+        return 1
+
+    @staticmethod
+    def symbolic(_name):
+        return 1
+
+    dynamic = symbolic
+
+    @staticmethod
+    def alloc_shared(*_args, **_kwargs):
+        return _FakeTileLangValue()
+
+    alloc_fragment = alloc_shared
+    alloc_var = alloc_shared
+
+    @staticmethod
+    def if_then_else(cond, true_value, false_value):
+        return true_value if bool(cond) else false_value
+
+    @staticmethod
+    def infinity(_dtype):
+        return _FakeTileLangValue()
+
+    @staticmethod
+    def max(a, _b):
+        return a
+
+    min = max
+    exp2 = staticmethod(lambda _x: _FakeTileLangValue())
+    log2 = staticmethod(lambda _x: _FakeTileLangValue())
+
+    @staticmethod
+    def copy(*_args, **_kwargs):
+        return None
+
+    fill = copy
+    clear = copy
+    reduce_sum = copy
+    reduce_max = copy
+    gemm = copy
+    sync_threads = copy
+    atomic_add = copy
+    atomic_addx4 = copy
+    thread_binding = copy
+    reshape = staticmethod(lambda value, _shape: value)
+
+
+class _FakeTileLangModule:
+    PassConfigKey = SimpleNamespace(
+        TL_DISABLE_TMA_LOWER="TL_DISABLE_TMA_LOWER",
+        TL_DISABLE_WARP_SPECIALIZED="TL_DISABLE_WARP_SPECIALIZED",
+        TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE="TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE",
+        TL_ENABLE_FAST_MATH="TL_ENABLE_FAST_MATH",
+    )
+
+    class math:
+        @staticmethod
+        def next_power_of_2(value):
+            return 1 << (value - 1).bit_length()
+
+    @staticmethod
+    def cdiv(a, b):
+        return (a + b - 1) // b
+
+
+def _patch_fake_tilelang(monkeypatch, module):
+    fake_t = _FakeTileLangLanguage()
+    fake_tilelang = _FakeTileLangModule()
+    monkeypatch.setattr(module, "T", fake_t)
+    if hasattr(module, "tilelang"):
+        monkeypatch.setattr(module, "tilelang", fake_tilelang)
+    if hasattr(module, "tl"):
+        monkeypatch.setattr(module, "tl", fake_tilelang)
+
+
+def test_tilelang_shim_handles_missing_and_delegates(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import _tilelang
+
+    assert _tilelang.tilelang.math.next_power_of_2(7) == 8
+    assert _tilelang.tilelang.cdiv(5, 2) == 3
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "tilelang" or name.startswith("tilelang."):
+            raise ImportError("missing tilelang")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(UnavailableError, match="GLM-5.2 DSA TileLang kernels"):
+        _tilelang._load_tilelang()
+
+    assert _tilelang._resolve_pass_configs(object(), None) is None
+
+    real_tilelang = SimpleNamespace(math=SimpleNamespace(custom_math="math-value"), custom_attr="tilelang-value")
+    real_language = SimpleNamespace(custom_lang="language-value", prim_func=lambda fn: ("prim", fn))
+    monkeypatch.setattr(_tilelang, "_load_tilelang", lambda: (real_tilelang, real_language))
+
+    assert _tilelang.tilelang.math.custom_math == "math-value"
+    assert _tilelang.tilelang.custom_attr == "tilelang-value"
+    assert _tilelang.T.custom_lang == "language-value"
+    prim_result, _ = _tilelang.T.prim_func(lambda: None)
+    assert prim_result == "prim"
+
+
+def test_tilelang_shim_loads_real_modules(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import _tilelang
+
+    tilelang_module = ModuleType("tilelang")
+    language_module = ModuleType("tilelang.language")
+    tilelang_module.language = language_module
+    monkeypatch.setitem(sys.modules, "tilelang", tilelang_module)
+    monkeypatch.setitem(sys.modules, "tilelang.language", language_module)
+
+    assert _tilelang._load_tilelang() == (tilelang_module, language_module)
+
+
+def test_tilelang_shim_lazy_jit_resolves_pass_configs_and_caches(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import _tilelang
+
+    compiled_calls = []
+    load_calls = []
+    fast_math_key = object()
+
+    def fake_jit(*jit_args, **jit_kwargs):
+        compiled_calls.append((jit_args, jit_kwargs))
+
+        def decorate(fn):
+            def compiled(*args, **kwargs):
+                return fn(*args, **kwargs)
+
+            return compiled
+
+        return decorate
+
+    real_tilelang = SimpleNamespace(
+        PassConfigKey=SimpleNamespace(TL_ENABLE_FAST_MATH=fast_math_key),
+        jit=fake_jit,
+    )
+
+    def fake_load_tilelang():
+        load_calls.append(True)
+        return real_tilelang, SimpleNamespace()
+
+    monkeypatch.setattr(_tilelang, "_load_tilelang", fake_load_tilelang)
+
+    @_tilelang.tilelang.jit("kernel-arg", pass_configs={"TL_ENABLE_FAST_MATH": True})
+    def add_one(value):
+        return value + 1
+
+    assert add_one(1) == 2
+    assert add_one(2) == 3
+    assert len(load_calls) == 1
+    assert compiled_calls == [(("kernel-arg",), {"pass_configs": {fast_math_key: True}})]
+
+    @_tilelang.tilelang.jit
+    def identity(value):
+        return value
+
+    assert identity("value") == "value"
+    assert len(load_calls) == 2
 
 
 def test_tilelang_indexer_topk_dispatches_varlen_helpers(monkeypatch):
@@ -166,6 +441,41 @@ def test_generate_padded_varlen_mask_params_excludes_cp_padding():
     assert ends.dtype == torch.int32
 
 
+def test_indexer_generates_topk_and_varlen_mask_params(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import indexer as indexer_mod
+
+    captured = {}
+
+    def fake_indexer_fwd(index_q, _index_k, _weights, _cu_seqlen_ks, _cu_seqlen_ke, clean_logits=True):
+        captured["clean_logits"] = clean_logits
+        return index_q.new_tensor([[3.0, float("-inf"), 1.0], [float("-inf"), float("-inf"), float("-inf")]])
+
+    def fake_indexer_bwd(index_q, weights, index_k, topk_indices, grad_scores):
+        captured.update(backward_topk=topk_indices, backward_grad_scores=grad_scores)
+        return torch.ones_like(index_q), torch.ones_like(weights), torch.ones_like(index_k)
+
+    monkeypatch.setattr(indexer_mod, "indexer_fwd_interface", fake_indexer_fwd)
+    monkeypatch.setattr(indexer_mod, "indexer_bwd_interface", fake_indexer_bwd)
+
+    cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+    starts, ends = indexer_mod.generate_varlen_mask_params(cu_seqlens)
+    torch.testing.assert_close(starts, torch.tensor([0, 0, 0, 3, 3], dtype=torch.int32))
+    torch.testing.assert_close(ends, torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64))
+
+    index_q = torch.randn(2, 2, 3, requires_grad=True)
+    index_k = torch.randn(3, 3, requires_grad=True)
+    weights = torch.randn(2, 2, requires_grad=True)
+    scores, topk_indices = indexer_mod.lighting_indexer(index_q, index_k, weights, starts[:2], ends[:2], 2)
+    scores.sum().backward()
+
+    torch.testing.assert_close(topk_indices, torch.tensor([[0, 2], [-1, -1]], dtype=torch.int32))
+    assert captured["clean_logits"] is True
+    torch.testing.assert_close(captured["backward_topk"], topk_indices)
+    torch.testing.assert_close(index_q.grad, torch.ones_like(index_q))
+    torch.testing.assert_close(index_k.grad, torch.ones_like(index_k))
+    torch.testing.assert_close(weights.grad, torch.ones_like(weights))
+
+
 def test_tilelang_sparse_attention_dispatches_and_projects_value(monkeypatch):
     q = torch.randn(3, 2, 4)
     kv_latent = torch.randn(3, 1, 4)
@@ -191,6 +501,301 @@ def test_tilelang_sparse_attention_dispatches_and_projects_value(monkeypatch):
     assert captured["scale"] == 0.125
     expected = torch.einsum("thc,hdc->thd", latent_out, w_vc)
     torch.testing.assert_close(out, expected)
+
+
+def test_indexer_autograd_backward_dispatches_kernel(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import indexer as indexer_mod
+
+    captured = {}
+
+    def fake_indexer_fwd(index_q, _index_k, _weights, _cu_seqlen_ks, _cu_seqlen_ke, clean_logits=True):
+        captured["clean_logits"] = clean_logits
+        return index_q[..., 0].sum(dim=-1, keepdim=True).expand(index_q.shape[0], 2)
+
+    def fake_indexer_bwd(index_q, weights, index_k, topk_indices, grad_scores):
+        captured.update(
+            backward_q=index_q,
+            backward_weights=weights,
+            backward_k=index_k,
+            backward_topk=topk_indices,
+            backward_grad_scores=grad_scores,
+        )
+        return torch.ones_like(index_q), torch.ones_like(weights), torch.ones_like(index_k)
+
+    monkeypatch.setattr(indexer_mod, "indexer_fwd_interface", fake_indexer_fwd)
+    monkeypatch.setattr(indexer_mod, "indexer_bwd_interface", fake_indexer_bwd)
+
+    index_q = torch.randn(2, 2, 3, requires_grad=True)
+    index_k = torch.randn(2, 3, requires_grad=True)
+    weights = torch.randn(2, 2, requires_grad=True)
+    starts = torch.tensor([0, 0], dtype=torch.int32)
+    ends = torch.tensor([1, 2], dtype=torch.int32)
+    topk_indices = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+
+    scores, returned_topk = indexer_mod.lighting_indexer(index_q, index_k, weights, starts, ends, 2, topk_indices)
+    scores.sum().backward()
+
+    torch.testing.assert_close(returned_topk, topk_indices)
+    assert captured["clean_logits"] is True
+    assert captured["backward_q"] is index_q
+    assert captured["backward_k"] is index_k
+    assert captured["backward_topk"] is topk_indices
+    torch.testing.assert_close(index_q.grad, torch.ones_like(index_q))
+    torch.testing.assert_close(index_k.grad, torch.ones_like(index_k))
+    torch.testing.assert_close(weights.grad, torch.ones_like(weights))
+
+
+def test_sparse_mla_autograd_backward_dispatches_kernel(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import sparse_mla as sparse_mla_mod
+
+    captured = {}
+
+    def fake_sparse_mla_fwd(q, kv, indices, sm_scale=None):
+        captured.update(forward_q=q, forward_kv=kv, forward_indices=indices, forward_scale=sm_scale)
+        out = torch.ones(q.shape[0], q.shape[1], 4, dtype=q.dtype)
+        lse = torch.zeros(q.shape[0], q.shape[1], dtype=torch.float32)
+        return out, lse
+
+    def fake_sparse_mla_bwd(q, kv, out, grad_output, indices, lse, sm_scale=None):
+        captured.update(
+            backward_q=q,
+            backward_kv=kv,
+            backward_out=out,
+            backward_grad_output=grad_output,
+            backward_indices=indices,
+            backward_lse=lse,
+            backward_scale=sm_scale,
+        )
+        return torch.ones_like(q), torch.ones_like(kv)
+
+    monkeypatch.setattr(sparse_mla_mod, "sparse_mla_fwd_interface", fake_sparse_mla_fwd)
+    monkeypatch.setattr(sparse_mla_mod, "sparse_mla_bwd", fake_sparse_mla_bwd)
+
+    q = torch.randn(3, 2, 6, requires_grad=True)
+    kv = torch.randn(3, 1, 6, requires_grad=True)
+    indices = torch.tensor([[[0, -1]], [[1, 0]], [[2, 1]]], dtype=torch.int32)
+
+    out, lse = sparse_mla_mod.SparseMLA.apply(q, kv, indices, 0.25)
+    (out.sum() + lse.sum()).backward()
+
+    assert captured["forward_q"].is_contiguous()
+    assert captured["forward_kv"].is_contiguous()
+    assert captured["forward_indices"].is_contiguous()
+    assert captured["forward_scale"] == 0.25
+    assert captured["backward_q"].shape == q.shape
+    assert captured["backward_kv"].shape == kv.shape
+    assert captured["backward_grad_output"].is_contiguous()
+    assert captured["backward_scale"] == 0.25
+    torch.testing.assert_close(q.grad, torch.ones_like(q))
+    torch.testing.assert_close(kv.grad, torch.ones_like(kv))
+
+
+def test_tilelang_indexer_backward_interface_launches_kernel(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_indexer_bwd as indexer_bwd_mod
+
+    captured = {}
+
+    def fake_kernel_builder(head_num, head_dim, topk):
+        captured.update(head_num=head_num, head_dim=head_dim, topk=topk)
+
+        def fake_kernel(index_q, index_k, weights, topk_indices, grad_scores, grad_q, grad_w, grad_k):
+            captured.update(
+                index_q=index_q,
+                index_k=index_k,
+                weights=weights,
+                topk_indices=topk_indices,
+                grad_scores=grad_scores,
+            )
+            grad_q.copy_(torch.ones_like(grad_q))
+            grad_w.copy_(torch.full_like(grad_w, 2.0))
+            grad_k.copy_(torch.full_like(grad_k, 3.0))
+
+        return fake_kernel
+
+    monkeypatch.setattr(indexer_bwd_mod, "tl_indexer_bwd_impl", fake_kernel_builder)
+
+    index_q = torch.randn(2, 4, 3)
+    weights = torch.randn(2, 4)
+    index_k = torch.randn(5, 3)
+    topk_indices = torch.tensor([[0, 1], [2, -1]], dtype=torch.int32)
+    grad_scores = torch.randn(2, 2)
+
+    grad_q, grad_w, grad_k = indexer_bwd_mod.indexer_bwd_interface(
+        index_q,
+        weights,
+        index_k,
+        topk_indices,
+        grad_scores,
+    )
+
+    assert captured["head_num"] == 4
+    assert captured["head_dim"] == 3
+    assert captured["topk"] == 2
+    assert captured["index_q"].is_contiguous()
+    assert captured["index_k"].is_contiguous()
+    assert captured["weights"].is_contiguous()
+    assert captured["topk_indices"].is_contiguous()
+    assert captured["grad_scores"].is_contiguous()
+    torch.testing.assert_close(grad_q, torch.ones_like(grad_q))
+    torch.testing.assert_close(grad_w, torch.full_like(grad_w, 2.0))
+    torch.testing.assert_close(grad_k, torch.full_like(grad_k, 3.0))
+
+
+def test_tilelang_sparse_mla_forward_interface_launches_kernel(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_sparse_mla_fwd as sparse_fwd_mod
+
+    captured = {}
+
+    def fake_sparse_mla_fwd(heads, dim, tail_dim, topk, kv_group, sm_scale, is_casual, block_I, num_stages, threads):
+        captured.update(
+            heads=heads,
+            dim=dim,
+            tail_dim=tail_dim,
+            topk=topk,
+            kv_group=kv_group,
+            sm_scale=sm_scale,
+            is_casual=is_casual,
+            block_I=block_I,
+            num_stages=num_stages,
+            threads=threads,
+        )
+
+        def kernel(q, kv, indices):
+            captured.update(q=q, kv=kv, indices=indices)
+            out = torch.ones(q.shape[0], q.shape[1], q.shape[2], dim, dtype=q.dtype)
+            lse = torch.zeros(q.shape[0], q.shape[1], q.shape[2], dtype=torch.float32)
+            return out, lse
+
+        return kernel
+
+    monkeypatch.setattr(sparse_fwd_mod, "sparse_mla_fwd", fake_sparse_mla_fwd)
+
+    q = torch.randn(2, 4, 576, dtype=torch.bfloat16).contiguous()
+    kv = torch.randn(3, 1, 576, dtype=torch.bfloat16).contiguous()
+    indices = torch.zeros(2, 1, 64, dtype=torch.int32).contiguous()
+
+    out, lse = sparse_fwd_mod.sparse_mla_fwd_interface(
+        q,
+        kv,
+        indices,
+        sm_scale=0.75,
+        d_v=512,
+        block_I=32,
+        num_stages=3,
+        threads=128,
+    )
+
+    assert captured["heads"] == 4
+    assert captured["dim"] == 512
+    assert captured["tail_dim"] == 64
+    assert captured["topk"] == 64
+    assert captured["kv_group"] == 1
+    assert captured["sm_scale"] == 0.75
+    assert captured["is_casual"] is True
+    assert captured["block_I"] == 32
+    assert captured["num_stages"] == 3
+    assert captured["threads"] == 128
+    assert captured["q"].shape == (1, 2, 4, 576)
+    assert captured["kv"].shape == (1, 3, 1, 576)
+    assert captured["indices"].shape == (1, 2, 1, 64)
+    torch.testing.assert_close(out, torch.ones(2, 4, 512, dtype=torch.bfloat16))
+    torch.testing.assert_close(lse, torch.zeros(2, 4, dtype=torch.float32))
+
+
+def test_tilelang_sparse_mla_backward_wrapper_launches_kernels(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_sparse_mla_bwd as sparse_bwd_mod
+
+    captured = {}
+
+    def fake_preprocess(batch, seq_len, heads, dim):
+        captured.update(preprocess=(batch, seq_len, heads, dim))
+
+        def kernel(o, do):
+            captured.update(preprocess_o=o, preprocess_do=do)
+            return torch.ones(o.shape[:-1], dtype=torch.float32)
+
+        return kernel
+
+    def fake_bwd(batch, seq_len, seq_len_kv, heads, dim, tail_dim, topk, kv_group, sm_scale, is_causal):
+        captured.update(bwd=(batch, seq_len, seq_len_kv, heads, dim, tail_dim, topk, kv_group, sm_scale, is_causal))
+
+        def kernel(q, kv, do, indices, lse, delta, dkv):
+            captured.update(bwd_q=q, bwd_kv=kv, bwd_do=do, bwd_indices=indices, bwd_lse=lse, bwd_delta=delta)
+            dkv.copy_(torch.full_like(dkv, 2.0))
+            return torch.ones_like(q)
+
+        return kernel
+
+    def fake_postprocess(batch, seq_len_kv, dim, tail_dim, kv_group):
+        captured.update(postprocess=(batch, seq_len_kv, dim, tail_dim, kv_group))
+
+        def kernel(dkv):
+            captured["postprocess_dkv"] = dkv
+            return dkv.to(torch.bfloat16)
+
+        return kernel
+
+    monkeypatch.setattr(sparse_bwd_mod, "preprocess", fake_preprocess)
+    monkeypatch.setattr(sparse_bwd_mod, "bwd", fake_bwd)
+    monkeypatch.setattr(sparse_bwd_mod, "postprocess", fake_postprocess)
+
+    q = torch.randn(2, 4, 576, dtype=torch.bfloat16).contiguous()
+    kv = torch.randn(2, 1, 576, dtype=torch.bfloat16).contiguous()
+    out = torch.randn(2, 4, 512, dtype=torch.bfloat16).contiguous()
+    grad_out = torch.randn(2, 4, 512, dtype=torch.bfloat16).contiguous()
+    indices = torch.zeros(2, 1, 64, dtype=torch.int32).contiguous()
+    lse = torch.zeros(2, 4, dtype=torch.float32).contiguous()
+
+    dq, dkv = sparse_bwd_mod.sparse_mla_bwd(q, kv, out, grad_out, indices, lse, sm_scale=0.5)
+
+    assert captured["preprocess"] == (1, 2, 4, 512)
+    assert captured["bwd"] == (1, 2, 2, 4, 512, 64, 64, 1, 0.5, True)
+    assert captured["postprocess"] == (1, 2, 512, 64, 1)
+    assert captured["bwd_q"].shape == (1, 2, 4, 576)
+    assert captured["bwd_kv"].shape == (1, 2, 1, 576)
+    assert captured["bwd_indices"].shape == (1, 2, 1, 64)
+    torch.testing.assert_close(dq, torch.ones_like(q))
+    torch.testing.assert_close(dkv, torch.full_like(kv, 2.0))
+
+
+def test_raw_tilelang_kernel_builders_with_fake_language(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_indexer_bwd as indexer_bwd_mod
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_sparse_mla_bwd as sparse_bwd_mod
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_sparse_mla_fwd as sparse_fwd_mod
+
+    for module in (indexer_bwd_mod, sparse_bwd_mod, sparse_fwd_mod):
+        _patch_fake_tilelang(monkeypatch, module)
+
+    fake = _FakeTileLangValue()
+
+    indexer_kernel = indexer_bwd_mod.tl_indexer_bwd_impl.__wrapped__(heads=8, dim=4, topk=32, block_I=32)
+    indexer_kernel(fake, fake, fake, fake, fake, fake, fake, fake)
+
+    preprocess_kernel = sparse_bwd_mod.preprocess.__wrapped__(1, 1, 1, 512)
+    preprocess_kernel(fake, fake, fake)
+    postprocess_kernel = sparse_bwd_mod.postprocess.__wrapped__(1, 1, 512, 64)
+    postprocess_kernel(fake, fake)
+    sparse_bwd_kernel = sparse_bwd_mod.bwd.__wrapped__(1, 1, 1, 16, 512, 64, 32, sm_scale=None)
+    sparse_bwd_kernel(fake, fake, fake, fake, fake, fake, fake, fake)
+
+    sparse_fwd_kernel = sparse_fwd_mod.sparse_mla_fwd.__wrapped__(
+        heads=8,
+        dim=512,
+        tail_dim=64,
+        topk=64,
+        kv_group=1,
+        sm_scale=None,
+    )
+    sparse_fwd_kernel(fake, fake, fake, fake, fake)
+    sparse_fwd_kernel = sparse_fwd_mod.sparse_mla_fwd.__wrapped__(
+        heads=128,
+        dim=512,
+        tail_dim=64,
+        topk=64,
+        kv_group=1,
+        sm_scale=0.5,
+    )
+    sparse_fwd_kernel(fake, fake, fake, fake, fake)
 
 
 def _dense_indexer_logits(index_q, index_k, weights_raw, scale):
@@ -530,6 +1135,23 @@ def test_mla_tilelang_sparse_attention_rejects_bshd_without_kernels():
         mla(
             x,
             _freqs(4, config.qk_rope_head_dim).unsqueeze(0),
+            prev_topk_indices=topk_indices,
+        )
+
+
+def test_mla_tilelang_sparse_attention_rejects_failed_validation(monkeypatch):
+    config = _small_dsa_config()
+    backend = BackendConfig(attn="tilelang", linear="torch", rms_norm="torch", rope_fusion=False)
+    mla = GlmMoeDsaMLA(config, backend, skip_topk=True)
+    monkeypatch.setattr(layer_mod, "should_use_tilelang", lambda *args, **kwargs: False)
+
+    x = torch.randn(4, config.hidden_size, dtype=torch.bfloat16)
+    topk_indices = torch.zeros(4, 1, config.index_topk, dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="did not pass validation"):
+        mla(
+            x,
+            _freqs(4, config.qk_rope_head_dim),
             prev_topk_indices=topk_indices,
         )
 
