@@ -111,4 +111,5 @@ optimizer:
 ci:
   time: "01:00:00"
   nodes: 8
+  cluster_tag: gb200
   ep_size: 32

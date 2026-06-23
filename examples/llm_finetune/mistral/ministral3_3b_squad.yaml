@@ -119,6 +119,10 @@ ci:
     cross_tp_kl_threshold: 5e-3
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
+    # Vanilla HF reload reads Ministral-3's FP8 config directly and can route
+    # through HF's finegrained-fp8 kernels/tolerances instead of Automodel's
+    # bf16 dequantized checkpoint path. Phase 3 still verifies Automodel reload.
+    skip_hf_reload: true
     # vision_tower params receive no grads from text-only batches, so Adam
     # never materialises per-param `step` state for them; DCP resume load is
     # strict and fails with `Missing key ... optim.state.model.vision_tower.*`.

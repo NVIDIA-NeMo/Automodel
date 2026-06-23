@@ -138,14 +138,19 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
 # Address base image CVE
 RUN pip install "aiohttp>=3.13.3" \
         "black>=26.3.1" \
+        "GitPython>=3.1.50" \
         "jaraco-context>=6.1.0" \
+        "jupyter-server>=2.18.0" \
+        "jupyterlab>=4.5.7" \
+        "mistune>=3.2.1" \
         "nbconvert>=7.17.0" \
+        "notebook>=7.5.6" \
         "onnx>=1.21.0" \
         "pillow>=12.2.0" \
         "protobuf>=6.33.5" \
         "setuptools>=80.10.2" \
         "tornado>=6.5.5" \
-        "urllib3>=2.6.0" && \
+        "urllib3>=2.7.0" && \
     rm -rf /opt/pytorch/pytorch/third_party/onnx
 
 FROM automodel_dep as automodel_final
@@ -199,6 +204,11 @@ RUN git clone --depth 1 --branch v0.17.0 --recurse-submodules --shallow-submodul
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 \
         pip install --no-cache-dir --no-build-isolation /tmp/torchao && \
     rm -rf /tmp/torchao
+
+# DeepSeek-V4 TileLang kernels are resolved by the cuda extra during `uv sync`.
+# The external DeepSeek TileKernels package is intentionally not installed here:
+# its import eagerly imports TileLang's vendored TVM, which can abort when other
+# TVM FFI bindings are already loaded. The MHC sinkhorn path remains optional.
 
 COPY . /opt/Automodel
 
