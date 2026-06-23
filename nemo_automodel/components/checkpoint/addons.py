@@ -442,6 +442,57 @@ def _save_original_config_json(original_model_path: str, hf_metadata_dir: str, c
         json.dump(cfg, f, indent=2)
 
 
+# Symbols some trust_remote_code models import at module load that newer transformers
+# removed. Map symbol -> (module, fallback literal) so a consolidated checkpoint reloads
+# under a deploy container whose transformers dropped them (e.g. DeciLM/Nemotron-Super
+# imports NEED_SETUP_CACHE_CLASSES_MAPPING, gone since transformers 4.57).
+_REMOVED_TRANSFORMERS_SYMBOLS = {
+    "NEED_SETUP_CACHE_CLASSES_MAPPING": ("transformers.generation.utils", "{}"),
+}
+
+
+def _apply_transformers_compat_guards(py_path: str) -> None:
+    """Guard imports of transformers symbols removed in newer versions.
+
+    For each copied ``.py`` that does ``from <module> import ... <symbol> ...`` where
+    ``<symbol>`` was removed upstream, insert a preamble defining the symbol on
+    ``<module>`` if absent, so the subsequent import resolves. Files that don't
+    reference such symbols are left byte-for-byte unchanged.
+    """
+    try:
+        with open(py_path, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return
+
+    # Seed with symbols already guarded (cross-call idempotency); also dedups multiple
+    # import lines of the same symbol within one file.
+    guarded = {sym for sym in _REMOVED_TRANSFORMERS_SYMBOLS if f"_nemo_compat_mod.{sym}" in text}
+
+    out: list[str] = []
+    changed = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("from ") and " import " in stripped:
+            for symbol, (module, fallback) in _REMOVED_TRANSFORMERS_SYMBOLS.items():
+                if symbol not in guarded and symbol in stripped and f"from {module} import" in stripped:
+                    indent = line[: len(line) - len(stripped)]
+                    out.append(
+                        f"{indent}import {module} as _nemo_compat_mod  # noqa\n"
+                        f'{indent}if not hasattr(_nemo_compat_mod, "{symbol}"):\n'
+                        f"{indent}    _nemo_compat_mod.{symbol} = {fallback}\n"
+                        f"{indent}del _nemo_compat_mod\n"
+                    )
+                    guarded.add(symbol)
+                    changed = True
+                    break
+        out.append(line)
+
+    if changed:
+        with open(py_path, "w", encoding="utf-8") as f:
+            f.writelines(out)
+
+
 def _maybe_save_custom_model_code(
     original_model_path: str | None,
     hf_metadata_dir: str,
@@ -468,6 +519,7 @@ def _maybe_save_custom_model_code(
                 continue
             os.makedirs(os.path.dirname(dst_path) or hf_metadata_dir, exist_ok=True)
             shutil.copy2(src_path, dst_path)
+            _apply_transformers_compat_guards(dst_path)
             copied.add(dst_path)
 
     if original_model_path is not None:

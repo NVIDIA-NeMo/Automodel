@@ -114,3 +114,4 @@ optimizer:
 
 ci:
   recipe_owner: HuiyingLi
+  time: "00:30:00"

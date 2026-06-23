@@ -47,7 +47,6 @@ from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
@@ -166,11 +165,6 @@ class DeepseekV4Block(nn.Module):
         )
         self.attn_hc = DeepseekV4HyperConnection(**hc_kwargs)
         self.ffn_hc = DeepseekV4HyperConnection(**hc_kwargs)
-        self.activation_checkpointing = False
-
-    def set_activation_checkpointing(self, enabled: bool = True) -> None:
-        """Enable block-local checkpointing that avoids replaying MoE dispatch."""
-        self.activation_checkpointing = enabled
 
     def forward(
         self,
@@ -215,12 +209,8 @@ class DeepseekV4Block(nn.Module):
             collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
             return collapsed, post, comb
 
-        if self.activation_checkpointing and torch.is_grad_enabled():
-            x = checkpoint(attention_site, x, use_reentrant=False)
-            collapsed, post, comb = checkpoint(ffn_prepare, x, use_reentrant=False)
-        else:
-            x = attention_site(x)
-            collapsed, post, comb = ffn_prepare(x)
+        x = attention_site(x)
+        collapsed, post, comb = ffn_prepare(x)
 
         # Hash-routing layers need the current batch's input_ids to do the
         # tid2eid lookup; stash it on the gate just before the MoE call.
