@@ -83,8 +83,8 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
 
 def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
     if isinstance(tensor, DTensor):
-        return tensor.full_tensor().clone()
-    return tensor
+        tensor = tensor.full_tensor()
+    return tensor.clone()
 
 
 def _dsv4_kernel_backend(backend: BackendConfig) -> str:

@@ -763,6 +763,17 @@ class TestDeepseekV4OptimizedKernels:
         gathered.sum().backward()
         assert torch.equal(full.grad, torch.ones_like(full))
 
+    def test_full_tensor_if_dtensor_clones_regular_tensor(self):
+        """FSDP can reshard a regular-looking tensor returned from an fp32 holder."""
+        tensor = torch.arange(4, dtype=torch.float32, requires_grad=True)
+
+        gathered = dsv4_layers._full_tensor_if_dtensor(tensor)
+
+        assert torch.equal(gathered, tensor)
+        assert gathered.data_ptr() != tensor.data_ptr()
+        gathered.sum().backward()
+        assert torch.equal(tensor.grad, torch.ones_like(tensor))
+
     def test_eager_attention_with_sink_passes_reference_to_sinks_holder(self):
         """FSDP2-wrapped fp32 sink holders need a tensor input during recompute."""
         batch, heads, seq_len, dim = 1, 2, 3, 4

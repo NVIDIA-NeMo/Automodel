@@ -34,8 +34,8 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
     if isinstance(tensor, DTensor):
-        return tensor.full_tensor().clone()
-    return tensor
+        tensor = tensor.full_tensor()
+    return tensor.clone()
 
 
 class NemotronV3Attention(nn.Module):

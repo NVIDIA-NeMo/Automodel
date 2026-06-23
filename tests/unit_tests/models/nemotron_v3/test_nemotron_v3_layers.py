@@ -453,6 +453,19 @@ class TestNemotronV3Mamba2Mixer:
         gathered.sum().backward()
         assert torch.equal(full.grad, torch.ones_like(full))
 
+    def test_full_tensor_if_dtensor_clones_regular_tensor(self):
+        """FSDP can reshard a regular-looking tensor returned from an fp32 holder."""
+        from nemo_automodel.components.models.nemotron_v3 import layers as layers_mod
+
+        tensor = torch.arange(4, dtype=torch.float32, requires_grad=True)
+
+        gathered = layers_mod._full_tensor_if_dtensor(tensor)
+
+        assert torch.equal(gathered, tensor)
+        assert gathered.data_ptr() != tensor.data_ptr()
+        gathered.sum().backward()
+        assert torch.equal(tensor.grad, torch.ones_like(tensor))
+
     def test_get_fp32_ssm_params_passes_reference(self, config):
         """FSDP2 root pre-forward expects a non-empty args tuple for the holder."""
         from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
