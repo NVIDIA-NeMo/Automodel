@@ -403,6 +403,7 @@ def build_dataloader(
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
         packing_strategy = getattr(cfg_ps, "packing_strategy", "thd")
+        prepacked_sequence = bool(getattr(cfg_ps, "prepacked", False))
 
         # check if packed sequence is supported (only for thd strategy)
         supports_seq_lens = _supports_seq_lens(model)
@@ -411,7 +412,13 @@ def build_dataloader(
             packed_sequence_size = 0
 
         # Apply packing if configured
-        if packed_sequence_size > 0:
+        if packed_sequence_size > 0 and prepacked_sequence:
+            logger.info(
+                "Using prepacked sequence dataset with size: %s, strategy: %s; skipping recipe-side packing",
+                packed_sequence_size,
+                packing_strategy,
+            )
+        elif packed_sequence_size > 0:
             logger.info(f"Packing dataset with size: {packed_sequence_size}, strategy: {packing_strategy}")
             if hasattr(ds, "shuffle"):
                 ds = ds.shuffle(seed)
@@ -1160,11 +1167,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # Model-owned context parallelism: if the model exposes a CP input-prep
             # hook, let it attach its own batch-sharding callable (``_cp_make_batch_fn``)
             # before make_cp_batch_and_ctx shards the batch, instead of the default
-            # load-balanced context_parallel path. DSV4 uses this for its Miles-style
-            # contiguous query shard + all-gathered K/V.
+            # load-balanced context_parallel path.
             _model_cp = self.model_parts[0] if hasattr(self, "model_parts") else None
             if cp_size > 1 and _model_cp is not None and hasattr(_model_cp, "prepare_model_inputs_for_cp"):
-                batch.update(_model_cp.prepare_model_inputs_for_cp(input_ids=batch["input_ids"]))
+                batch.update(
+                    _model_cp.prepare_model_inputs_for_cp(input_ids=batch["input_ids"], num_chunks=_num_chunks_value)
+                )
             train_ctx, batch = make_cp_batch_and_ctx(
                 self.device_mesh,
                 batch,
