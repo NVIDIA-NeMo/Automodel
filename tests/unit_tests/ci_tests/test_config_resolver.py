@@ -99,33 +99,39 @@ def test_env_layer_skips_when_var_unset(monkeypatch):
 def test_computed_layer_substitutes_env(monkeypatch):
     monkeypatch.setenv("PIPELINE_DIR", "/p")
     monkeypatch.setenv("TEST_NAME", "t1")
-    entries = [{
-        "target": "checkpoint.checkpoint_dir",
-        "format": "{PIPELINE_DIR}/{TEST_NAME}/checkpoint",
-        "phases": ["nightly"],
-    }]
+    entries = [
+        {
+            "target": "checkpoint.checkpoint_dir",
+            "format": "{PIPELINE_DIR}/{TEST_NAME}/checkpoint",
+            "phases": ["nightly"],
+        }
+    ]
     assert config_resolver._resolve_computed_layer(entries, "nightly") == {
         "checkpoint.checkpoint_dir": "/p/t1/checkpoint",
     }
 
 
 def test_computed_layer_substitutes_date(monkeypatch):
-    entries = [{
-        "target": "wandb.project",
-        "format": "test-{date:%Y%m%d}",
-        "phases": ["convergence"],
-    }]
+    entries = [
+        {
+            "target": "wandb.project",
+            "format": "test-{date:%Y%m%d}",
+            "phases": ["convergence"],
+        }
+    ]
     result = config_resolver._resolve_computed_layer(entries, "convergence")
     today = datetime.now().strftime("%Y%m%d")
     assert result == {"wandb.project": f"test-{today}"}
 
 
 def test_computed_layer_phase_filter():
-    entries = [{
-        "target": "wandb.name",
-        "format": "x",
-        "phases": ["convergence"],
-    }]
+    entries = [
+        {
+            "target": "wandb.name",
+            "format": "x",
+            "phases": ["convergence"],
+        }
+    ]
     assert config_resolver._resolve_computed_layer(entries, "nightly") == {}
 
 
@@ -222,7 +228,9 @@ def synthetic_recipe(tmp_path: Path) -> Path:
 def _run_resolver(args: list[str], env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, RESOLVER, *args],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
         env={**({} if env is None else env), "PATH": "/usr/bin:/bin"},
     )
 
@@ -274,7 +282,10 @@ def test_end_to_end_customizer_chat_path_wins(tmp_path):
 
     resolved = yaml.load(out.open())
     assert resolved["dataset"]["path_or_dataset_id"] == "/mnt/nci/datasets/customizer/sample-datasets/chat/train.jsonl"
-    assert resolved["validation_dataset"]["path_or_dataset_id"] == "/mnt/nci/datasets/customizer/sample-datasets/chat/validation.jsonl"
+    assert (
+        resolved["validation_dataset"]["path_or_dataset_id"]
+        == "/mnt/nci/datasets/customizer/sample-datasets/chat/validation.jsonl"
+    )
 
 
 def test_end_to_end_robustness_peft_disables_triton(tmp_path):
@@ -287,6 +298,27 @@ def test_end_to_end_robustness_peft_disables_triton(tmp_path):
 
     resolved = yaml.load(out.open())
     assert resolved["peft"]["use_triton"] is False
+
+
+def test_end_to_end_robustness_qwen3_moe_deepep_sets_ci_hf_tolerance(tmp_path):
+    """The Qwen3-MoE DeepEP HF tolerance is CI-only and stays out of the recipe body."""
+    recipe = tmp_path / "qwen3_moe_30b_te_deepep.yaml"
+    recipe.write_text(
+        "step_scheduler: {global_batch_size: 8}\n"
+        "ci:\n"
+        "  recipe_owner: t\n"
+        "  checkpoint_robustness:\n"
+        "    hf_kl_threshold: 1e-2\n"
+    )
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": "t1"}
+    _run_resolver(["--base", str(recipe), "--phase", "checkpoint_robustness", "--output", str(out)], env=env)
+
+    resolved = yaml.load(out.open())
+    assert "experts_implementation" not in resolved
+    assert "hf_kl_threshold" not in resolved
+    assert resolved["ci"]["checkpoint_robustness"]["experts_implementation"] == "eager"
+    assert resolved["ci"]["checkpoint_robustness"]["hf_kl_threshold"] == 2e-2
 
 
 def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
