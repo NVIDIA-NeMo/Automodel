@@ -16,11 +16,7 @@
 # Adapted from https://github.com/tile-ai/tilelang/blob/4956b5835fa554af6c03d4a6289cad44bf310869/examples/deepseek_v32/fp8_lighting_indexer.py
 import torch
 
-try:
-    import tilelang
-    from tilelang import language as T
-except ImportError as _e:
-    raise ImportError(f"UnavailableError: tilelang is required for {__name__}: {_e}") from _e
+from nemo_automodel.components.models.glm_moe_dsa.kernels._tilelang import T, tilelang
 
 
 @tilelang.jit(

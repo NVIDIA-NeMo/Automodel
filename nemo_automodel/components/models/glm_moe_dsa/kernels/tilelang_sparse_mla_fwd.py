@@ -14,11 +14,7 @@
 #
 # ruff: noqa
 # Adapted from https://github.com/tile-ai/tilelang/blob/e666d2d3cc483829c57618c9ebf2e4f4ada0819d/examples/deepseek_v32/sparse_mla_fwd.py
-try:
-    import tilelang
-    from tilelang import language as T
-except ImportError as _e:
-    raise ImportError(f"UnavailableError: tilelang is required for {__name__}: {_e}") from _e
+from nemo_automodel.components.models.glm_moe_dsa.kernels._tilelang import T, tilelang
 
 
 @tilelang.jit(

@@ -41,12 +41,12 @@ Local file                       Upstream file (slime_plugins/models/glm5/ops/)
 ``tilelang_sparse_mla_bwd.py``   ``tilelang_sparse_mla_bwd.py``
 ===============================  ==============================================================
 
-Local modifications: each raw kernel file's ``import tilelang`` is wrapped in a
-``try/except ImportError`` that re-raises with an ``"UnavailableError:"`` tag so
-the optional dependency degrades gracefully (``safe_import_from`` /
-``pytest.importorskip`` skip cleanly when tilelang is absent). The kernels are
-wired into AutoModel's GLM-5.2 DSA layers via ``optimized_kernels.py`` and gated
-behind ``backend.attn == "tilelang"``.
+Local modifications: each raw kernel file imports ``T``/``tilelang`` through the
+local ``_tilelang.py`` lazy shim, matching the DeepSeek-V4 kernels. This lets
+AutoModel import without importing the optional TileLang runtime; real TileLang
+is loaded only when a TileLang kernel is called. The kernels are wired into
+AutoModel's GLM-5.2 DSA layers via ``optimized_kernels.py`` and gated behind
+``backend.attn == "tilelang"``.
 
 These kernels require ``tilelang`` (an optional dependency). Note ``tilelang``
 0.1.11 must be paired with ``apache-tvm-ffi==0.1.11``; ``apache-tvm-ffi`` 0.1.12

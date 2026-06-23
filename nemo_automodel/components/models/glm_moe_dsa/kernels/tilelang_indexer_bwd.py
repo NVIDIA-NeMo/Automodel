@@ -16,11 +16,7 @@
 # Adapted from https://github.com/tile-ai/tilelang/blob/4956b5835fa554af6c03d4a6289cad44bf310869/examples/dsa_sparse_finetune/indexer_bwd.py
 import torch
 
-try:
-    import tilelang as tl
-    import tilelang.language as T
-except ImportError as _e:
-    raise ImportError(f"UnavailableError: tilelang is required for {__name__}: {_e}") from _e
+from nemo_automodel.components.models.glm_moe_dsa.kernels._tilelang import T, tilelang as tl
 
 BF16 = T.bfloat16
 FP32 = T.float32
