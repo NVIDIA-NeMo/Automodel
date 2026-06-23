@@ -122,7 +122,7 @@ cuda = [
     # DeepSeek-V4 TileLang kernels (enable backend.attn="tilelang": sparse MLA
     # attention, lightning indexer, and the external TileKernels MHC sinkhorn).
     "tilelang>=0.1.11",
-    "tile-kernels @ git+https://github.com/deepseek-ai/TileKernels@36d9e45d38e204ebb87e6f6e833821eee0482fe5",
+    "tile-kernels==1.0.0",
 ]
 cuda_source = [
     "bitsandbytes",
