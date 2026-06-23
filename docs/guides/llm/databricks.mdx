@@ -99,7 +99,7 @@ The GPU metrics in Databricks show that the single GPU has approximately 95% uti
   <img src="./databricks-gpu-metrics-single.png" alt="Single GPU utilization of ~95% during model training." />
 </Frame>
 
-To utilize all four GPUs available on this `g6e.12xlarge` instance, add `--nproc-per-node=4` to the same command:
+To use all four GPUs on this `g6e.12xlarge` instance, add `--nproc-per-node=4` to the command:
 
 ```bash
 !automodel --nproc-per-node=4 llama3_2_1b_squad.yaml \
