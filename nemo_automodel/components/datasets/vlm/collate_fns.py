@@ -1646,7 +1646,12 @@ def nemotron_omni_collate_fn(
                         if vid is None:
                             continue
                         if isinstance(vid, str):
-                            import decord
+                            try:
+                                import decord
+                            except ImportError as exc:
+                                raise RuntimeError(
+                                    "decord is required to read video files; install it with: pip install nemo-automodel[media]"
+                                ) from exc
 
                             decord.bridge.set_bridge("native")
                             total = len(decord.VideoReader(vid))

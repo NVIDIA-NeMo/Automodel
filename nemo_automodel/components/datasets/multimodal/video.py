@@ -83,7 +83,7 @@ def get_frame_indices(num_frames, vlen, sample="rand", fix_start=None, input_fps
 def read_frames_decord(video_path, num_frames, sample="rand", fix_start=None, clip=None, min_num_frames=4):
     """Read sampled frames from a video file with decord."""
     if decord is None:
-        raise RuntimeError("decord is required to read video files; install decord to enable video sampling.")
+        raise RuntimeError("decord is required to read video files; install it with: pip install nemo-automodel[media]")
     video_reader = decord.VideoReader(video_path, num_threads=1)
     vlen = len(video_reader)
     fps = video_reader.get_avg_fps()
