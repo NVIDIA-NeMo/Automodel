@@ -62,7 +62,7 @@ dataloader:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
     model_type: bi_encoder
     data_dir_list:
-      - path: /lustre/fsw/portfolios/datascience/users/gmoreira/automodel_colpali/training_datasets/colpali_train.json 
+      - path: <DATASETS_PATH>/automodel_colpali/training_datasets/colpali_train.json 
         num_samples: 5000
       - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
         num_samples: 5000
