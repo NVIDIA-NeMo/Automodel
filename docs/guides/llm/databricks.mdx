@@ -30,7 +30,7 @@ Note that this guide uses a small number of instances for demonstration purposes
 
 ## Train the Model
 
-With the above compute resources provisioned, we're ready to fine-tune a model using AutoModel.
+With the provisioned compute resources, you are ready to fine-tune a model using AutoModel.
 
 AutoModel uses YAML file recipes to configure various settings for the training process (for example, model, dataset, loss function, optimizer, etc.). Here we'll use this [preconfigured recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) for fine-tuning a Llama-3.2-1B model using the SQuAD dataset from Hugging Face. In a notebook connected to our compute resource, download the configuration file:
 
