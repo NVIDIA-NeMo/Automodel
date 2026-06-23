@@ -397,8 +397,8 @@ def build_dataloader(
                 # context-parallel runs, where the attention mask is stripped before the
                 # model anyway (document boundaries are recovered from position_ids), so
                 # the indexed form is both sufficient and orders of magnitude cheaper.
-                # Attn compuation still uses sdpa, the attn_implementation attribute in packing_cfg
-                # is only used to swictch the mask format to [B, S] when cp>1.
+                # Attn computation still uses sdpa, the attn_implementation attribute in packing_cfg
+                # is only used to switch the mask format to [B, S] when cp>1.
                 _attn_impl = packing_cfg.get("attn_implementation", None) or get_attn_implementation(cfg_model)
 
                 configure_packing(attn_implementation=_attn_impl)
