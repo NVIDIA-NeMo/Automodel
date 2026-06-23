@@ -100,4 +100,5 @@ freeze_config:
 #   wandb_save_dir:
 
 ci:
+  time: "00:15:00"
   recipe_owner: akoumpa

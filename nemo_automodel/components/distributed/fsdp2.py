@@ -116,8 +116,8 @@ class FSDP2Manager:
         Returns:
             The parallelized model.
         """
-        if get_world_size_safe() == 1:
-            logger.info("World size is 1, skipping parallelization.")
+        if get_world_size_safe() == 1 or self.device_mesh.size() == 1:
+            logger.info("World size or FSDP mesh size is 1, skipping parallelization.")
             if self.activation_checkpointing:
                 if is_selective_activation_checkpointing(self.activation_checkpointing):
                     # Selective AC works on a plain model (no FSDP required), so

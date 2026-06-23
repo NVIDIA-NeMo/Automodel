@@ -657,8 +657,12 @@ class MoESplitExpertsStateDictMixin:
 
             splits = self._split_experts_weights(tensor, n_experts)
 
-            # In-place views only engage when splits are plain (ep_shard==1).
-            inplace_ok = is_dtensor(tensor) and len(splits) > 0 and not is_dtensor(splits[0]) and not quantization
+            inplace_ok = (
+                (is_dtensor(tensor) or (isinstance(tensor, torch.Tensor) and tensor.is_cuda and not tensor.is_meta))
+                and len(splits) > 0
+                and not is_dtensor(splits[0])
+                and not quantization
+            )
             if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)
 
@@ -700,7 +704,12 @@ class MoESplitExpertsStateDictMixin:
                 validate_dtensor_expert_sharding(tensor, n_experts, f"down_projs (DeepEP) layer {layer_num}")
 
             splits = self._split_experts_weights(tensor, n_experts)
-            inplace_ok = is_dtensor(tensor) and len(splits) > 0 and not is_dtensor(splits[0]) and not quantization
+            inplace_ok = (
+                (is_dtensor(tensor) or (isinstance(tensor, torch.Tensor) and tensor.is_cuda and not tensor.is_meta))
+                and len(splits) > 0
+                and not is_dtensor(splits[0])
+                and not quantization
+            )
             if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)
 

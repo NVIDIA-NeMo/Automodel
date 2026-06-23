@@ -975,6 +975,15 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         # Expose moe_config for the MoE parallelizer assertion
         self.model.moe_config = self.model.language_model.moe_config
 
+        # HF's super().__init__() tied lm_head.weight to the *original* text
+        # embed_tokens, but the language_model replacement above swapped in a
+        # fresh embed_tokens and orphaned that alias. Re-tie through our own
+        # tie_weights() override so the public hook (also invoked by AutoModel
+        # and checkpoint load via ensure_tied_lm_head) re-points to the active
+        # MoE embedding. The shared Parameter survives the in-place cast in
+        # initialize_weights().
+        self.tie_weights()
+
         self.vocab_size = text_config.vocab_size
         # State dict adapter for HF ↔ NeMo weight conversion
         if self.backend.enable_hf_state_dict_adapter:
@@ -984,6 +993,29 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 self.backend,
                 dtype=get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16),
             )
+
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        """Tie ``lm_head`` to the active text ``embed_tokens`` when requested.
+
+        Overrides HF's generic tying so that any caller after the MoE
+        ``language_model`` swap (construction, AutoModel, and checkpoint load
+        via ``ensure_tied_lm_head``) re-points ``lm_head`` to the *active*
+        embedding rather than whatever HF's ``get_input_embeddings()``
+        indirection resolves to. No-op when the config requests untied
+        embeddings.
+
+        Accepts and ignores positional/keyword arguments (e.g. HF v5's
+        ``recompute_mapping``) so it stays drop-in compatible with the HF
+        ``init_weights() -> tie_weights(...)`` call path.
+
+        The controlling flag is the top-level ``Gemma4Config.tie_word_embeddings``
+        (verified against HF: the top-level flag decides tying regardless of the
+        nested ``text_config`` value), so read it first and only fall back to
+        ``text_config`` for configs that don't expose a top-level flag.
+        """
+        text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+        if getattr(self.config, "tie_word_embeddings", getattr(text_config, "tie_word_embeddings", False)):
+            self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
     def forward(
         self,

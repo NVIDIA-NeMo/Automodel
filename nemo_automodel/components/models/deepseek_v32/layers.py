@@ -381,11 +381,14 @@ class DeepseekV32MLA(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         attention_mask: torch.Tensor | None = None,
         union_across_batches: bool = False,
+        as_bool: bool = False,
     ) -> torch.Tensor:
         """Build a sparse attention mask/bias from top-k indices.
 
-        Creates a mask tensor where non-top-k positions are set to -inf.
-        Works for both TE (core_attention_bias) and SDPA (attn_mask).
+        Creates either an additive mask where non-top-k positions are set to
+        ``-inf`` or a boolean keep-mask. TE consumes the additive mask as
+        ``core_attention_bias``; SDPA consumes the boolean mask to avoid bf16
+        additive-mask leakage in fused kernels.
 
         Uses the same efficient pattern as the official DeepSeek inference code:
         `torch.full(..., -inf).scatter_(-1, topk_indices, 0)`
@@ -400,6 +403,7 @@ class DeepseekV32MLA(nn.Module):
             attention_mask: Optional attention mask to combine with (for SDPA)
             union_across_batches: If True, union top-k across batches (for TE);
                                   if False, keep per-batch masks (for SDPA)
+            as_bool: If True, return a boolean keep-mask (True = attend).
 
         Returns:
             sparse_mask: Mask tensor with shape:
@@ -409,34 +413,45 @@ class DeepseekV32MLA(nn.Module):
         """
         device = topk_indices.device
 
+        def make_sparse_mask(shape: tuple[int, ...], indices: torch.Tensor) -> torch.Tensor:
+            if as_bool:
+                return torch.zeros(shape, device=device, dtype=torch.bool).scatter_(-1, indices, True)
+            return torch.full(shape, float("-inf"), device=device, dtype=dtype).scatter_(-1, indices, 0.0)
+
         if qkv_format == "thd":
             num_tokens = topk_indices.shape[0]
             # Create mask directly in final shape [1, n_heads, T, T]
             # All heads share the same mask, so we create [T, T] and expand
-            sparse_mask = torch.full((num_tokens, num_tokens), float("-inf"), device=device, dtype=dtype).scatter_(
-                -1, topk_indices, 0.0
-            )
+            sparse_mask = make_sparse_mask((num_tokens, num_tokens), topk_indices)
             # expand creates a view, contiguous makes a copy
             sparse_mask = sparse_mask.view(1, 1, num_tokens, num_tokens).expand(1, n_heads, -1, -1).contiguous()
         else:
             if union_across_batches:
                 # For TE: create [B, S, S], scatter, union via max, then expand
-                sparse_mask = torch.full((bsz, seq_len, seq_len), float("-inf"), device=device, dtype=dtype).scatter_(
-                    -1, topk_indices, 0.0
-                )
+                sparse_mask = make_sparse_mask((bsz, seq_len, seq_len), topk_indices)
                 # Union: max(0, -inf) = 0 for any position selected in any batch
-                sparse_mask = sparse_mask.max(dim=0, keepdim=True).values
+                if as_bool:
+                    sparse_mask = sparse_mask.any(dim=0, keepdim=True)
+                else:
+                    sparse_mask = sparse_mask.max(dim=0, keepdim=True).values
                 sparse_mask = sparse_mask.view(1, 1, seq_len, seq_len).expand(1, n_heads, -1, -1).contiguous()
             else:
                 # For SDPA: create [B, S, S], scatter, expand (no contiguous needed)
-                sparse_mask = torch.full((bsz, seq_len, seq_len), float("-inf"), device=device, dtype=dtype).scatter_(
-                    -1, topk_indices, 0.0
-                )
+                sparse_mask = make_sparse_mask((bsz, seq_len, seq_len), topk_indices)
                 sparse_mask = sparse_mask.unsqueeze(1).expand(-1, n_heads, -1, -1)
 
         # Combine with existing attention mask if provided
         if attention_mask is not None:
-            sparse_mask = attention_mask + sparse_mask
+            if as_bool:
+                if attention_mask.is_floating_point():
+                    attention_mask = attention_mask >= 0
+                else:
+                    attention_mask = attention_mask.bool()
+                if attention_mask.dim() == 2:
+                    attention_mask = attention_mask[:, None, None, :]
+                sparse_mask = attention_mask & sparse_mask
+            else:
+                sparse_mask = attention_mask.to(dtype=sparse_mask.dtype) + sparse_mask
 
         return sparse_mask
 
@@ -484,9 +499,10 @@ class DeepseekV32MLA(nn.Module):
                 qkv_format,
                 bsz,
                 n_heads=1,
-                dtype=torch.float32,
+                dtype=x.dtype,
                 attention_mask=attention_mask,
                 union_across_batches=False,
+                as_bool=True,
             )
 
         # Compute Q from q_resid
