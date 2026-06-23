@@ -3894,6 +3894,7 @@ dependencies = [
 [package.optional-dependencies]
 all = [
     { name = "albumentations" },
+    { name = "apache-tvm-ffi" },
     { name = "backoff" },
     { name = "boto3" },
     { name = "causal-conv1d" },
@@ -3937,6 +3938,7 @@ cli = [
     { name = "pyyaml" },
 ]
 cuda = [
+    { name = "apache-tvm-ffi" },
     { name = "causal-conv1d" },
     { name = "mamba-ssm" },
     { name = "nv-grouped-gemm" },
@@ -3984,6 +3986,7 @@ fla = [
     { name = "flash-linear-attention" },
 ]
 moe = [
+    { name = "apache-tvm-ffi" },
     { name = "causal-conv1d" },
     { name = "deep-ep" },
     { name = "flash-linear-attention" },
@@ -4061,6 +4064,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "albumentations", marker = "extra == 'vlm'" },
+    { name = "apache-tvm-ffi", marker = "extra == 'cuda'", specifier = "<=0.1.11" },
     { name = "backoff", marker = "extra == 'vlm'" },
     { name = "bitsandbytes", marker = "extra == 'cuda-source'" },
     { name = "boto3", marker = "extra == 's3'", specifier = ">=1.34" },

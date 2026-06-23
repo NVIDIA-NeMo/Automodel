@@ -123,6 +123,9 @@ cuda = [
     # attention, lightning indexer, and the external TileKernels MHC sinkhorn).
     "tilelang>=0.1.11",
     "tile-kernels==1.0.0",
+    # tilelang 0.1.11 does not cap its TVM ffi dependency, but 0.1.12 is
+    # incompatible with its bundled TVM. Keep pip installs on the known-good ffi.
+    "apache-tvm-ffi<=0.1.11",
 ]
 cuda_source = [
     "bitsandbytes",
