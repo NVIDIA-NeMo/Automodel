@@ -14,6 +14,9 @@
 
 from __future__ import annotations
 
+import os
+
+import pytest
 import torch
 from torch.utils.data import Dataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -90,6 +93,13 @@ def _rank_states(world_size: int, num_batches: int) -> dict[int, dict]:
     return states
 
 
+def _legacy_rank_states(world_size: int, num_batches: int) -> dict[int, dict]:
+    states = _rank_states(world_size, num_batches)
+    for state in states.values():
+        state.pop("_automodel_dp_state", None)
+    return states
+
+
 def _next_global_window(world_size: int, rank_states: dict[int, dict]) -> list[int]:
     samples = []
     for rank in range(world_size):
@@ -120,6 +130,23 @@ def test_dp_aware_stateful_dataloader_preserves_same_dp_resume() -> None:
     assert _consume(loader, 1)[0] == [8, 10]
 
 
+def test_dp_aware_stateful_dataloader_allows_legacy_same_dp_resume() -> None:
+    rank_states = _legacy_rank_states(world_size=2, num_batches=2)
+    loader = _distributed_loader(rank=0, world_size=2)
+
+    loader.load_state_dict_from_dp_rank_states(rank_states)
+
+    assert _consume(loader, 1)[0] == [8, 10]
+
+
+def test_dp_aware_stateful_dataloader_rejects_legacy_dp_reshard() -> None:
+    rank_states = _legacy_rank_states(world_size=4, num_batches=1)
+    loader = _distributed_loader(rank=0, world_size=2)
+
+    with pytest.raises(ValueError, match="Cannot reshard a legacy dataloader checkpoint"):
+        loader.load_state_dict_from_dp_rank_states(rank_states)
+
+
 def test_dp_aware_stateful_dataloader_reshards_megatron_batch_sampler_state() -> None:
     rank_states = {}
     for rank in range(2):
@@ -136,13 +163,24 @@ def test_dp_aware_stateful_dataloader_reshards_megatron_batch_sampler_state() ->
     assert sorted(samples) == list(range(8, 16))
 
 
-def test_checkpointer_loads_all_saved_dp_rank_states_for_dp_aware_dataloader(tmp_path) -> None:
+def test_checkpointer_uses_one_saved_rank_file_for_dp_aware_scale_up(tmp_path, monkeypatch) -> None:
     state_name = "dataloader"
     state_dir = tmp_path / state_name
     state_dir.mkdir()
     for rank, state in _rank_states(world_size=2, num_batches=2).items():
         torch.save(state, state_dir / f"{state_name}_dp_rank_{rank}.pt")
 
+    loaded_files = []
+    real_torch_load = torch.load
+
+    def tracking_torch_load(path, *args, **kwargs):
+        loaded_files.append(os.path.basename(str(path)))
+        return real_torch_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.checkpoint.checkpointing.torch.load",
+        tracking_torch_load,
+    )
     loader = _distributed_loader(rank=3, world_size=4)
     checkpointer = CheckpointingConfig(
         checkpoint_dir=tmp_path,
@@ -152,4 +190,111 @@ def test_checkpointer_loads_all_saved_dp_rank_states_for_dp_aware_dataloader(tmp
 
     checkpointer.load_on_dp_ranks(loader, state_name, str(tmp_path))
 
+    assert loaded_files == [f"{state_name}_dp_rank_0.pt"]
     assert _consume(loader, 1)[0] == [11, 15]
+
+
+def test_checkpointer_loads_all_rank_states_without_single_rank_capability(tmp_path) -> None:
+    class AllRankState:
+        def __init__(self) -> None:
+            self.rank_states = None
+
+        def load_state_dict_from_dp_rank_states(self, rank_states):
+            self.rank_states = rank_states
+
+    state_name = "custom"
+    state_dir = tmp_path / state_name
+    state_dir.mkdir()
+    for rank in range(2):
+        torch.save({"rank": rank}, state_dir / f"{state_name}_dp_rank_{rank}.pt")
+
+    state = AllRankState()
+    checkpointer = CheckpointingConfig(
+        checkpoint_dir=tmp_path,
+        model_cache_dir=tmp_path / "cache",
+        save_consolidated=False,
+    ).build(dp_rank=0, tp_rank=0, pp_rank=0)
+
+    checkpointer.load_on_dp_ranks(state, state_name, str(tmp_path))
+
+    assert state.rank_states == {0: {"rank": 0}, 1: {"rank": 1}}
+
+
+def test_checkpointer_uses_current_rank_file_when_metadata_is_available(tmp_path, monkeypatch) -> None:
+    state_name = "dataloader"
+    state_dir = tmp_path / state_name
+    state_dir.mkdir()
+    for rank, state in _rank_states(world_size=2, num_batches=2).items():
+        torch.save(state, state_dir / f"{state_name}_dp_rank_{rank}.pt")
+
+    loaded_files = []
+    real_torch_load = torch.load
+
+    def tracking_torch_load(path, *args, **kwargs):
+        loaded_files.append(os.path.basename(str(path)))
+        return real_torch_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.checkpoint.checkpointing.torch.load",
+        tracking_torch_load,
+    )
+    loader = _distributed_loader(rank=0, world_size=2)
+    checkpointer = CheckpointingConfig(
+        checkpoint_dir=tmp_path,
+        model_cache_dir=tmp_path / "cache",
+        save_consolidated=False,
+    ).build(dp_rank=0, tp_rank=0, pp_rank=0)
+
+    checkpointer.load_on_dp_ranks(loader, state_name, str(tmp_path))
+
+    assert loaded_files == [f"{state_name}_dp_rank_0.pt"]
+    assert _consume(loader, 1)[0] == [8, 10]
+
+
+def test_checkpointer_uses_current_rank_file_for_legacy_same_dp_resume(tmp_path, monkeypatch) -> None:
+    state_name = "dataloader"
+    state_dir = tmp_path / state_name
+    state_dir.mkdir()
+    for rank, state in _legacy_rank_states(world_size=2, num_batches=2).items():
+        torch.save(state, state_dir / f"{state_name}_dp_rank_{rank}.pt")
+
+    loaded_files = []
+    real_torch_load = torch.load
+
+    def tracking_torch_load(path, *args, **kwargs):
+        loaded_files.append(os.path.basename(str(path)))
+        return real_torch_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.checkpoint.checkpointing.torch.load",
+        tracking_torch_load,
+    )
+    loader = _distributed_loader(rank=0, world_size=2)
+    checkpointer = CheckpointingConfig(
+        checkpoint_dir=tmp_path,
+        model_cache_dir=tmp_path / "cache",
+        save_consolidated=False,
+    ).build(dp_rank=0, tp_rank=0, pp_rank=0)
+
+    checkpointer.load_on_dp_ranks(loader, state_name, str(tmp_path))
+
+    assert loaded_files == [f"{state_name}_dp_rank_0.pt"]
+    assert _consume(loader, 1)[0] == [8, 10]
+
+
+def test_checkpointer_rejects_legacy_dp_reshard(tmp_path) -> None:
+    state_name = "dataloader"
+    state_dir = tmp_path / state_name
+    state_dir.mkdir()
+    for rank, state in _legacy_rank_states(world_size=4, num_batches=1).items():
+        torch.save(state, state_dir / f"{state_name}_dp_rank_{rank}.pt")
+
+    loader = _distributed_loader(rank=0, world_size=2)
+    checkpointer = CheckpointingConfig(
+        checkpoint_dir=tmp_path,
+        model_cache_dir=tmp_path / "cache",
+        save_consolidated=False,
+    ).build(dp_rank=0, tp_rank=0, pp_rank=0)
+
+    with pytest.raises(ValueError, match="Cannot reshard a legacy dataloader checkpoint"):
+        checkpointer.load_on_dp_ranks(loader, state_name, str(tmp_path))

@@ -92,12 +92,22 @@ class DPAwareStatefulDataLoader(StatefulDataLoader):
             self.load_state_dict({})
             return
 
-        if self.dp_rank in rank_states and self._can_load_rank_state_directly(rank_states[self.dp_rank]):
+        metadata = self._select_metadata(rank_states)
+        saved_world_size = metadata["dp_world_size"]
+        if metadata.get("is_legacy", False):
+            if saved_world_size != self.dp_world_size:
+                raise ValueError(
+                    "Cannot reshard a legacy dataloader checkpoint without Automodel DP metadata: "
+                    f"saved dp_world_size={saved_world_size}, current dp_world_size={self.dp_world_size}."
+                )
+            if self.dp_rank not in rank_states:
+                raise ValueError(
+                    "Cannot load legacy dataloader checkpoint because it does not contain "
+                    f"state for current dp_rank={self.dp_rank}."
+                )
             self.load_state_dict(rank_states[self.dp_rank])
             return
 
-        metadata = self._select_metadata(rank_states)
-        saved_world_size = metadata["dp_world_size"]
         if saved_world_size == self.dp_world_size and self.dp_rank in rank_states:
             self.load_state_dict(rank_states[self.dp_rank])
             return
@@ -126,11 +136,14 @@ class DPAwareStatefulDataLoader(StatefulDataLoader):
             "global_yielded": local_yielded * self.dp_world_size,
         }
 
-    def _can_load_rank_state_directly(self, state_dict: Mapping[str, Any]) -> bool:
+    def can_load_single_dp_rank_state(
+        self, state_dict: Mapping[str, Any], saved_dp_world_size: int | None = None
+    ) -> bool:
+        """Return whether one rank state is enough to restore this dataloader."""
         metadata = state_dict.get(_DP_STATE_KEY)
-        if not isinstance(metadata, Mapping):
+        if isinstance(metadata, Mapping):
             return True
-        return metadata.get("dp_world_size") == self.dp_world_size
+        return saved_dp_world_size == self.dp_world_size
 
     def _select_metadata(self, rank_states: Mapping[int, dict[str, Any]]) -> dict[str, Any]:
         metadata_by_rank = {
@@ -139,11 +152,11 @@ class DPAwareStatefulDataLoader(StatefulDataLoader):
             if isinstance(state.get(_DP_STATE_KEY), Mapping)
         }
         if not metadata_by_rank:
-            if self.dp_rank in rank_states:
-                return self._build_dp_state(_strip_dp_state(rank_states[self.dp_rank]))
-            raise ValueError(
-                "Cannot reshard a legacy dataloader checkpoint because it does not contain Automodel DP metadata."
-            )
+            return {
+                "version": 0,
+                "is_legacy": True,
+                "dp_world_size": len(rank_states),
+            }
 
         metadata = next(iter(metadata_by_rank.values()))
         expected = {
