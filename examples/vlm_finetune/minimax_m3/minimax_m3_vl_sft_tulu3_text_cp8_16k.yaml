@@ -24,7 +24,7 @@
 #            .to_json('logs/m3_tulu3_seqpack/data/tulu3_train.jsonl', lines=True)"
 #   2. (Optional) Validate label-masking/EOS for M3's chat template:
 #        python examples/convergence/tulu3/data/validate_data.py \
-#          --dataset allenai/tulu-3-sft-mixture --model /workspace/minimax-m3-bf16_vv1 --seq_length 16384
+#          --dataset allenai/tulu-3-sft-mixture --model MiniMaxAI/MiniMax-M3 --seq_length 16384
 # The meta JSON (logs/m3_tulu3_seqpack/data/tulu3_train_meta.json) points file_name at
 # tulu3_train.jsonl with columns {messages: messages}. Requires HF access for Tulu-3
 # (set HF_TOKEN; do NOT set HF_HUB_OFFLINE for prep).
@@ -56,7 +56,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /workspace/minimax-m3-bf16_vv1
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
   trust_remote_code: false
   torch_dtype: bfloat16
   text_config:
@@ -75,7 +75,7 @@ model:
 
 processor:
   _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
-  pretrained_model_name_or_path: /workspace/minimax-m3-bf16_vv1
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
   trust_remote_code: true
 
 checkpoint:
