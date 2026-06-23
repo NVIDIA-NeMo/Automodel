@@ -618,7 +618,7 @@ def qwen3_omni_collate_fn(
     """Collate function for Qwen3 Omni processors."""
     if not HAVE_QWEN_OMNI_UTILS:
         raise ImportError(
-            "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install qwen-omni-utils"
+            "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install nemo-automodel[media]"
         )
 
     # Import at call-time to support environments/tests that inject the module
@@ -627,7 +627,7 @@ def qwen3_omni_collate_fn(
         from qwen_omni_utils import process_mm_info as _process_mm_info
     except ImportError as exc:
         raise ImportError(
-            "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install qwen-omni-utils"
+            "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install nemo-automodel[media]"
         ) from exc
 
     conversations = [example["conversation"] for example in examples]

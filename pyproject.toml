@@ -146,8 +146,6 @@ vlm = [
     "numba",
     "open-clip-torch",
     "pillow",
-    "qwen-omni-utils",
-    "qwen-vl-utils",
     "soundfile",
     "timm<=1.0.22",
     "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
@@ -166,6 +164,8 @@ media = [
     "opencv-python-headless==4.10.0.84",
     "decord; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "imageio-ffmpeg",
+    "qwen-omni-utils",
+    "qwen-vl-utils",
 ]
 all = [
     "nemo_automodel[cli]",
