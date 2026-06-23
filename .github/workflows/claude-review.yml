@@ -71,7 +71,7 @@ jobs:
           - Runtime `obj.__class__ = ...` reassignment to inject mixins or
             behavior — it breaks `isinstance`, pickling, and type checking.
             Prefer selecting the class at construction time.
-          - God functions/files or signature bloat: a new function over ~150
+          - God functions/files or signature bloat: a new function over ~80
             lines, a new file over ~800 lines, a parameter list longer than ~8,
             or `**kwargs` passthrough that hides the real contract. Prefer
             splitting and explicit params / a typed config object.
