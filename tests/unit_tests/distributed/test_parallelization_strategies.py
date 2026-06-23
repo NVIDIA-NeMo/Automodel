@@ -537,6 +537,31 @@ class TestNemotronHParallelizationStrategy:
         expected_fully_shard_calls = len(nemotron_model.backbone.layers) + 1  # +1 for root
         assert fully_shard_by_dtype.call_count + fully_shard.call_count == expected_fully_shard_calls
 
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    def test_threads_reshard_after_forward_to_layer_sharding(
+        self,
+        fully_shard_by_dtype,
+        fully_shard,
+        strategy,
+        mock_device_mesh,
+        nemotron_model,
+    ):
+        """Nemotron layers must honor explicit FSDP reshard overrides."""
+        mesh, _, _, _ = mock_device_mesh
+        fully_shard.side_effect = lambda model, **kwargs: model
+        fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
+
+        strategy.parallelize(
+            model=nemotron_model,
+            device_mesh=mesh,
+            activation_checkpointing=False,
+            reshard_after_forward=True,
+        )
+
+        for call_args in fully_shard_by_dtype.call_args_list:
+            assert call_args.kwargs["reshard_after_forward"] is True
+
     @patch("nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper")
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")

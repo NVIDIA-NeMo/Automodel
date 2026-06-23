@@ -33,7 +33,9 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+    if isinstance(tensor, DTensor):
+        return tensor.full_tensor().clone()
+    return tensor
 
 
 class NemotronV3Attention(nn.Module):
@@ -203,8 +205,9 @@ class NemotronV3MambaFP32Params(nn.Module):
         self.D = nn.Parameter(torch.ones(num_heads, dtype=torch.float32))
         self.D._no_weight_decay = True
 
-    def forward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, reference: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return SSM params through the holder's FSDP hooks."""
+        del reference
         return (
             _full_tensor_if_dtensor(self.A_log),
             _full_tensor_if_dtensor(self.dt_bias),
@@ -291,8 +294,10 @@ class NemotronV3Mamba2Mixer(nn.Module):
     def D(self) -> torch.Tensor:
         return self._fp32_params.D
 
-    def _get_fp32_ssm_params(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self._fp32_params()
+    def _get_fp32_ssm_params(
+        self, reference: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._fp32_params(reference)
 
     def forward(
         self,
@@ -389,7 +394,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 projected_states = self.cp.pre_conv_ssm(projected_states, cu_seqlens=cu_seqlens_cp)
                 if squeezed and cu_seqlens_cp is not None:
                     projected_states = projected_states.unsqueeze(0).contiguous()
-                A_log, dt_bias, D = self._get_fp32_ssm_params()
+                A_log, dt_bias, D = self._get_fp32_ssm_params(projected_states)
                 A = -torch.exp(self.cp.get_A_log(A_log).float())
 
                 out = mamba_split_conv1d_scan_combined(
@@ -425,7 +430,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
                     out = out.squeeze(0)
                 return out
             else:
-                A_log, dt_bias, D = self._get_fp32_ssm_params()
+                A_log, dt_bias, D = self._get_fp32_ssm_params(projected_states)
                 A = -torch.exp(A_log.float())
 
                 out = mamba_split_conv1d_scan_combined(
@@ -483,7 +488,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
             )
 
             # Reshape for selective_state_update
-            A_log, dt_bias, D = self._get_fp32_ssm_params()
+            A_log, dt_bias, D = self._get_fp32_ssm_params(hidden_states)
             A = -torch.exp(A_log.float())
             A = A[:, None, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
             dt = dt[:, :, None].expand(-1, -1, self.head_dim)
@@ -547,7 +552,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
             dim=-1,
         )
 
-        A_log, dt_bias, D = self._get_fp32_ssm_params()
+        A_log, dt_bias, D = self._get_fp32_ssm_params(hidden_states_inner)
         A = -torch.exp(A_log.float())
         dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 

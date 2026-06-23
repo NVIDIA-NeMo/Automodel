@@ -212,6 +212,7 @@ class ParallelizationStrategy(ABC):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        reshard_after_forward: Optional[bool] = None,
         **kwargs,
     ) -> nn.Module:
         """Apply parallelization strategy to the model."""
@@ -419,6 +420,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        reshard_after_forward: Optional[bool] = None,
         **kwargs,
     ) -> nn.Module:
         """Apply NemotronH-specific parallelization."""
@@ -496,6 +498,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                 mp_policy=mp_policy,
                 offload_policy=offload_policy,
                 fp32_compute_module_names=fp32_compute_module_names,
+                reshard_after_forward=reshard_after_forward,
             )
 
         # do not reshard after forward for root model
