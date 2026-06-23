@@ -119,7 +119,14 @@ class WanProcessor(BaseVideoProcessor):
         # UMT5 requires bfloat16 (float16 causes overflow/zeros in attention and layer norm)
         text_encoder_dtype = torch.bfloat16 if "cuda" in device else torch.float32
 
+        from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
+
         logger.info("[Wan] Loading models from %s...", model_name)
+
+        # Resolve to a local snapshot dir once so the per-component subfolder
+        # loads below reuse the warm HF cache instead of re-validating over the
+        # network on every run.
+        model_name = resolve_diffusion_model_dir(model_name)
 
         # Load text encoder
         logger.info("  Loading UMT5 text encoder...")
