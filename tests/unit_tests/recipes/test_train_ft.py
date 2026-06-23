@@ -233,6 +233,21 @@ def test_build_validation_dataloader_no_validation_keys():
     mock_build.assert_not_called()
 
 
+def test_build_validation_dataloader_no_validation_config():
+    cfg = ConfigNode(
+        {
+            "model": {},
+            "dataloader": {},
+        }
+    )
+
+    with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader") as mock_build:
+        result = build_validation_dataloader(cfg, dp_world_size=1, dp_rank=0, pp_enabled=False)
+
+    assert result == {}
+    mock_build.assert_not_called()
+
+
 @pytest.mark.parametrize("attn", ["magi", "te", "sdpa"])
 def test_build_validation_dataloader_packs_val_for_thd_collater(monkeypatch, attn):
     """The validation set is packed (cfg_ps passed) when using the THD collater.

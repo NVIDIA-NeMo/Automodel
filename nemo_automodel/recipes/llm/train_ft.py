@@ -595,7 +595,8 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
         and model.should_pack_validation_with_training()
     )
     _backend_packs_validation = _uses_te_dot_product_attention(cfg.model) or _magi_backend or _model_packs_validation
-    _validation_uses_thd = _uses_thd_collater(cfg.validation_dataloader)
+    cfg_validation_dataloader = cfg.get("validation_dataloader", None)
+    _validation_uses_thd = _uses_thd_collater(cfg_validation_dataloader)
     _training_uses_thd = _uses_thd_collater(cfg.get("dataloader", None))
     _pack_val = cfg.get("packed_sequence.packed_sequence_size", 0) > 0 and (
         _validation_uses_thd or (_backend_packs_validation and _training_uses_thd)
@@ -608,7 +609,7 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
         val_ds_name = _prepare_val_ds_name(val_ds_name)
         val_dataloaders[val_ds_name] = build_dataloader(
             val_ds_cfg,
-            cfg.validation_dataloader,
+            cfg_validation_dataloader,
             cfg.model,
             cfg_ps=cfg.get("packed_sequence", None) if _pack_val else None,
             seed=cfg.get("seed", 42),
