@@ -160,7 +160,7 @@ args = [
 distributor.run(train_file, *args)
 ```
 
-`TorchDistributor` uses `torchrun` internally, so we point it at the recipe module directly (rather than the `automodel` CLI, which also wraps `torchrun`).
+`TorchDistributor` uses `torchrun` internally. Point the distributor at the recipe module directly, rather than the `automodel` CLI, which also wraps `torchrun`.
 
 During training, GPU utilization is approximately 95% across all eight GPUs on the worker nodes.
 
