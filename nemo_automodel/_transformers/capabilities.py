@@ -113,6 +113,11 @@ def _is_deepseek_v4(model: "nn.Module") -> bool:
     return getattr(config, "model_type", None) == "deepseek_v4" or type(model).__name__.startswith("DeepseekV4")
 
 
+def _is_glm_moe_dsa(model: "nn.Module") -> bool:
+    config = getattr(model, "config", None)
+    return getattr(config, "model_type", None) == "glm_moe_dsa" or type(model).__name__.startswith("GlmMoeDsa")
+
+
 def _is_hybrid(model: "nn.Module") -> bool:
     """True when the model mixes attention with non-attention layers (e.g. Mamba/SSM).
 
@@ -248,6 +253,9 @@ class ModelSupports:
                 # DSV4 owns its CP attention (Miles-style); gated on TileLang.
                 backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
                 return backend_attn == "tilelang"
+            if _is_glm_moe_dsa(self._model):
+                backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+                return backend_attn == "tilelang"
             if _is_hybrid(self._model):
                 backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
                 return backend_attn in ("te", "sdpa")
@@ -270,6 +278,10 @@ class ModelSupports:
             getattr(self._model, "_supports_sdpa", False) is True
             or _uses_te_attention(self._model)
             or _uses_magi_attention(self._model)
+            or (
+                _is_glm_moe_dsa(self._model)
+                and getattr(getattr(self._model, "backend", None), "attn", None) == "tilelang"
+            )
         )
         return _supports_seq_lens(self._model) and sp_attn_backend
 
@@ -318,6 +330,9 @@ class ModelSupports:
         CP + packing (see ``magi_attn_utils.magi_prepare_packed_cp``)."""
         if self.cp_size <= 1:
             return self.supports_sequence_packing
+        if _is_glm_moe_dsa(self._model):
+            backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+            return self.supports_sequence_packing and backend_attn == "tilelang"
         return self.supports_sequence_packing and (_uses_te_attention(self._model) or _uses_magi_attention(self._model))
 
 
@@ -431,7 +446,11 @@ def _supports_forwarding_property(name: str) -> property:
     """Property that forwards ``model.<name>`` to ``model.supports.<name>``."""
 
     def fget(self: "nn.Module") -> bool:
-        return getattr(self.supports, name)
+        try:
+            return getattr(self.supports, name)
+        except ReferenceError:
+            self._supports = ModelSupports(self, getattr(self, "_mesh", None))  # type: ignore[attr-defined]
+            return getattr(self._supports, name)  # type: ignore[attr-defined]
 
     fget.__name__ = name
     return property(fget)
@@ -439,8 +458,13 @@ def _supports_forwarding_property(name: str) -> property:
 
 def _lazy_supports_property(self: "nn.Module") -> ModelSupports:
     try:
-        return self._supports  # type: ignore[attr-defined]
+        supports = self._supports  # type: ignore[attr-defined]
+        supports._model
+        return supports
     except AttributeError:
+        self._supports = ModelSupports(self, getattr(self, "_mesh", None))  # type: ignore[attr-defined]
+        return self._supports  # type: ignore[attr-defined]
+    except ReferenceError:
         self._supports = ModelSupports(self, getattr(self, "_mesh", None))  # type: ignore[attr-defined]
         return self._supports  # type: ignore[attr-defined]
 
