@@ -160,7 +160,7 @@ distributor.run(train_file, *args)
 
 `TorchDistributor` uses `torchrun` internally, so we point it at the recipe module directly (rather than the `automodel` CLI, which also wraps `torchrun`).
 
-We now see GPU utilization is \~95% for all GPUs on all worker nodes during training (8 GPUs in this particular case).
+During training, GPU utilization is approximately 95% across all eight GPUs on the worker nodes.
 
 ## Track Experiments with MLflow
 
