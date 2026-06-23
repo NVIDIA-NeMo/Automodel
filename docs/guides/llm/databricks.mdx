@@ -136,7 +136,7 @@ rdd = sc.parallelize(range(sc.defaultParallelism))
 rdd.mapPartitions(lambda _: [run_command("hf auth login --token " + hf_token)]).collect();
 ```
 
-Next, we use PySpark's [TorchDistributor](https://spark.apache.org/docs/latest/api/python/reference/api/pyspark.ml.torch.distributor.TorchDistributor.html) to run the same training job across multiple instances like this:
+Next, use PySpark's [TorchDistributor](https://spark.apache.org/docs/latest/api/python/reference/api/pyspark.ml.torch.distributor.TorchDistributor.html) to run the training job across multiple instances:
 
 ```py
 from pyspark.ml.torch.distributor import TorchDistributor
