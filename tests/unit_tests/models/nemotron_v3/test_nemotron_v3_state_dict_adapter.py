@@ -200,6 +200,28 @@ class TestNemotronV3AdapterToHf:
         assert hf_state_dict["backbone.layers.0.mixer.dt_bias"].dtype == torch.float32
         assert hf_state_dict["backbone.layers.0.mixer.D"].dtype == torch.float32
 
+    def test_forced_hf_dtype_mapping_marks_fp32_protected_keys(self, config, moe_config, backend):
+        """Test Nemotron fp32-protected HF export keys keep fp32 consolidated metadata."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+
+        state_dict = {
+            "backbone.layers.0.mixer.A_log": torch.randn(4, dtype=torch.float32),
+            "backbone.layers.0.mixer.dt_bias": torch.randn(4, dtype=torch.float32),
+            "backbone.layers.0.mixer.D": torch.randn(4, dtype=torch.float32),
+            "backbone.layers.0.mixer.router.e_score_correction_bias": torch.randn(4, dtype=torch.float32),
+            "backbone.layers.0.mixer.in_proj.weight": torch.randn(4, 4, dtype=torch.float32),
+            "lm_head.weight": torch.randn(4, 4, dtype=torch.bfloat16),
+        }
+
+        forced = adapter.forced_hf_dtype_mapping(state_dict)
+
+        assert forced == {
+            "backbone.layers.0.mixer.A_log": "F32",
+            "backbone.layers.0.mixer.dt_bias": "F32",
+            "backbone.layers.0.mixer.D": "F32",
+            "backbone.layers.0.mixer.router.e_score_correction_bias": "F32",
+        }
+
 
 class TestNemotronV3AdapterFromHf:
     """Test from_hf conversion."""

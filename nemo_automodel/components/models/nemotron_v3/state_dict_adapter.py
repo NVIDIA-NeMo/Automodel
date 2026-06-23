@@ -278,3 +278,13 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
 
         return result
+
+    def forced_hf_dtype_mapping(self, state_dict: dict[str, Any]) -> dict[str, str]:
+        """Return HF export dtype overrides for tensors that are intrinsically fp32."""
+        forced: dict[str, str] = {}
+        for fqn, value in state_dict.items():
+            if not isinstance(value, torch.Tensor) or not value.dtype.is_floating_point:
+                continue
+            if _is_mamba_fp32_state_key(fqn) or "e_score_correction_bias" in fqn:
+                forced[fqn] = "F32"
+        return forced
