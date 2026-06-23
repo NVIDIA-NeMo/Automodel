@@ -16,6 +16,7 @@ import gc
 import glob
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1047,6 +1048,17 @@ class Checkpointer:
             path: Path to load stateful object
         """
         state_dir = os.path.join(path, state_name)
+        if hasattr(state, "load_state_dict_from_dp_rank_states"):
+            rank_states = {}
+            for state_path in glob.glob(os.path.join(state_dir, f"{state_name}_dp_rank_*.pt")):
+                match = re.search(r"_dp_rank_(\d+)\.pt$", state_path)
+                if match is None:
+                    continue
+                rank_states[int(match.group(1))] = torch.load(state_path, weights_only=False)
+            if rank_states:
+                state.load_state_dict_from_dp_rank_states(rank_states)
+                return
+
         state.load_state_dict(
             torch.load(os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"), weights_only=False)
         )

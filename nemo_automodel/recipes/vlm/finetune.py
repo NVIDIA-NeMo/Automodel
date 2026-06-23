@@ -48,6 +48,7 @@ from nemo_automodel._transformers import (
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
+from nemo_automodel.components.datasets.stateful_dataloader import instantiate_dataloader
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp, wrap_vlm_collate_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
@@ -282,6 +283,10 @@ def build_dataloader(
             "num_replicas": dp_mesh.size(),
             "rank": dp_mesh.get_local_rank(),
         }
+    dp_world_size = dist_sampler_kwargs.get(
+        "num_replicas", torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    )
+    dp_rank = dist_sampler_kwargs.get("rank", torch.distributed.get_rank() if torch.distributed.is_initialized() else 0)
 
     with ScopedRNG(seed=seed, ranked=True):
         processor = None
@@ -434,9 +439,18 @@ def build_dataloader(
         if pp_n_microbatches is not None:
             collate_fn = wrap_vlm_collate_for_pp(collate_fn, n_microbatches=pp_n_microbatches)
 
-        return cfg_dl.instantiate(
-            dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
-        ), processor
+        return (
+            instantiate_dataloader(
+                cfg_dl,
+                dp_rank=dp_rank,
+                dp_world_size=dp_world_size,
+                dataset=ds,
+                sampler=sampler,
+                collate_fn=collate_fn,
+                batch_size=local_batch_size,
+            ),
+            processor,
+        )
 
 
 def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:

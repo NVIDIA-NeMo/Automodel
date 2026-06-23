@@ -56,6 +56,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
+from nemo_automodel.components.datasets.stateful_dataloader import instantiate_dataloader
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -570,7 +571,10 @@ def build_dataloader(
                 mp.set_start_method("spawn", force=True)
         except RuntimeError:
             pass
-        return cfg_dl.instantiate(**dl_kwargs), tokenizer
+        return (
+            instantiate_dataloader(cfg_dl, dp_rank=dp_rank, dp_world_size=dp_world_size, **dl_kwargs),
+            tokenizer,
+        )
 
 
 def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: Optional[nn.Module] = None):
