@@ -41,6 +41,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule, roll_tensor
+from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
@@ -113,6 +114,13 @@ def _make_full_attention_config(config: Qwen3_5TextConfig, layer_idx: int) -> Qw
     layer_types[layer_idx] = "full_attention"
     mtp_config.layer_types = layer_types
     mtp_config.num_hidden_layers = max(int(getattr(config, "num_hidden_layers", 0) or 0), layer_idx + 1)
+    # The MTP sublayer re-enters the HF Qwen3.5 decoder self-attention over the
+    # SAME packed/varlen batch as the backbone. The HF flash-attention-2 varlen
+    # path cannot view the batched [B, S, H, D] MTP query against the packed
+    # cu_seqlens (RuntimeError: shape '[B, ...]' is invalid ...), so route the
+    # MTP self-attention through SDPA -- which consumes a 4D block-causal mask
+    # exactly like the native backbone -- instead of FA2. See NVBugs 6330129.
+    mtp_config._attn_implementation = "sdpa"
     return mtp_config
 
 
@@ -134,6 +142,23 @@ def _split_qwen3_5_position_ids(
     if position_ids.ndim == 3 and position_ids.shape[0] == 4:
         return position_ids[1:], position_ids[0]
     return position_ids, None
+
+
+def _mtp_block_causal_mask(packing_mask: torch.Tensor, inputs_embeds: torch.Tensor) -> torch.Tensor:
+    """Build a 4D block-causal attention mask from an indexed packing mask.
+
+    ``packing_mask`` is ``[B, S]`` with the 1-based document index per token
+    (0 = padding). The returned bool mask ``[B, 1, S, S]`` (``True`` = attend)
+    keeps attention causal *and* within each packed document, matching the
+    backbone's packed-sequence semantics. Used for the MTP sublayers, which run
+    SDPA self-attention over the same packed batch (NVBugs 6330129).
+    """
+    mask = packing_mask.to(device=inputs_embeds.device)
+    seq_len = mask.shape[-1]
+    same_doc = mask.unsqueeze(2) == mask.unsqueeze(1)  # [B, S, S]
+    causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=mask.device).tril()
+    not_padding = (mask > 0).unsqueeze(2) & (mask > 0).unsqueeze(1)
+    return (same_doc & causal.unsqueeze(0) & not_padding).unsqueeze(1)
 
 
 def _rolled_embed_inputs(inputs_embeds: torch.Tensor, num_depths: int) -> tuple[torch.Tensor, ...]:
@@ -685,13 +710,21 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
                 device=source_embeds.device,
                 past_key_values=past_key_values,
             )
-            causal_mask = create_causal_mask(
-                config=self.model.config,
-                inputs_embeds=source_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                position_ids=text_position_ids,
-            )
+            # For packed sequences (indexed mask), feed the MTP SDPA sublayers a
+            # 4D block-causal mask so attention stays within each document, the
+            # same way the backbone treats packing. Otherwise use the standard
+            # causal mask. See NVBugs 6330129.
+            packing_mask = attention_mask if is_indexed_packed_mask(attention_mask) else kwargs.get("_packed_seq_ids")
+            if is_indexed_packed_mask(packing_mask):
+                causal_mask = _mtp_block_causal_mask(packing_mask, source_embeds)
+            else:
+                causal_mask = create_causal_mask(
+                    config=self.model.config,
+                    inputs_embeds=source_embeds,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    position_ids=text_position_ids,
+                )
             if input_ids is None:
                 mtp_per_depth_h = self.mtp(
                     hidden_states,
@@ -1114,13 +1147,23 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                 device=source_embeds.device,
                 past_key_values=past_key_values,
             )
-            causal_mask = create_causal_mask(
-                config=language_model.config,
-                inputs_embeds=source_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                position_ids=text_position_ids,
+            # For packed sequences (indexed mask), feed the MTP SDPA sublayers a
+            # 4D block-causal mask so attention stays within each document, the
+            # same way the backbone treats packing. Otherwise use the standard
+            # causal mask. See NVBugs 6330129.
+            packing_mask = (
+                attention_mask if is_indexed_packed_mask(attention_mask) else model_kwargs.get("_packed_seq_ids")
             )
+            if is_indexed_packed_mask(packing_mask):
+                causal_mask = _mtp_block_causal_mask(packing_mask, source_embeds)
+            else:
+                causal_mask = create_causal_mask(
+                    config=language_model.config,
+                    inputs_embeds=source_embeds,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    position_ids=text_position_ids,
+                )
             mtp_kwargs = {
                 key: value
                 for key, value in model_kwargs.items()
