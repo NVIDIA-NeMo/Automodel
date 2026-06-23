@@ -15,6 +15,53 @@
 import torch
 
 
+def _row_trailing_pad_lengths(
+    seq_lens: torch.Tensor,
+    seq_lens_padded: torch.Tensor,
+    seq_len: int,
+    seq_lens_padding_value: int,
+) -> torch.Tensor | None:
+    """Return per-row real token counts when padding is only row-trailing."""
+    real_lengths = []
+    for row_idx in range(seq_lens.shape[0]):
+        valid = seq_lens[row_idx] != seq_lens_padding_value
+        padded_valid = seq_lens_padded[row_idx] != seq_lens_padding_value
+        if not bool(valid.any().item()):
+            return None
+        if not bool(torch.equal(valid, padded_valid)):
+            return None
+
+        row_seq_lens = seq_lens[row_idx][valid]
+        row_seq_lens_padded = seq_lens_padded[row_idx][valid]
+
+        length_diffs = row_seq_lens_padded - row_seq_lens
+        if bool((length_diffs[:-1] != 0).any().item()) or int(length_diffs[-1].item()) < 0:
+            return None
+
+        if int(row_seq_lens_padded.sum().item()) != seq_len:
+            return None
+        real_lengths.append(row_seq_lens.sum())
+
+    return torch.stack(real_lengths)
+
+
+def _compact_trailing_row_pad(
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    position_ids: torch.Tensor,
+    real_lengths: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Drop per-row trailing pad slots from token-level tensors."""
+    input_chunks = []
+    label_chunks = []
+    position_chunks = []
+    for row_idx, real_length in enumerate(real_lengths.tolist()):
+        input_chunks.append(input_ids[row_idx, :real_length])
+        label_chunks.append(labels[row_idx, :real_length])
+        position_chunks.append(position_ids[row_idx, :real_length])
+    return torch.cat(input_chunks, dim=0), torch.cat(label_chunks, dim=0), torch.cat(position_chunks, dim=0)
+
+
 def process_input_for_thd(
     batch: dict[str, torch.Tensor],
     seq_lens_padding_value: int = -1000,
@@ -105,16 +152,18 @@ def process_input_for_thd(
     batch_size, seq_len = input_ids.shape[0], input_ids.shape[1]
     total_tokens = batch_size * seq_len
 
-    position_ids_thd = position_ids.reshape(-1) if position_ids is not None else None
-    input_ids_thd = input_ids.reshape(total_tokens, -1).squeeze(-1)
-    labels_thd = labels.reshape(total_tokens, -1).squeeze(-1)
-
     cu_seqlens = None
     cu_seqlens_padded = None
     max_seqlen = None
+    real_lengths = None
     if seq_lens is not None:
         seq_lens_flat = seq_lens.reshape(-1)
         valid_seq_lens = seq_lens_flat[seq_lens_flat != seq_lens_padding_value]
+
+        if seq_lens_padded is not None and batch_size > 1 and position_ids is not None:
+            real_lengths = _row_trailing_pad_lengths(seq_lens, seq_lens_padded, seq_len, seq_lens_padding_value)
+            if real_lengths is not None:
+                total_tokens = int(real_lengths.sum().item())
 
         cu_seqlens = torch.cat(
             [
@@ -132,6 +181,9 @@ def process_input_for_thd(
                 [torch.tensor([0], device=valid_seq_lens_padded.device), torch.cumsum(valid_seq_lens_padded, dim=0)]
             )
             cu_seqlens_padded = cu_seqlens_padded.to(dtype=torch.int32).to(device=valid_seq_lens_padded.device)
+
+        if real_lengths is not None:
+            cu_seqlens_padded = cu_seqlens.clone()
 
         # Trailing-only pack-pad (cp_size==1): absorb into cu_seqlens[-1] so
         # the emit gate below drops cu_seqlens_padded and TE skips its
@@ -157,6 +209,15 @@ def process_input_for_thd(
         # cpp_extensions/fused_attn.py:152-159).
         if cu_seqlens is not None and cu_seqlens.numel() > 1:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().to(dtype=torch.int32)
+
+    if real_lengths is not None:
+        input_ids_thd, labels_thd, position_ids_thd = _compact_trailing_row_pad(
+            input_ids, labels, position_ids, real_lengths
+        )
+    else:
+        position_ids_thd = position_ids.reshape(-1) if position_ids is not None else None
+        input_ids_thd = input_ids.reshape(total_tokens, -1).squeeze(-1)
+        labels_thd = labels.reshape(total_tokens, -1).squeeze(-1)
 
     result = {
         "input_ids": input_ids_thd,

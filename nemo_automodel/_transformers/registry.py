@@ -54,6 +54,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.ling_v2.model", "BailingMoeV2ForCausalLM"),
         ),
         (
+            "DeciLMForCausalLM",
+            ("nemo_automodel.components.models.decilm.model", "DeciLMForCausalLM"),
+        ),
+        (
             "DeepseekV3ForCausalLM",
             ("nemo_automodel.components.models.deepseek_v3.model", "DeepseekV3ForCausalLM"),
         ),
@@ -221,6 +225,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
                 "nemo_automodel.components.models.qwen2_5_omni.model",
                 "Qwen2_5OmniThinkerForConditionalGeneration",
             ),
+        ),
+        (
+            "Qwen3ForCausalLM",
+            ("nemo_automodel.components.models.qwen3.model", "Qwen3ForCausalLM"),
         ),
         (
             "Qwen3MoeForCausalLM",

@@ -125,6 +125,7 @@ CI_KEY_TO_VAR = {
     "ep_size": "EP_SIZE",
     "recipe_owner": "RECIPE_OWNER",
     "nproc_per_node": "CONFIG_NPROC_PER_NODE",
+    "max_steps": "MAX_STEPS",
     "cluster_tag": "RESERVED_CLUSTER_TAG",
 }
 
