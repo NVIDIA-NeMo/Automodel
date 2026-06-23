@@ -328,9 +328,7 @@ def apply_ac(
     for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
         if mtp_repeated and id(block) in mtp_block_ids:
             continue
-        if ignore_router and hasattr(block, "set_activation_checkpointing"):
-            block.set_activation_checkpointing(True)
-        elif ignore_router:
+        if ignore_router:
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
