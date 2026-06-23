@@ -86,7 +86,7 @@ To run training on a single GPU, use this command:
     --checkpoint.is_async True
 ```
 
-In addition to specifying the configuration file, we also use these options:
+In addition to specifying the configuration file, the command accepts the following options:
 
 - `--step_scheduler.max_steps`: Limits the number of training steps taken. Again, this is for example purposes – adapt for your actual use case as needed.
 - `--checkpoint.checkpoint_dir`: Tells AutoModel where to [save model checkpoints](/development/checkpointing) from training. We recommend saving model checkpoints in a Databricks Unity Catalog [volume](https://docs.databricks.com/aws/en/volumes/).
