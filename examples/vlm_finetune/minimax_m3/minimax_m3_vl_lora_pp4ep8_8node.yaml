@@ -155,6 +155,7 @@ lr_scheduler:
   min_lr: 1.0e-7
 
 wandb:
+  enable: false
   project: <your_wandb_project>
   entity: <your_wandb_entity>
   name: <your_wandb_name>

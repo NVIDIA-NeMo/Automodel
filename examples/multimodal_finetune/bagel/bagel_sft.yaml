@@ -165,6 +165,7 @@ ema:
   decay: 0.9999
 
 wandb:
+  enable: false
   project: bagel-finetuning
   mode: disabled
   name: bagel_7b_mot_sft

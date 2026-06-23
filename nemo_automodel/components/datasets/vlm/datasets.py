@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import torch.utils.data
+from datasets import Image as HfImage
 from datasets import load_dataset
 from PIL import Image
 
@@ -111,24 +113,46 @@ def make_cord_v2_dataset(
 
 
 def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
-    """Load and preprocess the MedPix dataset for image-to-text fine-tuning."""
-    dataset = load_dataset(path_or_dataset, split=split)
+    """Load and preprocess the MedPix dataset for image-to-text fine-tuning.
 
-    def format(example):
+    Formatting is deferred to ``__getitem__`` via ``with_transform`` so the
+    dataset stays Arrow-backed (no Python-side copy of every image). Images are
+    loaded undecoded (``Image(decode=False)``) and wrapped as lazy ``PIL``
+    handles (``Image.open`` reads only the header); the actual pixel decode then
+    happens on demand in the DataLoader workers, rather than eagerly decoding the
+    whole split up front.
+    """
+    dataset = load_dataset(path_or_dataset, split=split)
+    if "image_id" in getattr(dataset, "features", {}):
+        dataset = dataset.cast_column("image_id", HfImage(decode=False))
+
+    def lazy_image(value):
+        # ``Image(decode=False)`` yields a ``{"bytes": ..., "path": ...}`` dict.
+        if isinstance(value, dict):
+            if value.get("bytes") is not None:
+                return Image.open(io.BytesIO(value["bytes"]))
+            if value.get("path"):
+                return value["path"]
+        return value
+
+    def transform(batch):
         return {
             "conversation": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": example["image_id"]},
-                        {"type": "text", "text": example["question"]},
-                    ],
-                },
-                {"role": "assistant", "content": [{"type": "text", "text": example["answer"]}]},
-            ],
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": lazy_image(image)},
+                            {"type": "text", "text": question},
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+                ]
+                for image, question, answer in zip(batch["image_id"], batch["question"], batch["answer"])
+            ]
         }
 
-    return [format(example) for example in dataset]
+    return dataset.with_transform(transform)
 
 
 def make_llava_onevision_dataset(

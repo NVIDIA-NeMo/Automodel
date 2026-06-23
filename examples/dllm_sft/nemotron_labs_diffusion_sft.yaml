@@ -29,6 +29,7 @@ dist_env:
 seed: 42
 
 wandb:
+  enable: false
   project: dllm-baseline
   name: am-nemotron-labs-diffusion-sft
 
