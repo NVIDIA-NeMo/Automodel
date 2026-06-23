@@ -148,7 +148,6 @@ vlm = [
     "pillow",
     "soundfile",
     "timm<=1.0.22",
-    "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
 ]
 cli = [
     "pyyaml",
