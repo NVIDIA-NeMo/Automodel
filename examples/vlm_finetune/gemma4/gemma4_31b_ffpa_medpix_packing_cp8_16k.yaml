@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Gemma 4 31B (dense) text-only SFT on Tulu-3, sequence-packed to 128k, single node.
-# The head_dim=512 full-attention ring chunks run through the FFPA CuTeDSL *varlen*
-# kernel (cu_seqlens from _packed_seq_ids, so it stays active under packing);
-# sliding-window layers use Flex.
-# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_31b_ffpa_tulu3_text_cp8_16k.yaml
+# Gemma 4 31B (dense) MedPix-VQA SFT, sequence-packed to 16k under Ring P2P CP8.
+# The head_dim=512 full-attention ring chunks run through the FFPA CuTeDSL varlen
+# kernel; sliding-window layers use Flex. MedPix-VQA is pulled from the HF Hub at
+# runtime, so the recipe is CI-runnable with no local data prep.
+# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_31b_ffpa_medpix_packing_cp8_16k.yaml
 
 recipe: FinetuneRecipeForVLM
 
@@ -68,18 +68,15 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_meta_dataset
-  path_or_dataset: /path/to/tulu3_sharegpt/tulu3_train_meta.json
-  split: train
-  truncate: false
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train[:1000]
 
-# pack_size must be divisible by 2*cp_size (16 here): 131072 / 16 = 8192.
-# collate_max_length MUST match pack_size, else the collate truncates each pack.
+# pack_size must be divisible by 2*cp_size (16 here): 16384 / 16 = 1024.
 packed_sequence:
   pretokenize: true
-  max_length: 131072
-  pack_size: 131072
-  collate_max_length: 131072
+  max_length: 16384
+  pack_size: 16384
   packing_ratio: 0.9
   drop_long_samples: true
   post_tokenize_hook_fn: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_inject_thinking_prefix
@@ -89,6 +86,16 @@ dataloader:
   num_workers: 4
   persistent_workers: true
   pin_memory: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation[:500]
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -102,10 +109,7 @@ freeze_config:
   freeze_audio_tower: true
   freeze_language_model: false
 
-wandb:
-  enable: True
-  project: gemma4-31b-ffpa-Ring-cp
-  name: gemma4_31b_ffpa_tulu3_text_cp8_128k
-  group: gemma4_31b_ffpa_tulu3_text_cp8_128k
-  tags: [gemma4-31b, tulu3, text-only, dense, cp8, 128k, ffpa, packed, single-node]
-  dir: logs/gemma4_31b_ffpa_tulu3_text_cp8_128k/wandb
+ci:
+  recipe_owner: Butterfingrz
+  env_vars:
+    MAX_STEPS: 10
