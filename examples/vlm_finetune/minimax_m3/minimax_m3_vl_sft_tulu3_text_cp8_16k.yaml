@@ -1,0 +1,158 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# MiniMax M3 VL text-only SFT on Tulu-3, sequence-packed to 16k, with cp_size=8.
+# LONG-CONTEXT CP validation: unlike the MedPix cp1-vs-cp2 parity recipe (short Q&A,
+# mostly padding at long seqlen), Tulu-3 SFT samples are long, so packing to 16k fills
+# REAL tokens -- exercising the block-sparse DSA CP path (gather K/V + global block
+# selection + FlexAttention) across a genuinely long sequence. Mirrors the Gemma4
+# gemma4_31b_tulu3_text_cp8_16k.yaml validation; M3 is a 400B MoE so it needs multi-node.
+#
+# world = pp4 * dp4 * cp8 * tp1 = 128 (16 nodes x 8);  ep32 | dp*cp = 4 * 8 = 32.
+# cp8 shards the 16k sequence to 2048 tokens/rank. Signal: trains cleanly with a sane
+# descending loss (the cp-correctness baseline is the MedPix cp1-vs-cp2 parity recipe;
+# cp1 at 16k is impractical -- which is the whole reason for CP).
+#
+# DATA PREP (one-time, no code changes -- the Tulu-3 pipeline is model-agnostic).
+# make_meta_dataset reads JSON/JSONL (not parquet), so dump Tulu-3 conversations to a
+# JSONL whose rows carry a `messages` field, then point a meta JSON at it. The meta JSON
+# already lives at the dataset.path_or_dataset below; only the .jsonl needs generating:
+#   1. Dump Tulu-3 train to JSONL (drop_long_samples + pretokenize below handle >16k
+#      docs, so an explicit prefilter pass is optional):
+#        python -c "from datasets import load_dataset; \
+#          load_dataset('allenai/tulu-3-sft-mixture', split='train') \
+#            .select_columns(['messages']) \
+#            .to_json('logs/m3_tulu3_seqpack/data/tulu3_train.jsonl', lines=True)"
+#   2. (Optional) Validate label-masking/EOS for M3's chat template:
+#        python examples/convergence/tulu3/data/validate_data.py \
+#          --dataset allenai/tulu-3-sft-mixture --model /workspace/minimax-m3-bf16_vv1 --seq_length 16384
+# The meta JSON (logs/m3_tulu3_seqpack/data/tulu3_train_meta.json) points file_name at
+# tulu3_train.jsonl with columns {messages: messages}. Requires HF access for Tulu-3
+# (set HF_TOKEN; do NOT set HF_HUB_OFFLINE for prep).
+
+recipe: FinetuneRecipeForVLM
+seed: 1234
+
+step_scheduler:
+  # packed local_batch_size = pp_size (4 packs to fill the pipeline); dp=4.
+  # global=64 -> grad_accum = 64/(4*4) = 4: averages each logged loss over 4x more
+  # tokens, smoothing the per-pack difficulty variance so the (shallow) Tulu-3
+  # descent reads as a clean trend rather than a jagged 0.46-0.97 band.
+  global_batch_size: 64
+  local_batch_size: 4
+  ckpt_every_steps: 1000000
+  val_every_steps: 1000000
+  log_remote_every_steps: 1
+  gc_every_steps: 10
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: /workspace/minimax-m3-bf16_vv1
+  trust_remote_code: false
+  torch_dtype: bfloat16
+  text_config:
+    num_mtp_modules: 0
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: gmm
+    dispatcher: deepep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
+  pretrained_model_name_or_path: /workspace/minimax-m3-bf16_vv1
+  trust_remote_code: true
+
+checkpoint:
+  enabled: false               # convergence smoke: don't persist a 400B checkpoint
+  checkpoint_dir: vlm_checkpoints/minimax_m3_vl_sft_tulu3_text_cp8_16k/
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 8
+  pp_size: 4
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: true
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_meta_dataset
+  path_or_dataset: logs/m3_tulu3_seqpack/data/tulu3_train_meta.json
+  split: train
+  truncate: false
+
+# Pack full Tulu-3 conversations to 16k. pretokenize uses M3's processor (chat template
+# + assistant-only label masking); no Gemma-specific thinking-prefix hook. 16384 is
+# divisible by 2*cp=16.
+packed_sequence:
+  pretokenize: true
+  max_length: 16384
+  pack_size: 16384
+  collate_max_length: 16384
+  packing_ratio: 0.9
+  drop_long_samples: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 2.0e-5
+  weight_decay: 0.01
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 2.0e-6
+
+wandb:
+  enable: false
+  project: <your_wandb_project>
+  entity: <your_wandb_entity>
+  name: <your_wandb_name>
+  dir: <your_wandb_save_dir>
