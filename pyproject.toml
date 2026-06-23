@@ -255,6 +255,7 @@ override-dependencies = [
     "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
     # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin
     "urllib3>=2.7.0",
+    "thrift>=0.23.0",
 ]
 prerelease = "allow"
 
