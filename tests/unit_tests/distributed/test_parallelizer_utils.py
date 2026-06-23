@@ -423,7 +423,7 @@ def test_fully_shard_by_dtype_fp32_master_pins_compute(monkeypatch):
     # Minority fp32 holder sharded on its own; the bf16 bulk is the parent unit.
     assert [mod for mod, _policy, _reshard in sub_calls] == [mixer._fp32_params]
     assert sub_calls[0][1].param_dtype == torch.float32
-    assert sub_calls[0][2] is False
+    assert sub_calls[0][2] is True
     assert [mod for mod, _policy, _reshard in fully_calls] == [mixer]
     assert fully_calls[0][1].param_dtype == torch.bfloat16
     assert fully_calls[0][2] is True
