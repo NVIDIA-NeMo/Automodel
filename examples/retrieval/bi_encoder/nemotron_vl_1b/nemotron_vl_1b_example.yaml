@@ -107,4 +107,5 @@ wandb:
   project: YOUR_WANDB_PROJECT
   entity: YOUR_WANDB_ENTITY
   name: nemotron_vl_1b_embedding_example
+  enable: false
   #save_dir: <your_wandb_save_dir> 
