@@ -3918,6 +3918,7 @@ all = [
     { name = "qwen-vl-utils" },
     { name = "sentencepiece" },
     { name = "soundfile" },
+    { name = "tile-kernels" },
     { name = "tilelang" },
     { name = "timm" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
@@ -3935,6 +3936,7 @@ cuda = [
     { name = "mamba-ssm" },
     { name = "nv-grouped-gemm" },
     { name = "onnxscript" },
+    { name = "tile-kernels" },
     { name = "tilelang" },
     { name = "transformer-engine", extra = ["pytorch"] },
 ]
@@ -3983,6 +3985,7 @@ moe = [
     { name = "mamba-ssm" },
     { name = "nv-grouped-gemm" },
     { name = "onnxscript" },
+    { name = "tile-kernels" },
     { name = "tilelang" },
     { name = "transformer-engine", extra = ["pytorch"] },
 ]
@@ -4105,6 +4108,7 @@ requires-dist = [
     { name = "sentencepiece", marker = "extra == 'extra'" },
     { name = "soundfile", marker = "extra == 'vlm'" },
     { name = "tiktoken" },
+    { name = "tile-kernels", marker = "extra == 'cuda'", git = "https://github.com/deepseek-ai/TileKernels?rev=36d9e45d38e204ebb87e6f6e833821eee0482fe5" },
     { name = "tilelang", marker = "extra == 'cuda'", specifier = ">=0.1.11" },
     { name = "timm", marker = "extra == 'vlm'", specifier = "<=1.0.22" },
     { name = "torch", marker = "sys_platform != 'darwin' and sys_platform != 'linux'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cpu" },
@@ -7632,6 +7636,17 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/28/c0/3c7a39ff68022ddfd7d93f3337ad90389a342f761c4d71de99a3ccc57857/tiktoken-0.12.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:54c891b416a0e36b8e2045b12b33dd66fb34a4fe7965565f1b482da50da3e86a", size = 1194908, upload-time = "2025-10-06T20:22:32.073Z" },
     { url = "https://files.pythonhosted.org/packages/ab/0d/c1ad6f4016a3968c048545f5d9b8ffebf577774b2ede3e2e352553b685fe/tiktoken-0.12.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:5edb8743b88d5be814b1a8a8854494719080c28faaa1ccbef02e87354fe71ef0", size = 1253706, upload-time = "2025-10-06T20:22:33.385Z" },
     { url = "https://files.pythonhosted.org/packages/af/df/c7891ef9d2712ad774777271d39fdef63941ffba0a9d59b7ad1fd2765e57/tiktoken-0.12.0-cp314-cp314t-win_amd64.whl", hash = "sha256:f61c0aea5565ac82e2ec50a05e02a6c44734e91b51c10510b084ea1b8e633a71", size = 920667, upload-time = "2025-10-06T20:22:34.444Z" },
+]
+
+[[package]]
+name = "tile-kernels"
+version = "0.1.dev3+g36d9e45d3"
+source = { git = "https://github.com/deepseek-ai/TileKernels?rev=36d9e45d38e204ebb87e6f6e833821eee0482fe5#36d9e45d38e204ebb87e6f6e833821eee0482fe5" }
+dependencies = [
+    { name = "tilelang" },
+    { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.10.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
+    { name = "torch", version = "2.10.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
 ]
 
 [[package]]
