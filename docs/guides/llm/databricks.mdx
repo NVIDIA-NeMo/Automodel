@@ -185,7 +185,7 @@ mlflow:
 For Databricks, the key configuration parameters are:
 
 - `tracking_uri`: Set to `"databricks"` to use Databricks' managed MLflow tracking server
-- `experiment_name`: Name of your experiment (will appear in the Databricks workspace)
+- `experiment_name`: The name of your experiment, which appears in the Databricks workspace
 - `artifact_location`: Leave as `null` to use default Databricks artifact storage, or specify a Unity Catalog volume path like `/Volumes/<catalog>/<schema>/<volume>/mlflow-artifacts`
 - `tags`: Add custom tags to organize and filter your runs
 
