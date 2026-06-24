@@ -44,7 +44,7 @@ model:
     linear: te
     rms_norm: torch_fp32
     experts: torch_mm
-    dispatcher: deepep
+    dispatcher: hybridep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     # WAR for https://github.com/NVIDIA-NeMo/Automodel/issues/2674:
