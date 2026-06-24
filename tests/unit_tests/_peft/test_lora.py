@@ -61,6 +61,20 @@ class DummyModelNoConfig(nn.Module):
         return x
 
 
+class DummySwiGLUMLP(nn.Module):
+    """Small HF-style SwiGLU MLP used to test LoRA MLP fusion config."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = nn.Linear(16, 32, bias=False)
+        self.up_proj = nn.Linear(16, 32, bias=False)
+        self.down_proj = nn.Linear(32, 16, bias=False)
+        self.act_fn = nn.SiLU()
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
 @pytest.fixture
 def dummy_input():
     """Provides a dummy input tensor for model testing."""
@@ -119,10 +133,27 @@ def test_lora_patch_applies_to_selected_module_with_str_dtype(model):
 def test_peft_config_memory_efficient_lora_round_trip():
     """PeftConfig should default memory-efficient LoRA on and preserve explicit overrides."""
     assert PeftConfig().use_memory_efficient_lora is True
+    assert PeftConfig().fuse_lora_mlp is True
 
-    cfg = PeftConfig.from_dict({"use_memory_efficient_lora": False})
+    cfg = PeftConfig.from_dict({"use_memory_efficient_lora": False, "fuse_lora_mlp": False})
     assert cfg.use_memory_efficient_lora is False
+    assert cfg.fuse_lora_mlp is False
     assert cfg.to_dict()["use_memory_efficient_lora"] is False
+    assert cfg.to_dict()["fuse_lora_mlp"] is False
+
+
+def test_peft_config_can_skip_lora_mlp_fusion():
+    """fuse_lora_mlp=False leaves LoRA-patched MLPs on the unfused forward path."""
+    mlp = DummySwiGLUMLP()
+    apply_lora_to_linear_modules(
+        mlp,
+        PeftConfig(match_all_linear=True, dim=4, alpha=4, use_triton=False, fuse_lora_mlp=False),
+    )
+
+    assert getattr(mlp.gate_proj, "lora_A", None) is not None
+    assert getattr(mlp.up_proj, "lora_A", None) is not None
+    assert getattr(mlp.down_proj, "lora_A", None) is not None
+    assert not getattr(mlp, "_lora_mlp_fused", False)
 
 
 def test_forward_output_consistency(dummy_input):

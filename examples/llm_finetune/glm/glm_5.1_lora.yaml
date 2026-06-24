@@ -40,6 +40,7 @@ peft:
   dim: 8
   alpha: 32
   use_triton: True
+  fuse_lora_mlp: False
 
 checkpoint:
   enabled: false
