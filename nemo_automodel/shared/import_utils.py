@@ -33,7 +33,7 @@ GPU_INSTALL_STRING = (
 or use `pip install --extra-index-url https://pypi.nvidia.com ".[cuda12x]"` if installing from source"""
 )
 MISSING_TRITON_MSG = "triton is not installed. Please install it with `pip install triton`."
-MISSING_QWEN_VL_UTILS_MSG = "qwen_vl_utils is not installed. Please install it with `pip install nemo-automodel[media]`."
+MISSING_QWEN_VL_UTILS_MSG = "qwen_vl_utils is not installed. Please install it with `pip install nemo-automodel[vlm-media]`."
 MISSING_CUT_CROSS_ENTROPY_MSG = (
     "cut_cross_entropy is not installed. Please install it with `pip install cut-cross-entropy`."
 )

@@ -81,7 +81,7 @@ def _read_video_frames(video_path, processor=None, frame_indices=None, return_me
         import decord
     except ImportError as exc:
         raise RuntimeError(
-            "decord is required to read video files; install it with: pip install nemo-automodel[media]"
+            "decord is required to read video files; install it with: pip install nemo-automodel[vlm-media]"
         ) from exc
     import torch as _torch
 
