@@ -117,6 +117,19 @@ class TestAdapter:
         assert out[q_proj_key] is sd[q_proj_key]
         assert out[q_proj_key].dtype == torch.bfloat16
 
+    def test_forced_hf_dtype_mapping_marks_gdn_fp32_params(self):
+        state_dict = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.float32),
+            "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.float32),
+            "model.language_model.layers.0.linear_attn.conv1d.weight": torch.zeros(4, dtype=torch.float32),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.float32),
+        }
+
+        assert self.adapter.forced_hf_dtype_mapping(state_dict) == {
+            "model.language_model.layers.0.linear_attn.A_log": "F32",
+            "model.language_model.layers.0.linear_attn.dt_bias": "F32",
+        }
+
     def test_to_hf_accepts_kwargs(self):
         # Save callsites pass exclude_key_regex, quantization, device_mesh, etc.
         out = self.adapter.to_hf(
