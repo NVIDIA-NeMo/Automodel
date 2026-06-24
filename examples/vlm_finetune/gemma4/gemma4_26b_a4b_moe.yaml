@@ -69,6 +69,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   ep_size: 8
+  frozen_multimodal_sharding: replicate
 
   sequence_parallel: false
 
