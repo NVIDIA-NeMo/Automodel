@@ -42,6 +42,7 @@ from transformers import (  # noqa: E402
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForMultimodalLM,
+    AutoModelForSeq2SeqLM,
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
     AutoModelForTokenClassification,
@@ -950,6 +951,21 @@ class NeMoAutoModelForTokenClassification(_BaseNeMoAutoModelClass, AutoModelForT
     >>> model = NeMoAutoModelForTokenClassification.from_pretrained("dbmdz/bert-large-cased-finetuned-conll03-english") # try Liger
     >>> model = NeMoAutoModelForTokenClassification.from_pretrained(
     ...     "dbmdz/bert-large-cased-finetuned-conll03-english", use_liger_kernel=False)   # skip Liger
+    """
+
+    pass
+
+
+class NeMoAutoModelForSeq2SeqLM(_BaseNeMoAutoModelClass, AutoModelForSeq2SeqLM):
+    """Drop-in replacement for ``transformers.AutoModelForSeq2SeqLM`` with custom-kernels.
+
+    Resolves encoder-decoder (sequence-to-sequence) architectures such as T5,
+    mT5, BART, and Pegasus to their HF ``*ForConditionalGeneration`` classes via
+    the inherited ``AutoModelForSeq2SeqLM`` mapping. Like the other wrappers it
+    only overrides ``from_pretrained`` / ``from_config`` to add the optional
+    ``use_liger_kernel`` flag; the Liger patch only applies to decoder-only
+    architectures, so for encoder-decoder models it silently falls back and the
+    model is unchanged.
     """
 
     pass
