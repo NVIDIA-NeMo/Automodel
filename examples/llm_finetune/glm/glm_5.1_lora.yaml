@@ -51,6 +51,7 @@ distributed:
   pp_size: 4
   ep_size: 32
 
+  activation_checkpointing: true
   sequence_parallel: false
 
   pipeline:
