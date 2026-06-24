@@ -120,10 +120,12 @@ cuda = [
     "onnxscript>=0.5.6",
     "transformer-engine[pytorch]>=2.14.1",
     # DeepSeek-V4 TileLang kernels (enable backend.attn="tilelang": sparse MLA
-    # attention and lightning indexer). The external DeepSeek ``tile_kernels``
-    # package (MHC sinkhorn) is not resolvable from PyPI and is not installed by
-    # default, so that path remains optional.
+    # attention, lightning indexer, and the external TileKernels MHC sinkhorn).
     "tilelang>=0.1.11",
+    "tile-kernels==1.0.0",
+    # tilelang 0.1.11 does not cap its TVM ffi dependency, but 0.1.12 is
+    # incompatible with its bundled TVM. Keep pip installs on the known-good ffi.
+    "apache-tvm-ffi<=0.1.11",
 ]
 cuda_source = [
     "bitsandbytes",
