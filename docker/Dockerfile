@@ -199,11 +199,6 @@ RUN git clone --depth 1 --branch v0.17.0 --recurse-submodules --shallow-submodul
         pip install --no-cache-dir --no-build-isolation /tmp/torchao && \
     rm -rf /tmp/torchao
 
-# DeepSeek-V4 TileLang kernels are resolved by the cuda extra during `uv sync`.
-# The external DeepSeek TileKernels package is intentionally not installed here:
-# its import eagerly imports TileLang's vendored TVM, which can abort when other
-# TVM FFI bindings are already loaded. The MHC sinkhorn path remains optional.
-
 COPY . /opt/Automodel
 
 # Re-apply PyTorch overrides after full COPY (which overwrites the modified pyproject.toml/uv.lock)

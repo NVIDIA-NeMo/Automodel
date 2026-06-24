@@ -403,6 +403,7 @@ def build_dataloader(
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
         packing_strategy = getattr(cfg_ps, "packing_strategy", "thd")
+        prepacked_sequence = bool(getattr(cfg_ps, "prepacked", False))
 
         # check if packed sequence is supported (only for thd strategy)
         supports_seq_lens = _supports_seq_lens(model)
@@ -411,7 +412,13 @@ def build_dataloader(
             packed_sequence_size = 0
 
         # Apply packing if configured
-        if packed_sequence_size > 0:
+        if packed_sequence_size > 0 and prepacked_sequence:
+            logger.info(
+                "Using prepacked sequence dataset with size: %s, strategy: %s; skipping recipe-side packing",
+                packed_sequence_size,
+                packing_strategy,
+            )
+        elif packed_sequence_size > 0:
             logger.info(f"Packing dataset with size: {packed_sequence_size}, strategy: {packing_strategy}")
             if hasattr(ds, "shuffle"):
                 ds = ds.shuffle(seed)
@@ -584,10 +591,8 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             val_ds_name = "default"
         return val_ds_name
 
-    # Pack the validation set the same way as training when the attention backend
-    # consumes a THD/cu_seqlens layout. Besides TE, the magi backend also packs (and,
-    # at cp>1, shards) THD sequences; leaving validation unpacked would feed magi tiny
-    # per-example sequences that cp-sharding splits degenerately, inflating val loss.
+    # Pack validation when it explicitly consumes THD/cu_seqlens metadata, or
+    # when a backend/model requires validation to follow training's THD layout.
     _magi_backend = (
         str(cfg.get("model.backend.attn", "")) == "magi" or str(cfg.get("model.attn_implementation", "")) == "magi"
     )
@@ -596,9 +601,13 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
         and callable(getattr(model, "should_pack_validation_with_training", None))
         and model.should_pack_validation_with_training()
     )
-    _pack_val = (
-        _uses_te_dot_product_attention(cfg.model) or _magi_backend or _model_packs_validation
-    ) and _uses_thd_collater(cfg.dataloader)
+    _backend_packs_validation = _uses_te_dot_product_attention(cfg.model) or _magi_backend or _model_packs_validation
+    cfg_validation_dataloader = cfg.get("validation_dataloader", None)
+    _validation_uses_thd = _uses_thd_collater(cfg_validation_dataloader)
+    _training_uses_thd = _uses_thd_collater(cfg.get("dataloader", None))
+    _pack_val = cfg.get("packed_sequence.packed_sequence_size", 0) > 0 and (
+        _validation_uses_thd or (_backend_packs_validation and _training_uses_thd)
+    )
 
     # Build validation dataloader if the config provides it
     val_dataloaders = {}
@@ -607,7 +616,7 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
         val_ds_name = _prepare_val_ds_name(val_ds_name)
         val_dataloaders[val_ds_name] = build_dataloader(
             val_ds_cfg,
-            cfg.validation_dataloader,
+            cfg_validation_dataloader,
             cfg.model,
             cfg_ps=cfg.get("packed_sequence", None) if _pack_val else None,
             seed=cfg.get("seed", 42),
@@ -1160,11 +1169,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # Model-owned context parallelism: if the model exposes a CP input-prep
             # hook, let it attach its own batch-sharding callable (``_cp_make_batch_fn``)
             # before make_cp_batch_and_ctx shards the batch, instead of the default
-            # load-balanced context_parallel path. DSV4 uses this for its Miles-style
-            # contiguous query shard + all-gathered K/V.
+            # load-balanced context_parallel path.
             _model_cp = self.model_parts[0] if hasattr(self, "model_parts") else None
             if cp_size > 1 and _model_cp is not None and hasattr(_model_cp, "prepare_model_inputs_for_cp"):
-                batch.update(_model_cp.prepare_model_inputs_for_cp(input_ids=batch["input_ids"]))
+                batch.update(
+                    _model_cp.prepare_model_inputs_for_cp(input_ids=batch["input_ids"], num_chunks=_num_chunks_value)
+                )
             train_ctx, batch = make_cp_batch_and_ctx(
                 self.device_mesh,
                 batch,
