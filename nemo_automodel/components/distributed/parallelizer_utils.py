@@ -122,12 +122,20 @@ def _fully_shard(
     mesh: DeviceMesh,
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy],
+    reshard_after_forward: Optional[bool] = None,
 ) -> None:
     if isinstance(module, nn.ModuleList):
         for layer in module:
-            _fully_shard(layer, mesh, mp_policy, offload_policy)
+            _fully_shard(layer, mesh, mp_policy, offload_policy, reshard_after_forward)
     else:
-        fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+        kwargs = {
+            "mesh": mesh,
+            "mp_policy": mp_policy,
+            "offload_policy": offload_policy,
+        }
+        if reshard_after_forward is not None:
+            kwargs["reshard_after_forward"] = reshard_after_forward
+        fully_shard(module, **kwargs)
 
 
 def _mp_policy_with_param_dtype(
@@ -206,6 +214,7 @@ def fully_shard_by_dtype(
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy],
     fp32_compute_module_names: Tuple[str, ...] = (),
+    reshard_after_forward: Optional[bool] = None,
 ) -> None:
     """Fully shard a module so every parameter computes in its required dtype.
 
@@ -230,6 +239,8 @@ def fully_shard_by_dtype(
         fp32_compute_module_names: Parameter/buffer name substrings that must compute in
             fp32 (e.g. ``("_fp32_params",)`` for Qwen3.5's GatedDeltaNet fp32 holder).
             Sourced from the model's ``_keep_in_fp32_modules_strict``.
+        reshard_after_forward: Optional FSDP2 reshard override for this module.
+            ``None`` leaves the caller's default FSDP2 behavior unchanged.
     """
     compute_dtype_of = _make_compute_dtype_fn(module, mp_policy, fp32_compute_module_names)
 
@@ -254,6 +265,7 @@ def fully_shard_by_dtype(
             mesh=mesh,
             mp_policy=_mp_policy_with_param_dtype(mp_policy, key[1]),
             offload_policy=offload_policy,
+            reshard_after_forward=reshard_after_forward,
         )
     else:
         least_items_key = min(grouped_params.items(), key=lambda x: len(x[1]))[0]
@@ -269,6 +281,7 @@ def fully_shard_by_dtype(
                     mesh=mesh,
                     mp_policy=_mp_policy_with_param_dtype(mp_policy, key[1]),
                     offload_policy=offload_policy,
+                    reshard_after_forward=reshard_after_forward,
                 )
         if len(grouped_params) == 2:
             parent_key = next(key for key in grouped_params if key != least_items_key)
@@ -277,4 +290,5 @@ def fully_shard_by_dtype(
                 mesh=mesh,
                 mp_policy=_mp_policy_with_param_dtype(mp_policy, parent_key[1]),
                 offload_policy=offload_policy,
+                reshard_after_forward=reshard_after_forward,
             )

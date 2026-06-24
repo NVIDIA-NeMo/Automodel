@@ -212,6 +212,7 @@ class ParallelizationStrategy(ABC):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        reshard_after_forward: Optional[bool] = None,
         **kwargs,
     ) -> nn.Module:
         """Apply parallelization strategy to the model."""
@@ -249,6 +250,12 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
         # if dp_replicate_size > 1, use HSDP, else use FSDP
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
+        pp_enabled = "pp" in dp_mesh.mesh_dim_names and dp_mesh["pp"].size() > 1
+        if pp_enabled and reshard_after_forward is True:
+            logger.warning(
+                "reshard_after_forward=True overrides the pipeline-parallel default of keeping layer weights "
+                "gathered across microbatches. This may increase per-microbatch all-gathers and reduce throughput."
+            )
 
         # Extract layers from the model for parallelization
         layers = _extract_model_layers(model)
@@ -413,6 +420,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        reshard_after_forward: Optional[bool] = None,
         **kwargs,
     ) -> nn.Module:
         """Apply NemotronH-specific parallelization."""
@@ -490,6 +498,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                 mp_policy=mp_policy,
                 offload_policy=offload_policy,
                 fp32_compute_module_names=fp32_compute_module_names,
+                reshard_after_forward=reshard_after_forward,
             )
 
         # do not reshard after forward for root model
@@ -527,23 +536,66 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         original_fn = globals().get("apply_fsdp2_sharding_recursively")
         assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
 
-        def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None, *args, **kwargs):
+        def _fsdp_by_dtype(
+            module,
+            mesh,
+            mp_policy,
+            offload_policy=None,
+            enable_fsdp2_prefetch=True,
+            fsdp2_backward_prefetch_depth=2,
+            fsdp2_forward_prefetch_depth=1,
+            reshard_after_forward=None,
+            fully_shard_fn=None,
+        ):
+            del enable_fsdp2_prefetch, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth, fully_shard_fn
+            pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
+
             if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
-                items = module.items() if isinstance(module, nn.ModuleDict) else enumerate(module)
-                for layer_id, child in items:
-                    if isinstance(child, (nn.ModuleList, nn.ModuleDict)):
-                        _fsdp_by_dtype(child, mesh, mp_policy, offload_policy)
+                all_items = list(module.items()) if isinstance(module, nn.ModuleDict) else list(enumerate(module))
+                flat_layer_items = [
+                    (layer_id, child)
+                    for layer_id, child in all_items
+                    if not isinstance(child, (nn.ModuleList, nn.ModuleDict))
+                ]
+                nested_items = [
+                    (layer_id, child)
+                    for layer_id, child in all_items
+                    if isinstance(child, (nn.ModuleList, nn.ModuleDict))
+                ]
+
+                for _, child in nested_items:
+                    _fsdp_by_dtype(
+                        child,
+                        mesh,
+                        mp_policy,
+                        offload_policy,
+                        reshard_after_forward=reshard_after_forward,
+                    )
+
+                for enum_id, (_, child) in enumerate(flat_layer_items):
+                    if reshard_after_forward is not None:
+                        layer_reshard_after_forward = reshard_after_forward
+                    elif pp_enabled:
+                        layer_reshard_after_forward = False
                     else:
-                        parallelizer_utils.fully_shard_by_dtype(
-                            child,
-                            mesh,
-                            mp_policy,
-                            offload_policy,
-                            fp32_compute_module_names=fp32_compute_module_names,
-                        )
+                        layer_reshard_after_forward = enum_id < len(flat_layer_items) - 1
+                    parallelizer_utils.fully_shard_by_dtype(
+                        child,
+                        mesh,
+                        mp_policy,
+                        offload_policy,
+                        fp32_compute_module_names=fp32_compute_module_names,
+                        reshard_after_forward=layer_reshard_after_forward,
+                    )
             else:
                 for _, sub in module.named_children():
-                    _fsdp_by_dtype(sub, mesh, mp_policy, offload_policy)
+                    _fsdp_by_dtype(
+                        sub,
+                        mesh,
+                        mp_policy,
+                        offload_policy,
+                        reshard_after_forward=reshard_after_forward,
+                    )
 
         globals()["apply_fsdp2_sharding_recursively"] = _fsdp_by_dtype
         try:
