@@ -29,6 +29,9 @@ The SwiGLU activation/gradient are computed by elementwise Triton kernels (``_sw
 a pure-torch fallback is used when Triton is unavailable. The matmuls stay on cuBLAS.
 """
 
+import logging
+import os
+
 import torch
 import torch.nn.functional as F
 from packaging import version
@@ -49,6 +52,42 @@ if not HAVE_TRITON:  # pragma: no cover
     triton = MagicMock()
     triton.jit = null_decorator
     tl = MagicMock()
+
+logger = logging.getLogger(__name__)
+
+_DEBUG_NAN = os.environ.get("NEMO_LORA_MLP_DEBUG_NAN", "0").lower() not in ("0", "", "false", "no")
+_DEBUG_NAN_SEEN: set[tuple[str, str, str]] = set()
+
+
+def _debug_nonfinite(debug_name: str | None, stage: str, **tensors) -> None:
+    """Log first nonfinite tensor per fused MLP stage when NEMO_LORA_MLP_DEBUG_NAN=1."""
+    if not _DEBUG_NAN or debug_name is None:
+        return
+    for tensor_name, tensor in tensors.items():
+        if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            continue
+        finite = torch.isfinite(tensor)
+        if bool(finite.all().item()):
+            continue
+        key = (debug_name, stage, tensor_name)
+        if key in _DEBUG_NAN_SEEN:
+            continue
+        _DEBUG_NAN_SEEN.add(key)
+        finite_count = int(finite.sum().item())
+        total = tensor.numel()
+        finite_abs_max = torch.nan_to_num(tensor.detach().float(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item()
+        logger.error(
+            "[lora-mlp-nan] module=%s stage=%s tensor=%s shape=%s dtype=%s device=%s nonfinite=%d/%d finite_abs_max=%g",
+            debug_name,
+            stage,
+            tensor_name,
+            tuple(tensor.shape),
+            tensor.dtype,
+            tensor.device,
+            total - finite_count,
+            total,
+            finite_abs_max,
+        )
 
 
 @triton.jit
@@ -130,7 +169,7 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, gW, gA, gB, gS, uW, uA, uB, uS, dW, dA, dB, dS):
+    def forward(ctx, x, gW, gA, gB, gS, uW, uA, uB, uS, dW, dA, dB, dS, debug_name=None):
         """Compute the fused SwiGLU MLP output, saving only x, gate_out, up_out for backward."""
         orig_shape = x.shape
         x2 = x.reshape(-1, orig_shape[-1])
@@ -144,12 +183,15 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
         h = _swiglu_fwd(e, g)  # down-projection input (recomputed in backward)
         out = F.linear(h, dW)
         out.addmm_(F.linear(h, dA) * dS, dB.t())
+        _debug_nonfinite(debug_name, "forward", x=x2, gate=e, up=g, swiglu=h, out=out)
 
         # Save only x / gate_out / up_out; the SwiGLU activation and down-input are recomputed.
         ctx.save_for_backward(x2, e, g, gA, gB, uA, uB, dA, dB)
         ctx.bases = (gW, uW, dW)
         ctx.scales = (gS, uS, dS)
         ctx.orig_shape = orig_shape
+        ctx.debug_name = debug_name
+        ctx.has_debug_name_input = debug_name is not None
         return out.view(*orig_shape[:-1], dW.shape[0])
 
     @staticmethod
@@ -166,37 +208,45 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
         gS, uS, dS = ctx.scales
         dY = grad_out.reshape(-1, grad_out.shape[-1])
         needs_x = ctx.needs_input_grad[0]
+        debug_name = getattr(ctx, "debug_name", None)
+        _debug_nonfinite(debug_name, "backward_input", grad_out=dY)
 
         # Grad of the down-projection input h = silu(e)*g (does not need h itself):
         # d_h = dY@dW + dS*(dY@dB)@dA. This is the only new (N, inter) buffer in backward.
         d_P = dS * (dY @ dB)  # (N, r)
         d_h = torch.addmm(dY @ dW, d_P, dA)  # (N, inter)
+        _debug_nonfinite(debug_name, "backward_down_input", d_P=d_P, d_h=d_h)
 
         # Recompute SwiGLU and produce (h, d_g, d_e) in the (d_h, e, g) buffers (in place).
         h, d_g, d_e = _swiglu_bwd_inplace(d_h, e, g)
+        _debug_nonfinite(debug_name, "backward_swiglu", h=h, d_up=d_g, d_gate=d_e)
 
         # ---- down LoRA grads (use recomputed h): out = h@dW.T + dS*(h@dA.T)@dB.T ----
         P = F.linear(h, dA)  # (N, r)
         d_dB = dS * (dY.t() @ P)  # (hidden, r)
         d_dA = d_P.t() @ h  # (r, inter)
+        _debug_nonfinite(debug_name, "backward_down_lora", P=P, d_down_A=d_dA, d_down_B=d_dB)
 
         # ---- up: g = x@uW.T + uS*(x@uA.T)@uB.T ----
         Q = F.linear(x, uA)  # (N, r)
         d_uB = uS * (d_g.t() @ Q)  # (inter, r)
         d_Q = uS * (d_g @ uB)  # (N, r)
         d_uA = d_Q.t() @ x  # (r, hidden)
+        _debug_nonfinite(debug_name, "backward_up_lora", Q=Q, d_Q=d_Q, d_up_A=d_uA, d_up_B=d_uB)
 
         # ---- gate: e = x@gW.T + gS*(x@gA.T)@gB.T ----
         R = F.linear(x, gA)  # (N, r)
         d_gB = gS * (d_e.t() @ R)  # (inter, r)
         d_R = gS * (d_e @ gB)  # (N, r)
         d_gA = d_R.t() @ x  # (r, hidden)
+        _debug_nonfinite(debug_name, "backward_gate_lora", R=R, d_R=d_R, d_gate_A=d_gA, d_gate_B=d_gB)
 
         d_x = None
         if needs_x:
             # gate base+lora (d_e@gW + d_R@gA) plus up base+lora (d_g@uW + d_Q@uA)
             d_x = torch.addmm(d_e @ gW, d_R, gA)
             d_x = d_x.addmm_(d_g, uW).addmm_(d_Q, uA).view(ctx.orig_shape)
+        _debug_nonfinite(debug_name, "backward_output", d_x=d_x)
 
         # Each returned gradient must live on the same device as its corresponding input. Under
         # pipeline-parallel graph construction torch tracks the LoRA parameters on the meta device
@@ -211,7 +261,10 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
             d_x = d_x.to(x.device)
 
         # order matches forward(x, gW, gA, gB, gS, uW, uA, uB, uS, dW, dA, dB, dS)
-        return (d_x, None, d_gA, d_gB, None, None, d_uA, d_uB, None, None, d_dA, d_dB, None)
+        grads = (d_x, None, d_gA, d_gB, None, None, d_uA, d_uB, None, None, d_dA, d_dB, None)
+        if getattr(ctx, "has_debug_name_input", False):
+            return grads + (None,)
+        return grads
 
 
 def _fusible(module) -> bool:
@@ -242,7 +295,7 @@ def _fusible(module) -> bool:
     return True
 
 
-def fused_lora_swiglu_mlp(gate, up, down, x):
+def fused_lora_swiglu_mlp(gate, up, down, x, debug_name: str | None = None):
     """Run ``down(silu(gate(x)) * up(x))`` through the fused LoRA autograd function.
 
     ``gate``/``up``/``down`` are ``LinearLoRA`` modules. Returns the MLP output, or ``None`` if the
@@ -251,7 +304,7 @@ def fused_lora_swiglu_mlp(gate, up, down, x):
     """
     if not (_fusible(gate) and _fusible(up) and _fusible(down)):
         return None
-    return LoRASwiGLUMLPFunction.apply(
+    args = (
         x,
         gate.weight,
         gate.lora_A.weight,
@@ -266,6 +319,9 @@ def fused_lora_swiglu_mlp(gate, up, down, x):
         down.lora_B.weight,
         down.scale,
     )
+    if debug_name is not None:
+        return LoRASwiGLUMLPFunction.apply(*args, debug_name)
+    return LoRASwiGLUMLPFunction.apply(*args)
 
 
 class LoRAReLU2MLPFunction(torch.autograd.Function):
@@ -414,9 +470,9 @@ def _projs_are_lora(module, projs) -> bool:
     return all(getattr(getattr(module, proj), "lora_A", None) is not None for proj in projs)
 
 
-def _swiglu_forward(mod, orig_forward):
+def _swiglu_forward(mod, orig_forward, debug_name: str | None = None):
     def forward(x):
-        out = fused_lora_swiglu_mlp(mod.gate_proj, mod.up_proj, mod.down_proj, x)
+        out = fused_lora_swiglu_mlp(mod.gate_proj, mod.up_proj, mod.down_proj, x, debug_name=debug_name)
         return out if out is not None else orig_forward(x)
 
     return forward
@@ -444,11 +500,11 @@ def install_fused_lora_mlp(model) -> int:
     Returns the number of MLP modules whose ``forward`` was swapped. Idempotent.
     """
     count = 0
-    for mlp in model.modules():
+    for name, mlp in model.named_modules():
         if getattr(mlp, "_lora_mlp_fused", False):
             continue
         if _is_silu_swiglu_mlp(mlp) and _projs_are_lora(mlp, ("gate_proj", "up_proj", "down_proj")):
-            mlp.forward = _swiglu_forward(mlp, mlp.forward)
+            mlp.forward = _swiglu_forward(mlp, mlp.forward, debug_name=name if _DEBUG_NAN else None)
         elif _is_relu2_mlp(mlp) and _projs_are_lora(mlp, ("up_proj", "down_proj")):
             mlp.forward = _relu2_forward(mlp, mlp.forward)
         else:
