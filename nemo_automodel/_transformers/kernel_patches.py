@@ -48,6 +48,26 @@ logger = logging.getLogger(__name__)
 _MODEL_RUNTIME_PATCHES = {}
 
 
+def _set_global_sdpa_backends(sdpa_method):
+    """Apply resolved SDPA backend constraints process-wide for checkpoint recompute."""
+    if sdpa_method is None:
+        return
+
+    enabled = {getattr(backend, "name", str(backend)) for backend in sdpa_method}
+    backend_setters = {
+        "FLASH_ATTENTION": "enable_flash_sdp",
+        "EFFICIENT_ATTENTION": "enable_mem_efficient_sdp",
+        "MATH": "enable_math_sdp",
+        "CUDNN_ATTENTION": "enable_cudnn_sdp",
+    }
+    for backend_name, setter_name in backend_setters.items():
+        setter = getattr(torch.backends.cuda, setter_name, None)
+        if setter is not None:
+            setter(backend_name in enabled)
+
+    logger.info("Set global SDPA backends to %s", sdpa_method)
+
+
 def _assert_same_signature(original, patched):
     """
     Raise AssertionError if the two call signatures differ.
@@ -79,6 +99,8 @@ def _patch_attention(obj, sdpa_method=None):
             SDPBackend.EFFICIENT_ATTENTION,
             SDPBackend.MATH,
         ]
+    else:
+        _set_global_sdpa_backends(sdpa_method)
     orig_forward = obj.forward
 
     def patch_method(method):
