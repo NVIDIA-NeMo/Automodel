@@ -125,7 +125,11 @@ class DistributedSetup:
 class MoEParallelizerConfig:
     """Configuration for MoE model parallelization (EP + FSDP settings)."""
 
-    ignore_router_for_ac: bool = False
+    # Default True: under activation checkpointing the MoE router output must be saved
+    # rather than recomputed. Recomputing the router can route a different number of tokens
+    # per expert than the forward pass, which makes torch.utils.checkpoint raise a
+    # CheckpointError on the backward recompute.
+    ignore_router_for_ac: bool = True
     reshard_after_forward: bool = False
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
     wrap_outer_model: bool = True
@@ -177,9 +181,12 @@ class FSDP2Config:
             activation checkpointing.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
         reshard_after_forward (Optional[bool]): Override layer-level FSDP2 resharding.
-            If ``None`` (default), AutoModel reshards all but the last layer outside
-            pipeline parallelism. Set ``False`` for a ZeRO-2-like benchmark where
-            gathered parameters stay resident after forward.
+            ``None`` preserves AutoModel's heuristic: pipeline-parallel layers do
+            not reshard after forward, while non-pipeline layers reshard all but
+            the last layer. Set ``False`` for a ZeRO-2-like benchmark where
+            gathered parameters stay resident after forward. Set ``True`` to force
+            resharding everywhere, including pipeline-parallel layers, which may
+            reduce throughput by adding per-microbatch all-gathers.
         enable_async_tensor_parallel (bool): Enable async tensor parallelism via
             ``torch._inductor.config._micro_pipeline_tp``.  Overlaps ReduceScatter with
             compute in row-parallel layers.  Requires ``sequence_parallel=True`` (forced

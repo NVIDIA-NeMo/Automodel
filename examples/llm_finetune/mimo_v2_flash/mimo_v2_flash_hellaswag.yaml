@@ -68,7 +68,7 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    dispatcher: deepep
+    dispatcher: hybridep
     experts: torch_mm
     gate_precision: float32
     enable_hf_state_dict_adapter: true
@@ -129,10 +129,12 @@ optimizer:
   weight_decay: 0.1
 
 wandb:
+  enable: false
   project: automodel-mimo-v2-flash
   name: mimo_v2_flash_hellaswag_16n
   mode: online
 
 ci:
+  time: "00:15:00"
   # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
   nodes: 16

@@ -85,6 +85,7 @@ checkpoint:
   restore_from: null
 
 wandb:
+  enable: false
   project: flux-finetuning
   mode: online
   name: flux_pretrain_ddp_test_run_1

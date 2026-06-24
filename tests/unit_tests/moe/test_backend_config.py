@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
+import logging
 
 import pytest
 import torch
@@ -122,66 +122,43 @@ class TestBackendConfigFakeGateNoise:
         assert config.fake_gate_noise == 0.3
 
 
-class TestBackendConfigEnableDeepepDeprecation:
-    """Test backwards compatibility for deprecated enable_deepep parameter."""
+class TestBackendConfigEnableDeepepRemoved:
+    """enable_deepep was removed: it is ignored (with a warning) and never alters dispatcher/experts."""
 
-    def test_enable_deepep_true_sets_dispatcher_deepep_and_experts_gmm(self):
-        """Test that enable_deepep=True sets dispatcher='deepep' and experts='gmm' with deprecation warning."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            config = BackendConfig(enable_deepep=True)
-            assert config.dispatcher == "deepep"
-            assert config.experts == "gmm"
-            assert config.enable_deepep is None  # Should be cleared after conversion
-            assert len(w) == 1
-            assert issubclass(w[0].category, DeprecationWarning)
-            assert "enable_deepep is deprecated" in str(w[0].message)
+    def test_enable_deepep_true_is_ignored_and_warns(self, caplog):
+        """enable_deepep=True is ignored; dispatcher/experts keep their explicit values and a warning is logged."""
+        with caplog.at_level(logging.WARNING):
+            config = BackendConfig(dispatcher="hybridep", experts="gmm", enable_deepep=True)
+        assert config.dispatcher == "hybridep"  # not overridden to "deepep"
+        assert config.experts == "gmm"
+        assert config.enable_deepep is None  # cleared after the warning
+        assert "enable_deepep is no longer supported" in caplog.text
 
-    def test_enable_deepep_false_sets_dispatcher_torch(self):
-        """Test that enable_deepep=False sets dispatcher='torch' with deprecation warning."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            config = BackendConfig(enable_deepep=False)
-            assert config.dispatcher == "torch"
-            expected_experts = "torch_mm" if torch.cuda.is_available() else "torch"
-            assert config.experts == expected_experts  # experts unchanged when enable_deepep=False
-            assert config.enable_deepep is None  # Should be cleared after conversion
-            assert len(w) == 1
-            assert issubclass(w[0].category, DeprecationWarning)
-            assert "enable_deepep is deprecated" in str(w[0].message)
+    def test_enable_deepep_false_is_ignored_and_warns(self, caplog):
+        """enable_deepep=False is ignored; the dispatcher is NOT forced to torch and a warning is logged."""
+        with caplog.at_level(logging.WARNING):
+            config = BackendConfig(dispatcher="deepep", experts="gmm", enable_deepep=False)
+        assert config.dispatcher == "deepep"  # not forced to "torch"
+        assert config.experts == "gmm"
+        assert config.enable_deepep is None
+        assert "enable_deepep is no longer supported" in caplog.text
 
-    def test_enable_deepep_none_no_warning(self):
-        """Test that enable_deepep=None (default) does not trigger warning."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
+    def test_enable_deepep_none_no_warning(self, caplog):
+        """enable_deepep=None (default) leaves the field as None and logs no warning."""
+        with caplog.at_level(logging.WARNING):
             config = BackendConfig()
-            assert config.enable_deepep is None
-            # No deprecation warning should be raised
-            deprecation_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
-            assert len(deprecation_warnings) == 0
+        assert config.enable_deepep is None
+        assert "enable_deepep" not in caplog.text
 
-    def test_enable_deepep_overrides_dispatcher_and_experts(self):
-        """Test that enable_deepep takes precedence over dispatcher and experts when both provided."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            # Even if dispatcher="torch" and experts="torch", enable_deepep=True should override them
+    def test_enable_deepep_does_not_override_explicit_dispatcher(self, caplog):
+        """A stale enable_deepep no longer wins over an explicit dispatcher/experts."""
+        with caplog.at_level(logging.WARNING):
             config = BackendConfig(dispatcher="torch", experts="torch", enable_deepep=True)
-            assert config.dispatcher == "deepep"
-            assert config.experts == "gmm"
-            assert len(w) == 1
-            assert issubclass(w[0].category, DeprecationWarning)
-
-    def test_enable_deepep_false_overrides_dispatcher_deepep(self):
-        """Test that enable_deepep=False overrides dispatcher='deepep'."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            config = BackendConfig(dispatcher="deepep", enable_deepep=False)
-            assert config.dispatcher == "torch"
-            assert len(w) == 1
-            assert issubclass(w[0].category, DeprecationWarning)
+        assert config.dispatcher == "torch"
+        assert config.experts == "torch"
 
     def test_dispatcher_without_enable_deepep(self):
-        """Test that dispatcher works correctly without enable_deepep."""
+        """dispatcher works correctly without enable_deepep (field stays None)."""
         config = BackendConfig(dispatcher="deepep")
         assert config.dispatcher == "deepep"
         assert config.enable_deepep is None
@@ -189,17 +166,6 @@ class TestBackendConfigEnableDeepepDeprecation:
         config = BackendConfig(dispatcher="torch")
         assert config.dispatcher == "torch"
         assert config.enable_deepep is None
-
-    def test_deprecation_warning_message_content(self):
-        """Test that deprecation warning message contains helpful migration info."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            BackendConfig(enable_deepep=True)
-            warning_message = str(w[0].message)
-            assert "experts='gmm'" in warning_message
-            assert "dispatcher='deepep'" in warning_message
-            assert "dispatcher='torch'" in warning_message
-            assert "will be removed in a future release" in warning_message
 
 
 class TestBackendConfigHybridEP:

@@ -1266,19 +1266,24 @@ def default_collate_fn(
         conversations, kept = _drop_overlong_samples(conversations, processor, max_length)
         examples = [examples[i] for i in kept]
 
-    processor_kwargs = {
-        "tokenize": True,
-        "padding": True,
-        "truncation": True,
-        "return_tensors": "pt",
-        "return_dict": True,
-    }
+    # transformers>=5 expects processing kwargs (padding/truncation/max_length) to be
+    # nested under `processor_kwargs`; only apply_chat_template's own controls
+    # (tokenize/return_dict/return_tensors) stay top-level. Passing them flat still
+    # works but logs, once per sample: "Kwargs passed to `processor.__call__` have to
+    # be in `processor_kwargs` dict, not in `**kwargs`".
+    processing_kwargs = {"padding": True, "truncation": True}
     if max_length is not None:
-        processor_kwargs["max_length"] = max_length
-        processor_kwargs["padding"] = "max_length"
+        processing_kwargs["max_length"] = max_length
+        processing_kwargs["padding"] = "max_length"
         if drop_overlong:
-            processor_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
-    batch = processor.apply_chat_template(conversations, **processor_kwargs)
+            processing_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
+    batch = processor.apply_chat_template(
+        conversations,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        processor_kwargs=processing_kwargs,
+    )
 
     if _post_tokenize_hook is not None:
         batch = _post_tokenize_hook(batch, processor)

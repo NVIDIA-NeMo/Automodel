@@ -210,7 +210,7 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
 
 def apply_ac(
     model: nn.Module,
-    ignore_router: bool = False,
+    ignore_router: bool = True,
     hidden_size: int | None = None,
     num_experts: int | None = None,
     selective: bool = False,
@@ -219,7 +219,9 @@ def apply_ac(
 
     Args:
         model: The model to apply activation checkpointing to.
-        ignore_router: If True, uses selective checkpointing that saves router outputs.
+        ignore_router: If True (the default), saves the MoE router output so the dispatch
+            is not recomputed under activation checkpointing (avoids a CheckpointError from
+            non-deterministic re-routing on recompute). If False, a warning is emitted.
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
         num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
             first, then falls back to model.config attributes.
@@ -228,6 +230,16 @@ def apply_ac(
             ``ignore_router``; the shared policy already saves expert-parallel communication
             collectives and ``topk``, so it composes with expert parallelism.
     """
+    if not selective and not ignore_router:
+        logger.warning(
+            "Activation checkpointing is enabled with ignore_router_for_ac=False. The MoE "
+            "router/dispatch will be recomputed in the backward pass, which can route a "
+            "different number of tokens per expert than the forward pass and crash with "
+            "torch.utils.checkpoint.CheckpointError ('Recomputed values ... have different "
+            "metadata'). Set ignore_router_for_ac=True (the default) to save the router "
+            "output and keep routing consistent across recompute."
+        )
+
     if selective:
         # Reuse the dense FSDP2 selective policy so the save-op set (attention,
         # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
@@ -316,9 +328,7 @@ def apply_ac(
     for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
         if mtp_repeated and id(block) in mtp_block_ids:
             continue
-        if ignore_router and hasattr(block, "set_activation_checkpointing"):
-            block.set_activation_checkpointing(True)
-        elif ignore_router:
+        if ignore_router:
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
@@ -630,7 +640,7 @@ def parallelize_model(
     ep_axis_name: str | None = None,
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool | str = False,
-    ignore_router_for_ac: bool = False,
+    ignore_router_for_ac: bool = True,
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,

@@ -70,7 +70,7 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -901,6 +901,19 @@ class TestFp32ParamRouting:
         q_proj_key = "model.language_model.layers.0.self_attn.q_proj.weight"
         assert out[q_proj_key] is sd[q_proj_key]
         assert out[q_proj_key].dtype == torch.bfloat16
+
+    def test_forced_hf_dtype_mapping_marks_gdn_fp32_params(self, adapter):
+        state_dict = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.float32),
+            "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.float32),
+            "model.language_model.layers.0.linear_attn.conv1d.weight": torch.zeros(4, dtype=torch.float32),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.float32),
+        }
+
+        assert adapter.forced_hf_dtype_mapping(state_dict) == {
+            "model.language_model.layers.0.linear_attn.A_log": "F32",
+            "model.language_model.layers.0.linear_attn.dt_bias": "F32",
+        }
 
     def test_convert_single_tensor_strips_holder(self, adapter):
         result = adapter.convert_single_tensor_to_hf(

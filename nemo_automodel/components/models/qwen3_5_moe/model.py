@@ -800,9 +800,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Keep the SSM-gating params (A_log/dt_bias) — isolated in each
         # linear_attn ``_fp32_params`` holder at construction — in fp32 storage
-        # even when the model's bulk dtype is bf16, matching the intrinsically-fp32
-        # dtype Qwen3.5 checkpoints store them in. cast_model_to_dtype() (called
-        # from initialize_weights) honors this list.
+        # even when the model's bulk dtype is bf16. cast_model_to_dtype() (called
+        # from initialize_weights) honors this AutoModel training-storage contract.
         keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
         if "_fp32_params" not in keep_fp32:
             keep_fp32.append("_fp32_params")

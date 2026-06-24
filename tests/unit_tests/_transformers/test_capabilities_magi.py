@@ -59,31 +59,41 @@ def test_uses_magi_attention_no_backend():
 # supports_cp / supports_sequence_packing / supports_cp_with_sequence_packing
 # --------------------------------------------------------------------------- #
 def _supports(attn, cp_size=1):
+    # ModelSupports holds the model weakly (in production the model owns it as
+    # ``model._supports``), so the caller must keep ``model`` alive for the
+    # duration of the capability check -- return it alongside.
+    model = _BackendModel(attn)
     mesh = SimpleNamespace(cp_size=cp_size)
-    return ModelSupports(_BackendModel(attn), mesh)
+    return model, ModelSupports(model, mesh)
 
 
 def test_supports_cp_admits_magi():
-    assert _supports("magi").supports_cp is True
+    model, supports = _supports("magi")
+    assert supports.supports_cp is True
 
 
 def test_supports_cp_rejects_flex_backend():
     """Regression: the gate was not broadened to every custom backend."""
-    assert _supports("flex").supports_cp is False
+    model, supports = _supports("flex")
+    assert supports.supports_cp is False
 
 
 def test_supports_sequence_packing_admits_magi():
-    assert _supports("magi").supports_sequence_packing is True
+    model, supports = _supports("magi")
+    assert supports.supports_sequence_packing is True
 
 
 def test_supports_cp_with_sequence_packing_admits_magi_at_cp2():
-    assert _supports("magi", cp_size=2).supports_cp_with_sequence_packing is True
+    model, supports = _supports("magi", cp_size=2)
+    assert supports.supports_cp_with_sequence_packing is True
 
 
 def test_supports_cp_with_sequence_packing_rejects_flex_at_cp2():
-    assert _supports("flex", cp_size=2).supports_cp_with_sequence_packing is False
+    model, supports = _supports("flex", cp_size=2)
+    assert supports.supports_cp_with_sequence_packing is False
 
 
 def test_supports_cp_with_sequence_packing_cp1_falls_back_to_packing():
     # at cp_size<=1 it reduces to plain sequence-packing support (magi qualifies).
-    assert _supports("magi", cp_size=1).supports_cp_with_sequence_packing is True
+    model, supports = _supports("magi", cp_size=1)
+    assert supports.supports_cp_with_sequence_packing is True
