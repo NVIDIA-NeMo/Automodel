@@ -70,6 +70,8 @@ class DFlashTrainerModule(nn.Module):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
+        loss_type: str = "dflash",
+        dpace_alpha: float = 0.5,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -80,11 +82,18 @@ class DFlashTrainerModule(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        self.loss_type = loss_type
+        self.dpace_alpha = float(dpace_alpha)
 
         # Block-wise decay-weighted CE. ``normalize="mean"`` gives a local
         # per-micro-batch decay-weighted mean; ``loss_decay_gamma=None`` disables
         # decay (uniform weights).
-        self.loss_fn = DFlashDecayLoss(loss_gamma=loss_decay_gamma, normalize="mean")
+        self.loss_fn = DFlashDecayLoss(
+            loss_gamma=loss_decay_gamma,
+            normalize="mean",
+            loss_type=loss_type,
+            dpace_alpha=dpace_alpha,
+        )
 
         # Per-block offset constant (block_size,) for label gathering / position ids.
         self.register_buffer("_block_offsets", torch.arange(block_size).view(1, 1, -1), persistent=False)

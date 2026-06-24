@@ -252,6 +252,8 @@ class DFlashStrategy(DLLMStrategy):
     - ``target_torch_dtype`` (default ``"bfloat16"``) — target dtype string.
     - ``block_size`` (default 0) — draft block size; 0 reads from draft config.
     - ``loss_decay_gamma`` (default 0.0) — γ for Eq. 4; 0 uses paper defaults.
+    - ``loss_type`` (default ``"dflash"``) — ``"dflash"`` or a D-PACE variant.
+    - ``dpace_alpha`` (default 0.5) — smoothing alpha for D-PACE variants.
     - ``num_blocks_per_sample`` (default 1) — N anchor blocks per sequence per
       step, enabling the multi-block sparse-attention pass from §4.2. Paper
       default is 512 (Appendix A.1); requires ``attention_backend=flex_attention``.
@@ -394,6 +396,8 @@ class DFlashStrategy(DLLMStrategy):
             loss_gamma=loss_gamma,
             use_fused_linear_ce=self.use_fused_linear_ce,
             chunk_size=ce_chunk_size,
+            loss_type=str(dflash_cfg.get("loss_type", "dflash")),
+            dpace_alpha=float(dflash_cfg.get("dpace_alpha", 0.5)),
         )
 
         # --- Multi-block ---

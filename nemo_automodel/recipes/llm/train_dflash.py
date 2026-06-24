@@ -211,6 +211,8 @@ class TrainDFlashRecipe(BaseRecipe):
             attention_backend=attention_backend,
             num_anchors=int(recipe_cfg.get("num_anchors", 512)),
             loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
+            loss_type=str(recipe_cfg.get("loss_type", "dflash")),
+            dpace_alpha=float(recipe_cfg.get("dpace_alpha", 0.5)),
         ).to(self.device)
         if self.dist_env.world_size > 1:
             trainer_module = DistributedDataParallel(
