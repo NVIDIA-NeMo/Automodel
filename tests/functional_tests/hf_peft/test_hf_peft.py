@@ -14,7 +14,21 @@
 
 import shutil
 
+import pytest
+
 from tests.utils.test_utils import run_test_script
+
+try:
+    import qwen_vl_utils  # noqa: F401
+
+    _has_qwen_vl_utils = True
+except ImportError:
+    _has_qwen_vl_utils = False
+
+skip_if_no_qwen_vl_utils = pytest.mark.skipif(
+    not _has_qwen_vl_utils,
+    reason="qwen_vl_utils is not installed (requires the vlm-media extra)",
+)
 
 TEST_FOLDER = "hf_peft"
 HF_PEFT_FSDP2_CHECKPOINT_FILENAME = "L2_HF_PEFT_FSDP2_Checkpoint.sh"
@@ -26,6 +40,7 @@ HF_PEFT_DEEPSEEK_MOE_LORA_FILENAME = "L2_HF_PEFT_DeepSeek_MoE_LoRA.sh"
 HF_PEFT_DORA_FSDP2_CHECKPOINT_FILENAME = "L2_HF_PEFT_DoRA_FSDP2_Checkpoint.sh"
 HF_MERGE_LORA_DENSE_FILENAME = "L2_Merge_LoRA_Dense.sh"
 HF_MERGE_LORA_MOE_FILENAME = "L2_Merge_LoRA_MoE.sh"
+
 
 class TestHFPEFT:
     def test_hf_peft_fsdp2_checkpoint(self):
@@ -48,6 +63,8 @@ class TestHFPEFT:
         finally:
             # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    @skip_if_no_qwen_vl_utils
     def test_hf_peft_vlm_fsdp2_checkpoint(self):
         try:
             run_test_script(TEST_FOLDER, HF_PEFT_VLM_FSDP2_CHECKPOINT_FILENAME)
