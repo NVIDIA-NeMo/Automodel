@@ -222,10 +222,13 @@ class TestDenseTextBackbone:
         assert out.last_hidden_state.shape == (1, 4, cfg.hidden_size)
         assert out.past_key_values is None
 
+    @pytest.mark.timeout(180)
     def test_forward_shape_mixed_layers(self):
         # The linear_attention block runs FLA's gated-delta-rule / causal_conv1d
         # kernels, which are CUDA-only (no CPU fallback when CUDA is present), so
-        # build the backbone and inputs on the GPU. Skip when no GPU is available.
+        # build the backbone and inputs on the GPU. The first run can spend over
+        # 60s in Triton compile/autotune on CI, so this smoke gets a narrow
+        # timeout override while the suite-level default stays strict.
         if not torch.cuda.is_available():
             pytest.skip("linear_attention forward requires CUDA (FLA kernels)")
         device = torch.device("cuda")
