@@ -54,7 +54,6 @@ distributed:
   strategy: fsdp2
   dp_size: none
   tp_size: 4
-  tp_plan: llama_nemotron_super_tp_plan  # registered DeciLM/nemotron-nas TP plan; custom-code arch has no default plan
   cp_size: 1
   ep_size: 1
   pipeline:
@@ -119,7 +118,7 @@ lr_scheduler:
 ci:
   recipe_owner: akoumpa
   nodes: 2
-  time: "00:55:00"  # 49B robustness (Phase 1-4 reloads of a 49B on 2 nodes) needs >45min
+  time: "01:15:00"  # 49B finetune+robustness runs ~51-55min wall-clock; 55min is too tight (a run hit 55.1min)
   vllm_deploy: true
   vllm_smoke_test: true  # 49B exceeds 1 GPU; use vLLM's native nemotron-nas backend (no HF reference load)
   vllm_deploy_gpus: 4  # expose 4 of the node's 8 GPUs for tensor-parallel vLLM load

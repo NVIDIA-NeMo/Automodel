@@ -233,15 +233,30 @@ def test_build_validation_dataloader_no_validation_keys():
     mock_build.assert_not_called()
 
 
-@pytest.mark.parametrize("attn,expect_packed", [("magi", True), ("te", True), ("sdpa", False)])
-def test_build_validation_dataloader_packs_val_for_thd_backends(monkeypatch, attn, expect_packed):
-    """The validation set is packed (cfg_ps passed) for THD-consuming backends.
+def test_build_validation_dataloader_no_validation_config():
+    cfg = ConfigNode(
+        {
+            "model": {},
+            "dataloader": {},
+        }
+    )
 
-    Regression: previously only TE triggered val packing; the magi backend left
-    validation unpacked, so at cp>1 magi sharded tiny per-example sequences
-    degenerately and inflated the val loss.
+    with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader") as mock_build:
+        result = build_validation_dataloader(cfg, dp_world_size=1, dp_rank=0, pp_enabled=False)
+
+    assert result == {}
+    mock_build.assert_not_called()
+
+
+@pytest.mark.parametrize("attn", ["magi", "te", "sdpa"])
+def test_build_validation_dataloader_packs_val_for_thd_collater(monkeypatch, attn):
+    """The validation set is packed (cfg_ps passed) when using the THD collater.
+
+    Regression: validation packing was previously gated by backend, so FA2/SDPA
+    configs with a THD collater left validation unpacked and repeatedly rebuilt
+    pipeline shapes for variable-length examples.
     """
-    # Pretend the (training) dataloader uses the THD packed collater.
+    # Pretend the validation dataloader uses the THD packed collater.
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda _cfg: True)
     cfg = ConfigNode(
         {
@@ -263,7 +278,66 @@ def test_build_validation_dataloader_packs_val_for_thd_backends(monkeypatch, att
     with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader", return_value=("dl", "tok")) as mock_build:
         build_validation_dataloader(cfg, dp_world_size=1, dp_rank=0, pp_enabled=False)
     _, kwargs = mock_build.call_args
-    assert (kwargs["cfg_ps"] is not None) is expect_packed
+    assert kwargs["cfg_ps"] is not None
+
+
+def test_build_validation_dataloader_skips_val_packing_without_pack_size(monkeypatch):
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda _cfg: True)
+    cfg = ConfigNode(
+        {
+            "model": {"backend": {"attn": "sdpa"}},
+            "dataloader": {},
+            "validation_dataloader": {},
+            "packed_sequence": {"packed_sequence_size": 0},
+            "distributed": {"cp_size": 1},
+            "step_scheduler": {
+                "local_batch_size": 1,
+                "global_batch_size": 8,
+                "max_steps": 5,
+                "val_every_steps": 1,
+            },
+            "seed": 42,
+            "validation_dataset": {"some": "cfg"},
+        }
+    )
+    with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader", return_value=("dl", "tok")) as mock_build:
+        build_validation_dataloader(cfg, dp_world_size=1, dp_rank=0, pp_enabled=False)
+    _, kwargs = mock_build.call_args
+    assert kwargs["cfg_ps"] is None
+
+
+def test_build_validation_dataloader_packs_val_when_model_requires_thd(monkeypatch):
+    """Models with backend-specific packed validation requirements can opt in."""
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda _cfg: True)
+    cfg = ConfigNode(
+        {
+            "model": {"backend": {"attn": "sdpa"}},
+            "dataloader": {},
+            "validation_dataloader": {},
+            "packed_sequence": {"packed_sequence_size": 1024},
+            "distributed": {"cp_size": 1},
+            "step_scheduler": {
+                "local_batch_size": 1,
+                "global_batch_size": 8,
+                "max_steps": 5,
+                "val_every_steps": 1,
+            },
+            "seed": 42,
+            "validation_dataset": {"some": "cfg"},
+        }
+    )
+
+    class ModelRequiresPackedVal:
+        def should_pack_validation_with_training(self):
+            return True
+
+    model = ModelRequiresPackedVal()
+    with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader", return_value=("dl", "tok")) as mock_build:
+        build_validation_dataloader(cfg, dp_world_size=1, dp_rank=0, pp_enabled=False, model=model)
+
+    _, kwargs = mock_build.call_args
+    assert kwargs["cfg_ps"] is cfg.packed_sequence
+    assert kwargs["model"] is model
 
 
 class DummyLinear(nn.Module):
@@ -505,6 +579,51 @@ def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatc
     assert ds._shard == (2, 1)
     # Shuffle called with buffer size and seed
     assert ds._shuffle_calls and ds._shuffle_calls[-1] == (8, 123)
+
+
+def test_build_dataloader_prepacked_sequence_skips_recipe_packing(monkeypatch):
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
+            "tokenizer": None,
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+        }
+    )
+    cfg_model = ConfigNode({})
+    cfg_ps = ConfigNode({"packed_sequence_size": 8, "prepacked": True})
+
+    class _PackedModel(nn.Module):
+        def forward(self, input_ids, seq_lens=None):
+            return input_ids
+
+    dl, tok = _build_dataloader(
+        cfg_ds=cfg_ds,
+        cfg_dl=cfg_dl,
+        cfg_model=cfg_model,
+        cfg_ps=cfg_ps,
+        seed=123,
+        local_batch_size=2,
+        global_batch_size=4,
+        max_steps=None,
+        val_check_interval=None,
+        dp_rank=0,
+        dp_world_size=1,
+        pp_enabled=False,
+        cp_size=1,
+        model=_PackedModel(),
+    )
+
+    assert dl == "dl"
+    assert tok is None
+    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
+    ds = mod.dl_factory_capture.captured["dataset"]
+    assert ds.__class__.__name__ == "DummyIterableDataset"
+    assert ds._shuffle_calls == []
 
 
 class _FlagCM(AbstractContextManager):
@@ -2167,8 +2286,9 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
             self.lin = nn.Linear(4, 8192)
             self.prepared = False
 
-        def prepare_model_inputs_for_cp(self, input_ids):
+        def prepare_model_inputs_for_cp(self, input_ids, **kwargs):
             self.prepared = True
+            self.num_chunks = kwargs.get("num_chunks")
             return {"_cp_full_logits_grad_touch": True}
 
         def forward(self, **batch):

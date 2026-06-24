@@ -73,7 +73,19 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
     yarn_get_mscale,
 )
+from nemo_automodel.components.models.glm_moe_dsa.cp import glm_dsa_cp_all_gather, glm_dsa_cp_enabled
+from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import (
+    is_dsa_kernel_available,
+    should_use_tilelang,
+    tilelang_indexer_topk,
+    tilelang_sparse_attention,
+)
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+def _dsa_kernel_backend(backend: BackendConfig) -> str:
+    """Resolve the DSA kernel path: TileLang sparse kernels or the dense torch path."""
+    return "tilelang" if backend.attn == "tilelang" else "torch"
 
 
 def _apply_index_rope_half_split(x: torch.Tensor, freqs_cis: torch.Tensor, qkv_format: str) -> torch.Tensor:
@@ -254,6 +266,49 @@ class GlmMoeDsaIndexer(nn.Module):
         # Combine pe and nope parts (rope slice first, matching the reference layout)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
+        cp_group = attn_kwargs.get("_glm_dsa_cp_group")
+        cp_enabled = glm_dsa_cp_enabled(cp_group)
+        if cp_enabled:
+            if qkv_format != "thd":
+                raise ValueError("GLM DSA context parallelism requires THD/packed sequences.")
+            k = glm_dsa_cp_all_gather(k, dim=0, cp_group=cp_group)
+
+        # TileLang sparse path (opt-in via backend.attn == "tilelang"): the fused lighting-indexer
+        # kernel computes logits + top-k directly, avoiding the dense [T, T_kv] score tensor. THD only.
+        if should_use_tilelang(
+            _dsa_kernel_backend(self.backend),
+            available=is_dsa_kernel_available("indexer"),
+            kernel_name="indexer",
+            tensors=(q, k),
+            require_bf16=True,
+        ):
+            if qkv_format != "thd":
+                raise ValueError(
+                    "TileLang DSA indexer requires THD/packed sequences (qkv_format='thd'); "
+                    f"got '{qkv_format}'. Use backend.attn in {{te, sdpa}} for the bshd dense path."
+                )
+            cu_seqlens = attn_kwargs.get("cu_seqlens")
+            if cu_seqlens is None:
+                raise ValueError("TileLang DSA indexer requires 'cu_seqlens' in attn_kwargs (THD packing metadata).")
+            # Fold the index softmax_scale (head_dim ** -0.5) into the per-head weight: the kernel
+            # computes relu(q·k) * w with no internal scale, and relu(s*x) == s*relu(x) for s > 0.
+            head_weights = self.weights_proj(x).float() * (self.num_heads**-0.5) * self.softmax_scale
+            return tilelang_indexer_topk(
+                q.contiguous(),
+                k.contiguous(),
+                head_weights.contiguous(),
+                cu_seqlens.flatten().to(torch.int32),
+                self.index_topk,
+                query_indices=attn_kwargs.get("glm_dsa_cp_query_indices"),
+                cu_seqlens_padded=(
+                    attn_kwargs["cu_seqlens_padded"].flatten().to(torch.int32)
+                    if "cu_seqlens_padded" in attn_kwargs
+                    else None
+                ),
+            )
+
+        if cp_enabled:
+            raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
 
         # NOTE: the reference Indexer applies a Hadamard rotation (`rotate_activation`) only as part
         # of its FP8 scoring kernel. The Hadamard transform is orthogonal, so it leaves the q·k index
@@ -412,13 +467,18 @@ class GlmMoeDsaMLA(nn.Module):
                 mscale = yarn_get_mscale(factor, mscale)
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
-        self.attn_module, self.attn_func = initialize_attn_module_and_func(
-            attn_impl=attn_impl,
-            num_attention_heads=self.n_heads,
-            num_qk_channels=self.qk_head_dim,
-            num_v_channels=self.v_head_dim,
-            softmax_scale=self.softmax_scale,
-        )
+        if attn_impl == "tilelang":
+            # The TileLang sparse path runs the SparseMLA kernel directly in forward; it never uses
+            # the dense attention module, and initialize_attn_module_and_func does not implement it.
+            self.attn_module, self.attn_func = None, None
+        else:
+            self.attn_module, self.attn_func = initialize_attn_module_and_func(
+                attn_impl=attn_impl,
+                num_attention_heads=self.n_heads,
+                num_qk_channels=self.qk_head_dim,
+                num_v_channels=self.v_head_dim,
+                softmax_scale=self.softmax_scale,
+            )
 
         # Initialize the Indexer. "shared" layers (GLM IndexShare) own no indexer and
         # reuse the previous full layer's top-k indices passed in via `prev_topk_indices`.
@@ -561,7 +621,69 @@ class GlmMoeDsaMLA(nn.Module):
                 )
             topk_indices = prev_topk_indices
 
-        # Build sparse bias/mask from top-k indices based on backend
+        # Compute Q from q_resid
+        q = self.q_b_proj(q_resid)
+
+        if qkv_format == "thd":
+            q = q.view(num_tokens, self.n_heads, self.qk_head_dim)
+        else:
+            q = q.view(bsz, seq_len, self.n_heads, self.qk_head_dim)
+
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        kv = self.kv_a_proj_with_mqa(x)
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv = self.kv_a_layernorm(kv)
+
+        # For MLA, k_pe needs an extra head dimension for apply_rotary_emb
+        head_unsqueeze_dim = 2 if qkv_format == "bshd" else 1
+        k_pe = k_pe.unsqueeze(head_unsqueeze_dim)
+
+        # Apply rotary embeddings to q_pe and k_pe
+        q_pe = apply_rotary_emb(q_pe, freqs_cis, qkv_format=qkv_format)
+        k_pe = apply_rotary_emb(k_pe, freqs_cis, qkv_format=qkv_format)
+
+        # Remove the head dimension we added to k_pe
+        k_pe = k_pe.squeeze(head_unsqueeze_dim)
+        cp_group = attn_kwargs.get("_glm_dsa_cp_group")
+        cp_enabled = glm_dsa_cp_enabled(cp_group)
+        if cp_enabled:
+            if qkv_format != "thd":
+                raise ValueError("GLM DSA context parallelism requires THD/packed sequences.")
+            kv = glm_dsa_cp_all_gather(kv, dim=0, cp_group=cp_group)
+            k_pe = glm_dsa_cp_all_gather(k_pe, dim=0, cp_group=cp_group)
+
+        # TileLang sparse path (opt-in via backend.attn == "tilelang"): run the gather-top-k sparse
+        # MLA kernel on the absorbed latent representation. The k_nope up-projection is folded into
+        # the query so attention runs over compressed latent KV, and w_vc maps the latent output back.
+        if _dsa_kernel_backend(self.backend) == "tilelang":
+            if qkv_format != "thd":
+                raise ValueError(
+                    "TileLang DSA sparse attention requires THD/packed sequences (qkv_format='thd'); "
+                    f"got '{qkv_format}'. Use backend.attn in {{te, sdpa}} for the bshd dense path."
+                )
+            w = self.kv_b_proj.weight.view(self.n_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
+            w_kc = w[:, : self.qk_nope_head_dim, :]
+            w_vc = w[:, self.qk_nope_head_dim :, :]
+            q_absorbed = torch.einsum("thd,hdc->thc", q_nope, w_kc.to(q_nope.dtype))
+            q_tl = torch.cat([q_absorbed, q_pe], dim=-1).to(torch.bfloat16)
+            kv_latent = torch.cat([kv, k_pe], dim=-1).unsqueeze(1).to(torch.bfloat16)
+            if not should_use_tilelang(
+                "tilelang",
+                available=is_dsa_kernel_available("sparse_attn"),
+                kernel_name="sparse_attn",
+                tensors=(q_tl, kv_latent),
+                require_bf16=True,
+            ):
+                raise RuntimeError("TileLang sparse attention was selected but did not pass validation.")
+            attn_out = tilelang_sparse_attention(q_tl, kv_latent, topk_indices, w_vc.to(q_tl.dtype), self.softmax_scale)
+            x = self.o_proj(attn_out.flatten(1))
+            if return_topk_indices:
+                return x, topk_indices
+            return x
+
+        # Dense reference path (te / sdpa / eager / flex): materialize the sparse mask and run full
+        # attention. Build the sparse bias/mask from the top-k indices based on backend.
         if self.backend.attn == "te":
             # For TE: build sparse bias for core_attention_bias (must match Q/K/V dtype)
             # Union across batches since TE expects [1, n_heads, S, S]
@@ -588,31 +710,6 @@ class GlmMoeDsaMLA(nn.Module):
                 attention_mask=attention_mask,
                 union_across_batches=False,
             )
-
-        # Compute Q from q_resid
-        q = self.q_b_proj(q_resid)
-
-        if qkv_format == "thd":
-            q = q.view(num_tokens, self.n_heads, self.qk_head_dim)
-        else:
-            q = q.view(bsz, seq_len, self.n_heads, self.qk_head_dim)
-
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-        kv = self.kv_a_proj_with_mqa(x)
-        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv = self.kv_a_layernorm(kv)
-
-        # For MLA, k_pe needs an extra head dimension for apply_rotary_emb
-        head_unsqueeze_dim = 2 if qkv_format == "bshd" else 1
-        k_pe = k_pe.unsqueeze(head_unsqueeze_dim)
-
-        # Apply rotary embeddings to q_pe and k_pe
-        q_pe = apply_rotary_emb(q_pe, freqs_cis, qkv_format=qkv_format)
-        k_pe = apply_rotary_emb(k_pe, freqs_cis, qkv_format=qkv_format)
-
-        # Remove the head dimension we added to k_pe
-        k_pe = k_pe.squeeze(head_unsqueeze_dim)
 
         q = torch.cat([q_nope, q_pe], dim=-1)
 
