@@ -119,24 +119,22 @@ def get_controlling_tie_word_embeddings(config: object, model_class_name: str) -
     Returns:
         bool: The controlling ``tie_word_embeddings`` value.
     """
-    # These composite models keep a genuinely separate (untied) top-level lm_head
-    # regardless of any nested text_config flag. Their real configs default to
-    # top-level untied; keep them untied so the checkpoint save path never drops
-    # lm_head.weight for them (preserves the ModelState non-tied guarantee).
-    force_untied_models = (
-        "Qwen3OmniMoeThinkerForConditionalGeneration",
+    # Composite models whose top-level / thinker config owns the lm_head tying
+    # decision; their nested ``text_config`` flag can disagree and must be ignored.
+    # Return the top-level flag (not a forced ``False``) so a constructor guard can
+    # still see and reject an unsupported ``top-level=True``. The checkpoint save
+    # path stays safe through the storage-based ``has_local_tied_lm_head()`` check,
+    # which only drops ``lm_head.weight`` when the tensors actually share storage.
+    composite_top_level_models = (
+        "Qwen2_5OmniThinkerForConditionalGeneration",
+        "Mistral3FP8VLMForConditionalGeneration",
         "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3OmniMoeThinkerForConditionalGeneration",
     )
-    if any(name in model_class_name for name in force_untied_models):
-        return False
+    if any(name in model_class_name for name in composite_top_level_models):
+        return bool(getattr(config, "tie_word_embeddings", False))
 
-    # General rule: HF ties lm_head on the TOP-LEVEL config flag, not a nested
-    # text_config (verified by construction for Gemma4 / Mistral3 / Qwen2.5-Omni
-    # under transformers 5.8.1: the top-level flag decides tying regardless of the
-    # nested value). This also covers composite models whose tying is controlled
-    # by the top-level / thinker flag, e.g.
-    # Qwen2_5OmniThinkerForConditionalGeneration and
-    # Mistral3FP8VLMForConditionalGeneration.
+    # General rule: the top-level config wins when it exposes the flag.
     if hasattr(config, "tie_word_embeddings"):
         return bool(config.tie_word_embeddings)
 

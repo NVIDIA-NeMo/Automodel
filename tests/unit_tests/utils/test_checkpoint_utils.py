@@ -45,25 +45,26 @@ def test_is_tied_word_embeddings_prefers_top_level_value():
     assert checkpoint_utils.is_tied_word_embeddings(DummyModel(top=False, text=True)) is False
 
 
-def test_is_tied_word_embeddings_respects_qwen3_vl_moe_exclusion():
-    """Qwen3VLMoe stays force-untied (separate top-level head), ignoring nested text_config=True."""
-
-    class DummyTextConfig:
-        tie_word_embeddings = True
+def test_is_tied_word_embeddings_qwen3_vl_moe_follows_top_level():
+    """Qwen3VLMoe follows its top-level flag, ignoring a conflicting nested text_config."""
 
     class DummyConfig:
-        tie_word_embeddings = False
+        def __init__(self, top: bool) -> None:
+            self.tie_word_embeddings = top
 
         def get_text_config(self):
-            return DummyTextConfig()
+            # Conflicting nested flag that must be ignored.
+            return SimpleNamespace(tie_word_embeddings=True)
 
     class Qwen3VLMoeForConditionalGeneration(nn.Module):
-        def __init__(self) -> None:
+        def __init__(self, top: bool) -> None:
             super().__init__()
-            self.config = DummyConfig()
+            self.config = DummyConfig(top)
 
-    model = Qwen3VLMoeForConditionalGeneration()
-    assert checkpoint_utils.is_tied_word_embeddings(model) is False
+    # top-level True is honored even though nested text_config is also True
+    assert checkpoint_utils.is_tied_word_embeddings(Qwen3VLMoeForConditionalGeneration(top=True)) is True
+    # top-level False wins over nested text_config True
+    assert checkpoint_utils.is_tied_word_embeddings(Qwen3VLMoeForConditionalGeneration(top=False)) is False
 
 
 def test_is_tied_word_embeddings_falls_back_to_top_level_when_no_text_config():
@@ -85,20 +86,21 @@ def test_is_tied_word_embeddings_handles_missing_config():
     assert checkpoint_utils.is_tied_word_embeddings(model) is False
 
 
-def test_is_tied_word_embeddings_respects_exclusion_list():
-    """Qwen3OmniMoeThinker stays force-untied even if a config sets the top-level flag.
+def test_is_tied_word_embeddings_qwen3_omni_moe_follows_top_level():
+    """Qwen3OmniMoeThinker reports its top-level config intent.
 
-    These composite models keep a separate top-level lm_head; the resolver hard-
-    excludes them so the checkpoint save path never drops lm_head.weight.
+    The resolver returns the actual controlling flag so a constructor guard can
+    detect/reject an unsupported top-level=True. Checkpoint save safety comes from
+    the storage-based has_local_tied_lm_head(), not from forcing this False.
     """
 
     class Qwen3OmniMoeThinkerForConditionalGeneration(nn.Module):
-        def __init__(self) -> None:
+        def __init__(self, top: bool) -> None:
             super().__init__()
-            self.config = SimpleNamespace(tie_word_embeddings=True)
+            self.config = SimpleNamespace(tie_word_embeddings=top)
 
-    model = Qwen3OmniMoeThinkerForConditionalGeneration()
-    assert checkpoint_utils.is_tied_word_embeddings(model) is False
+    assert checkpoint_utils.is_tied_word_embeddings(Qwen3OmniMoeThinkerForConditionalGeneration(top=True)) is True
+    assert checkpoint_utils.is_tied_word_embeddings(Qwen3OmniMoeThinkerForConditionalGeneration(top=False)) is False
 
 
 def test_get_controlling_tie_word_embeddings_top_level_first():
