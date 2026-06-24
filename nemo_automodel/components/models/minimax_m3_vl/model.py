@@ -248,6 +248,8 @@ class MiniMaxM3TextModel(nn.Module):
 class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Standalone M3 text backbone for causal LM (Stage 1 parity target)."""
 
+    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
+
     # The state-dict adapter loads every tensor from the checkpoint, so skip HF
     # random init on load (also avoids DTensor-collective hangs under sharding/PP).
     _skip_init_weights_on_load = True
@@ -368,6 +370,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # (vision_encoder.py) fp32 — the bf16 cast would otherwise round it and degrade
     # vision RoPE (see llama/rope_utils.py).
     _keep_in_fp32_modules = ["rotary_emb", "inv_freq"]
+    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
     _pp_keep_self_forward: bool = True
     mtp_outputs_are_logits = True
     # The state-dict adapter fully populates every tensor from the checkpoint

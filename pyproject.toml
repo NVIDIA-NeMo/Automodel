@@ -119,6 +119,13 @@ cuda = [
     # This is required to prevent ONNX errors arising from TE
     "onnxscript>=0.5.6",
     "transformer-engine[pytorch]>=2.14.1",
+    # DeepSeek-V4 TileLang kernels (enable backend.attn="tilelang": sparse MLA
+    # attention, lightning indexer, and the external TileKernels MHC sinkhorn).
+    "tilelang>=0.1.11",
+    "tile-kernels==1.0.0",
+    # tilelang 0.1.11 does not cap its TVM ffi dependency, but 0.1.12 is
+    # incompatible with its bundled TVM. Keep pip installs on the known-good ffi.
+    "apache-tvm-ffi<=0.1.11",
 ]
 cuda_source = [
     "bitsandbytes",
@@ -222,6 +229,7 @@ no-build-isolation-package = [
 constraint-dependencies = [
     "aiohttp>=3.13.3", # Address CVE GHSA-6mq8-rvhq-8wgg
     "cryptography>=46.0.7",
+    "diffusers>=0.38.0",
     "gitpython>=3.1.50",
     "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
     "mako>=1.3.11",
@@ -240,11 +248,17 @@ constraint-dependencies = [
     "pyjwt>=2.12.0",
     "pytest>=8.4.3",
     "pygments>=2.20.0",
+    # tilelang 0.1.11 bundles its own TVM but leaves apache-tvm-ffi unpinned, so it
+    # resolves to 0.1.12, which double-registers TVM FFI TypeAttrs against the
+    # bundled TVM and breaks the tilelang kernels (SIGABRT/instability on the GPU
+    # paths). Upstream capped it to <=0.1.11 (tile-ai/tilelang#2373); mirror that.
+    "apache-tvm-ffi<=0.1.11",
 ]
 override-dependencies = [
     "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
     # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin
     "urllib3>=2.7.0",
+    "thrift>=0.23.0",
 ]
 prerelease = "allow"
 

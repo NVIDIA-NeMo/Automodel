@@ -479,3 +479,14 @@ def test_named_plan_decilm_with_sequence_parallel():
     )
     assert "model.norm" in result
     assert "model.layers.*.self_attn.q_proj" in result
+
+
+def test_decilm_remote_code_class_auto_selects_nemotron_plan():
+    class DeciLMForCausalLM:
+        config = SimpleNamespace(model_type="nemotron-nas")
+
+    result = _get_parallel_plan(DeciLMForCausalLM(), sequence_parallel=False, tp_size=2)
+    assert "model.layers.*.self_attn.q_proj" in result
+    assert "model.layers.*.self_attn.k_proj" in result
+    assert "model.layers.*.self_attn.v_proj" in result
+    assert "model.layers.*.self_attn.qkv_proj" not in result
