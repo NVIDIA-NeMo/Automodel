@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.models.deepseek_v4 import layers as dsv4_layers
+from nemo_automodel.components.models.deepseek_v4 import optimized_kernels as dsv4_optimized_kernels
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import build_dsv4_cp_causal_padding_mask
 from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
@@ -914,6 +915,32 @@ class TestDeepseekV4OptimizedKernels:
         )
         torch.testing.assert_close(actual, expected)
         torch.testing.assert_close(actual_grad, expected_grad)
+
+    def test_sinkhorn_auto_backend_falls_back_to_torch_when_tilekernels_missing(self, monkeypatch):
+        monkeypatch.setattr(dsv4_optimized_kernels, "is_dsv4_kernel_available", lambda name: False)
+        torch.manual_seed(123)
+        x = torch.randn(2, 3, 4, 4)
+        grad = torch.randn_like(x)
+
+        expected, (expected_grad,) = _run_forward_backward(
+            lambda x_: sinkhorn_normalize_torch(x_, repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        actual, (actual_grad,) = _run_forward_backward(
+            lambda x_: dsv4_sinkhorn_normalize(x_, backend="auto", repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+    def test_tilelang_attention_keeps_sinkhorn_optional(self):
+        backend = type("Backend", (), {"attn": "tilelang"})()
+
+        assert dsv4_layers._dsv4_kernel_backend(backend) == "tilelang"
+        assert dsv4_layers._dsv4_sinkhorn_backend(backend) == "auto"
 
     def test_vendored_tilelang_module_imports_with_phony_decorator(self, monkeypatch):
         import builtins
