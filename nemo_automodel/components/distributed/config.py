@@ -43,6 +43,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
+from nemo_automodel.shared.multimodal_fsdp import FrozenMultimodalSharding, normalize_frozen_multimodal_sharding
+
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
     from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
@@ -203,6 +205,15 @@ class FSDP2Config:
             memory at a small throughput cost.  Default ``2``.
         fsdp2_forward_prefetch_depth (int): Number of FSDP units to prefetch during
             forward pass.  Default ``1``.
+        frozen_multimodal_sharding (str): Controls fully frozen multimodal modules
+            such as vision/audio towers and projectors. ``"shard"`` leaves fully
+            frozen multimodal parameters in an ancestor/root FSDP unit so they remain
+            sharded without creating modality-specific FSDP units that may not run on
+            text-only batches. If no ancestor/root FSDP unit is wrapped around them,
+            they remain replicated. ``"replicate"`` excludes fully frozen multimodal
+            parameters from FSDP roots so each rank keeps a full copy. If any parameter
+            in a multimodal module is trainable, the module is sharded separately
+            regardless of this setting.
     """
 
     sequence_parallel: bool = False
@@ -226,6 +237,7 @@ class FSDP2Config:
     enable_fsdp2_prefetch: bool = False
     fsdp2_backward_prefetch_depth: int = 2
     fsdp2_forward_prefetch_depth: int = 1
+    frozen_multimodal_sharding: FrozenMultimodalSharding = "shard"
 
     def __post_init__(self):
         if self.mp_policy is None:
@@ -238,6 +250,7 @@ class FSDP2Config:
                 output_dtype=torch.bfloat16,
                 cast_forward_inputs=True,
             )
+        self.frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(self.frozen_multimodal_sharding)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary (shallow, preserves policy objects)."""

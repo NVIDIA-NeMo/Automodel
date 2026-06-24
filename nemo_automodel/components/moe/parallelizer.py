@@ -34,6 +34,14 @@ from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedE
 from nemo_automodel.components.moe.layers import (
     MoE,
 )
+from nemo_automodel.shared.multimodal_fsdp import (
+    FrozenMultimodalSharding,
+    ignored_params_for_root,
+    iter_multimodal_modules,
+    module_parameters,
+    normalize_frozen_multimodal_sharding,
+    shard_trainable_multimodal_module,
+)
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -389,8 +397,10 @@ def apply_fsdp(
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
+    frozen_multimodal_sharding: FrozenMultimodalSharding = "shard",
 ):
     """Apply FSDP wrapping to MoE transformer blocks and model-level modules."""
+    frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
 
     if isinstance(lm_head_precision, str):
         lm_head_precision = dtype_from_str(lm_head_precision, default=None)
@@ -522,18 +532,25 @@ def apply_fsdp(
             lm_head_precision,
         )
 
-    # TODO: properly handle all possible multimodal component names
-    if hasattr(model, "audio_tower") and model.audio_tower is not None:
-        if any(param.requires_grad for param in model.audio_tower.parameters()):
-            fully_shard_default(model.audio_tower)
+    ignored_multimodal_params: set[nn.Parameter] = set()
+    for module_name, module in iter_multimodal_modules(model):
+        module_params = set(module_parameters(module))
+        if not module_params:
+            continue
+        module_is_trainable = any(param.requires_grad for param in module_params)
+        if module_is_trainable:
+            shard_trainable_multimodal_module(module, fully_shard_default)
         else:
-            logging.info("Skipping FSDP wrap for frozen audio tower")
-
-    if hasattr(model, "visual") and model.visual is not None:
-        if any(param.requires_grad for param in model.visual.parameters()):
-            fully_shard_default(model.visual)
-        else:
-            logging.info("Skipping FSDP wrap for frozen visual tower")
+            # Fully frozen modality towers/projectors can be skipped by batches
+            # without that modality. A standalone FSDP unit depends on its own
+            # forward pre-hook to create lazy unsharded state; if the unit never
+            # runs, deferred post-backward can touch missing state. In shard
+            # mode, leave these params to an always-run ancestor/root FSDP unit.
+            # In replicate mode, the root ignores them so each rank keeps a
+            # full copy.
+            logger.info("Skipping separate FSDP wrap for frozen multimodal module %s", module_name)
+            if frozen_multimodal_sharding == "replicate":
+                ignored_multimodal_params.update(module_params)
 
     if tied_embeddings_cross_fsdp_roots and wrap_outer_model and model is not _model:
         logger.info(
@@ -546,11 +563,15 @@ def apply_fsdp(
                 "lm_head.weight is tied to embed_tokens.weight across the outer model boundary, but "
                 "wrap_outer_model=False prevents preserving the tie in one FSDP root."
             )
-        fully_shard_default(_model)
+        fully_shard_default(_model, ignored_params=ignored_params_for_root(_model, ignored_multimodal_params))
 
     # If model has a nested structure (outer model wrapping inner _model), wrap the outer model if requested
+    # If wrap_outer_model=False, skipped frozen multimodal params outside _model
+    # are not owned by this outer root; in shard mode they remain replicated
+    # instead of root-sharded. Keep wrap_outer_model=True for root-sharded frozen
+    # towers on nested VLM/MoE models.
     if wrap_outer_model and model is not _model:
-        fully_shard_default(model)
+        fully_shard_default(model, ignored_params=ignored_params_for_root(model, ignored_multimodal_params))
 
 
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
@@ -645,6 +666,7 @@ def parallelize_model(
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
+    frozen_multimodal_sharding: FrozenMultimodalSharding = "shard",
 ):
     """Apply context, expert, activation-checkpointing, and FSDP parallelism."""
 
@@ -693,4 +715,5 @@ def parallelize_model(
             reshard_after_forward=reshard_after_forward,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,
+            frozen_multimodal_sharding=frozen_multimodal_sharding,
         )

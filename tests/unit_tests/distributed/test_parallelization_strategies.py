@@ -34,6 +34,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     HunyuanParallelizationStrategy,
     NemotronHParallelizationStrategy,
     ParallelizationStrategy,
+    Qwen3_5ParallelizationStrategy,
     WanParallelizationStrategy,
     _extract_model_layers,
     _nemotronh_decoder_blocks,
@@ -304,6 +305,7 @@ class TestDefaultParallelizationStrategy:
             "dp_replicate_mesh_name",
             "dp_shard_cp_mesh_name",
             "tp_mesh_name",
+            "frozen_multimodal_sharding",
         ]
 
         for param in required_params:
@@ -596,6 +598,69 @@ class TestNemotronHParallelizationStrategy:
         # Should apply checkpoint wrapper to both MLP and Mamba layers
         expected_checkpoint_calls = 3  # 2 MLP (from MockNemotronHModel) + 1 Mamba layer
         assert mock_checkpoint.call_count == expected_checkpoint_calls
+
+
+class TestQwen3_5ParallelizationStrategy:
+    """Test the Qwen3.5 dtype-based FSDP strategy."""
+
+    @pytest.fixture
+    def strategy(self):
+        """Create a Qwen3_5ParallelizationStrategy instance."""
+        return Qwen3_5ParallelizationStrategy()
+
+    @pytest.mark.parametrize(
+        "frozen_multimodal_sharding, expected_ignored",
+        [("shard", False), ("replicate", True)],
+    )
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    def test_frozen_multimodal_modules_are_not_separately_sharded(
+        self,
+        fully_shard_by_dtype,
+        fully_shard,
+        strategy,
+        mock_device_mesh,
+        frozen_multimodal_sharding,
+        expected_ignored,
+    ):
+        """Frozen multimodal modules stay out of standalone FSDP units."""
+
+        class MockQwen35Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([nn.Linear(10, 10)])
+                self.vision_tower = nn.Module()
+                self.vision_tower.layers = nn.ModuleList([nn.Linear(10, 10)])
+
+        class MockQwen35Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(num_attention_heads=8, num_key_value_heads=8, hidden_size=64)
+                self.model = MockQwen35Inner()
+
+        mesh, _, _, _ = mock_device_mesh
+        model = MockQwen35Model()
+        for param in model.model.vision_tower.parameters():
+            param.requires_grad_(False)
+        frozen_vision_params = set(model.model.vision_tower.parameters())
+        fully_shard.side_effect = lambda model, **kwargs: model
+        fully_shard_by_dtype.side_effect = lambda model, *args, **kwargs: model
+
+        result = strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            frozen_multimodal_sharding=frozen_multimodal_sharding,
+        )
+
+        sharded_by_dtype = [call_args.args[0] for call_args in fully_shard_by_dtype.call_args_list]
+        assert result is model
+        assert model.model.layers[0] in sharded_by_dtype
+        assert model.model.vision_tower.layers[0] not in sharded_by_dtype
+        root_kwargs = fully_shard.call_args_list[-1].kwargs
+        if expected_ignored:
+            assert root_kwargs["ignored_params"] == frozen_vision_params
+        else:
+            assert "ignored_params" not in root_kwargs
 
 
 class TestStrategyRegistry:
@@ -951,6 +1016,7 @@ class TestFsdp2StrategyParallelizeIntegration:
             "dp_replicate_mesh_name",
             "dp_shard_cp_mesh_name",
             "tp_mesh_name",
+            "frozen_multimodal_sharding",
         ]
 
         for param in expected_params:
@@ -962,6 +1028,7 @@ class TestFsdp2StrategyParallelizeIntegration:
         assert sig.parameters["dp_replicate_mesh_name"].default == "dp_replicate"
         assert sig.parameters["dp_shard_cp_mesh_name"].default == "dp_shard_cp"
         assert sig.parameters["tp_mesh_name"].default == "tp"
+        assert sig.parameters["frozen_multimodal_sharding"].default == "shard"
 
 
 class TestStrategyExtensibility:

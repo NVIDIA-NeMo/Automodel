@@ -344,6 +344,11 @@ def instantiate_infrastructure(
         moe_kwargs = moe_parallel_config.to_dict()
         if moe_kwargs.get("mp_policy") is None and model_wrapper is not None:
             moe_kwargs["mp_policy"] = getattr(model_wrapper, "mp_policy", None)
+        if model_wrapper is not None:
+            moe_kwargs.setdefault(
+                "frozen_multimodal_sharding",
+                getattr(model_wrapper, "frozen_multimodal_sharding", "shard"),
+            )
         parallelize_fn = partial(
             parallelize_model,
             activation_checkpointing=activation_checkpointing,
