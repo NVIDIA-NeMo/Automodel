@@ -75,8 +75,13 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
 
 
 def _dsv4_kernel_backend(backend: BackendConfig) -> str:
-    """Use TileLang DSV4 kernels only when the attention backend requests them."""
+    """Use TileLang DSV4 sparse kernels only when the attention backend requests them."""
     return "tilelang" if backend.attn == "tilelang" else "torch"
+
+
+def _dsv4_sinkhorn_backend(backend: BackendConfig) -> str:
+    """Use optional TileKernels sinkhorn when available, otherwise torch fallback."""
+    return "auto" if backend.attn == "tilelang" else "torch"
 
 
 def _rms_norm_last_dim(x: torch.Tensor, eps: float) -> torch.Tensor:
