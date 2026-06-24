@@ -583,6 +583,24 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             val_ds_name = "default"
         return val_ds_name
 
+    # Pack validation when it explicitly consumes THD/cu_seqlens metadata, or
+    # when a backend/model requires validation to follow training's THD layout.
+    _magi_backend = (
+        str(cfg.get("model.backend.attn", "")) == "magi" or str(cfg.get("model.attn_implementation", "")) == "magi"
+    )
+    _model_packs_validation = bool(
+        model is not None
+        and callable(getattr(model, "should_pack_validation_with_training", None))
+        and model.should_pack_validation_with_training()
+    )
+    _backend_packs_validation = _uses_te_dot_product_attention(cfg.model) or _magi_backend or _model_packs_validation
+    cfg_validation_dataloader = cfg.get("validation_dataloader", None)
+    _validation_uses_thd = _uses_thd_collater(cfg_validation_dataloader)
+    _training_uses_thd = _uses_thd_collater(cfg.get("dataloader", None))
+    _pack_val = cfg.get("packed_sequence.packed_sequence_size", 0) > 0 and (
+        _validation_uses_thd or (_backend_packs_validation and _training_uses_thd)
+    )
+
     # Build validation dataloader if the config provides it
     val_dataloaders = {}
     for val_ds_name in filter(lambda x: x.startswith("validation_dataset"), cfg.to_dict().keys()):
@@ -590,11 +608,9 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
         val_ds_name = _prepare_val_ds_name(val_ds_name)
         val_dataloaders[val_ds_name] = build_dataloader(
             val_ds_cfg,
-            cfg.validation_dataloader,
+            cfg_validation_dataloader,
             cfg.model,
-            cfg_ps=cfg.get("packed_sequence", None)
-            if _uses_te_dot_product_attention(cfg.model) and _uses_thd_collater(cfg.dataloader)
-            else None,
+            cfg_ps=cfg.get("packed_sequence", None) if _pack_val else None,
             seed=cfg.get("seed", 42),
             local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
             global_batch_size=cfg.get("step_scheduler.global_batch_size", 1),
