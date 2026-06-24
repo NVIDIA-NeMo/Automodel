@@ -81,8 +81,13 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
 
 
 def _dsv4_kernel_backend(backend: BackendConfig) -> str:
-    """Use TileLang DSV4 kernels only when the attention backend requests them."""
+    """Use TileLang DSV4 sparse kernels only when the attention backend requests them."""
     return "tilelang" if backend.attn == "tilelang" else "torch"
+
+
+def _dsv4_sinkhorn_backend(backend: BackendConfig) -> str:
+    """Use optional TileKernels sinkhorn when available, otherwise torch fallback."""
+    return "auto" if backend.attn == "tilelang" else "torch"
 
 
 def _rms_norm_last_dim(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -501,10 +506,18 @@ def build_causal_padding_mask(
     if attention_mask.dim() == 4:
         return attention_mask.to(dtype)
     if attention_mask.dim() == 2:
-        # 1=valid, 0=padding -> 0 keep, min_value mask, broadcast over query rows
-        pad_add = (1.0 - attention_mask.to(dtype)) * min_value  # [B, S]
-        pad_add = pad_add.unsqueeze(1).unsqueeze(2)  # [B,1,1,S]
-        return (causal + pad_add).to(dtype)
+        # 1=valid, 0=padding.  Overwrite padded key columns with ``min_value``
+        # instead of ADDING a second ``min_value`` plane: a cell that is masked
+        # by BOTH the causal/sliding-window mask AND padding would otherwise sum
+        # two ``min_value`` planes, which overflows to ``-inf`` in low precision
+        # (bf16: -3.39e38 + -3.39e38 -> -inf).  An ``-inf`` logit poisons the
+        # softmax backward (0 * inf -> NaN), producing nan grad_norm at step 0.
+        # Masking via where keeps masked cells at exactly ``min_value`` and
+        # matches the sibling builders (build_packed_causal_padding_mask,
+        # build_dsv4_cp_causal_padding_mask).
+        causal = causal.expand(attention_mask.shape[0], 1, seq_len, seq_len)
+        is_pad_key = (attention_mask == 0).to(device).view(attention_mask.shape[0], 1, 1, seq_len)
+        return torch.where(is_pad_key, torch.full((), min_value, dtype=dtype, device=device), causal).to(dtype)
     raise ValueError(f"Unsupported attention_mask rank: {attention_mask.dim()}")
 
 
