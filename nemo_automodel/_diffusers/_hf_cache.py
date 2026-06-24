@@ -31,6 +31,11 @@ from nemo_automodel.shared.import_utils import safe_import
 
 HF_HUB_AVAILABLE, _ = safe_import("huggingface_hub")
 
+if HF_HUB_AVAILABLE:
+    from huggingface_hub import snapshot_download
+else:
+    snapshot_download = None
+
 
 def resolve_diffusion_model_dir(model_id: str) -> str:
     """Resolve a HF repo id to a local snapshot directory.
@@ -52,8 +57,6 @@ def resolve_diffusion_model_dir(model_id: str) -> str:
     """
     if os.path.isdir(model_id) or not HF_HUB_AVAILABLE:
         return model_id
-
-    from huggingface_hub import snapshot_download
 
     if os.environ.get("HF_HUB_OFFLINE", "0") != "1":
         # Cold cache + online: fetch the snapshot once.
