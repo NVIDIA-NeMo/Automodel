@@ -159,6 +159,35 @@ class TestNemotronV3Model:
         output = model(input_ids)
         assert output.shape == (batch_size, seq_len, config.hidden_size)
 
+    def test_get_capabilities_moe_supports_ep(self):
+        """MoE config (has experts) reports supports_ep=True."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        caps = NemotronHForCausalLM.get_capabilities(MockNemotronV3Config())
+        assert caps.supports_ep is True
+
+    def test_get_capabilities_dense_no_ep(self):
+        """Dense config (no experts) reports supports_ep=False (PR #2670 review / #2004)."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config = MockNemotronV3Config(layers_block_type=["attention", "mlp"])
+        for attr in (
+            "n_routed_experts",
+            "num_experts_per_tok",
+            "n_group",
+            "topk_group",
+            "routed_scaling_factor",
+            "moe_intermediate_size",
+            "norm_topk_prob",
+            "moe_shared_expert_intermediate_size",
+        ):
+            delattr(config, attr)
+        caps = NemotronHForCausalLM.get_capabilities(config)
+        assert caps.supports_ep is False
+        assert caps.supports_cp is True
+        assert caps.supports_pp is True
+        assert caps.supports_tp is False
+
     def test_model_embedding_dimensions(self, config, backend):
         """Test that embeddings have correct dimensions."""
         from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model

@@ -22,6 +22,7 @@ from transformers import AutoConfig
 from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import (
     BackendConfig,
     HFCheckpointingMixin,
@@ -306,14 +307,19 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     # Skip patch_hf_model_for_pp; our forward already handles PP routing.
     _pp_keep_self_forward: bool = True
 
-    @dataclass(frozen=True)
-    class ModelCapabilities:
-        """Declared parallelism capabilities for this model class."""
+    @classmethod
+    def get_capabilities(cls, config) -> ModelCapabilities:
+        """Return parallelism capabilities for a specific Nemotron-H config.
 
-        supports_tp: bool = False
-        supports_cp: bool = True
-        supports_pp: bool = True
-        supports_ep: bool = True
+        NemotronHForCausalLM serves both the MoE ("v3") and the dense Nemotron-H
+        variants. Expert parallelism only applies when the config actually has MoE
+        layers; a dense config has no experts to parallelize, so supports_ep must
+        be False for it (see #2004). The other flags are the same for both.
+        """
+        is_moe = getattr(config, "n_routed_experts", None) is not None or "moe" in (
+            getattr(config, "layers_block_type", None) or []
+        )
+        return ModelCapabilities(supports_cp=True, supports_pp=True, supports_ep=is_moe)
 
     @classmethod
     def from_config(
