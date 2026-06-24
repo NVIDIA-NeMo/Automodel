@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.config import MoEConfig
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
@@ -573,6 +574,29 @@ class TestNemotronHForCausalLM:
         model = NemotronHForCausalLM(config, backend=backend)
 
         assert hasattr(model, "state_dict_adapter")
+
+    def test_mamba_decay_params_stay_fp32_after_bf16_cast(self, config, backend):
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.layers_block_type = ["mamba", "attention"]
+        model = NemotronHForCausalLM(config, backend=backend)
+        expected = {}
+        for name, param in model.named_parameters():
+            if name.endswith(("A_log", "dt_bias", "D")):
+                values = torch.linspace(0.00123, 0.00456, param.numel(), dtype=torch.float32).reshape_as(param)
+                param.data.copy_(values)
+                expected[name] = values
+
+        assert expected, "Nemotron V3 Mamba layers should create decay parameters"
+        assert all("._fp32_params." in name for name in expected)
+
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        params = dict(model.named_parameters())
+        for name, values in expected.items():
+            assert params[name].dtype == torch.float32
+            torch.testing.assert_close(params[name], values)
+        assert model.lm_head.weight.dtype == torch.bfloat16
 
     def test_model_class_export(self):
         """Test that ModelClass is exported correctly."""

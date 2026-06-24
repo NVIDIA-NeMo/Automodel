@@ -227,6 +227,50 @@ class TestNemotronV3AdapterToHf:
         assert "backbone.embeddings.weight" in hf_state_dict
         assert "exclude_me.weight" not in hf_state_dict
 
+    def test_to_hf_hides_mamba_fp32_holder(self, config, moe_config, backend):
+        """Test to_hf maps internal Mamba fp32 holder keys back to public HF keys."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+
+        state_dict = {
+            "model.layers.0.mixer._fp32_params.A_log": torch.randn(4, dtype=torch.bfloat16),
+            "model.layers.0.mixer._fp32_params.dt_bias": torch.randn(4, dtype=torch.bfloat16),
+            "model.layers.0.mixer._fp32_params.D": torch.randn(4, dtype=torch.bfloat16),
+        }
+
+        hf_state_dict = adapter.to_hf(state_dict)
+
+        assert "backbone.layers.0.mixer.A_log" in hf_state_dict
+        assert "backbone.layers.0.mixer.dt_bias" in hf_state_dict
+        assert "backbone.layers.0.mixer.D" in hf_state_dict
+        assert "backbone.layers.0.mixer._fp32_params.A_log" not in hf_state_dict
+        assert "backbone.layers.0.mixer._fp32_params.dt_bias" not in hf_state_dict
+        assert "backbone.layers.0.mixer._fp32_params.D" not in hf_state_dict
+        assert hf_state_dict["backbone.layers.0.mixer.A_log"].dtype == torch.float32
+        assert hf_state_dict["backbone.layers.0.mixer.dt_bias"].dtype == torch.float32
+        assert hf_state_dict["backbone.layers.0.mixer.D"].dtype == torch.float32
+
+    def test_forced_hf_dtype_mapping_marks_fp32_protected_keys(self, config, moe_config, backend):
+        """Test Nemotron fp32-protected HF export keys keep fp32 consolidated metadata."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+
+        state_dict = {
+            "backbone.layers.0.mixer.A_log": torch.randn(4, dtype=torch.float32),
+            "backbone.layers.0.mixer.dt_bias": torch.randn(4, dtype=torch.float32),
+            "backbone.layers.0.mixer.D": torch.randn(4, dtype=torch.float32),
+            "backbone.layers.0.mixer.router.e_score_correction_bias": torch.randn(4, dtype=torch.float32),
+            "backbone.layers.0.mixer.in_proj.weight": torch.randn(4, 4, dtype=torch.float32),
+            "lm_head.weight": torch.randn(4, 4, dtype=torch.bfloat16),
+        }
+
+        forced = adapter.forced_hf_dtype_mapping(state_dict)
+
+        assert forced == {
+            "backbone.layers.0.mixer.A_log": "F32",
+            "backbone.layers.0.mixer.dt_bias": "F32",
+            "backbone.layers.0.mixer.D": "F32",
+            "backbone.layers.0.mixer.router.e_score_correction_bias": "F32",
+        }
+
 
 class TestNemotronV3AdapterFromHf:
     """Test from_hf conversion."""
@@ -315,6 +359,31 @@ class TestNemotronV3AdapterFromHf:
 
             assert adapter._uses_model_prefix is True
 
+    def test_from_hf_routes_mamba_fp32_params_to_holder(self, config, moe_config, backend):
+        """Test from_hf maps public Mamba fp32 keys into the internal holder."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+
+        hf_state_dict = {
+            "backbone.layers.0.mixer.A_log": torch.randn(4, dtype=torch.bfloat16),
+            "backbone.layers.0.mixer.dt_bias": torch.randn(4, dtype=torch.bfloat16),
+            "backbone.layers.0.mixer.D": torch.randn(4, dtype=torch.bfloat16),
+        }
+
+        with patch.object(adapter, "_from_hf_w_merged_experts") as mock_merge:
+            mock_merge.return_value = {}
+            adapter.from_hf(hf_state_dict)
+
+            call_args = mock_merge.call_args[0][0]
+            assert "model.layers.0.mixer._fp32_params.A_log" in call_args
+            assert "model.layers.0.mixer._fp32_params.dt_bias" in call_args
+            assert "model.layers.0.mixer._fp32_params.D" in call_args
+            assert "model.layers.0.mixer.A_log" not in call_args
+            assert "model.layers.0.mixer.dt_bias" not in call_args
+            assert "model.layers.0.mixer.D" not in call_args
+            assert call_args["model.layers.0.mixer._fp32_params.A_log"].dtype == torch.float32
+            assert call_args["model.layers.0.mixer._fp32_params.dt_bias"].dtype == torch.float32
+            assert call_args["model.layers.0.mixer._fp32_params.D"].dtype == torch.float32
+
 
 class TestNemotronV3AdapterConvertSingleTensor:
     """Test convert_single_tensor_to_hf method."""
@@ -386,6 +455,19 @@ class TestNemotronV3AdapterConvertSingleTensor:
         assert len(result) == 1
         assert result[0][0] == "backbone.layers.0.mixer.weight"
         assert torch.equal(result[0][1], tensor)
+
+    def test_convert_mamba_fp32_holder_weight(self, config, moe_config, backend):
+        """Test single-tensor conversion hides Mamba fp32 holder keys."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(4, dtype=torch.bfloat16)
+        fqn = "model.layers.0.mixer._fp32_params.D"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+        assert len(result) == 1
+        assert result[0][0] == "backbone.layers.0.mixer.D"
+        assert result[0][1].dtype == torch.float32
 
     def test_convert_expert_tensor(self, config, moe_config, backend):
         """Test converting merged expert tensor to split experts."""

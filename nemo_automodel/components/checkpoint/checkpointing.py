@@ -125,6 +125,29 @@ def _normalize_dtype_mapping_to_state_dict_keys(
     return normalized
 
 
+def _apply_adapter_forced_dtype_mapping(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    fqn_to_dtype_mapping: dict[str, str],
+) -> dict[str, str]:
+    """Let model adapters override original HF dtype metadata for export-only keys."""
+    adapter = getattr(model, "state_dict_adapter", None)
+    forced_dtype_mapping = getattr(adapter, "forced_hf_dtype_mapping", None)
+    if not callable(forced_dtype_mapping):
+        return fqn_to_dtype_mapping
+
+    forced = forced_dtype_mapping(state_dict)
+    if not forced:
+        return fqn_to_dtype_mapping
+
+    normalized = dict(fqn_to_dtype_mapping)
+    state_dict_key_set = set(state_dict)
+    for fqn, dtype_str in forced.items():
+        if fqn in state_dict_key_set:
+            normalized[fqn] = dtype_str
+    return normalized
+
+
 def is_cloud_path(path: str) -> bool:
     """Check if path is a cloud storage path (MSC)."""
     return path.startswith("msc://")
@@ -1357,6 +1380,7 @@ fi
         normalized_dtype_mapping = _normalize_dtype_mapping_to_state_dict_keys(
             dtype_mapping, list(state_dict.keys()), getattr(model, "base_model_prefix", None)
         )
+        normalized_dtype_mapping = _apply_adapter_forced_dtype_mapping(model, state_dict, normalized_dtype_mapping)
         return normalized_dtype_mapping or None
 
     def _get_storage_writer(

@@ -540,7 +540,7 @@ def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
     logger_mock.warning.assert_not_called()
 
 
-def test_apply_ac_uses_block_local_checkpointing_when_available(monkeypatch):
+def test_apply_ac_uses_generic_wrapper_even_when_block_local_checkpointing_is_available(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
 
     class BlockWithLocalAC(DummyBlock):
@@ -553,14 +553,17 @@ def test_apply_ac_uses_block_local_checkpointing_when_available(monkeypatch):
 
     block = BlockWithLocalAC()
     model = DummyModel([block])
-    wrapper_mock = MagicMock()
+    wrapped = object()
+    wrapper_mock = MagicMock(return_value=wrapped)
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
 
     P.apply_ac(model, ignore_router=True, hidden_size=7168, num_experts=256)
 
-    wrapper_mock.assert_not_called()
-    assert block.activation_checkpointing is True
-    assert model.layers.registered["0"] is block
+    wrapper_mock.assert_called_once()
+    assert wrapper_mock.call_args.kwargs["preserve_rng_state"] is True
+    assert callable(wrapper_mock.call_args.kwargs["context_fn"])
+    assert block.activation_checkpointing is False
+    assert model.layers.registered["0"] is wrapped
 
 
 def test_apply_ac_custom_policy_respects_hidden_and_expert_dims(monkeypatch):
