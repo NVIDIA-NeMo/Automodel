@@ -247,7 +247,10 @@ class TestPatchAttention:
         obj = DummyModule()
         custom_sdpa_method = [SDPBackend.FLASH_ATTENTION]
 
-        with patch("nemo_automodel._transformers.kernel_patches.sdpa_kernel") as mock_sdpa_kernel:
+        with (
+            patch("nemo_automodel._transformers.kernel_patches.sdpa_kernel") as mock_sdpa_kernel,
+            patch("nemo_automodel._transformers.kernel_patches._set_global_sdpa_backends") as mock_global_sdpa,
+        ):
             result = _patch_attention(obj, custom_sdpa_method)
 
             assert result is obj
@@ -257,6 +260,7 @@ class TestPatchAttention:
             # Call forward and verify sdpa_kernel was called with the custom method
             output = obj.forward(5)
             assert output == 6  # Original forward logic still works
+            mock_global_sdpa.assert_called_once_with(custom_sdpa_method)
             mock_sdpa_kernel.assert_called_once_with(custom_sdpa_method)
 
 
@@ -1566,6 +1570,51 @@ class TestBuildModelRetryDepth:
 
         assert result is sentinel_model
         assert order == ["runtime_patches", "infrastructure"]
+
+    def test_custom_model_gets_sdpa_patch_when_method_resolved(self):
+        """Custom models need resolved SDPA method constraints too, e.g. to exclude cuDNN under AC."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        sdpa_method = [object()]
+        build_kwargs.update(is_hf_model=False, use_sdpa_patching=True, sdpa_method=sdpa_method)
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("sdpa", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model", return_value=(True, sentinel_model)),
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch(
+                "nemo_automodel._transformers.auto_model._patch_attention", return_value=sentinel_model
+            ) as mock_patch,
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+
+        assert result is sentinel_model
+        mock_patch.assert_called_once_with(sentinel_model, sdpa_method)
+
+    def test_custom_model_skips_sdpa_patch_when_method_is_default(self):
+        """Keep the custom-model default path unchanged when no SDPA method was resolved."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        build_kwargs.update(is_hf_model=False, use_sdpa_patching=True, sdpa_method=None)
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("sdpa", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model", return_value=(True, sentinel_model)),
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch(
+                "nemo_automodel._transformers.auto_model._patch_attention", return_value=sentinel_model
+            ) as mock_patch,
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+
+        assert result is sentinel_model
+        mock_patch.assert_not_called()
 
     def test_meta_tensor_runtime_error_retries_without_meta_device(self):
         """RuntimeError with 'meta tensors' triggers retry without meta device."""
