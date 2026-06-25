@@ -169,6 +169,7 @@ vlm-media = [
 ]
 diffusion-media = [
     "imageio-ffmpeg",
+    "opencv-python-headless==4.10.0.84",  # cv2: diffusion preprocessing entry point (also in vlm-media)
 ]
 media = [
     "nemo_automodel[vlm-media]",
