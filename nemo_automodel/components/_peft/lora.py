@@ -770,6 +770,17 @@ class LoRATritonFunction(torch.autograd.Function):
         if reshape and d_x is not None:
             d_x = d_x.view(bs, seq_len, d)
 
+        # Under pipeline-parallel graph construction torch may track LoRA parameter
+        # inputs on meta while the execution pass computes their grads on cuda.
+        # Return each grad on its corresponding input device so autograd accepts the
+        # meta graph pass; this is a no-op for normal materialized parameters.
+        if d_lora_A is not None:
+            d_lora_A = d_lora_A.to(lora_A.device)
+        if d_lora_B is not None:
+            d_lora_B = d_lora_B.to(lora_B.device)
+        if d_x is not None:
+            d_x = d_x.to(x.device)
+
         gradients = (d_x, d_lora_A, d_lora_B, None, None)
         if ctx.num_inputs == 7:
             return gradients + (None, d_res)
