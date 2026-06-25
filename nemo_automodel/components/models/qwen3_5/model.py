@@ -537,27 +537,25 @@ class Qwen3_5Model(HFQwen3_5Model):
         # multimodal scatter), which then calls self.language_model (NeMo backbone).
         if (pixel_values is not None or pixel_values_videos is not None) and self.visual is not None:
             embed_tokens = self.get_input_embeddings()
-            if inputs_embeds is None:
-                if embed_tokens is not None:
-                    inputs_embeds = embed_tokens(input_ids)
-                elif (
-                    input_ids is not None
-                    and isinstance(input_ids, torch.Tensor)
-                    and input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32)
-                ):
-                    inputs_embeds = input_ids
-                    input_ids = None
-                else:
+            input_ids_for_super = input_ids
+            inputs_embeds_for_super = inputs_embeds
+            if inputs_embeds_for_super is None:
+                if input_ids is not None and isinstance(input_ids, torch.Tensor) and torch.is_floating_point(input_ids):
+                    inputs_embeds_for_super = input_ids
+                    input_ids_for_super = None
+                elif embed_tokens is None:
                     raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
+            else:
+                input_ids_for_super = None
             media_tensor = pixel_values if pixel_values is not None else pixel_values_videos
             if isinstance(media_tensor, torch.Tensor) and hasattr(self.visual, "rotary_pos_emb"):
                 self.visual.rotary_pos_emb.to(media_tensor.device)
             return super().forward(
-                input_ids=None,
+                input_ids=input_ids_for_super,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
+                inputs_embeds=inputs_embeds_for_super,
                 pixel_values=pixel_values,
                 pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,

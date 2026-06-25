@@ -23,7 +23,11 @@ import torch.nn as nn
 
 pytest.importorskip("transformers.models.qwen3_5")
 
-from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
+from nemo_automodel.components.models.qwen3_5.model import (
+    HFQwen3_5Model,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5Model,
+)
 
 
 def _build_model(*, rope_index=None, image_token_id=None, video_token_id=None, vision_start_token_id=None):
@@ -271,3 +275,58 @@ class TestForwardPreEmbedDispatch:
         assert torch.equal(captured["input_ids"], input_ids)
         assert captured["pixel_values"] is pixel_values
         assert "image_grid_hws" in captured["kwargs"]
+
+
+class TestQwen3_5ModelForward:
+    def _build_inner_model(self):
+        model = Qwen3_5Model.__new__(Qwen3_5Model)
+        nn.Module.__init__(model)
+        model.visual = types.SimpleNamespace(rotary_pos_emb=types.SimpleNamespace(to=lambda device: None))
+        model.get_input_embeddings = lambda: lambda input_ids: pytest.fail("media forward should keep input_ids")
+        return model
+
+    def test_media_forward_keeps_input_ids_for_hf_placeholder_mask(self, monkeypatch):
+        model = self._build_inner_model()
+        captured = {}
+        sentinel = object()
+
+        def _fake_hf_forward(self, **kwargs):
+            captured.update(kwargs)
+            return sentinel
+
+        monkeypatch.setattr(HFQwen3_5Model, "forward", _fake_hf_forward)
+
+        input_ids = torch.tensor([[5, 99, 7]])
+        pixel_values = torch.randn(4, 8)
+        out = model.forward(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=torch.tensor([[1, 2, 2]]),
+        )
+
+        assert out is sentinel
+        assert captured["input_ids"] is input_ids
+        assert captured["inputs_embeds"] is None
+        assert captured["pixel_values"] is pixel_values
+
+    def test_media_forward_accepts_hidden_states_as_input_ids(self, monkeypatch):
+        model = self._build_inner_model()
+        captured = {}
+        sentinel = object()
+
+        def _fake_hf_forward(self, **kwargs):
+            captured.update(kwargs)
+            return sentinel
+
+        monkeypatch.setattr(HFQwen3_5Model, "forward", _fake_hf_forward)
+
+        hidden_states = torch.randn(1, 3, 4)
+        out = model.forward(
+            input_ids=hidden_states,
+            pixel_values=torch.randn(4, 8),
+            image_grid_thw=torch.tensor([[1, 2, 2]]),
+        )
+
+        assert out is sentinel
+        assert captured["input_ids"] is None
+        assert captured["inputs_embeds"] is hidden_states
