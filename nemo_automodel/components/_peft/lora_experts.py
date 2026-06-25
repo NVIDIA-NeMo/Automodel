@@ -37,6 +37,11 @@ def _to_local(proj):
     return proj.to_local() if isinstance(proj, DTensor) else proj
 
 
+def _to_grouped_mm_operand(proj, dtype: torch.dtype):
+    """Convert a projection tensor to the dtype/layout expected by grouped MM."""
+    return _to_local(proj).to(dtype).contiguous()
+
+
 class GroupedExpertsLoRA(GroupedExperts):
     """
     GroupedExperts + LoRA.
@@ -156,12 +161,13 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         assert self.n_routed_experts % ep_size == 0
 
-        gate_and_up_projs = _to_local(self.gate_and_up_projs)
-        down_projs = _to_local(self.down_projs)
-        lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A)
-        lora_gate_and_up_B = _to_local(self.lora_gate_and_up_B)
-        lora_down_A = _to_local(self.lora_down_A)
-        lora_down_B = _to_local(self.lora_down_B)
+        compute_dtype = x.dtype
+        gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
+        down_projs = _to_grouped_mm_operand(self.down_projs, compute_dtype)
+        lora_gate_and_up_A = _to_grouped_mm_operand(self.lora_gate_and_up_A, compute_dtype)
+        lora_gate_and_up_B = _to_grouped_mm_operand(self.lora_gate_and_up_B, compute_dtype)
+        lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
+        lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
         if ep_size > 1:
             x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
@@ -484,12 +490,13 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
 
-        gate_and_up_projs = _to_local(self.gate_and_up_projs)
-        down_projs = _to_local(self.down_projs)
-        lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A)
-        lora_gate_and_up_B = _to_local(self.lora_gate_and_up_B)
-        lora_down_A = _to_local(self.lora_down_A)
-        lora_down_B = _to_local(self.lora_down_B)
+        compute_dtype = x.dtype
+        gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
+        down_projs = _to_grouped_mm_operand(self.down_projs, compute_dtype)
+        lora_gate_and_up_A = _to_grouped_mm_operand(self.lora_gate_and_up_A, compute_dtype)
+        lora_gate_and_up_B = _to_grouped_mm_operand(self.lora_gate_and_up_B, compute_dtype)
+        lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
+        lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
         if torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
