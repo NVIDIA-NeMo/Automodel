@@ -77,6 +77,52 @@ class TestShiftSample:
         assert "pixel_values" in shifted
         assert shifted["pixel_values"].shape == sample["pixel_values"].shape
 
+    def test_shift_drops_image_media_when_placeholder_is_removed(self):
+        sample = {
+            "input_ids": torch.tensor([10, 99]),
+            "attention_mask": torch.ones(2, dtype=torch.long),
+            "labels": torch.tensor([20, 21]),
+            "pixel_values": torch.randn(4, 8),
+            "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        }
+
+        shifted = _shift_sample(sample, image_token_id=99)
+
+        assert shifted["input_ids"].tolist() == [10]
+        assert "pixel_values" not in shifted
+        assert "image_grid_thw" not in shifted
+
+    def test_shift_keeps_image_media_when_placeholder_survives(self):
+        sample = {
+            "input_ids": torch.tensor([99, 10]),
+            "attention_mask": torch.ones(2, dtype=torch.long),
+            "labels": torch.tensor([20, 21]),
+            "pixel_values": torch.randn(4, 8),
+            "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        }
+
+        shifted = _shift_sample(sample, image_token_id=99)
+
+        assert shifted["input_ids"].tolist() == [99]
+        assert "pixel_values" in shifted
+        assert "image_grid_thw" in shifted
+
+    def test_shift_drops_image_media_with_mm_token_type_fallback(self):
+        sample = {
+            "input_ids": torch.tensor([10, 11]),
+            "attention_mask": torch.ones(2, dtype=torch.long),
+            "labels": torch.tensor([20, 21]),
+            "mm_token_type_ids": torch.tensor([0, 1]),
+            "pixel_values": torch.randn(4, 8),
+            "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        }
+
+        shifted = _shift_sample(sample)
+
+        assert shifted["mm_token_type_ids"].tolist() == [0]
+        assert "pixel_values" not in shifted
+        assert "image_grid_thw" not in shifted
+
     def test_shift_mm_token_type_ids_1d(self):
         sample = _make_vlm_sample(5)
         sample["mm_token_type_ids"] = torch.tensor([0, 1, 1, 0, 0])

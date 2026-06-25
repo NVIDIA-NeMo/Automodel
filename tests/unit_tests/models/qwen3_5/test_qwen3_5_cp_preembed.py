@@ -26,7 +26,7 @@ pytest.importorskip("transformers.models.qwen3_5")
 from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
 
 
-def _build_model(*, rope_index=None, image_token_id=None, video_token_id=None):
+def _build_model(*, rope_index=None, image_token_id=None, video_token_id=None, vision_start_token_id=None):
     """Build a barebones Qwen3_5ForConditionalGeneration with stubbed deps."""
     model = Qwen3_5ForConditionalGeneration.__new__(Qwen3_5ForConditionalGeneration)
     nn.Module.__init__(model)
@@ -56,6 +56,7 @@ def _build_model(*, rope_index=None, image_token_id=None, video_token_id=None):
     model.config = types.SimpleNamespace(
         image_token_id=image_token_id,
         video_token_id=video_token_id,
+        vision_start_token_id=vision_start_token_id,
     )
     return model
 
@@ -139,6 +140,42 @@ class TestPrepareModelInputsForCP:
 
         # token 6 -> image (1), token 8 -> video (2), others 0.
         assert captured["mm_token_type_ids"].tolist() == [[0, 1, 0, 2]]
+
+
+class TestPopStagedVlmMedia:
+    def test_drops_orphaned_image_media(self):
+        model = _build_model(image_token_id=99, video_token_id=98, vision_start_token_id=97)
+        kwargs = {
+            "pixel_values": torch.randn(4, 8),
+            "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        }
+
+        pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw = model._pop_staged_vlm_media(
+            torch.tensor([[10, 11, 12]]),
+            kwargs,
+        )
+
+        assert pixel_values is None
+        assert pixel_values_videos is None
+        assert image_grid_thw is None
+        assert video_grid_thw is None
+
+    def test_keeps_image_media_when_placeholder_exists(self):
+        model = _build_model(image_token_id=99, video_token_id=98, vision_start_token_id=97)
+        pixel_values_in = torch.randn(4, 8)
+        image_grid_in = torch.tensor([[1, 4, 4]])
+        kwargs = {
+            "pixel_values": pixel_values_in,
+            "image_grid_thw": image_grid_in,
+        }
+
+        pixel_values, _, image_grid_thw, _ = model._pop_staged_vlm_media(
+            torch.tensor([[10, 99, 12]]),
+            kwargs,
+        )
+
+        assert pixel_values is pixel_values_in
+        assert image_grid_thw is image_grid_in
 
     def test_image_features_scattered_into_embeds(self):
         """pixel_values path: image features replace image-token embeddings via masked_scatter."""

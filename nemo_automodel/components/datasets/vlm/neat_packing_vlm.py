@@ -56,6 +56,83 @@ MEDIA_KEYS = (
     "second_per_grid_ts",
 )
 
+IMAGE_MEDIA_KEYS = ("pixel_values", "image_grid_thw", "image_position_ids")
+VIDEO_MEDIA_KEYS = ("pixel_values_videos", "video_grid_thw", "second_per_grid_ts")
+
+
+def _resolve_processor_token_id(processor, attr_names: tuple[str, ...], token_names: tuple[str, ...]) -> int | None:
+    """Resolve a media placeholder token id from processor/config/tokenizer metadata."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+
+    for source in (processor, getattr(processor, "config", None), tokenizer, getattr(tokenizer, "config", None)):
+        if source is None:
+            continue
+        for attr in attr_names:
+            value = getattr(source, attr, None)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str):
+                try:
+                    token_id = tokenizer.convert_tokens_to_ids(value)
+                except Exception:
+                    continue
+                if isinstance(token_id, int) and token_id != unk_id:
+                    return token_id
+
+    for token in token_names:
+        try:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+        except Exception:
+            continue
+        if isinstance(token_id, int) and token_id != unk_id:
+            return token_id
+    return None
+
+
+def _resolve_media_token_ids(processor) -> tuple[int | None, int | None]:
+    if processor is None:
+        return None, None
+    image_token_id = _resolve_processor_token_id(
+        processor,
+        ("image_token_id", "image_token_index", "image_token"),
+        ("<|image_pad|>", "<image>", "<|image|>"),
+    )
+    video_token_id = _resolve_processor_token_id(
+        processor,
+        ("video_token_id", "video_token_index", "video_token"),
+        ("<|video_pad|>", "<video>", "<|video|>"),
+    )
+    return image_token_id, video_token_id
+
+
+def _contains_token(input_ids: torch.Tensor, token_id: int | None) -> bool | None:
+    if token_id is None:
+        return None
+    return bool((input_ids == token_id).any().item())
+
+
+def _contains_mm_type(sample: dict, type_id: int) -> bool | None:
+    mm_token_type_ids = sample.get("mm_token_type_ids")
+    if mm_token_type_ids is None:
+        return None
+    return bool((torch.as_tensor(mm_token_type_ids) == type_id).any().item())
+
+
+def _has_media_marker(sample: dict, token_id: int | None, mm_type_id: int) -> bool:
+    token_present = _contains_token(sample["input_ids"], token_id)
+    if token_present is not None:
+        return token_present
+    mm_type_present = _contains_mm_type(sample, mm_type_id)
+    if mm_type_present is not None:
+        return mm_type_present
+    return True
+
+
+def _drop_media_keys(sample: dict, keys: tuple[str, ...]) -> None:
+    for key in keys:
+        sample.pop(key, None)
+
 
 # ---------------------------------------------------------------------------
 # Visual-token-balanced greedy knapsack
@@ -302,7 +379,12 @@ def _compute_mrope_position_ids(
         return position_ids
 
 
-def _shift_sample(sample: dict, has_mrope: bool = False) -> dict:
+def _shift_sample(
+    sample: dict,
+    has_mrope: bool = False,
+    image_token_id: int | None = None,
+    video_token_id: int | None = None,
+) -> dict:
     """Apply per-sample autoregressive shift before concatenation."""
     out = {}
     out["input_ids"] = sample["input_ids"][:-1]
@@ -319,6 +401,10 @@ def _shift_sample(sample: dict, has_mrope: bool = False) -> dict:
     for key in MEDIA_KEYS:
         if key in sample and sample[key] is not None:
             out[key] = sample[key]
+    if any(key in out for key in IMAGE_MEDIA_KEYS) and not _has_media_marker(out, image_token_id, 1):
+        _drop_media_keys(out, IMAGE_MEDIA_KEYS)
+    if any(key in out for key in VIDEO_MEDIA_KEYS) and not _has_media_marker(out, video_token_id, 2):
+        _drop_media_keys(out, VIDEO_MEDIA_KEYS)
     return out
 
 
@@ -440,6 +526,8 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
         pack_size: int,
         padding_idx: int = 0,
         get_rope_index: Callable | None = None,
+        image_token_id: int | None = None,
+        video_token_id: int | None = None,
         max_retries: int = 10,
     ):
         self.inner = inner_dataset
@@ -448,6 +536,8 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
         self.padding_idx = padding_idx
         self.get_rope_index = get_rope_index
         self.has_mrope = get_rope_index is not None
+        self.image_token_id = image_token_id
+        self.video_token_id = video_token_id
         self.max_retries = max_retries
 
     def __len__(self):
@@ -466,7 +556,12 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
                 if mrope_pos is not None:
                     sample["position_ids"] = mrope_pos
 
-            shifted = _shift_sample(sample, has_mrope=self.has_mrope)
+            shifted = _shift_sample(
+                sample,
+                has_mrope=self.has_mrope,
+                image_token_id=self.image_token_id,
+                video_token_id=self.video_token_id,
+            )
             seq_len = shifted["input_ids"].shape[0]
 
             # If real length exceeds pack_size after shift, skip this sample
@@ -567,6 +662,7 @@ def neat_pack_dataset_vlm(
     # Extract processor configs for accurate media token estimation
     image_cfg = LengthGroupedSampler._extract_image_config(processor) if processor is not None else None
     video_cfg = LengthGroupedSampler._extract_video_config(processor) if processor is not None else None
+    image_token_id, video_token_id = _resolve_media_token_ids(processor)
     if image_cfg is not None or video_cfg is not None:
         logger.info("Neat packing VLM: using processor configs for media token estimation.")
     else:
@@ -718,4 +814,6 @@ def neat_pack_dataset_vlm(
         pack_size=pack_size,
         padding_idx=padding_idx,
         get_rope_index=get_rope_index,
+        image_token_id=image_token_id,
+        video_token_id=video_token_id,
     )

@@ -1023,17 +1023,24 @@ def make_meta_dataset(
 
 def _resolve_processor_token_id(processor, attr_names, token_names):
     """Resolve a model-specific media token id from processor/config/tokenizer."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+
     config = getattr(processor, "config", None)
-    for source in (processor, config):
+    for source in (processor, config, tokenizer, getattr(tokenizer, "config", None)):
         if source is None:
             continue
         for attr in attr_names:
-            token_id = getattr(source, attr, None)
-            if isinstance(token_id, int):
-                return token_id
-
-    tokenizer = getattr(processor, "tokenizer", processor)
-    unk_id = getattr(tokenizer, "unk_token_id", None)
+            value = getattr(source, attr, None)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str):
+                try:
+                    token_id = tokenizer.convert_tokens_to_ids(value)
+                except Exception:
+                    continue
+                if isinstance(token_id, int) and token_id != unk_id:
+                    return token_id
     for token in token_names:
         try:
             token_id = tokenizer.convert_tokens_to_ids(token)
@@ -1060,12 +1067,12 @@ def _media_token_mismatch(input_ids, result, processor) -> str | None:
     """Return a mismatch description if media grids survived without tokens."""
     image_token_id = _resolve_processor_token_id(
         processor,
-        ("image_token_id", "image_token_index"),
+        ("image_token_id", "image_token_index", "image_token"),
         ("<|image_pad|>", "<image>", "<|image|>"),
     )
     video_token_id = _resolve_processor_token_id(
         processor,
-        ("video_token_id", "video_token_index"),
+        ("video_token_id", "video_token_index", "video_token"),
         ("<|video_pad|>", "<video>", "<|video|>"),
     )
 

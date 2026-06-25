@@ -887,11 +887,29 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         image_token_id = self.config.image_token_id
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
-        has_media_tokens = input_ids is not None and (
-            (input_ids == image_token_id).any()
-            or (input_ids == video_token_id).any()
-            or (input_ids == vision_start_token_id).any()
+        has_image_tokens = (
+            bool((input_ids == image_token_id).any().item())
+            if input_ids is not None and image_token_id is not None
+            else False
         )
+        has_video_tokens = (
+            bool((input_ids == video_token_id).any().item())
+            if input_ids is not None and video_token_id is not None
+            else False
+        )
+        has_vision_start_tokens = (
+            bool((input_ids == vision_start_token_id).any().item())
+            if input_ids is not None and vision_start_token_id is not None
+            else False
+        )
+        has_media_tokens = input_ids is not None and (has_image_tokens or has_video_tokens or has_vision_start_tokens)
+        if input_ids is not None:
+            if pixel_values is not None and image_token_id is not None and not has_image_tokens:
+                pixel_values = None
+                image_grid_thw = None
+            if pixel_values_videos is not None and video_token_id is not None and not has_video_tokens:
+                pixel_values_videos = None
+                video_grid_thw = None
         if not has_media_tokens:
             return pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
 
