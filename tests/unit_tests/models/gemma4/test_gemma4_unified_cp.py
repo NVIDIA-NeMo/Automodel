@@ -72,6 +72,48 @@ def test_gemma4_unified_prepare_model_inputs_for_cp_requires_input_ids():
         raise AssertionError("expected prepare_model_inputs_for_cp to require input_ids")
 
 
+def test_gemma4_unified_packed_attention_mask_mapping_applies_sliding_window():
+    fake_self = SimpleNamespace(
+        config=SimpleNamespace(image_token_id=42),
+        _get_text_config=lambda: SimpleNamespace(sliding_window=2, _attn_implementation="sdpa"),
+        get_input_embeddings=lambda: SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16)),
+    )
+    attention_mask = torch.ones(1, 1, 4, 4, dtype=torch.bool).tril()
+    packed_seq_ids = torch.tensor([[1, 1, 1, 1]])
+    mm_token_type_ids = torch.zeros_like(packed_seq_ids)
+
+    masks = Gemma4UnifiedForConditionalGeneration._prepare_packed_attention_mask_mapping(
+        fake_self,
+        attention_mask,
+        packed_seq_ids,
+        mm_token_type_ids,
+        input_ids=torch.tensor([[1, 2, 3, 4]]),
+        inputs_embeds=None,
+    )
+
+    assert set(masks) == {"full_attention", "sliding_attention"}
+    assert masks["full_attention"].dtype == torch.bool
+    assert masks["full_attention"][0, 0, 3, 0]
+    assert not masks["sliding_attention"][0, 0, 3, 0]
+    assert masks["sliding_attention"][0, 0, 3, 2]
+
+
+def test_gemma4_unified_packed_attention_mask_mapping_keeps_indexed_2d_mask():
+    fake_self = SimpleNamespace()
+    indexed_mask = torch.tensor([[1, 1, 2, 2]])
+
+    out = Gemma4UnifiedForConditionalGeneration._prepare_packed_attention_mask_mapping(
+        fake_self,
+        indexed_mask,
+        packed_seq_ids=indexed_mask,
+        mm_token_type_ids=torch.zeros_like(indexed_mask),
+        input_ids=torch.tensor([[1, 2, 3, 4]]),
+        inputs_embeds=None,
+    )
+
+    assert out is indexed_mask
+
+
 def test_gemma4_unified_cp_boundary_mask_blocks_cross_document_attention():
     attention = SimpleNamespace(sliding_window=None)
     query = torch.empty(1, 1, 4, 1)

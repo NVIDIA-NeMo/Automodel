@@ -1514,6 +1514,46 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
             )
         return prepared_inputs
 
+    def _prepare_packed_attention_mask_mapping(
+        self,
+        attention_mask: Any,
+        packed_seq_ids: torch.Tensor | None,
+        mm_token_type_ids: torch.Tensor | None,
+        *,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+    ) -> Any:
+        """Build Gemma4 full/sliding masks for packed unified VLM batches."""
+        if isinstance(attention_mask, dict):
+            return attention_mask
+        if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 4:
+            return attention_mask
+        if packed_seq_ids is None:
+            packed_seq_ids = (~_derive_padding_mask(attention_mask)).to(torch.long)
+
+        if mm_token_type_ids is None:
+            image_token_id = getattr(getattr(self, "config", None), "image_token_id", None)
+            if input_ids is not None and image_token_id is not None:
+                mm_token_type_ids = (input_ids == image_token_id).to(torch.long)
+            else:
+                mm_token_type_ids = torch.zeros_like(packed_seq_ids)
+        mm_token_type_ids = mm_token_type_ids.to(device=packed_seq_ids.device)
+
+        text_config = self._get_text_config()
+        attn_implementation = getattr(text_config, "_attn_implementation", None)
+        if inputs_embeds is not None:
+            dtype = inputs_embeds.dtype
+        else:
+            dtype = getattr(self.get_input_embeddings().weight, "dtype", torch.float32)
+
+        return _build_packed_gemma4_causal_mask_mapping(
+            packed_seq_ids,
+            mm_token_type_ids,
+            dtype=dtype,
+            sliding_window=getattr(text_config, "sliding_window", None),
+            as_additive=attn_implementation == "eager",
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -1549,6 +1589,14 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
             for module in self.modules():
                 if getattr(module, "_cp_uses_attention_hook", False):
                     module._cp_dense_metadata = cp_meta
+        else:
+            kwargs["attention_mask"] = self._prepare_packed_attention_mask_mapping(
+                kwargs.get("attention_mask"),
+                kwargs.get("_packed_seq_ids"),
+                mm_token_type_ids,
+                input_ids=input_ids,
+                inputs_embeds=kwargs.get("inputs_embeds"),
+            )
 
         return super().forward(
             input_ids=input_ids,
