@@ -404,3 +404,21 @@ class TestNeatPackedCollater:
         assert result["attention_mask"].shape == (1, 1, 4, 4)
         assert result["attention_mask"].dtype == torch.bool
         assert result["_packed_seq_ids"].tolist() == [[1, 1, 2, 2]]
+
+    def test_sdpa_sliding_window_emits_hybrid_mask_mapping(self):
+        batch = [
+            {
+                "input_ids": torch.tensor([1, 2, 3, 4]),
+                "labels": torch.tensor([10, 20, 30, 40]),
+                "attention_mask": torch.tensor([1, 1, 1, 1]),
+                "position_ids": torch.tensor([0, 1, 2, 3]),
+            },
+        ]
+
+        result = neat_packed_collater(batch, attn_implementation="sdpa", sliding_window=2)
+        masks = result["attention_mask"]
+
+        assert set(masks) == {"full_attention", "sliding_attention"}
+        assert masks["full_attention"][0, 0, 3, 0]
+        assert not masks["sliding_attention"][0, 0, 3, 0]
+        assert masks["sliding_attention"][0, 0, 3, 2]

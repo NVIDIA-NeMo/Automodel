@@ -33,6 +33,10 @@ def _make_missing(name: str):
     return UnavailableMeta(name, (), {"_msg": "transformers.models.gemma4 is not available."})
 
 
+def _make_missing_unified(name: str):
+    return UnavailableMeta(name, (), {"_msg": "transformers.models.gemma4_unified is not available."})
+
+
 try:
     from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
     from transformers.models.gemma4 import modeling_gemma4 as _g4
@@ -76,6 +80,22 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     Gemma4CausalLMOutputWithPast = _make_missing("Gemma4CausalLMOutputWithPast")
     BaseModelOutputWithPast = _make_missing("BaseModelOutputWithPast")
     CausalLMOutputWithPast = _make_missing("CausalLMOutputWithPast")
+
+try:
+    from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedConfig
+    from transformers.models.gemma4_unified.modeling_gemma4_unified import (
+        Gemma4UnifiedForConditionalGeneration as HFGemma4UnifiedForConditionalGeneration,
+    )
+    from transformers.models.gemma4_unified.modeling_gemma4_unified import (
+        Gemma4UnifiedTextAttention,
+    )
+
+    _GEMMA4_UNIFIED_HF_AVAILABLE = True
+except (ModuleNotFoundError, ImportError, AttributeError):
+    _GEMMA4_UNIFIED_HF_AVAILABLE = False
+    Gemma4UnifiedConfig = _make_missing_unified("Gemma4UnifiedConfig")
+    HFGemma4UnifiedForConditionalGeneration = _make_missing_unified("Gemma4UnifiedForConditionalGeneration")
+    Gemma4UnifiedTextAttention = _make_missing_unified("Gemma4UnifiedTextAttention")
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
@@ -1285,6 +1305,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         pixel_values: torch.Tensor | None = None,
         image_position_ids: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
+        **_: Any,
     ) -> dict[str, Any]:
         """Prepare Gemma4 embeddings on the full sequence before CP sharding."""
         if input_ids is None:
@@ -1363,6 +1384,181 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 layer.moe.init_weights(buffer_device)
 
         cast_model_to_dtype(self, dtype)
+
+
+class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4UnifiedForConditionalGeneration):
+    """Gemma4 unified dense wrapper with model-owned context parallelism.
+
+    Gemma 4 12B checkpoints advertise ``Gemma4UnifiedForConditionalGeneration``.
+    The implementation stays on the upstream HF unified model and only adds the
+    Automodel CP seam: a contiguous CP batch sharder plus Gemma4's p2p ring
+    attention hook. Tensor parallelism is intentionally not registered here.
+    """
+
+    supports_gradient_checkpointing = True
+    _keep_in_fp32_modules = ["rotary_emb"]
+
+    @classmethod
+    def get_capabilities(cls, config: "Gemma4UnifiedConfig") -> ModelCapabilities:
+        return ModelCapabilities(
+            supports_tp=False,
+            supports_cp=True,
+            supports_pp=False,
+            supports_ep=False,
+        )
+
+    @classmethod
+    def from_config(cls, config: Gemma4UnifiedConfig, backend: BackendConfig | None = None, **kwargs):
+        for key, value in kwargs.items():
+            if hasattr(config, key):
+                setattr(config, key, value)
+            text_config = getattr(config, "text_config", None)
+            if text_config is not None and hasattr(text_config, key):
+                setattr(text_config, key, value)
+        return cls(config, backend=backend)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
+        if not _GEMMA4_UNIFIED_HF_AVAILABLE:
+            raise UnavailableError("transformers.models.gemma4_unified is not available.")
+        config = Gemma4UnifiedConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        return cls.from_config(config, *model_args, **kwargs)
+
+    def __init__(self, config: Gemma4UnifiedConfig, backend: BackendConfig | None = None):
+        if not _GEMMA4_UNIFIED_HF_AVAILABLE:
+            raise UnavailableError("transformers.models.gemma4_unified is not available.")
+
+        # Keep the HF-style capability path for CP. Setting ``self.backend``
+        # would make generic introspection treat this as a custom backend model,
+        # where SDPA is not enough for CP support.
+        _ = backend
+
+        top_dtype = getattr(config, "torch_dtype", None)
+        if top_dtype is not None:
+            for sub_cfg in vars(config).values():
+                if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
+                    sub_cfg.torch_dtype = top_dtype
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None:
+            for attr in ("output_hidden_states", "output_attentions", "use_cache"):
+                if hasattr(config, attr) and hasattr(text_config, attr):
+                    setattr(text_config, attr, getattr(config, attr))
+            attn_impl = getattr(config, "_attn_implementation", None)
+            if attn_impl is not None and hasattr(text_config, "_attn_implementation"):
+                text_config._attn_implementation = attn_impl
+
+        super().__init__(config)
+
+        text_config = self._get_text_config()
+        pad_token_id = getattr(text_config, "pad_token_id", None)
+        if pad_token_id is None:
+            eos_token_id = getattr(text_config, "eos_token_id", None)
+            if isinstance(eos_token_id, (list, tuple)):
+                eos_token_id = eos_token_id[0]
+            pad_token_id = eos_token_id
+        self.pad_token_id = pad_token_id if pad_token_id is not None else -1
+
+        for module in self.modules():
+            if isinstance(module, Gemma4UnifiedTextAttention):
+                attach_gemma4_cp_ring_attention(module)
+
+    def _get_text_config(self):
+        if hasattr(self.config, "get_text_config"):
+            return self.config.get_text_config()
+        return getattr(self.config, "text_config", self.config)
+
+    def _force_cp_sdpa(self) -> None:
+        text_config = self._get_text_config()
+        for cfg in (getattr(self, "config", None), text_config, getattr(getattr(self, "model", None), "config", None)):
+            if cfg is not None and hasattr(cfg, "_attn_implementation"):
+                cfg._attn_implementation = "sdpa"
+
+    def setup_cp_attention(self, cp_mesh) -> None:
+        """Install Gemma4's p2p ring CP attention on unified text attention."""
+        if getattr(self, "_cp_enabled", False):
+            return
+        self._cp_enabled = True
+        self._force_cp_sdpa()
+        for module in self.modules():
+            if module is self:
+                continue
+            module_setup = getattr(module, "setup_cp_attention", None)
+            if callable(module_setup):
+                module_setup(cp_mesh)
+
+    def _cp_shard_batch(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+        self.setup_cp_attention(cp_mesh)
+        return make_contiguous_shard_cp_batch_and_ctx(
+            cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id
+        )
+
+    def prepare_model_inputs_for_cp(
+        self,
+        input_ids: torch.Tensor,
+        mm_token_type_ids: torch.Tensor | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        """Bind Gemma4's CP batch sharder without pre-embedding text inputs."""
+        if input_ids is None:
+            raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
+
+        prepared_inputs: dict[str, Any] = {"_cp_make_batch_fn": self._cp_shard_batch}
+        if mm_token_type_ids is not None:
+            prepared_inputs.update(
+                {
+                    "mm_token_type_ids": mm_token_type_ids,
+                    "_gemma4_vision_group_ids": gemma4_vision_group_ids(mm_token_type_ids),
+                    "_cp_metadata_seq_dims": {"_gemma4_vision_group_ids": 1},
+                    "_cp_metadata_pad_values": {"_gemma4_vision_group_ids": -1},
+                }
+            )
+        return prepared_inputs
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        *,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        input_features: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        _pre_embed_only: bool = False,
+        **kwargs: Any,
+    ):
+        if _pre_embed_only:
+            return self.prepare_model_inputs_for_cp(
+                input_ids=input_ids,
+                mm_token_type_ids=mm_token_type_ids,
+                **kwargs,
+            )
+
+        if getattr(self, "_cp_enabled", False):
+            if pixel_values is not None or pixel_values_videos is not None or input_features is not None:
+                raise NotImplementedError(
+                    "Context parallelism with Gemma4 unified raw multimodal inputs requires pre-computed text inputs. "
+                    "Gemma4 12B CP support is wired for text training batches."
+                )
+            self._force_cp_sdpa()
+            cp_meta = {
+                "mm_token_type_ids": mm_token_type_ids,
+                "padding_mask": kwargs.get("padding_mask"),
+                "_packed_seq_ids": kwargs.get("_packed_seq_ids"),
+                "_gemma4_vision_group_ids": kwargs.get("_gemma4_vision_group_ids"),
+            }
+            for module in self.modules():
+                if getattr(module, "_cp_uses_attention_hook", False):
+                    module._cp_dense_metadata = cp_meta
+
+        return super().forward(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            input_features=input_features,
+            mm_token_type_ids=mm_token_type_ids,
+            logits_to_keep=logits_to_keep,
+            **kwargs,
+        )
 
 
 if _GEMMA4_HF_AVAILABLE:

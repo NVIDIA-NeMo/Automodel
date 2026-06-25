@@ -92,11 +92,12 @@ def _prepare_manual_cp_batch(cp_mesh, tp_mesh, batch, loss_mask):
     """
     attention_mask = batch.pop("attention_mask", None)
     if attention_mask is not None and "padding_mask" not in batch:
-        if attention_mask.ndim == 4:
-            diagonal = torch.diagonal(attention_mask[:, 0], dim1=-2, dim2=-1)
-            batch["padding_mask"] = diagonal.logical_not() if attention_mask.dtype == torch.bool else diagonal != 0
-        else:
-            batch["padding_mask"] = attention_mask.bool().logical_not()
+        mask_for_padding = attention_mask.get("full_attention") if isinstance(attention_mask, dict) else attention_mask
+        if mask_for_padding is not None and mask_for_padding.ndim == 4:
+            diagonal = torch.diagonal(mask_for_padding[:, 0], dim1=-2, dim2=-1)
+            batch["padding_mask"] = diagonal.logical_not() if mask_for_padding.dtype == torch.bool else diagonal != 0
+        elif mask_for_padding is not None:
+            batch["padding_mask"] = mask_for_padding.bool().logical_not()
 
     has_inputs_embeds = "inputs_embeds" in batch
     has_input_ids = "input_ids" in batch

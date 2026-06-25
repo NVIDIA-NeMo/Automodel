@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import os
 from dataclasses import dataclass, replace
 from types import MethodType
 from typing import Any
@@ -26,8 +27,13 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel.components.utils.memory_profile import log_cuda_memory_profile
+
 logger = logging.getLogger(__name__)
 _GEMMA4_CP_FLEX_RING_OK_LOGGED = False
+_GEMMA4_CP_PROFILE_NEXT_MODULE_ID = 0
+_GEMMA4_CP_PACKED_DEBUG_SEEN: set[tuple[Any, ...]] = set()
+_GEMMA4_CP_COMPARE_SDPA_SEEN: set[tuple[Any, ...]] = set()
 
 
 def _patch_fsdp_accumulated_grad_guard() -> None:
@@ -135,6 +141,250 @@ def _cached_block_mask(key, build):
     return mask
 
 
+def _cp_memory_profile_allowed(attention_module: torch.nn.Module) -> bool:
+    layers = os.environ.get("NEMO_AUTOMODEL_MEMORY_PROFILE_CP_LAYERS")
+    if not layers:
+        return True
+
+    layer_idx = getattr(attention_module, "layer_idx", None)
+    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", None)
+    allowed = set()
+    for item in layers.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            allowed.add(int(item))
+        except ValueError:
+            continue
+    return layer_idx in allowed or profile_id in allowed
+
+
+def _log_cp_memory(
+    attention_module: torch.nn.Module,
+    tag: str,
+    *,
+    include_tensors: bool = False,
+) -> None:
+    if not _cp_memory_profile_allowed(attention_module):
+        return
+    layer_idx = getattr(attention_module, "layer_idx", None)
+    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", None)
+    log_cuda_memory_profile(
+        f"gemma4_cp layer={layer_idx} profile_id={profile_id} {tag}",
+        logger=logger,
+        include_tensors=include_tensors,
+    )
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def _debug_list_allows(value: int, env_name: str) -> bool:
+    raw = os.environ.get(env_name)
+    if not raw:
+        return True
+    raw = raw.strip().lower()
+    if raw in {"all", "*"}:
+        return True
+    allowed = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            allowed.add(int(item))
+        except ValueError:
+            continue
+    return value in allowed
+
+
+def _debug_compare_allowed(attention_module: torch.nn.Module, ctx: Any, *, kv_global_start: int) -> bool:
+    if not _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_SDPA"):
+        return False
+    rank = _debug_rank()
+    if not _debug_list_allows(rank, "NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_SDPA_RANKS"):
+        return False
+    layer_idx = getattr(attention_module, "layer_idx", None)
+    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", -1)
+    layer_or_profile = profile_id if layer_idx is None else layer_idx
+    if not _debug_list_allows(int(layer_or_profile), "NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_SDPA_LAYERS"):
+        return False
+    seen_key = (rank, profile_id, ctx.cp_rank, int(ctx.seq_global_start), int(kv_global_start), int(ctx.seq_local))
+    if seen_key in _GEMMA4_CP_COMPARE_SDPA_SEEN:
+        return False
+    _GEMMA4_CP_COMPARE_SDPA_SEEN.add(seen_key)
+    return True
+
+
+def _packed_id_segments(seq_ids: torch.Tensor, *, global_start: int, limit: int = 12) -> str:
+    ids = seq_ids.detach().to("cpu").tolist()
+    if not ids:
+        return "[]"
+    segments = []
+    start = 0
+    current = ids[0]
+    for idx, value in enumerate(ids[1:], start=1):
+        if value == current:
+            continue
+        if current > 0:
+            segments.append((current, global_start + start, global_start + idx, idx - start))
+        start = idx
+        current = value
+    if current > 0:
+        segments.append((current, global_start + start, global_start + len(ids), len(ids) - start))
+
+    rendered = [
+        f"id={doc_id} global=[{seg_start},{seg_end}) len={length}"
+        for doc_id, seg_start, seg_end, length in segments[:limit]
+    ]
+    suffix = "" if len(segments) <= limit else f"; ... total_segments={len(segments)}"
+    return "[" + "; ".join(rendered) + suffix + "]"
+
+
+def _boundary_allowed_mask(
+    attention_module: torch.nn.Module,
+    ctx: Any,
+    *,
+    packed_seq_ids_q: torch.Tensor,
+    packed_seq_ids_kv: torch.Tensor,
+    padding_mask_q: torch.Tensor | None,
+    padding_mask_kv: torch.Tensor | None,
+    vision_group_ids_q: torch.Tensor | None,
+    vision_group_ids_kv: torch.Tensor | None,
+    kv_global_start: int,
+    use_vision_bidirectional: bool,
+) -> torch.Tensor:
+    q_global = torch.arange(ctx.seq_global_start, ctx.seq_global_start + ctx.seq_local, device=ctx.query.device)
+    kv_global = torch.arange(kv_global_start, kv_global_start + packed_seq_ids_kv.shape[1], device=ctx.query.device)
+    if ctx.is_causal:
+        allowed = kv_global.view(1, 1, -1) <= q_global.view(1, -1, 1)
+    else:
+        allowed = torch.ones(
+            (packed_seq_ids_q.shape[0], ctx.seq_local, packed_seq_ids_kv.shape[1]),
+            dtype=torch.bool,
+            device=ctx.query.device,
+        )
+
+    sliding_window = getattr(attention_module, "sliding_window", None)
+    if sliding_window is not None:
+        allowed = allowed & ((q_global.view(1, -1, 1) - kv_global.view(1, 1, -1)) < sliding_window)
+    if use_vision_bidirectional and vision_group_ids_q is not None and vision_group_ids_kv is not None:
+        same_vision_group = (vision_group_ids_q[:, :, None] == vision_group_ids_kv[:, None, :]) & (
+            vision_group_ids_q[:, :, None] >= 0
+        )
+        allowed = allowed | same_vision_group
+
+    same_doc = packed_seq_ids_q[:, :, None] == packed_seq_ids_kv[:, None, :]
+    allowed = allowed & same_doc & (packed_seq_ids_q[:, :, None] > 0)
+    allowed = torch.where(packed_seq_ids_q[:, :, None] <= 0, torch.zeros_like(allowed), allowed)
+    if padding_mask_kv is not None:
+        allowed = allowed & ~padding_mask_kv[:, None, :]
+    if padding_mask_q is not None:
+        allowed = torch.where(padding_mask_q[:, :, None], torch.zeros_like(allowed), allowed)
+    return allowed
+
+
+def _debug_packed_boundaries(
+    attention_module: torch.nn.Module,
+    ctx: Any,
+    *,
+    key_chunk: torch.Tensor,
+    packed_seq_ids_q: torch.Tensor | None,
+    packed_seq_ids_kv: torch.Tensor | None,
+    padding_mask_q: torch.Tensor | None,
+    padding_mask_kv: torch.Tensor | None,
+    vision_group_ids_q: torch.Tensor | None,
+    vision_group_ids_kv: torch.Tensor | None,
+    kv_global_start: int,
+    use_vision_bidirectional: bool,
+) -> None:
+    if not _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_DEBUG_PACKED"):
+        return
+
+    rank = _debug_rank()
+    if not _debug_list_allows(rank, "NEMO_AUTOMODEL_GEMMA4_CP_DEBUG_PACKED_RANKS"):
+        return
+    layer_idx = getattr(attention_module, "layer_idx", None)
+    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", -1)
+    if layer_idx is not None:
+        if not _debug_list_allows(int(layer_idx), "NEMO_AUTOMODEL_GEMMA4_CP_DEBUG_PACKED_LAYERS"):
+            return
+    elif not _debug_list_allows(int(profile_id), "NEMO_AUTOMODEL_GEMMA4_CP_DEBUG_PACKED_LAYERS"):
+        return
+
+    if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_DEBUG_PACKED_ONCE"):
+        seen_key = (rank, profile_id, ctx.cp_rank, kv_global_start, ctx.seq_local, key_chunk.shape[2])
+        if seen_key in _GEMMA4_CP_PACKED_DEBUG_SEEN:
+            return
+        _GEMMA4_CP_PACKED_DEBUG_SEEN.add(seen_key)
+
+    prefix = (
+        "[GEMMA4_CP_PACKED_DEBUG] "
+        f"rank={rank} cp_rank={ctx.cp_rank} layer={layer_idx} profile_id={profile_id} "
+        f"q_global=[{ctx.seq_global_start},{ctx.seq_global_start + ctx.seq_local}) "
+        f"kv_global=[{kv_global_start},{kv_global_start + key_chunk.shape[2]}) "
+        f"q_shape={tuple(ctx.query.shape)} kv_shape={tuple(key_chunk.shape)}"
+    )
+
+    if packed_seq_ids_q is None or packed_seq_ids_kv is None:
+        message = f"{prefix} missing packed ids: q_present={packed_seq_ids_q is not None} kv_present={packed_seq_ids_kv is not None}"
+        print(message, flush=True)
+        if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_DEBUG_REQUIRE_PACKED"):
+            raise RuntimeError(message)
+        return
+
+    q_ids = packed_seq_ids_q.contiguous()
+    kv_ids = packed_seq_ids_kv.contiguous()
+    allowed = _boundary_allowed_mask(
+        attention_module,
+        ctx,
+        packed_seq_ids_q=q_ids,
+        packed_seq_ids_kv=kv_ids,
+        padding_mask_q=padding_mask_q,
+        padding_mask_kv=padding_mask_kv,
+        vision_group_ids_q=vision_group_ids_q,
+        vision_group_ids_kv=vision_group_ids_kv,
+        kv_global_start=kv_global_start,
+        use_vision_bidirectional=use_vision_bidirectional,
+    )
+    valid_q = q_ids > 0 if padding_mask_q is None else (q_ids > 0) & ~padding_mask_q
+    valid_kv = kv_ids > 0 if padding_mask_kv is None else (kv_ids > 0) & ~padding_mask_kv
+    cross_doc = (q_ids[:, :, None] != kv_ids[:, None, :]) & valid_q[:, :, None] & valid_kv[:, None, :]
+    cross_doc_allowed = (allowed & cross_doc).sum()
+
+    q_unique = torch.unique(q_ids[q_ids > 0]).numel()
+    kv_unique = torch.unique(kv_ids[kv_ids > 0]).numel()
+    padding_q = int((~valid_q).sum().item())
+    padding_kv = int((~valid_kv).sum().item())
+    print(
+        f"{prefix} q_ids_shape={tuple(q_ids.shape)} kv_ids_shape={tuple(kv_ids.shape)} "
+        f"q_docs={int(q_unique)} kv_docs={int(kv_unique)} q_padding={padding_q} kv_padding={padding_kv} "
+        f"allowed_pairs={int(allowed.sum().item())} cross_doc_allowed={int(cross_doc_allowed.item())}",
+        flush=True,
+    )
+    print(
+        f"{prefix} q_segments={_packed_id_segments(q_ids[0], global_start=ctx.seq_global_start)}",
+        flush=True,
+    )
+    print(
+        f"{prefix} kv_segments={_packed_id_segments(kv_ids[0], global_start=kv_global_start)}",
+        flush=True,
+    )
+    if cross_doc_allowed.item() != 0:
+        raise RuntimeError(
+            f"{prefix} packed sequence boundary audit failed: cross_doc_allowed={cross_doc_allowed.item()}"
+        )
+    print(f"{prefix} packed sequence boundary audit PASS", flush=True)
+
+
 def _compiled_flex_attention(attention_module: torch.nn.Module):
     compiled = getattr(attention_module, "_gemma4_cp_compiled_flex_attn", None)
     if compiled is None:
@@ -187,6 +437,15 @@ def _metadata_like(metadata: dict[str, torch.Tensor | None]) -> dict[str, torch.
 
 def _detach_metadata(metadata: dict[str, torch.Tensor | None]) -> dict[str, torch.Tensor | None]:
     return {name: value.detach().contiguous() if value is not None else None for name, value in metadata.items()}
+
+
+def _repeat_kv_for_gqa(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Repeat KV heads to query-head count, matching HF SDPA with an explicit mask."""
+    if n_rep == 1:
+        return hidden_states
+    batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, seq_len, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, seq_len, head_dim)
 
 
 def _ring_exchange(
@@ -251,9 +510,203 @@ def _merge_flex_chunk(
     if out_acc is None or lse_acc is None:
         return out_step, lse_step
     lse_next = torch.logaddexp(lse_acc, lse_step)
-    old_scale = torch.exp(lse_acc - lse_next).unsqueeze(-1)
-    new_scale = torch.exp(lse_step - lse_next).unsqueeze(-1)
+    empty_rows = torch.isneginf(lse_next)
+    old_scale = torch.where(empty_rows, torch.zeros_like(lse_next), torch.exp(lse_acc - lse_next)).unsqueeze(-1)
+    new_scale = torch.where(empty_rows, torch.zeros_like(lse_next), torch.exp(lse_step - lse_next)).unsqueeze(-1)
     return out_acc * old_scale + out_step * new_scale, lse_next
+
+
+def _zero_masked_attention_rows(
+    tensor: torch.Tensor,
+    *,
+    empty_query_rows: torch.Tensor | None,
+    chunk_empty_query_rows: torch.Tensor,
+) -> torch.Tensor:
+    if empty_query_rows is not None and empty_query_rows.any():
+        tensor = tensor.masked_fill(empty_query_rows[:, None, :, None], 0)
+    if chunk_empty_query_rows.any():
+        tensor = tensor.masked_fill(chunk_empty_query_rows[:, None, :, None], 0)
+    return tensor
+
+
+def _debug_compare_flex_sdpa(
+    attention_module: torch.nn.Module,
+    ctx: Any,
+    *,
+    query_for_flex: torch.Tensor,
+    key_for_flex: torch.Tensor,
+    value_for_flex: torch.Tensor,
+    block_mask: Any,
+    cp_score_mod: Any,
+    dense_allowed_mask: torch.Tensor,
+    empty_query_rows: torch.Tensor | None,
+    chunk_empty_query_rows: torch.Tensor,
+    flex_scale: float | None,
+    flex_kwargs: dict[str, Any],
+    flex_out: torch.Tensor,
+    kv_global_start: int,
+) -> None:
+    if not _debug_compare_allowed(attention_module, ctx, kv_global_start=kv_global_start):
+        return
+
+    rank = _debug_rank()
+    layer_idx = getattr(attention_module, "layer_idx", None)
+    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", -1)
+    prefix = (
+        "[GEMMA4_CP_SDPA_COMPARE] "
+        f"rank={rank} cp_rank={ctx.cp_rank} layer={layer_idx} profile_id={profile_id} "
+        f"q_global=[{ctx.seq_global_start},{ctx.seq_global_start + ctx.seq_local}) "
+        f"kv_global=[{kv_global_start},{kv_global_start + key_for_flex.shape[2]})"
+    )
+
+    if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_FULL_SDPA"):
+        compare_kwargs = {key: value for key, value in flex_kwargs.items() if key != "enable_gqa"}
+        compare_kwargs["enable_gqa"] = False
+        compare_kwargs["score_mod"] = cp_score_mod
+        compare_kwargs["block_mask"] = block_mask
+        compare_kwargs["scale"] = flex_scale
+
+        dense_mask = dense_allowed_mask[:, None, :, :]
+        compare_grads = _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_SDPA_GRADS")
+        with torch.enable_grad():
+            q = query_for_flex.detach().contiguous().requires_grad_(compare_grads)
+            k = key_for_flex.detach().contiguous().requires_grad_(compare_grads)
+            v = value_for_flex.detach().contiguous().requires_grad_(compare_grads)
+            ref_out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=dense_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=flex_scale,
+                enable_gqa=False,
+            )
+            ref_out = _zero_masked_attention_rows(
+                ref_out,
+                empty_query_rows=empty_query_rows,
+                chunk_empty_query_rows=chunk_empty_query_rows,
+            )
+            flex_cmp, _ = _compiled_flex_attention(attention_module)(
+                q,
+                k,
+                v,
+                return_lse=True,
+                **compare_kwargs,
+            )
+            flex_cmp = _zero_masked_attention_rows(
+                flex_cmp,
+                empty_query_rows=empty_query_rows,
+                chunk_empty_query_rows=chunk_empty_query_rows,
+            )
+            if compare_grads:
+                upstream = torch.randn_like(ref_out)
+                ref_grads = torch.autograd.grad(ref_out, (q, k, v), upstream, retain_graph=True)
+                flex_grads = torch.autograd.grad(flex_cmp, (q, k, v), upstream)
+            else:
+                ref_grads = flex_grads = None
+
+        out_diff = (flex_cmp.detach() - ref_out.detach()).float()
+        prod_out_diff = (flex_out.detach() - ref_out.detach()).float()
+        ref_norm = ref_out.detach().float().norm()
+        flex_norm = flex_cmp.detach().float().norm()
+        out_max = out_diff.abs().max()
+        out_mean = out_diff.abs().mean()
+        prod_out_max = prod_out_diff.abs().max()
+        math_sdpa_message = ""
+        if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_MATH_SDPA"):
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+
+            with sdpa_kernel(SDPBackend.MATH):
+                math_out = F.scaled_dot_product_attention(
+                    q.detach(),
+                    k.detach(),
+                    v.detach(),
+                    attn_mask=dense_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=flex_scale,
+                    enable_gqa=False,
+                )
+            math_out = _zero_masked_attention_rows(
+                math_out,
+                empty_query_rows=empty_query_rows,
+                chunk_empty_query_rows=chunk_empty_query_rows,
+            )
+            math_flex_diff = (flex_cmp.detach() - math_out.detach()).float()
+            math_default_diff = (ref_out.detach() - math_out.detach()).float()
+            math_sdpa_message = (
+                f" math_sdpa_norm={math_out.detach().float().norm().item():.6e}"
+                f" flex_math_max={math_flex_diff.abs().max().item():.6e}"
+                f" flex_math_mean={math_flex_diff.abs().mean().item():.6e}"
+                f" default_math_max={math_default_diff.abs().max().item():.6e}"
+                f" default_math_mean={math_default_diff.abs().mean().item():.6e}"
+            )
+    else:
+        ref_grads = flex_grads = None
+        scale = flex_scale if flex_scale is not None else (1.0 / math.sqrt(query_for_flex.shape[-1]))
+        block_q = int(os.environ.get("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_MANUAL_BLOCK_Q", "128"))
+        abs_sum = torch.zeros((), device=query_for_flex.device, dtype=torch.float32)
+        sq_sum = torch.zeros((), device=query_for_flex.device, dtype=torch.float32)
+        ref_sq_sum = torch.zeros((), device=query_for_flex.device, dtype=torch.float32)
+        flex_sq_sum = torch.zeros((), device=query_for_flex.device, dtype=torch.float32)
+        out_max = torch.zeros((), device=query_for_flex.device, dtype=torch.float32)
+        prod_out_max = torch.zeros((), device=query_for_flex.device, dtype=torch.float32)
+        numel = 0
+        key_t = key_for_flex.transpose(-2, -1)
+        for q_start in range(0, query_for_flex.shape[2], block_q):
+            q_end = min(q_start + block_q, query_for_flex.shape[2])
+            scores = torch.matmul(query_for_flex[:, :, q_start:q_end, :], key_t) * scale
+            scores = scores.masked_fill(~dense_allowed_mask[:, None, q_start:q_end, :], -float("inf"))
+            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(value_for_flex.dtype)
+            ref_block = torch.matmul(probs, value_for_flex)
+            flex_block = flex_out[:, :, q_start:q_end, :]
+            if empty_query_rows is not None:
+                ref_block = ref_block.masked_fill(empty_query_rows[:, None, q_start:q_end, None], 0)
+            if chunk_empty_query_rows.any():
+                ref_block = ref_block.masked_fill(chunk_empty_query_rows[:, None, q_start:q_end, None], 0)
+            diff = (flex_block.detach() - ref_block.detach()).float()
+            abs_diff = diff.abs()
+            abs_sum = abs_sum + abs_diff.sum()
+            sq_sum = sq_sum + (diff * diff).sum()
+            ref_float = ref_block.detach().float()
+            flex_float = flex_block.detach().float()
+            ref_sq_sum = ref_sq_sum + (ref_float * ref_float).sum()
+            flex_sq_sum = flex_sq_sum + (flex_float * flex_float).sum()
+            out_max = torch.maximum(out_max, abs_diff.max())
+            prod_out_max = out_max
+            numel += diff.numel()
+        out_mean = abs_sum / max(numel, 1)
+        ref_norm = torch.sqrt(ref_sq_sum)
+        flex_norm = torch.sqrt(flex_sq_sum)
+    allowed_pairs = int(dense_allowed_mask.sum().item())
+    empty_rows = int(chunk_empty_query_rows.sum().item())
+    empty_query_count = 0 if empty_query_rows is None else int(empty_query_rows.sum().item())
+    ref_name = "sdpa" if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_FULL_SDPA") else "manual"
+    message = (
+        f"{prefix} allowed_pairs={allowed_pairs} empty_rows={empty_rows} "
+        f"empty_query_rows={empty_query_count} ref={ref_name} scale={flex_scale} "
+        f"q_dtype={query_for_flex.dtype} k_dtype={key_for_flex.dtype} v_dtype={value_for_flex.dtype} "
+        f"q_stride={tuple(query_for_flex.stride())} k_stride={tuple(key_for_flex.stride())} "
+        f"v_stride={tuple(value_for_flex.stride())} "
+        f"q_absmax={query_for_flex.detach().abs().max().item():.6e} "
+        f"k_absmax={key_for_flex.detach().abs().max().item():.6e} "
+        f"v_absmax={value_for_flex.detach().abs().max().item():.6e} "
+        f"ref_norm={ref_norm.item():.6e} "
+        f"flex_norm={flex_norm.item():.6e} "
+        f"out_max={out_max.item():.6e} out_mean={out_mean.item():.6e} "
+        f"prod_out_max={prod_out_max.item():.6e}"
+    )
+    if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_FULL_SDPA"):
+        message += math_sdpa_message
+    if ref_grads is not None and flex_grads is not None:
+        grad_diffs = [(fg.detach() - sg.detach()).float() for fg, sg in zip(flex_grads, ref_grads)]
+        message += (
+            f" q_grad_max={grad_diffs[0].abs().max().item():.6e} q_grad_norm={grad_diffs[0].norm().item():.6e}"
+            f" k_grad_max={grad_diffs[1].abs().max().item():.6e} k_grad_norm={grad_diffs[1].norm().item():.6e}"
+            f" v_grad_max={grad_diffs[2].abs().max().item():.6e} v_grad_norm={grad_diffs[2].norm().item():.6e}"
+        )
+    print(message, flush=True)
 
 
 def _run_gemma4_flex_chunk(
@@ -291,6 +744,19 @@ def _run_gemma4_flex_chunk(
         and config_uses_vision_bidir
         and vision_group_ids_q is not None
         and vision_group_ids_kv is not None
+    )
+    _debug_packed_boundaries(
+        attention_module,
+        ctx,
+        key_chunk=key_chunk,
+        packed_seq_ids_q=packed_seq_ids_q,
+        packed_seq_ids_kv=packed_seq_ids_kv,
+        padding_mask_q=padding_mask_q,
+        padding_mask_kv=padding_mask_kv,
+        vision_group_ids_q=vision_group_ids_q,
+        vision_group_ids_kv=vision_group_ids_kv,
+        kv_global_start=kv_global_start,
+        use_vision_bidirectional=use_vision_bidirectional,
     )
 
     empty_query_rows = None
@@ -377,6 +843,15 @@ def _run_gemma4_flex_chunk(
         )
         block_mask = _cached_block_mask(block_mask_key, _build_block_mask)
 
+        batch_idx = torch.arange(query.shape[0], device=query.device).view(-1, 1, 1)
+        head_idx = torch.zeros_like(batch_idx)
+        q_idx = torch.arange(ctx.seq_local, device=query.device).view(1, -1, 1)
+        kv_idx = torch.arange(key_chunk.shape[2], device=query.device).view(1, 1, -1)
+        chunk_allowed = cp_mask(batch_idx, head_idx, q_idx, kv_idx)
+        if chunk_allowed.shape[0] == 1 and query.shape[0] > 1:
+            chunk_allowed = chunk_allowed.expand(query.shape[0], -1, -1)
+        chunk_empty_query_rows = ~chunk_allowed.any(dim=-1)
+
         query_for_flex = query
         key_for_flex = key_chunk
         value_for_flex = value_chunk
@@ -389,7 +864,16 @@ def _run_gemma4_flex_chunk(
             if flex_scale is None:
                 flex_scale = 1.0 / math.sqrt(orig_head_dim)
 
-        flex_kwargs = {"block_mask": block_mask, "scale": flex_scale, "enable_gqa": ctx.enable_gqa}
+        def cp_score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
+            allowed = cp_mask(batch_idx, head_idx, q_idx, kv_idx)
+            return torch.where(allowed, score, torch.full_like(score, -float("inf")))
+
+        flex_kwargs = {
+            "score_mod": cp_score_mod,
+            "block_mask": block_mask,
+            "scale": flex_scale,
+            "enable_gqa": ctx.enable_gqa,
+        }
         if use_small_flex_blocks:
             flex_kwargs["kernel_options"] = {
                 "BLOCK_M": 32,
@@ -418,6 +902,25 @@ def _run_gemma4_flex_chunk(
 
         if empty_query_rows is not None and empty_query_rows.any():
             out = out.masked_fill(empty_query_rows[:, None, :, None], 0)
+        if chunk_empty_query_rows.any():
+            out = out.masked_fill(chunk_empty_query_rows[:, None, :, None], 0)
+            lse = lse.masked_fill(chunk_empty_query_rows[:, None, :], -float("inf"))
+        _debug_compare_flex_sdpa(
+            attention_module,
+            ctx,
+            query_for_flex=query_for_flex,
+            key_for_flex=key_for_flex,
+            value_for_flex=value_for_flex,
+            block_mask=block_mask,
+            cp_score_mod=cp_score_mod,
+            dense_allowed_mask=chunk_allowed,
+            empty_query_rows=empty_query_rows,
+            chunk_empty_query_rows=chunk_empty_query_rows,
+            flex_scale=flex_scale,
+            flex_kwargs=flex_kwargs,
+            flex_out=out,
+            kv_global_start=kv_global_start,
+        )
         if padded_head_dim != orig_head_dim:
             out = out[..., :orig_head_dim]
 
@@ -472,6 +975,7 @@ def _run_gemma4_cp_ring_attention_forward(attention_module: torch.nn.Module, ctx
     empty_query_rows = None
     padded_head_dim = ctx.query.shape[-1]
 
+    _log_cp_memory(attention_module, "forward_start")
     for current_owner, current_key, current_value, current_metadata in _collect_ring_kv_chunks(ctx):
         kv_global_start = current_owner * ctx.seq_local
         out_step, lse_step, empty_query_rows, padded_head_dim = _run_gemma4_flex_chunk(
@@ -483,6 +987,8 @@ def _run_gemma4_cp_ring_attention_forward(attention_module: torch.nn.Module, ctx
             kv_global_start=kv_global_start,
         )
         out_acc, lse_acc = _merge_flex_chunk(out_acc, lse_acc, out_step, lse_step)
+        if os.environ.get("NEMO_AUTOMODEL_MEMORY_PROFILE_CP_VERBOSE", "").lower() in {"1", "true", "yes", "on"}:
+            _log_cp_memory(attention_module, f"forward_after_owner={current_owner}")
 
     if out_acc is None:
         raise RuntimeError("Gemma4 CP ring attention produced no output chunks.")
@@ -501,6 +1007,7 @@ def _run_gemma4_cp_ring_attention_forward(attention_module: torch.nn.Module, ctx
             ctx.cp_size,
         )
         _GEMMA4_CP_FLEX_RING_OK_LOGGED = True
+    _log_cp_memory(attention_module, "forward_end")
     return out_acc.to(ctx.query.dtype)
 
 
@@ -511,6 +1018,7 @@ def _zero_if_none(grad: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor
 class _Gemma4FlexRingAttention(torch.autograd.Function):
     @staticmethod
     def forward(autograd_ctx, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, ring_ctx: Any):
+        _log_cp_memory(ring_ctx.module, "autograd_forward_start")
         runtime_ctx = replace(ring_ctx, query=query, key=key, value=value)
         out = _run_gemma4_cp_ring_attention_forward(ring_ctx.module, runtime_ctx)
         autograd_ctx.save_for_backward(query, key, value)
@@ -521,12 +1029,14 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
             value=None,
             metadata=_detach_metadata(ring_ctx.metadata),
         )
+        _log_cp_memory(ring_ctx.module, "autograd_forward_end")
         return out
 
     @staticmethod
     def backward(autograd_ctx, grad_output: torch.Tensor):
         query, key, value = autograd_ctx.saved_tensors
         ring_ctx = autograd_ctx.ring_ctx
+        _log_cp_memory(ring_ctx.module, "backward_start")
 
         with torch.enable_grad():
             query_req = query.detach().requires_grad_(True)
@@ -538,6 +1048,7 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
                 metadata=_detach_metadata(ring_ctx.metadata),
             )
             chunks = _collect_ring_kv_chunks(collect_ctx)
+            _log_cp_memory(ring_ctx.module, "backward_after_collect")
 
             runtime_ctx = replace(collect_ctx, query=query_req)
             key_reqs = []
@@ -563,14 +1074,23 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
                     kv_global_start=owner * ring_ctx.seq_local,
                 )
                 out_acc, lse_acc = _merge_flex_chunk(out_acc, lse_acc, out_step, lse_step)
+                if os.environ.get("NEMO_AUTOMODEL_MEMORY_PROFILE_CP_VERBOSE", "").lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    _log_cp_memory(ring_ctx.module, f"backward_after_recompute_owner={owner}")
 
             if out_acc is None:
                 raise RuntimeError("Gemma4 CP ring attention backward produced no output chunks.")
             if empty_query_rows is not None and empty_query_rows.any():
                 out_acc = out_acc.masked_fill(empty_query_rows[:, None, :, None], 0)
 
+            _log_cp_memory(ring_ctx.module, "backward_before_autograd_grad")
             grad_targets = [query_req, *key_reqs, *value_reqs]
             grads = torch.autograd.grad(out_acc, grad_targets, grad_output, allow_unused=True)
+            _log_cp_memory(ring_ctx.module, "backward_after_autograd_grad", include_tensors=True)
 
         grad_query = _zero_if_none(grads[0], query)
         num_chunks = len(chunks)
@@ -598,6 +1118,7 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
             )
             grad_key = grad_key + recv_grad_key
             grad_value = grad_value + recv_grad_value
+        _log_cp_memory(ring_ctx.module, "backward_end", include_tensors=True)
 
         return grad_query, grad_key, grad_value, None
 
@@ -635,7 +1156,10 @@ def _gemma4_cp_manual_attention(
     seq_global_start = cp_rank * seq_local
     seq_full = seq_local * size
     if query.shape[1] != key.shape[1]:
-        enable_gqa = True
+        num_key_value_groups = query.shape[1] // key.shape[1]
+        key = _repeat_kv_for_gqa(key, num_key_value_groups)
+        value = _repeat_kv_for_gqa(value, num_key_value_groups)
+        enable_gqa = False
 
     local_metadata = getattr(attention_module, "_cp_manual_metadata", {})
     metadata_seq_dims = getattr(attention_module, "_cp_manual_metadata_seq_dims", {})
@@ -737,6 +1261,10 @@ def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module) -> None:
     instead of cp_utils' generic SDPA hooks. ``run_cp_manual_attention`` is also bound
     as the ring entry point.
     """
+    global _GEMMA4_CP_PROFILE_NEXT_MODULE_ID
+    if not hasattr(attention_module, "_gemma4_cp_profile_id"):
+        attention_module._gemma4_cp_profile_id = _GEMMA4_CP_PROFILE_NEXT_MODULE_ID
+        _GEMMA4_CP_PROFILE_NEXT_MODULE_ID += 1
     attention_module._cp_manual_metadata_keys = (
         "mm_token_type_ids",
         "_packed_seq_ids",

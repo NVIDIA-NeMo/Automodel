@@ -317,6 +317,19 @@ def test_deepseek_v4_registered_in_arch_mapping():
     assert cls_name == "DeepseekV4ForCausalLM"
 
 
+def test_gemma4_unified_registered_in_arch_mapping():
+    """Gemma4 12B checkpoints declare Gemma4UnifiedForConditionalGeneration."""
+    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+
+    assert "Gemma4UnifiedForConditionalGeneration" in MODEL_ARCH_MAPPING, (
+        "Gemma4 12B checkpoints use this architecture name and need it mapped "
+        "to the in-tree CP wrapper."
+    )
+    module_path, cls_name = MODEL_ARCH_MAPPING["Gemma4UnifiedForConditionalGeneration"]
+    assert module_path == "nemo_automodel.components.models.gemma4_moe.model"
+    assert cls_name == "Gemma4UnifiedForConditionalGeneration"
+
+
 def test_deepseek_v4_in_custom_config_registrations():
     """deepseek_v4 model_type must be registered in _CUSTOM_CONFIG_REGISTRATIONS."""
     from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS

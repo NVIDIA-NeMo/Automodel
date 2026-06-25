@@ -1,0 +1,117 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from types import SimpleNamespace
+
+import torch
+
+from nemo_automodel.components.models.gemma4_moe.cp_attention import _boundary_allowed_mask
+from nemo_automodel.components.models.gemma4_moe.cp_batch import _prepare_manual_cp_batch
+from nemo_automodel.components.models.gemma4_moe.model import Gemma4UnifiedForConditionalGeneration
+
+
+def test_gemma4_unified_capabilities_are_cp_only():
+    caps = Gemma4UnifiedForConditionalGeneration.get_capabilities(SimpleNamespace())
+
+    assert caps.supports_cp is True
+    assert caps.supports_tp is False
+    assert caps.supports_pp is False
+    assert caps.supports_ep is False
+
+
+def test_gemma4_unified_prepare_model_inputs_for_cp_binds_batch_sharder_without_preembedding():
+    sentinel = object()
+    fake_self = SimpleNamespace(_cp_shard_batch=sentinel)
+
+    out = Gemma4UnifiedForConditionalGeneration.prepare_model_inputs_for_cp(
+        fake_self,
+        input_ids=torch.arange(8).view(1, 8),
+        num_chunks=2,
+    )
+
+    assert out == {"_cp_make_batch_fn": sentinel}
+
+
+def test_gemma4_unified_prepare_model_inputs_for_cp_carries_vision_metadata():
+    sentinel = object()
+    fake_self = SimpleNamespace(_cp_shard_batch=sentinel)
+    mm = torch.tensor([[0, 1, 1, 0, 2, 2]])
+
+    out = Gemma4UnifiedForConditionalGeneration.prepare_model_inputs_for_cp(
+        fake_self,
+        input_ids=torch.arange(6).view(1, 6),
+        mm_token_type_ids=mm,
+    )
+
+    assert out["_cp_make_batch_fn"] is sentinel
+    assert out["mm_token_type_ids"] is mm
+    assert out["_gemma4_vision_group_ids"].tolist() == [[-1, 0, 0, -1, 1, 1]]
+    assert out["_cp_metadata_seq_dims"] == {"_gemma4_vision_group_ids": 1}
+    assert out["_cp_metadata_pad_values"] == {"_gemma4_vision_group_ids": -1}
+
+
+def test_gemma4_unified_prepare_model_inputs_for_cp_requires_input_ids():
+    fake_self = SimpleNamespace(_cp_shard_batch=object())
+
+    try:
+        Gemma4UnifiedForConditionalGeneration.prepare_model_inputs_for_cp(fake_self, input_ids=None)
+    except ValueError as exc:
+        assert "requires input_ids" in str(exc)
+    else:
+        raise AssertionError("expected prepare_model_inputs_for_cp to require input_ids")
+
+
+def test_gemma4_unified_cp_boundary_mask_blocks_cross_document_attention():
+    attention = SimpleNamespace(sliding_window=None)
+    query = torch.empty(1, 1, 4, 1)
+    ctx = SimpleNamespace(seq_global_start=4, seq_local=4, query=query, is_causal=True)
+    q_ids = torch.tensor([[3, 3, 4, 4]])
+    kv_ids = torch.tensor([[1, 1, 2, 2]])
+
+    allowed = _boundary_allowed_mask(
+        attention,
+        ctx,
+        packed_seq_ids_q=q_ids,
+        packed_seq_ids_kv=kv_ids,
+        padding_mask_q=None,
+        padding_mask_kv=None,
+        vision_group_ids_q=None,
+        vision_group_ids_kv=None,
+        kv_global_start=0,
+        use_vision_bidirectional=False,
+    )
+
+    # The remote KV chunk is entirely in the causal past, so only document
+    # boundaries can mask it. Since IDs do not match, no pair is visible.
+    assert allowed.shape == (1, 4, 4)
+    assert allowed.sum().item() == 0
+
+
+def test_gemma4_unified_cp_batch_accepts_attention_mask_mapping_for_padding():
+    full_attention = torch.ones(1, 1, 4, 4, dtype=torch.bool).tril()
+    full_attention[..., 3, :] = False
+    full_attention[..., :, 3] = False
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 0]]),
+        "labels": torch.tensor([[2, 3, 4, -100]]),
+        "position_ids": torch.tensor([[0, 1, 2, 0]]),
+        "attention_mask": {
+            "full_attention": full_attention,
+            "sliding_attention": full_attention.clone(),
+        },
+    }
+
+    _prepare_manual_cp_batch(None, None, batch, loss_mask=None)
+
+    assert batch["padding_mask"].tolist() == [[False, False, False, True]]

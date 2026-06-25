@@ -118,6 +118,17 @@ def _is_glm_moe_dsa(model: "nn.Module") -> bool:
     return getattr(config, "model_type", None) == "glm_moe_dsa" or type(model).__name__.startswith("GlmMoeDsa")
 
 
+def _is_gemma4_model_owned_cp(model: "nn.Module") -> bool:
+    """True for Gemma4 wrappers that own their CP batch sharding and attention."""
+    config = getattr(model, "config", None)
+    text_config = getattr(config, "text_config", None)
+    return (
+        getattr(config, "model_type", None) in {"gemma4", "gemma4_unified"}
+        or getattr(text_config, "model_type", None) in {"gemma4", "gemma4_unified"}
+        or type(model).__name__.startswith("Gemma4")
+    ) and callable(getattr(model, "prepare_model_inputs_for_cp", None))
+
+
 def _is_hybrid(model: "nn.Module") -> bool:
     """True when the model mixes attention with non-attention layers (e.g. Mamba/SSM).
 
@@ -333,6 +344,8 @@ class ModelSupports:
         if _is_glm_moe_dsa(self._model):
             backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
             return self.supports_sequence_packing and backend_attn == "tilelang"
+        if _is_gemma4_model_owned_cp(self._model):
+            return self.supports_sequence_packing
         return self.supports_sequence_packing and (_uses_te_attention(self._model) or _uses_magi_attention(self._model))
 
 

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import os
 from typing import List, Optional, Set
 
 import torch
@@ -323,7 +324,13 @@ def make_cp_batch_and_ctx(
     # the batch in its pre-embed step. Honor it instead of the default
     # load-balanced context_parallel path so the implementation stays with the model.
     cp_make_batch_fn = batch.pop("_cp_make_batch_fn", None)
-    if _get_mesh_size(cp_mesh) > 1 and cp_make_batch_fn is not None:
+    force_model_cp = os.environ.get("NEMO_AUTOMODEL_DEBUG_FORCE_MODEL_CP", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if (_get_mesh_size(cp_mesh) > 1 or force_model_cp) and cp_make_batch_fn is not None:
         return cp_make_batch_fn(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
 
     if use_te:
