@@ -14,6 +14,7 @@
 
 """Device mesh construction and access utilities for distributed training."""
 
+import datetime
 from dataclasses import dataclass, field
 
 import torch
@@ -62,6 +63,7 @@ def _create_device_meshes(
     parallelism: ParallelismSizes,
     *,
     world_size: int,
+    timeout_minutes: int | None = None,
 ) -> tuple[DeviceMesh | None, DeviceMesh | None]:
     """Create raw device meshes based on distributed config type."""
     if (
@@ -75,6 +77,7 @@ def _create_device_meshes(
         return _create_fsdp2_device_mesh(
             parallelism,
             world_size=world_size,
+            timeout_minutes=timeout_minutes,
         )
     elif isinstance(strategy_config, MegatronFSDPConfig):
         _require_size_one("megatron_fsdp", parallelism.pp_size, "pipeline parallelism")
@@ -82,6 +85,7 @@ def _create_device_meshes(
         mesh = _create_megatron_fsdp_device_mesh(
             parallelism,
             world_size=world_size,
+            timeout_minutes=timeout_minutes,
         )
         return mesh, None
     elif isinstance(strategy_config, DDPConfig):
@@ -120,15 +124,41 @@ def _mesh_device_type() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _init_named_mesh(spec: _MeshSpec) -> DeviceMesh:
+def _init_named_mesh(spec: _MeshSpec, *, timeout_minutes: int | None = None) -> DeviceMesh:
     _validate_mesh_spec(spec)
+    device_type = _mesh_device_type()
     device_mesh = init_device_mesh(
-        device_type=_mesh_device_type(),
+        device_type=device_type,
         mesh_shape=spec.shape,
         mesh_dim_names=spec.axes,
+        backend_override=_nccl_backend_override(spec.axes, device_type=device_type, timeout_minutes=timeout_minutes),
     )
     _register_flattened_axes(device_mesh, spec.flattened_axes)
     return device_mesh
+
+
+def _nccl_backend_override(
+    axes: tuple[MeshAxisName, ...],
+    *,
+    device_type: str,
+    timeout_minutes: int | None,
+):
+    """Create per-axis NCCL options for DeviceMesh subgroups.
+
+    ``init_process_group(timeout=...)`` configures the default process group, but
+    ``init_device_mesh`` creates additional per-axis process groups. Without a
+    backend override those groups keep PyTorch's default NCCL timeout.
+    """
+    if timeout_minutes is None or device_type != "cuda":
+        return None
+
+    timeout = datetime.timedelta(minutes=timeout_minutes)
+    override = {}
+    for axis in axes:
+        options = dist.ProcessGroupNCCL.Options()
+        options._timeout = timeout
+        override[axis] = ("nccl", options)
+    return override
 
 
 def _validate_mesh_spec(spec: _MeshSpec) -> None:
@@ -153,6 +183,7 @@ def _create_fsdp2_device_mesh(
     parallelism: ParallelismSizes,
     *,
     world_size: int,
+    timeout_minutes: int | None = None,
 ) -> tuple[DeviceMesh, DeviceMesh | None]:
     """Create the FSDP2 root mesh and optional MoE mesh."""
     tp_size = _degree(parallelism.tp_size)
@@ -198,6 +229,7 @@ def _create_fsdp2_device_mesh(
                 MeshAxisName.DP_CP: (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP),
             },
         ),
+        timeout_minutes=timeout_minutes,
     )
 
     moe_mesh = None
@@ -211,6 +243,7 @@ def _create_megatron_fsdp_device_mesh(
     parallelism: ParallelismSizes,
     *,
     world_size: int,
+    timeout_minutes: int | None = None,
 ) -> DeviceMesh:
     """Create the Megatron FSDP mesh."""
     tp_size = _degree(parallelism.tp_size)
@@ -229,6 +262,7 @@ def _create_megatron_fsdp_device_mesh(
             axes=(MeshAxisName.DP, MeshAxisName.CP, MeshAxisName.TP),
             flattened_axes={MeshAxisName.DP_CP: (MeshAxisName.DP, MeshAxisName.CP)} if cp_size > 1 else {},
         ),
+        timeout_minutes=timeout_minutes,
     )
 
 
