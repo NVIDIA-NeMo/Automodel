@@ -24,6 +24,9 @@ if [ "${PYTEST_PROPAGATE_S:-}" = "1" ]; then
     PYTEST_S_FLAG="-s"
 fi
 
+# load_checkpoint auto-detects the latest dir in checkpoint_dir; clear sibling leftovers first.
+rm -rf checkpoints/
+
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run  --master-port=29504 \
 --nproc_per_node=2 --nnodes=1 -m coverage run  \
 -m pytest $PYTEST_S_FLAG tests/functional_tests/checkpoint/test_peft_vlm.py \

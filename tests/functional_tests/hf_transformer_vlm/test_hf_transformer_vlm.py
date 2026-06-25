@@ -50,8 +50,8 @@ class TestHFTransformerVLM:
         try:
             run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_PEFT_FILENAME)
         finally:
-            # remove the checkpoint directory
-            shutil.rmtree("vlm_checkpoints/", ignore_errors=True)
+            # peft config defaults checkpoint_dir to checkpoints/, not vlm_checkpoints/
+            shutil.rmtree("checkpoints/", ignore_errors=True)
 
     def test_hf_transformer_vlm_sft(self):
         try:
