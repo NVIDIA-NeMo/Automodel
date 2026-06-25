@@ -68,7 +68,7 @@ model:
     rms_norm: torch_fp32
     rope_fusion: false
     experts: gmm
-    dispatcher: deepep
+    dispatcher: hybridep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -156,3 +156,7 @@ wandb:
   entity: <your_wandb_entity>
   name: <your_wandb_name>
   dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: athitten
+  nodes: 16
