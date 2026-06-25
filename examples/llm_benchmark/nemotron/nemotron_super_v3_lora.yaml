@@ -68,7 +68,7 @@ model:
     rms_norm: te
     rope_fusion: false
     experts: gmm
-    dispatcher: deepep
+    dispatcher: hybridep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
