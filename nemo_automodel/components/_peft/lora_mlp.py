@@ -382,7 +382,7 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
 
 
 def _fusible(module) -> bool:
-    """A LoRA linear is fusible when it is a plain (non-DoRA, dropout-free, non-DTensor) adapter."""
+    """A LoRA linear is fusible when it is a plain materialized adapter."""
     lora_A = getattr(module, "lora_A", None)
     lora_B = getattr(module, "lora_B", None)
     if lora_A is None or lora_B is None:
@@ -405,6 +405,8 @@ def _fusible(module) -> bool:
         return False
     for w in (base_w, lora_A.weight, lora_B.weight):
         if isinstance(w, DTensor):
+            return False
+        if getattr(w, "is_meta", False):
             return False
     return True
 

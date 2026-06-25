@@ -111,10 +111,8 @@ optimizer:
 ci:
   # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
   time: "00:30:00"
-  max_steps: 1
+  max_steps: 2
   env_vars:
     NEMO_LORA_MLP_DEBUG_NAN: "1"
-    NEMO_LORA_MLP_DEBUG_STATS: "1"
-    NEMO_LORA_MLP_DEBUG_COMPARE_FILTER: "model.layers.1.mlp"
   recipe_owner: hemildesai
   nodes: 16
