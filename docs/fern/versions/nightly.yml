@@ -408,6 +408,9 @@ navigation:
       - page: "Gradient Checkpointing"
         path: ../../guides/gradient-checkpointing.mdx
         slug: gradient-checkpointing
+      - page: "Distributed Setup (Python API)"
+        path: ../../guides/distributed-setup.mdx
+        slug: distributed-setup
       - page: "Pipeline Parallelism"
         path: ../../guides/pipelining.mdx
         slug: pipeline-parallelism
