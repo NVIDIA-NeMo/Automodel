@@ -370,7 +370,13 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     def __init__(
         self, orig_module: GroupedExpertsDeepEP, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None
     ):
-        super().__init__(orig_module.config)
+        super().__init__(
+            orig_module.config,
+            dispatcher_backend=orig_module.dispatcher_backend,
+            dispatcher_num_sms=orig_module.dispatcher_num_sms,
+            dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
+            dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
+        )
 
         self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
         self.down_projs.data.copy_(orig_module.down_projs.data)
@@ -385,6 +391,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.ep_rank = getattr(orig_module, "ep_rank", 0)
         self.token_dispatcher = getattr(orig_module, "token_dispatcher", None)
         self.use_torch_mm = getattr(orig_module, "use_torch_mm", False)
+        self.use_mxfp8 = getattr(orig_module, "use_mxfp8", False)
 
         GroupedExpertsDeepEPLoRA._init_adapter(
             self,

@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 import torch
 import torch.nn as nn
-from unittest.mock import MagicMock, patch
+
 try:
     import grouped_gemm
 except ImportError:
@@ -23,14 +25,15 @@ except ImportError:
 
 try:
     import transformer_engine  # noqa: F401
+
     HAS_TE = True
 except ImportError:
     HAS_TE = False
 
+from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules, patch_moe_module
+from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
-from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA, GroupedExpertsDeepEPLoRA
-from nemo_automodel.components._peft.lora import patch_moe_module, apply_lora_to_linear_modules, PeftConfig
 
 
 @pytest.fixture
@@ -58,7 +61,7 @@ def moe_config():
         moe_inter_dim=32,
         norm_topk_prob=False,
         expert_activation="swiglu",
-        dtype=torch.float32
+        dtype=torch.float32,
     )
 
 
@@ -80,7 +83,7 @@ def test_grouped_experts_lora_init(moe_config, device):
     # lora_gate_and_up_A: [n_experts, in_dim, lora_dim] -> [4, 16, 4]
     assert lora_experts.lora_gate_and_up_A.shape == (4, 16, 4)
     # lora_gate_and_up_B: [n_experts, lora_dim, out_dim] -> [4, 4, 64]
-    assert lora_experts.lora_gate_and_up_B.shape == (4, 4, 64) # 32 * 2
+    assert lora_experts.lora_gate_and_up_B.shape == (4, 4, 64)  # 32 * 2
     # lora_down_A: [n_experts, inter_dim, lora_dim] -> [4, 32, 4]
     assert lora_experts.lora_down_A.shape == (4, 32, 4)
     # lora_down_B: [n_experts, lora_dim, out_dim] -> [4, 4, 16]
@@ -96,6 +99,7 @@ def test_grouped_experts_lora_init(moe_config, device):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_apply_lora_equivalence(moe_config, device):
     """Test that applying LoRA to a model maintains output equivalence upon initialization."""
+
     class MockModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -127,10 +131,7 @@ def test_apply_lora_equivalence(moe_config, device):
         out_orig = model(x, token_mask, weights, indices)
 
     # Apply LoRA
-    peft_config = PeftConfig(
-        target_modules=["*experts*"],
-        dim=4
-    )
+    peft_config = PeftConfig(target_modules=["*experts*"], dim=4)
     apply_lora_to_linear_modules(model, peft_config)
     model = model.to(device)
     # LoRA output
@@ -167,6 +168,28 @@ def test_grouped_experts_deepep_lora_init(moe_config, device):
     assert lora_experts.lora_gate_and_up_B.requires_grad
 
 
+def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
+    """Test that LoRA wrapping preserves the source expert dispatcher backend."""
+    orig_experts = GroupedExpertsDeepEP(
+        moe_config,
+        dispatcher_backend="hybridep",
+        dispatcher_num_sms=24,
+        dispatcher_share_token_dispatcher=False,
+        dispatcher_async_dispatch=True,
+    )
+    orig_experts.use_torch_mm = True
+    orig_experts.use_mxfp8 = True
+
+    lora_experts = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4, alpha=8)
+
+    assert lora_experts.dispatcher_backend == "hybridep"
+    assert lora_experts.dispatcher_num_sms == 24
+    assert lora_experts.dispatcher_share_token_dispatcher is False
+    assert lora_experts.dispatcher_async_dispatch is True
+    assert lora_experts.use_torch_mm is True
+    assert lora_experts.use_mxfp8 is True
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_patch_moe_module(moe_config, device):
     """Test that patch_moe_module correctly wraps the original experts with the appropriate LoRA class."""
@@ -188,6 +211,7 @@ def test_apply_lora_patching_logic(moe_config, device):
     2. Wildcard matching works for MoE modules.
     3. Non-target modules (e.g., standard Linear layers not in target list) are NOT patched.
     """
+
     class MockModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -195,30 +219,25 @@ def test_apply_lora_patching_logic(moe_config, device):
             self.linear = nn.Linear(16, 16)
 
     model = MockModel().to(device)
-    peft_config = PeftConfig(
-        target_modules=["experts"],
-        dim=4
-    )
+    peft_config = PeftConfig(target_modules=["experts"], dim=4)
 
     count = apply_lora_to_linear_modules(model, peft_config)
     assert count == 1
     assert isinstance(model.experts, GroupedExpertsLoRA)
-    assert isinstance(model.linear, nn.Linear) # Should not be patched
+    assert isinstance(model.linear, nn.Linear)  # Should not be patched
 
     # Test wildcard matching
     model = MockModel().to(device)
-    peft_config = PeftConfig(
-        target_modules=["*experts*"],
-        dim=4
-    )
+    peft_config = PeftConfig(target_modules=["*experts*"], dim=4)
     count = apply_lora_to_linear_modules(model, peft_config)
     assert count == 1
     assert isinstance(model.experts, GroupedExpertsLoRA)
-    assert isinstance(model.linear, nn.Linear) # Should not be patched
+    assert isinstance(model.linear, nn.Linear)  # Should not be patched
 
 
 class MockDeepEPDispatcher:
     """Mock dispatcher that simulates DeepEP's token permutation locally."""
+
     def token_permutation2(self, hidden_states, num_local_tokens, token_probs, token_indices):
         # Simply return the hidden states as if it was a single expert local dispatch
         # To make it compatible with ops.gmm, we need a tokens_per_expert tensor
@@ -229,10 +248,7 @@ class MockDeepEPDispatcher:
         return hidden_states
 
 
-@pytest.mark.skipif(
-    grouped_gemm is None or not torch.cuda.is_available(),
-    reason="Requires grouped_gemm and CUDA"
-)
+@pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
 def test_grouped_experts_deepep_lora_forward_mocked(moe_config, device):
     """
     Test Forward pass of GroupedExpertsDeepEPLoRA using a Mock Dispatcher.
@@ -270,9 +286,7 @@ def test_grouped_experts_deepep_lora_forward_mocked(moe_config, device):
     permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
 
     # Set the same mock on both modules to ensure they see the same "dispatched" data
-    mock_dispatcher.token_permutation2 = MagicMock(
-        return_value=(permuted_x, tokens_per_expert, permuted_probs)
-    )
+    mock_dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
     lora_module.token_dispatcher = mock_dispatcher
     orig_experts.token_dispatcher = mock_dispatcher
 
@@ -452,7 +466,7 @@ def test_lora_with_expert_bias(device):
         norm_topk_prob=False,
         expert_activation="swiglu",
         dtype=torch.float32,
-        expert_bias=True  # Enable bias
+        expert_bias=True,  # Enable bias
     )
 
     orig_experts = GroupedExperts(moe_config).to(device)
@@ -462,8 +476,8 @@ def test_lora_with_expert_bias(device):
     lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
 
     # Check that bias parameters exist and are frozen
-    assert hasattr(lora_experts, 'gate_up_proj_bias')
-    assert hasattr(lora_experts, 'down_proj_bias')
+    assert hasattr(lora_experts, "gate_up_proj_bias")
+    assert hasattr(lora_experts, "down_proj_bias")
     assert not lora_experts.gate_up_proj_bias.requires_grad
     assert not lora_experts.down_proj_bias.requires_grad
 
@@ -499,7 +513,7 @@ def test_quick_geglu_activation_with_lora(device):
         expert_activation="quick_geglu",  # Use QuickGEGLU
         activation_alpha=1.702,
         activation_limit=7.0,
-        dtype=torch.float32
+        dtype=torch.float32,
     )
 
     orig_experts = GroupedExperts(moe_config).to(device)
@@ -528,7 +542,7 @@ def test_lora_dtype_conversion(moe_config, device):
         orig_experts.init_weights(buffer_device=device)
 
     # Create LoRA with explicit bfloat16 dtype
-    if device.type == 'cuda' and torch.cuda.is_bf16_supported():
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
         lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8, lora_dtype="bfloat16").to(device)
 
         # Check that LoRA weights have the correct dtype
@@ -565,14 +579,15 @@ def test_lora_backward_pass_values(moe_config, device):
     loss.backward()
 
     # Check that gradients are non-zero
-    assert not torch.allclose(lora_experts.lora_gate_and_up_A.grad, torch.zeros_like(lora_experts.lora_gate_and_up_A.grad))
-    assert not torch.allclose(lora_experts.lora_gate_and_up_B.grad, torch.zeros_like(lora_experts.lora_gate_and_up_B.grad))
+    assert not torch.allclose(
+        lora_experts.lora_gate_and_up_A.grad, torch.zeros_like(lora_experts.lora_gate_and_up_A.grad)
+    )
+    assert not torch.allclose(
+        lora_experts.lora_gate_and_up_B.grad, torch.zeros_like(lora_experts.lora_gate_and_up_B.grad)
+    )
 
 
-@pytest.mark.skipif(
-    grouped_gemm is None or not torch.cuda.is_available(),
-    reason="Requires grouped_gemm and CUDA"
-)
+@pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
 def test_deepep_lora_zero_tokens(moe_config, device):
     """Test DeepEP LoRA forward pass with zero tokens routed to experts."""
     moe_config.n_routed_experts = 4
@@ -598,9 +613,7 @@ def test_deepep_lora_zero_tokens(moe_config, device):
     permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
     permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
 
-    mock_dispatcher.token_permutation2 = MagicMock(
-        return_value=(permuted_x, tokens_per_expert, permuted_probs)
-    )
+    mock_dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
     lora_module.token_dispatcher = mock_dispatcher
 
     x = torch.randn(num_tokens, 16, device=device).to(dtype)
@@ -628,6 +641,7 @@ def test_patch_moe_module_rejects_te_experts(moe_config, device):
 @pytest.mark.skipif(not HAS_TE, reason="Transformer Engine required")
 def test_apply_lora_rejects_te_experts(moe_config, device):
     """Test that apply_lora_to_linear_modules raises NotImplementedError for GroupedExpertsTE."""
+
     class MockModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -881,10 +895,7 @@ def test_grouped_experts_lora_forward_torch_mm_with_bias(device):
     assert not torch.isnan(out).any()
 
 
-@pytest.mark.skipif(
-    grouped_gemm is None or not torch.cuda.is_available(),
-    reason="Requires grouped_gemm and CUDA"
-)
+@pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
 def test_deepep_lora_forward_torch_mm(moe_config, device):
     """Test DeepEP LoRA forward with use_torch_mm=True via mock dispatcher."""
     moe_config.n_routed_experts = 4
@@ -913,9 +924,7 @@ def test_deepep_lora_forward_torch_mm(moe_config, device):
     permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
     permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
 
-    mock_dispatcher.token_permutation2 = MagicMock(
-        return_value=(permuted_x, tokens_per_expert, permuted_probs)
-    )
+    mock_dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
     lora_module.token_dispatcher = mock_dispatcher
 
     x = torch.randn(num_tokens, 16, device=device).to(dtype)
@@ -928,10 +937,7 @@ def test_deepep_lora_forward_torch_mm(moe_config, device):
     assert not torch.isnan(out).any()
 
 
-@pytest.mark.skipif(
-    grouped_gemm is None or not torch.cuda.is_available(),
-    reason="Requires grouped_gemm and CUDA"
-)
+@pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
 def test_deepep_lora_forward_torch_mm_equivalence(moe_config, device):
     """With zero-init B, torch_mm and grouped_gemm paths should match for DeepEP LoRA."""
     moe_config.n_routed_experts = 4
@@ -967,13 +973,9 @@ def test_deepep_lora_forward_torch_mm_equivalence(moe_config, device):
     permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
 
     mock_dispatcher_gg = MockDeepEPDispatcher()
-    mock_dispatcher_gg.token_permutation2 = MagicMock(
-        return_value=(permuted_x, tokens_per_expert, permuted_probs)
-    )
+    mock_dispatcher_gg.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
     mock_dispatcher_mm = MockDeepEPDispatcher()
-    mock_dispatcher_mm.token_permutation2 = MagicMock(
-        return_value=(permuted_x, tokens_per_expert, permuted_probs)
-    )
+    mock_dispatcher_mm.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
     lora_gg.token_dispatcher = mock_dispatcher_gg
     lora_mm.token_dispatcher = mock_dispatcher_mm
 
@@ -996,7 +998,7 @@ def test_lora_dtype_string(moe_config, device):
     with torch.no_grad():
         orig_experts.init_weights(buffer_device=device)
 
-    if device.type == 'cuda' and torch.cuda.is_bf16_supported():
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
         lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8, lora_dtype="bfloat16").to(device)
         assert lora_experts.lora_gate_and_up_A.dtype == torch.bfloat16
 
@@ -1010,7 +1012,7 @@ def test_deepep_lora_dtype_string(moe_config, device):
     orig_experts.n_routed_experts = 4
     orig_experts.ep_size = 1
 
-    if device.type == 'cuda' and torch.cuda.is_bf16_supported():
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
         lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4, lora_dtype="bfloat16").to(device)
         assert lora_module.lora_gate_and_up_A.dtype == torch.bfloat16
 
@@ -1035,10 +1037,7 @@ def test_deepep_lora_kaiming_init(moe_config, device):
     assert not torch.allclose(lora_module.lora_down_A, torch.zeros_like(lora_module.lora_down_A))
 
 
-@pytest.mark.skipif(
-    grouped_gemm is None or not torch.cuda.is_available(),
-    reason="Requires grouped_gemm and CUDA"
-)
+@pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
 def test_deepep_lora_forward_torch_mm_with_bias(device):
     """Test DeepEP LoRA forward with use_torch_mm=True and expert_bias=True."""
     config = MoEConfig(
@@ -1078,9 +1077,7 @@ def test_deepep_lora_forward_torch_mm_with_bias(device):
     permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
     permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
 
-    mock_dispatcher.token_permutation2 = MagicMock(
-        return_value=(permuted_x, tokens_per_expert, permuted_probs)
-    )
+    mock_dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
     lora_module.token_dispatcher = mock_dispatcher
 
     x = torch.randn(num_tokens, 16, device=device).to(dtype)
@@ -1093,10 +1090,7 @@ def test_deepep_lora_forward_torch_mm_with_bias(device):
     assert not torch.isnan(out).any()
 
 
-@pytest.mark.skipif(
-    grouped_gemm is None or not torch.cuda.is_available(),
-    reason="Requires grouped_gemm and CUDA"
-)
+@pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
 def test_deepep_lora_forward_grouped_gemm_with_bias(device):
     """Test DeepEP LoRA forward with use_torch_mm=False (grouped_gemm) and expert_bias=True."""
     config = MoEConfig(
@@ -1135,9 +1129,7 @@ def test_deepep_lora_forward_grouped_gemm_with_bias(device):
     permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
     permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
 
-    mock_dispatcher.token_permutation2 = MagicMock(
-        return_value=(permuted_x, tokens_per_expert, permuted_probs)
-    )
+    mock_dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
     lora_module.token_dispatcher = mock_dispatcher
 
     x = torch.randn(num_tokens, 16, device=device).to(dtype)
@@ -1156,6 +1148,7 @@ def test_deepep_lora_forward_grouped_gemm_with_bias(device):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_moe_rank_scaling_basic(moe_config, device):
     """MoE experts get dim // n_activated_experts; Linear keeps full dim."""
+
     class MockModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -1185,6 +1178,7 @@ def test_moe_rank_scaling_basic(moe_config, device):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_moe_rank_scaling_default_off(moe_config, device):
     """With moe_rank_scaling=False (default), both get the full dim."""
+
     class MockModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -1257,6 +1251,7 @@ def test_moe_rank_scaling_floor_division_warning(device):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_moe_rank_scaling_dim_too_small(moe_config, device):
     """When dim < n_activated_experts, raise ValueError."""
+
     class MockModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -1279,6 +1274,7 @@ def test_moe_rank_scaling_dim_too_small(moe_config, device):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_moe_rank_scaling_output_equivalence(moe_config, device):
     """With zero-init B, scaled-rank MoE LoRA should produce the same output as the original model."""
+
     class MockModel(nn.Module):
         def __init__(self):
             super().__init__()
