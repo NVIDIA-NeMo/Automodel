@@ -53,10 +53,10 @@ configs accept either a dataclass or a plain dict.
 | Argument | Type | Default | Purpose |
 |---|---|---|---|
 | `strategy` | `str \| DistributedStrategyConfig` | `"fsdp2"` | Sharding strategy: `"fsdp2"`, `"ddp"`, or `"megatron_fsdp"` (or a config object such as `FSDP2Config`/`DDPConfig`). |
-| `parallelism_sizes` | `ParallelismSizes \| None` | `None` | Requested parallel dimensions (`tp_size`, `pp_size`, `cp_size`, `ep_size`, `dp_size`, `dp_replicate_size`). |
+| `parallelism_sizes` | `ParallelismSizes \| None` | `None` | Requested parallel dimensions (`tp_size`, `pp_size`, `cp_size`, `ep_size`, `dp_size`, `dp_replicate_size`). `dp_replicate_size` is FSDP2-only. |
 | `pipeline_config` | `PipelineConfig \| dict \| None` | `None` | Pipeline-parallel options; **requires `pp_size > 1`**. |
 | `moe_parallel_config` | `MoEParallelizerConfig \| dict \| None` | `None` | Expert-parallel options; **requires `ep_size > 1`**. |
-| `activation_checkpointing` | `bool \| str` | `False` | `True`/`"full"` for full AC, `"selective"` for FSDP2 selective AC. |
+| `activation_checkpointing` | `bool \| "selective"` | `False` | `True` enables full activation checkpointing; `"selective"` enables FSDP2 selective AC. |
 | `world_size` | `int \| None` | `None` | Total ranks; auto-detected from the process group when omitted. |
 
 `ParallelismSizes` is durable user intent (what you requested). The resolved
