@@ -408,15 +408,16 @@ class TestGetFsdpDpMesh:
     # Branch 3 – dp_replicate = 1, cp > 1
     # ------------------------------------------------------------------
 
-    def test_cp_only_returns_shard_cp_tuple_slice(self):
-        """dp_replicate=1, cp>1 → device_mesh[("dp_shard","cp")]."""
+    def test_cp_only_returns_flattened_shard_cp_mesh(self):
+        """dp_replicate=1, cp>1 → device_mesh["dp_shard_cp"]."""
         mesh = self._make_mesh(self._ALL_NATIVE_DIMS, {"dp_replicate": 1, "cp": 4})
+        shard_cp_mesh = Mock()
+        mesh._get_root_mesh = Mock(return_value=mesh)
+        mesh._flatten_mapping = {"dp_shard_cp": shard_cp_mesh}
 
         result = get_fsdp_dp_mesh(mesh)
 
-        mesh.__getitem__.assert_any_call(("dp_shard", "cp"))
-        assert result._key == ("dp_shard", "cp")
-        assert result._mesh is mesh
+        assert result is shard_cp_mesh
 
     # ------------------------------------------------------------------
     # Branch 4 – dp_replicate > 1 AND cp > 1 → get_submesh fallback
