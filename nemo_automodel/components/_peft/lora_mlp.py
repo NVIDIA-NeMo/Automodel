@@ -174,16 +174,33 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
         orig_shape = x.shape
         x2 = x.reshape(-1, orig_shape[-1])
 
-        # Build each projection in-place (base buffer += scaled LoRA delta) to avoid an extra
-        # tokens x out buffer per projection. forward runs outside autograd, so this is safe.
-        e = F.linear(x2, gW)  # gate_out (saved)
-        e.addmm_(F.linear(x2, gA) * gS, gB.t())
-        g = F.linear(x2, uW)  # up_out (saved)
-        g.addmm_(F.linear(x2, uA) * uS, uB.t())
+        # Debug variant: keep LoRA active, but avoid in-place base += LoRA accumulation
+        # so we can isolate whether addmm_ into the base output is responsible for NaNs.
+        e_base = F.linear(x2, gW)
+        e_lora = F.linear(F.linear(x2, gA) * gS, gB)
+        e = e_base + e_lora  # gate_out (saved)
+        g_base = F.linear(x2, uW)
+        g_lora = F.linear(F.linear(x2, uA) * uS, uB)
+        g = g_base + g_lora  # up_out (saved)
         h = _swiglu_fwd(e, g)  # down-projection input (recomputed in backward)
-        out = F.linear(h, dW)
-        out.addmm_(F.linear(h, dA) * dS, dB.t())
-        _debug_nonfinite(debug_name, "forward", x=x2, gate=e, up=g, swiglu=h, out=out)
+        out_base = F.linear(h, dW)
+        out_lora = F.linear(F.linear(h, dA) * dS, dB)
+        out = out_base + out_lora
+        _debug_nonfinite(
+            debug_name,
+            "forward",
+            x=x2,
+            gate_base=e_base,
+            gate_lora=e_lora,
+            gate=e,
+            up_base=g_base,
+            up_lora=g_lora,
+            up=g,
+            swiglu=h,
+            out_base=out_base,
+            out_lora=out_lora,
+            out=out,
+        )
 
         # Save only x / gate_out / up_out; the SwiGLU activation and down-input are recomputed.
         ctx.save_for_backward(x2, e, g, gA, gB, uA, uB, dA, dB)
