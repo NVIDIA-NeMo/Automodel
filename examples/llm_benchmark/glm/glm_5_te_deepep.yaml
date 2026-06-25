@@ -28,7 +28,7 @@ benchmark:
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
-  num_nodes: 64
+  num_nodes: 128
 
 step_scheduler:
   gc_every_steps: 10
@@ -112,6 +112,6 @@ optimizer:
 
 ci:
   time: "00:45:00"
-  nodes: 64
+  nodes: 128
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
