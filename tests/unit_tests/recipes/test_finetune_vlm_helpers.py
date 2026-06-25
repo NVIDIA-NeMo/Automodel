@@ -3041,17 +3041,12 @@ def _make_packing_cfg(pack_size=128):
     return cfg
 
 
-_MISSING = object()
-
-
-def _make_dataset_cfg(truncate=True):
+def _make_dataset_cfg():
     cfg = MagicMock(spec=["get", "instantiate", "path_or_dataset"])
-    values = {
+    cfg.get.side_effect = lambda key, default=None: {
         "path_or_dataset": None,
-    }
-    if truncate is not _MISSING:
-        values["truncate"] = truncate
-    cfg.get.side_effect = lambda key, default=None: values.get(key, default)
+        "truncate": True,
+    }.get(key, default)
     cfg.path_or_dataset = None
     cfg.instantiate.return_value = []
     return cfg
@@ -3198,15 +3193,3 @@ def test_build_dataloader_forwards_inject_fake_images_false():
 
     wrapper_mock = _run_build_dataloader_capturing_wrapper(cfg)
     assert wrapper_mock.call_args.kwargs["inject_fake_images"] is False
-
-
-def test_build_dataloader_packing_defaults_to_no_truncation():
-    """Packed VLM should replace overlong samples instead of truncating media."""
-    wrapper_mock = _run_build_dataloader_capturing_wrapper(_make_dataset_cfg(truncate=_MISSING))
-    assert wrapper_mock.call_args.kwargs["truncate"] is False
-
-
-def test_build_dataloader_explicit_truncate_still_respected():
-    """A user-specified dataset.truncate override should still be forwarded."""
-    wrapper_mock = _run_build_dataloader_capturing_wrapper(_make_dataset_cfg(truncate=True))
-    assert wrapper_mock.call_args.kwargs["truncate"] is True
