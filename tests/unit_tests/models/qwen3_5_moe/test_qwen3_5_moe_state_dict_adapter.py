@@ -35,6 +35,8 @@ def config():
     cfg.num_key_value_heads = 2
     cfg.num_experts = 4
     cfg.num_experts_per_tok = 2
+    cfg._name_or_path = "Qwen/Qwen3.6-35B-A3B"
+    cfg.name_or_path = "Qwen/Qwen3.6-35B-A3B"
     return cfg
 
 
@@ -673,9 +675,9 @@ class TestConvertSingleTensorToHf:
 
         assert result == [("mtp.fc.weight", tensor)]
 
-    def test_mtp_expert_key_conversion(self, adapter):
-        # MTP experts convert to the GROUPED HF layout, identical to the main
-        # decoder layers — not per-expert keys (AM-442).
+    def test_mtp_expert_key_conversion_grouped_layout(self, adapter):
+        # Qwen3.6 MTP experts use the grouped HF layout, identical to the main
+        # decoder layers, not per-expert keys (AM-442).
         tensor = torch.randn(4, 64, 128)
         result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.gate_and_up_projs", tensor)
 
@@ -686,7 +688,7 @@ class TestConvertSingleTensorToHf:
         # No per-expert keys are emitted.
         assert not any(".experts.0." in k for k, _ in result)
 
-    def test_mtp_down_expert_key_conversion(self, adapter):
+    def test_mtp_down_expert_key_conversion_grouped_layout(self, adapter):
         tensor = torch.randn(4, 64, 32)
         result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.down_projs", tensor)
 
@@ -695,7 +697,7 @@ class TestConvertSingleTensorToHf:
         assert key == "mtp.layers.0.mlp.experts.down_proj"
         torch.testing.assert_close(value, tensor.transpose(1, 2))
 
-    def test_mtp_experts_emit_no_per_expert_keys(self, adapter):
+    def test_mtp_experts_emit_no_per_expert_keys_for_grouped_layout(self, adapter):
         """AM-442 regression: to_hf must not fabricate per-expert MTP keys that are
         absent from the grouped checkpoint (e.g. ``...experts.224.down_proj.weight``)."""
         for native in ("mtp.layers.0.mlp.experts.gate_and_up_projs", "mtp.layers.0.mlp.experts.down_projs"):
@@ -704,6 +706,45 @@ class TestConvertSingleTensorToHf:
             key = result[0][0]
             assert key in ("mtp.layers.0.mlp.experts.gate_up_proj", "mtp.layers.0.mlp.experts.down_proj")
             assert not re.search(r"\.experts\.\d+\.", key)
+
+    def test_mtp_expert_key_conversion_split_layout_for_qwen35(self, adapter):
+        adapter.pretrained_model_name_or_path = "Qwen/Qwen3.5-35B-A3B"
+        tensor = torch.randn(4, 64, 128)
+
+        result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.gate_and_up_projs", tensor)
+
+        assert len(result) == 8
+        result_by_key = dict(result)
+        expected_keys = set()
+        for expert_id in range(4):
+            expected_keys.add(f"mtp.layers.0.mlp.experts.{expert_id}.gate_proj.weight")
+            expected_keys.add(f"mtp.layers.0.mlp.experts.{expert_id}.up_proj.weight")
+        assert set(result_by_key) == expected_keys
+        for expert_id in range(4):
+            torch.testing.assert_close(
+                result_by_key[f"mtp.layers.0.mlp.experts.{expert_id}.gate_proj.weight"],
+                tensor[expert_id, :, :64].transpose(0, 1),
+            )
+            torch.testing.assert_close(
+                result_by_key[f"mtp.layers.0.mlp.experts.{expert_id}.up_proj.weight"],
+                tensor[expert_id, :, 64:].transpose(0, 1),
+            )
+
+    def test_mtp_down_expert_key_conversion_split_layout_for_qwen35(self, adapter):
+        adapter.pretrained_model_name_or_path = "Qwen/Qwen3.5-35B-A3B"
+        tensor = torch.randn(4, 64, 32)
+
+        result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.down_projs", tensor)
+
+        assert len(result) == 4
+        result_by_key = dict(result)
+        expected_keys = {f"mtp.layers.0.mlp.experts.{expert_id}.down_proj.weight" for expert_id in range(4)}
+        assert set(result_by_key) == expected_keys
+        for expert_id in range(4):
+            torch.testing.assert_close(
+                result_by_key[f"mtp.layers.0.mlp.experts.{expert_id}.down_proj.weight"],
+                tensor[expert_id].transpose(0, 1),
+            )
 
 
 # ---------------------------------------------------------------------------
