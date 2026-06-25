@@ -350,7 +350,7 @@ def get_fsdp_dp_mesh(
     Prefer native dimensions whenever possible:
     - cp=1, dp_replicate=1  -> ``device_mesh["dp_shard"]``
     - cp=1, dp_replicate>1  -> ``device_mesh[("dp_replicate", "dp_shard")]``
-    - cp>1, dp_replicate=1  -> ``device_mesh[("dp_shard", "cp")]``
+    - cp>1, dp_replicate=1  -> ``device_mesh["dp_shard_cp"]``
 
     When both CP and replicated DP are active we fall back to ``get_submesh()``
     because the composed mesh is genuinely multi-level.
@@ -373,7 +373,7 @@ def get_fsdp_dp_mesh(
         elif dp_replicate_size > 1:
             return device_mesh[(dp_replicate_name, dp_shard_name)]
         elif cp_size > 1:
-            return device_mesh[(dp_shard_name, cp_name)]
+            return get_flat_mesh(device_mesh, dp_shard_cp_name)
         else:
             return device_mesh[dp_shard_name]
 
