@@ -73,6 +73,8 @@ def _is_fsdp_module(module) -> bool:
 
 def _debug_tensor_summary(tensor: torch.Tensor) -> str:
     local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+    if local.is_meta:
+        return f"shape={tuple(local.shape)} dtype={local.dtype} device=meta dtensor={isinstance(tensor, DTensor)}"
     finite = torch.isfinite(local)
     finite_count = int(finite.sum().item())
     total = local.numel()
@@ -112,7 +114,10 @@ def _debug_nonfinite(debug_name: str | None, stage: str, **tensors) -> None:
     for tensor_name, tensor in tensors.items():
         if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
             continue
-        finite = torch.isfinite(tensor)
+        local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+        if local.is_meta:
+            continue
+        finite = torch.isfinite(local)
         if bool(finite.all().item()):
             continue
         key = (debug_name, stage, tensor_name)
@@ -120,16 +125,16 @@ def _debug_nonfinite(debug_name: str | None, stage: str, **tensors) -> None:
             continue
         _DEBUG_NAN_SEEN.add(key)
         finite_count = int(finite.sum().item())
-        total = tensor.numel()
-        finite_abs_max = torch.nan_to_num(tensor.detach().float(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item()
+        total = local.numel()
+        finite_abs_max = torch.nan_to_num(local.detach().float(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item()
         logger.error(
             "[lora-mlp-nan] module=%s stage=%s tensor=%s shape=%s dtype=%s device=%s nonfinite=%d/%d finite_abs_max=%g",
             debug_name,
             stage,
             tensor_name,
-            tuple(tensor.shape),
-            tensor.dtype,
-            tensor.device,
+            tuple(local.shape),
+            local.dtype,
+            local.device,
             total - finite_count,
             total,
             finite_abs_max,
@@ -220,28 +225,30 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
         orig_shape = x.shape
         x2 = x.reshape(-1, orig_shape[-1])
 
-        # Debug variant: keep LoRA active, but avoid in-place base += LoRA accumulation
-        # so we can isolate whether addmm_ into the base output is responsible for NaNs.
-        e_base = F.linear(x2, gW)
-        e_lora = F.linear(F.linear(x2, gA) * gS, gB)
-        e = e_base + e_lora  # gate_out (saved)
-        g_base = F.linear(x2, uW)
-        g_lora = F.linear(F.linear(x2, uA) * uS, uB)
-        g = g_base + g_lora  # up_out (saved)
-        h = _swiglu_fwd(e, g)  # down-projection input (recomputed in backward)
+        # Keep the forward GEMMs on the same ranked input shape as nn.Linear/LinearLoRA.forward.
+        # The saved tensors are flattened afterward because the manual backward is written in 2D.
+        e_base = F.linear(x, gW)
+        e_lora = F.linear(F.linear(x, gA) * gS, gB)
+        e_ranked = e_base + e_lora  # gate_out (saved flattened below)
+        g_base = F.linear(x, uW)
+        g_lora = F.linear(F.linear(x, uA) * uS, uB)
+        g_ranked = g_base + g_lora  # up_out (saved flattened below)
+        h = _swiglu_fwd(e_ranked, g_ranked)  # down-projection input (recomputed in backward)
         out_base = F.linear(h, dW)
         out_lora = F.linear(F.linear(h, dA) * dS, dB)
         out = out_base + out_lora
+        e = e_ranked.reshape(-1, e_ranked.shape[-1])
+        g = g_ranked.reshape(-1, g_ranked.shape[-1])
         _debug_nonfinite(
             debug_name,
             "forward",
-            x=x2,
+            x=x,
             gate_base=e_base,
             gate_lora=e_lora,
-            gate=e,
+            gate=e_ranked,
             up_base=g_base,
             up_lora=g_lora,
-            up=g,
+            up=g_ranked,
             swiglu=h,
             out_base=out_base,
             out_lora=out_lora,
