@@ -609,8 +609,8 @@ class TestQwen3_5ParallelizationStrategy:
         return Qwen3_5ParallelizationStrategy()
 
     @pytest.mark.parametrize(
-        "frozen_multimodal_sharding, expected_ignored",
-        [("shard", False), ("replicate", True)],
+        "frozen_multimodal_sharding, expected_ignored, expected_vision_sharded",
+        [("shard", False, True), ("replicate", True, False)],
     )
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
@@ -622,8 +622,9 @@ class TestQwen3_5ParallelizationStrategy:
         mock_device_mesh,
         frozen_multimodal_sharding,
         expected_ignored,
+        expected_vision_sharded,
     ):
-        """Frozen multimodal modules stay out of standalone FSDP units."""
+        """Dense shard mode keeps vision layer traversal; replicate mode skips it."""
 
         class MockQwen35Inner(nn.Module):
             def __init__(self):
@@ -655,7 +656,7 @@ class TestQwen3_5ParallelizationStrategy:
         sharded_by_dtype = [call_args.args[0] for call_args in fully_shard_by_dtype.call_args_list]
         assert result is model
         assert model.model.layers[0] in sharded_by_dtype
-        assert model.model.vision_tower.layers[0] not in sharded_by_dtype
+        assert (model.model.vision_tower.layers[0] in sharded_by_dtype) is expected_vision_sharded
         root_kwargs = fully_shard.call_args_list[-1].kwargs
         if expected_ignored:
             assert root_kwargs["ignored_params"] == frozen_vision_params

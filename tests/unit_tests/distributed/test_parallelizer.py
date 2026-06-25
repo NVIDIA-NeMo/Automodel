@@ -944,10 +944,10 @@ class TestApplyFsdpShardingRecursively:
         assert model.text_layers[0] in sharded_modules
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    def test_apply_fsdp_sharding_keeps_frozen_multimodal_modules_in_root_by_default(
+    def test_apply_fsdp_sharding_keeps_frozen_audio_root_and_shards_frozen_vision_by_default(
         self, mock_fully_shard, mock_mesh, mock_mp_policy, mock_offload_policy
     ):
-        """Shard mode leaves frozen multimodal modules to the root FSDP unit."""
+        """Dense shard mode preserves the historical audio/vision split."""
         mock_mesh.mesh_dim_names = ("dp",)
 
         class AudioTower(nn.Module):
@@ -983,7 +983,7 @@ class TestApplyFsdpShardingRecursively:
 
         sharded_modules = [call.args[0] for call in mock_fully_shard.call_args_list]
         assert model.audio_tower.layers[0] not in sharded_modules
-        assert model.vision_tower.layers[0] not in sharded_modules
+        assert model.vision_tower.layers[0] in sharded_modules
         assert model.text_layers[0] in sharded_modules
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")

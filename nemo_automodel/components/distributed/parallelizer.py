@@ -655,10 +655,14 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
             else:
                 for name, sub in module.named_children():
                     if is_multimodal_module_name(name) and _subtree_all_frozen(sub):
-                        logger.info("Skipping separate FSDP wrap for frozen multimodal module %s", name)
-                        if frozen_multimodal_sharding == "replicate" and ignored_multimodal_params is not None:
-                            ignored_multimodal_params.update(module_parameters(sub))
-                        continue
+                        if frozen_multimodal_sharding == "replicate":
+                            logger.info("Skipping separate FSDP wrap for frozen multimodal module %s", name)
+                            if ignored_multimodal_params is not None:
+                                ignored_multimodal_params.update(module_parameters(sub))
+                            continue
+                        if name == "audio_tower":
+                            logger.info("Skipping separate FSDP wrap for frozen multimodal module %s", name)
+                            continue
                     _fsdp_by_dtype(
                         sub,
                         mesh,
@@ -1079,7 +1083,7 @@ def apply_fsdp2_sharding_recursively(
         reshard_after_forward (Optional[bool]): Optional override for each layer's
             ``fully_shard`` reshard behavior.
         frozen_multimodal_sharding: Whether fully frozen multimodal modules should
-            be sharded or replicated.
+            follow dense FSDP traversal/root guards or be replicated.
         ignored_multimodal_params: Accumulator for replicated frozen multimodal
             parameters that must be ignored by ancestor FSDP roots.
     Note:
@@ -1165,17 +1169,23 @@ def apply_fsdp2_sharding_recursively(
     else:
         for name, sub_module in module.named_children():
             if is_multimodal_module_name(name) and _subtree_all_frozen(sub_module):
-                # Fully frozen modality towers/projectors can be skipped by
-                # batches without that modality. A standalone FSDP unit depends
-                # on its own forward pre-hook to create lazy unsharded state; if
-                # the unit never runs, deferred post-backward can touch missing
-                # state. In shard mode, leave these params to an always-run
-                # ancestor/root FSDP unit. In replicate mode, the root ignores
-                # them so each rank keeps a full copy.
-                logger.info("Skipping separate FSDP wrap for frozen multimodal module %s", name)
-                if frozen_multimodal_sharding == "replicate" and ignored_multimodal_params is not None:
-                    ignored_multimodal_params.update(module_parameters(sub_module))
-                continue
+                if frozen_multimodal_sharding == "replicate":
+                    # Explicit replication opt-in: exclude frozen multimodal
+                    # params from ancestor/root FSDP units so each rank keeps a
+                    # full copy. This also avoids standalone FSDP units for
+                    # modules that may be skipped by batches without that
+                    # modality.
+                    logger.info("Skipping separate FSDP wrap for frozen multimodal module %s", name)
+                    if ignored_multimodal_params is not None:
+                        ignored_multimodal_params.update(module_parameters(sub_module))
+                    continue
+                if name == "audio_tower":
+                    # Preserve the historical dense-FSDP behavior: a frozen
+                    # audio tower may never run on image/text-only batches, so
+                    # leave it to the root FSDP unit. Frozen vision modules keep
+                    # their previous per-layer traversal in shard mode.
+                    logger.info("Skipping separate FSDP wrap for frozen multimodal module %s", name)
+                    continue
             apply_fsdp2_sharding_recursively(
                 sub_module,
                 mesh,
@@ -1983,8 +1993,8 @@ def fsdp2_strategy_parallelize(
         tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
             Defaults to "tp".
         frozen_multimodal_sharding: Whether fully frozen multimodal modules should
-            remain FSDP-sharded (``"shard"``) or be excluded from FSDP roots and
-            replicated (``"replicate"``).
+            remain FSDP-owned by the selected strategy (``"shard"``) or be
+            excluded from FSDP roots and replicated (``"replicate"``).
 
     Returns:
         The parallelized model.

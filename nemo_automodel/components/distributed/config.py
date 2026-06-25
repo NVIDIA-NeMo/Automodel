@@ -206,14 +206,13 @@ class FSDP2Config:
         fsdp2_forward_prefetch_depth (int): Number of FSDP units to prefetch during
             forward pass.  Default ``1``.
         frozen_multimodal_sharding (str): Controls fully frozen multimodal modules
-            such as vision/audio towers and projectors. ``"shard"`` leaves fully
-            frozen multimodal parameters in an ancestor/root FSDP unit so they remain
-            sharded without creating modality-specific FSDP units that may not run on
-            text-only batches. If no ancestor/root FSDP unit is wrapped around them,
-            they remain replicated. ``"replicate"`` excludes fully frozen multimodal
-            parameters from FSDP roots so each rank keeps a full copy. If any parameter
-            in a multimodal module is trainable, the module is sharded separately
-            regardless of this setting.
+            such as vision/audio towers and projectors. ``"shard"`` keeps those
+            parameters FSDP-owned: dense strategies keep their normal layer traversal
+            while preserving the frozen-audio root guard, and MoE strategies leave
+            frozen multimodal modules in an ancestor/root FSDP unit. ``"replicate"``
+            excludes fully frozen multimodal parameters from FSDP roots so each rank
+            keeps a full copy. If any parameter in a multimodal module is trainable,
+            the module is sharded separately regardless of this setting.
     """
 
     sequence_parallel: bool = False

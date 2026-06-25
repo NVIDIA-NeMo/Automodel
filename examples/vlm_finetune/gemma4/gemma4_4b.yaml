@@ -61,7 +61,6 @@ distributed:
   dp_size: none
   tp_size: 1
   cp_size: 1
-  frozen_multimodal_sharding: replicate
   sequence_parallel: false
 
 loss_fn:
