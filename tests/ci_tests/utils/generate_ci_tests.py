@@ -15,6 +15,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -305,6 +306,7 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[
     exempt_configs = set(config_override.get("exempt_configs") or [])
 
     pipeline: Dict[str, Any] = {"include": ["automodel/automodel_ci_template.yml"]}
+    job_name_suffix = os.environ.get("AUTOMODEL_CI_JOB_NAME_SUFFIX", "")
 
     for config in yml_configs:
         # Skip missing recipes so one bad reference doesn't abort the whole pipeline.
@@ -319,7 +321,7 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[
 
         for suffix, job in generate_job(config, config_override, scope, test_folder, automodel_dir):
             job["variables"]["MODEL_FAMILY"] = model_name
-            pipeline[f"{config_name}{suffix}"] = job
+            pipeline[f"{config_name}{suffix}{job_name_suffix}"] = job
 
     return pipeline
 
