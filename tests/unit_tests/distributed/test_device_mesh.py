@@ -15,6 +15,8 @@
 """Tests for the high-level mesh context builder."""
 
 import pytest
+import torch
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
@@ -116,6 +118,67 @@ def test_mesh_context_build_requires_strategy_config():
 def test_distributed_setup_config_rejects_unknown_strategy():
     with pytest.raises(ValueError, match="Unknown strategy"):
         DistributedSetup.build(strategy="unknown", world_size=1)
+
+
+def test_distributed_setup_config_accepts_strategy_config_dict(captured_raw_mesh_call):
+    setup = DistributedSetup.build(
+        strategy="fsdp2",
+        strategy_config={
+            "sequence_parallel": True,
+            "autocast_dtype": "bfloat16",
+            "offload_policy": {"pin_memory": False},
+            "mp_policy": {
+                "param_dtype": "float16",
+                "reduce_dtype": "float32",
+                "output_dtype": "bfloat16",
+            },
+        },
+        world_size=1,
+    )
+
+    config = setup.strategy_config
+    assert isinstance(config, FSDP2Config)
+    assert config.sequence_parallel is True
+    assert config.autocast_dtype is torch.bfloat16
+    assert isinstance(config.offload_policy, CPUOffloadPolicy)
+    assert config.offload_policy.pin_memory is False
+    assert isinstance(config.mp_policy, MixedPrecisionPolicy)
+    assert config.mp_policy.param_dtype is torch.float16
+    assert config.mp_policy.reduce_dtype is torch.float32
+    assert config.mp_policy.output_dtype is torch.bfloat16
+    assert captured_raw_mesh_call["strategy_config"] is config
+
+
+def test_distributed_setup_config_rejects_strategy_config_with_instantiated_strategy(captured_raw_mesh_call):
+    with pytest.raises(ValueError, match="Strategy kwargs"):
+        DistributedSetup.build(
+            strategy=FSDP2Config(),
+            strategy_config={"sequence_parallel": True},
+            world_size=1,
+        )
+
+
+def test_distributed_setup_config_coerces_parallel_subconfig_dicts(captured_raw_mesh_call):
+    setup = DistributedSetup.build(
+        strategy="fsdp2",
+        parallelism_sizes=ParallelismSizes(pp_size=2, ep_size=2),
+        pipeline_config={"dtype": "float16"},
+        moe_parallel_config={
+            "mp_policy": {
+                "_target_": "torch.distributed.fsdp.MixedPrecisionPolicy",
+                "param_dtype": "bfloat16",
+                "reduce_dtype": "float32",
+            }
+        },
+        world_size=4,
+    )
+
+    assert isinstance(setup.pipeline_config, PipelineConfig)
+    assert setup.pipeline_config.dtype is torch.float16
+    assert isinstance(setup.moe_parallel_config, MoEParallelizerConfig)
+    assert isinstance(setup.moe_parallel_config.mp_policy, MixedPrecisionPolicy)
+    assert setup.moe_parallel_config.mp_policy.param_dtype is torch.bfloat16
+    assert setup.moe_parallel_config.mp_policy.reduce_dtype is torch.float32
 
 
 def test_distributed_setup_config_defaults_parallel_subconfigs(monkeypatch):

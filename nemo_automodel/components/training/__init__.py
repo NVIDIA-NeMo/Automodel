@@ -14,6 +14,18 @@
 
 """Training utilities shared across recipes."""
 
+from nemo_automodel.components.training.model_output import (
+    ModelOutput,
+    compute_entropy,
+    selected_token_logprobs,
+    split_per_datum,
+)
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
-__all__ = ["StepSchedulerConfig"]
+__all__ = [
+    "ModelOutput",
+    "StepSchedulerConfig",
+    "compute_entropy",
+    "selected_token_logprobs",
+    "split_per_datum",
+]

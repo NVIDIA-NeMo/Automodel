@@ -37,11 +37,15 @@ Usage:
 
 from __future__ import annotations
 
+import importlib
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
+
+from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
@@ -73,6 +77,7 @@ class DistributedSetup:
         moe_parallel_config: "MoEParallelizerConfig | dict | None" = None,
         activation_checkpointing: ActivationCheckpointingMode = False,
         world_size: int | None = None,
+        strategy_config: dict[str, Any] | None = None,
     ) -> "DistributedSetup":
         """Create a resolved distributed setup from sizes and policy configs.
 
@@ -86,7 +91,8 @@ class DistributedSetup:
         if world_size is None:
             world_size = get_world_size_safe()
 
-        strategy_config = _resolve_strategy_config(strategy)
+        strategy_kwargs = dict(strategy_config or {})
+        resolved_strategy_config = _resolve_strategy_config(strategy, **strategy_kwargs)
 
         if parallelism_sizes is None:
             parallelism_sizes = ParallelismSizes()
@@ -100,21 +106,21 @@ class DistributedSetup:
         if pp_size > 1 and pipeline_config is None:
             pipeline_config = PipelineConfig()
         if isinstance(pipeline_config, dict):
-            pipeline_config = PipelineConfig(**pipeline_config)
+            pipeline_config = _resolve_pipeline_config(pipeline_config)
         if ep_size > 1 and moe_parallel_config is None:
             moe_parallel_config = MoEParallelizerConfig()
         if isinstance(moe_parallel_config, dict):
-            moe_parallel_config = MoEParallelizerConfig(**moe_parallel_config)
+            moe_parallel_config = _resolve_moe_parallel_config(moe_parallel_config)
 
         mesh_context = MeshContext.build(
-            strategy_config,
+            resolved_strategy_config,
             parallelism_sizes=parallelism_sizes,
             world_size=world_size,
         )
 
         return cls(
             mesh_context=mesh_context,
-            strategy_config=strategy_config,
+            strategy_config=resolved_strategy_config,
             pipeline_config=pipeline_config,
             moe_parallel_config=moe_parallel_config,
             activation_checkpointing=activation_checkpointing,
@@ -339,6 +345,77 @@ _STRATEGY_MAP: Dict[str, _StrategyConfigClass] = {
     "ddp": DDPConfig,
 }
 
+_HYDRA_META_KEYS = {"_target_", "_recursive_", "_convert_"}
+_MP_POLICY_DTYPE_FIELDS = ("param_dtype", "reduce_dtype", "output_dtype")
+
+
+def _strip_meta_keys(config: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in config.items() if key not in _HYDRA_META_KEYS}
+
+
+def _resolve_callable(target: str | Callable[..., Any]) -> Callable[..., Any]:
+    if callable(target):
+        return target
+    if not isinstance(target, str) or "." not in target:
+        raise ValueError(f"Expected a callable or dotted import path, got {target!r}.")
+    module_path, name = target.rsplit(".", 1)
+    return getattr(importlib.import_module(module_path), name)
+
+
+def _resolve_mixed_precision_policy(value: Any) -> MixedPrecisionPolicy | Any:
+    if not isinstance(value, dict):
+        return value
+
+    kwargs = _strip_meta_keys(value)
+    target = value.get("_target_", None)
+    for key in _MP_POLICY_DTYPE_FIELDS:
+        if isinstance(kwargs.get(key), str):
+            kwargs[key] = dtype_from_str(kwargs[key])
+
+    if target is not None:
+        return _resolve_callable(target)(**kwargs)
+    return MixedPrecisionPolicy(**kwargs)
+
+
+def _resolve_cpu_offload_policy(value: Any) -> CPUOffloadPolicy | Any:
+    if not isinstance(value, dict):
+        return value
+
+    kwargs = _strip_meta_keys(value)
+    target = value.get("_target_", None)
+    if target is not None:
+        return _resolve_callable(target)(**kwargs)
+    return CPUOffloadPolicy(**kwargs)
+
+
+def _resolve_strategy_kwargs(strategy_kwargs: dict[str, Any]) -> dict[str, Any]:
+    strategy_kwargs = _strip_meta_keys(strategy_kwargs)
+
+    if "mp_policy" in strategy_kwargs:
+        strategy_kwargs["mp_policy"] = _resolve_mixed_precision_policy(strategy_kwargs["mp_policy"])
+    if "offload_policy" in strategy_kwargs:
+        strategy_kwargs["offload_policy"] = _resolve_cpu_offload_policy(strategy_kwargs["offload_policy"])
+    if isinstance(strategy_kwargs.get("autocast_dtype"), str):
+        strategy_kwargs["autocast_dtype"] = dtype_from_str(strategy_kwargs["autocast_dtype"])
+
+    return strategy_kwargs
+
+
+def _resolve_pipeline_config(config: dict[str, Any]) -> "PipelineConfig":
+    from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
+
+    kwargs = _strip_meta_keys(config)
+    if isinstance(kwargs.get("dtype"), str):
+        kwargs["dtype"] = dtype_from_str(kwargs["dtype"])
+    return PipelineConfig(**kwargs)
+
+
+def _resolve_moe_parallel_config(config: dict[str, Any]) -> MoEParallelizerConfig:
+    kwargs = _strip_meta_keys(config)
+    if "mp_policy" in kwargs:
+        kwargs["mp_policy"] = _resolve_mixed_precision_policy(kwargs["mp_policy"])
+    return MoEParallelizerConfig(**kwargs)
+
 
 def _resolve_strategy_config(
     strategy: str | DistributedStrategyConfig,
@@ -358,6 +435,7 @@ def _resolve_strategy_config(
         valid = sorted(_STRATEGY_MAP)
         raise ValueError(f"Unknown strategy: {strategy}. Valid strategies: {valid}")
     strategy_cls = _STRATEGY_MAP[strategy_name]
+    strategy_kwargs = _resolve_strategy_kwargs(strategy_kwargs)
     valid_fields = {f.name for f in fields(strategy_cls)}
     unknown = set(strategy_kwargs) - valid_fields
     if unknown:

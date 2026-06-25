@@ -426,6 +426,8 @@ class LRSchedulerConfig:
     init_lr: float | None = None
     max_lr: float | None = None
     min_lr: float | None = None
+    init_lr_ratio: float | None = 0.1
+    min_lr_ratio: float | None = 0.01
     start_wd: float | None = None
     end_wd: float | None = None
     wd_incr_steps: int | None = None
@@ -452,6 +454,20 @@ class LRSchedulerConfig:
         Returns:
             One :class:`OptimizerParamScheduler` per optimizer.
         """
+        return self.build_from_total_steps(optimizer, self._total_steps_from_step_scheduler(step_scheduler))
+
+    def build_from_total_steps(
+        self,
+        optimizer: list[torch.optim.Optimizer] | torch.optim.Optimizer,
+        total_steps: int,
+    ) -> list[OptimizerParamScheduler]:
+        """Build one LR scheduler per optimizer from an explicit total step count."""
+        if total_steps <= 0:
+            raise ValueError(f"total_steps must be positive, got {total_steps}.")
+        return self._build(optimizer, total_steps)
+
+    @staticmethod
+    def _total_steps_from_step_scheduler(step_scheduler: StepScheduler) -> int:
         # ``epoch_len`` is already expressed in optimizer steps (StepScheduler computes it as
         # ``ceil(len(dataloader) / grad_acc_steps)``) and is ``None`` for iterable/streaming
         # dataloaders, where ``len()`` is undefined.  Never call ``len(dataloader)`` here.
@@ -465,6 +481,13 @@ class LRSchedulerConfig:
             raise ValueError(
                 "Cannot infer total steps for an iterable/streaming dataset; set step_scheduler.max_steps."
             )
+        return total_steps
+
+    def _build(
+        self,
+        optimizer: list[torch.optim.Optimizer] | torch.optim.Optimizer,
+        total_steps: int,
+    ) -> list[OptimizerParamScheduler]:
         lr_decay_steps = self.lr_decay_steps if self.lr_decay_steps is not None else total_steps
         wd_incr_steps = self.wd_incr_steps if self.wd_incr_steps is not None else total_steps
         if isinstance(optimizer, torch.optim.Optimizer):
@@ -475,12 +498,14 @@ class LRSchedulerConfig:
         for opt in optimizers:
             base_lr = opt.param_groups[0]["lr"]
             base_wd = opt.param_groups[0].get("weight_decay", 0.0)
+            init_lr_ratio = self.init_lr_ratio if self.init_lr_ratio is not None else 0.1
+            min_lr_ratio = self.min_lr_ratio if self.min_lr_ratio is not None else 0.01
             schedulers.append(
                 OptimizerParamScheduler(
                     optimizer=opt,
-                    init_lr=self.init_lr if self.init_lr is not None else base_lr * 0.1,
+                    init_lr=self.init_lr if self.init_lr is not None else base_lr * init_lr_ratio,
                     max_lr=self.max_lr if self.max_lr is not None else base_lr,
-                    min_lr=self.min_lr if self.min_lr is not None else base_lr * 0.01,
+                    min_lr=self.min_lr if self.min_lr is not None else base_lr * min_lr_ratio,
                     lr_warmup_steps=self.lr_warmup_steps
                     if self.lr_warmup_steps is not None
                     else min(1000, total_steps // 10),
