@@ -31,7 +31,11 @@ except ImportError:
     HAS_TE = False
 
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules, patch_moe_module
-from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
+from nemo_automodel.components._peft.lora_experts import (
+    GroupedExpertsDeepEPLoRA,
+    GroupedExpertsLoRA,
+    _pad_lora_rank_for_grouped_mm,
+)
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 
@@ -188,6 +192,21 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
     assert lora_experts.dispatcher_async_dispatch is True
     assert lora_experts.use_torch_mm is True
     assert lora_experts.use_mxfp8 is True
+
+
+def test_pad_lora_rank_for_grouped_mm_aligns_bf16_rank():
+    """Test rank padding for torch._grouped_mm stride alignment."""
+    lora_A = torch.randn(2, 16, 4, dtype=torch.bfloat16)
+    lora_B = torch.randn(2, 4, 32, dtype=torch.bfloat16)
+
+    padded_A, padded_B = _pad_lora_rank_for_grouped_mm(lora_A, lora_B)
+
+    assert padded_A.shape == (2, 16, 8)
+    assert padded_B.shape == (2, 8, 32)
+    assert torch.equal(padded_A[..., :4], lora_A)
+    assert torch.equal(padded_B[:, :4], lora_B)
+    assert torch.count_nonzero(padded_A[..., 4:]) == 0
+    assert torch.count_nonzero(padded_B[:, 4:]) == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

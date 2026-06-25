@@ -16,6 +16,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Partial, Shard
 
 from nemo_automodel.components.moe.experts import (
@@ -40,6 +41,16 @@ def _to_local(proj):
 def _to_grouped_mm_operand(proj, dtype: torch.dtype):
     """Convert a projection tensor to the dtype/layout expected by grouped MM."""
     return _to_local(proj).to(dtype).contiguous()
+
+
+def _pad_lora_rank_for_grouped_mm(lora_A: torch.Tensor, lora_B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad LoRA rank tensors so grouped-mm strides are 16-byte aligned."""
+    rank = lora_A.size(-1)
+    alignment = max(1, 16 // lora_A.element_size())
+    padding = (-rank) % alignment
+    if padding == 0:
+        return lora_A, lora_B
+    return F.pad(lora_A, (0, padding)), F.pad(lora_B, (0, 0, 0, padding))
 
 
 class GroupedExpertsLoRA(GroupedExperts):
@@ -184,6 +195,10 @@ class GroupedExpertsLoRA(GroupedExperts):
         experts_end_idx = experts_start_idx + n_local_experts
 
         if self.use_torch_mm:
+            lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
+                lora_gate_and_up_A, lora_gate_and_up_B
+            )
+            lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
             y = self._forward_grouped_mm(
                 x,
                 token_mask,
@@ -500,6 +515,10 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
 
         if torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
+                lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
+                    lora_gate_and_up_A, lora_gate_and_up_B
+                )
+                lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
                 tokens_per_expert_gpu = tokens_per_expert.to(
                     device=permuted_local_hidden_states.device, non_blocking=True
                 )
