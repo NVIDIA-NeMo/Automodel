@@ -264,6 +264,34 @@ def _get_checkpoint_metadata_keys(
     return set(metadata.state_dict_metadata.keys())
 
 
+def _is_mtp_state_key(key: str) -> bool:
+    """Return True when a state-dict key belongs to an MTP module."""
+    return key == "mtp" or key.startswith("mtp.") or key.startswith("model.mtp.")
+
+
+def _pop_missing_init_mtp_keys(
+    state_dict: dict[str, torch.Tensor],
+    checkpoint_metadata_keys: set[str],
+    model_path: str,
+) -> dict[str, torch.Tensor]:
+    """Remove init-only MTP keys absent from the base checkpoint and return their current tensors."""
+    missing_mtp_keys = sorted(
+        key for key in state_dict if _is_mtp_state_key(key) and key not in checkpoint_metadata_keys
+    )
+    if not missing_mtp_keys:
+        return {}
+
+    current_mtp_state = {key: state_dict.pop(key) for key in missing_mtp_keys}
+    logging.warning(
+        "Base checkpoint %s is missing %d requested MTP keys. Keeping the current initialization for those MTP "
+        "parameters (examples=%s).",
+        model_path,
+        len(missing_mtp_keys),
+        missing_mtp_keys[:10],
+    )
+    return current_mtp_state
+
+
 if _is_geq_torch_2_9():
     from torch.distributed.checkpoint.staging import DefaultStager
     from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType, AsyncSaveResponse
@@ -725,6 +753,7 @@ class Checkpointer:
         )
 
         compat_tied_lm_head_source_key: str | None = None
+        init_missing_mtp_state: dict[str, torch.Tensor] = {}
         lm_head_param_name = getattr(model_state, "lm_head_param_name", None)
         should_try_tied_lm_head_compat = (
             getattr(model_state, "uses_tied_lm_head", False)
@@ -734,8 +763,16 @@ class Checkpointer:
         )
         checkpoint_metadata_keys: set[str] = set()
         extra_state_keys = sorted(key for key in state_dict if key.endswith("_extra_state"))
-        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys:
+        needs_metadata_for_init_mtp = is_init_step and any(_is_mtp_state_key(key) for key in state_dict)
+        if (
+            should_try_tied_lm_head_compat
+            or allow_checkpoint_key_subset
+            or extra_state_keys
+            or needs_metadata_for_init_mtp
+        ):
             checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+        if needs_metadata_for_init_mtp:
+            init_missing_mtp_state = _pop_missing_init_mtp_keys(state_dict, checkpoint_metadata_keys, model_path)
         if extra_state_keys:
             missing_extra_state_keys = [key for key in extra_state_keys if key not in checkpoint_metadata_keys]
             if missing_extra_state_keys:
@@ -814,6 +851,7 @@ class Checkpointer:
                 )
 
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
+        state_dict.update(init_missing_mtp_state)
 
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)

@@ -1275,6 +1275,155 @@ class TestLoadModelCheckpointKeySubset:
         assert "missing=0" in caplog.text
 
 
+class TestLoadModelInitMTPKeys:
+    """Test MTP key handling for base initialization and checkpoint restoration."""
+
+    def _make_checkpointer(self):
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/test",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="test/model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def test_base_init_keeps_missing_mtp_random_initialized(self, caplog):
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Module()
+        initial_state_dict = {
+            "layer.weight": torch.zeros(2, 2),
+            "mtp.layers.0.block.weight": torch.full((2, 2), 7.0),
+        }
+        captured = {}
+
+        def fake_do_load(state_dict, *args, **kwargs):
+            captured["requested_keys"] = set(state_dict)
+            return {key: torch.ones_like(value) for key, value in state_dict.items()}
+
+        caplog.set_level(logging.WARNING)
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch.object(checkpointer, "_get_storage_reader", return_value=object()),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
+                return_value={"layer.weight"},
+            ),
+            patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = initial_state_dict.copy()
+
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        assert captured["requested_keys"] == {"layer.weight"}
+        loaded_state_dict = mock_model_state.load_state_dict.call_args.args[0]
+        assert set(loaded_state_dict) == {"layer.weight", "mtp.layers.0.block.weight"}
+        assert torch.equal(loaded_state_dict["layer.weight"], torch.ones(2, 2))
+        assert torch.equal(
+            loaded_state_dict["mtp.layers.0.block.weight"], initial_state_dict["mtp.layers.0.block.weight"]
+        )
+        assert mock_model_state.load_state_dict.call_args.kwargs["strict"] is True
+        assert "requested MTP keys" in caplog.text
+
+    def test_base_init_loads_mtp_keys_when_checkpoint_has_them(self, caplog):
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Module()
+        initial_state_dict = {
+            "layer.weight": torch.zeros(2, 2),
+            "mtp.layers.0.block.weight": torch.zeros(2, 2),
+        }
+        captured = {}
+
+        def fake_do_load(state_dict, *args, **kwargs):
+            captured["requested_keys"] = set(state_dict)
+            return {key: torch.ones_like(value) for key, value in state_dict.items()}
+
+        caplog.set_level(logging.WARNING)
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch.object(checkpointer, "_get_storage_reader", return_value=object()),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
+                return_value={"layer.weight", "mtp.layers.0.block.weight"},
+            ),
+            patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = initial_state_dict.copy()
+
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        assert captured["requested_keys"] == {"layer.weight", "mtp.layers.0.block.weight"}
+        loaded_state_dict = mock_model_state.load_state_dict.call_args.args[0]
+        assert set(loaded_state_dict) == {"layer.weight", "mtp.layers.0.block.weight"}
+        assert torch.equal(loaded_state_dict["mtp.layers.0.block.weight"], torch.ones(2, 2))
+        assert "requested MTP keys" not in caplog.text
+
+    def test_checkpoint_restore_keeps_mtp_keys_strict(self):
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Module()
+        initial_state_dict = {
+            "layer.weight": torch.zeros(2, 2),
+            "mtp.layers.0.block.weight": torch.zeros(2, 2),
+        }
+        captured = {}
+
+        def fake_do_load(state_dict, *args, **kwargs):
+            captured["requested_keys"] = set(state_dict)
+            return {key: torch.ones_like(value) for key, value in state_dict.items()}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch.object(checkpointer, "_get_storage_reader", return_value=object()),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
+            ) as mock_get_metadata,
+            patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = initial_state_dict.copy()
+
+            checkpointer.load_model(model, model_path="/fake/path")
+
+        assert captured["requested_keys"] == {"layer.weight", "mtp.layers.0.block.weight"}
+        mock_get_metadata.assert_not_called()
+        assert mock_model_state.load_state_dict.call_args.kwargs["strict"] is True
+
+
 class TestLoadModelExtraState:
     """Test checkpoint load compatibility for module extra-state keys."""
 
