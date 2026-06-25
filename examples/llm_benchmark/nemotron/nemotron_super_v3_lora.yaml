@@ -67,7 +67,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: false
-    experts: torch_mm
+    experts: torch
     dispatcher: torch
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
