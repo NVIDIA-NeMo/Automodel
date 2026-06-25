@@ -298,7 +298,9 @@ class DDPConfig:
     Only dp_size is relevant (inferred from world_size).
 
     Attributes:
-        activation_checkpointing (bool): Enable activation checkpointing if True.
+        activation_checkpointing (bool | "selective"): Enable activation checkpointing. ``True`` keeps the existing
+            full activation checkpointing behavior. ``"selective"`` wraps transformer blocks with PyTorch selective
+            activation checkpointing.
         broadcast_buffers (bool): Synchronize module buffers before each forward.
         find_unused_parameters (bool): Traverse the autograd graph to support unused parameters.
         static_graph (bool): Tell DDP the used/unused parameter set is stable.
@@ -309,7 +311,7 @@ class DDPConfig:
             Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
     """
 
-    activation_checkpointing: bool = False
+    activation_checkpointing: ActivationCheckpointingMode = False
     broadcast_buffers: bool = False
     find_unused_parameters: bool = False
     static_graph: bool = False

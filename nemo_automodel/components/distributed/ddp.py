@@ -21,8 +21,14 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from nemo_automodel.components.distributed.activation_checkpointing import (
+    is_selective_activation_checkpointing,
+)
 from nemo_automodel.components.distributed.config import DDPConfig
-from nemo_automodel.components.distributed.parallelizer import _extract_model_layers
+from nemo_automodel.components.distributed.parallelizer import (
+    _extract_model_layers,
+    apply_selective_activation_checkpointing,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +107,9 @@ class DDPManager:
             if self.device.type == "cuda":
                 model = model.to(torch.bfloat16)
             if self.activation_checkpointing:
-                if hasattr(model, "gradient_checkpointing_enable"):
+                if is_selective_activation_checkpointing(self.activation_checkpointing):
+                    apply_selective_activation_checkpointing(model)
+                elif hasattr(model, "gradient_checkpointing_enable"):
                     model.gradient_checkpointing_enable()
                 else:
                     logger.error("Model does not support gradient checkpointing. Skipping.")
@@ -116,18 +124,21 @@ class DDPManager:
                 except Exception:
                     pass
 
-            layers = _extract_model_layers(model)
-            for i, layer in enumerate(layers):
-                if hasattr(layer, "mlp"):
-                    layers[i].mlp = checkpoint_wrapper(layer.mlp)
-                if hasattr(layer, "self_attn"):
-                    layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)
+            if is_selective_activation_checkpointing(self.activation_checkpointing):
+                apply_selective_activation_checkpointing(model)
+            else:
+                layers = _extract_model_layers(model)
+                for i, layer in enumerate(layers):
+                    if hasattr(layer, "mlp"):
+                        layers[i].mlp = checkpoint_wrapper(layer.mlp)
+                    if hasattr(layer, "self_attn"):
+                        layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)
 
-                if hasattr(layer, "input_layernorm"):
-                    layers[i].input_layernorm = checkpoint_wrapper(layers[i].input_layernorm)
+                    if hasattr(layer, "input_layernorm"):
+                        layers[i].input_layernorm = checkpoint_wrapper(layers[i].input_layernorm)
 
-                if hasattr(layer, "post_attention_layernorm"):
-                    layers[i].post_attention_layernorm = checkpoint_wrapper(layers[i].post_attention_layernorm)
+                    if hasattr(layer, "post_attention_layernorm"):
+                        layers[i].post_attention_layernorm = checkpoint_wrapper(layers[i].post_attention_layernorm)
 
         ddp_kwargs = {
             "device_ids": [self.device] if self.device.type == "cuda" else None,
