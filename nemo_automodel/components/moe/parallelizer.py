@@ -42,6 +42,9 @@ from nemo_automodel.shared.multimodal_fsdp import (
     normalize_frozen_multimodal_sharding,
     shard_trainable_multimodal_module,
 )
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
+)
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -401,6 +404,10 @@ def apply_fsdp(
 ):
     """Apply FSDP wrapping to MoE transformer blocks and model-level modules."""
     frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
+    # MoE normally keeps fully frozen skipped towers with an always-run root,
+    # but trainable multimodal towers still get standalone FSDP units. Install
+    # the same lazy-state guard as dense FSDP for modality-free batches.
+    _patch_fsdp_accumulated_grad_guard()
 
     if isinstance(lm_head_precision, str):
         lm_head_precision = dtype_from_str(lm_head_precision, default=None)

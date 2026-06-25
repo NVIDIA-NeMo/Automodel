@@ -691,6 +691,25 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     assert model_call is not None and model_call[1]["mesh"] is fsdp_mesh
 
 
+def test_apply_fsdp_installs_accumulated_grad_guard(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    guard_mock = MagicMock()
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "_patch_fsdp_accumulated_grad_guard", guard_mock)
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    P.apply_fsdp(
+        model=DummyModel([DummyBlock(mlp=DummyMoE())]),
+        fsdp_mesh=object(),
+        ep_enabled=False,
+        ep_shard_enabled=False,
+    )
+
+    guard_mock.assert_called_once_with()
+
+
 def test_shard_fp32_param_holders_shards_each_holder(monkeypatch):
     """``_shard_fp32_param_holders`` fully_shards each model-owned fp32 holder."""
     P = _import_parallelizer_with_stubs(monkeypatch)

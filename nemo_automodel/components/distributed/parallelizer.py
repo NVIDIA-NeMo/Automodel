@@ -74,6 +74,9 @@ from nemo_automodel.shared.multimodal_fsdp import (
     module_parameters,
     normalize_frozen_multimodal_sharding,
 )
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
+)
 
 
 def _is_transformers_v5_or_higher() -> bool:
@@ -133,46 +136,6 @@ import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-
-def _patch_fsdp_accumulated_grad_guard() -> None:
-    """Guard FSDP2 post-backward against params that were never unsharded.
-
-    This is needed for text-only configs that still instantiate and shard a
-    full VLM model, e.g.
-    ``examples/llm_finetune/mistral/ministral3_3b_squad.yaml`` when
-    ``ci.checkpoint_robustness.distributed.tp_size: 2`` reruns the recipe.
-    Ministral3 FP8 is loaded through ``Mistral3FP8VLMForConditionalGeneration``
-    so the vision tower remains separately FSDP-sharded, but SQuAD batches do
-    not execute that tower. Those FSDP params never create PyTorch's lazy
-    ``_unsharded_param`` field, and the fp32 grad-reduce post-backward helper
-    dereferences it unconditionally. If the field is absent, there is no
-    unsharded grad to upcast, so returning early preserves the no-grad case.
-    The wrapper still calls PyTorch first and only handles the exact
-    ``AttributeError`` from the missing lazy field.
-    Permalinks:
-    - Trigger YAML: https://github.com/NVIDIA-NeMo/Automodel/blob/0990cb2c047496bae50e2035dac7b8c509316076/examples/llm_finetune/mistral/ministral3_3b_squad.yaml#L114-L128
-    - Mistral3 layer extraction: https://github.com/NVIDIA-NeMo/Automodel/blob/0990cb2c047496bae50e2035dac7b8c509316076/nemo_automodel/components/distributed/parallelizer.py#L1522-L1530
-    """
-    try:
-        from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
-    except Exception:
-        return
-
-    orig = FSDPParam.to_accumulated_grad_if_needed
-    if getattr(orig, "_nemo_automodel_guarded", False):
-        return
-
-    def guarded(self: Any) -> Any:
-        try:
-            return orig(self)
-        except AttributeError as exc:
-            if "_unsharded_param" not in str(exc) or hasattr(self, "_unsharded_param"):
-                raise
-            return None
-
-    setattr(guarded, "_nemo_automodel_guarded", True)
-    FSDPParam.to_accumulated_grad_if_needed = guarded
 
 
 def apply_selective_activation_checkpointing(model: nn.Module, *, enable_compile: bool = False) -> None:
