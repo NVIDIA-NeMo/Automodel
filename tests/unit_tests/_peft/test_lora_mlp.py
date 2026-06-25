@@ -195,6 +195,18 @@ def test_fused_helper_declines_on_meta_weights():
     assert fused_lora_swiglu_mlp(gate, up, down, x) is None
 
 
+def test_install_skips_meta_weight_mlp():
+    """Do not install a fused MLP wrapper when any projection weight is still on meta."""
+    from nemo_automodel.components._peft.lora_mlp import install_fused_lora_mlp
+
+    H, I, R = 64, 96, 8
+    mlp = _lora_swiglu_mlp(H, I, R)
+    mlp.gate_proj.weight = nn.Parameter(torch.empty_like(mlp.gate_proj.weight, device="meta"), requires_grad=False)
+
+    assert install_fused_lora_mlp(mlp) == 0
+    assert not getattr(mlp, "_lora_mlp_fused", False)
+
+
 def _lora_swiglu_mlp(H, I, R):
     """A moe.layers.MLP (swiglu) with all three projections LoRA-patched (torch path, CPU-safe)."""
     from nemo_automodel.components.moe.layers import MLP

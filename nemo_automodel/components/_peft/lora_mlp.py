@@ -586,6 +586,10 @@ def _projs_are_lora(module, projs) -> bool:
     return all(getattr(getattr(module, proj), "lora_A", None) is not None for proj in projs)
 
 
+def _projs_are_fusible(module, projs) -> bool:
+    return all(_fusible(getattr(module, proj)) for proj in projs)
+
+
 def _swiglu_forward(mod, orig_forward, debug_name: str | None = None):
     def forward(x):
         if _DEBUG_COMPARE_ORIG:
@@ -658,9 +662,17 @@ def install_fused_lora_mlp(model) -> int:
     for name, mlp in model.named_modules():
         if getattr(mlp, "_lora_mlp_fused", False):
             continue
-        if _is_silu_swiglu_mlp(mlp) and _projs_are_lora(mlp, ("gate_proj", "up_proj", "down_proj")):
+        if (
+            _is_silu_swiglu_mlp(mlp)
+            and _projs_are_lora(mlp, ("gate_proj", "up_proj", "down_proj"))
+            and _projs_are_fusible(mlp, ("gate_proj", "up_proj", "down_proj"))
+        ):
             mlp.forward = _swiglu_forward(mlp, mlp.forward, debug_name=name if _DEBUG_NAN else None)
-        elif _is_relu2_mlp(mlp) and _projs_are_lora(mlp, ("up_proj", "down_proj")):
+        elif (
+            _is_relu2_mlp(mlp)
+            and _projs_are_lora(mlp, ("up_proj", "down_proj"))
+            and _projs_are_fusible(mlp, ("up_proj", "down_proj"))
+        ):
             mlp.forward = _relu2_forward(mlp, mlp.forward)
         else:
             continue
