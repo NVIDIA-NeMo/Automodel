@@ -357,7 +357,11 @@ def build_dataloader(
             from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
 
             ds_raw = ds
-            truncate = cfg_ds.get("truncate", max_length is not None)
+            # Packed VLM samples must keep media tensors and media placeholder
+            # tokens aligned.  Let packing replace/drop overlong samples by
+            # default instead of truncating them before they enter a pack.
+            default_truncate = max_length is not None and not bool(packing_cfg)
+            truncate = cfg_ds.get("truncate", default_truncate)
 
             post_tokenize_hook = cfg_ps.get("post_tokenize_hook_fn", None) if cfg_ps is not None else None
 
