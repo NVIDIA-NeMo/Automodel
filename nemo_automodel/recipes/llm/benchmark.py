@@ -240,14 +240,24 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if mtp_cfg is None or not getattr(mtp_cfg, "enabled", False) or layers is None:
                 continue
             block_types = [getattr(s, "block_type", "moe") for s in layers]
-            flops = _nemotronh_mtp_flops(
-                mp.config,
-                global_batch_size,
-                seq_len,
-                mtp_cfg.num_layers,
-                block_types,
-                mtp_cfg.use_repeated_layer,
-            )
+            try:
+                flops = _nemotronh_mtp_flops(
+                    mp.config,
+                    global_batch_size,
+                    seq_len,
+                    mtp_cfg.num_layers,
+                    block_types,
+                    mtp_cfg.use_repeated_layer,
+                )
+            except AttributeError as exc:
+                if self.dist_env.is_main:
+                    logger.warning(
+                        "Skipping MTP head FLOPs for %s because the Nemotron-H FLOPs formula "
+                        "does not support this config: %s",
+                        type(mp.config).__name__,
+                        exc,
+                    )
+                continue
             if self.dist_env.is_main:
                 logger.info(
                     f"MTP head FLOPs: N={mtp_cfg.num_layers} repeated={mtp_cfg.use_repeated_layer} "
