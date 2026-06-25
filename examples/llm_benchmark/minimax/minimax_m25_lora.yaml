@@ -49,6 +49,14 @@ distributed:
   ep_size: 32
   sequence_parallel: false
   activation_checkpointing: true
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
   moe:
     reshard_after_forward: false
     wrap_outer_model: false
