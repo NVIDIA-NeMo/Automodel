@@ -540,7 +540,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return _retry(use_liger_kernel=False)
 
         try:
-            if use_sdpa_patching and not is_custom_model:
+            if use_sdpa_patching and (not is_custom_model or sdpa_method is not None):
                 model = _patch_attention(model, sdpa_method)  # noqa: F821
         except Exception:
             logger.warning("Retrying without SDPA patching.")
