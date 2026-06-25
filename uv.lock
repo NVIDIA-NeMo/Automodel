@@ -3925,6 +3925,7 @@ diffusion-kernels = [
 ]
 diffusion-media = [
     { name = "imageio-ffmpeg" },
+    { name = "opencv-python-headless" },
 ]
 extra = [
     { name = "perceptron" },
@@ -4065,6 +4066,7 @@ requires-dist = [
     { name = "nv-grouped-gemm", marker = "extra == 'cuda'" },
     { name = "onnxscript", marker = "extra == 'cuda'", specifier = ">=0.5.6" },
     { name = "open-clip-torch", marker = "extra == 'vlm'" },
+    { name = "opencv-python-headless", marker = "extra == 'diffusion-media'", specifier = "==4.10.0.84" },
     { name = "opencv-python-headless", marker = "extra == 'vlm-media'", specifier = "==4.10.0.84" },
     { name = "perceptron", marker = "extra == 'extra'" },
     { name = "pillow", marker = "extra == 'vlm'" },
