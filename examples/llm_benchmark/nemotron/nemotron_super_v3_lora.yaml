@@ -68,7 +68,7 @@ model:
     rms_norm: te
     rope_fusion: false
     experts: torch_mm
-    dispatcher: hybridep
+    dispatcher: torch
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
