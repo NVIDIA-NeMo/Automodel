@@ -45,7 +45,7 @@ RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
-ENV UV_VERSION="0.10.11"
+ENV UV_VERSION="0.11.24"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
