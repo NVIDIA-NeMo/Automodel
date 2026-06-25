@@ -104,5 +104,5 @@ optimizer:
   weight_decay: 0
 
 ci:
-  time: "00:30:00"
+  time: "00:45:00"
   nodes: 16
