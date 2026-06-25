@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Nemotron-3-Ultra-550B-A55B throughput benchmark (16 nodes / 128x H100, EP=64):
-# torch_mm experts, balanced gate, EP=64, local batch size 2, seq 4096, activation checkpointing,
+# torch_mm experts, balanced gate, EP=64, local batch size 1, seq 4096, activation checkpointing,
 # fused linear cross-entropy, and the repeated MTP head (num_nextn_predict_layers=2 +
 # mtp_use_repeated_layer=true; one physical MTP layer reused across both depths). Run via the
 # recipe (nemo_automodel/recipes/llm/benchmark.py) to get MFU / TFLOPs.
@@ -31,7 +31,7 @@ recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 
 benchmark:
-  warmup_steps: 10
+  warmup_steps: 2
   peak_tflops: 989  # H100 dense bf16 peak TFLOPs
   nsys_start: -1
   nsys_end: -1
@@ -40,12 +40,12 @@ benchmark:
 
 step_scheduler:
   gc_every_steps: 10
-  global_batch_size: 256  # local_batch_size(2) * dp_size(128) -> 1 microbatch/GPU/step (no grad accum)
-  local_batch_size: 2
+  global_batch_size: 128  # local_batch_size(1) * dp_size(128) -> 1 microbatch/GPU/step (no grad accum)
+  local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
-  max_steps: 30
+  max_steps: 12
 
 distributed:
   strategy: fsdp2
@@ -112,5 +112,5 @@ optimizer:
   weight_decay: 0
 
 ci:
-  time: "00:30:00"
+  time: "00:45:00"
   nodes: 16
