@@ -397,9 +397,30 @@ def build_dataloader(
                 # context-parallel runs, where the attention mask is stripped before the
                 # model anyway (document boundaries are recovered from position_ids), so
                 # the indexed form is both sufficient and orders of magnitude cheaper.
-                # Attn computation still uses sdpa, the attn_implementation attribute in packing_cfg
-                # is only used to switch the mask format to [B, S] when cp>1.
-                _attn_impl = packing_cfg.get("attn_implementation", None) or get_attn_implementation(cfg_model)
+                # Attn computation still uses the model's backend; the attn_implementation
+                # attribute in packing_cfg only switches the collater mask format. It is
+                # therefore only safe to diverge from the model backend when cp>1, where the
+                # mask is stripped before the model. Without CP the collater mask must match
+                # the model backend, so ignore the override (and warn) and fall back to it.
+                cp_size = (
+                    device_mesh["cp"].size()
+                    if device_mesh is not None and "cp" in getattr(device_mesh, "mesh_dim_names", ())
+                    else 1
+                )
+                _model_attn_impl = get_attn_implementation(cfg_model)
+                _pack_attn_override = packing_cfg.get("attn_implementation", None)
+                if _pack_attn_override is not None and cp_size > 1:
+                    _attn_impl = _pack_attn_override
+                else:
+                    if _pack_attn_override not in (None, _model_attn_impl):
+                        logging.warning(
+                            "Ignoring packed_sequence.attn_implementation=%r at cp_size=1: the packed "
+                            "mask format must match the model attention backend (%r) when the mask is "
+                            "not stripped by context parallelism.",
+                            _pack_attn_override,
+                            _model_attn_impl,
+                        )
+                    _attn_impl = _model_attn_impl
 
                 configure_packing(attn_implementation=_attn_impl)
                 logging.info(f"Configured VLM neat packing for attn_implementation={_attn_impl}")
