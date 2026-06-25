@@ -108,6 +108,12 @@ def test_mesh_context_build_passes_parallelism_to_raw_mesh_builder(captured_raw_
     assert parallelism.ep_size == 1
 
 
+def test_mesh_context_build_passes_timeout_to_raw_mesh_builder(captured_raw_mesh_call):
+    MeshContext.build(FSDP2Config(), world_size=4, timeout_minutes=30)
+
+    assert captured_raw_mesh_call["timeout_minutes"] == 30
+
+
 def test_mesh_context_build_requires_strategy_config():
     with pytest.raises(ValueError, match="Unknown distributed strategy config type"):
         MeshContext.build("ddp", world_size=1)  # type: ignore[arg-type]
