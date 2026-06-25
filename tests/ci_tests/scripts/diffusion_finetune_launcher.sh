@@ -33,7 +33,7 @@ case "$RECIPE_NAME" in
         MEDIA_TYPE="video"
         PROCESSOR="wan"
         GENERATE_CONFIG="examples/diffusion/generate/configs/generate_wan.yaml"
-        MODEL_NAME="Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        MODEL_NAME="Wan-AI/Wan2.1-T2V-14B-Diffusers"
         INFER_NUM_FRAMES=9
         PREPROCESS_EXTRA_ARGS=""
         ;;
@@ -153,6 +153,7 @@ if grep -qE '^ddp:' "/opt/Automodel/${CONFIG_PATH}"; then
 fi
 
 CONFIG="--config /opt/Automodel/${CONFIG_PATH} \
+    --model.pretrained_model_name_or_path $MODEL_NAME \
     --data.dataloader.cache_dir $DATA_DIR/cache \
     --checkpoint.checkpoint_dir $CKPT_DIR \
     --step_scheduler.max_steps ${MAX_STEPS:-100} \
