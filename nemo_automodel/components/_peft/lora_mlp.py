@@ -56,7 +56,53 @@ if not HAVE_TRITON:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 _DEBUG_NAN = os.environ.get("NEMO_LORA_MLP_DEBUG_NAN", "0").lower() not in ("0", "", "false", "no")
+_DEBUG_COMPARE_ORIG = os.environ.get("NEMO_LORA_MLP_DEBUG_COMPARE_ORIG", "0").lower() not in (
+    "0",
+    "",
+    "false",
+    "no",
+)
+_DEBUG_COMPARE_FILTER = os.environ.get("NEMO_LORA_MLP_DEBUG_COMPARE_FILTER", "model.layers.1.mlp")
 _DEBUG_NAN_SEEN: set[tuple[str, str, str]] = set()
+_DEBUG_SUMMARY_SEEN: set[tuple[str, str]] = set()
+
+
+def _is_fsdp_module(module) -> bool:
+    return any(cls.__name__ == "FSDPModule" for cls in type(module).mro())
+
+
+def _debug_tensor_summary(tensor: torch.Tensor) -> str:
+    local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+    finite = torch.isfinite(local)
+    finite_count = int(finite.sum().item())
+    total = local.numel()
+    finite_abs_max = torch.nan_to_num(local.detach().float(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item()
+    return (
+        f"shape={tuple(local.shape)} dtype={local.dtype} device={local.device} "
+        f"dtensor={isinstance(tensor, DTensor)} nonfinite={total - finite_count}/{total} "
+        f"finite_abs_max={finite_abs_max:g}"
+    )
+
+
+def _debug_summary_once(debug_name: str | None, stage: str, **tensors) -> None:
+    if not (_DEBUG_NAN or _DEBUG_COMPARE_ORIG) or debug_name is None:
+        return
+    key = (debug_name, stage)
+    if key in _DEBUG_SUMMARY_SEEN:
+        return
+    _DEBUG_SUMMARY_SEEN.add(key)
+    parts = []
+    for tensor_name, tensor in tensors.items():
+        if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+            parts.append(f"{tensor_name}=({_debug_tensor_summary(tensor)})")
+    if parts:
+        logger.error("[lora-mlp-summary] module=%s stage=%s %s", debug_name, stage, " ".join(parts))
+
+
+def _debug_compare_selected(debug_name: str | None) -> bool:
+    if debug_name is None:
+        return False
+    return not _DEBUG_COMPARE_FILTER or _DEBUG_COMPARE_FILTER in debug_name
 
 
 def _debug_nonfinite(debug_name: str | None, stage: str, **tensors) -> None:
@@ -489,6 +535,45 @@ def _projs_are_lora(module, projs) -> bool:
 
 def _swiglu_forward(mod, orig_forward, debug_name: str | None = None):
     def forward(x):
+        if _DEBUG_COMPARE_ORIG:
+            selected = _debug_compare_selected(debug_name)
+            x2 = x.reshape(-1, x.shape[-1])
+            if selected:
+                meta_key = (debug_name or "<none>", "compare_module")
+                if meta_key not in _DEBUG_SUMMARY_SEEN:
+                    _DEBUG_SUMMARY_SEEN.add(meta_key)
+                    logger.error(
+                        "[lora-mlp-compare] module=%s gate_cls=%s gate_fsdp=%s weight_cls=%s",
+                        debug_name,
+                        type(mod.gate_proj).__qualname__,
+                        _is_fsdp_module(mod.gate_proj),
+                        type(mod.gate_proj.weight).__qualname__,
+                    )
+                gate_bias = getattr(mod.gate_proj, "bias", None)
+                if gate_bias is not None and gate_bias.numel() == 0:
+                    gate_bias = None
+                try:
+                    gate_direct = F.linear(x2, mod.gate_proj.weight, gate_bias)
+                    _debug_summary_once(
+                        debug_name,
+                        "compare_direct_before_orig",
+                        x=x2,
+                        gate_weight=mod.gate_proj.weight,
+                        gate_bias=gate_bias,
+                        gate_direct=gate_direct,
+                    )
+                    _debug_nonfinite(debug_name, "compare_direct_before_orig", x=x2, gate_direct=gate_direct)
+                except Exception:
+                    logger.exception(
+                        "[lora-mlp-compare] module=%s direct gate projection failed",
+                        debug_name,
+                    )
+            out = orig_forward(x)
+            if selected:
+                _debug_summary_once(debug_name, "compare_orig_forward", orig_out=out)
+                _debug_nonfinite(debug_name, "compare_orig_forward", orig_out=out)
+            return out
+
         out = fused_lora_swiglu_mlp(mod.gate_proj, mod.up_proj, mod.down_proj, x, debug_name=debug_name)
         return out if out is not None else orig_forward(x)
 
