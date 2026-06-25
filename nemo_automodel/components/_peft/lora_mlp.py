@@ -63,6 +63,7 @@ _DEBUG_COMPARE_ORIG = os.environ.get("NEMO_LORA_MLP_DEBUG_COMPARE_ORIG", "0").lo
     "no",
 )
 _DEBUG_COMPARE_FILTER = os.environ.get("NEMO_LORA_MLP_DEBUG_COMPARE_FILTER", "model.layers.1.mlp")
+_DEBUG_STATS = os.environ.get("NEMO_LORA_MLP_DEBUG_STATS", "0").lower() not in ("0", "", "false", "no")
 _DEBUG_NAN_SEEN: set[tuple[str, str, str]] = set()
 _DEBUG_SUMMARY_SEEN: set[tuple[str, str]] = set()
 
@@ -87,17 +88,17 @@ def _debug_tensor_summary(tensor: torch.Tensor) -> str:
 
 
 def _debug_summary_once(debug_name: str | None, stage: str, **tensors) -> None:
-    if not (_DEBUG_NAN or _DEBUG_COMPARE_ORIG) or debug_name is None:
+    if not (_DEBUG_NAN or _DEBUG_COMPARE_ORIG or _DEBUG_STATS) or debug_name is None:
         return
     key = (debug_name, stage)
     if key in _DEBUG_SUMMARY_SEEN:
         return
-    _DEBUG_SUMMARY_SEEN.add(key)
     parts = []
     for tensor_name, tensor in tensors.items():
         if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
             parts.append(f"{tensor_name}=({_debug_tensor_summary(tensor)})")
     if parts:
+        _DEBUG_SUMMARY_SEEN.add(key)
         logger.error("[lora-mlp-summary] module=%s stage=%s %s", debug_name, stage, " ".join(parts))
 
 
@@ -105,6 +106,28 @@ def _debug_compare_selected(debug_name: str | None) -> bool:
     if debug_name is None:
         return False
     return not _DEBUG_COMPARE_FILTER or _DEBUG_COMPARE_FILTER in debug_name
+
+
+def _debug_param_metadata_once(debug_name: str | None, stage: str, **params) -> None:
+    if not _DEBUG_STATS or debug_name is None:
+        return
+    key = (debug_name, stage)
+    if key in _DEBUG_SUMMARY_SEEN:
+        return
+    _DEBUG_SUMMARY_SEEN.add(key)
+    parts = []
+    for name, param in params.items():
+        if not isinstance(param, torch.Tensor):
+            continue
+        parts.append(
+            (
+                f"{name}=type:{type(param).__qualname__},shape:{tuple(param.shape)},dtype:{param.dtype},"
+                f"device:{param.device},requires_grad:{param.requires_grad},"
+                f"hf_compute_dtype:{getattr(param, '_hf_compute_dtype', None)}"
+            )
+        )
+    if parts:
+        logger.error("[lora-mlp-param] module=%s stage=%s %s", debug_name, stage, " ".join(parts))
 
 
 def _debug_nonfinite(debug_name: str | None, stage: str, **tensors) -> None:
@@ -224,6 +247,27 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
         """Compute the fused SwiGLU MLP output, saving only x, gate_out, up_out for backward."""
         orig_shape = x.shape
         x2 = x.reshape(-1, orig_shape[-1])
+        if _DEBUG_STATS and _debug_compare_selected(debug_name) and isinstance(x, torch.Tensor) and not x.is_meta:
+            _debug_param_metadata_once(
+                debug_name,
+                "forward_params",
+                x=x,
+                gate_weight=gW,
+                gate_lora_A=gA,
+                gate_lora_B=gB,
+                up_weight=uW,
+                down_weight=dW,
+            )
+            _debug_summary_once(
+                debug_name,
+                "forward_inputs",
+                x=x,
+                gate_weight=gW,
+                gate_lora_A=gA,
+                gate_lora_B=gB,
+                up_weight=uW,
+                down_weight=dW,
+            )
 
         # Keep the forward GEMMs on the same ranked input shape as nn.Linear/LinearLoRA.forward.
         # The saved tensors are flattened afterward because the manual backward is written in 2D.
