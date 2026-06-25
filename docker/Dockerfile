@@ -151,7 +151,7 @@ RUN pip install "aiohttp>=3.13.3" \
         "setuptools>=80.10.2" \
         "tornado>=6.5.5" \
         "urllib3>=2.7.0" && \
-    pip uninstall nvidia-dali-cuda130 && \
+    pip uninstall -y nvidia-dali-cuda130 && \
     rm -rf /opt/pytorch/pytorch/third_party/onnx
 
 FROM automodel_dep as automodel_final
