@@ -220,9 +220,10 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
     """Context-parallel-aware drop-in for a MiniMax M3 sparse-attention layer.
 
     Inherits every parameter and the eager forward from ``MiniMaxM3Attention``.
-    The only addition is ``_cp_mesh`` (set post-FSDP by the MoE parallelizer's
-    ``apply_cp``). When CP is off (``_cp_mesh`` is None / size 1) it delegates to
-    the parent's eager sparse forward, so non-CP runs are unaffected.
+    The only addition is ``_cp_mesh``, installed post-FSDP via
+    :meth:`setup_cp_attention` (called by the MoE parallelizer's ``apply_cp``).
+    When CP is off (``_cp_mesh`` is None / size 1) it delegates to the parent's
+    eager sparse forward, so non-CP runs are unaffected.
 
     Under CP (``cp_size > 1``) the sequence is sharded across ranks, so the DSA
     block selection -- which is causal over the *global* sequence -- cannot be
@@ -250,6 +251,16 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
     def __init__(self, config: Any, backend: Any, *, is_sparse_attention_layer: bool = True):
         super().__init__(config, backend, is_sparse_attention_layer=is_sparse_attention_layer)
         self._cp_mesh = None
+
+    def setup_cp_attention(self, cp_mesh: Any) -> None:
+        """Install the CP submesh consumed by :meth:`_cp_forward` (model-owned CP).
+
+        Called post-FSDP by the MoE parallelizer's ``apply_cp`` for each sparse
+        layer. Routing M3 through this hook -- rather than having ``apply_cp`` set
+        ``_cp_mesh`` directly -- keeps it on the same model-owned CP path as the
+        other custom-attention models (Gemma4, DeepSeek-V4).
+        """
+        self._cp_mesh = cp_mesh
 
     def forward(
         self,

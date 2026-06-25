@@ -574,24 +574,15 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
 
     # Route each attention block's CP setup by capability:
     #   * TE DotProductAttention -> TE's own context-parallel group;
-    #   * a module exposing setup_cp_attention (e.g. Gemma4's p2p ring) -> installs
-    #     its own CP attention + mask handling (model-owned, like TE/DSV4).
+    #   * a module exposing setup_cp_attention (e.g. Gemma4's p2p ring or MiniMax
+    #     M3's block-sparse DSA) -> installs its own CP attention + mask handling
+    #     (model-owned, like TE/DSV4).
     # Any other (non-TE, non-model-owned) attention is not supported under CP here.
     for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
         if layer_type in ("full_attention", "sliding_attention"):
-            # CP-aware custom attention (e.g. MiniMax M3 block-sparse DSA, which
-            # gathers K/V and rebuilds the global block-sparse mask via
-            # FlexAttention): store the CP mesh on the module so its forward can
-            # build the CP context. These do not use TE DotProductAttention.
             self_attn = block.self_attn
-            if hasattr(self_attn, "_cp_mesh"):
-                self_attn._cp_mesh = cp_mesh
-                moe_module = block.moe if hasattr(block, "moe") else block.mlp
-                if isinstance(moe_module, MoE):
-                    moe_module.cp_mesh = cp_mesh
-                continue
             attn_module = getattr(self_attn, "attn_module", None)
             if isinstance(attn_module, DotProductAttention):
                 attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
