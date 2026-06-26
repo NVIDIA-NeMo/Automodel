@@ -102,7 +102,7 @@ next, using a technique called **test-time training (TTT) unroll**:
 ```text
 Target (frozen)          Drafter (trainable)
 ┌──────────────┐         ┌──────────────┐
-│ Llama 3.1 8B │ ──────> │  2-layer     │
+│ Llama 3.1 8B │ ──────> │  1-layer     │
 │              │ hidden  │  transformer │
 │ Full model   │ states  │  + fc fusion │
 │ (frozen)     │         │  + lm_head   │
@@ -116,7 +116,7 @@ Key components:
 
 - **Target model**: The full LLM (e.g., Llama 3.1 8B), completely frozen. Provides
   hidden states from selected intermediate layers as auxiliary inputs to the drafter.
-- **Draft model**: A shallow transformer (typically 2 layers) with:
+- **Draft model**: A shallow transformer (a single fused decoder layer) with:
   - A **fusion layer** (`fc`) that combines auxiliary hidden states from 3 target layers
   - Its own attention layers, MLP, and layer norm
   - A smaller **output vocabulary** (e.g., 8192 or 32000 tokens instead of 128k) to reduce compute
@@ -156,7 +156,7 @@ recipe_args:
 ### How EAGLE-1 Differs
 
 EAGLE-1 is simpler: it uses a single transformer layer, predicts the full
-vocabulary, and trains with a combined loss of MSE on hidden states
+vocabulary, and trains with a combined loss of SmoothL1 (Huber) on hidden states
 (`hidden_loss_weight`) and cross-entropy on tokens (`token_loss_weight`).
 No TTT unroll, no vocabulary mapping.
 
@@ -583,7 +583,7 @@ recipe_args:
 
   # EAGLE-1 specific
   draft_num_hidden_layers: 1    # number of draft transformer layers
-  hidden_loss_weight: 1.0       # MSE loss on hidden states
+  hidden_loss_weight: 1.0       # SmoothL1 (Huber) loss on hidden states
   token_loss_weight: 0.1        # cross-entropy loss on tokens
 
   freeze_embeddings: true

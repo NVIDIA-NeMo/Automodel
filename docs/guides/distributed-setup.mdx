@@ -1,0 +1,148 @@
+---
+title: "Distributed Setup (Python API)"
+description: "Configure tensor, pipeline, context, and expert parallelism for NeMoAutoModel* loaders with the typed DistributedSetup object."
+---
+
+When you use the YAML recipes or the `automodel` CLI, distributed training is
+configured from the `distributed:` section of your config (see
+[Configuration](/get-started/configuration)). When you call the `NeMoAutoModel*`
+loaders directly from Python, you describe the same topology and execution
+policies with a single typed object: `DistributedSetup`.
+
+## Quick start
+
+Build a `DistributedSetup` and pass it to `from_pretrained` (or `from_config`):
+
+```python
+import torch
+from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel.components.distributed import (
+    DistributedSetup,
+    FSDP2Config,
+    ParallelismSizes,
+    initialize_distributed,
+)
+
+dist_env = initialize_distributed("nccl")
+
+distributed_setup = DistributedSetup.build(
+    strategy=FSDP2Config(sequence_parallel=True),
+    parallelism_sizes=ParallelismSizes(tp_size=2),
+    activation_checkpointing=True,
+    world_size=dist_env.world_size,
+)
+
+model = NeMoAutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B",
+    distributed_setup=distributed_setup,
+)
+```
+
+The same `distributed_setup=` keyword works on every NeMo AutoModel loader,
+including `NeMoAutoModelForImageTextToText`,
+`NeMoAutoModelForSequenceClassification`, and
+`NeMoAutoModelForTokenClassification`.
+
+## `DistributedSetup.build`
+
+`DistributedSetup.build` resolves a device mesh and the execution policies from
+your requested parallelism sizes. It is intentionally forgiving about input
+types — `strategy` accepts a string or a config object, and the pipeline / MoE
+configs accept either a dataclass or a plain dict.
+
+| Argument | Type | Default | Purpose |
+|---|---|---|---|
+| `strategy` | `str \| DistributedStrategyConfig` | `"fsdp2"` | Sharding strategy: `"fsdp2"`, `"ddp"`, or `"megatron_fsdp"` (or a config object such as `FSDP2Config`/`DDPConfig`). |
+| `parallelism_sizes` | `ParallelismSizes \| None` | `None` | Requested parallel dimensions (`tp_size`, `pp_size`, `cp_size`, `ep_size`, `dp_size`, `dp_replicate_size`). `dp_replicate_size` is FSDP2-only. |
+| `pipeline_config` | `PipelineConfig \| dict \| None` | `None` | Pipeline-parallel options; **requires `pp_size > 1`**. |
+| `moe_parallel_config` | `MoEParallelizerConfig \| dict \| None` | `None` | Expert-parallel options; **requires `ep_size > 1`**. |
+| `activation_checkpointing` | `bool \| "selective"` | `False` | `True` enables full activation checkpointing; `"selective"` enables FSDP2 selective AC. |
+| `world_size` | `int \| None` | `None` | Total ranks; auto-detected from the process group when omitted. |
+
+`ParallelismSizes` is durable user intent (what you requested). The resolved
+runtime topology lives on `DistributedSetup.mesh_context`
+(`MeshContext`), which derives its sizes from the live `DeviceMesh` after build.
+
+<Note>
+Validation happens at construction time, so invalid combinations fail fast
+instead of deep inside training. For example, passing a `pipeline_config`
+without `pp_size > 1`, or a `moe_parallel_config` without `ep_size > 1`, raises
+a `ValueError`.
+</Note>
+
+### Plain device mesh shortcut
+
+If you only need a topology and no NeMo-specific policies, you can pass a
+pre-created Hugging Face-style `DeviceMesh` directly as `device_mesh=`. NeMo
+wraps it in a topology-only `DistributedSetup` internally:
+
+```python
+from torch.distributed.device_mesh import init_device_mesh
+
+mesh = init_device_mesh("cuda", mesh_shape=(2,), mesh_dim_names=("tp",))
+
+model = NeMoAutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B",
+    device_mesh=mesh,
+)
+```
+
+Pass either `distributed_setup` **or** `device_mesh`, not both. Use
+`distributed_setup` whenever you need strategy, pipeline, MoE, or
+activation-checkpointing policies.
+
+## Migrating from the per-keyword API
+
+Earlier releases accepted a flat set of distributed keywords on
+`from_pretrained` / `from_config`. These are now consolidated into the single
+`distributed_setup` object.
+
+**Before:**
+
+```python
+model = NeMoAutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B",
+    distributed_config=FSDP2Config(activation_checkpointing=True),
+    tp_size=2,
+    pipeline_config=pp_cfg,
+    moe_config=moe_cfg,
+    moe_mesh=moe_mesh,
+    activation_checkpointing=True,
+)
+```
+
+**After:**
+
+```python
+distributed_setup = DistributedSetup.build(
+    strategy=FSDP2Config(),
+    parallelism_sizes=ParallelismSizes(tp_size=2),
+    pipeline_config=pp_cfg,
+    moe_parallel_config=moe_cfg,
+    activation_checkpointing=True,
+)
+
+model = NeMoAutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B",
+    distributed_setup=distributed_setup,
+)
+```
+
+<Warning>
+The following keywords are **no longer accepted** directly on the loaders and
+raise a `TypeError` if passed: `distributed_config`, `moe_config`, `moe_mesh`,
+`pipeline_config`, `tp_plan`, and `activation_checkpointing`. Move them onto
+`DistributedSetup.build`. Note the rename `moe_config` → `moe_parallel_config`,
+and that flat size keywords (e.g. `tp_size`) now live on `ParallelismSizes`.
+</Warning>
+
+## See also
+
+- [Configuration](/get-started/configuration) — the equivalent `distributed:`
+  YAML section used by recipes and the CLI.
+- [Pipeline Parallelism](/development/pipeline-parallelism) — the lower-level
+  `AutoPipeline` building blocks for custom training loops.
+- [Gradient Checkpointing](/development/gradient-checkpointing) — full and
+  selective activation checkpointing.
+- [`DistributedSetup`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/distributed/config.py)
+  source.
