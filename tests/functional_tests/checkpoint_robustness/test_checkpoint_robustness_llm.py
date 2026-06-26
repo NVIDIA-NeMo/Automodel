@@ -392,7 +392,7 @@ def _release_recipe_memory(recipe) -> None:
         torch.cuda.empty_cache()
 
 
-def test_checkpoint_robustness():
+def test_checkpoint_robustness(capfd):
     """Train -> checkpoint -> reload automodel from consolidated -> reload vanilla HF, compare logits."""
     custom_args, config_argv = _extract_custom_args(sys.argv[1:])
     sys.argv = [sys.argv[0]] + config_argv
@@ -515,7 +515,12 @@ def test_checkpoint_robustness():
     kl_restored = _kl_divergence_from_logits(reference_logits, restored_logits)
     max_kl_restored = kl_restored.max().item()
     if _rank0():
-        print(f"\n[Phase 3] Automodel-from-consolidated max KL: {max_kl_restored:.6e} (threshold: {kl_threshold:.6e})")
+        with capfd.disabled():
+            print(
+                f"\n[Phase 3] Automodel-from-consolidated max KL achieved: {max_kl_restored:.6e} "
+                f"vs threshold: {kl_threshold:.6e}",
+                flush=True,
+            )
     assert max_kl_restored <= kl_threshold, (
         f"KL divergence between original and automodel-from-consolidated too large: "
         f"max per-token KL = {max_kl_restored:.6e} > threshold {kl_threshold:.6e}"
@@ -648,7 +653,11 @@ def test_checkpoint_robustness():
 
         kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits)
         max_kl_hf = kl_hf.max().item()
-        print(f"[Phase 4] HF-loaded max KL: {max_kl_hf:.6e} (threshold: {hf_kl_threshold:.6e})")
+        with capfd.disabled():
+            print(
+                f"[Phase 4] HF-loaded max KL achieved: {max_kl_hf:.6e} vs threshold: {hf_kl_threshold:.6e}",
+                flush=True,
+            )
         assert max_kl_hf <= hf_kl_threshold, (
             f"KL divergence between original and HF-loaded model too large: "
             f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
