@@ -119,6 +119,97 @@ def test_dist_gather_tensor_uses_regular_gather_for_non_grad_tensors(monkeypatch
     assert torch.equal(gathered, expected)
 
 
+def test_dist_gather_tensor_uses_tensor_collective_for_preserved_grad(monkeypatch):
+    monkeypatch.setattr(inbatch_neg_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(inbatch_neg_utils, "_can_use_tensor_collectives", lambda tensor: True)
+
+    def fail_regular_all_gather(*args, **kwargs):
+        raise AssertionError("regular all_gather should not handle tensor collective path")
+
+    def fail_autograd_all_gather(*args, **kwargs):
+        raise AssertionError("tuple-returning autograd all_gather should not handle tensor collective path")
+
+    def fake_all_gather_into_tensor(gathered, tensor):
+        gathered[: tensor.shape[0]].copy_(tensor.detach() + 10)
+        gathered[tensor.shape[0] :].copy_(tensor.detach() + 20)
+
+    def fake_reduce_scatter_tensor(grad_input, grad_output, op=None):
+        assert op == inbatch_neg_utils.dist.ReduceOp.SUM
+        grad_input.copy_(grad_output[: grad_input.shape[0]] + grad_output[grad_input.shape[0] :])
+
+    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather", fail_regular_all_gather)
+    monkeypatch.setattr(inbatch_neg_utils.dist_nn_func, "all_gather", fail_autograd_all_gather)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather_into_tensor", fake_all_gather_into_tensor)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "reduce_scatter_tensor", fake_reduce_scatter_tensor)
+
+    t = torch.tensor([[1.0], [2.0]], requires_grad=True)
+    gathered = dist_gather_tensor(t, preserve_grad=True)
+
+    expected = torch.tensor([[11.0], [12.0], [21.0], [22.0]])
+    assert torch.equal(gathered, expected)
+    gathered.sum().backward()
+    assert torch.equal(t.grad, torch.full_like(t, 2.0))
+
+
+def test_dist_gather_tensor_uses_tensor_collective_for_metadata(monkeypatch):
+    monkeypatch.setattr(inbatch_neg_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(inbatch_neg_utils, "_can_use_tensor_collectives", lambda tensor: True)
+
+    def fail_regular_all_gather(*args, **kwargs):
+        raise AssertionError("regular all_gather should not handle tensor collective path")
+
+    def fail_autograd_all_gather(*args, **kwargs):
+        raise AssertionError("autograd all_gather should not handle metadata tensors")
+
+    def fake_all_gather_into_tensor(gathered, tensor):
+        gathered[: tensor.shape[0]].copy_(tensor + 10)
+        gathered[tensor.shape[0] :].copy_(tensor + 20)
+
+    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather", fail_regular_all_gather)
+    monkeypatch.setattr(inbatch_neg_utils.dist_nn_func, "all_gather", fail_autograd_all_gather)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather_into_tensor", fake_all_gather_into_tensor)
+
+    t = torch.tensor([[1], [2]], dtype=torch.long)
+    gathered = dist_gather_tensor(t)
+
+    expected = torch.tensor([[11], [12], [21], [22]], dtype=torch.long)
+    assert torch.equal(gathered, expected)
+
+
+def test_dist_gather_tensor_tensor_collective_detaches_remote_grad_by_default(monkeypatch):
+    monkeypatch.setattr(inbatch_neg_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(inbatch_neg_utils, "_can_use_tensor_collectives", lambda tensor: True)
+
+    def fail_regular_all_gather(*args, **kwargs):
+        raise AssertionError("regular all_gather should not handle tensor collective path")
+
+    def fail_autograd_all_gather(*args, **kwargs):
+        raise AssertionError("autograd all_gather should not handle detached mode")
+
+    def fake_all_gather_into_tensor(gathered, tensor):
+        gathered[: tensor.shape[0]].copy_(tensor.detach() + 10)
+        gathered[tensor.shape[0] :].copy_(tensor.detach() + 20)
+
+    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather", fail_regular_all_gather)
+    monkeypatch.setattr(inbatch_neg_utils.dist_nn_func, "all_gather", fail_autograd_all_gather)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather_into_tensor", fake_all_gather_into_tensor)
+
+    t = torch.tensor([[1.0], [2.0]], requires_grad=True)
+    gathered = dist_gather_tensor(t)
+
+    expected = torch.tensor([[11.0], [12.0], [1.0], [2.0]])
+    assert torch.equal(gathered, expected)
+    gathered.sum().backward()
+    assert torch.equal(t.grad, torch.ones_like(t))
+
+
 def test_dist_gather_tensor_with_dim1_padding_single_rank_is_noop():
     t = torch.randn(4, 3, 8)
     assert dist_gather_tensor_with_dim1_padding(t) is t
