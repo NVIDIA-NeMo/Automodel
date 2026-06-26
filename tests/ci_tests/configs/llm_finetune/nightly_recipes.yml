@@ -73,6 +73,7 @@ configs:
   - qwen/qwen2_5_7b_squad.yaml
   - qwen/qwen3_moe_30b_hellaswag.yaml
   - qwen/qwen3_moe_30b_te_deepep.yaml
+  - qwen/qwen3_moe_30b_a3b_squad_lora.yaml
 
   # -- seed --
   - seed/seed_coder_8b_instruct_squad.yaml
