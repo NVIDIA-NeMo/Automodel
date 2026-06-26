@@ -6,7 +6,7 @@ This directory holds the Fern build infrastructure (config, repo-specific compon
 
 NVIDIA branding (logos, favicon, footer, fonts, NVIDIA-green CSS, OneTrust JS) comes from the central control repo at **[NVIDIA/fern-components](https://github.com/NVIDIA/fern-components)** via `global-theme: nvidia` in `docs.yml` — no logos or theme CSS are vendored locally.
 
-## Quick links
+## Quick Links
 
 | What | Where |
 |---|---|
@@ -42,7 +42,7 @@ make docs-check
 
 **`make docs-login` is load-bearing.** Skip it and `fern docs md generate` returns `HTTP 403: User does not belong to organization` — the CLI's `fern login` flow alone is *not* enough; Fern requires that you sign in to the dashboard first so your account record exists in Fern's user DB. See [NeMo Gym #1185](https://github.com/NVIDIA-NeMo/Gym/issues/1185) for the ugly version of that bug.
 
-### Fern CLI + docs reference
+### Fern CLI and Docs Reference
 
 | Resource | Link |
 |---|---|
@@ -88,7 +88,7 @@ The **`docs/` top-level tree IS the nightly tree** — every PR lands there. The
 
 **Only the nightly tree is on `main`.** The frozen `v0.4/pages/` snapshot lives on the **`docs-archive` branch** and is restored into the working copy before any Fern build — by `make docs-stitch` locally, or the `.github/actions/stitch-fern-versions` composite action in CI (publish, `fern check`, and preview all run it first). Fern reads one local tree and publishes a full-site snapshot, so the archived pages must be physically present at build time; they can't be sourced from another branch natively. The restore path is gitignored on `main`. To pull a version from an immutable tag instead of the branch: `make docs-check ARCHIVE_REF=docs/v0.4.0`.
 
-## Local development
+## Local Development
 
 From this directory (`cd docs/fern` first, or use `make -C docs/fern <target>` from anywhere):
 
@@ -104,13 +104,13 @@ For first-time-on-this-machine setup, see the [Quickstart](#quickstart) above �
 
 `fern docs md generate` (run by `make docs`) populates `docs/fern/product-docs/` from the `nemo_automodel` package source declared in the `libraries:` block of `docs.yml`. Without it, a cold `fern docs dev` will fail with `Folder not found: ./product-docs/...`. Re-run only when the upstream Python source changes — for prose-only iteration, `cd docs/fern && fern docs dev` alone is enough.
 
-## Sidebar fidelity rule
+## Sidebar Fidelity Rule
 
 **The published v0.4.0 sidebar at docs.nvidia.com/nemo/automodel/latest is the source of truth for section captions, page titles, and Model Coverage child ordering.** Don't silently shorten "Install NeMo AutoModel" to "Installation" or rename a section caption — engineers and the docs PM diff this site against the published one and any drift looks like a content regression.
 
 If you want a shorter or different sidebar label, change the toctree-derived display name in the source — never just retitle in the converted MDX.
 
-## Authoring conventions
+## Authoring Conventions
 
 ### Frontmatter
 
@@ -137,7 +137,7 @@ The shared NVIDIA `<CustomFooter />` (privacy / Do Not Sell / etc.) ships from t
 
 Standard Fern components are also available — `<Note>`, `<Tip>`, `<Info>`, `<Warning>`, `<Cards>` / `<Card>`, etc. Don't use GitHub `> [!NOTE]` syntax — it does not render in MDX.
 
-### Internal links
+### Internal Links
 
 Use **version-agnostic paths** (no `/latest/`, `/v0.4/`, or `/nightly/` prefix):
 
@@ -148,7 +148,7 @@ Use **version-agnostic paths** (no `/latest/`, `/v0.4/`, or `/nightly/` prefix):
 
 The same MDX backs every version slug — a hard-coded prefix would jump readers across versions. Page slugs come from explicit `slug:` overrides in the version YAML, not from the (often verbose) display title — so `Install NeMo AutoModel` is at `/get-started/installation`, not `/get-started/install-nemo-automodel`.
 
-### Cross-repo references (yaml configs, source files)
+### Cross-Repo References (YAML Configs, Source Files)
 
 Repository source paths like `examples/llm_finetune/foo.yaml` or `nemo_automodel/components/...` are not part of the docs site. Link to them as **absolute GitHub URLs**:
 
@@ -176,7 +176,7 @@ When the next GA cuts (e.g. `v0.5`):
 4. Add the new frozen-pin entry to `docs.yml` `versions:` (`display-name: "0.5.0"`, `slug: v0.5`, `availability: stable`); keep `v0.4` per support policy
 5. `docs/` keeps moving forward as the nightly tree; `versions/v0.4/pages/` and `versions/v0.5/pages/` are both frozen
 
-## CI and publishing
+## CI and Publishing
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
@@ -197,7 +197,7 @@ DCO sign-off is required:
 git commit -s -m "docs: <add|update|remove> <page-title>"
 ```
 
-PR titles follow Conventional Commits (e.g. `docs(fern): add gemma4 fine-tuning guide`) — see [`AGENTS.md`](../../AGENTS.md) for the full convention.
+PR titles follow Conventional Commits (e.g., `docs(fern): add gemma4 fine-tuning guide`) — see [`AGENTS.md`](../../AGENTS.md) for the full convention.
 
 ## Troubleshooting
 
