@@ -12,20 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmarking config for GPT-OSS 120B Te Deepep, tuned for GB200.
-#
-# GB200-specific deltas vs the generic gptoss_120b_te_deepep.yaml:
-#   - peak_tflops: 2500  (GB200 BF16 dense peak; the generic recipe uses the
-#     H100 989 value, which inflates the reported MFU on Blackwell)
-#   - local_batch_size: 4, GBS=512 (GA=4), activation_checkpointing=false —
-#     the best-MFU bf16 operating point from the gpt-oss sweep: 3.506 s/iter,
-#     22.70% MFU@2500, 154.6 GB. AC-off avoids recompute (higher MFU); lbs=4
-#     is the largest that fits <192GB with AC off (lbs=6 would OOM). NOTE: the
-#     TE-MXFP8 config uses a DIFFERENT operating point (lbs=8/GBS1280/AC-on) —
-#     for mxfp8 the bigger batch wins MFU despite recompute. Each precision is at
-#     its own best config, so the comparison is best-vs-best, not iso-batch.
-#
-# 8 nodes x 4 GB200 = 32 GPUs, ep_size=16, GBS=512, seq_len=4096.
+# MFU-sweep variant of gptoss_120b_te_deepep_gb200: activation_checkpointing=OFF
+# (no recompute tax) with local_batch_size=8 (GBS=512 -> GA=2), made to fit by
+# resharding the MoE expert FSDP shards after forward (moe.reshard_after_forward=true).
+# This trades an extra expert all-gather in the backward for the activation-memory
+# room to double the microbatch WITHOUT paying the AC recompute tax — potentially the
+# best of both worlds if it fits under 184 GiB. Iso-GBS=512 with the other variants.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 
@@ -42,7 +34,7 @@ benchmark:
 step_scheduler:
   gc_every_steps: 10
   global_batch_size: 512
-  local_batch_size: 4
+  local_batch_size: 8
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
@@ -68,7 +60,7 @@ distributed:
     layers_per_stage: 2
 
   moe:
-    reshard_after_forward: false
+    reshard_after_forward: true
 
 dist_env:
   backend: nccl
@@ -125,7 +117,4 @@ ci:
   cluster_tag: gb200
   ep_size: 16
   env_vars:
-    # GB200 has 184 GiB/GPU. At lbs=4/AC-off this recipe peaks ~155-179 GiB; the
-    # default caching allocator fragments and strands ~11 GiB reserved-but-unallocated,
-    # tipping the backward into OOM. expandable_segments reclaims that fragmentation.
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
