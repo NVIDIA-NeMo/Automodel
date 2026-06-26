@@ -131,6 +131,10 @@ packed_sequence:
   collate_max_length: 16384
   packing_ratio: 0.9
   drop_long_samples: true
+  # cp > 1 strips the attention mask before the model, use flash_attention_2 attn_impl to get the
+  # [B, S] mask rather than the dense [B, 1, S, S]
+  # attention still computes with the model's sdpa backend.
+  attn_implementation: flash_attention_2
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
