@@ -15,12 +15,14 @@ from transformers import AutoConfig, AutoModel
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_bidirectional_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalProjector
+from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
 from transformers.models.ministral3.configuration_ministral3 import Ministral3Config
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Model
+from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
-
 
 class Ministral3BidirectionalConfig(Ministral3Config):
     """Configuration for Ministral3BidirectionalModel with pooling and temperature settings."""
@@ -126,8 +128,67 @@ class Ministral3BidirectionalModel(Ministral3Model):
         )
 
 
+
+class Mistral3BidirectionalConfig(Mistral3Config):
+    """Configuration for Mistral3BidirectionalModel with pooling and temperature settings."""
+
+    model_type = "mistral3_bidirec"
+
+    @property
+    def pooling(self):
+        return self._pooling
+
+    @pooling.setter
+    def pooling(self, value):
+        self._pooling = value
+        if self.text_config is not None:
+            if isinstance(self.text_config, dict):
+                self.text_config["pooling"] = value
+            else:
+                self.text_config.pooling =value
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.pooling = kwargs.get("pooling", "avg")
+
+    def __post_init__(self, **kwargs):
+        if self.text_config is not None:
+            if isinstance(self.text_config, dict):
+                self.text_config = Ministral3BidirectionalConfig(**self.text_config)
+        super().__post_init__(**kwargs)
+
+    def to_dict(self):
+        config_dict = super().to_dict()
+        config_dict.pop("_pooling", None)
+        return config_dict
+
+
+class Mistral3BidirectionalModel(Mistral3Model):
+    """
+    Mistral3Model modified to use bidirectional (non-causal) attention (Ministral3BidirectionalModel).
+
+    In standard Mistral3, each token can only attend to previous tokens (causal
+    attention). This model removes that restriction, allowing each token to attend
+    to all tokens in the sequence, which is useful for embedding tasks.
+    """
+
+    config_class = Mistral3BidirectionalConfig
+
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.vision_tower = AutoModel.from_config(config.vision_config)
+        self.multi_modal_projector = Mistral3MultiModalProjector(config)
+        self.language_model = Ministral3BidirectionalModel(config.text_config)
+        self.post_init()
+
+    def build_collator(self, processor=None, **kwargs):
+        """Dummy method that matches the interface for evaluation, returning the processor argunment as the model collator for data loading."""	
+        return processor
+
+
 # Export for ModelRegistry auto-discovery
-ModelClass = [Ministral3BidirectionalModel]
+ModelClass = [Ministral3BidirectionalModel, Mistral3BidirectionalModel]
 
 
 def _register_with_hf_auto_classes() -> None:
@@ -145,11 +206,21 @@ def _register_with_hf_auto_classes() -> None:
     except ValueError:
         pass  # Already registered
 
+    try:
+        AutoConfig.register(Mistral3BidirectionalConfig.model_type, Mistral3BidirectionalConfig)
+    except ValueError:
+        pass  # Already registered
+    try:
+        AutoModel.register(Mistral3BidirectionalConfig, Mistral3BidirectionalModel)
+    except ValueError:
+        pass  # Already registered
+
 
 _register_with_hf_auto_classes()
 
 __all__ = [
     "Ministral3BidirectionalModel",
     "Ministral3BidirectionalConfig",
+    "Mistral3BidirectionalModel",
     "ModelClass",
 ]

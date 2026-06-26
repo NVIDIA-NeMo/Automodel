@@ -150,44 +150,6 @@ def _build_backbone_from_extracted_submodel(
     return _load_from_extracted_state(backbone_class, config, extracted_model)
 
 
-def _sync_parent_config_after_submodel_replacement(
-    parent_model: PreTrainedModel,
-    replace_submodel: str,
-    replacement_model: PreTrainedModel,
-) -> None:
-    """Keep the parent config aligned with a replaced text submodule."""
-    parent_config = getattr(parent_model, "config", None)
-    replacement_config = getattr(replacement_model, "config", None)
-    if parent_config is None or replacement_config is None:
-        return
-
-    if replace_submodel.endswith("language_model") and hasattr(parent_config, "text_config"):
-        parent_config.text_config = replacement_config
-
-
-def _replace_submodel_with_retrieval_backbone(
-    parent_model: PreTrainedModel,
-    replace_submodel: str,
-    task: str,
-    pooling: Optional[str],
-    num_labels: Optional[int],
-    temperature: Optional[float],
-) -> PreTrainedModel:
-    """Replace a nested parent submodule with its retrieval-specific backbone."""
-    extracted_model = _extract_submodel(parent_model, replace_submodel)
-    replacement_model = _build_backbone_from_extracted_submodel(
-        extracted_model,
-        task=task,
-        pooling=pooling,
-        num_labels=num_labels,
-        temperature=temperature,
-    )
-    parent, attr = _get_submodule_parent_and_attr(parent_model, replace_submodel)
-    setattr(parent, attr, replacement_model)
-    _sync_parent_config_after_submodel_replacement(parent_model, replace_submodel, replacement_model)
-    return parent_model
-
-
 def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_type: str) -> torch.Tensor:
     """
     Pool hidden states using the specified pooling method.
@@ -339,7 +301,6 @@ def build_encoder_backbone(
     trust_remote_code: bool = False,
     pooling: Optional[str] = None,
     extract_submodel: Optional[str] = None,
-    replace_submodel: Optional[str] = None,
     num_labels: Optional[int] = None,
     temperature: Optional[float] = None,
     **hf_kwargs,
@@ -368,8 +329,6 @@ def build_encoder_backbone(
             (e.g. Qwen3) loaded via ``AutoModel``; those only receive ``**hf_kwargs``.
         extract_submodel: Dotted attribute path to extract from the loaded model
             (e.g. ``"language_model"`` to extract the text backbone from a VLM).
-        replace_submodel: Dotted attribute path to replace on the loaded parent model
-            with a retrieval-specific backbone. The parent model is returned.
         num_labels: Number of labels for reranking/classification backbones.
         temperature: Optional retrieval score temperature for custom retrieval backbones.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
@@ -381,9 +340,6 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
-    if extract_submodel is not None and replace_submodel is not None:
-        raise ValueError("Only one of extract_submodel and replace_submodel can be set.")
-
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
     model_type = getattr(config, "model_type", "")
 
@@ -398,19 +354,7 @@ def build_encoder_backbone(
             num_labels=num_labels,
             temperature=temperature,
         )
-        return extracted_model
-
-    if replace_submodel is not None:
-        logger.info(f"Loading {model_name_or_path} with HuggingFace Auto classes to replace {replace_submodel}")
-        model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
-        return _replace_submodel_with_retrieval_backbone(
-            model,
-            replace_submodel=replace_submodel,
-            task=task,
-            pooling=pooling,
-            num_labels=num_labels,
-            temperature=temperature,
-        )
+        return extracted_model    
 
     BidirectionalModelClass = _get_supported_backbone_class(model_type, task)
     if BidirectionalModelClass is not None:
@@ -477,6 +421,9 @@ _LLAMA_TASKS = {
     "embedding": "LlamaBidirectionalModel",
     "score": "LlamaBidirectionalForSequenceClassification",
 }
+_MISTRAL3_BIDIREC_TASKS = {
+    "embedding": "Mistral3BidirectionalModel",
+}
 _MINISTRAL3_BIDIREC_TASKS = {
     "embedding": "Ministral3BidirectionalModel",
 }
@@ -486,6 +433,8 @@ _LLAMA_NEMOTRON_VL_TASKS = {
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
+    "mistral3": _MISTRAL3_BIDIREC_TASKS,
+    "mistral3_bidirec": _MISTRAL3_BIDIREC_TASKS,
     "ministral3": _MINISTRAL3_BIDIREC_TASKS,
     "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
     "llama_nemotron_vl": _LLAMA_NEMOTRON_VL_TASKS,

@@ -30,7 +30,7 @@ from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
 )
-from nemo_automodel.components.models.ministral_bidirectional.processor import Ministral3BiEncoderProcessor
+from nemo_automodel.components.models.ministral_bidirectional.processor import Mistral3BiEncoderProcessor
 
 
 def tiny_bidirectional_config() -> Ministral3BidirectionalConfig:
@@ -120,7 +120,7 @@ class FakePixtralImageProcessor:
 @pytest.fixture
 def pixtral_processor(monkeypatch):
     monkeypatch.setattr(ProcessorMixin, "check_argument_for_proper_class", lambda *args, **kwargs: None)
-    return Ministral3BiEncoderProcessor(
+    return Mistral3BiEncoderProcessor(
         image_processor=FakePixtralImageProcessor(),
         tokenizer=FakePixtralTokenizer(),
         patch_size=4,
@@ -184,7 +184,7 @@ def test_ministral3_biencoder_processor_processes_mixed_image_text_documents(pix
 def test_ministral3_biencoder_processor_forwards_image_longest_edge(monkeypatch):
     monkeypatch.setattr(ProcessorMixin, "check_argument_for_proper_class", lambda *args, **kwargs: None)
     image_processor = FakePixtralImageProcessor()
-    processor = Ministral3BiEncoderProcessor(
+    processor = Mistral3BiEncoderProcessor(
         image_processor=image_processor,
         tokenizer=FakePixtralTokenizer(),
         patch_size=4,

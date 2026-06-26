@@ -46,7 +46,7 @@ def load_image(image: Any) -> Image.Image:
     raise ValueError(f"Invalid image: {image}")
 
 
-class Ministral3BiEncoderProcessor(PixtralProcessor):
+class Mistral3BiEncoderProcessor(PixtralProcessor):
     """Pixtral processor with retrieval-specific query/document batching helpers."""
 
     def __init__(
@@ -237,7 +237,7 @@ class Ministral3BiEncoderProcessor(PixtralProcessor):
 
 
 def _register_with_hf_auto_classes() -> None:
-    Ministral3BiEncoderProcessor.register_for_auto_class("AutoProcessor")
+    Mistral3BiEncoderProcessor.register_for_auto_class("AutoProcessor")
 
 
 _register_with_hf_auto_classes()
