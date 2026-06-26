@@ -102,17 +102,53 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         moe_config: MoEConfig,
         backend: BackendConfig,
         dtype: torch.dtype = torch.float32,
+        pretrained_model_name_or_path: str | None = None,
+        mtp_expert_hf_layout: str | None = None,
     ):
         self.config = config
         self.moe_config = moe_config
         self.backend = backend
         self.dtype = dtype
+        self.pretrained_model_name_or_path = pretrained_model_name_or_path
+        self.mtp_expert_hf_layout = mtp_expert_hf_layout
         self._uses_model_prefix = True
 
         self.hf_to_internal_map = {
             ".mlp.shared_expert.": ".mlp.shared_experts.",
         }
         self.internal_to_hf_map = {v: k for k, v in self.hf_to_internal_map.items()}
+
+    def _get_mtp_expert_hf_layout(self) -> str:
+        """Return whether MTP experts are stored as split or grouped HF tensors."""
+        layout = self.mtp_expert_hf_layout
+        if layout is None:
+            config_layout = getattr(self.config, "mtp_expert_hf_layout", None)
+            layout = config_layout if isinstance(config_layout, str) else None
+
+        if layout is not None:
+            normalized = layout.lower().replace("_", "-")
+            if normalized in {"split", "per-expert", "per-expert-safetensors"}:
+                return "split"
+            if normalized in {"grouped", "group"}:
+                return "grouped"
+            raise ValueError(f"Unsupported MTP expert HF layout: {layout!r}")
+
+        model_names = [self.pretrained_model_name_or_path]
+        for attr in ("_name_or_path", "name_or_path"):
+            value = getattr(self.config, attr, None)
+            if isinstance(value, str) and value:
+                model_names.append(value)
+
+        for model_name in model_names:
+            if not model_name:
+                continue
+            normalized_name = model_name.lower()
+            if "qwen3.5-35b-a3b" in normalized_name:
+                return "split"
+            if "qwen3.6-35b-a3b" in normalized_name:
+                return "grouped"
+
+        return "grouped"
 
     def _apply_key_mapping(self, state_dict: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
         """Apply key substring mappings to state dict keys."""
@@ -291,13 +327,45 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
 
         new_fqn = fqn
         value = tensor
-        # MTP experts use the SAME grouped layout as the main decoder layers in the
-        # HF checkpoint (e.g. ``mtp.layers.0.mlp.experts.{gate_up_proj,down_proj}``),
-        # so they fall through to the generic grouped handling below. Splitting them
-        # into per-expert keys here produced destinations like
-        # ``mtp.layers.0.mlp.experts.224.down_proj.weight`` that don't exist in the
-        # checkpoint, raising "Missing key in checkpoint state_dict" on load under
-        # expert parallelism (AM-442).
+        mtp_gate_up_match = re.match(r"mtp\.layers\.(\d+)\.mlp\.experts\.gate_and_up_projs$", fqn)
+        mtp_down_match = re.match(r"mtp\.layers\.(\d+)\.mlp\.experts\.down_projs$", fqn)
+        if self._get_mtp_expert_hf_layout() == "split":
+            if mtp_gate_up_match:
+                layer_num = mtp_gate_up_match.group(1)
+                splits, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
+                    tensor, self.moe_config.n_routed_experts
+                )
+                result = []
+                inter_dim = self.moe_config.moe_inter_dim
+                for expert_tensor, expert_id in zip(splits, expert_ids):
+                    gate = expert_tensor[:, :inter_dim].transpose(0, 1)
+                    up = expert_tensor[:, inter_dim:].transpose(0, 1)
+                    if not state_dict_utils.is_dtensor(gate):
+                        gate = gate.contiguous()
+                    if not state_dict_utils.is_dtensor(up):
+                        up = up.contiguous()
+                    result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.gate_proj.weight", gate))
+                    result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.up_proj.weight", up))
+                if exclude_key_regex:
+                    result = [(key, val) for key, val in result if not re.match(exclude_key_regex, key)]
+                return result
+            if mtp_down_match:
+                layer_num = mtp_down_match.group(1)
+                splits, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
+                    tensor, self.moe_config.n_routed_experts
+                )
+                result = []
+                for expert_tensor, expert_id in zip(splits, expert_ids):
+                    down = expert_tensor.transpose(0, 1)
+                    if not state_dict_utils.is_dtensor(down):
+                        down = down.contiguous()
+                    result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.down_proj.weight", down))
+                if exclude_key_regex:
+                    result = [(key, val) for key, val in result if not re.match(exclude_key_regex, key)]
+                return result
+
+        # Qwen3.6 stores MTP experts in the same grouped layout as decoder experts,
+        # while Qwen3.5 stores MTP experts as per-expert tensors handled above.
         if ".mlp.experts.gate_and_up_projs" in fqn:
             new_fqn = fqn.replace(".mlp.experts.gate_and_up_projs", ".mlp.experts.gate_up_proj")
             value = tensor.transpose(1, 2)

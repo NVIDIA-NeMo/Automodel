@@ -818,6 +818,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 self.model.language_model.moe_config,
                 self.backend,
                 dtype=dtype,
+                pretrained_model_name_or_path=getattr(config, "_name_or_path", None)
+                or getattr(config, "name_or_path", None),
             )
 
         # Wrap vision rotary embedding with fp32-safe version
