@@ -76,7 +76,13 @@ docker run --gpus all -it --rm \
 cd /opt/Automodel
 ```
 
-**3. Run the recipe**:
+**3. Install media dependencies** (the image ships without them):
+
+```bash
+uv pip install ".[vlm-media]"
+```
+
+**4. Run the recipe**:
 
 ```bash
 automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_5_4b.yaml

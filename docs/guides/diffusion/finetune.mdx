@@ -58,6 +58,14 @@ docker pull nvcr.io/nvidia/nemo-automodel:26.06.00
 docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:26.06.00
 ```
 
+<Note>
+The container ships without media deps. Add them from the AutoModel directory before preprocessing or training:
+
+```bash
+cd /opt/Automodel && uv pip install ".[diffusion-media]"
+```
+</Note>
+
 <Info>
 **Docker users:** Checkpoints are lost when the container exits unless you bind-mount the checkpoint directory to the host. See [Install with NeMo Docker Container](/get-started/installation#install-with-nemo-docker-container) and [Save Checkpoints When Using Docker](/development/checkpointing#save-checkpoints-when-using-docker).
 

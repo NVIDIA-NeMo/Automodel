@@ -127,7 +127,13 @@ docker run --gpus all -it --rm \
 cd /opt/Automodel
 ```
 
-**3. Run the recipe**:
+**3. Install media dependencies** (the image ships without them):
+
+```bash
+uv pip install ".[diffusion-media]"
+```
+
+**4. Run the recipe**:
 
 ```bash
 torchrun --nproc-per-node=8 \
