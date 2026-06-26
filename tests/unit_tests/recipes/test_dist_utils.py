@@ -621,6 +621,33 @@ class TestCreateDistributedSetupFromConfigWorldSizeAutoDetect:
         assert result.strategy_config.activation_checkpointing is False
         assert result.activation_checkpointing is True
 
+    def test_top_level_dist_env_timeout_passed_to_mesh(self, patched_mesh):
+        create_distributed_setup_from_config(
+            {
+                "distributed": {
+                    "strategy": "fsdp2",
+                    "pp_size": 2,
+                    "pipeline": {},
+                },
+                "dist_env": {"timeout_minutes": 30},
+            },
+            world_size=4,
+        )
+
+        assert patched_mesh["timeout_minutes"] == 30
+
+    def test_explicit_timeout_overrides_cfg_timeout(self, patched_mesh):
+        create_distributed_setup_from_config(
+            {
+                "distributed": {"strategy": "fsdp2"},
+                "dist_env": {"timeout_minutes": 10},
+            },
+            timeout_minutes=45,
+            world_size=4,
+        )
+
+        assert patched_mesh["timeout_minutes"] == 45
+
     @pytest.mark.parametrize("strategy", ["megatron_fsdp", "megatron-fsdp", "mfsdp"])
     def test_programmatic_megatron_fsdp_names(self, strategy, patched_mesh):
         result = create_distributed_setup_from_config(strategy=strategy, world_size=1)

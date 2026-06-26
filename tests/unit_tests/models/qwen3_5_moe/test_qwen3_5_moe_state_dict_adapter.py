@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import re
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+import nemo_automodel.components.models.qwen3_5_moe.model as qwen3_5_moe_model
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import Qwen3_5MoeStateDictAdapter
 from nemo_automodel.components.moe.layers import MoEConfig
@@ -35,6 +37,8 @@ def config():
     cfg.num_key_value_heads = 2
     cfg.num_experts = 4
     cfg.num_experts_per_tok = 2
+    cfg._name_or_path = "Qwen/Qwen3.6-35B-A3B"
+    cfg.name_or_path = "Qwen/Qwen3.6-35B-A3B"
     return cfg
 
 
@@ -102,6 +106,33 @@ class TestInitialization:
         # reverse mapping should be the inverse
         assert ".mlp.shared_experts." in adapter.internal_to_hf_map
         assert adapter.internal_to_hf_map[".mlp.shared_experts."] == ".mlp.shared_expert."
+
+    def test_mtp_layout_explicit_override(self, config, moe_config, backend_config):
+        adapter = Qwen3_5MoeStateDictAdapter(
+            config=config,
+            moe_config=moe_config,
+            backend=backend_config,
+            mtp_expert_hf_layout="per_expert_safetensors",
+        )
+
+        assert adapter._get_mtp_expert_hf_layout() == "split"
+
+    def test_mtp_layout_config_override(self, config, moe_config, backend_config):
+        config.mtp_expert_hf_layout = "group"
+        adapter = Qwen3_5MoeStateDictAdapter(config=config, moe_config=moe_config, backend=backend_config)
+
+        assert adapter._get_mtp_expert_hf_layout() == "grouped"
+
+    def test_mtp_layout_rejects_unknown_override(self, config, moe_config, backend_config):
+        adapter = Qwen3_5MoeStateDictAdapter(
+            config=config,
+            moe_config=moe_config,
+            backend=backend_config,
+            mtp_expert_hf_layout="packed",
+        )
+
+        with pytest.raises(ValueError, match="Unsupported MTP expert HF layout"):
+            adapter._get_mtp_expert_hf_layout()
 
 
 # ---------------------------------------------------------------------------
@@ -673,9 +704,9 @@ class TestConvertSingleTensorToHf:
 
         assert result == [("mtp.fc.weight", tensor)]
 
-    def test_mtp_expert_key_conversion(self, adapter):
-        # MTP experts convert to the GROUPED HF layout, identical to the main
-        # decoder layers — not per-expert keys (AM-442).
+    def test_mtp_expert_key_conversion_grouped_layout(self, adapter):
+        # Qwen3.6 MTP experts use the grouped HF layout, identical to the main
+        # decoder layers, not per-expert keys (AM-442).
         tensor = torch.randn(4, 64, 128)
         result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.gate_and_up_projs", tensor)
 
@@ -686,7 +717,7 @@ class TestConvertSingleTensorToHf:
         # No per-expert keys are emitted.
         assert not any(".experts.0." in k for k, _ in result)
 
-    def test_mtp_down_expert_key_conversion(self, adapter):
+    def test_mtp_down_expert_key_conversion_grouped_layout(self, adapter):
         tensor = torch.randn(4, 64, 32)
         result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.down_projs", tensor)
 
@@ -695,7 +726,7 @@ class TestConvertSingleTensorToHf:
         assert key == "mtp.layers.0.mlp.experts.down_proj"
         torch.testing.assert_close(value, tensor.transpose(1, 2))
 
-    def test_mtp_experts_emit_no_per_expert_keys(self, adapter):
+    def test_mtp_experts_emit_no_per_expert_keys_for_grouped_layout(self, adapter):
         """AM-442 regression: to_hf must not fabricate per-expert MTP keys that are
         absent from the grouped checkpoint (e.g. ``...experts.224.down_proj.weight``)."""
         for native in ("mtp.layers.0.mlp.experts.gate_and_up_projs", "mtp.layers.0.mlp.experts.down_projs"):
@@ -704,6 +735,119 @@ class TestConvertSingleTensorToHf:
             key = result[0][0]
             assert key in ("mtp.layers.0.mlp.experts.gate_up_proj", "mtp.layers.0.mlp.experts.down_proj")
             assert not re.search(r"\.experts\.\d+\.", key)
+
+    def test_mtp_expert_key_conversion_split_layout_for_qwen35(self, adapter):
+        adapter.pretrained_model_name_or_path = "Qwen/Qwen3.5-35B-A3B"
+        tensor = torch.randn(4, 64, 128)
+
+        result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.gate_and_up_projs", tensor)
+
+        assert len(result) == 8
+        result_by_key = dict(result)
+        expected_keys = set()
+        for expert_id in range(4):
+            expected_keys.add(f"mtp.layers.0.mlp.experts.{expert_id}.gate_proj.weight")
+            expected_keys.add(f"mtp.layers.0.mlp.experts.{expert_id}.up_proj.weight")
+        assert set(result_by_key) == expected_keys
+        for expert_id in range(4):
+            torch.testing.assert_close(
+                result_by_key[f"mtp.layers.0.mlp.experts.{expert_id}.gate_proj.weight"],
+                tensor[expert_id, :, :64].transpose(0, 1),
+            )
+            torch.testing.assert_close(
+                result_by_key[f"mtp.layers.0.mlp.experts.{expert_id}.up_proj.weight"],
+                tensor[expert_id, :, 64:].transpose(0, 1),
+            )
+
+    def test_mtp_down_expert_key_conversion_split_layout_for_qwen35(self, adapter):
+        adapter.pretrained_model_name_or_path = "Qwen/Qwen3.5-35B-A3B"
+        tensor = torch.randn(4, 64, 32)
+
+        result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.down_projs", tensor)
+
+        assert len(result) == 4
+        result_by_key = dict(result)
+        expected_keys = {f"mtp.layers.0.mlp.experts.{expert_id}.down_proj.weight" for expert_id in range(4)}
+        assert set(result_by_key) == expected_keys
+        for expert_id in range(4):
+            torch.testing.assert_close(
+                result_by_key[f"mtp.layers.0.mlp.experts.{expert_id}.down_proj.weight"],
+                tensor[expert_id].transpose(0, 1),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Qwen3_5MoeForConditionalGeneration state dict adapter wiring
+# ---------------------------------------------------------------------------
+class TestConditionalGenerationStateDictAdapterWiring:
+    def test_passes_top_level_model_name_to_state_dict_adapter(self):
+        class DummyRotary:
+            inv_freq = torch.ones(4)
+
+        class DummyVisual:
+            def __init__(self):
+                self.rotary_pos_emb = DummyRotary()
+
+        class DummyParentModel:
+            def __init__(self):
+                self.visual = DummyVisual()
+                self.language_model = SimpleNamespace()
+
+        class DummyTextBackend:
+            def __init__(self, *args, **kwargs):
+                self.moe_config = Mock(name="moe_config")
+
+        class DummyMTPConfig:
+            enabled = False
+
+        class DummyFp32SafeRotary:
+            def __init__(self, dim):
+                self.dim = dim
+
+            def register_buffer(self, *args, **kwargs):
+                pass
+
+            def to(self, *args, **kwargs):
+                return self
+
+        adapter_calls = []
+
+        class DummyAdapter:
+            def __init__(self, *args, **kwargs):
+                adapter_calls.append((args, kwargs))
+
+        def fake_hf_init(self, config):
+            self.model = DummyParentModel()
+            self.lm_head = None
+
+        text_config = SimpleNamespace(torch_dtype=None, hidden_size=8, vocab_size=16, pad_token_id=None)
+        config = SimpleNamespace(
+            text_config=text_config,
+            torch_dtype=None,
+            _name_or_path="model-under-test",
+            name_or_path=None,
+        )
+        backend = BackendConfig(enable_hf_state_dict_adapter=True)
+
+        with (
+            patch.object(qwen3_5_moe_model.HFQwen3_5MoeForConditionalGeneration, "__init__", fake_hf_init),
+            patch.object(qwen3_5_moe_model, "Qwen3_5MoeModel", DummyParentModel),
+            patch.object(qwen3_5_moe_model, "Qwen3_5MoeTextModelBackend", DummyTextBackend),
+            patch.object(qwen3_5_moe_model, "initialize_linear_module", Mock(return_value=Mock())),
+            patch.object(qwen3_5_moe_model, "build_mtp_config_from_hf", Mock(return_value=DummyMTPConfig())),
+            patch.object(qwen3_5_moe_model, "Qwen3_5MoeStateDictAdapter", DummyAdapter),
+            patch.object(
+                qwen3_5_moe_model,
+                "Fp32SafeQwen3_5MoeVisionRotaryEmbedding",  # pragma: allowlist secret
+                DummyFp32SafeRotary,
+            ),
+        ):
+            qwen3_5_moe_model.Qwen3_5MoeForConditionalGeneration(config, backend=backend)
+
+        assert len(adapter_calls) == 1
+        args, kwargs = adapter_calls[0]
+        assert args[0] is text_config
+        assert kwargs["pretrained_model_name_or_path"] == "model-under-test"
 
 
 # ---------------------------------------------------------------------------

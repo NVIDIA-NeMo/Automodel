@@ -249,14 +249,13 @@ class ModelSupports:
         +------------------+----------------+---------+
         """
         if _has_backend(self._model):
-            if _is_deepseek_v4(self._model):
+            backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+            if _is_deepseek_v4(self._model) or _is_glm_moe_dsa(self._model):
                 # DSV4 owns its CP attention (Miles-style); gated on TileLang.
-                backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
                 return backend_attn == "tilelang"
-            if _is_glm_moe_dsa(self._model):
-                backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
-                return backend_attn == "tilelang"
-            if _is_hybrid(self._model):
+            # Hybrids, and custom models that ship their own CP-aware attention and opt in
+            # via ``_supports_cp_sdpa``, may run CP on either TE or SDPA attention.
+            if _is_hybrid(self._model) or getattr(self._model, "_supports_cp_sdpa", False):
                 backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
                 return backend_attn in ("te", "sdpa")
             return _uses_te_attention(self._model) or _uses_magi_attention(self._model)

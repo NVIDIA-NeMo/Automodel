@@ -67,3 +67,27 @@ def test_leaves_none_when_no_jinja(mock_auto_processor, tmp_path):
     out = build_minimax_m3_vl_processor(str(tmp_path))
 
     assert out.chat_template is None
+
+
+@mock.patch("huggingface_hub.hf_hub_download")
+@mock.patch(_PROCESSING)
+def test_reattaches_chat_template_from_hub_cache(mock_auto_processor, mock_hf_hub_download):
+    """When given a hub id, resolve chat_template.jinja from the HF cache."""
+    proc = SimpleNamespace(chat_template=None)
+    mock_auto_processor.from_pretrained.return_value = proc
+    mock_hf_hub_download.return_value = "/cache/MiniMax-M3/chat_template.jinja"
+
+    with mock.patch(
+        "nemo_automodel.components.models.minimax_m3_vl.processing.os.path.isfile",
+        return_value=False,
+    ), mock.patch(
+        "builtins.open",
+        mock.mock_open(read_data="HUB-TEMPLATE"),
+    ):
+        out = build_minimax_m3_vl_processor("MiniMaxAI/MiniMax-M3", trust_remote_code=True)
+
+    assert out.chat_template == "HUB-TEMPLATE"
+    mock_hf_hub_download.assert_called_once_with(
+        repo_id="MiniMaxAI/MiniMax-M3",
+        filename="chat_template.jinja",
+    )

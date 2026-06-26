@@ -188,6 +188,10 @@ class MiniMaxM3TextModel(nn.Module):
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
+                # Forwarded so CP-aware sparse attention can derive per-document
+                # boundaries (position_ids reset to 0 per packed document) for
+                # block-diagonal masking; ignored/popped by the eager path.
+                position_ids=position_ids,
                 **attn_kwargs,
             )
 
@@ -373,6 +377,11 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
     _pp_keep_self_forward: bool = True
     mtp_outputs_are_logits = True
+    # Opt into context parallelism on the SDPA attention backend (M3's block-sparse DSA
+    # bias is an explicit additive mask that only SDPA accepts, not TE). Dense layers use
+    # the standard CP path (mask-strip hook + is_causal); sparse layers require the
+    # CP-aware indexer attention for a correct global-sequence bias.
+    _supports_cp_sdpa = True
     # The state-dict adapter fully populates every tensor from the checkpoint
     # (MXFP8 -> bf16), so skip HF random init on load. This also avoids the
     # stage-divergent DTensor collectives in initialize_weights() under sharding/PP.
@@ -383,12 +392,14 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         """Declared parallelism capabilities for this model class.
 
         Mirrors the MiniMax M2 backbone: PP + EP are validated; TP is unsupported
-        by the custom MoE parallelizer. Context parallelism for the block-sparse
-        DSA attention is a separate (CP-aware) implementation, so it stays off here.
+        by the custom MoE parallelizer. Context parallelism is supported via the
+        CP-aware block-sparse DSA attention (dense layers use the standard CP
+        path; sparse layers gather K/V and rebuild the global block-sparse mask
+        using FlexAttention).
         """
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
 
@@ -561,6 +572,66 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         inputs_embeds[mask] = features.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
         return inputs_embeds
 
+    def _embed_and_splice(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw=None,
+        pixel_values_videos: torch.Tensor | None = None,
+        video_grid_thw=None,
+    ) -> torch.Tensor:
+        """Embed token ids and splice vision/video features into the embeddings.
+
+        Shared by ``forward`` and ``prepare_model_inputs_for_cp`` so the splice logic
+        lives in one place.
+        """
+        inputs_embeds = self.model.embed_tokens(input_ids)
+        if pixel_values is not None or pixel_values_videos is not None:
+            inputs_embeds = inputs_embeds.clone()
+        if pixel_values is not None:
+            inputs_embeds = self._splice_multimodal(
+                inputs_embeds, input_ids, pixel_values, image_grid_thw, self.image_token_index
+            )
+        if pixel_values_videos is not None:
+            inputs_embeds = self._splice_multimodal(
+                inputs_embeds, input_ids, pixel_values_videos, video_grid_thw, self.video_token_index
+            )
+        return inputs_embeds
+
+    def prepare_model_inputs_for_cp(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw=None,
+        pixel_values_videos: torch.Tensor | None = None,
+        video_grid_thw=None,
+        **_: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Merge vision features into token embeddings BEFORE context-parallel sequence
+        sharding.
+
+        The VLM recipe calls ``model(_pre_embed_only=True, **mm_kwargs)`` when
+        ``cp_size > 1`` so the ``input_ids == image_token_index`` splice runs on the full,
+        un-sharded sequence; the returned ``inputs_embeds`` is then sequence-sharded by the
+        recipe. Mirrors ``step3p7``/``kimi_k25_vl``. Defining this method is also the opt-in
+        signal the recipe checks (``hasattr(model, "prepare_model_inputs_for_cp")``).
+        """
+        inputs_embeds = self._embed_and_splice(
+            input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+        )
+        # Detach: the recipe hands this to torch's context_parallel, which shards
+        # buffers via in-place resize_() and rejects tensors that require grad. The
+        # sharded buffer is fed back into forward() (which rebuilds the autograd graph
+        # from there), and the embeddings/vision tower are frozen for CP runs, so
+        # detaching here loses no gradient.
+        return {"inputs_embeds": inputs_embeds.detach()}
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -574,6 +645,20 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        # CP pre-embed: the recipe calls model(_pre_embed_only=True, **mm_kwargs) when
+        # cp_size>1 to splice vision into inputs_embeds before the batch is sequence-
+        # sharded. Return early with {"inputs_embeds": ...}; no PP/MTP/decoder work here.
+        if kwargs.pop("_pre_embed_only", False):
+            if input_ids is None:
+                raise ValueError("MiniMax M3 VL CP pre-embedding requires input_ids.")
+            return self.prepare_model_inputs_for_cp(
+                input_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+            )
+
         is_pp_stage = self._is_pipeline_parallel_stage()
 
         # Authoritative MTP-under-PP guard: keyed on the config (which survives the
@@ -626,17 +711,13 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             input_ids = None
 
         if inputs_embeds is None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
-            if pixel_values is not None or pixel_values_videos is not None:
-                inputs_embeds = inputs_embeds.clone()
-            if pixel_values is not None:
-                inputs_embeds = self._splice_multimodal(
-                    inputs_embeds, input_ids, pixel_values, image_grid_thw, self.image_token_index
-                )
-            if pixel_values_videos is not None:
-                inputs_embeds = self._splice_multimodal(
-                    inputs_embeds, input_ids, pixel_values_videos, video_grid_thw, self.video_token_index
-                )
+            inputs_embeds = self._embed_and_splice(
+                input_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+            )
 
         hidden = self.model(
             None,

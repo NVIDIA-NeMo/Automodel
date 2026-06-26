@@ -1614,7 +1614,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             return
 
         if wandb.run is not None:
-            wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+            if val_name == "default":
+                wandb.log(log_data.metrics, step=log_data.step)
+            else:
+                metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
+                wandb.log(metrics, step=log_data.step)
 
         if mlflow.active_run() is not None:
             mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)

@@ -73,6 +73,7 @@ class DistributedSetup:
         moe_parallel_config: "MoEParallelizerConfig | dict | None" = None,
         activation_checkpointing: ActivationCheckpointingMode = False,
         world_size: int | None = None,
+        timeout_minutes: int | None = None,
     ) -> "DistributedSetup":
         """Create a resolved distributed setup from sizes and policy configs.
 
@@ -110,6 +111,7 @@ class DistributedSetup:
             strategy_config,
             parallelism_sizes=parallelism_sizes,
             world_size=world_size,
+            timeout_minutes=timeout_minutes,
         )
 
         return cls(
