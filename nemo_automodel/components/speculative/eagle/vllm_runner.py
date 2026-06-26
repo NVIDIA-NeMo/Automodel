@@ -183,6 +183,11 @@ class VLLMTargetRunner:
 
         self._llm = None
         self._aux_layer_ids: Optional[list[int]] = None
+        self._sampling_params = None
+        self._hsc = None
+        # Lazily loaded once (see ``_ensure_weights_loaded``): input embeddings
+        # (original dtype, for the draft to copy), the final RMSNorm weight (fp32),
+        # and the LM head already cast to fp32 and transposed to ``[hidden, vocab]``.
         self._embed_w: Optional[torch.Tensor] = None
         self._norm_w: Optional[torch.Tensor] = None
         self._lm_head_w: Optional[torch.Tensor] = None
@@ -222,8 +227,9 @@ class VLLMTargetRunner:
         self._build_llm()
 
     def _build_llm(self) -> None:  # pragma: no cover - requires GPU + vLLM
-        from vllm import LLM
+        from vllm import LLM, SamplingParams
         from vllm.config.kv_transfer import KVTransferConfig
+        from vllm.distributed.kv_transfer.kv_connector.v1 import example_hidden_states_connector as hsc
 
         os.makedirs(self._shared_storage_path, exist_ok=True)
         # Capture the three EAGLE-3 layers plus the final pre-norm hidden
@@ -236,7 +242,18 @@ class VLLMTargetRunner:
         # of layer ``k - 1``). Shift the aux ids by +1 so the vLLM backend captures
         # the exact same hidden states as the co-located HF backend, keeping the
         # supervision numerically equivalent across engines.
-        capture_ids = [layer_id + 1 for layer_id in self._aux_layer_ids] + [self._num_layers]
+        shifted = [layer_id + 1 for layer_id in self._aux_layer_ids]
+        if self._num_layers in shifted:
+            # An aux id of num_layers-1 would shift onto the final-hidden sentinel,
+            # collapsing two distinct capture slots into one and corrupting the
+            # aux/final split in forward_eagle3. Fail loudly at config time.
+            raise ValueError(
+                f"aux_layer_ids={self._aux_layer_ids} include the last decoder layer; its +1 shift collides "
+                f"with the final-hidden capture id ({self._num_layers}). Pick aux layers below num_hidden_layers-1."
+            )
+        capture_ids = shifted + [self._num_layers]
+        self._sampling_params = SamplingParams(max_tokens=1, temperature=0.0)
+        self._hsc = hsc
         self._llm = LLM(
             model=self._model_path,
             trust_remote_code=self._trust_remote_code,
@@ -273,27 +290,25 @@ class VLLMTargetRunner:
         is a full causal prefill in vLLM (trailing pad tokens do not affect
         earlier positions under causal attention).
         """
-        from vllm import SamplingParams
-        from vllm.distributed.kv_transfer.kv_connector.v1 import example_hidden_states_connector as hsc
-
         del attention_mask  # each row is a full causal prefill in vLLM
         if self._llm is None:
             raise RuntimeError("set_aux_layers must be called before forward_eagle3 (it builds the vLLM engine).")
-        batch_size, seq_len = input_ids.shape
         device = input_ids.device
-        prompts = [{"prompt_token_ids": input_ids[i].tolist()} for i in range(batch_size)]
+        # One device-to-host copy for the whole batch, not one per row.
+        token_ids = input_ids.cpu().tolist()
+        prompts = [{"prompt_token_ids": ids} for ids in token_ids]
         # ``LLM.generate`` returns outputs in input order.
-        outputs = self._llm.generate(prompts, SamplingParams(max_tokens=1, temperature=0.0))
+        outputs = self._llm.generate(prompts, self._sampling_params)
 
         aux_rows: list[torch.Tensor] = []
         final_rows: list[torch.Tensor] = []
         for output in outputs:
             path = output.kv_transfer_params.get("hidden_states_path")
-            obj = hsc.load_hidden_states(path)
+            obj = self._hsc.load_hidden_states(path)
             hidden = obj["hidden_states"]
             if not torch.is_tensor(hidden):
                 hidden = torch.as_tensor(hidden)
-            hsc.cleanup_hidden_states(path)
+            self._hsc.cleanup_hidden_states(path)
             # hidden: [seq, num_capture_layers, hidden]; layers [0:3] are EAGLE-3 aux, [3] is the final hidden.
             aux_rows.append(hidden[:, :3, :].reshape(hidden.shape[0], -1))
             final_rows.append(hidden[:, 3, :])
@@ -303,23 +318,36 @@ class VLLMTargetRunner:
         logits = self._compute_logits(final_hidden)
         return logits, aux
 
+    def _ensure_weights_loaded(self, device: torch.device) -> None:  # pragma: no cover - requires GPU + vLLM
+        """Load the final-norm + LM-head + input embeddings once and cache them.
+
+        ``norm`` is kept in fp32 and ``lm_head`` is cast to fp32 and transposed to
+        ``[hidden, vocab]`` here so the per-microbatch ``forward_eagle3`` does no
+        redundant cast/transpose (the LM head is multi-GB at large vocab).
+        """
+        if self._norm_w is not None:
+            return
+        embed, norm, lm_head = _load_target_head_weights(self._model_path, device)
+        self._embed_w = embed
+        self._norm_w = norm.float()
+        self._lm_head_w = lm_head.float().t().contiguous()
+
     def _compute_logits(self, final_hidden: torch.Tensor) -> torch.Tensor:  # pragma: no cover - requires GPU + vLLM
-        """Rebuild full-vocab logits from the captured pre-norm final hidden state."""
-        if self._norm_w is None:
-            self._embed_w, self._norm_w, self._lm_head_w = _load_target_head_weights(
-                self._model_path, final_hidden.device
-            )
+        """Rebuild full-vocab logits from the captured pre-norm final hidden state.
+
+        Capture id ``num_hidden_layers`` yields the pre-(final-norm) residual hidden
+        (verified for ``vllm==0.23.0``), so apply the target's final RMSNorm + LM
+        head here; if a future vLLM captures post-norm, drop the RMSNorm below.
+        """
+        self._ensure_weights_loaded(final_hidden.device)
         x = final_hidden.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self._rms_eps)
-        x = x * self._norm_w.float()
-        return x @ self._lm_head_w.float().t()
+        x = x * self._norm_w
+        return x @ self._lm_head_w
 
     def input_embedding_weight(self) -> torch.Tensor:  # pragma: no cover - requires GPU + vLLM
         """Return the target input-embedding weight ``[vocab, hidden]``."""
-        if self._embed_w is None:
-            self._embed_w, self._norm_w, self._lm_head_w = _load_target_head_weights(
-                self._model_path, torch.device("cuda", torch.cuda.current_device())
-            )
+        self._ensure_weights_loaded(torch.device("cuda", torch.cuda.current_device()))
         return self._embed_w
 
     def close(self) -> None:  # pragma: no cover - requires GPU + vLLM
