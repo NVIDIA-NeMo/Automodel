@@ -57,7 +57,7 @@ make docs-check
 
 ## Layout
 
-```
+```text
 docs/                            ← nightly MDX lives here (sibling of fern/)
 ├── index.mdx, breaking-changes.mdx, release-notes.mdx, ...
 ├── about/, guides/, model-coverage/, launcher/, api-reference/
@@ -76,7 +76,7 @@ docs/                            ← nightly MDX lives here (sibling of fern/)
     └── product-docs/            # GENERATED Python API reference (gitignored — `make docs` regenerates)
 ```
 
-```
+```text
 File path                                                  Published URL
 ─────────────────────────────────────────────────────────  ─────────────────────────────────────────────────
 docs/get-started/installation.mdx                          docs.nvidia.com/nemo/automodel/nightly/get-started/installation
