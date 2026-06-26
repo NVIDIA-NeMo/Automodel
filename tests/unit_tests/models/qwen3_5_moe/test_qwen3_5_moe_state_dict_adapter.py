@@ -824,7 +824,7 @@ class TestConditionalGenerationStateDictAdapterWiring:
         config = SimpleNamespace(
             text_config=text_config,
             torch_dtype=None,
-            _name_or_path="Qwen/Qwen3.5-35B-A3B",
+            _name_or_path="model-under-test",
             name_or_path=None,
         )
         backend = BackendConfig(enable_hf_state_dict_adapter=True)
@@ -836,14 +836,18 @@ class TestConditionalGenerationStateDictAdapterWiring:
             patch.object(qwen3_5_moe_model, "initialize_linear_module", Mock(return_value=Mock())),
             patch.object(qwen3_5_moe_model, "build_mtp_config_from_hf", Mock(return_value=DummyMTPConfig())),
             patch.object(qwen3_5_moe_model, "Qwen3_5MoeStateDictAdapter", DummyAdapter),
-            patch.object(qwen3_5_moe_model, "Fp32SafeQwen3_5MoeVisionRotaryEmbedding", DummyFp32SafeRotary),
+            patch.object(
+                qwen3_5_moe_model,
+                "Fp32SafeQwen3_5MoeVisionRotaryEmbedding",  # pragma: allowlist secret
+                DummyFp32SafeRotary,
+            ),
         ):
             qwen3_5_moe_model.Qwen3_5MoeForConditionalGeneration(config, backend=backend)
 
         assert len(adapter_calls) == 1
         args, kwargs = adapter_calls[0]
         assert args[0] is text_config
-        assert kwargs["pretrained_model_name_or_path"] == "Qwen/Qwen3.5-35B-A3B"
+        assert kwargs["pretrained_model_name_or_path"] == "model-under-test"
 
 
 # ---------------------------------------------------------------------------
