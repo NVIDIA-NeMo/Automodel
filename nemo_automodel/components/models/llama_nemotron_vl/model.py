@@ -62,13 +62,6 @@ class LlamaNemotronVLConfig(PretrainedConfig):
     This serves as the foundation for LlamaNemotronVL configurations.
     """
 
-    @dataclass(frozen=True)
-    class ModelCapabilities:
-        supports_tp: bool = False
-        supports_cp: bool = False
-        supports_pp: bool = False
-        supports_ep: bool = False
-
     model_type = "llama_nemotron_vl"
     is_composition = True
     # is_composition was renamed to has_no_defaults_at_init in transformers 4.52.1
@@ -391,6 +384,15 @@ class LlamaNemotronVLModel(PreTrainedModel):
     Combines a vision encoder (SigLIP) with a bidirectional language model (LLaMA)
     for cross-modal reranking tasks.
     """
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     config_class = LlamaNemotronVLConfig
     main_input_name = "pixel_values"
