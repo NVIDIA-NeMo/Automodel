@@ -37,6 +37,7 @@ help:
 	@echo "  make docs                   Generate library reference and start Fern dev server"
 	@echo "  make docs-stitch            Restore frozen backward-version pages from the $(ARCHIVE_REF) branch"
 	@echo "  make docs-check             Run 'fern check' (config + MDX validation)"
+	@echo "  make docs-mdx-check         Run MDX syntax validation"
 	@echo "  make docs-preview           Build a shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)"
 	@echo "  make docs-publish           Trigger the 'Publish Fern Docs' workflow on origin/main"
 	@echo "  make docs-generate-library  Regenerate the autodoc library reference under product-docs/"
@@ -97,8 +98,15 @@ docs-login:
 docs: docs-stitch docs-generate-library
 	fern docs dev
 
-docs-check: docs-stitch
+docs-check: docs-mdx-check
 	fern check
+
+docs-mdx-check: docs-stitch
+	@tmp_dir="$$(mktemp -d)"; \
+	trap 'rm -rf "$$tmp_dir"' EXIT; \
+	printf '%s\n' '{"private":true,"type":"module"}' > "$$tmp_dir/package.json"; \
+	npm --prefix "$$tmp_dir" install --silent @mdx-js/mdx@3 remark-frontmatter@5 remark-math@6 >/dev/null; \
+	MDX_LINT_PREFIX="$$tmp_dir" MDX_LINT_REPO_ROOT="$(REPO_ROOT)" node "$(REPO_ROOT)/tools/validate_mdx_syntax.mjs" "$(REPO_ROOT)/docs"
 
 # Restore the frozen backward-version page trees into the working copy. They
 # live on the `$(ARCHIVE_REF)` branch (not on main), so a fresh clone has only
