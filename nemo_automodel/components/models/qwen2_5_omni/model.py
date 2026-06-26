@@ -44,6 +44,7 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniThinkerForConditionalGeneration as HFQwen2_5OmniThinkerForConditionalGeneration,
 )
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.qwen2_5_omni.state_dict_adapter import Qwen2_5OmniStateDictAdapter
@@ -102,6 +103,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
     ):
         thinker_config = _resolve_thinker_config(config)
         super().__init__(thinker_config)
+        reject_unsupported_tied_word_embeddings(self.config, type(self).__name__)
 
         # HF Qwen2.5-Omni declares ``audio_tower.audio_bos_eos_token`` as an
         # ``nn.Embedding(2, output_dim)`` (modeling_qwen2_5_omni.py:751) but it

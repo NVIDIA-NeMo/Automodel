@@ -30,6 +30,7 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeVisionRotaryEmbedding,
 )
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
@@ -500,6 +501,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
                     sub_cfg.torch_dtype = top_dtype
 
         super().__init__(config)
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
 
         self.backend = backend
         self.model.__class__ = Qwen3VLMoeModel

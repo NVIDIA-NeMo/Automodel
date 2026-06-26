@@ -38,6 +38,7 @@ from transformers.models.mbart.modeling_mbart import (
     MBartScaledWordEmbedding,
 )
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 
@@ -445,6 +446,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
 
     def __init__(self, config: NemotronParseConfig, loss_fn=None, **kwargs):
         super().__init__(config)
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.loss_fn = loss_fn
 
         self.encoder = RadioWithNeck(config.encoder)

@@ -163,6 +163,34 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
     return get_controlling_tie_word_embeddings(config, type(model).__name__)
 
 
+def reject_unsupported_tied_word_embeddings(config: object, model_class_name: str) -> None:
+    """Reject ``tie_word_embeddings=True`` for models whose HF default is untied.
+
+    Separate-head architectures (HF default: distinct input/output embeddings)
+    don't build a shared ``lm_head``, so honoring ``tie_word_embeddings=True``
+    would silently leave a randomly-initialized head or require materializing a
+    tied weight NeMo does not support. Reject it explicitly with a clear message
+    instead of pretending to support it.
+
+    Uses :func:`get_controlling_tie_word_embeddings`, so composite VLM/omni configs
+    are read from the controlling top-level flag rather than a nested
+    ``text_config``.
+
+    Args:
+        config: The model's config.
+        model_class_name: ``type(self).__name__`` of the constructing model.
+
+    Raises:
+        NotImplementedError: if the controlling ``tie_word_embeddings`` flag is set.
+    """
+    if get_controlling_tie_word_embeddings(config, model_class_name):
+        raise NotImplementedError(
+            f"{model_class_name} has separate input and output embeddings and does not "
+            f"support tie_word_embeddings=True. The Hugging Face default for this "
+            f"architecture is untied; set tie_word_embeddings=False."
+        )
+
+
 def _normalize_param_name(name: str) -> str:
     """Strip wrapper-specific prefixes from a parameter name."""
     return name.replace("_orig_mod.", "")
