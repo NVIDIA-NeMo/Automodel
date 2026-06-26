@@ -3,6 +3,7 @@
 
 import inspect
 import math
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -61,6 +62,13 @@ class LlamaNemotronVLConfig(PretrainedConfig):
     This serves as the foundation for LlamaNemotronVL configurations.
     """
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
+
     model_type = "llama_nemotron_vl"
     is_composition = True
     # is_composition was renamed to has_no_defaults_at_init in transformers 4.52.1
@@ -98,19 +106,13 @@ class LlamaNemotronVLConfig(PretrainedConfig):
         img_context_token_id: int = 128258,  # tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
         **kwargs,
     ):
-        if vision_config is None:
-            vision_config = {}
-            logger.info("vision_config is None. Initializing Vision Encoders with default values.")
-        else:
+        if vision_config is not None:
             if vision_config["model_type"] == "siglip_vision_model":
                 self.vision_config = SiglipVisionConfig(**vision_config)
             else:
                 raise ValueError("Unsupported model_type: {}".format(vision_config["model_type"]))
 
-        if llm_config is None:
-            llm_config = {}
-            logger.info("llm_config is None. Initializing the LLM config with default values")
-        else:
+        if llm_config is not None:
             if llm_config["architectures"][0] in {
                 "LlamaBidirectionalModel",
                 "LlamaBidirectionalForSequenceClassification",

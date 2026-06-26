@@ -303,7 +303,7 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
         query_prefix: str = "query:",
         passage_prefix: str = "passage:",
         max_input_tiles: int = 6,
-        num_image_token: int = 128258,
+        num_image_token: int = 256,
         dynamic_image_size: bool = True,
         image_size: int = 512,
         use_thumbnail: bool = True,
@@ -558,7 +558,7 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
                 pixel_values_return_value = pixel_values_list
         else:
             raise ValueError(
-                f"Invalid pixel_values_layout: {pixel_values_layout!r}. Must be 'squeezed' or 'per_image'."
+                f"Invalid pixel_values_layout: {pixel_values_layout!r}. Must be 'flat_tiles' or 'per_image'."
             )
 
         batch_docs = {

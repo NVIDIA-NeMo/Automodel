@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # To run this recipe:
-#   automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
+#   automodel examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: TrainBiEncoderRecipe
@@ -49,8 +49,8 @@ model:
 tokenizer:
   _target_: nemo_automodel.components.models.llama_nemotron_vl.processor.LlamaNemotronVLProcessor.from_pretrained
   pretrained_model_name_or_path: nvidia/llama-nemotron-embed-vl-1b-v2
-  q_max_len: 512
-  p_max_len: 4096
+  q_max_length: 512
+  p_max_length: 4096
   query_prefix: "query:"
   passage_prefix: "passage:"
   max_input_tiles: 2
