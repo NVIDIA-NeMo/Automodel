@@ -101,7 +101,7 @@ def _apply_common_mocks(monkeypatch):
 
 
 def test_from_pretrained_happy_path(monkeypatch):
-    calls = {"build": 0, "liger": 0, "sdpa": 0}
+    calls = {"build": 0, "liger": 0, "sdpa": 0, "te_norms": 0}
     last_kwargs = {}
 
     def fake_build(**kwargs):
@@ -120,6 +120,11 @@ def test_from_pretrained_happy_path(monkeypatch):
         model.marker.append("sdpa")
         return model
 
+    def fake_replace_norms(model):
+        calls["te_norms"] += 1
+        model.marker.append("te_norms")
+        return 1, 2
+
     def fake_apply_infrastructure(model, **kwargs):
         return model
 
@@ -127,6 +132,7 @@ def test_from_pretrained_happy_path(monkeypatch):
     monkeypatch.setattr(BiEncoderModel, "build", staticmethod(fake_build))
     monkeypatch.setattr(am, "_patch_liger_kernel", fake_liger)
     monkeypatch.setattr(am, "_patch_attention", fake_sdpa)
+    monkeypatch.setattr(am, "replace_norms_with_te", fake_replace_norms)
     monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
 
     model = am.NeMoAutoModelBiEncoder.from_pretrained(
@@ -137,16 +143,19 @@ def test_from_pretrained_happy_path(monkeypatch):
         detach_distributed_inbatch_negatives=False,
         use_liger_kernel=True,
         use_sdpa_patching=True,
+        use_te_norms=True,
         sdpa_method=None,
         some_other_kwarg="x",
     )
     assert isinstance(model, DummyModel)
     # Patches applied
-    assert "liger" in model.marker and "sdpa" in model.marker
+    assert model.marker == ["liger", "sdpa", "te_norms"]
+    assert calls["te_norms"] == 1
     # Ensure HF kwargs injected + passthrough of parameters to build
     assert last_kwargs["attn_implementation"] == am.DEFAULT_ATTN_IMPLEMENTATION
     assert last_kwargs["do_distributed_inbatch_negative"] is True
     assert last_kwargs["detach_distributed_inbatch_negatives"] is False
+    assert "use_te_norms" not in last_kwargs
     assert last_kwargs["some_other_kwarg"] == "x"
 
 

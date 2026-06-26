@@ -96,6 +96,7 @@ from nemo_automodel._transformers.model_init import (
     no_hf_meta_device,
     resolve_sdpa_method,
 )
+from nemo_automodel._transformers.te_norms import replace_norms_with_te
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
     from transformers.cache_utils import StaticCache
@@ -1003,6 +1004,7 @@ class _NeMoAutoModelForRetrievalBase:
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype="auto",
+        use_te_norms: bool = False,
         distributed_setup: Optional[DistributedSetup] = None,
         device_mesh: Optional["DeviceMesh"] = None,
         compile_config: Optional["CompileConfig"] = None,
@@ -1025,6 +1027,9 @@ class _NeMoAutoModelForRetrievalBase:
             use_sdpa_patching: Whether to apply SDPA patching.
             sdpa_method: SDPA backend methods to use.
             torch_dtype: Data type passed to the underlying model initialization.
+            use_te_norms: Whether to replace supported torch/HF norm modules
+                with Transformer Engine LayerNorm/RMSNorm modules before
+                applying distributed infrastructure.
             distributed_setup: Resolved distributed topology and policy object.
             device_mesh: Pre-created Hugging Face-style device mesh. NeMo wraps it
                 in a topology-only ``DistributedSetup`` internally.
@@ -1053,6 +1058,7 @@ class _NeMoAutoModelForRetrievalBase:
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
                 torch_dtype=torch_dtype,
+                use_te_norms=use_te_norms,
                 distributed_setup=distributed_setup,
                 device_mesh=device_mesh,
                 compile_config=compile_config,
@@ -1112,6 +1118,14 @@ class _NeMoAutoModelForRetrievalBase:
             del model
             gc.collect()
             return _retry(use_sdpa_patching=False)
+
+        if use_te_norms:
+            layer_norms, rms_norms = replace_norms_with_te(model)
+            logger.info(
+                "Replaced norm modules with Transformer Engine: layer_norm=%d, rms_norm=%d",
+                layer_norms,
+                rms_norms,
+            )
 
         model = apply_model_infrastructure(
             model=model,  # noqa: F821
