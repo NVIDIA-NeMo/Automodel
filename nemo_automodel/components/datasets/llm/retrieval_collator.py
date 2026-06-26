@@ -19,13 +19,6 @@ import torch
 from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.file_utils import PaddingStrategy
 
-from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
-
-MODELS_WITH_PROCESSOR = {
-    "llama_nemotron_vl": LlamaNemotronVLProcessor,
-}
-
-
 def _doc_id_str_to_int64(doc_id: str) -> int:
     """Stable 63-bit int for corpus doc id strings (for in-batch duplicate masking)."""
     h = hashlib.md5(doc_id.encode("utf-8")).digest()[:8]
