@@ -114,7 +114,7 @@ optimizer:
 ci:
   time: "00:50:00"
   nodes: 8
-  cluster_tag: gb200
+  cluster_tag: "[Gg][Bb]200"  # case-insensitive: pretyche GPU=gb200, oci_hsg GPU=GB200
   ep_size: 16
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
