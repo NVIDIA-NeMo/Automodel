@@ -213,11 +213,18 @@ def _auto_num_proc(dataset_len: int, requested: Optional[int] = None) -> int:
 
 
 def load_raw_dataset(dataset_id: str, name: str, split: str, max_samples: int):
-    """Load the raw CoderForge split (messages/tools stay as JSON strings)."""
+    """Load only the target split's parquet shards (messages/tools stay as JSON strings).
+
+    CoderForge's ``trajectories`` config defines several splits in one config, and
+    ``load_dataset(..., split=split)`` would still download every split's shards
+    before selecting. Pointing ``data_files`` at just this split's shards (e.g.
+    ``trajectories/filtered_reward1-*.parquet``) downloads only what we need.
+    """
     from datasets import load_dataset
 
-    split_arg = f"{split}[:{max_samples}]" if max_samples and max_samples > 0 else split
-    return load_dataset(dataset_id, name=name, split=split_arg)
+    data_files = f"{name}/{split}-*.parquet" if name else f"{split}-*.parquet"
+    split_arg = f"train[:{max_samples}]" if max_samples and max_samples > 0 else "train"
+    return load_dataset(dataset_id, data_files=data_files, split=split_arg)
 
 
 def add_token_lengths(dataset, tokenizer, num_proc: Optional[int] = None):
