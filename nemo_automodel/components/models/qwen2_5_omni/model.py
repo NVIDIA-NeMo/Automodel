@@ -101,9 +101,11 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         backend: BackendConfig | None = None,
         **kwargs,
     ):
+        # Check the controlling top-level flag on the original config before
+        # resolving to thinker_config and building the HF parent.
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         thinker_config = _resolve_thinker_config(config)
         super().__init__(thinker_config)
-        reject_unsupported_tied_word_embeddings(self.config, type(self).__name__)
 
         # HF Qwen2.5-Omni declares ``audio_tower.audio_bos_eos_token`` as an
         # ``nn.Embedding(2, output_dim)`` (modeling_qwen2_5_omni.py:751) but it

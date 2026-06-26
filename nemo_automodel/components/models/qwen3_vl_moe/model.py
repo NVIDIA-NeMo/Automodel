@@ -500,8 +500,8 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
                 if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
                     sub_cfg.torch_dtype = top_dtype
 
-        super().__init__(config)
         reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        super().__init__(config)
 
         self.backend = backend
         self.model.__class__ = Qwen3VLMoeModel

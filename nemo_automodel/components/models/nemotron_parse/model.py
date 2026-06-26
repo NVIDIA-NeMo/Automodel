@@ -445,8 +445,8 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         supports_ep: bool = False
 
     def __init__(self, config: NemotronParseConfig, loss_fn=None, **kwargs):
-        super().__init__(config)
         reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        super().__init__(config)
         self.loss_fn = loss_fn
 
         self.encoder = RadioWithNeck(config.encoder)

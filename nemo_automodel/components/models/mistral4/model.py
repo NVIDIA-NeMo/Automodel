@@ -346,10 +346,12 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         **kwargs,
     ):
         super().__init__()
+        # Reject an unsupported tied request on the controlling top-level flag
+        # before unwrapping to text_config below.
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         # Extract text_config if this is a multimodal wrapper config
         config = getattr(config, "text_config", config)
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Mistral4Model(
