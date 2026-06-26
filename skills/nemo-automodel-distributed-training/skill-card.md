@@ -9,10 +9,16 @@ NVIDIA <br>
 ### License/Terms of Use: <br>
 Apache 2.0 <br>
 ## Use Case: <br>
-Developers and engineers selecting and configuring distributed training strategies (FSDP2, HSDP, DDP, tensor/pipeline/context/expert parallelism) for large language models, vision-language models, and mixture-of-experts models using NeMo AutoModel. <br>
+Developers and engineers selecting and configuring distributed training strategies (FSDP2, HSDP, DDP, tensor/pipeline/context/expert parallelism) for large-scale model training with NeMo AutoModel. <br>
 
 ### Deployment Geography for Use: <br>
 Global <br>
+
+## Requirements / Dependencies: <br>
+**Requires API Key or External Credential:** [No] <br>
+**Credential Type(s):** [None] <br>  
+
+Do not include secrets in prompts/logs/output; use least-privilege credentials; rotate keys as appropriate. <br>
 
 ## Known Risks and Mitigations: <br>
 Risk: Review before execution as proposals could introduce incorrect or misleading guidance into skills. <br>
@@ -20,23 +26,23 @@ Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
 - [NeMo AutoModel Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) <br>
-- [NeMo AutoModel GitHub Repository](https://github.com/NVIDIA-NeMo/Automodel) <br>
+- [NVIDIA-NeMo/Automodel GitHub Repository](https://github.com/NVIDIA-NeMo/Automodel) <br>
 
 
 ## Skill Output: <br>
-**Output Type(s):** [Configuration instructions, Shell commands] <br>
+**Output Type(s):** [Configuration instructions, Code] <br>
 **Output Format:** [Markdown with inline YAML code blocks] <br>
 **Output Parameters:** [1D] <br>
 **Other Properties Related to Output:** [None] <br>
 
 ## Evaluation Agents Used: <br>
-- `claude-code` <br>
-- `codex` <br>
+- claude-code <br>
+- codex <br>
 
 
 
 ## Evaluation Tasks: <br>
-Evaluated against 3 internal skill evaluation tasks via NVSkills-Eval (external profile, 2 attempts per task, 50% pass threshold). <br>
+Evaluated against 3 evaluation tasks via NVSkills-Eval external profile in astra-sandbox environment. <br>
 
 ## Evaluation Metrics Used: <br>
 Reported benchmark dimensions: <br>
@@ -47,6 +53,7 @@ Reported benchmark dimensions: <br>
 - Efficiency: Checks whether the agent uses fewer tokens and avoids redundant work. <br>
 
 Underlying evaluation signals used in this run: <br>
+- `security`: Checks for unsafe operations, secret leakage, and unauthorized access. <br>
 - `skill_execution`: Verifies that the agent loaded the expected skill and workflow. <br>
 - `skill_efficiency`: Checks routing quality, decoy avoidance, and redundant tool usage. <br>
 - `accuracy`: Grades final-answer correctness against the reference answer. <br>
@@ -59,16 +66,11 @@ Underlying evaluation signals used in this run: <br>
 ## Evaluation Results: <br>
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
-| Security | 6 | 94% (+0%) | 100% (+29%) |
-| Correctness | 6 | 100% (+0%) | 92% (+5%) |
-| Discoverability | 6 | 100% (+0%) | 76% (+10%) |
-| Effectiveness | 6 | 93% (+0%) | 97% (+20%) |
-| Efficiency | 6 | 92% (-0%) | 70% (+16%) |
-
-## Testing Completed: <br>
-**[x] Agent Red-Teaming** <br>
-**[ ] Network Security** <br>
-**[ ] Product Security** <br>
+| Security | 3 | 100% (+0%) | 100% (+0%) |
+| Correctness | 3 | 100% (+68%) | 94% (+29%) |
+| Discoverability | 3 | 100% (+92%) | 85% (+49%) |
+| Effectiveness | 3 | 94% (+60%) | 94% (+34%) |
+| Efficiency | 3 | 94% (+68%) | 84% (+46%) |
 
 ## Skill Version(s): <br>
 v1.2.1+7febc6e (source: pyproject.toml) <br>
