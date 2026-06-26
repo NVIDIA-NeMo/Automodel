@@ -93,6 +93,7 @@ wandb:
 dist_env:
   backend: "nccl"
   init_method: "env://"
+  timeout_minutes: 30
 
 seed: 42
 
