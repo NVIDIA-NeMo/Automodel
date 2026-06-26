@@ -34,7 +34,7 @@ Verify readiness with ``curl http://<host>:8001/health``. NCCL GPU-direct
 transfer requires sglang installed in the server's environment; without it the
 server transparently falls back to the binary wire format.
 
-The frozen target runs under one of two inference engines (``--engine``):
+The frozen target runs under one of three inference engines (``--engine``):
 
 - ``hf`` (default): HuggingFace forward with aux-layer hooks
   (:class:`HFEagle3TargetModel`); works for any AutoModel target.
@@ -46,7 +46,15 @@ The frozen target runs under one of two inference engines (``--engine``):
 
       uv pip install sglang==0.5.9
 
-Both engines emit the identical supervision contract, so the training client is
+- ``vllm``: vLLM forward (:class:`VLLMEagle3TargetModel`) via vLLM's native
+  ``extract_hidden_states`` path. Like sglang, vLLM is **not** a NeMo-AutoModel
+  dependency and is imported only when this engine is selected. Install it
+  yourself in a separate, dedicated speculative-decoding venv/container on the
+  server::
+
+      uv pip install vllm==0.23.0
+
+All engines emit the identical supervision contract, so the training client is
 unchanged regardless of which one serves the target.
 """
 
@@ -99,12 +107,31 @@ def _build_sglang_target(args, device: torch.device, dtype: torch.dtype):
     )
 
 
+def _build_vllm_target(args, device: torch.device, dtype: torch.dtype):
+    """Load the target under vLLM (imported here so hf runs need no vLLM).
+
+    vLLM places the model itself (``torch.cuda.current_device()``), so ``device``
+    is unused; the signature matches :func:`_build_hf_target` so both are
+    interchangeable in the engine dispatch.
+    """
+    del device
+    from nemo_automodel.components.speculative.eagle.vllm_target import VLLMEagle3TargetModel
+
+    return VLLMEagle3TargetModel.from_pretrained(
+        args.target,
+        aux_layer_ids=args.aux_layer_ids,
+        dtype=dtype,
+        tp_size=args.tp_size,
+        trust_remote_code=args.trust_remote_code,
+    )
+
+
 def _parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve an EAGLE-3 target model for remote draft training.")
     parser.add_argument("--target", required=True, help="Target model name or path.")
     parser.add_argument(
         "--engine",
-        choices=("hf", "sglang"),
+        choices=("hf", "sglang", "vllm"),
         default="hf",
         help="Inference engine for the frozen target (default: hf).",
     )
@@ -112,7 +139,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
         "--tp-size",
         type=int,
         default=1,
-        help="Tensor-parallel size for the sglang engine (ignored for hf).",
+        help="Tensor-parallel size for the sglang/vllm engine (ignored for hf).",
     )
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (0.0.0.0 for cross-machine).")
     parser.add_argument("--port", type=int, default=8001, help="HTTP control-plane port.")
@@ -144,7 +171,7 @@ def main(argv=None) -> None:
     logger.info("Loading target model %s on %s via %s engine", args.target, device, args.engine)
     # Engine builders share a ``(args, device, dtype)`` signature so adding an
     # engine is one map entry; resolved at call time so tests can patch builders.
-    builders = {"hf": _build_hf_target, "sglang": _build_sglang_target}
+    builders = {"hf": _build_hf_target, "sglang": _build_sglang_target, "vllm": _build_vllm_target}
     target_wrapper = builders[args.engine](args, device, dtype)
 
     nccl_port = args.nccl_port if args.nccl_port is not None else args.port + 100
