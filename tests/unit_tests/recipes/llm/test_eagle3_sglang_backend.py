@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -115,6 +115,10 @@ class _DispatchReached(Exception):
     """Sentinel: the dispatch reached the expected backend setup method."""
 
 
+def _sentinel(self, *args, **kwargs):
+    raise _DispatchReached()
+
+
 @pytest.mark.parametrize(
     "backend, method",
     [
@@ -125,10 +129,6 @@ class _DispatchReached(Exception):
 )
 def test_online_target_dispatches_backend(monkeypatch, backend, method):
     recipe = _make_recipe()
-
-    def _sentinel(self, *args, **kwargs):
-        raise _DispatchReached()
-
     monkeypatch.setattr(TrainEagle3Recipe, method, _sentinel)
     with pytest.raises(_DispatchReached):
         recipe._setup_online_target(_RecipeCfg(target_model_backend=backend), "target/path", None)
@@ -138,3 +138,21 @@ def test_online_target_rejects_unknown_backend():
     recipe = _make_recipe()
     with pytest.raises(ValueError, match="expected 'colocated', 'sglang', or 'remote'"):
         recipe._setup_online_target(_RecipeCfg(target_model_backend="bogus"), "target/path", None)
+
+
+@pytest.mark.parametrize("backend", ["sglang", "remote"])
+def test_online_target_rejects_packing_on_non_colocated(backend):
+    """packed_sequence_size > 0 is colocated-only; SGLang/remote leak across docs."""
+    recipe = _make_recipe()
+    cfg = _RecipeCfg(target_model_backend=backend, packed_sequence_size=4)
+    with pytest.raises(NotImplementedError, match="only supported with the colocated"):
+        recipe._setup_online_target(cfg, "target/path", None)
+
+
+def test_online_target_allows_packing_on_colocated(monkeypatch):
+    """packed_sequence_size > 0 passes the guard for the colocated backend."""
+    recipe = _make_recipe()
+    monkeypatch.setattr(TrainEagle3Recipe, "_setup_colocated_target", _sentinel)
+    cfg = _RecipeCfg(target_model_backend="colocated", packed_sequence_size=4)
+    with pytest.raises(_DispatchReached):
+        recipe._setup_online_target(cfg, "target/path", None)

@@ -366,22 +366,24 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         #     precomputed supervision over HTTP + NCCL. No target weights are
         #     loaded here, which frees the training GPU's memory.
         backend = recipe_cfg.get("target_model_backend", "colocated")
-        # Sequence packing is colocated-only (the remote server does not yet honor
-        # per-document masking).
+        if backend not in ("colocated", "sglang", "remote"):
+            raise ValueError(f"Unknown target_model_backend={backend!r}; expected 'colocated', 'sglang', or 'remote'.")
+        # Sequence packing is colocated-only: neither the remote server nor the
+        # SGLang runner honors per-document masking (SGLang treats each row as one
+        # full causal sequence), so a packed row would leak supervision across
+        # document boundaries.
         packed_sequence_size = recipe_cfg.get("packed_sequence_size", 0)
-        if packed_sequence_size > 0 and backend == "remote":
+        if packed_sequence_size > 0 and backend != "colocated":
             raise NotImplementedError(
                 "packed_sequence_size > 0 is only supported with the colocated target backend; "
-                "the remote backend does not yet propagate per-document masking."
+                f"the {backend!r} backend does not propagate per-document masking."
             )
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
         elif backend == "sglang":
             self._setup_sglang_target(recipe_cfg, target_path)
-        elif backend == "colocated":
+        else:  # colocated
             self._setup_colocated_target(recipe_cfg, target_path)
-        else:
-            raise ValueError(f"Unknown target_model_backend={backend!r}; expected 'colocated', 'sglang', or 'remote'.")
 
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
