@@ -226,7 +226,15 @@ class VLLMTargetRunner:
         os.makedirs(self._shared_storage_path, exist_ok=True)
         # Capture the three EAGLE-3 layers plus the final pre-norm hidden
         # (layer id == num_hidden_layers) used to rebuild logits.
-        capture_ids = list(self._aux_layer_ids) + [self._num_layers]
+        #
+        # Convention shift: ``HFEagle3TargetModel`` (and SGLang, matched to it)
+        # hook the *output* of decoder layer ``aux_layer_id`` (== HF
+        # ``hidden_states[aux_layer_id + 1]``), whereas vLLM's capture id ``k``
+        # records the residual-stream value *entering* layer ``k`` (== the output
+        # of layer ``k - 1``). Shift the aux ids by +1 so the vLLM backend captures
+        # the exact same hidden states as the co-located HF backend, keeping the
+        # supervision numerically equivalent across engines.
+        capture_ids = [layer_id + 1 for layer_id in self._aux_layer_ids] + [self._num_layers]
         self._llm = LLM(
             model=self._model_path,
             trust_remote_code=self._trust_remote_code,
