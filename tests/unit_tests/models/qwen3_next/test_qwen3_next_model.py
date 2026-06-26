@@ -45,8 +45,10 @@ class MockQwen3NextGatedDeltaNet(torch.nn.Module):
 
 @pytest.fixture(autouse=True)
 def mock_gated_deltanet():
-    """Automatically mock Qwen3NextGatedDeltaNet for all tests to avoid torch.get_current_dtype() issue"""
-    with patch("nemo_automodel.components.models.qwen3_next.model.Qwen3NextGatedDeltaNet", MockQwen3NextGatedDeltaNet):
+    """Automatically mock Qwen3NextFp32GatedDeltaNet for all tests to avoid torch.get_current_dtype() issue"""
+    with patch(
+        "nemo_automodel.components.models.qwen3_next.model.Qwen3NextFp32GatedDeltaNet", MockQwen3NextGatedDeltaNet
+    ):
         yield
 
 

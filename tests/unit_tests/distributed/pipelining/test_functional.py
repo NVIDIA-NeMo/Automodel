@@ -25,6 +25,7 @@ from torch.distributed.pipelining.schedules import (
 from nemo_automodel.components.distributed.pipelining.functional import (
     _get_hidden_and_vocab_size,
     _precompute_stage_shapes,
+    _wrap_stage_forward_to_emit_tensor,
     build_pipeline_schedule,
     calculate_virtual_stages,
     generate_hf_model_fqn_per_model_part,
@@ -1355,3 +1356,107 @@ class TestSplitModelIntoStagesKeepListHook:
         for stage_fqns in lists:
             assert "model.custom_shared" not in stage_fqns
             assert "custom_last" not in stage_fqns
+
+
+class TestWrapStageForwardToEmitTensor:
+    """A PP stage forward must emit tensors, not a HF ModelOutput.
+
+    Regression test for the ``CausalLMOutputWithPast' object has no attribute
+    'shape'`` crash: custom ``*ForCausalLM`` forwards return a
+    ``CausalLMOutputWithPast`` (fused-linear-CE), but ``torch.distributed.pipelining``
+    calls ``.shape`` on each output leaf. The kept outer forward (``_pp_keep_self_forward``
+    models, and MoE configs with ``patch_causal_lm_model=False``) must be unwrapped.
+    """
+
+    def test_unwraps_model_output_to_logits(self):
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+
+        logits = torch.randn(2, 3, 8)
+
+        class FinalStage(torch.nn.Module):
+            def forward(self, x, position_ids=None):
+                return CausalLMOutputWithPast(logits=logits, hidden_states=None)
+
+        m = FinalStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        out = m(torch.randn(2, 3, 8))
+        assert isinstance(out, torch.Tensor)
+        assert torch.equal(out, logits)
+
+    def test_nonfinal_stage_passthrough_hidden_states(self):
+        # lm_head is None on non-final stages -> compute_lm_head_logits returns
+        # CausalLMOutputWithPast(logits=hidden_states); unwrap must yield that tensor.
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+
+        hidden = torch.randn(2, 3, 8)
+
+        class MidStage(torch.nn.Module):
+            def forward(self, x):
+                return CausalLMOutputWithPast(logits=hidden, hidden_states=None)
+
+        m = MidStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        assert torch.equal(m(torch.randn(2, 3, 8)), hidden)
+
+    def test_grad_flows_through_unwrapped_logits(self):
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+
+        class FinalStage(torch.nn.Module):
+            def forward(self, x):
+                return CausalLMOutputWithPast(logits=x * 2, hidden_states=None)
+
+        m = FinalStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        x = torch.randn(2, 3, 8, requires_grad=True)
+        m(x).sum().backward()
+        assert x.grad is not None
+
+    def test_bare_tensor_return_is_unchanged(self):
+        # Patched-forward path (create_pipeline_forward_causal_lm) already returns a tensor.
+        class TensorStage(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        m = TensorStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        x = torch.randn(2, 3, 8)
+        assert torch.equal(m(x), x + 1)
+
+    def test_tuple_return_is_preserved(self):
+        # MTP last stage emits (logits, *mtp_per_depth_h, seq_idx); must not be unwrapped.
+        class TupleStage(torch.nn.Module):
+            def forward(self, x):
+                return (x, x * 3, torch.zeros(2, 3, dtype=torch.int32))
+
+        m = TupleStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        out = m(torch.randn(2, 3, 8))
+        assert isinstance(out, tuple) and len(out) == 3
+
+    def test_idempotent(self):
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+
+        class FinalStage(torch.nn.Module):
+            def forward(self, x):
+                return CausalLMOutputWithPast(logits=x, hidden_states=None)
+
+        m = FinalStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        first = m.forward
+        _wrap_stage_forward_to_emit_tensor(m)
+        assert m.forward is first  # second call is a no-op
+
+    def test_forward_signature_is_preserved(self):
+        # PP / kwarg-filtering introspects the forward signature; it must survive wrapping.
+        import inspect
+
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+
+        class FinalStage(torch.nn.Module):
+            def forward(self, input_ids, position_ids=None, attention_mask=None):
+                return CausalLMOutputWithPast(logits=input_ids, hidden_states=None)
+
+        m = FinalStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        params = list(inspect.signature(m.forward).parameters)
+        assert params == ["input_ids", "position_ids", "attention_mask"]

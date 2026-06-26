@@ -48,6 +48,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
 from nemo_automodel.components.distributed import DistributedSetup, ParallelismSizes, parallelizer
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.distributed.ddp import DDPManager
@@ -587,7 +588,7 @@ class NeMoAutoDiffusionPipeline:
             peft_cfg: PeftConfig instance or None. When provided, LoRA is injected
                 before _apply_parallelization() (FSDP2 wrapping). Base weights
                 are frozen after FSDP2; LoRA params are collected pre-FSDP2 and stored on pipe.
-            model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
+            model_type: "flux" | "flux2" | "wan" | "hunyuan". Required when peft_cfg is provided.
             active_transformer: For two-transformer pipelines (e.g. Wan2.2 with
                 ``transformer`` + ``transformer_2``), selects which one becomes
                 ``pipe.transformer`` for training. Accepts ``"transformer"`` (default,
@@ -611,9 +612,13 @@ class NeMoAutoDiffusionPipeline:
 
         logger.info("[INFO] Loading pipeline from pretrained: %s", pretrained_model_name_or_path)
 
+        # Resolve to a local snapshot dir so a warm HF cache is not re-validated
+        # (and potentially re-downloaded) over the network on every run.
+        model_dir = resolve_diffusion_model_dir(pretrained_model_name_or_path)
+
         # Use DiffusionPipeline.from_pretrained for auto-detection
         pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
-            pretrained_model_name_or_path,
+            model_dir,
             *model_args,
             torch_dtype=torch_dtype,
             **kwargs,
@@ -663,7 +668,9 @@ class NeMoAutoDiffusionPipeline:
             # Pre-FSDP2 lora_params refs are stored on pipe and remain valid
             # after wrapping (FSDP2 preserves original Parameter objects).
             if model_type is None:
-                raise ValueError("model_type must be set when peft_cfg is provided. Options: 'flux', 'wan', 'hunyuan'")
+                raise ValueError(
+                    "model_type must be set when peft_cfg is provided. Options: 'flux', 'flux2', 'wan', 'hunyuan'"
+                )
             import dataclasses
 
             from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -794,6 +801,10 @@ class NeMoAutoDiffusionPipeline:
         logger.info("[INFO] Initializing pipeline from config with random weights")
         logger.info("[INFO] Model ID: %s", model_id)
         logger.info("[INFO] Transformer class: %s", spec.transformer_cls)
+
+        # Resolve to a local snapshot dir so config/pipeline loads reuse the
+        # warm HF cache instead of re-validating over the network.
+        model_id = resolve_diffusion_model_dir(model_id)
 
         # Dynamically import transformer class from diffusers
         TransformerCls = _import_diffusers_class(spec.transformer_cls)

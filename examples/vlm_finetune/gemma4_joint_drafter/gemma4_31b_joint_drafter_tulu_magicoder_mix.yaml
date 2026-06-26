@@ -1,0 +1,154 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Joint multi-step (K=4) MTP fine-tuning of Gemma 4 31B (dense) base + the
+# released 31B drafter (google/gemma-4-31B-it-assistant) on a text-only 80/20
+# mix of allenai/tulu-3-sft-mixture and ise-uiuc/Magicoder-OSS-Instruct-75K.
+#
+# This is the 31B analog of gemma4_4b_joint_drafter_tulu_magicoder_mix.yaml.
+# Google ships a drafter for the 31B backbone, so no custom drafter is needed:
+# point ``drafter_path`` at ``google/gemma-4-31B-it-assistant``. Its
+# ``backbone_hidden_size`` (5376) and KV-head layout match the 31B base, which
+# is grouped-query (16 sliding vs 4 full KV heads); the released drafter is
+# configured for that layout, so the stock modeling runs unchanged.
+#
+# Resourcing: the 31B base is sharded with FSDP2 across the data-parallel mesh;
+# this config targets a single node of 8 x 80GB. The drafter's shared-KV path is
+# not tensor- or pipeline-parallel safe, so keep ``tp_size: 1`` and ``pp_size: 1``
+# (the composite raises otherwise). ``base_activation_checkpointing`` recomputes
+# the base's 60-layer activations in backward to keep K=4 + bf16 + 2048 padding
+# under 80GB.
+#
+# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c \
+# examples/vlm_finetune/gemma4_joint_drafter/gemma4_31b_joint_drafter_tulu_magicoder_mix.yaml
+#
+# Requires: transformers>=5.8.0.dev
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  max_steps: 2000
+
+dist_env:
+  backend: nccl
+  # 30 min to be safe since the text-mix sources have long-tail samples whose
+  # tokenization can stall a single rank for several minutes.
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.components.models.gemma4_drafter.composite.Gemma4WithDrafter.from_pretrained
+  pretrained_model_name_or_path: google/gemma-4-31B-it
+  drafter_path: google/gemma-4-31B-it-assistant
+  drafter_loss_weight: 0.01
+  drafter_num_steps: 4
+  # K=4 + bf16 + 2048 fixed-pad pushes activation memory past 80GB.
+  # Enable HF gradient checkpointing on the base to recompute its 60-layer
+  # activations during backward. Adds ~25-30% time overhead but reclaims tens of GB.
+  base_activation_checkpointing: true
+  text_config:
+    use_cache: true
+  torch_dtype: torch.bfloat16
+  use_liger_kernel: true
+  use_sdpa_patching: false
+  attn_implementation: eager
+
+processor:
+  padding_side: right
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: vlm_checkpoints/gemma4_31b_joint_drafter_text_mix/
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  # Joint drafter is TP/PP-unsafe (the drafter cross-attends the base's shared KV);
+  # keep tp_size/cp_size/pp_size at 1 and shard the 31B base with FSDP2 instead.
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+# Tighten gradient clipping to 0.5 to reduce noise
+clip_grad_norm:
+  max_norm: 0.5
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_magicoder_text_mix_dataset
+  tulu_split: train
+  magicoder_split: train
+  seed: 42
+  max_turns: 16
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    # max_length: 4096 OOMs on 80GB
+    max_length: 2048
+    # drop_overlong: true can lead to NCCL hang in case of an empty batch.
+    drop_overlong: false
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_magicoder_text_mix_dataset
+  tulu_split: train
+  magicoder_split: train
+  seed: 7
+  max_turns: 16
+  limit_total: 200
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+lr_scheduler:
+# 10% of max_steps as warmup is used by default which is what we want hence not setting lr_warmup_steps here.
+  lr_decay_style: cosine
+
+freeze_config:
+  # The drafter consumes the base's token embeddings via its pre_projection
+  # input at EVERY recurrent round, so embeddings must stay trainable for
+  # gradient flow from the drafter loss back to the base.
+  freeze_embeddings: false
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+# wandb:
+#   project: <your-project>
+#   entity: <your-entity>
+#   name: <your-run-name>
+
+ci:
+  recipe_owner: athitten

@@ -618,7 +618,7 @@ def qwen3_omni_collate_fn(
     """Collate function for Qwen3 Omni processors."""
     if not HAVE_QWEN_OMNI_UTILS:
         raise ImportError(
-            "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install qwen-omni-utils"
+            "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install nemo-automodel[vlm-media]"
         )
 
     # Import at call-time to support environments/tests that inject the module
@@ -627,7 +627,7 @@ def qwen3_omni_collate_fn(
         from qwen_omni_utils import process_mm_info as _process_mm_info
     except ImportError as exc:
         raise ImportError(
-            "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install qwen-omni-utils"
+            "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install nemo-automodel[vlm-media]"
         ) from exc
 
     conversations = [example["conversation"] for example in examples]
@@ -1266,19 +1266,24 @@ def default_collate_fn(
         conversations, kept = _drop_overlong_samples(conversations, processor, max_length)
         examples = [examples[i] for i in kept]
 
-    processor_kwargs = {
-        "tokenize": True,
-        "padding": True,
-        "truncation": True,
-        "return_tensors": "pt",
-        "return_dict": True,
-    }
+    # transformers>=5 expects processing kwargs (padding/truncation/max_length) to be
+    # nested under `processor_kwargs`; only apply_chat_template's own controls
+    # (tokenize/return_dict/return_tensors) stay top-level. Passing them flat still
+    # works but logs, once per sample: "Kwargs passed to `processor.__call__` have to
+    # be in `processor_kwargs` dict, not in `**kwargs`".
+    processing_kwargs = {"padding": True, "truncation": True}
     if max_length is not None:
-        processor_kwargs["max_length"] = max_length
-        processor_kwargs["padding"] = "max_length"
+        processing_kwargs["max_length"] = max_length
+        processing_kwargs["padding"] = "max_length"
         if drop_overlong:
-            processor_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
-    batch = processor.apply_chat_template(conversations, **processor_kwargs)
+            processing_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
+    batch = processor.apply_chat_template(
+        conversations,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        processor_kwargs=processing_kwargs,
+    )
 
     if _post_tokenize_hook is not None:
         batch = _post_tokenize_hook(batch, processor)
@@ -1641,7 +1646,12 @@ def nemotron_omni_collate_fn(
                         if vid is None:
                             continue
                         if isinstance(vid, str):
-                            import decord
+                            try:
+                                import decord
+                            except ImportError as exc:
+                                raise RuntimeError(
+                                    "decord is required to read video files; install it with: pip install nemo-automodel[vlm-media]"
+                                ) from exc
 
                             decord.bridge.set_bridge("native")
                             total = len(decord.VideoReader(vid))

@@ -14,12 +14,17 @@
 
 """Tests for mesh_utils: get_flat_mesh, get_submesh, _unflatten_compat utilities."""
 
+import datetime
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+import nemo_automodel.components.distributed.mesh_utils as mesh_utils
+from nemo_automodel.components.distributed.mesh import MeshAxisName
 from nemo_automodel.components.distributed.mesh_utils import (
+    _init_named_mesh,
+    _MeshSpec,
     _unflatten_compat,
     get_flat_mesh,
     get_fsdp_dp_mesh,
@@ -48,6 +53,41 @@ def test_distributed_package_exports_user_entrypoints():
     assert distributed.MeshContext is MeshContext
     assert distributed.ParallelismSizes is ParallelismSizes
     assert distributed.initialize_distributed is initialize_distributed
+
+
+def test_init_named_mesh_sets_nccl_timeout_backend_override(monkeypatch):
+    captured: dict = {}
+    fake_mesh = Mock()
+
+    def fake_init_device_mesh(**kwargs):
+        captured.update(kwargs)
+        return fake_mesh
+
+    monkeypatch.setattr(mesh_utils, "init_device_mesh", fake_init_device_mesh)
+    monkeypatch.setattr(mesh_utils, "_mesh_device_type", lambda: "cuda")
+
+    result = _init_named_mesh(_MeshSpec(shape=(2,), axes=(MeshAxisName.PP,)), timeout_minutes=30)
+
+    assert result is fake_mesh
+    backend, options = captured["backend_override"][MeshAxisName.PP]
+    assert backend == "nccl"
+    assert options._timeout == datetime.timedelta(minutes=30)
+
+
+def test_init_named_mesh_omits_backend_override_for_cpu(monkeypatch):
+    captured: dict = {}
+    fake_mesh = Mock()
+
+    def fake_init_device_mesh(**kwargs):
+        captured.update(kwargs)
+        return fake_mesh
+
+    monkeypatch.setattr(mesh_utils, "init_device_mesh", fake_init_device_mesh)
+    monkeypatch.setattr(mesh_utils, "_mesh_device_type", lambda: "cpu")
+
+    _init_named_mesh(_MeshSpec(shape=(2,), axes=(MeshAxisName.PP,)), timeout_minutes=30)
+
+    assert captured["backend_override"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -408,15 +448,16 @@ class TestGetFsdpDpMesh:
     # Branch 3 – dp_replicate = 1, cp > 1
     # ------------------------------------------------------------------
 
-    def test_cp_only_returns_shard_cp_tuple_slice(self):
-        """dp_replicate=1, cp>1 → device_mesh[("dp_shard","cp")]."""
+    def test_cp_only_returns_flattened_shard_cp_mesh(self):
+        """dp_replicate=1, cp>1 → device_mesh["dp_shard_cp"]."""
         mesh = self._make_mesh(self._ALL_NATIVE_DIMS, {"dp_replicate": 1, "cp": 4})
+        shard_cp_mesh = Mock()
+        mesh._get_root_mesh = Mock(return_value=mesh)
+        mesh._flatten_mapping = {"dp_shard_cp": shard_cp_mesh}
 
         result = get_fsdp_dp_mesh(mesh)
 
-        mesh.__getitem__.assert_any_call(("dp_shard", "cp"))
-        assert result._key == ("dp_shard", "cp")
-        assert result._mesh is mesh
+        assert result is shard_cp_mesh
 
     # ------------------------------------------------------------------
     # Branch 4 – dp_replicate > 1 AND cp > 1 → get_submesh fallback

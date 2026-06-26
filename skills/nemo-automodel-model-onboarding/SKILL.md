@@ -191,7 +191,15 @@ See the pattern files for detailed implementation guidance:
 - MoE: [moe-patterns.md](./moe-patterns.md)
 - VLM: [vlm-patterns.md](./vlm-patterns.md)
 
-### 2.3 MoE state-dict adapter checklist
+### 2.3 Causal LM weight tying
+
+For any CausalLM-style class whose config can enable `tie_word_embeddings`,
+make tying explicit: declare `_tied_weights_keys`, implement `tie_weights()`
+with the actual `lm_head` and input-embedding FQNs, and add tiny tests for
+tied and untied configs. Do not tie architectures with intentionally separate
+heads, asymmetric vocab sizes, or stages that do not own both tensors.
+
+### 2.4 MoE state-dict adapter checklist
 
 For MoE models, do not stop at generic loading. The adapter must explicitly map:
 
@@ -210,7 +218,7 @@ Do not use these shortcuts:
   and NeMo layouts require it and a test proves the conversion is reversible.
 - Do not skip router or shared-expert tests because dense-layer tests pass.
 
-### 2.4 VLM onboarding checklist
+### 2.5 VLM onboarding checklist
 
 For VLMs, confirm the Hugging Face config has `vision_config` and `text_config`
 and that `architectures` points to a conditional-generation class. Start from
@@ -225,7 +233,7 @@ The implementation should explicitly cover:
 - Registration of the `ForConditionalGeneration` class in `_transformers/registry.py`.
 - Tiny tests that exercise image-text inputs and verify the adapter round-trip.
 
-### 2.5 Register in registry
+### 2.6 Register in registry
 
 Add the model to `MODEL_ARCH_MAPPING` in `_transformers/registry.py`:
 
@@ -249,7 +257,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 }
 ```
 
-### 2.6 Declare model capabilities (mandatory)
+### 2.7 Declare model capabilities (mandatory)
 
 Every class registered in `MODEL_ARCH_MAPPING` must declare its parallelism
 capabilities. Pick exactly one of the two patterns below — never both, never
@@ -343,8 +351,9 @@ the bare-class form because they need a config to make the decision.
 ### 2.7 Keep intrinsically-fp32 params in fp32 compute
 
 Some parameters are numerically unstable in low precision and must be **computed** in fp32
-even when the rest of the model computes in bf16 — e.g. SSM/Mamba `A_log`, `dt_bias`, `D`;
-MoE sigmoid-gate bias (`e_score_correction_bias`); attention-sink bias; per-head `scale`.
+even when the rest of the model computes in bf16 — e.g. SSM/Mamba `A_log` / `dt_bias`,
+plus `D` for Mamba variants whose reference checkpoints keep it fp32; MoE sigmoid-gate
+bias (`e_score_correction_bias`); attention-sink bias; per-head `scale`.
 If your model has any such params, declare them in `_keep_in_fp32_modules_strict` as
 parameter-name substrings; sharding (`fully_shard_by_dtype`) reads this list and gives those
 params an fp32 compute dtype while everything else uses `mp_policy.param_dtype` (bf16). A
@@ -354,8 +363,16 @@ Where to declare it:
 
 - **NeMo-native model class** (you own `model.py`): a class attribute, e.g.
   `_keep_in_fp32_modules_strict = ["e_score_correction_bias"]` (see `deepseek_v4`, `ling_v2`).
-- **HF model you only patch** (e.g. Qwen3.5): set it on the instance inside `patch_hf_model`,
-  e.g. `model._keep_in_fp32_modules_strict = existing + ("_fp32_params",)`.
+- **Trainable fp32 params inside mixed modules**: do not leave them as bare parameters on a
+  module that also owns bf16 bulk weights. A strict marker identifies the compute dtype, but it
+  does not create an FSDP-isolatable subtree. Move the params into a small `_fp32_params` holder,
+  call the holder in `forward` so FSDP hooks run, return a full tensor from the holder when FSDP
+  exposes the parameter as a `DTensor`, keep the holder out of broad dtype casts with
+  `cast_model_to_dtype(..., skip_modules=("_fp32_params",))`, and make the state-dict adapter
+  strip/route holder keys plus upcast loaded tensors to fp32.
+- **HF-derived models with fp32 runtime params**: build the fp32 structure in the model or layer
+  constructor; do not use a runtime monkeypatch, and do not infer the contract globally from a
+  module path such as `linear_attn` or from an `A_log` parameter name alone.
 
 Always declare the pin for these params. A normal checkpoint load also auto-records each
 param's original HF dtype and uses it as a fallback, but that recording is skipped on the
@@ -510,7 +527,7 @@ that only surface in a full parity comparison.
 - [ ] Created example YAML config
 - [ ] Verified model loads via `NeMoAutoModelForCausalLM.from_pretrained()`
 - [ ] Created unit tests (forward shape, state_dict round-trip)
-- [ ] Declared `_keep_in_fp32_modules_strict` for every intrinsically-fp32 param (SSM `A_log`/`dt_bias`/`D`, MoE gate bias, attention-sink bias, `scale`, …) — see §2.6
+- [ ] Declared `_keep_in_fp32_modules_strict` for every intrinsically-fp32 param (SSM `A_log`/`dt_bias`, Mamba `D` when reference-fp32, MoE gate bias, attention-sink bias, `scale`, …) — see §2.7
 - [ ] Created layer equivalence tests for every rewritten layer (matching model dtype)
 - [ ] Created functional tests (training loss decreases)
 - [ ] Updated docs/model-coverage page

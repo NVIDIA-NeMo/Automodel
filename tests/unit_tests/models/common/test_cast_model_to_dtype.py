@@ -19,6 +19,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.models.common.utils import (
     _get_fp32_module_keywords,
+    _get_strict_fp32_module_keywords,
     _has_dtensor_params,
     _restore_fp32_buffers,
     _restore_fp32_modules,
@@ -76,6 +77,21 @@ class ModelWithStrictFp32Parameter(nn.Module):
         self.mixer.scale = nn.Parameter(torch.ones(4))
 
 
+class ModelWithStrictFp32Buffer(nn.Module):
+    """Model that declares one strict fp32 buffer by qualified buffer name."""
+
+    _keep_in_fp32_modules_strict = ["router.e_score_correction_bias"]
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4)
+        self.router = nn.Module()
+        self.router.register_buffer(
+            "e_score_correction_bias",
+            torch.tensor([1.001, -2.003, 0.3333, 17.125], dtype=torch.float32),
+        )
+
+
 class ModelWithBothFp32Attrs(nn.Module):
     """Model with both _keep_in_fp32_modules and _keep_in_fp32_modules_strict."""
 
@@ -107,6 +123,28 @@ class TestGetFp32ModuleKeywords:
         model = ModelWithStrictFp32()
         assert _get_fp32_module_keywords(model) == ["head"]
 
+    def test_keep_in_fp32_modules_strict_tuple(self):
+        class Model(nn.Module):
+            _keep_in_fp32_modules_strict = ("head",)
+
+            def __init__(self):
+                super().__init__()
+
+        model = Model()
+        assert _get_fp32_module_keywords(model) == ["head"]
+        assert _get_strict_fp32_module_keywords(model) == ["head"]
+
+    def test_keep_in_fp32_modules_strict_set(self):
+        class Model(nn.Module):
+            _keep_in_fp32_modules_strict = {"head"}
+
+            def __init__(self):
+                super().__init__()
+
+        model = Model()
+        assert _get_fp32_module_keywords(model) == ["head"]
+        assert _get_strict_fp32_module_keywords(model) == ["head"]
+
     def test_both_attributes_deduped(self):
         model = ModelWithBothFp32Attrs()
         keywords = _get_fp32_module_keywords(model)
@@ -135,6 +173,19 @@ class TestGetFp32ModuleKeywords:
 
         model = Model()
         assert _get_fp32_module_keywords(model) == []
+
+    def test_set_and_tuple_accepted(self):
+        # HuggingFace's PreTrainedModel.__init__ converts a class-level list into an
+        # instance-level set; accept set (and tuple) so keep-fp32 keywords are not
+        # silently dropped (regression: this no-op'd the gemma4_moe/diffusion_gemma fix).
+        class Model(nn.Module):
+            _keep_in_fp32_modules = {"norm"}
+            _keep_in_fp32_modules_strict = ("head",)
+
+            def __init__(self):
+                super().__init__()
+
+        assert set(_get_fp32_module_keywords(Model())) == {"norm", "head"}
 
 
 # ---------------------------------------------------------------------------
@@ -198,11 +249,43 @@ class TestCastModelToDtype:
         assert model.head.weight.dtype == torch.float32
         assert model.linear.weight.dtype == torch.bfloat16
 
+    def test_strict_fp32_modules_preserved_from_tuple(self):
+        class Model(nn.Module):
+            _keep_in_fp32_modules_strict = ("head",)
+
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(4, 4)
+                self.head = nn.Linear(4, 2)
+
+        model = Model()
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert model.head.weight.dtype == torch.float32
+        assert model.linear.weight.dtype == torch.bfloat16
+
     def test_strict_fp32_parameters_preserved(self):
         model = ModelWithStrictFp32Parameter()
+        original_scale = torch.tensor([1.001, -2.003, 0.3333, 17.125], dtype=torch.float32)
+        with torch.no_grad():
+            model.mixer.scale.copy_(original_scale)
+
         cast_model_to_dtype(model, torch.bfloat16)
 
         assert model.mixer.scale.dtype == torch.float32
+        assert torch.equal(model.mixer.scale, original_scale)
+        assert not torch.equal(model.mixer.scale, original_scale.to(torch.bfloat16).float())
+        assert model.linear.weight.dtype == torch.bfloat16
+
+    def test_strict_fp32_buffers_preserve_values(self):
+        model = ModelWithStrictFp32Buffer()
+        original_bias = model.router.e_score_correction_bias.clone()
+
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert model.router.e_score_correction_bias.dtype == torch.float32
+        assert torch.equal(model.router.e_score_correction_bias, original_bias)
+        assert not torch.equal(model.router.e_score_correction_bias, original_bias.to(torch.bfloat16).float())
         assert model.linear.weight.dtype == torch.bfloat16
 
     def test_both_fp32_attrs_preserved(self):
@@ -227,6 +310,68 @@ class TestCastModelToDtype:
         for p in model.parameters():
             assert p.dtype == torch.float16
 
+    def test_skip_modules_left_untouched(self):
+        """Submodules named in ``skip_modules`` keep their original dtype."""
+
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(4, 4)
+                self._fp32_params = nn.Linear(4, 4)
+
+        model = Model()
+        cast_model_to_dtype(model, torch.bfloat16, skip_modules=("_fp32_params",))
+
+        # Regular submodule is cast; the skipped holder stays fp32.
+        assert model.linear.weight.dtype == torch.bfloat16
+        assert model._fp32_params.weight.dtype == torch.float32
+
+    def test_skip_modules_nested_and_restored(self):
+        """Nested skip_modules are preserved and re-attached after the cast."""
+
+        class Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self._fp32_params = nn.Linear(2, 2)
+                self.proj = nn.Linear(2, 2)
+
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.block = Inner()
+
+        model = Model()
+        cast_model_to_dtype(model, torch.bfloat16, skip_modules=("_fp32_params",))
+
+        assert model.block.proj.weight.dtype == torch.bfloat16
+        # Holder preserved in fp32 and re-attached (still reachable on the module).
+        assert model.block._fp32_params.weight.dtype == torch.float32
+        assert model.block._fp32_params is dict(model.block.named_modules())["_fp32_params"]
+
+    def test_skip_modules_empty_is_noop(self):
+        """An empty skip_modules tuple casts everything (default behavior)."""
+        model = SimpleModel()
+        cast_model_to_dtype(model, torch.bfloat16, skip_modules=())
+
+        for p in model.parameters():
+            assert p.dtype == torch.bfloat16
+
+    def test_set_valued_keep_in_fp32_preserved(self):
+        # Mirrors HF converting _keep_in_fp32_modules (list) to a set on the instance —
+        # the gemma4_moe/diffusion_gemma case. cast_model_to_dtype must still restore it.
+        class M(nn.Module):
+            _keep_in_fp32_modules = {"norm"}
+
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(4, 4)
+                self.norm = nn.LayerNorm(4)
+
+        model = M()
+        cast_model_to_dtype(model, torch.bfloat16)
+        assert model.norm.weight.dtype == torch.float32
+        assert model.linear.weight.dtype == torch.bfloat16
+
 
 # ---------------------------------------------------------------------------
 # Tests for DTensor-aware casting
@@ -248,6 +393,16 @@ class TestDTensorAwareCasting:
         # Parameters should be bf16 — FSDP2 requires uniform dtype
         for p in model.parameters():
             assert p.dtype == torch.bfloat16
+
+    def test_dtensor_strict_fp32_params_restored(self):
+        """Strict fp32 modules are already isolated as their own FSDP units, so they can be restored."""
+        model = ModelWithStrictFp32()
+
+        with patch("nemo_automodel.components.models.common.utils._has_dtensor_params", return_value=True):
+            cast_model_to_dtype(model, torch.bfloat16)
+
+        assert model.head.weight.dtype == torch.float32
+        assert model.linear.weight.dtype == torch.bfloat16
 
     def test_dtensor_buffers_in_matching_modules_restored(self):
         """Buffers in fp32-keyword-matching modules are cast to fp32 even with DTensor params."""
@@ -370,6 +525,63 @@ class TestCastFrozenModulesToComputeDtype:
         assert model.vision.norm.weight.dtype == torch.bfloat16
         # Frozen buffer is always cast (never FSDP-managed) -- the actual fix.
         assert model.vision.pos.dtype == torch.bfloat16
+
+
+class TestRopeBufferPreserved:
+    """Regression: a model-wide bf16 cast must not round rotary frequency buffers.
+
+    ``nn.Module.to(bf16)`` rounds floating-point buffers, including a rotary
+    embedding's (non-persistent) ``inv_freq`` / ``freqs_cis``. Building cos/sin from a
+    bf16-rounded buffer degrades RoPE precision vs HF (which keeps it fp32) and shows
+    up as a large logit/KL divergence when a checkpoint is reloaded in vanilla HF.
+    Models guard against this by listing the rotary module (or buffer) in
+    ``_keep_in_fp32_modules``; these tests pin that ``cast_model_to_dtype`` honors it
+    for non-persistent rope buffers (the mechanism the per-model fixes rely on).
+    """
+
+    @staticmethod
+    def _rope_model(keep, *, buffer_name="inv_freq", module_name="rotary_emb"):
+        class Rope(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Non-persistent, exactly like the real rotary frequency buffers.
+                self.register_buffer(buffer_name, torch.arange(0, 8, 2, dtype=torch.float32), persistent=False)
+
+        class M(nn.Module):
+            _keep_in_fp32_modules = keep
+
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(4, 4)
+                setattr(self, module_name, Rope())
+
+        return M()
+
+    def test_rotary_emb_keyword_keeps_inv_freq_fp32(self):
+        # deepseek_v4 / mimo_v2_flash / gemma4_moe / diffusion_gemma case.
+        model = self._rope_model(["rotary_emb"])
+        cast_model_to_dtype(model, torch.bfloat16)
+        assert model.rotary_emb.inv_freq.dtype == torch.float32  # protected
+        assert model.linear.weight.dtype == torch.bfloat16  # everything else cast
+
+    def test_unprotected_inv_freq_is_rounded(self):
+        # Without the keep-list entry the bug reproduces: inv_freq is rounded to bf16.
+        model = self._rope_model([])
+        cast_model_to_dtype(model, torch.bfloat16)
+        assert model.rotary_emb.inv_freq.dtype == torch.bfloat16
+
+    def test_inv_freq_keyword_protects_non_rotary_named_module(self):
+        # minimax_m3_vl vision tower: inv_freq lives on a module not named "rotary_emb",
+        # so the "inv_freq" buffer-name keyword is what pins it fp32.
+        model = self._rope_model(["inv_freq"], module_name="vision_tower")
+        cast_model_to_dtype(model, torch.bfloat16)
+        assert model.vision_tower.inv_freq.dtype == torch.float32
+
+    def test_freqs_cis_keyword_protects_buffer(self):
+        # deepseek_v3 / kimi_k25_vl: the real-valued frequency buffer is named "freqs_cis".
+        model = self._rope_model(["freqs_cis"], buffer_name="freqs_cis", module_name="model")
+        cast_model_to_dtype(model, torch.bfloat16)
+        assert model.model.freqs_cis.dtype == torch.float32
 
 
 class TestRestoreFp32Buffers:

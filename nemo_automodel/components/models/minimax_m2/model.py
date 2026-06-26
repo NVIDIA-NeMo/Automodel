@@ -224,6 +224,8 @@ class MiniMaxM2Model(nn.Module):
 
 
 class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""

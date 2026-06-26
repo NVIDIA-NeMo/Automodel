@@ -26,10 +26,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
+from nemo_automodel.recipes.llm._spec_train_utils import optim_steps_per_epoch as _optim_steps_per_epoch
 from nemo_automodel.recipes.llm.train_eagle3 import (
     TrainEagle3Recipe,
     _all_reduce_mean,
-    _optim_steps_per_epoch,
 )
 
 # ---------------------------------------------------------------------------
@@ -259,3 +259,35 @@ def test_logging_path_is_exercised(tmp_path):
     recipe = _build_recipe(tmp_path, num_samples=4, grad_accum=2, log_every=1)
     recipe.run_train_validation_loop()
     assert recipe.runtime.global_step == 2
+
+
+# ---------------------------------------------------------------------------
+# Progress bar: one update per optimizer step, postfix at log points, closed
+# ---------------------------------------------------------------------------
+
+
+class _FakeProgressBar:
+    def __init__(self):
+        self.n = 0
+        self.postfix = None
+        self.closed = False
+
+    def update(self, count=1):
+        self.n += count
+
+    def set_postfix(self, **kwargs):
+        self.postfix = kwargs
+
+    def close(self):
+        self.closed = True
+
+
+def test_progress_bar_advances_per_optim_step(tmp_path, monkeypatch):
+    fake = _FakeProgressBar()
+    monkeypatch.setattr(TrainEagle3Recipe, "_make_progress_bar", lambda self, **kwargs: fake)
+    # 5 samples / accum 3 -> one full window + one trailing flush = 2 steps.
+    recipe = _build_recipe(tmp_path, num_samples=5, grad_accum=3, log_every=1)
+    recipe.run_train_validation_loop()
+    assert fake.n == recipe.runtime.global_step == 2
+    assert fake.closed
+    assert set(fake.postfix) == {"loss", "acc", "lr"}

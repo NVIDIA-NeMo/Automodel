@@ -52,6 +52,9 @@ DTYPE_MAP = {
     "F8_E4M3": torch.float8_e4m3fn,
     "F8_E5M2": torch.float8_e5m2,
     "F8_E8M0": torch.float8_e8m0fnu,
+    # Standard safetensors dtype; without it, bool buffers (e.g. EAGLE-3's
+    # draft-vocab masks) crash the safetensors checkpoint save.
+    "BOOL": torch.bool,
 }
 
 HF_DCP_VERSION: float = 1.0

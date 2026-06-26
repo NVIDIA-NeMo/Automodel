@@ -50,6 +50,8 @@ from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loggers.mlflow_utils import to_float_metrics
+from nemo_automodel.components.loss.dllm_loss import encoder_ar_loss
+from nemo_automodel.components.models.diffusion_gemma.attention_mask import build_block_diffusion_training_mask
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import (
     prepare_after_first_microbatch,
@@ -59,7 +61,7 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
-from nemo_automodel.recipes.dllm.strategy import get_dllm_strategy
+from nemo_automodel.recipes.dllm.strategy import BlockDiffusionStrategy, get_dllm_strategy
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 logger = logging.getLogger(__name__)
@@ -74,6 +76,12 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
     2. Applying token corruption before each forward pass
     3. Using dLLM-specific loss functions via a pluggable strategy
     """
+
+    # Whether the collator uses DiffusionGemma response-window EOS-fill (response-relative,
+    # attended) + the single-turn guard. False here = pre-response-window behavior
+    # (absolute, non-attended fill) for full-sequence dLLMs (llada / nemotron); the
+    # DiffusionGemma subclass overrides it to True.
+    _response_window_collation: bool = False
 
     def setup(self):
         """Build all training components, then apply dLLM-specific overrides."""
@@ -205,22 +213,44 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             pad_seq_len_divisible=self.dllm_pad_seq_len_divisible,
             max_seq_len=max_seq_len,
             supervise_padding=supervise_padding,
+            response_window=self._response_window_collation,
         )
 
         self.dataloader.collate_fn = collator
         for _name, val_dl in self.val_dataloaders.items():
             val_dl.collate_fn = collator
 
-    def _apply_corruption(self, input_ids, loss_mask):
+    def _apply_corruption(self, input_ids, loss_mask, microbatch_idx: int = 0):
         """Apply token corruption via the configured strategy.
 
         Args:
             input_ids: Clean token IDs, shape [B, L].
             loss_mask: Supervised positions mask, shape [B, L].
+            microbatch_idx: Index of this microbatch within the step; folded into
+                the corruption seed so distinct microbatches get distinct noise.
 
         Returns:
             Tuple of (noisy_input_ids, noise_mask, p_mask).
         """
+        # Step/rank/microbatch-seeded generator so the D3PM corruption noise is a
+        # deterministic function of (step, microbatch, rank) and reproduces exactly
+        # on checkpoint resume. Corruption previously drew from the GLOBAL RNG, whose
+        # state is not faithfully reinstated at the first post-resume draw, so a
+        # resumed run trained on a different noise realization (the resume loss/grad
+        # spike). Mirrors the already-resume-safe block-selection (+1<<42) and
+        # self-conditioning (+0) step-seeded generators; the distinct (+2<<42) offset
+        # decorrelates the three streams, and the rank term preserves per-DP-rank
+        # noise diversity (each rank corrupts its own microbatch independently).
+        step = int(self.step_scheduler.step)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        seed = (
+            int(getattr(self, "_self_cond_base_seed", 42))
+            + 7919 * step
+            + int(microbatch_idx)
+            + 104729 * rank
+            + (2 << 42)
+        )
+        gen = torch.Generator(device=input_ids.device).manual_seed(seed)
         return self.dllm_strategy.apply_corruption(
             input_ids,
             loss_mask,
@@ -228,7 +258,16 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             eps=self.dllm_eps,
             block_size=self.dllm_block_size,
             half_life_ratio=self.dllm_half_life_ratio,
+            generator=gen,
         )
+
+    def _augment_batch_for_model(self, batch, *, clean_input_ids, loss_mask):
+        """Add any model-specific forward inputs derived from the batch.
+
+        Default is a no-op; ``block_diffusion`` overrides this to attach the
+        block-causal attention masks and canvas position ids.
+        """
+        return batch
 
     def _forward_backward_step(
         self,
@@ -263,7 +302,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         else:
             loss_mask = batch.pop("loss_mask")
             clean_input_ids = batch["input_ids"].clone()
-            noisy_input_ids, noise_mask, p_mask = self._apply_corruption(clean_input_ids, loss_mask)
+            noisy_input_ids, noise_mask, p_mask = self._apply_corruption(clean_input_ids, loss_mask, microbatch_idx=idx)
 
         batch = self.dllm_strategy.prepare_batch(batch, noisy_input_ids, noise_mask, clean_input_ids)
 
@@ -288,6 +327,10 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         )
 
         with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+            # Hook for model families that need extra forward inputs derived from
+            # the (clean) batch — e.g. block_diffusion builds the block-causal
+            # attention masks + canvas position ids here. No-op by default.
+            batch = self._augment_batch_for_model(batch, clean_input_ids=clean_input_ids, loss_mask=loss_mask)
             batch = filter_forward_kwargs(model, batch)
             out = model(**batch)
             logits = getattr(out, "logits", out)
@@ -320,6 +363,23 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             if is_train:
                 (microbatch_loss * self._get_dp_group_size(include_cp=True)).backward()
 
+    def _compute_loss_denominators(self, batches, num_noise_tokens, num_supervised_tokens):
+        """Return ``(num_diffusion_tokens, num_ar_tokens)`` — the GLOBAL token
+        denominators for this step's diffusion + AR losses.
+
+        Base: the pre-mask counts (diffusion per the strategy's ``normalization_mode``,
+        AR = supervised). Subclasses whose *final* loss masks differ from these raw
+        counts (e.g. block-diffusion, which restricts the diffusion loss to one
+        selected canvas block and drops padding) override this to count the final
+        masks — otherwise the losses are divided by tokens that cannot contribute and
+        are silently under-scaled.
+        """
+        if self.dllm_strategy.normalization_mode == "noise":
+            num_diffusion_tokens = num_noise_tokens
+        else:
+            num_diffusion_tokens = num_supervised_tokens
+        return num_diffusion_tokens, num_supervised_tokens
+
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step with dLLM loss.
 
@@ -327,19 +387,17 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         instead of labels != -100 for token counting.
         """
         # Pre-process all microbatches (corruption for MDLM, target forwards for DFlash).
+        # The strategy's pre_step stashes _noisy_input_ids/_noise_mask/_p_mask/_clean_input_ids
+        # on each batch and threads microbatch_idx into the corruption seed (resume-safe).
         num_noise_tokens_raw, num_supervised_tokens_raw = self.dllm_strategy.pre_step(self, batches)
         num_noise_tokens = self._dp_allreduce(torch.tensor(num_noise_tokens_raw, dtype=torch.long)).item()
         num_supervised_tokens = self._dp_allreduce(torch.tensor(num_supervised_tokens_raw, dtype=torch.long)).item()
 
-        # Select diffusion-loss denominator based on strategy:
-        # - MDLM (LLaDA) -> supervised
-        # - Hybrid (Nemotron-Labs-Diffusion) -> noise
-        # AR-loss denominator is always supervised (only relevant for Hybrid).
-        if self.dllm_strategy.normalization_mode == "noise":
-            num_diffusion_tokens = num_noise_tokens
-        else:
-            num_diffusion_tokens = num_supervised_tokens
-        num_ar_tokens = num_supervised_tokens
+        # Global token denominators for the diffusion + AR losses (overridable so
+        # subclasses whose FINAL loss masks differ from these raw counts can recount).
+        num_diffusion_tokens, num_ar_tokens = self._compute_loss_denominators(
+            batches, num_noise_tokens, num_supervised_tokens
+        )
 
         loss_buffer = []
 
@@ -349,6 +407,29 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
         num_batches = len(batches)
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+
+        # Optional one-shot FLOPs measurement for the perf report.
+        # FlopCounterMode captures the ACTUAL per-GPU model FLOPs of one post-warmup
+        # step (encoder + both decode passes + active experts + both lm heads) — which
+        # an analytical formula can't easily express for this encoder-decoder MoE. Gated
+        # by `measure_flops` (default off → no effect on normal / llada / nemotron runs);
+        # attempted once, after `measure_flops_after` steps; any failure degrades to "no
+        # TFLOPs" rather than crashing the step.
+        _fcm = None
+        if (
+            bool(self.cfg.get("measure_flops", False))
+            and not getattr(self, "_flop_measure_attempted", False)
+            and self.step_scheduler.step >= int(self.cfg.get("measure_flops_after", 3))
+        ):
+            self._flop_measure_attempted = True
+            try:
+                from torch.utils.flop_counter import FlopCounterMode
+
+                _fcm = FlopCounterMode(display=False)
+                _fcm.__enter__()
+            except Exception as e:
+                logging.warning("FLOPs measurement unavailable, skipping: %s", e)
+                _fcm = None
 
         for i, batch in enumerate(batches):
             if i == num_batches - 1:
@@ -366,6 +447,19 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
             if i == 0:
                 prepare_after_first_microbatch()
+
+        if _fcm is not None:
+            try:
+                _fcm.__exit__(None, None, None)
+                # Per-GPU FLOPs for one full step (all microbatches' fwd+bwd).
+                self._step_flops_per_gpu = float(_fcm.get_total_flops())
+                logging.info(
+                    "Measured per-GPU step FLOPs: %.3e (TFLOPs reported on later clean steps)",
+                    self._step_flops_per_gpu,
+                )
+            except Exception as e:
+                logging.warning("FLOPs measurement failed, skipping: %s", e)
+                self._step_flops_per_gpu = None
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
@@ -495,14 +589,24 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
             total_weighted_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_norm_tokens = 0
-            use_noise = self.dllm_strategy.normalization_mode == "noise"
 
             for batch in val_dataloader:
-                # Pre-process this val batch via the strategy (mirrors training pre_step).
+                # Pre-process this val batch via the strategy (mirrors training pre_step):
+                # corrupts and stashes _noisy_input_ids/_noise_mask/_p_mask/_clean_input_ids
+                # on the batch and returns the raw token counts.
                 num_noise_raw, num_supervised_raw = self.dllm_strategy.pre_step(self, [batch])
                 num_noise = self._dp_allreduce(torch.tensor(num_noise_raw, dtype=torch.long)).item()
                 num_supervised = self._dp_allreduce(torch.tensor(num_supervised_raw, dtype=torch.long)).item()
-                num_norm = num_noise if use_noise else num_supervised
+                # Delegate to the (overridable) denominator hook so a subclass whose FINAL
+                # loss masks differ from the raw counts (DiffusionGemma response window: one
+                # selected canvas block for diffusion + attention-scoped AR) divides val
+                # losses by the SAME counts as training -> comparable val/train curves. For
+                # the base recipes this returns (num_noise if the strategy normalizes on
+                # noise else num_supervised, num_supervised), so the val path is unchanged.
+                num_diffusion_tokens, num_ar_tokens = self._compute_loss_denominators(
+                    [batch], num_noise, num_supervised
+                )
+                num_norm = num_diffusion_tokens
 
                 loss_buffer = []
                 self.dllm_strategy.forward_backward(
@@ -510,8 +614,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                     0,
                     batch,
                     loss_buffer=loss_buffer,
-                    num_diffusion_tokens=num_norm,
-                    num_ar_tokens=num_supervised,
+                    num_diffusion_tokens=num_diffusion_tokens,
+                    num_ar_tokens=num_ar_tokens,
                     num_batches=1,
                     is_train=False,
                 )
@@ -549,10 +653,24 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         if not self.dist_env.is_main:
             return
 
+        # Buffer numeric metrics every step; on a remote-logging step emit the MEAN
+        # over the window so the wandb curve is de-noised (the per-step diffusion
+        # loss is dominated by the random corruption level t). Console + file
+        # loggers below stay per-step.
+        if not hasattr(self, "_remote_log_window"):
+            self._remote_log_window = []
+        self._remote_log_window.append(
+            {k: float(v) for k, v in log_data.metrics.items() if isinstance(v, (int, float))}
+        )
+
         if self.step_scheduler.is_remote_logging_step:
-            # Filter out step/epoch/timestamp — they're redundant with the
-            # x-axis and would create separate wandb panels.
-            remote_metrics = {k: v for k, v in log_data.to_dict().items() if k not in ("step", "epoch", "timestamp")}
+            # Window mean of each numeric metric (Loss/Train_Total, Loss/Train_DLLM,
+            # grad_norm, lr, ...) since the last remote log.
+            _win = self._remote_log_window
+            remote_metrics = {
+                k: sum(d[k] for d in _win) / len(_win) for k in _win[0] if k not in ("step", "epoch", "timestamp")
+            }
+            self._remote_log_window = []
             if wandb.run is not None:
                 wandb.log(remote_metrics, step=self.step_scheduler.step)
             if mlflow.active_run() is not None:
@@ -582,13 +700,464 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         torch.cuda.reset_peak_memory_stats()
 
 
+class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
+    """dLLM SFT recipe for the ``diffusion_gemma`` block-diffusion model.
+
+    Extends :class:`DiffusionLMSFTRecipe` (``dllm.mode = block_diffusion``) with
+    the model-specific **response-window canvas** wiring (single-turn v1):
+
+    * The encoder sees the **clean full sequence** (prompt + response). The
+      decoder canvas is the **noised response region only**: per example the
+      contiguous supervised suffix ``[prefix_len, S)`` is left-aligned into a
+      ``[B, R]`` canvas (``R = S - min(prefix_len)``; shorter responses are
+      right-padded). Canvas position ``0`` is the first response token, so the
+      diffusion block boundaries align to the response — block ``i`` is
+      bidirectional within itself and attends (offset-block-causal, strict
+      ``>``) the clean prompt + clean earlier response blocks in the encoder KV.
+      This matches the reference inference contract (each block conditioned on
+      the prompt + already-generated blocks).
+    * The block-causal masks (full + sliding) are built by
+      :func:`build_block_diffusion_training_mask` with per-example
+      ``prefix_lengths = prompt length``, ``response_length = response length``,
+      ``enc_len = full sequence length``; ``decoder_position_ids`` are the
+      response tokens' absolute positions so their query RoPE aligns with the
+      encoder key RoPE.
+    * Because the model returns **canvas-only** logits (``[B, R, V]``), the loss
+      tensors (``target_ids`` / ``noise_mask`` / ``loss_mask`` / ``p_mask``) are
+      sliced to the same response window in :meth:`_forward_backward_step` so
+      they align with the logits (the inherited path passes full-sequence
+      targets against canvas-only logits → misalignment).
+    * The two-pass self-conditioning is orchestrated inside ``model.forward``,
+      so the recipe still calls ``model(**batch)`` once.
+
+    **Single-turn assumption.** The response is taken to be the single
+    contiguous supervised suffix (:meth:`BlockDiffusionStrategy.split_prompt_response`).
+    Multi-turn ``ChatDataset`` ``loss_mask`` (``0..0 1..1 0..0 1..1``) is not a
+    contiguous suffix, so the prompt|response split is ill-defined; interleaved
+    multi-turn masking is deferred.
+
+    ``corrupt_uniform_random`` does not use a ``mask_token_id`` (random-token
+    corruption); this recipe injects a harmless default so the parent setup,
+    which expects one, does not fail.
+    """
+
+    # Response-window collation: response-relative + attended EOS-fill, single-turn
+    # guard (matches Google's ChunkResponseIntoCanvases). See DLLMCollator.
+    _response_window_collation: bool = True
+
+    def setup(self):
+        """Inject a dummy mask_token_id (unused by block_diffusion) then build."""
+        dllm_cfg = self.cfg.get("dllm", None)
+        if dllm_cfg is not None and dllm_cfg.get("mask_token_id", None) is None:
+            # Random-token corruption ignores this; satisfy the parent's check.
+            dllm_cfg.mask_token_id = 0
+        super().setup()
+
+        model = self.model_parts[0]
+
+        # Canvas/block geometry for the block-causal mask. Prefer the model's
+        # own config; fall back to the dllm.block_size config / 256.
+        self.canvas_length = int(getattr(model, "canvas_length", self.dllm_block_size or 256))
+        text_config = getattr(model, "text_config", None)
+        self.block_diffusion_sliding_window = int(getattr(text_config, "sliding_window", 1024)) if text_config else 1024
+
+        # Per-step probability of running the two-pass self-conditioning (the
+        # ~0.5 zero-feed branch of Analog-Bits). The base seed makes the per-step
+        # decision identical across DP ranks (see _decide_self_conditioning).
+        dllm_cfg = self.cfg.get("dllm", {})
+        self.self_conditioning_p = float(dllm_cfg.get("self_conditioning_p", 0.5))
+        self._self_cond_base_seed = int(self.cfg.get("seed", 42))
+
+        # Co-trained autoregressive encoder loss (matches Google: total = diffusion
+        # + encoder_loss_weight * AR). The pad id (default 0) masks AR loss at pads.
+        self._encoder_loss_weight = float(dllm_cfg.get("encoder_loss_weight", 1.0))
+        tok = getattr(self, "tokenizer", None)
+        pad_id = getattr(tok, "pad_token_id", None) if tok is not None else None
+        self._pad_token_id = int(pad_id) if pad_id is not None else 0
+
+        # Freeze the router on the live model (the config flag also freezes it in
+        # __init__, but freezing here is idempotent and covers from_config paths).
+        if getattr(model, "freeze_router", False) and hasattr(model, "freeze_router_params"):
+            model.freeze_router_params()
+
+    def _compute_loss_denominators(self, batches, num_noise_tokens, num_supervised_tokens):
+        """Count the GLOBAL denominators from the FINAL response-window masks.
+
+        The raw pre-mask counts over-count: ``_build_response_window`` restricts the
+        diffusion loss to ONE step-selected canvas block (one-canvas scheme) and drops
+        padding, while the AR loss is scored on the padding-masked, next-token-shifted
+        supervised mask. Dividing by ``num_noise_tokens`` / ``num_supervised_tokens``
+        would include tokens that cannot contribute, under-scaling diffusion (~by the
+        response-block count) and AR (by padding + the shift). We build each
+        microbatch's window once here (caching it on the batch so the forward reuses
+        the *same* step-seeded block selection) and sum the actually-scored tokens.
+        """
+        device = self.dist_env.device
+        num_diffusion = 0
+        num_ar = 0
+        for microbatch_idx, batch in enumerate(batches):
+            clean = batch["_clean_input_ids"].to(device)
+            noisy = batch["_noisy_input_ids"].to(device)
+            noise_mask = batch["_noise_mask"].to(device)
+            p_mask = batch["_p_mask"].to(device)
+            loss_mask = batch["loss_mask"].to(device)
+            attn = batch.get("attention_mask", None)
+            attn = attn.to(device) if attn is not None else None
+            window = self._build_response_window(
+                clean, noisy, noise_mask, loss_mask, p_mask, attention_mask=attn, microbatch_idx=microbatch_idx
+            )
+            # Cache so _forward_backward_step reuses the same window (same one-canvas
+            # selection) instead of rebuilding it.
+            batch["_window"] = window
+            # Diffusion: ALL supervised canvas tokens in the step-selected block (= the
+            # loss numerator's support and Google's target_mask; NOT noise-gated). Using
+            # noise_mask & loss_mask (corrupted-only) mismatched the all-supervised loss
+            # numerator -> a random ~1/t inflation of loss and gradients.
+            num_diffusion += int(window["loss_mask"].sum().item())
+            # AR: next-token pairs over the FULL valid sequence (prompt + canvas +
+            # EOS-fill), matching Google's encoder_target_mask = full_valid &
+            # shifted_valid where full_valid = concat([prompt!=pad, canvas_mask]).
+            # With the collator now attending the EOS block-fill, attention_mask IS
+            # that full_valid (prompt+response+EOS, excluding only global pad), so
+            # the AR denominator counts the same positions the AR loss scores.
+            ar = attn.to(dtype=torch.bool) if attn is not None else loss_mask.bool()
+            num_ar += int((ar[:, :-1] & ar[:, 1:]).sum().item())
+        num_diffusion = self._dp_allreduce(torch.tensor(num_diffusion, dtype=torch.long)).item()
+        num_ar = self._dp_allreduce(torch.tensor(num_ar, dtype=torch.long)).item()
+        # Guard a degenerate all-pad step against divide-by-zero in the loss.
+        return max(num_diffusion, 1), max(num_ar, 1)
+
+    def _build_response_window(
+        self,
+        clean_input_ids,
+        noisy_input_ids,
+        noise_mask,
+        loss_mask,
+        p_mask,
+        attention_mask=None,
+        microbatch_idx: int = 0,
+    ):
+        """Slice the batch to the response window and build the block-causal masks.
+
+        Returns a dict with the canvas-region tensors (all ``[B, R]``) and the
+        forward inputs (canvas ids, masks, position ids). ``R`` is the longest
+        response in the batch; shorter responses are right-padded and the pad
+        positions are dropped from the (sliced) ``loss_mask`` / ``noise_mask`` so
+        they never contribute to the loss.
+        """
+        batch_size, seq_len = clean_input_ids.shape
+        device = clean_input_ids.device
+
+        prefix_lengths, _ = BlockDiffusionStrategy.split_prompt_response(clean_input_ids, loss_mask)
+        if attention_mask is not None:
+            effective_lengths = attention_mask.to(device=device, dtype=torch.long).sum(dim=1)
+        else:
+            effective_lengths = torch.full((batch_size,), seq_len, device=device, dtype=torch.long)
+        response_lengths = (effective_lengths - prefix_lengths).clamp(min=0)  # [B]
+
+        # NOTE: the single-turn requirement (the supervised response is a single
+        # contiguous run, not multiple assistant turns) is enforced on the RAW
+        # per-sample loss_mask in DLLMCollator, BEFORE the EOS block-fill. Checking
+        # it here (post-collation) is wrong: the EOS-fill legitimately appends a
+        # second supervised run after any trailing unsupervised token (e.g. a single
+        # EOS that some datasets leave loss=0 after the response), which is benign —
+        # the canvas stays contiguous and the unscored interior token is harmless.
+        canvas_len = int(response_lengths.max().item()) if batch_size else 0
+        # Degenerate batch with no supervised tokens: keep a 1-wide canvas so the
+        # forward/loss shapes stay valid; the empty loss_mask zeroes the loss.
+        canvas_len = max(canvas_len, 1)
+
+        # Gather index of each canvas position into the absolute sequence:
+        # canvas pos j of example b <- absolute pos prefix_lengths[b] + j.
+        offsets = torch.arange(canvas_len, device=device)[None, :]  # [1, R]
+        abs_idx = prefix_lengths[:, None] + offsets  # [B, R]
+        valid = (abs_idx < effective_lengths[:, None]) & (
+            offsets < response_lengths[:, None]
+        )  # [B, R] real response token
+        gather_idx = abs_idx.clamp(max=seq_len - 1)  # clamp pad positions for gather
+
+        def _gather(t):
+            return torch.gather(t, 1, gather_idx)
+
+        canvas_ids = _gather(noisy_input_ids)
+        target_ids = _gather(clean_input_ids)
+        # Pad canvas positions are unsupervised: AND with `valid`.
+        canvas_noise = _gather(noise_mask) & valid
+        canvas_loss = _gather(loss_mask.bool()) & valid
+        canvas_p = _gather(p_mask)
+        # Decoder positions are the response tokens' absolute positions (RoPE
+        # alignment with the clean encoder keys). Pad rows keep the clamped value
+        # — harmless, those rows are unsupervised and masked.
+        decoder_position_ids = abs_idx.clamp(max=seq_len - 1)
+
+        block_size = self.dllm_block_size or self.canvas_length
+
+        # One-canvas-per-step (match Google): restrict the diffusion loss to a
+        # single randomly-chosen response block per example. The forward still
+        # denoises all blocks, but only the selected block's corrupted tokens are
+        # scored, so the gradient matches Google's one-canvas scheme. Selection is
+        # per-example (no cross-rank control flow), step-seeded for reproducibility.
+        canvas_block_id = (offsets // block_size).expand(batch_size, -1)  # [B, R]
+        num_valid_blocks = ((response_lengths - 1).clamp(min=0) // block_size + 1).clamp(min=1)  # [B]
+        step = int(getattr(getattr(self, "step_scheduler", None), "step", 0))
+        # Per-(step, microbatch) seed so each grad-accumulation microbatch selects an
+        # INDEPENDENT block — a per-step-only seed reused the same uniform draw across
+        # microbatches, biasing the selection. Offset by a large constant to
+        # decorrelate this stream from the self-conditioning coin (which seeds with
+        # base + 7919*step + microbatch_idx) so the two never collide.
+        sel_seed = int(getattr(self, "_self_cond_base_seed", 42)) + 7919 * step + int(microbatch_idx) + (1 << 42)
+        gen = torch.Generator().manual_seed(sel_seed)
+        sel_block = torch.floor(torch.rand(batch_size, generator=gen) * num_valid_blocks.float().cpu()).long()
+        sel_block = sel_block.to(device)  # [B]
+        canvas_loss = canvas_loss & (canvas_block_id == sel_block[:, None])
+
+        sliding_window = self.block_diffusion_sliding_window
+        mask_dtype = getattr(self.distributed_config, "autocast_dtype", None) or torch.float32
+        mask_full, mask_sliding = self._build_batched_block_mask(
+            prefix_lengths=prefix_lengths,
+            response_lengths=response_lengths,
+            canvas_len=canvas_len,
+            enc_len=seq_len,
+            block_size=block_size,
+            sliding_window=sliding_window,
+            device=device,
+            dtype=mask_dtype,
+        )
+
+        encoder_positions = torch.arange(seq_len, device=device)[None, :].expand(batch_size, -1)
+        encoder_padding_mask = (
+            attention_mask.to(device=device, dtype=torch.bool).logical_not() if attention_mask is not None else None
+        )
+        return {
+            "canvas_ids": canvas_ids,
+            "target_ids": target_ids,
+            "noise_mask": canvas_noise,
+            "loss_mask": canvas_loss,
+            "p_mask": canvas_p,
+            "decoder_attention_mask": {"full_attention": mask_full, "sliding_attention": mask_sliding},
+            "encoder_position_ids": encoder_positions,
+            "encoder_padding_mask": encoder_padding_mask,
+            "decoder_position_ids": decoder_position_ids,
+            "decoder_padding_mask": valid.logical_not(),
+        }
+
+    @staticmethod
+    def _build_batched_block_mask(
+        *, prefix_lengths, response_lengths, canvas_len, enc_len, block_size, sliding_window, device, dtype
+    ):
+        """Assemble the ``[B, 1, R, enc_len + R]`` block-causal mask from per-example builds.
+
+        Each example satisfies ``build_block_diffusion_training_mask``'s
+        ``prefix + response_length == enc_len`` contract exactly, so the builder
+        is called once per example (batch is small) and the result is placed into
+        a padded additive mask. Pad query rows (``j >= response_length``) are kept
+        well-defined by leaving their canvas self-diagonal unmasked, so the shared
+        transformer never sees an all-``-inf`` softmax row; those rows are
+        unsupervised and discarded from the loss.
+        """
+        batch_size = int(prefix_lengths.shape[0])
+        key_len = enc_len + canvas_len
+        neg = torch.finfo(dtype).min
+        mask_full = torch.full((batch_size, 1, canvas_len, key_len), neg, dtype=dtype, device=device)
+        mask_sliding = torch.full((batch_size, 1, canvas_len, key_len), neg, dtype=dtype, device=device)
+
+        for b in range(batch_size):
+            resp = int(response_lengths[b].item())
+            if resp > 0:
+                full_b, sliding_b = build_block_diffusion_training_mask(
+                    prefix_lengths=int(prefix_lengths[b].item()),
+                    response_length=resp,
+                    enc_len=enc_len,
+                    block_size=block_size,
+                    sliding_window=sliding_window,
+                    batch_size=1,
+                    device=device,
+                    dtype=dtype,
+                )
+                # Encoder columns [0, enc_len) and this example's canvas columns
+                # [enc_len, enc_len + resp) map directly; the rest stay masked.
+                mask_full[b, 0, :resp, :enc_len] = full_b[0, 0, :, :enc_len]
+                mask_full[b, 0, :resp, enc_len : enc_len + resp] = full_b[0, 0, :, enc_len:]
+                mask_sliding[b, 0, :resp, :enc_len] = sliding_b[0, 0, :, :enc_len]
+                mask_sliding[b, 0, :resp, enc_len : enc_len + resp] = sliding_b[0, 0, :, enc_len:]
+            # Every canvas query row attends at least its own canvas position so
+            # no softmax row is fully masked (real rows already keep this via M_BD).
+            diag = enc_len + torch.arange(canvas_len, device=device)
+            mask_full[b, 0, torch.arange(canvas_len, device=device), diag] = 0
+            mask_sliding[b, 0, torch.arange(canvas_len, device=device), diag] = 0
+        return mask_full, mask_sliding
+
+    def _decide_self_conditioning(self, batch_size: int, microbatch_idx: int = 0) -> torch.Tensor:
+        """Per-EXAMPLE two-pass self-conditioning coins -> ``[B]`` bool tensor.
+
+        Google draws the coin PER EXAMPLE (``uniform(B) < p``) and mixes
+        conditioned / zero-conditioned examples within a batch. Returns a ``[B]``
+        mask so the model gates the self-cond branch per example, while pass-1 (the
+        no_grad self-cond signal) ALWAYS runs in the forward. Always running pass-1
+        makes the FSDP collectives identical every step regardless of the coins (no
+        rank desync) and keeps it correct for ``local_batch_size > 1`` — a scalar
+        per-microbatch coin only matched Google's per-example mix when ``B == 1``.
+        Seeded by ``(step, microbatch_idx)`` for reproducibility; rank-correlation
+        of the coins is harmless now that pass-1 no longer branches on them.
+        """
+        step = getattr(getattr(self, "step_scheduler", None), "step", 0)
+        seed = self._self_cond_base_seed + 7919 * int(step) + int(microbatch_idx)
+        gen = torch.Generator().manual_seed(seed)
+        return torch.rand(batch_size, generator=gen) < self.self_conditioning_p
+
+    def _forward_backward_step(
+        self,
+        idx,
+        batch,
+        *,
+        loss_buffer,
+        num_diffusion_tokens,
+        num_ar_tokens=None,
+        num_batches,
+        is_train: bool = True,
+    ):
+        """Response-window forward/backward: canvas-only logits + canvas-sliced loss."""
+        # Reuse the window built during denominator counting (same step-seeded
+        # one-canvas selection). Pop before the to-device sweep, which can't handle
+        # the nested decoder-mask dict.
+        cached_window = batch.pop("_window", None)
+        batch = {
+            k: (
+                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
+                if isinstance(v, dict)
+                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+            )
+            for k, v in batch.items()
+        }
+
+        if "_noise_mask" in batch:
+            noisy_input_ids = batch.pop("_noisy_input_ids")
+            noise_mask = batch.pop("_noise_mask")
+            p_mask = batch.pop("_p_mask")
+            clean_input_ids = batch.pop("_clean_input_ids")
+            loss_mask = batch.pop("loss_mask")
+        else:
+            loss_mask = batch.pop("loss_mask")
+            clean_input_ids = batch["input_ids"].clone()
+            noisy_input_ids, noise_mask, p_mask = self._apply_corruption(clean_input_ids, loss_mask, microbatch_idx=idx)
+
+        attention_mask = batch.get("attention_mask", None)
+        # Encoder input + drop attention_mask/use_cache; canvas slicing follows.
+        batch = self.dllm_strategy.prepare_batch(batch, noisy_input_ids, noise_mask, clean_input_ids)
+        # Valid mask for the AR encoder loss = the FULL non-pad sequence (prompt +
+        # response + EOS-fill) = concat([prompt != pad, canvas_mask]). The encoder is a
+        # standard causal LM here, so it is trained to predict the next token
+        # across the prompt and the canvas (incl. the EOS-fill), not only the
+        # response. attention_mask now spans exactly that span (EOS-fill attended);
+        # num_ar_tokens counts the matching shifted pairs.
+        if attention_mask is not None:
+            ar_full_loss_mask = attention_mask.to(device=loss_mask.device, dtype=torch.bool)
+        else:
+            ar_full_loss_mask = loss_mask.bool()
+        window = (
+            cached_window
+            if cached_window is not None
+            else self._build_response_window(
+                clean_input_ids,
+                noisy_input_ids,
+                noise_mask,
+                loss_mask,
+                p_mask,
+                attention_mask=attention_mask,
+                microbatch_idx=idx,
+            )
+        )
+
+        batch["canvas_ids"] = window["canvas_ids"]
+        batch["decoder_attention_mask"] = window["decoder_attention_mask"]
+        batch["encoder_position_ids"] = window["encoder_position_ids"]
+        if window["encoder_padding_mask"] is not None:
+            batch["encoder_padding_mask"] = window["encoder_padding_mask"]
+        batch["decoder_position_ids"] = window["decoder_position_ids"]
+        batch["decoder_padding_mask"] = window["decoder_padding_mask"]
+        batch["do_self_conditioning"] = self._decide_self_conditioning(clean_input_ids.shape[0], idx)
+        # Canvas-region loss tensors aligned with the canvas-only logits.
+        target_ids = window["target_ids"]
+        noise_mask = window["noise_mask"]
+        loss_mask = window["loss_mask"]
+        p_mask = window["p_mask"]
+
+        model = self.model_parts[0]
+        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
+        sync_ctx = (
+            get_sync_ctx(
+                model,
+                idx == num_batches - 1,
+                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+            )
+            if is_train
+            else nullcontext()
+        )
+        autocast_dtype = getattr(self.distributed_config, "autocast_dtype", None)
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
+        )
+
+        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+            batch = filter_forward_kwargs(model, batch)
+            out = model(**batch)
+            logits = getattr(out, "logits", out)
+            encoder_logits = getattr(out, "encoder_logits", None)
+            del out
+
+            loss_result = self.dllm_loss_fn(
+                logits=logits,
+                target_ids=target_ids,
+                noise_mask=noise_mask,
+                p_mask=p_mask,
+                loss_mask=loss_mask,
+                loss_mask_ar=None,
+                num_diffusion_tokens=num_diffusion_tokens,
+                num_ar_tokens=None,
+                causal_logits=None,
+            )
+            microbatch_loss = loss_result.total_loss
+            dllm_loss = loss_result.dllm_loss.detach().clone()
+
+            # Co-trained autoregressive encoder loss: next-token CE over the clean
+            # sequence, added at encoder_loss_weight, only when training (encoder_logits
+            # is produced by the forward only then). The SCOPE matches Google (full_valid:
+            # prompt + canvas + EOS-fill, via attention_mask); the REDUCTION does NOT —
+            # we use token-normalization (Σ CE / Σ tokens over the global count) whereas
+            # Google takes a per-example mean (Σ_b CE_b / N_b, then mean over B).
+            # Token-norm weights long examples more; it is kept deliberately (#4 decision)
+            # for consistency with the diffusion loss's global-token normalization and the
+            # recipe's `* dp_group_size` backward scaling.
+            if is_train and encoder_logits is not None and self._encoder_loss_weight > 0.0:
+                # Normalize by the GLOBAL supervised-token count (num_ar_tokens),
+                # exactly like the diffusion loss uses num_diffusion_tokens, so the
+                # recipe's `* dp_group_size` backward scaling is correct for both
+                # terms (a local mean here would be over-scaled by dp_group_size).
+                ar_loss = encoder_ar_loss(
+                    encoder_logits,
+                    clean_input_ids,
+                    valid_mask=ar_full_loss_mask,
+                    num_tokens=num_ar_tokens,
+                )
+                microbatch_loss = microbatch_loss + self._encoder_loss_weight * ar_loss
+
+            loss_buffer.append(microbatch_loss.clone().detach())
+            self._dllm_loss_buffer.append(dllm_loss)
+
+            if is_train:
+                (microbatch_loss * self._get_dp_group_size(include_cp=True)).backward()
+
+
 # Entry point
 def main(config_path=None):
     """Main entry point for dLLM SFT recipe."""
     if config_path is None:
         config_path = "examples/dllm_sft/mdlm_sft.yaml"
     cfg = parse_args_and_load_config(config_path)
-    trainer = DiffusionLMSFTRecipe(cfg)
+    recipe_name = cfg.get("recipe", "DiffusionLMSFTRecipe")
+    recipe_cls = DiffusionGemmaSFTRecipe if recipe_name == "DiffusionGemmaSFTRecipe" else DiffusionLMSFTRecipe
+    trainer = recipe_cls(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
 

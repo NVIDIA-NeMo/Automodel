@@ -37,86 +37,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 
-from nemo_automodel.recipes.llm.train_eagle1 import (
-    TrainEagle1Recipe,
-    _optim_steps_per_epoch,
-    _should_sync_grads,
-)
-
-
-@pytest.mark.parametrize(
-    "num_batches,accum,expected",
-    [
-        (10, 1, 10),
-        (10, 2, 5),
-        (10, 3, 4),  # 3 full windows + 1 trailing micro-batch -> 4 steps
-        (10, 4, 3),  # 2 full windows + 2 trailing -> 3 steps
-        (1, 4, 1),  # entire epoch is one trailing flush
-        (4, 4, 1),
-        (5, 4, 2),
-        (0, 4, 0),  # iterable dataloader / no length
-    ],
-)
-def test_optim_steps_per_epoch_uses_ceil_division(num_batches, accum, expected):
-    assert _optim_steps_per_epoch(num_batches, accum) == expected
-
-
-def test_optim_steps_per_epoch_handles_invalid_inputs():
-    assert _optim_steps_per_epoch(0, 1) == 0
-    assert _optim_steps_per_epoch(-1, 4) == 0
-    assert _optim_steps_per_epoch(10, 0) == 0
-    assert _optim_steps_per_epoch(10, -1) == 0
-
-
-# ---------------------------------------------------------------------------
-# DDP gradient-sync decision (no_sync)
-# ---------------------------------------------------------------------------
-
-
-def _sync(pending, batch_idx, *, accum=4, batches_per_epoch=10, is_ddp=True):
-    return _should_sync_grads(
-        pending_micro_batches=pending,
-        grad_accumulation_steps=accum,
-        batch_idx=batch_idx,
-        batches_per_epoch=batches_per_epoch,
-        is_ddp=is_ddp,
-    )
-
-
-def test_should_sync_always_true_without_ddp():
-    # Single process: nothing to all-reduce, so every step "syncs" (no_sync is
-    # never entered) regardless of window position or batch index.
-    for pending in range(4):
-        assert _sync(pending, batch_idx=0, is_ddp=False) is True
-
-
-def test_should_sync_only_on_window_close_under_ddp():
-    # accum=4: interior micro-batches defer the all-reduce, the 4th closes it.
-    assert _sync(0, batch_idx=0) is False
-    assert _sync(1, batch_idx=1) is False
-    assert _sync(2, batch_idx=2) is False
-    assert _sync(3, batch_idx=3) is True  # pending+1 == accum -> window closer
-
-
-def test_should_sync_on_epoch_final_batch_even_mid_window():
-    # The trailing-flush step consumes the last batch's grads, so it must sync
-    # even though the window is not full (batch_idx == batches_per_epoch - 1).
-    assert _sync(0, batch_idx=9, batches_per_epoch=10) is True
-    assert _sync(1, batch_idx=9, batches_per_epoch=10) is True
-
-
-def test_should_sync_every_step_when_length_unknown():
-    # IterableDataset (len unknown): we cannot identify the final batch, so a
-    # trailing window could step on un-synced grads -- sync every step instead.
-    for pending in range(4):
-        assert _sync(pending, batch_idx=pending, batches_per_epoch=None) is True
-
-
-def test_should_sync_every_step_when_accum_is_one():
-    # No accumulation: each batch closes its own window -> always sync.
-    for batch_idx in range(5):
-        assert _sync(0, batch_idx=batch_idx, accum=1) is True
-
+from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
 
 # ---------------------------------------------------------------------------
 # Trailing-flush gradient rescale
@@ -196,6 +117,7 @@ def _build_recipe(num_batches: int, grad_accum: int, trainer_module: nn.Module |
     recipe.max_grad_norm = 1e9
     recipe.num_epochs = 1
     recipe.log_every_steps = 1
+    recipe.total_optim_steps = -(-num_batches // grad_accum)
     recipe.optimizer = torch.optim.SGD(recipe.trainer_module.parameters(), lr=0.0)
     recipe.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(recipe.optimizer, lambda s: 1.0)
     return recipe
@@ -269,3 +191,54 @@ def test_no_sync_entered_for_interior_microbatches_under_ddp(tmp_path):
         assert recipe.runtime.global_step == 2
     finally:
         dist.destroy_process_group()
+
+
+# ---------------------------------------------------------------------------
+# Progress bar: one update per optimizer step (incl. trailing flush), closed
+# ---------------------------------------------------------------------------
+
+
+class _FakeProgressBar:
+    def __init__(self):
+        self.n = 0
+        self.postfix = None
+        self.closed = False
+
+    def update(self, count=1):
+        self.n += count
+
+    def set_postfix(self, **kwargs):
+        self.postfix = kwargs
+
+    def close(self):
+        self.closed = True
+
+
+def test_progress_bar_advances_per_optim_step(monkeypatch):
+    fake = _FakeProgressBar()
+    monkeypatch.setattr(TrainEagle1Recipe, "_make_progress_bar", lambda self, **kwargs: fake)
+    # 4 batches / accum 3 -> one full window + one trailing flush = 2 steps.
+    recipe = _build_recipe(num_batches=4, grad_accum=3)
+    recipe.run_train_validation_loop()
+    assert fake.n == recipe.runtime.global_step == 2
+    assert fake.closed
+    assert set(fake.postfix) == {"loss", "acc", "lr"}
+
+
+class _RaisingModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = nn.Parameter(torch.zeros(4))
+
+    def forward(self, **kwargs):
+        raise RuntimeError("boom")
+
+
+def test_progress_bar_closed_when_loop_raises(monkeypatch):
+    """The bar is closed even when the training loop raises (try/finally)."""
+    fake = _FakeProgressBar()
+    monkeypatch.setattr(TrainEagle1Recipe, "_make_progress_bar", lambda self, **kwargs: fake)
+    recipe = _build_recipe(num_batches=2, grad_accum=1, trainer_module=_RaisingModule())
+    with pytest.raises(RuntimeError, match="boom"):
+        recipe.run_train_validation_loop()
+    assert fake.closed

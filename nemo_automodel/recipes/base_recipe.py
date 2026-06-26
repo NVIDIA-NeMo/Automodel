@@ -516,6 +516,37 @@ class BaseRecipe:
                 f"Updated LOWEST_VAL checkpoint symlink to {os.path.basename(target_dir)} (val_loss={val_loss:.4f})"
             )
 
+    def _finalize_pending_checkpoint(self) -> None:
+        """Wait the final async checkpoint write and flush its deferred symlinks.
+
+        The async ``save_checkpoint`` path defers the ``latest`` / ``best`` symlink
+        update to the *next* save's preamble. After the final checkpoint there is
+        no next save, so the training loop must call this once at the end --
+        otherwise the last async write may be left unfinished and ``latest`` /
+        ``best`` still point at the previous checkpoint. A no-op when checkpointing
+        is disabled or no async save is pending.
+        """
+        checkpointer = getattr(self, "checkpointer", None)
+        if checkpointer is None or not getattr(checkpointer.config, "enabled", False):
+            return
+        checkpointer.async_wait()
+        is_dist_initialized = torch.distributed.is_initialized()
+        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
+        if prev_pending is not None:
+            if is_rank_0:
+                self._update_latest_symlink(prev_pending)
+            setattr(self, "_last_pending_checkpoint_dir", None)
+            if is_dist_initialized:
+                torch.distributed.barrier()
+        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
+        if prev_best_pending is not None:
+            if is_rank_0 and prev_best_pending.get("val") is not None:
+                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
+            setattr(self, "_last_pending_best_checkpoint_info", None)
+            if is_dist_initialized:
+                torch.distributed.barrier()
+
     def _validate_checkpoint_dir_exists(self, ckpt_dir: str, restore_from: str, is_rank_0: bool) -> None:
         """Validate resolved checkpoint directory exists; raise FileNotFoundError with a helpful message."""
         if os.path.exists(ckpt_dir):
@@ -801,19 +832,23 @@ class BaseRecipe:
         if not self.device_mesh:
             return None
 
+        dp_mesh = get_flat_mesh(self.device_mesh, "dp")
         if include_cp and self.device_mesh["cp"].size() > 1:
-            return get_flat_mesh(self.device_mesh, "dp_cp").get_group()
-        return get_flat_mesh(self.device_mesh, "dp").get_group()
+            dp_mesh = get_flat_mesh(self.device_mesh, "dp_cp")
+        if dp_mesh.size() == 1:
+            return None
+        return dp_mesh.get_group()
 
     def _get_dp_group_size(self, include_cp: bool = False):
-        dp_group = self._get_dp_group(include_cp=include_cp)
-        if dp_group is None:
-            # For DDP without a device mesh, all ranks form a single
-            # data-parallel group whose size equals the world size.
+        if not self.device_mesh:
             if dist.is_initialized():
                 return dist.get_world_size()
             return 1
-        return dp_group.size()
+
+        dp_mesh = get_flat_mesh(self.device_mesh, "dp")
+        if include_cp and self.device_mesh["cp"].size() > 1:
+            dp_mesh = get_flat_mesh(self.device_mesh, "dp_cp")
+        return dp_mesh.size()
 
     def _get_cp_group_size(self):
         if not self.device_mesh or self.device_mesh["cp"].size() == 1:
@@ -827,9 +862,12 @@ class BaseRecipe:
                 return dist.get_rank()
             return 0
 
+        dp_mesh = get_flat_mesh(self.device_mesh, "dp")
         if include_cp and self.device_mesh["cp"].size() > 1:
-            return get_flat_mesh(self.device_mesh, "dp_cp").get_local_rank()
-        return get_flat_mesh(self.device_mesh, "dp").get_local_rank()
+            dp_mesh = get_flat_mesh(self.device_mesh, "dp_cp")
+        if dp_mesh.size() == 1:
+            return 0
+        return dp_mesh.get_local_rank()
 
     def _get_tp_rank(self):
         if not self.device_mesh or self.device_mesh["tp"].size() == 1:
@@ -844,21 +882,32 @@ class BaseRecipe:
 
     def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)
-        if dp_group is not None:
-            tensor = tensor.cuda()
+        if self.device_mesh and dp_group is None:
+            return tensor
+        if dp_group is not None or dist.is_initialized():
+            if not tensor.is_cuda and torch.cuda.is_available():
+                tensor = tensor.cuda()
             dist.all_reduce(tensor, op=op, group=dp_group)
             tensor = tensor.cpu()
         return tensor
 
-    def _make_progress_bar(self):
-        """Create a tqdm progress bar on rank 0; returns None on other ranks."""
+    def _make_progress_bar(self, total: int | None = None, initial: int = 0):
+        """Create a tqdm progress bar on rank 0; returns None on other ranks.
+
+        Without arguments the totals come from ``self.step_scheduler``; recipes
+        without a step scheduler (e.g. the EAGLE family) pass ``total`` and
+        ``initial`` explicitly.
+        """
         if not _is_rank_0():
             return None
         from tqdm import tqdm
 
+        if total is None:
+            total = getattr(self.step_scheduler, "max_steps", None)
+            initial = getattr(self.step_scheduler, "step", 0)
         return tqdm(
-            total=getattr(self.step_scheduler, "max_steps", None),
-            initial=getattr(self.step_scheduler, "step", 0),
+            total=total,
+            initial=initial,
             desc="Training",
             unit="step",
             dynamic_ncols=True,
