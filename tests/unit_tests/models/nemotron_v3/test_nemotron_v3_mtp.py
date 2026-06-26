@@ -326,6 +326,48 @@ class TestMTPEnabled:
         assert model.mtp.layers[1].final_layernorm.weight.grad is not None
 
 
+class TestMTPComputeInEval:
+    """The ``compute_mtp_in_eval`` flag lets validation run the MTP heads to
+    measure per-head token acceptance, while the cached generation/decoding
+    path (``use_cache``) never pays the MTP cost. The flag defaults to False so
+    behavior is unchanged unless a harness explicitly opts in."""
+
+    def test_flag_defaults_false(self, backend):
+        """A freshly built model must not run MTP in eval by default."""
+        model, _ = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
+        assert model.compute_mtp_in_eval is False
+
+    @pytest.mark.run_only_on("GPU")
+    def test_eval_runs_mtp_when_flag_enabled(self, backend):
+        """With the flag on and no KV cache, eval must emit per-depth hidden
+        states even though ``self.training`` is False."""
+        model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
+        model.eval()
+        model.compute_mtp_in_eval = True
+        input_ids = torch.randint(0, config.vocab_size, (2, 8))
+        out = model(input_ids, labels=input_ids.clone())
+        assert out.mtp_per_depth_h is not None
+        # D=1 in this fixture.
+        assert len(out.mtp_per_depth_h) == 1
+        assert out.mtp_loss_scaling_factor == 0.1
+
+    @pytest.mark.run_only_on("GPU")
+    def test_eval_skips_mtp_on_cached_decode_path(self, backend):
+        """Even with the flag on, the cached generation path (``use_cache``)
+        must skip MTP — decoding feeds one token at a time and must not pay
+        the MTP cost."""
+        from nemo_automodel.components.models.nemotron_v3.cache import NemotronHybridCache
+
+        model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
+        model.eval()
+        model.compute_mtp_in_eval = True
+        cache = NemotronHybridCache(config, batch_size=2, dtype=torch.bfloat16, device=torch.device("cuda"))
+        input_ids = torch.randint(0, config.vocab_size, (2, 8), device="cuda")
+        out = model.to("cuda")(input_ids, past_key_values=cache, use_cache=True)
+        assert out.mtp_per_depth_h is None
+        assert out.mtp_loss_scaling_factor is None
+
+
 # ---------------------------------------------------------------------------
 # State-dict adapter MTP key handling
 # ---------------------------------------------------------------------------
