@@ -59,7 +59,7 @@ docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:26.06
 ```
 
 <Note>
-The container ships without media deps. Add them from the AutoModel directory before preprocessing or training:
+Media dependencies are not installed in the Docker container by default. Add them from the AutoModel directory before preprocessing or training:
 
 ```bash
 cd /opt/Automodel && uv pip install ".[diffusion-media]"

@@ -332,9 +332,9 @@ pip3 install "nemo-automodel[diffusion,diffusion-media]"  # diffusion + media
 ```
 
 <Warning>
-**`[all]` does not include the media extras**, and the Docker image ships
-without them — FFmpeg is no longer packaged in the container. After
-`pip3 install nemo-automodel[all]` (or inside the container) add media
+**`[all]` does not include the media extras**, and they are not installed in
+the Docker container by default — FFmpeg is no longer packaged in the container.
+After `pip3 install nemo-automodel[all]` (or inside the container) add media
 explicitly: `pip3 install nemo-automodel[media]`.
 
 </Warning>
