@@ -58,11 +58,62 @@ jobs:
           through `cast_model_to_dtype(self, dtype)`, so also flag new model code
           that casts the whole model with a raw `self.to(dtype)` / `model.to(dtype)`
           instead of `cast_model_to_dtype`.
+        - Recipe / component boundary violations in files under
+          `nemo_automodel/recipes/`. Recipes are thin orchestrators: they should
+          compose behavior through the public APIs exposed by
+          `nemo_automodel/components/` (and the `build_*` builders), not
+          reimplement that logic inline. Flag when a diff to a recipe:
+          - reaches into component internals (imports a private
+            `_module`/`_name`, or pokes at attributes a component should own)
+            instead of calling the component's public API, or duplicates logic
+            that already exists in a component;
+          - adds excessive branching at the recipe level — e.g. `if`/`elif`
+            chains or `getattr`/`hasattr` switching on model family, backend,
+            dtype, parallelism axis, or config shape to decide HOW to build or
+            run something. That dispatch belongs inside the relevant component
+            (a builder, registry, or capability flag), so the recipe stays a
+            linear "build model -> build optimizer -> build dataloader -> train"
+            flow. Prefer pushing the new branch into the component API and
+            calling it from the recipe.
+        - Code smells introduced by this diff. Only flag patterns the PR ADDS or
+          expands in changed lines — never pre-existing patterns in untouched
+          code. Keep each comment to one concrete, actionable suggestion:
+          - Defensive type-probing instead of types: new `getattr(obj, "x",
+            default)` / `hasattr(obj, "x")` chains (especially on HF configs or
+            models) used to branch behavior, new behavioral dispatch on
+            `type(x).__name__ == "..."` or class-name -> value lookup tables, or
+            capability sniffing via `inspect.signature(...).parameters`. Prefer a
+            typed attribute / dataclass field, a registry keyed on `model_type`,
+            or an explicit `Protocol`/flag.
+          - Runtime `obj.__class__ = ...` reassignment to inject mixins or
+            behavior — it breaks `isinstance`, pickling, and type checking.
+            Prefer selecting the class at construction time.
+          - God functions/files or signature bloat: a new function over ~80
+            lines, a new file over ~800 lines, a parameter list longer than ~8,
+            or `**kwargs` passthrough that hides the real contract. Prefer
+            splitting and explicit params / a typed config object.
+          - Copy-paste duplication: a new model family, recipe, or
+            `state_dict_adapter.py` that clones an existing `Block`, train loop,
+            or weight-mapping table with only minor edits instead of reusing a
+            shared base class/mixin.
+          - Error-swallowing: new broad `except Exception:` or `except: pass`
+            that hides failures without logging or re-raising.
+          - Untyped public APIs: new public functions/methods missing type
+            hints, or `Any` / `dict` / `**kwargs` used as an ad-hoc struct where
+            a dataclass / `TypedDict` fits.
+          - `print()` for diagnostics instead of `logging.getLogger(__name__)`.
+          - Optional dependencies not guarded by `safe_import()` from
+            `nemo_automodel.shared.import_utils` — raw `try/except ImportError`
+            or `MagicMock`/stub fallbacks in non-test code.
+          - Import-time side effects or monkeypatching of third-party
+            (HuggingFace / torch) globals at module import.
 
         Do NOT comment on:
         - Style preferences or formatting
         - Minor naming suggestions
-        - Architectural opinions or refactoring ideas
+        - Pre-existing code smells in code the PR does not touch
+        - Large speculative rewrites or architectural opinions beyond the
+          scope of the diff (do still flag the concrete code smells listed above)
         - Performance unless there is a clear, measurable issue
 
         Provide feedback using inline comments for specific code suggestions.
