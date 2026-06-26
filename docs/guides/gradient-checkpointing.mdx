@@ -26,7 +26,7 @@ distributed:
   ...
 ```
 
-For FSDP2, `activation_checkpointing` also accepts explicit policy strings:
+For FSDP2 and DDP, `activation_checkpointing` also accepts explicit policy strings:
 
 ```yaml
 distributed:
@@ -34,10 +34,16 @@ distributed:
   activation_checkpointing: selective
 ```
 
-Use `true` or `full` for full activation checkpointing. Use `selective` for PyTorch selective activation checkpointing on FSDP2 configs. Selective checkpointing saves expensive operations such as attention, collectives, and part of the matrix multiplications while recomputing cheaper operations during backward.
+```yaml
+distributed:
+  strategy: ddp
+  activation_checkpointing: selective
+```
+
+Use `true` or `full` for full activation checkpointing. Use `selective` for PyTorch selective activation checkpointing on FSDP2 or DDP configs. Selective checkpointing saves expensive operations such as attention, collectives, and part of the matrix multiplications while recomputing cheaper operations during backward.
 
 <Note>
-`selective` requires the FSDP2 strategy. Non-FSDP2 strategies (`ddp`, `megatron_fsdp`) raise an error when `selective` is requested. KV-sharing models (e.g., Gemma4) automatically fall back to sub-module checkpointing, because attention cannot be recomputed through the KV cache.
+`selective` is supported for FSDP2 and DDP. Megatron-FSDP raises an error when `selective` is requested. KV-sharing models (e.g., Gemma4) automatically fall back to sub-module checkpointing, because attention cannot be recomputed through the KV cache.
 </Note>
 
 <Tip>
@@ -49,7 +55,7 @@ Selective AC only speeds things up when the model's expensive operations are the
 </Note>
 
 <Note>
-**MoE/expert parallelism:** Selective AC is designed for dense transformers and generally does **not** help Mixture-of-Experts models with expert parallelism. In an MoE block the experts dominate the cost (they are cheap to recompute but expensive to store), and the expert-parallel dispatch/communication is opaque to the selective policy, so it is recomputed regardless. As a result, selective AC tends to add activation memory without a corresponding speedup for MoE, matching what reference implementations such as TorchTitan observe. Prefer **full** activation checkpointing (`true`/`full`) for MoE; selective remains supported for MoE and FSDP2 as an opt-in.
+**MoE/expert parallelism:** Selective AC is designed for dense transformers and generally does **not** help Mixture-of-Experts models with expert parallelism. In an MoE block the experts dominate the cost (they are cheap to recompute but expensive to store), and the expert-parallel dispatch/communication is opaque to the selective policy, so it is recomputed regardless. As a result, selective AC tends to add activation memory without a corresponding speedup for MoE, matching what reference implementations such as TorchTitan observe. Prefer **full** activation checkpointing (`true`/`full`) for MoE; selective remains available as an opt-in for FSDP2, including MoE configs, and for DDP.
 </Note>
 
 ### Configure Programmatically
@@ -57,10 +63,10 @@ Selective AC only speeds things up when the model's expensive operations are the
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.distributed.config import DistributedSetup
 
-# Use activation_checkpointing="selective" for FSDP2 selective checkpointing.
+# Use activation_checkpointing="selective" for FSDP2 or DDP selective checkpointing.
 distributed_setup = DistributedSetup.build(
     strategy="fsdp2",
-    activation_checkpointing=True,
+    activation_checkpointing="selective",
 )
 
 model = NeMoAutoModelForCausalLM.from_pretrained(
