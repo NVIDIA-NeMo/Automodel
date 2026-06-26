@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import re
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+import nemo_automodel.components.models.qwen3_5_moe.model as qwen3_5_moe_model
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import Qwen3_5MoeStateDictAdapter
 from nemo_automodel.components.moe.layers import MoEConfig
@@ -104,6 +106,33 @@ class TestInitialization:
         # reverse mapping should be the inverse
         assert ".mlp.shared_experts." in adapter.internal_to_hf_map
         assert adapter.internal_to_hf_map[".mlp.shared_experts."] == ".mlp.shared_expert."
+
+    def test_mtp_layout_explicit_override(self, config, moe_config, backend_config):
+        adapter = Qwen3_5MoeStateDictAdapter(
+            config=config,
+            moe_config=moe_config,
+            backend=backend_config,
+            mtp_expert_hf_layout="per_expert_safetensors",
+        )
+
+        assert adapter._get_mtp_expert_hf_layout() == "split"
+
+    def test_mtp_layout_config_override(self, config, moe_config, backend_config):
+        config.mtp_expert_hf_layout = "group"
+        adapter = Qwen3_5MoeStateDictAdapter(config=config, moe_config=moe_config, backend=backend_config)
+
+        assert adapter._get_mtp_expert_hf_layout() == "grouped"
+
+    def test_mtp_layout_rejects_unknown_override(self, config, moe_config, backend_config):
+        adapter = Qwen3_5MoeStateDictAdapter(
+            config=config,
+            moe_config=moe_config,
+            backend=backend_config,
+            mtp_expert_hf_layout="packed",
+        )
+
+        with pytest.raises(ValueError, match="Unsupported MTP expert HF layout"):
+            adapter._get_mtp_expert_hf_layout()
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +774,76 @@ class TestConvertSingleTensorToHf:
                 result_by_key[f"mtp.layers.0.mlp.experts.{expert_id}.down_proj.weight"],
                 tensor[expert_id].transpose(0, 1),
             )
+
+
+# ---------------------------------------------------------------------------
+# Qwen3_5MoeForConditionalGeneration state dict adapter wiring
+# ---------------------------------------------------------------------------
+class TestConditionalGenerationStateDictAdapterWiring:
+    def test_passes_top_level_model_name_to_state_dict_adapter(self):
+        class DummyRotary:
+            inv_freq = torch.ones(4)
+
+        class DummyVisual:
+            def __init__(self):
+                self.rotary_pos_emb = DummyRotary()
+
+        class DummyParentModel:
+            def __init__(self):
+                self.visual = DummyVisual()
+                self.language_model = SimpleNamespace()
+
+        class DummyTextBackend:
+            def __init__(self, *args, **kwargs):
+                self.moe_config = Mock(name="moe_config")
+
+        class DummyMTPConfig:
+            enabled = False
+
+        class DummyFp32SafeRotary:
+            def __init__(self, dim):
+                self.dim = dim
+
+            def register_buffer(self, *args, **kwargs):
+                pass
+
+            def to(self, *args, **kwargs):
+                return self
+
+        adapter_calls = []
+
+        class DummyAdapter:
+            def __init__(self, *args, **kwargs):
+                adapter_calls.append((args, kwargs))
+
+        def fake_hf_init(self, config):
+            self.model = DummyParentModel()
+            self.lm_head = None
+
+        text_config = SimpleNamespace(torch_dtype=None, hidden_size=8, vocab_size=16, pad_token_id=None)
+        config = SimpleNamespace(
+            text_config=text_config,
+            torch_dtype=None,
+            _name_or_path="Qwen/Qwen3.5-35B-A3B",
+            name_or_path=None,
+        )
+        backend = BackendConfig(enable_hf_state_dict_adapter=True)
+
+        with (
+            patch.object(qwen3_5_moe_model.HFQwen3_5MoeForConditionalGeneration, "__init__", fake_hf_init),
+            patch.object(qwen3_5_moe_model, "Qwen3_5MoeModel", DummyParentModel),
+            patch.object(qwen3_5_moe_model, "Qwen3_5MoeTextModelBackend", DummyTextBackend),
+            patch.object(qwen3_5_moe_model, "initialize_linear_module", Mock(return_value=Mock())),
+            patch.object(qwen3_5_moe_model, "build_mtp_config_from_hf", Mock(return_value=DummyMTPConfig())),
+            patch.object(qwen3_5_moe_model, "Qwen3_5MoeStateDictAdapter", DummyAdapter),
+            patch.object(qwen3_5_moe_model, "Fp32SafeQwen3_5MoeVisionRotaryEmbedding", DummyFp32SafeRotary),
+        ):
+            qwen3_5_moe_model.Qwen3_5MoeForConditionalGeneration(config, backend=backend)
+
+        assert len(adapter_calls) == 1
+        args, kwargs = adapter_calls[0]
+        assert args[0] is text_config
+        assert kwargs["pretrained_model_name_or_path"] == "Qwen/Qwen3.5-35B-A3B"
 
 
 # ---------------------------------------------------------------------------
