@@ -84,6 +84,9 @@ def _supports_seq_lens(model: nn.Module) -> bool:
 # so callers don't need a per-model branch. New VLM family -> append its keys.
 VLM_INPUT_KEYS: tuple[str, ...] = (
     "input_ids",
+    "position_ids",
+    "attention_mask",
+    "_packed_seq_ids",
     # Image
     "pixel_values",
     "image_flags",

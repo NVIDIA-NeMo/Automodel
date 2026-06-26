@@ -28,7 +28,6 @@ except ImportError:
 import gc
 import inspect
 import logging
-import os
 import pathlib
 import time
 from contextlib import nullcontext
@@ -62,7 +61,6 @@ from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.mesh import MeshContext
-from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -91,11 +89,6 @@ from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
 )
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
-from nemo_automodel.components.utils.memory_profile import (
-    log_cuda_grad_profile,
-    log_cuda_memory_profile,
-    memory_profile_enabled,
-)
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     _supports_seq_lens,
@@ -126,128 +119,6 @@ def _get_model_name(cfg_model):
         return cfg_model.config.get("pretrained_model_name_or_path", None)
     else:
         return None
-
-
-def _get_gemma4_unified_sliding_window(model: nn.Module) -> int | None:
-    """Return Gemma4 Unified's sliding-window size for neat packed masks."""
-    config = getattr(model, "config", None)
-    text_config = config.get_text_config() if callable(getattr(config, "get_text_config", None)) else None
-    if text_config is None:
-        text_config = getattr(config, "text_config", config)
-
-    config_type = type(config).__name__ if config is not None else ""
-    text_config_type = type(text_config).__name__ if text_config is not None else ""
-    if "Gemma4Unified" not in config_type and "Gemma4Unified" not in text_config_type:
-        return None
-
-    layer_types = getattr(text_config, "layer_types", None)
-    sliding_window = getattr(text_config, "sliding_window", None)
-    if sliding_window is None or (layer_types is not None and "sliding_attention" not in layer_types):
-        return None
-    return int(sliding_window)
-
-
-def _debug_hidden_profile(out, *, tag: str) -> None:
-    """Print selected hidden-state local norms for CP parity debugging."""
-    if os.environ.get("NEMO_AUTOMODEL_DEBUG_HIDDEN_PROFILE", "").lower() not in {"1", "true", "yes", "on"}:
-        return
-    hidden_states = getattr(out, "hidden_states", None)
-    if not hidden_states:
-        return
-    rank = (
-        torch.distributed.get_rank() if torch.distributed.is_available() and torch.distributed.is_initialized() else 0
-    )
-    raw_layers = os.environ.get("NEMO_AUTOMODEL_DEBUG_HIDDEN_PROFILE_LAYERS", "0,1,6,12,24,-1")
-    layer_indices = []
-    for item in raw_layers.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            layer_indices.append(int(item))
-        except ValueError:
-            continue
-    for layer_idx in layer_indices:
-        resolved_idx = layer_idx if layer_idx >= 0 else len(hidden_states) + layer_idx
-        if resolved_idx < 0 or resolved_idx >= len(hidden_states):
-            continue
-        hidden = hidden_states[resolved_idx]
-        if not isinstance(hidden, torch.Tensor):
-            continue
-        local_norm = hidden.detach().float().norm().item()
-        local_mean = hidden.detach().float().mean().item()
-        local_std = hidden.detach().float().std().item()
-        print(
-            f"[hidden-profile] rank={rank} tag={tag} layer={layer_idx} resolved={resolved_idx} "
-            f"shape={tuple(hidden.shape)} local_norm={local_norm:.6f} "
-            f"local_mean={local_mean:.6e} local_std={local_std:.6e}",
-            flush=True,
-        )
-
-
-def _debug_hidden_layer_indices(hidden_states) -> list[int]:
-    raw_layers = os.environ.get("NEMO_AUTOMODEL_DEBUG_HIDDEN_PROFILE_LAYERS", "0,1,6,12,24,-1")
-    layer_indices = []
-    for item in raw_layers.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            layer_idx = int(item)
-        except ValueError:
-            continue
-        resolved_idx = layer_idx if layer_idx >= 0 else len(hidden_states) + layer_idx
-        if 0 <= resolved_idx < len(hidden_states):
-            layer_indices.append(layer_idx)
-    return layer_indices
-
-
-def _debug_hidden_grad_retain(out, *, tag: str):
-    """Retain selected hidden-state grads for CP backward parity debugging."""
-    if os.environ.get("NEMO_AUTOMODEL_DEBUG_HIDDEN_GRAD_PROFILE", "").lower() not in {"1", "true", "yes", "on"}:
-        return []
-    hidden_states = getattr(out, "hidden_states", None)
-    if not hidden_states:
-        return []
-    retained = []
-    for layer_idx in _debug_hidden_layer_indices(hidden_states):
-        resolved_idx = layer_idx if layer_idx >= 0 else len(hidden_states) + layer_idx
-        hidden = hidden_states[resolved_idx]
-        if not isinstance(hidden, torch.Tensor) or not hidden.requires_grad:
-            continue
-        hidden.retain_grad()
-        retained.append((layer_idx, resolved_idx, hidden))
-    if retained:
-        rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_available() and torch.distributed.is_initialized()
-            else 0
-        )
-        print(f"[hidden-grad-retain] rank={rank} tag={tag} layers={[(i, r) for i, r, _ in retained]}", flush=True)
-    return retained
-
-
-def _debug_hidden_grad_profile(retained_hidden_states, *, tag: str) -> None:
-    if not retained_hidden_states:
-        return
-    rank = (
-        torch.distributed.get_rank() if torch.distributed.is_available() and torch.distributed.is_initialized() else 0
-    )
-    for layer_idx, resolved_idx, hidden in retained_hidden_states:
-        grad = hidden.grad
-        if grad is None:
-            print(
-                f"[hidden-grad-profile] rank={rank} tag={tag} layer={layer_idx} resolved={resolved_idx} grad=None",
-                flush=True,
-            )
-            continue
-        grad_f = grad.detach().float()
-        print(
-            f"[hidden-grad-profile] rank={rank} tag={tag} layer={layer_idx} resolved={resolved_idx} "
-            f"shape={tuple(grad.shape)} local_norm={grad_f.norm().item():.6f} "
-            f"local_mean={grad_f.mean().item():.6e} local_std={grad_f.std().item():.6e}",
-            flush=True,
-        )
 
 
 def _uses_te_dot_product_attention(model_or_cfg):
@@ -552,7 +423,6 @@ def build_dataloader(
             if hasattr(ds, "shuffle"):
                 ds = ds.shuffle(seed)
 
-            dataset_split = getattr(cfg_ds, "split", "train")
             if packing_strategy == "neat":
                 from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
                 from nemo_automodel.components.datasets.utils import neat_packed_collater
@@ -560,31 +430,22 @@ def build_dataloader(
 
                 ds = neat_pack_dataset(
                     ds,
-                    split=dataset_split,
+                    split=cfg_ds.split,
                     pack_size=packed_sequence_size,
                     max_packs=getattr(cfg_ps, "max_packs", None),
                     padding_idx=getattr(tokenizer, "pad_token_id", 0),
                     drop_long_samples=getattr(cfg_ps, "drop_long_samples", True),
                 )
                 _attn_impl = get_attn_implementation(cfg_model)
-                _sliding_window = _get_gemma4_unified_sliding_window(model)
                 configure_packing(attn_implementation=_attn_impl)
                 # Set collater with attn_implementation so it produces the right mask format
-                cfg_dl.collate_fn = lambda batch, _ai=_attn_impl, _sw=_sliding_window: neat_packed_collater(
-                    batch,
-                    attn_implementation=_ai,
-                    sliding_window=_sw,
-                )
-                logger.info(
-                    "Configured neat packing for attn_implementation=%s, sliding_window=%s",
-                    _attn_impl,
-                    _sliding_window,
-                )
+                cfg_dl.collate_fn = lambda batch, _ai=_attn_impl: neat_packed_collater(batch, attn_implementation=_ai)
+                logger.info(f"Configured neat packing for attn_implementation={_attn_impl}")
             else:
                 # "thd" — existing packing logic
                 ds = pack_dataset(
                     ds,
-                    split=dataset_split,
+                    split=cfg_ds.split,
                     packed_sequence_size=packed_sequence_size,
                     max_packs=getattr(cfg_ps, "max_packs", None),
                     padding_idx=getattr(tokenizer, "pad_token_id", 0),
@@ -836,26 +697,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         ) = self._distributed_setup_attributes(
             create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
         )
-        if memory_profile_enabled() and self.dist_env.is_main:
-            fsdp_mesh = get_fsdp_dp_mesh(
-                self.device_mesh,
-                fsdp_cp_mesh_policy=getattr(self.distributed_config, "fsdp_cp_mesh_policy", "shard"),
-            )
-            logging.info(
-                "[memory-profile] device_mesh_names=%s device_mesh=%s fsdp_mesh_names=%s fsdp_mesh_size=%s "
-                "fsdp_mesh=%s mesh_context=(dp=%s dp_shard=%s dp_replicate=%s cp=%s tp=%s pp=%s)",
-                self.device_mesh.mesh_dim_names,
-                self.device_mesh,
-                fsdp_mesh.mesh_dim_names,
-                fsdp_mesh.size(),
-                fsdp_mesh,
-                self.mesh_context.dp_size,
-                self.mesh_context.dp_shard_size,
-                self.mesh_context.dp_replicate_size,
-                self.mesh_context.cp_size,
-                self.mesh_context.tp_size,
-                self.mesh_context.pp_size,
-            )
 
         # MagiAttention (FFA / context-parallel) backend, enabled via
         # model.attn_implementation="magi" (HF) or model.backend.attn="magi" (custom).
@@ -1330,17 +1171,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # before make_cp_batch_and_ctx shards the batch, instead of the default
             # load-balanced context_parallel path.
             _model_cp = self.model_parts[0] if hasattr(self, "model_parts") else None
-            _force_model_cp = os.environ.get("NEMO_AUTOMODEL_DEBUG_FORCE_MODEL_CP", "").lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
-            if (
-                (cp_size > 1 or _force_model_cp)
-                and _model_cp is not None
-                and hasattr(_model_cp, "prepare_model_inputs_for_cp")
-            ):
+            if cp_size > 1 and _model_cp is not None and hasattr(_model_cp, "prepare_model_inputs_for_cp"):
                 batch.update(
                     _model_cp.prepare_model_inputs_for_cp(input_ids=batch["input_ids"], num_chunks=_num_chunks_value)
                 )
@@ -1404,8 +1235,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_buffer.append(local_loss.clone().detach())
         else:
             model = self.model_parts[0]
-            profile_prefix = f"step={self.step_scheduler.step} microbatch={idx}/{num_batches - 1}"
-            log_cuda_memory_profile(f"{profile_prefix} before_forward", logger=logger)
             sync_ctx = (
                 get_sync_ctx(
                     model,
@@ -1426,9 +1255,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         )
                 else:
                     out = model(**batch)
-                retained_hidden_states = _debug_hidden_grad_retain(out, tag=profile_prefix)
-                _debug_hidden_profile(out, tag=profile_prefix)
-                log_cuda_memory_profile(f"{profile_prefix} after_forward", logger=logger)
 
                 # Gather the LM head once and share it across the main loss and
                 # all MTP depths (FusedLinearCrossEntropy path) to avoid redundant
@@ -1476,24 +1302,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         # would be nan, poisoning local_loss and the backward pass.
                         local_loss = local_loss + logits.float().sum() * 0.0
                 loss_buffer.append(local_loss.clone().detach())
-                log_cuda_memory_profile(f"{profile_prefix} after_loss", logger=logger)
                 if is_train:
-                    log_cuda_memory_profile(f"{profile_prefix} before_backward", logger=logger)
-                    backward_group_size = self._get_dp_group_size(include_cp=True)
-                    if os.environ.get("NEMO_AUTOMODEL_DEBUG_CP_BACKWARD_SCALE_DP_ONLY", "").lower() in {
-                        "1",
-                        "true",
-                        "yes",
-                        "on",
-                    }:
-                        backward_group_size = self._get_dp_group_size(include_cp=False)
-                    (local_loss * backward_group_size).backward()
-                    _debug_hidden_grad_profile(retained_hidden_states, tag=profile_prefix)
-                    log_cuda_memory_profile(
-                        f"{profile_prefix} after_backward",
-                        logger=logger,
-                        include_tensors=True,
-                    )
+                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
     def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
         """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
@@ -1536,7 +1346,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
 
         loss_buffer = []
-        log_cuda_memory_profile(f"step={self.step_scheduler.step} train_step_start", logger=logger)
 
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = torch.tensor(
@@ -1547,12 +1356,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         num_batches = len(batches)
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
-        log_cuda_memory_profile(f"step={self.step_scheduler.step} after_prepare_grad_accum", logger=logger)
 
         for i, batch in enumerate(batches):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
-                log_cuda_memory_profile(f"step={self.step_scheduler.step} after_prepare_final_backward", logger=logger)
 
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
@@ -1561,8 +1368,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if i == 0:
                 prepare_after_first_microbatch()
 
-        log_cuda_memory_profile(f"step={self.step_scheduler.step} before_grad_clip", logger=logger)
-        log_cuda_grad_profile(self.model_parts, f"step={self.step_scheduler.step} before_grad_clip", logger=logger)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,
@@ -1576,30 +1381,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
         )
-        log_cuda_memory_profile(
-            f"step={self.step_scheduler.step} after_grad_clip",
-            logger=logger,
-            include_tensors=True,
-        )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].finish_grad_sync()
 
         self.checkpointer.maybe_wait_for_staging()
-        log_cuda_memory_profile(f"step={self.step_scheduler.step} before_optimizer_step", logger=logger)
         for opt in self.optimizer:
             opt.step()
-            log_cuda_memory_profile(
-                f"step={self.step_scheduler.step} after_optimizer_step",
-                logger=logger,
-                include_tensors=True,
-            )
             opt.zero_grad()
-            log_cuda_memory_profile(
-                f"step={self.step_scheduler.step} after_zero_grad",
-                logger=logger,
-                include_tensors=True,
-            )
 
         if hasattr(self.model_parts[0], "update_moe_gate_bias"):
             for mp in self.model_parts:
@@ -1620,12 +1409,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             and self.device_mesh["dp_shard"].size() > 1
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
-            log_cuda_memory_profile(f"step={self.step_scheduler.step} after_fp8_scale_precompute", logger=logger)
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].install_optimized_model_weights()
         # self.model_parts[0].zero_grad_buffer()
-        log_cuda_memory_profile(f"step={self.step_scheduler.step} train_step_end", logger=logger)
 
         t = time.perf_counter()
         time_delta = t - self.timestamp

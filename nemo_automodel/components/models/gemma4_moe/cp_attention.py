@@ -34,6 +34,10 @@ _GEMMA4_CP_FLEX_RING_OK_LOGGED = False
 _GEMMA4_CP_PROFILE_NEXT_MODULE_ID = 0
 _GEMMA4_CP_PACKED_DEBUG_SEEN: set[tuple[Any, ...]] = set()
 _GEMMA4_CP_COMPARE_SDPA_SEEN: set[tuple[Any, ...]] = set()
+_GEMMA4_CP_COMPARE_RING_DENSE_BACKWARD_SEEN: set[tuple[Any, ...]] = set()
+_GEMMA4_CP_COMPARE_ALLQUERY_BACKWARD_SEEN: set[tuple[Any, ...]] = set()
+_GEMMA4_CP_COMPARE_FULL_MASK_SEEN: set[tuple[Any, ...]] = set()
+_GEMMA4_CP_COMPARE_REFERENCE_MASK_SEEN: set[tuple[Any, ...]] = set()
 
 
 def _patch_fsdp_accumulated_grad_guard() -> None:
@@ -121,10 +125,29 @@ _BLOCK_MASK_CACHE: dict = {}
 _BLOCK_MASK_GEN: list = [None, None]
 
 
+def _debug_metadata_checksum(tensor: torch.Tensor | None) -> tuple[tuple[int, ...] | None, int, int]:
+    if tensor is None:
+        return None, 0, 0
+    data = tensor.detach().to(dtype=torch.long).reshape(-1)
+    if data.numel() == 0:
+        return tuple(tensor.shape), 0, 0
+    weights = torch.arange(1, data.numel() + 1, device=data.device, dtype=torch.long)
+    return tuple(tensor.shape), int(data.sum().item()), int((data * weights).sum().item())
+
+
 def _block_mask_set_generation(gen_tensor) -> None:
     """Reset the per-step block-mask cache when a new batch (new metadata) arrives."""
     ptr = None if gen_tensor is None else gen_tensor.data_ptr()
     if ptr != _BLOCK_MASK_GEN[0]:
+        if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_DEBUG_BLOCK_MASK_CACHE"):
+            rank = _debug_rank()
+            shape, total, checksum = _debug_metadata_checksum(gen_tensor)
+            print(
+                "[GEMMA4_CP_BLOCK_MASK_CACHE] "
+                f"rank={rank} old_ptr={_BLOCK_MASK_GEN[0]} new_ptr={ptr} old_cache_size={len(_BLOCK_MASK_CACHE)} "
+                f"gen_shape={shape} gen_sum={total} gen_checksum={checksum} action=clear",
+                flush=True,
+            )
         _BLOCK_MASK_CACHE.clear()
         _BLOCK_MASK_GEN[0] = ptr
         _BLOCK_MASK_GEN[1] = gen_tensor  # pin the storage for the duration of the step
@@ -221,6 +244,98 @@ def _debug_compare_allowed(attention_module: torch.nn.Module, ctx: Any, *, kv_gl
     if seen_key in _GEMMA4_CP_COMPARE_SDPA_SEEN:
         return False
     _GEMMA4_CP_COMPARE_SDPA_SEEN.add(seen_key)
+    return True
+
+
+def _debug_compare_ring_dense_backward_allowed(attention_module: torch.nn.Module, ctx: Any) -> bool:
+    if not _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_RING_DENSE_BACKWARD"):
+        return False
+    rank = _debug_rank()
+    if not _debug_list_allows(rank, "NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_RING_DENSE_BACKWARD_RANKS"):
+        return False
+    layer_idx = getattr(attention_module, "layer_idx", None)
+    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", -1)
+    layer_or_profile = profile_id if layer_idx is None else layer_idx
+    if not _debug_list_allows(int(layer_or_profile), "NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_RING_DENSE_BACKWARD_LAYERS"):
+        return False
+    seen_key = (rank, profile_id, ctx.cp_rank, int(ctx.seq_global_start), int(ctx.seq_local))
+    if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_BACKWARD_BY_METADATA"):
+        gen_tensor = None
+        for gen_key in ("mm_token_type_ids", "_packed_seq_ids", "padding_mask"):
+            candidate = ctx.metadata.get(gen_key)
+            if candidate is not None:
+                gen_tensor = candidate
+                break
+        seen_key = (*seen_key, None if gen_tensor is None else int(gen_tensor.data_ptr()))
+    if seen_key in _GEMMA4_CP_COMPARE_RING_DENSE_BACKWARD_SEEN:
+        return False
+    _GEMMA4_CP_COMPARE_RING_DENSE_BACKWARD_SEEN.add(seen_key)
+    return True
+
+
+def _debug_compare_allquery_backward_allowed(attention_module: torch.nn.Module, ctx: Any) -> bool:
+    if not _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_ALLQUERY_BACKWARD"):
+        return False
+    layer_idx = getattr(attention_module, "layer_idx", None)
+    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", -1)
+    layer_or_profile = profile_id if layer_idx is None else layer_idx
+    if not _debug_list_allows(int(layer_or_profile), "NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_ALLQUERY_BACKWARD_LAYERS"):
+        return False
+    rank = _debug_rank()
+    seen_key = (rank, profile_id, ctx.cp_rank, int(ctx.seq_global_start), int(ctx.seq_local))
+    if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_BACKWARD_BY_METADATA"):
+        gen_tensor = None
+        for gen_key in ("mm_token_type_ids", "_packed_seq_ids", "padding_mask"):
+            candidate = ctx.metadata.get(gen_key)
+            if candidate is not None:
+                gen_tensor = candidate
+                break
+        seen_key = (*seen_key, None if gen_tensor is None else int(gen_tensor.data_ptr()))
+    if seen_key in _GEMMA4_CP_COMPARE_ALLQUERY_BACKWARD_SEEN:
+        return False
+    _GEMMA4_CP_COMPARE_ALLQUERY_BACKWARD_SEEN.add(seen_key)
+    return True
+
+
+def _debug_compare_full_mask_allowed(attention_module: torch.nn.Module, ctx: Any, *, kv_global_start: int) -> bool:
+    if not _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_FULL_MASK"):
+        return False
+    layer_idx = getattr(attention_module, "layer_idx", None)
+    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", -1)
+    layer_or_profile = profile_id if layer_idx is None else layer_idx
+    if not _debug_list_allows(int(layer_or_profile), "NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_FULL_MASK_LAYERS"):
+        return False
+    rank = _debug_rank()
+    seen_key = (rank, profile_id, ctx.cp_rank, int(ctx.seq_global_start), int(kv_global_start), int(ctx.seq_local))
+    if seen_key in _GEMMA4_CP_COMPARE_FULL_MASK_SEEN:
+        return False
+    _GEMMA4_CP_COMPARE_FULL_MASK_SEEN.add(seen_key)
+    return True
+
+
+def _debug_compare_reference_mask_allowed(attention_module: torch.nn.Module, ctx: Any, *, kv_global_start: int) -> bool:
+    if not _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_REFERENCE_MASK"):
+        return False
+    rank = _debug_rank()
+    if not _debug_list_allows(rank, "NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_REFERENCE_MASK_RANKS"):
+        return False
+    layer_idx = getattr(attention_module, "layer_idx", None)
+    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", -1)
+    layer_or_profile = profile_id if layer_idx is None else layer_idx
+    if not _debug_list_allows(int(layer_or_profile), "NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_REFERENCE_MASK_LAYERS"):
+        return False
+    seen_key = (rank, profile_id, ctx.cp_rank, int(ctx.seq_global_start), int(kv_global_start), int(ctx.seq_local))
+    if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_REFERENCE_MASK_BY_METADATA"):
+        gen_tensor = None
+        for gen_key in ("mm_token_type_ids", "_packed_seq_ids", "padding_mask"):
+            candidate = ctx.metadata.get(gen_key)
+            if candidate is not None:
+                gen_tensor = candidate
+                break
+        seen_key = (*seen_key, None if gen_tensor is None else int(gen_tensor.data_ptr()))
+    if seen_key in _GEMMA4_CP_COMPARE_REFERENCE_MASK_SEEN:
+        return False
+    _GEMMA4_CP_COMPARE_REFERENCE_MASK_SEEN.add(seen_key)
     return True
 
 
@@ -385,6 +500,177 @@ def _debug_packed_boundaries(
     print(f"{prefix} packed sequence boundary audit PASS", flush=True)
 
 
+def _all_gather_cp_metadata(value: torch.Tensor | None, ctx: Any) -> torch.Tensor | None:
+    if value is None:
+        return None
+    gathered = [torch.empty_like(value) for _ in range(ctx.cp_size)]
+    torch.distributed.all_gather(gathered, value.contiguous(), group=ctx.cp_group)
+    return torch.cat(gathered, dim=1)
+
+
+def _debug_compare_full_dense_mask(
+    attention_module: torch.nn.Module,
+    ctx: Any,
+    *,
+    chunk_allowed: torch.Tensor,
+    packed_seq_ids_q: torch.Tensor | None,
+    padding_mask_q: torch.Tensor | None,
+    vision_group_ids_q: torch.Tensor | None,
+    kv_global_start: int,
+    use_vision_bidirectional: bool,
+) -> None:
+    if not _debug_compare_full_mask_allowed(attention_module, ctx, kv_global_start=kv_global_start):
+        return
+    if packed_seq_ids_q is None:
+        return
+
+    full_packed_ids = _all_gather_cp_metadata(packed_seq_ids_q, ctx)
+    full_padding_mask = _all_gather_cp_metadata(padding_mask_q, ctx)
+    full_vision_group_ids = _all_gather_cp_metadata(vision_group_ids_q, ctx)
+    if full_packed_ids is None:
+        return
+
+    q_start = int(ctx.seq_global_start)
+    q_end = q_start + int(ctx.seq_local)
+    kv_start = int(kv_global_start)
+    kv_end = kv_start + int(chunk_allowed.shape[-1])
+
+    q_global = torch.arange(q_start, q_end, device=chunk_allowed.device)
+    kv_global = torch.arange(kv_start, kv_end, device=chunk_allowed.device)
+    if ctx.is_causal:
+        dense_allowed = kv_global.view(1, 1, -1) <= q_global.view(1, -1, 1)
+    else:
+        dense_allowed = torch.ones_like(chunk_allowed)
+
+    sliding_window = getattr(attention_module, "sliding_window", None)
+    if sliding_window is not None:
+        dense_allowed = dense_allowed & ((q_global.view(1, -1, 1) - kv_global.view(1, 1, -1)) < sliding_window)
+
+    q_ids = full_packed_ids[:, q_start:q_end]
+    kv_ids = full_packed_ids[:, kv_start:kv_end]
+    same_doc = (q_ids[:, :, None] == kv_ids[:, None, :]) & (q_ids[:, :, None] > 0) & (kv_ids[:, None, :] > 0)
+
+    if use_vision_bidirectional and full_vision_group_ids is not None:
+        q_group = full_vision_group_ids[:, q_start:q_end]
+        kv_group = full_vision_group_ids[:, kv_start:kv_end]
+        same_vision_group = (q_group[:, :, None] == kv_group[:, None, :]) & (q_group[:, :, None] >= 0)
+        dense_allowed = dense_allowed | same_vision_group
+
+    dense_allowed = dense_allowed & same_doc
+    valid_q = q_ids > 0
+    valid_kv = kv_ids > 0
+    if full_padding_mask is not None:
+        q_padding = full_padding_mask[:, q_start:q_end]
+        kv_padding = full_padding_mask[:, kv_start:kv_end]
+        valid_q = valid_q & ~q_padding
+        valid_kv = valid_kv & ~kv_padding
+        dense_allowed = dense_allowed & ~kv_padding[:, None, :]
+        dense_allowed = torch.where(q_padding[:, :, None], torch.zeros_like(dense_allowed), dense_allowed)
+
+    cp_allowed = chunk_allowed.clone()
+    cp_allowed = torch.where(valid_q[:, :, None], cp_allowed, torch.zeros_like(cp_allowed))
+    cp_allowed = cp_allowed & valid_kv[:, None, :]
+
+    diff = cp_allowed ^ dense_allowed
+    mismatch = int(diff.sum().item())
+    cp_extra = int((cp_allowed & ~dense_allowed).sum().item())
+    cp_missing = int((dense_allowed & ~cp_allowed).sum().item())
+    rank = _debug_rank()
+    if not _debug_list_allows(rank, "NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_FULL_MASK_RANKS"):
+        return
+    layer_idx = getattr(attention_module, "layer_idx", None)
+    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", -1)
+    print(
+        "[GEMMA4_CP_FULL_MASK_COMPARE] "
+        f"rank={rank} cp_rank={ctx.cp_rank} layer={layer_idx} profile_id={profile_id} "
+        f"q_global=[{q_start},{q_end}) kv_global=[{kv_start},{kv_end}) "
+        f"cp_allowed={int(cp_allowed.sum().item())} dense_allowed={int(dense_allowed.sum().item())} "
+        f"mismatch={mismatch} cp_extra={cp_extra} cp_missing={cp_missing}",
+        flush=True,
+    )
+    if mismatch:
+        first = diff.nonzero(as_tuple=False)[0]
+        b_idx, q_idx, kv_idx = (int(first[0].item()), int(first[1].item()), int(first[2].item()))
+        print(
+            "[GEMMA4_CP_FULL_MASK_COMPARE] "
+            f"first_mismatch batch={b_idx} q={q_start + q_idx} kv={kv_start + kv_idx} "
+            f"q_id={int(q_ids[b_idx, q_idx].item())} kv_id={int(kv_ids[b_idx, kv_idx].item())} "
+            f"cp={bool(cp_allowed[b_idx, q_idx, kv_idx].item())} "
+            f"dense={bool(dense_allowed[b_idx, q_idx, kv_idx].item())}",
+            flush=True,
+        )
+
+
+def _debug_compare_reference_mask(
+    attention_module: torch.nn.Module,
+    ctx: Any,
+    *,
+    chunk_allowed: torch.Tensor,
+    kv_global_start: int,
+) -> None:
+    if not _debug_compare_reference_mask_allowed(attention_module, ctx, kv_global_start=kv_global_start):
+        return
+
+    reference_key = (
+        "_gemma4_reference_sliding_attention"
+        if getattr(attention_module, "sliding_window", None) is not None
+        else "_gemma4_reference_full_attention"
+    )
+    reference_mask = ctx.metadata.get(reference_key)
+    if reference_mask is None:
+        return
+    if reference_mask.dtype != torch.bool:
+        reference_allowed = reference_mask == 0
+    else:
+        reference_allowed = reference_mask
+
+    q_start = int(ctx.seq_global_start)
+    q_end = q_start + int(ctx.seq_local)
+    kv_start = int(kv_global_start)
+    kv_end = kv_start + int(chunk_allowed.shape[-1])
+    reference_chunk = reference_allowed[:, 0, q_start:q_end, kv_start:kv_end].to(device=chunk_allowed.device)
+
+    cp_allowed = chunk_allowed
+    if cp_allowed.shape[0] == 1 and reference_chunk.shape[0] > 1:
+        cp_allowed = cp_allowed.expand(reference_chunk.shape[0], -1, -1)
+
+    diff = cp_allowed ^ reference_chunk
+    mismatch = int(diff.sum().item())
+    cp_extra = int((cp_allowed & ~reference_chunk).sum().item())
+    cp_missing = int((reference_chunk & ~cp_allowed).sum().item())
+    rank = _debug_rank()
+    layer_idx = getattr(attention_module, "layer_idx", None)
+    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", -1)
+    print(
+        "[GEMMA4_CP_REFERENCE_MASK_COMPARE] "
+        f"rank={rank} cp_rank={ctx.cp_rank} layer={layer_idx} profile_id={profile_id} "
+        f"mask={reference_key} q_global=[{q_start},{q_end}) kv_global=[{kv_start},{kv_end}) "
+        f"cp_allowed={int(cp_allowed.sum().item())} reference_allowed={int(reference_chunk.sum().item())} "
+        f"mismatch={mismatch} cp_extra={cp_extra} cp_missing={cp_missing}",
+        flush=True,
+    )
+    if mismatch:
+        first = diff.nonzero(as_tuple=False)[0]
+        b_idx, q_idx, kv_idx = (int(first[0].item()), int(first[1].item()), int(first[2].item()))
+        packed_seq_ids = ctx.metadata.get("_packed_seq_ids")
+        q_doc = None
+        kv_doc = None
+        if packed_seq_ids is not None:
+            q_doc = int(packed_seq_ids[b_idx, q_idx].item())
+            if kv_start <= q_start + kv_idx < q_start + packed_seq_ids.shape[1]:
+                local_kv_idx = kv_start + kv_idx - q_start
+                if 0 <= local_kv_idx < packed_seq_ids.shape[1]:
+                    kv_doc = int(packed_seq_ids[b_idx, local_kv_idx].item())
+        print(
+            "[GEMMA4_CP_REFERENCE_MASK_COMPARE] "
+            f"first_mismatch batch={b_idx} q={q_start + q_idx} kv={kv_start + kv_idx} "
+            f"q_doc={q_doc} kv_doc={kv_doc} "
+            f"cp={bool(cp_allowed[b_idx, q_idx, kv_idx].item())} "
+            f"reference={bool(reference_chunk[b_idx, q_idx, kv_idx].item())}",
+            flush=True,
+        )
+
+
 def _compiled_flex_attention(attention_module: torch.nn.Module):
     compiled = getattr(attention_module, "_gemma4_cp_compiled_flex_attn", None)
     if compiled is None:
@@ -417,8 +703,15 @@ def _duck_shape_disabled():
         _fx_config.use_duck_shape = prev
 
 
-def _base_gemma4_cp_mask(attention_module: torch.nn.Module, ctx: Any, q_idx, kv_idx, kv_global_start: int = 0):
-    q_global_idx = q_idx + ctx.seq_global_start
+def _base_gemma4_cp_mask(
+    attention_module: torch.nn.Module,
+    ctx: Any,
+    q_idx,
+    kv_idx,
+    kv_global_start: int | torch.Tensor = 0,
+    q_global_start: int | torch.Tensor | None = None,
+):
+    q_global_idx = q_idx + (ctx.seq_global_start if q_global_start is None else q_global_start)
     kv_global_idx = kv_idx + kv_global_start
     if not ctx.is_causal:
         allowed = torch.ones_like(q_global_idx >= kv_global_idx)
@@ -529,6 +822,10 @@ def _zero_masked_attention_rows(
     return tensor
 
 
+def _original_sdpa(attention_module: torch.nn.Module):
+    return getattr(attention_module, "_gemma4_cp_original_sdpa", F.scaled_dot_product_attention)
+
+
 def _debug_compare_flex_sdpa(
     attention_module: torch.nn.Module,
     ctx: Any,
@@ -568,11 +865,13 @@ def _debug_compare_flex_sdpa(
 
         dense_mask = dense_allowed_mask[:, None, :, :]
         compare_grads = _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_SDPA_GRADS")
+        true_sdpa = _original_sdpa(attention_module)
         with torch.enable_grad():
             q = query_for_flex.detach().contiguous().requires_grad_(compare_grads)
             k = key_for_flex.detach().contiguous().requires_grad_(compare_grads)
             v = value_for_flex.detach().contiguous().requires_grad_(compare_grads)
-            ref_out = F.scaled_dot_product_attention(
+            save_path = os.environ.get("NEMO_AUTOMODEL_GEMMA4_CP_SAVE_QKV")
+            ref_out = true_sdpa(
                 q,
                 k,
                 v,
@@ -599,6 +898,101 @@ def _debug_compare_flex_sdpa(
                 empty_query_rows=empty_query_rows,
                 chunk_empty_query_rows=chunk_empty_query_rows,
             )
+            if save_path:
+                torch.save(
+                    {
+                        "q": q.detach().cpu(),
+                        "k": k.detach().cpu(),
+                        "v": v.detach().cpu(),
+                        "dense_allowed_mask": dense_allowed_mask.detach().cpu(),
+                        "empty_query_rows": None if empty_query_rows is None else empty_query_rows.detach().cpu(),
+                        "chunk_empty_query_rows": chunk_empty_query_rows.detach().cpu(),
+                        "ref_out": ref_out.detach().cpu(),
+                        "flex_cmp": flex_cmp.detach().cpu(),
+                        "flex_out": flex_out.detach().cpu(),
+                        "scale": flex_scale,
+                    },
+                    save_path,
+                )
+            flex_dense_message = ""
+            if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_DENSE_FLEX"):
+                dense_flex_cmp, _ = _compiled_flex_attention(attention_module)(
+                    q,
+                    k,
+                    v,
+                    score_mod=cp_score_mod,
+                    block_mask=None,
+                    scale=flex_scale,
+                    enable_gqa=False,
+                    return_lse=True,
+                )
+                dense_flex_cmp = _zero_masked_attention_rows(
+                    dense_flex_cmp,
+                    empty_query_rows=empty_query_rows,
+                    chunk_empty_query_rows=chunk_empty_query_rows,
+                )
+                dense_flex_diff = (dense_flex_cmp.detach() - ref_out.detach()).float()
+                flex_dense_message = (
+                    f" dense_flex_norm={dense_flex_cmp.detach().float().norm().item():.6e}"
+                    f" dense_flex_max={dense_flex_diff.abs().max().item():.6e}"
+                    f" dense_flex_mean={dense_flex_diff.abs().mean().item():.6e}"
+                )
+            if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_DENSE_MASK_SCORE"):
+                dense_allowed_for_score = dense_allowed_mask.contiguous()
+
+                def dense_mask_score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
+                    allowed = dense_allowed_for_score[batch_idx, q_idx, kv_idx]
+                    return torch.where(allowed, score, torch.full_like(score, -float("inf")))
+
+                dense_mask_flex_cmp, _ = _compiled_flex_attention(attention_module)(
+                    q,
+                    k,
+                    v,
+                    score_mod=dense_mask_score_mod,
+                    block_mask=None,
+                    scale=flex_scale,
+                    enable_gqa=False,
+                    return_lse=True,
+                )
+                dense_mask_flex_cmp = _zero_masked_attention_rows(
+                    dense_mask_flex_cmp,
+                    empty_query_rows=empty_query_rows,
+                    chunk_empty_query_rows=chunk_empty_query_rows,
+                )
+                dense_mask_flex_diff = (dense_mask_flex_cmp.detach() - ref_out.detach()).float()
+                flex_dense_message += (
+                    f" dense_mask_flex_norm={dense_mask_flex_cmp.detach().float().norm().item():.6e}"
+                    f" dense_mask_flex_max={dense_mask_flex_diff.abs().max().item():.6e}"
+                    f" dense_mask_flex_mean={dense_mask_flex_diff.abs().mean().item():.6e}"
+                )
+            if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_UNMASKED_FLEX"):
+                unmasked_ref = true_sdpa(
+                    q,
+                    k,
+                    v,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=flex_scale,
+                    enable_gqa=False,
+                )
+                unmasked_flex, _ = _compiled_flex_attention(attention_module)(
+                    q,
+                    k,
+                    v,
+                    score_mod=None,
+                    block_mask=None,
+                    scale=flex_scale,
+                    enable_gqa=False,
+                    return_lse=True,
+                )
+                unmasked_diff = (unmasked_flex.detach() - unmasked_ref.detach()).float()
+                flex_dense_message += (
+                    f" unmasked_ref_norm={unmasked_ref.detach().float().norm().item():.6e}"
+                    f" unmasked_flex_norm={unmasked_flex.detach().float().norm().item():.6e}"
+                    f" unmasked_flex_max={unmasked_diff.abs().max().item():.6e}"
+                    f" unmasked_flex_mean={unmasked_diff.abs().mean().item():.6e}"
+                )
             if compare_grads:
                 upstream = torch.randn_like(ref_out)
                 ref_grads = torch.autograd.grad(ref_out, (q, k, v), upstream, retain_graph=True)
@@ -618,7 +1012,7 @@ def _debug_compare_flex_sdpa(
             from torch.nn.attention import SDPBackend, sdpa_kernel
 
             with sdpa_kernel(SDPBackend.MATH):
-                math_out = F.scaled_dot_product_attention(
+                math_out = true_sdpa(
                     q.detach(),
                     k.detach(),
                     v.detach(),
@@ -642,6 +1036,7 @@ def _debug_compare_flex_sdpa(
                 f" default_math_max={math_default_diff.abs().max().item():.6e}"
                 f" default_math_mean={math_default_diff.abs().mean().item():.6e}"
             )
+        math_sdpa_message += flex_dense_message
     else:
         ref_grads = flex_grads = None
         scale = flex_scale if flex_scale is not None else (1.0 / math.sqrt(query_for_flex.shape[-1]))
@@ -709,6 +1104,277 @@ def _debug_compare_flex_sdpa(
     print(message, flush=True)
 
 
+def _debug_compare_ring_dense_backward(
+    attention_module: torch.nn.Module,
+    ctx: Any,
+    *,
+    chunks: list[tuple[int, torch.Tensor, torch.Tensor, dict[str, torch.Tensor | None]]],
+    grad_output: torch.Tensor,
+    split_grads: tuple[torch.Tensor | None, ...],
+) -> None:
+    if not _debug_compare_ring_dense_backward_allowed(attention_module, ctx):
+        return
+
+    ordered_chunks = sorted(chunks, key=lambda item: item[0])
+    owners = [owner for owner, _, _, _ in chunks]
+    ordered_keys = [key.detach() for _, key, _, _ in ordered_chunks]
+    ordered_values = [value.detach() for _, _, value, _ in ordered_chunks]
+    key_full = torch.cat(ordered_keys, dim=2).requires_grad_(True)
+    value_full = torch.cat(ordered_values, dim=2).requires_grad_(True)
+    query_full = ctx.query.detach().requires_grad_(True)
+
+    packed_seq_ids_q = ctx.metadata.get("_packed_seq_ids")
+    padding_mask_q = ctx.metadata.get("padding_mask")
+    vision_group_ids_q = ctx.metadata.get("_gemma4_vision_group_ids")
+    if vision_group_ids_q is None and ctx.metadata.get("mm_token_type_ids") is not None:
+        vision_group_ids_q = gemma4_vision_group_ids(ctx.metadata["mm_token_type_ids"])
+
+    sliding_window = getattr(attention_module, "sliding_window", None)
+    config_uses_vision_bidir = (
+        getattr(getattr(attention_module, "config", None), "use_bidirectional_attention", None) == "vision"
+    )
+
+    allowed_chunks = []
+    for owner, _, _, metadata_chunk in ordered_chunks:
+        packed_seq_ids_kv = metadata_chunk.get("_packed_seq_ids")
+        padding_mask_kv = metadata_chunk.get("padding_mask")
+        vision_group_ids_kv = metadata_chunk.get("_gemma4_vision_group_ids")
+        if vision_group_ids_kv is None and metadata_chunk.get("mm_token_type_ids") is not None:
+            vision_group_ids_kv = gemma4_vision_group_ids(metadata_chunk["mm_token_type_ids"])
+        use_vision_bidirectional = (
+            sliding_window is not None
+            and config_uses_vision_bidir
+            and vision_group_ids_q is not None
+            and vision_group_ids_kv is not None
+        )
+        if packed_seq_ids_q is None or packed_seq_ids_kv is None:
+            batch_idx = torch.arange(query_full.shape[0], device=query_full.device).view(-1, 1, 1)
+            q_idx = torch.arange(ctx.seq_local, device=query_full.device).view(1, -1, 1)
+            kv_idx = torch.arange(key_full.shape[2] // ctx.cp_size, device=query_full.device).view(1, 1, -1)
+            allowed = _base_gemma4_cp_mask(
+                attention_module,
+                ctx,
+                q_idx,
+                kv_idx,
+                owner * ctx.seq_local,
+                q_global_start=ctx.seq_global_start,
+            )
+            allowed = allowed.expand(query_full.shape[0], -1, -1)
+            _ = batch_idx
+        else:
+            allowed = _boundary_allowed_mask(
+                attention_module,
+                ctx,
+                packed_seq_ids_q=packed_seq_ids_q,
+                packed_seq_ids_kv=packed_seq_ids_kv,
+                padding_mask_q=padding_mask_q,
+                padding_mask_kv=padding_mask_kv,
+                vision_group_ids_q=vision_group_ids_q,
+                vision_group_ids_kv=vision_group_ids_kv,
+                kv_global_start=owner * ctx.seq_local,
+                use_vision_bidirectional=use_vision_bidirectional,
+            )
+        allowed_chunks.append(allowed)
+    dense_allowed_mask = torch.cat(allowed_chunks, dim=-1)
+
+    dense_out = _original_sdpa(attention_module)(
+        query_full,
+        key_full,
+        value_full,
+        attn_mask=dense_allowed_mask[:, None, :, :],
+        dropout_p=0.0,
+        is_causal=False,
+        scale=ctx.scale,
+        enable_gqa=False,
+    )
+    empty_query_rows = None
+    if packed_seq_ids_q is not None:
+        empty_query_rows = packed_seq_ids_q <= 0
+    if padding_mask_q is not None:
+        empty_query_rows = padding_mask_q if empty_query_rows is None else empty_query_rows | padding_mask_q
+    if empty_query_rows is not None and empty_query_rows.any():
+        dense_out = dense_out.masked_fill(empty_query_rows[:, None, :, None], 0)
+    dense_grads = torch.autograd.grad(dense_out, (query_full, key_full, value_full), grad_output, allow_unused=True)
+
+    split_query_grad = _zero_if_none(split_grads[0], query_full)
+    dense_query_grad = _zero_if_none(dense_grads[0], query_full)
+    key_chunks = torch.chunk(_zero_if_none(dense_grads[1], key_full), ctx.cp_size, dim=2)
+    value_chunks = torch.chunk(_zero_if_none(dense_grads[2], value_full), ctx.cp_size, dim=2)
+    dense_key_by_owner = {owner: key_chunks[idx] for idx, (owner, _, _, _) in enumerate(ordered_chunks)}
+    dense_value_by_owner = {owner: value_chunks[idx] for idx, (owner, _, _, _) in enumerate(ordered_chunks)}
+
+    num_chunks = len(chunks)
+    rank = _debug_rank()
+    layer_idx = getattr(attention_module, "layer_idx", None)
+    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", -1)
+    output_diff = torch.zeros((), device=query_full.device)
+    rows = []
+    q_diff = (split_query_grad.detach() - dense_query_grad.detach()).float()
+    rows.append(
+        "query"
+        f": split_norm={split_query_grad.detach().float().norm().item():.6e}"
+        f" dense_norm={dense_query_grad.detach().float().norm().item():.6e}"
+        f" diff_norm={q_diff.norm().item():.6e}"
+        f" diff_max={q_diff.abs().max().item():.6e}"
+    )
+    for idx, owner in enumerate(owners):
+        split_key_grad = _zero_if_none(split_grads[1 + idx], chunks[idx][1])
+        split_value_grad = _zero_if_none(split_grads[1 + num_chunks + idx], chunks[idx][2])
+        dense_key_grad = dense_key_by_owner[owner]
+        dense_value_grad = dense_value_by_owner[owner]
+        key_diff = (split_key_grad.detach() - dense_key_grad.detach()).float()
+        value_diff = (split_value_grad.detach() - dense_value_grad.detach()).float()
+        rows.append(
+            f"owner={owner}"
+            f" key_split_norm={split_key_grad.detach().float().norm().item():.6e}"
+            f" key_dense_norm={dense_key_grad.detach().float().norm().item():.6e}"
+            f" key_diff_norm={key_diff.norm().item():.6e}"
+            f" key_diff_max={key_diff.abs().max().item():.6e}"
+            f" value_split_norm={split_value_grad.detach().float().norm().item():.6e}"
+            f" value_dense_norm={dense_value_grad.detach().float().norm().item():.6e}"
+            f" value_diff_norm={value_diff.norm().item():.6e}"
+            f" value_diff_max={value_diff.abs().max().item():.6e}"
+        )
+
+    print(
+        "[GEMMA4_CP_RING_DENSE_BACKWARD] "
+        f"rank={rank} cp_rank={ctx.cp_rank} layer={layer_idx} profile_id={profile_id} "
+        f"q_global=[{ctx.seq_global_start},{ctx.seq_global_start + ctx.seq_local}) "
+        f"allowed_pairs={int(dense_allowed_mask.sum().item())} output_diff={output_diff.item():.6e} "
+        + " | ".join(rows),
+        flush=True,
+    )
+
+
+def _debug_compare_allquery_backward(
+    attention_module: torch.nn.Module,
+    ctx: Any,
+    *,
+    chunks: list[tuple[int, torch.Tensor, torch.Tensor, dict[str, torch.Tensor | None]]],
+    grad_output: torch.Tensor,
+    grad_query: torch.Tensor,
+    grad_key: torch.Tensor,
+    grad_value: torch.Tensor,
+) -> None:
+    if not _debug_compare_allquery_backward_allowed(attention_module, ctx):
+        return
+
+    local_query = ctx.query.detach().contiguous()
+    local_grad_output = grad_output.detach().contiguous()
+    gathered_query = [torch.empty_like(local_query) for _ in range(ctx.cp_size)]
+    gathered_grad_output = [torch.empty_like(local_grad_output) for _ in range(ctx.cp_size)]
+    torch.distributed.all_gather(gathered_query, local_query, group=ctx.cp_group)
+    torch.distributed.all_gather(gathered_grad_output, local_grad_output, group=ctx.cp_group)
+
+    query_full = torch.cat(gathered_query, dim=2).contiguous().requires_grad_(True)
+    grad_output_full = torch.cat(gathered_grad_output, dim=2).contiguous()
+    ordered_chunks = sorted(chunks, key=lambda item: item[0])
+    key_full = torch.cat([key.detach() for _, key, _, _ in ordered_chunks], dim=2).contiguous().requires_grad_(True)
+    value_full = (
+        torch.cat([value.detach() for _, _, value, _ in ordered_chunks], dim=2).contiguous().requires_grad_(True)
+    )
+    metadata_by_owner = {owner: metadata for owner, _, _, metadata in ordered_chunks}
+
+    sliding_window = getattr(attention_module, "sliding_window", None)
+    config_uses_vision_bidir = (
+        getattr(getattr(attention_module, "config", None), "use_bidirectional_attention", None) == "vision"
+    )
+    row_masks = []
+    for q_owner in range(ctx.cp_size):
+        q_metadata = metadata_by_owner[q_owner]
+        q_ctx = replace(
+            ctx,
+            query=query_full[:, :, q_owner * ctx.seq_local : (q_owner + 1) * ctx.seq_local],
+            metadata=q_metadata,
+            seq_global_start=q_owner * ctx.seq_local,
+        )
+        col_masks = []
+        packed_seq_ids_q = q_metadata.get("_packed_seq_ids")
+        padding_mask_q = q_metadata.get("padding_mask")
+        vision_group_ids_q = q_metadata.get("_gemma4_vision_group_ids")
+        if vision_group_ids_q is None and q_metadata.get("mm_token_type_ids") is not None:
+            vision_group_ids_q = gemma4_vision_group_ids(q_metadata["mm_token_type_ids"])
+        for kv_owner in range(ctx.cp_size):
+            kv_metadata = metadata_by_owner[kv_owner]
+            packed_seq_ids_kv = kv_metadata.get("_packed_seq_ids")
+            padding_mask_kv = kv_metadata.get("padding_mask")
+            vision_group_ids_kv = kv_metadata.get("_gemma4_vision_group_ids")
+            if vision_group_ids_kv is None and kv_metadata.get("mm_token_type_ids") is not None:
+                vision_group_ids_kv = gemma4_vision_group_ids(kv_metadata["mm_token_type_ids"])
+            use_vision_bidirectional = (
+                sliding_window is not None
+                and config_uses_vision_bidir
+                and vision_group_ids_q is not None
+                and vision_group_ids_kv is not None
+            )
+            if packed_seq_ids_q is not None and packed_seq_ids_kv is not None:
+                allowed = _boundary_allowed_mask(
+                    attention_module,
+                    q_ctx,
+                    packed_seq_ids_q=packed_seq_ids_q,
+                    packed_seq_ids_kv=packed_seq_ids_kv,
+                    padding_mask_q=padding_mask_q,
+                    padding_mask_kv=padding_mask_kv,
+                    vision_group_ids_q=vision_group_ids_q,
+                    vision_group_ids_kv=vision_group_ids_kv,
+                    kv_global_start=kv_owner * ctx.seq_local,
+                    use_vision_bidirectional=use_vision_bidirectional,
+                )
+            else:
+                q_idx = torch.arange(ctx.seq_local, device=query_full.device).view(1, -1, 1)
+                kv_idx = torch.arange(ctx.seq_local, device=query_full.device).view(1, 1, -1)
+                allowed = _base_gemma4_cp_mask(
+                    attention_module,
+                    q_ctx,
+                    q_idx,
+                    kv_idx,
+                    kv_owner * ctx.seq_local,
+                    q_global_start=q_owner * ctx.seq_local,
+                ).expand(query_full.shape[0], -1, -1)
+            col_masks.append(allowed)
+        row_masks.append(torch.cat(col_masks, dim=-1))
+    dense_allowed_mask = torch.cat(row_masks, dim=1)
+
+    with torch.enable_grad():
+        dense_out = _original_sdpa(attention_module)(
+            query_full,
+            key_full,
+            value_full,
+            attn_mask=dense_allowed_mask[:, None, :, :],
+            dropout_p=0.0,
+            is_causal=False,
+            scale=ctx.scale,
+            enable_gqa=False,
+        )
+        dense_grads = torch.autograd.grad(dense_out, (query_full, key_full, value_full), grad_output_full)
+
+    q_start = ctx.cp_rank * ctx.seq_local
+    q_end = q_start + ctx.seq_local
+    dense_grad_query = dense_grads[0][:, :, q_start:q_end]
+    dense_grad_key = dense_grads[1][:, :, q_start:q_end]
+    dense_grad_value = dense_grads[2][:, :, q_start:q_end]
+
+    q_diff = (grad_query.detach() - dense_grad_query.detach()).float()
+    k_diff = (grad_key.detach() - dense_grad_key.detach()).float()
+    v_diff = (grad_value.detach() - dense_grad_value.detach()).float()
+    rank = _debug_rank()
+    if _debug_list_allows(rank, "NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_ALLQUERY_BACKWARD_RANKS"):
+        layer_idx = getattr(attention_module, "layer_idx", None)
+        profile_id = getattr(attention_module, "_gemma4_cp_profile_id", -1)
+        print(
+            "[GEMMA4_CP_ALLQUERY_BACKWARD] "
+            f"rank={rank} cp_rank={ctx.cp_rank} layer={layer_idx} profile_id={profile_id} "
+            f"allowed_pairs={int(dense_allowed_mask.sum().item())} "
+            f"q_norm={grad_query.detach().float().norm().item():.6e}/{dense_grad_query.detach().float().norm().item():.6e} "
+            f"q_diff_norm={q_diff.norm().item():.6e} q_diff_max={q_diff.abs().max().item():.6e} "
+            f"k_norm={grad_key.detach().float().norm().item():.6e}/{dense_grad_key.detach().float().norm().item():.6e} "
+            f"k_diff_norm={k_diff.norm().item():.6e} k_diff_max={k_diff.abs().max().item():.6e} "
+            f"v_norm={grad_value.detach().float().norm().item():.6e}/{dense_grad_value.detach().float().norm().item():.6e} "
+            f"v_diff_norm={v_diff.norm().item():.6e} v_diff_max={v_diff.abs().max().item():.6e}",
+            flush=True,
+        )
+
+
 def _run_gemma4_flex_chunk(
     attention_module: torch.nn.Module,
     ctx: Any,
@@ -723,6 +1389,26 @@ def _run_gemma4_flex_chunk(
     padded_head_dim = 1 << (orig_head_dim - 1).bit_length()
     use_small_flex_blocks = padded_head_dim > 256
     flex_block_size = (32, 32) if use_small_flex_blocks else 128
+    flex_kernel_block_q = 32
+    flex_kernel_block_kv = 32
+    forced_flex_block_size = os.environ.get("NEMO_AUTOMODEL_GEMMA4_CP_FLEX_BLOCK_SIZE")
+    if forced_flex_block_size:
+        forced_block_q, _, forced_block_kv = forced_flex_block_size.partition(",")
+        forced_block_q_int = int(forced_block_q)
+        forced_block_kv_int = int(forced_block_kv or forced_block_q)
+        flex_kernel_block_q = forced_block_q_int
+        flex_kernel_block_kv = forced_block_kv_int
+        flex_block_size = (
+            (forced_block_q_int, forced_block_kv_int)
+            if forced_block_q_int != forced_block_kv_int
+            else forced_block_q_int
+        )
+        use_small_flex_blocks = forced_block_q_int <= 64 and forced_block_kv_int <= 64
+    # torch.compile keys FlexAttention score_mod graphs by Python function code.
+    # Keep per-ring chunk offsets as tensor captures so later chunks do not reuse
+    # the first chunk's baked-in Python integer offset.
+    q_global_start_tensor = torch.tensor(ctx.seq_global_start, device=query.device, dtype=torch.int64)
+    kv_global_start_tensor = torch.tensor(kv_global_start, device=query.device, dtype=torch.int64)
 
     packed_seq_ids_q = ctx.metadata.get("_packed_seq_ids")
     packed_seq_ids_kv = metadata_chunk.get("_packed_seq_ids")
@@ -778,7 +1464,14 @@ def _run_gemma4_flex_chunk(
         ):
 
             def cp_mask(batch_idx, head_idx, q_idx, kv_idx):
-                allowed = _base_gemma4_cp_mask(attention_module, ctx, q_idx, kv_idx, kv_global_start)
+                allowed = _base_gemma4_cp_mask(
+                    attention_module,
+                    ctx,
+                    q_idx,
+                    kv_idx,
+                    kv_global_start_tensor,
+                    q_global_start=q_global_start_tensor,
+                )
                 if use_vision_bidirectional:
                     q_group = vision_group_ids_q[batch_idx, q_idx]
                     kv_group = vision_group_ids_kv[batch_idx, kv_idx]
@@ -788,20 +1481,26 @@ def _run_gemma4_flex_chunk(
                     q_pack_id = packed_seq_ids_q[batch_idx, q_idx]
                     kv_pack_id = packed_seq_ids_kv[batch_idx, kv_idx]
                     allowed = allowed & (q_pack_id == kv_pack_id) & (q_pack_id > 0)
-                    allowed = torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
                 if padding_mask_kv is not None:
                     kv_is_padding = padding_mask_kv[batch_idx, kv_idx]
                     allowed = allowed & ~kv_is_padding
                 if padding_mask_q is not None:
                     q_is_padding = padding_mask_q[batch_idx, q_idx]
-                    allowed = torch.where(q_is_padding, kv_idx == 0, allowed)
+                    allowed = allowed & ~q_is_padding
                 return allowed
 
             block_mask_batch = query.shape[0]
         else:
 
             def cp_mask(batch_idx, head_idx, q_idx, kv_idx):
-                return _base_gemma4_cp_mask(attention_module, ctx, q_idx, kv_idx, kv_global_start)
+                return _base_gemma4_cp_mask(
+                    attention_module,
+                    ctx,
+                    q_idx,
+                    kv_idx,
+                    kv_global_start_tensor,
+                    q_global_start=q_global_start_tensor,
+                )
 
             block_mask_batch = None
 
@@ -842,6 +1541,16 @@ def _run_gemma4_flex_chunk(
             query.device.index,
         )
         block_mask = _cached_block_mask(block_mask_key, _build_block_mask)
+        if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_DISABLE_FULL_BLOCKS"):
+            block_mask = type(block_mask).from_kv_blocks(
+                block_mask.kv_num_blocks,
+                block_mask.kv_indices,
+                full_kv_num_blocks=None,
+                full_kv_indices=None,
+                BLOCK_SIZE=block_mask.BLOCK_SIZE,
+                mask_mod=block_mask.mask_mod,
+                seq_lengths=block_mask.seq_lengths,
+            )
 
         batch_idx = torch.arange(query.shape[0], device=query.device).view(-1, 1, 1)
         head_idx = torch.zeros_like(batch_idx)
@@ -850,6 +1559,22 @@ def _run_gemma4_flex_chunk(
         chunk_allowed = cp_mask(batch_idx, head_idx, q_idx, kv_idx)
         if chunk_allowed.shape[0] == 1 and query.shape[0] > 1:
             chunk_allowed = chunk_allowed.expand(query.shape[0], -1, -1)
+        _debug_compare_full_dense_mask(
+            attention_module,
+            ctx,
+            chunk_allowed=chunk_allowed,
+            packed_seq_ids_q=packed_seq_ids_q,
+            padding_mask_q=padding_mask_q,
+            vision_group_ids_q=vision_group_ids_q,
+            kv_global_start=kv_global_start,
+            use_vision_bidirectional=use_vision_bidirectional,
+        )
+        _debug_compare_reference_mask(
+            attention_module,
+            ctx,
+            chunk_allowed=chunk_allowed,
+            kv_global_start=kv_global_start,
+        )
         chunk_empty_query_rows = ~chunk_allowed.any(dim=-1)
 
         query_for_flex = query
@@ -876,12 +1601,12 @@ def _run_gemma4_flex_chunk(
         }
         if use_small_flex_blocks:
             flex_kwargs["kernel_options"] = {
-                "BLOCK_M": 32,
-                "BLOCK_N": 32,
-                "BLOCK_M1": 32,
-                "BLOCK_N1": 32,
-                "BLOCK_M2": 32,
-                "BLOCK_N2": 32,
+                "BLOCK_M": flex_kernel_block_q,
+                "BLOCK_N": flex_kernel_block_kv,
+                "BLOCK_M1": flex_kernel_block_q,
+                "BLOCK_N1": flex_kernel_block_kv,
+                "BLOCK_M2": flex_kernel_block_q,
+                "BLOCK_N2": flex_kernel_block_kv,
                 "num_stages": 1,
                 "num_warps": 4,
             }
@@ -1090,6 +1815,13 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
             _log_cp_memory(ring_ctx.module, "backward_before_autograd_grad")
             grad_targets = [query_req, *key_reqs, *value_reqs]
             grads = torch.autograd.grad(out_acc, grad_targets, grad_output, allow_unused=True)
+            _debug_compare_ring_dense_backward(
+                ring_ctx.module,
+                runtime_ctx,
+                chunks=chunks,
+                grad_output=grad_output,
+                split_grads=grads,
+            )
             _log_cp_memory(ring_ctx.module, "backward_after_autograd_grad", include_tensors=True)
 
         grad_query = _zero_if_none(grads[0], query)
@@ -1118,6 +1850,15 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
             )
             grad_key = grad_key + recv_grad_key
             grad_value = grad_value + recv_grad_value
+        _debug_compare_allquery_backward(
+            ring_ctx.module,
+            replace(ring_ctx, query=query, key=key, value=value),
+            chunks=chunks,
+            grad_output=grad_output,
+            grad_query=grad_query,
+            grad_key=grad_key,
+            grad_value=grad_value,
+        )
         _log_cp_memory(ring_ctx.module, "backward_end", include_tensors=True)
 
         return grad_query, grad_key, grad_value, None
@@ -1126,6 +1867,68 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
 def _run_gemma4_cp_ring_attention(attention_module: torch.nn.Module, ctx: Any) -> torch.Tensor:
     """Run Gemma4 local-query/ring-key CP attention with FlexAttention."""
     return _Gemma4FlexRingAttention.apply(ctx.query, ctx.key, ctx.value, ctx)
+
+
+def _run_gemma4_cp_debug_dense_sdpa_attention(attention_module: torch.nn.Module, ctx: Any) -> torch.Tensor:
+    """Run the CP-prepared local attention with dense SDPA for CP1 diagnostics."""
+    if ctx.cp_size != 1:
+        raise RuntimeError("NEMO_AUTOMODEL_GEMMA4_CP_DEBUG_DENSE_SDPA is only a CP1 diagnostic.")
+
+    packed_seq_ids = ctx.metadata.get("_packed_seq_ids")
+    padding_mask = ctx.metadata.get("padding_mask")
+    vision_group_ids = ctx.metadata.get("_gemma4_vision_group_ids")
+    if vision_group_ids is None and ctx.metadata.get("mm_token_type_ids") is not None:
+        vision_group_ids = gemma4_vision_group_ids(ctx.metadata["mm_token_type_ids"])
+
+    sliding_window = getattr(attention_module, "sliding_window", None)
+    config_uses_vision_bidir = (
+        getattr(getattr(attention_module, "config", None), "use_bidirectional_attention", None) == "vision"
+    )
+    use_vision_bidirectional = sliding_window is not None and config_uses_vision_bidir and vision_group_ids is not None
+    if packed_seq_ids is not None:
+        dense_allowed_mask = _boundary_allowed_mask(
+            attention_module,
+            ctx,
+            packed_seq_ids_q=packed_seq_ids,
+            packed_seq_ids_kv=packed_seq_ids,
+            padding_mask_q=padding_mask,
+            padding_mask_kv=padding_mask,
+            vision_group_ids_q=vision_group_ids,
+            vision_group_ids_kv=vision_group_ids,
+            kv_global_start=0,
+            use_vision_bidirectional=use_vision_bidirectional,
+        )
+    else:
+        q_idx = torch.arange(ctx.seq_local, device=ctx.query.device).view(1, -1, 1)
+        kv_idx = torch.arange(ctx.seq_local, device=ctx.query.device).view(1, 1, -1)
+        dense_allowed_mask = _base_gemma4_cp_mask(
+            attention_module,
+            ctx,
+            q_idx,
+            kv_idx,
+            0,
+            q_global_start=0,
+        ).expand(ctx.query.shape[0], -1, -1)
+        if padding_mask is not None:
+            dense_allowed_mask = dense_allowed_mask & ~padding_mask[:, None, :]
+            dense_allowed_mask = torch.where(
+                padding_mask[:, :, None], torch.zeros_like(dense_allowed_mask), dense_allowed_mask
+            )
+
+    out = _original_sdpa(attention_module)(
+        ctx.query,
+        ctx.key,
+        ctx.value,
+        attn_mask=dense_allowed_mask[:, None, :, :],
+        dropout_p=ctx.dropout_p,
+        is_causal=False,
+        scale=ctx.scale,
+        enable_gqa=ctx.enable_gqa,
+    )
+    empty_query_rows = ~dense_allowed_mask.any(dim=-1)
+    if empty_query_rows.any():
+        out = out.masked_fill(empty_query_rows[:, None, :, None], 0)
+    return out.to(ctx.query.dtype)
 
 
 def _gemma4_cp_manual_attention(
@@ -1156,10 +1959,11 @@ def _gemma4_cp_manual_attention(
     seq_global_start = cp_rank * seq_local
     seq_full = seq_local * size
     if query.shape[1] != key.shape[1]:
-        num_key_value_groups = query.shape[1] // key.shape[1]
-        key = _repeat_kv_for_gqa(key, num_key_value_groups)
-        value = _repeat_kv_for_gqa(value, num_key_value_groups)
-        enable_gqa = False
+        if not _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_DEBUG_NATIVE_GQA"):
+            num_key_value_groups = query.shape[1] // key.shape[1]
+            key = _repeat_kv_for_gqa(key, num_key_value_groups)
+            value = _repeat_kv_for_gqa(value, num_key_value_groups)
+            enable_gqa = False
 
     local_metadata = getattr(attention_module, "_cp_manual_metadata", {})
     metadata_seq_dims = getattr(attention_module, "_cp_manual_metadata_seq_dims", {})
@@ -1184,6 +1988,8 @@ def _gemma4_cp_manual_attention(
         metadata=local_metadata,
         metadata_seq_dims=metadata_seq_dims,
     )
+    if _env_flag("NEMO_AUTOMODEL_GEMMA4_CP_DEBUG_DENSE_SDPA"):
+        return _run_gemma4_cp_debug_dense_sdpa_attention(attention_module, ctx)
     return _run_gemma4_cp_ring_attention(attention_module, ctx)
 
 
@@ -1201,6 +2007,7 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
     import torch.nn.functional as F_module
 
     original_sdpa = F_module.scaled_dot_product_attention
+    attention_module._gemma4_cp_original_sdpa = original_sdpa
     metadata_keys = getattr(attention_module, "_cp_manual_metadata_keys", ())
 
     @torch._dynamo.disable
@@ -1270,6 +2077,8 @@ def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module) -> None:
         "_packed_seq_ids",
         "padding_mask",
         "_gemma4_vision_group_ids",
+        "_gemma4_reference_full_attention",
+        "_gemma4_reference_sliding_attention",
     )
     attention_module._cp_manual_metadata_seq_dims = {
         "mm_token_type_ids": 1,

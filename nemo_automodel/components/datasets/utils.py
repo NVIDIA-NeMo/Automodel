@@ -384,20 +384,13 @@ def packed_sequence_thd_collater(batch):
     }
 
 
-def _indexed_mask_to_4d_block_causal(
-    attention_mask: torch.Tensor,
-    *,
-    sliding_window: int | None = None,
-) -> torch.Tensor:
+def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tensor:
     """Convert an indexed attention mask to a 4D block-causal mask.
 
     Args:
         attention_mask: Integer tensor of shape ``[B, S]`` where each
             position contains the 1-based index of the sub-sequence it
             belongs to (0 = padding).
-        sliding_window: Optional causal sliding-window size. When provided,
-            tokens can only attend to prior tokens from the same document within
-            this window.
 
     Returns:
         Bool tensor of shape ``[B, 1, S, S]`` suitable for
@@ -420,36 +413,23 @@ def _indexed_mask_to_4d_block_causal(
     not_padding_k = (attention_mask > 0).unsqueeze(1)  # [B, 1, S]
 
     mask_4d = same_doc & causal.unsqueeze(0) & not_padding_q & not_padding_k  # [B, S, S]
-    if sliding_window is not None:
-        positions = torch.arange(S, device=attention_mask.device)
-        q_positions = positions.view(1, S, 1)
-        kv_positions = positions.view(1, 1, S)
-        mask_4d = mask_4d & ((q_positions - kv_positions) < sliding_window)
 
     return mask_4d.unsqueeze(1)  # [B, 1, S, S]
 
 
-def neat_packed_collater(
-    batch: list[dict],
-    attn_implementation: str = "sdpa",
-    sliding_window: int | None = None,
-) -> dict:
+def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -> dict:
     """Collater for neat-packed LLM sequences.
 
     Stacks ``input_ids``, ``labels``, ``position_ids`` and converts the
     indexed ``attention_mask`` to the format required by the attention backend.
 
     For ``flash_attention_2``: keeps the indexed 2D mask ``[B, S]``.
-    For ``sdpa`` / ``eager``: converts to a 4D block-causal bool mask. When
-    ``sliding_window`` is provided, emits a HF hybrid-attention mask mapping so
-    sliding layers do not silently reuse the full-attention mask.
+    For ``sdpa`` / ``eager``: converts to a 4D block-causal float mask.
 
     Args:
         batch: List of sample dicts produced by ``neat_pack_dataset``.
         attn_implementation: Attention backend (``"flash_attention_2"``,
             ``"sdpa"``, or ``"eager"``).
-        sliding_window: Optional causal sliding-window size for hybrid-attention
-            models.
 
     Returns:
         Dict with batched tensors ready for model forward.
@@ -464,14 +444,6 @@ def neat_packed_collater(
 
     if attn_implementation == "flash_attention_2":
         mask_out = attention_mask
-    elif sliding_window is not None:
-        mask_out = {
-            "full_attention": _indexed_mask_to_4d_block_causal(attention_mask),
-            "sliding_attention": _indexed_mask_to_4d_block_causal(
-                attention_mask,
-                sliding_window=sliding_window,
-            ),
-        }
     else:
         mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
 

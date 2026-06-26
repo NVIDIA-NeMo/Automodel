@@ -33,14 +33,15 @@ def test_gemma4_unified_capabilities_are_cp_only():
 def test_gemma4_unified_prepare_model_inputs_for_cp_binds_batch_sharder_without_preembedding():
     sentinel = object()
     fake_self = SimpleNamespace(_cp_shard_batch=sentinel)
+    input_ids = torch.arange(8).view(1, 8)
 
     out = Gemma4UnifiedForConditionalGeneration.prepare_model_inputs_for_cp(
         fake_self,
-        input_ids=torch.arange(8).view(1, 8),
+        input_ids=input_ids,
         num_chunks=2,
     )
 
-    assert out == {"_cp_make_batch_fn": sentinel}
+    assert out == {"input_ids": input_ids, "_cp_make_batch_fn": sentinel}
 
 
 def test_gemma4_unified_prepare_model_inputs_for_cp_carries_vision_metadata():
@@ -59,6 +60,36 @@ def test_gemma4_unified_prepare_model_inputs_for_cp_carries_vision_metadata():
     assert out["_gemma4_vision_group_ids"].tolist() == [[-1, 0, 0, -1, 1, 1]]
     assert out["_cp_metadata_seq_dims"] == {"_gemma4_vision_group_ids": 1}
     assert out["_cp_metadata_pad_values"] == {"_gemma4_vision_group_ids": -1}
+
+
+def test_gemma4_unified_prepare_model_inputs_for_cp_merges_image_features():
+    sentinel = object()
+    embedding = torch.nn.Embedding(100, 4)
+    image_features = torch.tensor([[10.0, 11.0, 12.0, 13.0]])
+    fake_self = SimpleNamespace(
+        _cp_shard_batch=sentinel,
+        config=SimpleNamespace(image_token_id=42),
+        model=SimpleNamespace(get_input_embeddings=lambda: embedding),
+        _get_text_pad_token_id=lambda: 0,
+        get_image_features=lambda *args, **kwargs: SimpleNamespace(pooler_output=image_features),
+    )
+    input_ids = torch.tensor([[1, 42, 3]])
+    pixel_values = torch.randn(1, 3, 8, 8)
+    base_embeds = embedding(torch.tensor([[1, 0, 3]]))
+
+    out = Gemma4UnifiedForConditionalGeneration.prepare_model_inputs_for_cp(
+        fake_self,
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+    )
+
+    assert "input_ids" not in out
+    assert out["_cp_make_batch_fn"] is sentinel
+    torch.testing.assert_close(out["inputs_embeds"][:, 0, :], base_embeds[:, 0, :])
+    torch.testing.assert_close(out["inputs_embeds"][:, 1, :], image_features)
+    torch.testing.assert_close(out["inputs_embeds"][:, 2, :], base_embeds[:, 2, :])
+    assert out["mm_token_type_ids"].tolist() == [[0, 1, 0]]
+    assert out["_gemma4_vision_group_ids"].tolist() == [[-1, 0, -1]]
 
 
 def test_gemma4_unified_prepare_model_inputs_for_cp_requires_input_ids():

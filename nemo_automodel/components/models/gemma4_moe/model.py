@@ -19,6 +19,7 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
+import os
 from collections.abc import MutableMapping
 from typing import Any, Iterator, Optional, Union
 
@@ -1118,6 +1119,8 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                     "padding_mask": padding_mask,
                     "_packed_seq_ids": kwargs.get("_packed_seq_ids"),
                     "_gemma4_vision_group_ids": kwargs.get("_gemma4_vision_group_ids"),
+                    "_gemma4_reference_full_attention": kwargs.get("_gemma4_reference_full_attention"),
+                    "_gemma4_reference_sliding_attention": kwargs.get("_gemma4_reference_sliding_attention"),
                 }
                 # Left set (not cleared) so the activation-checkpoint recompute in
                 # backward sees the same metadata; each CP forward overwrites it.
@@ -1302,6 +1305,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     def prepare_model_inputs_for_cp(
         self,
         input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: Any | None = None,
+        _packed_seq_ids: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         image_position_ids: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
@@ -1326,6 +1332,12 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             "_cp_metadata_seq_dims": {"_gemma4_vision_group_ids": 1},
             "_cp_metadata_pad_values": {"_gemma4_vision_group_ids": -1},
         }
+        if position_ids is not None:
+            prepared_inputs["position_ids"] = position_ids
+        if attention_mask is not None:
+            prepared_inputs["attention_mask"] = attention_mask
+        if _packed_seq_ids is not None:
+            prepared_inputs["_packed_seq_ids"] = _packed_seq_ids
 
         per_layer_inputs = self._prepare_per_layer_inputs_for_cp(input_ids, special_image_mask)
         if per_layer_inputs is not None:
@@ -1467,6 +1479,22 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
             return self.config.get_text_config()
         return getattr(self.config, "text_config", self.config)
 
+    def _get_text_pad_token_id(self) -> int:
+        pad_token_id = getattr(self, "pad_token_id", None)
+        if pad_token_id is None or pad_token_id < 0:
+            text_config = self._get_text_config()
+            pad_token_id = getattr(text_config, "pad_token_id", None)
+        if pad_token_id is None or pad_token_id < 0:
+            eos_token_id = getattr(getattr(self, "config", None), "eos_token_id", None)
+            if eos_token_id is None:
+                eos_token_id = getattr(self._get_text_config(), "eos_token_id", None)
+            if isinstance(eos_token_id, (list, tuple)):
+                eos_token_id = eos_token_id[0]
+            pad_token_id = eos_token_id
+        if pad_token_id is None or pad_token_id < 0:
+            raise ValueError("Gemma4 unified CP requires a valid pad_token_id.")
+        return pad_token_id
+
     def _force_cp_sdpa(self) -> None:
         text_config = self._get_text_config()
         for cfg in (getattr(self, "config", None), text_config, getattr(getattr(self, "model", None), "config", None)):
@@ -1495,22 +1523,80 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
     def prepare_model_inputs_for_cp(
         self,
         input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: Any | None = None,
+        _packed_seq_ids: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
         **_: Any,
     ) -> dict[str, Any]:
-        """Bind Gemma4's CP batch sharder without pre-embedding text inputs."""
+        """Prepare Gemma4 unified inputs before context-parallel sharding."""
         if input_ids is None:
             raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
 
-        prepared_inputs: dict[str, Any] = {"_cp_make_batch_fn": self._cp_shard_batch}
-        if mm_token_type_ids is not None:
+        prepared_inputs: dict[str, Any] = {
+            "input_ids": input_ids,
+            "_cp_make_batch_fn": self._cp_shard_batch,
+        }
+        if position_ids is not None:
+            prepared_inputs["position_ids"] = position_ids
+        if attention_mask is not None:
+            prepared_inputs["attention_mask"] = attention_mask
+        if _packed_seq_ids is not None:
+            prepared_inputs["_packed_seq_ids"] = _packed_seq_ids
+
+        if os.environ.get("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_REFERENCE_MASK", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            reference_mask_mapping = self._prepare_packed_attention_mask_mapping(
+                attention_mask,
+                _packed_seq_ids,
+                mm_token_type_ids,
+                input_ids=input_ids,
+                inputs_embeds=prepared_inputs.get("inputs_embeds"),
+            )
+            if isinstance(reference_mask_mapping, dict):
+                for mask_name, mask_value in reference_mask_mapping.items():
+                    if mask_value is not None:
+                        prepared_inputs[f"_gemma4_reference_{mask_name}"] = mask_value
+
+        special_image_mask: torch.Tensor | None = None
+        if mm_token_type_ids is not None or pixel_values is not None:
+            special_image_mask = (
+                mm_token_type_ids == 1 if mm_token_type_ids is not None else input_ids == self.config.image_token_id
+            )
+            token_type_ids = mm_token_type_ids if mm_token_type_ids is not None else special_image_mask.to(torch.long)
             prepared_inputs.update(
                 {
-                    "mm_token_type_ids": mm_token_type_ids,
-                    "_gemma4_vision_group_ids": gemma4_vision_group_ids(mm_token_type_ids),
+                    "mm_token_type_ids": token_type_ids,
+                    "_gemma4_vision_group_ids": gemma4_vision_group_ids(token_type_ids),
                     "_cp_metadata_seq_dims": {"_gemma4_vision_group_ids": 1},
                     "_cp_metadata_pad_values": {"_gemma4_vision_group_ids": -1},
                 }
+            )
+
+        if pixel_values is not None:
+            assert special_image_mask is not None
+            llm_input_ids = input_ids.masked_fill(special_image_mask, self._get_text_pad_token_id())
+            inputs_embeds = self.model.get_input_embeddings()(llm_input_ids)
+            image_features = self.get_image_features(
+                pixel_values, image_position_ids=image_position_ids, return_dict=True
+            ).pooler_output
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+            if inputs_embeds[image_mask].numel() != image_features.numel():
+                raise ValueError(
+                    "Image features and image tokens do not match, "
+                    f"tokens: {special_image_mask.sum().item()}, features: {image_features.shape[0]}"
+                )
+            prepared_inputs.pop("input_ids")
+            prepared_inputs["inputs_embeds"] = inputs_embeds.masked_scatter(
+                image_mask,
+                image_features.to(inputs_embeds.device),
             )
         return prepared_inputs
 
@@ -1561,6 +1647,7 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         input_features: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         _pre_embed_only: bool = False,
@@ -1569,6 +1656,8 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
         if _pre_embed_only:
             return self.prepare_model_inputs_for_cp(
                 input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_position_ids=image_position_ids,
                 mm_token_type_ids=mm_token_type_ids,
                 **kwargs,
             )
@@ -1585,6 +1674,8 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
                 "padding_mask": kwargs.get("padding_mask"),
                 "_packed_seq_ids": kwargs.get("_packed_seq_ids"),
                 "_gemma4_vision_group_ids": kwargs.get("_gemma4_vision_group_ids"),
+                "_gemma4_reference_full_attention": kwargs.get("_gemma4_reference_full_attention"),
+                "_gemma4_reference_sliding_attention": kwargs.get("_gemma4_reference_sliding_attention"),
             }
             for module in self.modules():
                 if getattr(module, "_cp_uses_attention_hook", False):
@@ -1603,6 +1694,7 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
             input_features=input_features,
+            image_position_ids=image_position_ids,
             mm_token_type_ids=mm_token_type_ids,
             logits_to_keep=logits_to_keep,
             **kwargs,

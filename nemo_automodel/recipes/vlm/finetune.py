@@ -26,6 +26,7 @@ except ImportError:
     pass
 
 import logging
+import os
 import pathlib
 import time
 from contextlib import nullcontext
@@ -89,6 +90,578 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _debug_env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_rank_allows(rank: int, env_name: str) -> bool:
+    raw = os.environ.get(env_name)
+    if not raw:
+        return True
+    raw = raw.strip().lower()
+    if raw in {"all", "*"}:
+        return True
+    allowed = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            allowed.add(int(item))
+        except ValueError:
+            continue
+    return rank in allowed
+
+
+@torch.no_grad()
+def _debug_grad_fingerprint(model_parts: list[nn.Module], *, tag: str) -> None:
+    if not _debug_env_flag("NEMO_AUTOMODEL_DEBUG_GRAD_FINGERPRINT"):
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    rank = torch.distributed.get_rank()
+    patterns = [
+        item.strip()
+        for item in os.environ.get(
+            "NEMO_AUTOMODEL_DEBUG_GRAD_FINGERPRINT_PATTERNS",
+            "layers.0.self_attn.q_proj.weight,layers.0.self_attn.k_proj.weight,"
+            "layers.0.self_attn.v_proj.weight,layers.0.self_attn.o_proj.weight,"
+            "layers.5.self_attn.q_proj.weight,layers.47.mlp.down_proj.weight",
+        ).split(",")
+        if item.strip()
+    ]
+    limit = int(os.environ.get("NEMO_AUTOMODEL_DEBUG_GRAD_FINGERPRINT_LIMIT", "8"))
+    rank_allowed = _debug_rank_allows(rank, "NEMO_AUTOMODEL_DEBUG_GRAD_FINGERPRINT_RANKS")
+
+    rows = []
+    for part_idx, model_part in enumerate(model_parts):
+        for name, param in model_part.named_parameters():
+            if not any(pattern in name for pattern in patterns):
+                continue
+            grad = param.grad
+            if grad is None:
+                rows.append({"part": part_idx, "name": name, "grad": None})
+                continue
+            placements = "regular"
+            if hasattr(grad, "to_local") and _debug_env_flag("NEMO_AUTOMODEL_DEBUG_GRAD_FINGERPRINT_FULL"):
+                placements = ",".join(str(placement) for placement in getattr(grad, "placements", ()))
+                grad_local = grad.full_tensor()
+            elif hasattr(grad, "to_local"):
+                placements = ",".join(str(placement) for placement in getattr(grad, "placements", ()))
+                grad_local = grad.to_local()
+            else:
+                grad_local = grad
+            grad_float = grad_local.detach().float().reshape(-1)
+            sample = grad_float[: min(limit, grad_float.numel())].cpu().tolist()
+            rows.append(
+                {
+                    "part": part_idx,
+                    "name": name,
+                    "shape": tuple(grad_local.shape),
+                    "dtype": str(grad_local.dtype).replace("torch.", ""),
+                    "placements": placements,
+                    "sum": float(grad_float.sum().item()),
+                    "norm": float(grad_float.norm().item()),
+                    "absmax": float(grad_float.abs().max().item()) if grad_float.numel() else 0.0,
+                    "sample": [float(x) for x in sample],
+                }
+            )
+    if _debug_env_flag("NEMO_AUTOMODEL_DEBUG_GRAD_FINGERPRINT_FULL"):
+        payload = {"rank": rank, "tag": tag, "rows": rows if rank_allowed else []}
+        gathered = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, payload)
+        if rank == 0:
+            print(f"[grad-fingerprint-full] {tag} {gathered}", flush=True)
+        return
+
+    payload = {"rank": rank, "tag": tag, "rows": rows}
+    gathered = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, payload)
+    if rank == 0:
+        print(f"[grad-fingerprint] {tag} {gathered}", flush=True)
+
+
+@torch.no_grad()
+def _debug_top_grad_norms(model_parts: list[nn.Module], *, tag: str) -> None:
+    if not _debug_env_flag("NEMO_AUTOMODEL_DEBUG_TOP_GRAD_NORMS"):
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    rank = torch.distributed.get_rank()
+    limit = int(os.environ.get("NEMO_AUTOMODEL_DEBUG_TOP_GRAD_NORMS_LIMIT", "24"))
+    rank_allowed = _debug_rank_allows(rank, "NEMO_AUTOMODEL_DEBUG_TOP_GRAD_NORMS_RANKS")
+    rows = []
+    if rank_allowed:
+        for part_idx, model_part in enumerate(model_parts):
+            for name, param in model_part.named_parameters():
+                grad = param.grad
+                if grad is None:
+                    continue
+                placements = "regular"
+                if hasattr(grad, "to_local"):
+                    placements = ",".join(str(placement) for placement in getattr(grad, "placements", ()))
+                    grad_local = grad.to_local()
+                else:
+                    grad_local = grad
+                grad_float = grad_local.detach().float()
+                rows.append(
+                    {
+                        "part": part_idx,
+                        "name": name,
+                        "shape": tuple(grad_local.shape),
+                        "placements": placements,
+                        "norm": float(grad_float.norm().item()),
+                        "absmax": float(grad_float.abs().max().item()) if grad_float.numel() else 0.0,
+                    }
+                )
+        rows.sort(key=lambda row: row["norm"], reverse=True)
+        rows = rows[:limit]
+
+    payload = {"rank": rank, "tag": tag, "rows": rows}
+    gathered = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, payload)
+    if rank == 0:
+        print(f"[top-grad-norms] {tag} {gathered}", flush=True)
+
+
+@torch.no_grad()
+def _debug_hidden_fingerprint(out: Any, *, tag: str) -> None:
+    if not _debug_env_flag("NEMO_AUTOMODEL_DEBUG_HIDDEN_FINGERPRINT"):
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    hidden_states = getattr(out, "hidden_states", None)
+    if not hidden_states:
+        return
+
+    rank = torch.distributed.get_rank()
+    rank_allowed = _debug_rank_allows(rank, "NEMO_AUTOMODEL_DEBUG_HIDDEN_FINGERPRINT_RANKS")
+    raw_layers = os.environ.get("NEMO_AUTOMODEL_DEBUG_HIDDEN_FINGERPRINT_LAYERS", "0,1,6,-1")
+    layer_indices = []
+    for item in raw_layers.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            layer_indices.append(int(item))
+        except ValueError:
+            continue
+
+    rows = []
+    if not rank_allowed:
+        payload = {"rank": rank, "tag": tag, "rows": rows}
+        gathered = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, payload)
+        if rank == 0:
+            print(f"[hidden-fingerprint] {tag} {gathered}", flush=True)
+        return
+
+    for layer_idx in layer_indices:
+        resolved_idx = layer_idx if layer_idx >= 0 else len(hidden_states) + layer_idx
+        if resolved_idx < 0 or resolved_idx >= len(hidden_states):
+            continue
+        hidden = hidden_states[resolved_idx]
+        if not isinstance(hidden, torch.Tensor):
+            continue
+        seq_len = hidden.shape[1]
+        spans = [(0, seq_len)]
+        if os.environ.get("NEMO_AUTOMODEL_DEBUG_HIDDEN_FINGERPRINT_HALVES", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            mid = seq_len // 2
+            spans = [(0, mid), (mid, seq_len)]
+        for start, end in spans:
+            view = hidden[:, start:end].detach().float().reshape(-1)
+            rows.append(
+                {
+                    "layer": layer_idx,
+                    "resolved": resolved_idx,
+                    "span": (start, end),
+                    "shape": tuple(hidden[:, start:end].shape),
+                    "sum": float(view.sum().item()),
+                    "norm": float(view.norm().item()),
+                    "sample": [float(x) for x in view[: min(4, view.numel())].cpu().tolist()],
+                }
+            )
+
+    payload = {"rank": rank, "tag": tag, "rows": rows}
+    gathered = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, payload)
+    if rank == 0:
+        print(f"[hidden-fingerprint] {tag} {gathered}", flush=True)
+
+
+def _debug_register_hidden_grad_fingerprint(hidden: torch.Tensor, *, tag: str) -> None:
+    if not _debug_env_flag("NEMO_AUTOMODEL_DEBUG_HIDDEN_GRAD_FINGERPRINT"):
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    rank = torch.distributed.get_rank()
+    rank_allowed = _debug_rank_allows(rank, "NEMO_AUTOMODEL_DEBUG_HIDDEN_GRAD_FINGERPRINT_RANKS")
+
+    def _hook(grad: torch.Tensor) -> None:
+        rows = []
+        if rank_allowed:
+            seq_len = grad.shape[1]
+            spans = [(0, seq_len)]
+            if os.environ.get("NEMO_AUTOMODEL_DEBUG_HIDDEN_GRAD_FINGERPRINT_HALVES", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                mid = seq_len // 2
+                spans = [(0, mid), (mid, seq_len)]
+            for start, end in spans:
+                view = grad[:, start:end].detach().float().reshape(-1)
+                rows.append(
+                    {
+                        "span": (start, end),
+                        "shape": tuple(grad[:, start:end].shape),
+                        "sum": float(view.sum().item()),
+                        "norm": float(view.norm().item()),
+                        "absmax": float(view.abs().max().item()) if view.numel() else 0.0,
+                        "sample": [float(x) for x in view[: min(4, view.numel())].cpu().tolist()],
+                    }
+                )
+        payload = {"rank": rank, "tag": tag, "rows": rows}
+        gathered = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, payload)
+        if rank == 0:
+            print(f"[hidden-grad-fingerprint] {tag} {gathered}", flush=True)
+
+    hidden.register_hook(_hook)
+
+
+def _debug_register_hidden_states_grad_fingerprint(out: Any, *, tag: str) -> None:
+    if not _debug_env_flag("NEMO_AUTOMODEL_DEBUG_HIDDEN_STATES_GRAD_FINGERPRINT"):
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    hidden_states = getattr(out, "hidden_states", None)
+    if not hidden_states:
+        return
+
+    rank = torch.distributed.get_rank()
+    rank_allowed = _debug_rank_allows(rank, "NEMO_AUTOMODEL_DEBUG_HIDDEN_STATES_GRAD_FINGERPRINT_RANKS")
+    raw_layers = os.environ.get("NEMO_AUTOMODEL_DEBUG_HIDDEN_STATES_GRAD_FINGERPRINT_LAYERS", "0,1,6,-1")
+    layer_indices = []
+    for item in raw_layers.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            layer_indices.append(int(item))
+        except ValueError:
+            continue
+
+    for layer_idx in layer_indices:
+        resolved_idx = layer_idx if layer_idx >= 0 else len(hidden_states) + layer_idx
+        if resolved_idx < 0 or resolved_idx >= len(hidden_states):
+            continue
+        hidden = hidden_states[resolved_idx]
+        if not isinstance(hidden, torch.Tensor) or not hidden.requires_grad:
+            continue
+
+        def _make_hook(requested_idx: int, resolved: int):
+            def _hook(grad: torch.Tensor) -> None:
+                rows = []
+                if rank_allowed:
+                    view = grad.detach().float().reshape(-1)
+                    rows.append(
+                        {
+                            "layer": requested_idx,
+                            "resolved": resolved,
+                            "shape": tuple(grad.shape),
+                            "sum": float(view.sum().item()),
+                            "norm": float(view.norm().item()),
+                            "absmax": float(view.abs().max().item()) if view.numel() else 0.0,
+                            "sample": [float(x) for x in view[: min(4, view.numel())].cpu().tolist()],
+                        }
+                    )
+                payload = {"rank": rank, "tag": tag, "rows": rows}
+                gathered = [None] * torch.distributed.get_world_size()
+                torch.distributed.all_gather_object(gathered, payload)
+                if rank == 0:
+                    print(f"[hidden-states-grad-fingerprint] {tag} {gathered}", flush=True)
+
+            return _hook
+
+        hidden.register_hook(_make_hook(layer_idx, resolved_idx))
+
+
+@torch.no_grad()
+def _debug_loss_inputs(
+    hidden_states: torch.Tensor | None,
+    labels: torch.Tensor,
+    *,
+    local_loss: torch.Tensor | None = None,
+    num_label_tokens: int | None = None,
+    tag: str,
+) -> None:
+    if not _debug_env_flag("NEMO_AUTOMODEL_DEBUG_LOSS_INPUTS"):
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    rank = torch.distributed.get_rank()
+    rank_allowed = _debug_rank_allows(rank, "NEMO_AUTOMODEL_DEBUG_LOSS_INPUTS_RANKS")
+    rows = []
+    if rank_allowed:
+        label_mask = labels != -100
+        label_positions = label_mask.nonzero(as_tuple=False)
+        label_values = labels[label_mask]
+        weighted_positions = torch.arange(labels.numel(), device=labels.device, dtype=torch.long).reshape_as(labels)
+        label_checksum = (
+            (labels.masked_fill(~label_mask, 0).long() * (weighted_positions + 1)).sum().item() if labels.numel() else 0
+        )
+        row = {
+            "rank": rank,
+            "label_shape": tuple(labels.shape),
+            "label_count_local": int(label_mask.sum().item()),
+            "num_label_tokens": int(num_label_tokens) if num_label_tokens is not None else None,
+            "label_sum": int(label_values.long().sum().item()) if label_values.numel() else 0,
+            "label_checksum": int(label_checksum),
+            "first_label_positions": [[int(x) for x in pos.cpu().tolist()] for pos in label_positions[:8]],
+            "first_label_values": [int(x) for x in label_values[:8].cpu().tolist()],
+            "loss": float(local_loss.detach().float().item()) if local_loss is not None else None,
+        }
+        if hidden_states is not None:
+            selected = hidden_states[label_mask]
+            ignored = hidden_states[~label_mask]
+            selected_flat = selected.detach().float().reshape(-1)
+            ignored_flat = ignored.detach().float().reshape(-1)
+            row.update(
+                {
+                    "hidden_shape": tuple(hidden_states.shape),
+                    "label_hidden_sum": float(selected_flat.sum().item()) if selected_flat.numel() else 0.0,
+                    "label_hidden_norm": float(selected_flat.norm().item()) if selected_flat.numel() else 0.0,
+                    "label_hidden_absmax": float(selected_flat.abs().max().item()) if selected_flat.numel() else 0.0,
+                    "label_hidden_sample": [
+                        float(x) for x in selected_flat[: min(8, selected_flat.numel())].cpu().tolist()
+                    ],
+                    "ignored_hidden_sum": float(ignored_flat.sum().item()) if ignored_flat.numel() else 0.0,
+                    "ignored_hidden_norm": float(ignored_flat.norm().item()) if ignored_flat.numel() else 0.0,
+                    "ignored_hidden_absmax": float(ignored_flat.abs().max().item()) if ignored_flat.numel() else 0.0,
+                    "ignored_hidden_sample": [
+                        float(x) for x in ignored_flat[: min(8, ignored_flat.numel())].cpu().tolist()
+                    ],
+                }
+            )
+        rows.append(row)
+
+    gathered = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, {"rank": rank, "tag": tag, "rows": rows})
+    if rank == 0:
+        print(f"[loss-inputs] {tag} {gathered}", flush=True)
+
+
+@torch.no_grad()
+def _debug_label_hidden_fingerprint(out: Any, labels: torch.Tensor, *, tag: str) -> None:
+    if not _debug_env_flag("NEMO_AUTOMODEL_DEBUG_LABEL_HIDDEN_FINGERPRINT"):
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    hidden_states = getattr(out, "hidden_states", None)
+    if not hidden_states:
+        return
+    if isinstance(hidden_states, torch.Tensor):
+        hidden_states = (hidden_states,)
+
+    rank = torch.distributed.get_rank()
+    rank_allowed = _debug_rank_allows(rank, "NEMO_AUTOMODEL_DEBUG_LABEL_HIDDEN_FINGERPRINT_RANKS")
+    raw_layers = os.environ.get("NEMO_AUTOMODEL_DEBUG_LABEL_HIDDEN_FINGERPRINT_LAYERS", "0,1,6,12,24,-1")
+    layer_indices = []
+    for item in raw_layers.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            layer_indices.append(int(item))
+        except ValueError:
+            continue
+
+    rows = []
+    if rank_allowed:
+        label_mask = labels != -100
+        for layer_idx in layer_indices:
+            resolved_idx = layer_idx if layer_idx >= 0 else len(hidden_states) + layer_idx
+            if resolved_idx < 0 or resolved_idx >= len(hidden_states):
+                continue
+            hidden = hidden_states[resolved_idx]
+            if not isinstance(hidden, torch.Tensor):
+                continue
+            selected = hidden[label_mask]
+            view = selected.detach().float().reshape(-1)
+            rows.append(
+                {
+                    "layer": layer_idx,
+                    "resolved": resolved_idx,
+                    "hidden_shape": tuple(hidden.shape),
+                    "count": int(label_mask.sum().item()),
+                    "sum": float(view.sum().item()) if view.numel() else 0.0,
+                    "norm": float(view.norm().item()) if view.numel() else 0.0,
+                    "absmax": float(view.abs().max().item()) if view.numel() else 0.0,
+                    "sample": [float(x) for x in view[: min(8, view.numel())].cpu().tolist()],
+                }
+            )
+
+    gathered = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, {"rank": rank, "tag": tag, "rows": rows})
+    if rank == 0:
+        print(f"[label-hidden-fingerprint] {tag} {gathered}", flush=True)
+
+
+def _debug_first_tensor(obj: Any) -> torch.Tensor | None:
+    if isinstance(obj, torch.Tensor):
+        return obj
+    if isinstance(obj, dict):
+        for value in obj.values():
+            tensor = _debug_first_tensor(value)
+            if tensor is not None:
+                return tensor
+        return None
+    if isinstance(obj, (list, tuple)):
+        for value in obj:
+            tensor = _debug_first_tensor(value)
+            if tensor is not None:
+                return tensor
+        return None
+    return None
+
+
+@torch.no_grad()
+def _debug_tensor_stats(tensor: torch.Tensor | None) -> dict[str, Any] | None:
+    if tensor is None:
+        return None
+    view = tensor.detach().float().reshape(-1)
+    stats = {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype).replace("torch.", ""),
+        "sum": float(view.sum().item()),
+        "norm": float(view.norm().item()),
+        "absmax": float(view.abs().max().item()) if view.numel() else 0.0,
+        "sample": [float(x) for x in view[: min(4, view.numel())].cpu().tolist()],
+    }
+    raw_spans = os.environ.get("NEMO_AUTOMODEL_DEBUG_MODULE_FINGERPRINT_SPANS", "")
+    if raw_spans and tensor.ndim >= 3:
+        seq_len = tensor.shape[1]
+        span_rows = []
+        for item in raw_spans.split(","):
+            item = item.strip()
+            if not item or ":" not in item:
+                continue
+            start_raw, end_raw = item.split(":", 1)
+            try:
+                start = max(0, min(seq_len, int(start_raw)))
+                end = max(start, min(seq_len, int(end_raw)))
+            except ValueError:
+                continue
+            span_view = tensor[:, start:end].detach().float().reshape(-1)
+            span_rows.append(
+                {
+                    "span": (start, end),
+                    "sum": float(span_view.sum().item()),
+                    "norm": float(span_view.norm().item()),
+                    "absmax": float(span_view.abs().max().item()) if span_view.numel() else 0.0,
+                    "sample": [float(x) for x in span_view[: min(4, span_view.numel())].cpu().tolist()],
+                }
+            )
+        if span_rows:
+            stats["spans"] = span_rows
+    return stats
+
+
+def _debug_module_name_matches(name: str, patterns: list[str]) -> bool:
+    for pattern in patterns:
+        if pattern.startswith("="):
+            if name == pattern[1:]:
+                return True
+        elif pattern in name:
+            return True
+    return False
+
+
+def _debug_register_module_fingerprints(model_parts: list[nn.Module]) -> None:
+    if not _debug_env_flag("NEMO_AUTOMODEL_DEBUG_MODULE_FINGERPRINT"):
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    rank = torch.distributed.get_rank()
+    if not _debug_rank_allows(rank, "NEMO_AUTOMODEL_DEBUG_MODULE_FINGERPRINT_RANKS"):
+        return
+
+    patterns = [
+        item.strip()
+        for item in os.environ.get(
+            "NEMO_AUTOMODEL_DEBUG_MODULE_FINGERPRINT_PATTERNS",
+            "=model.language_model.layers.0,"
+            "=model.language_model.layers.0.input_layernorm,"
+            "=model.language_model.layers.0.self_attn,"
+            "=model.language_model.layers.0.post_attention_layernorm,"
+            "=model.language_model.layers.0.pre_feedforward_layernorm,"
+            "=model.language_model.layers.0.mlp,"
+            "=model.language_model.layers.0.post_feedforward_layernorm",
+        ).split(",")
+        if item.strip()
+    ]
+    phases = {
+        item.strip()
+        for item in os.environ.get("NEMO_AUTOMODEL_DEBUG_MODULE_FINGERPRINT_PHASES", "forward,backward").split(",")
+        if item.strip()
+    }
+
+    def _make_forward_hook(part_idx: int, name: str):
+        def _hook(module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any], output: Any) -> None:
+            input_tensor = _debug_first_tensor(args)
+            if input_tensor is None:
+                input_tensor = _debug_first_tensor(kwargs)
+            print(
+                "[module-fingerprint] "
+                f"phase=forward rank={rank} part={part_idx} name={name} "
+                f"input={_debug_tensor_stats(input_tensor)} output={_debug_tensor_stats(_debug_first_tensor(output))}",
+                flush=True,
+            )
+
+        return _hook
+
+    def _make_backward_hook(part_idx: int, name: str):
+        def _hook(module: nn.Module, grad_input: tuple[Any, ...], grad_output: tuple[Any, ...]) -> None:
+            print(
+                "[module-fingerprint] "
+                f"phase=backward rank={rank} part={part_idx} name={name} "
+                f"grad_input={_debug_tensor_stats(_debug_first_tensor(grad_input))} "
+                f"grad_output={_debug_tensor_stats(_debug_first_tensor(grad_output))}",
+                flush=True,
+            )
+
+        return _hook
+
+    registered = 0
+    for part_idx, model_part in enumerate(model_parts):
+        for name, module in model_part.named_modules():
+            if not _debug_module_name_matches(name, patterns):
+                continue
+            if "forward" in phases:
+                module.register_forward_hook(_make_forward_hook(part_idx, name), with_kwargs=True)
+            if "backward" in phases:
+                module.register_full_backward_hook(_make_backward_hook(part_idx, name))
+            registered += 1
+    if rank == 0:
+        print(f"[module-fingerprint] registered={registered} patterns={patterns}", flush=True)
+
 
 try:
     from megatron_fsdp import MegatronFSDP
@@ -642,6 +1215,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         else:
             self.model_parts = [model]
             self.pp = None
+        _debug_register_module_fingerprints(self.model_parts)
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
 
@@ -865,7 +1439,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         _cp_active = (
             self.device_mesh is not None
             and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
-            and self.device_mesh["cp"].size() > 1
+            and (self.device_mesh["cp"].size() > 1 or _debug_env_flag("NEMO_AUTOMODEL_DEBUG_FORCE_GEMMA4_CP_PATH"))
         )
         if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
             if not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False):
@@ -943,13 +1517,39 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 else:
                     out = model(**batch)
 
+                _debug_hidden_fingerprint(out, tag=f"step={self.step_scheduler.step}:microbatch={idx}:after_forward")
+                _debug_label_hidden_fingerprint(
+                    out, labels, tag=f"step={self.step_scheduler.step}:microbatch={idx}:after_forward"
+                )
+                _debug_register_hidden_states_grad_fingerprint(
+                    out, tag=f"step={self.step_scheduler.step}:microbatch={idx}:hidden_states"
+                )
+
+                final_hidden_states = get_final_hidden_states(out)
+                _debug_register_hidden_grad_fingerprint(
+                    final_hidden_states, tag=f"step={self.step_scheduler.step}:microbatch={idx}:final_hidden"
+                )
+                _debug_loss_inputs(
+                    final_hidden_states,
+                    labels,
+                    num_label_tokens=num_label_tokens,
+                    tag=f"step={self.step_scheduler.step}:microbatch={idx}:before_loss",
+                )
+
                 local_loss = calculate_loss(
                     self.loss_fn,
                     logits=getattr(out, "logits", out),
                     labels=labels,
                     model=model,
-                    hidden_states=get_final_hidden_states(out),
+                    hidden_states=final_hidden_states,
                     num_label_tokens=num_label_tokens,
+                )
+                _debug_loss_inputs(
+                    final_hidden_states,
+                    labels,
+                    local_loss=local_loss,
+                    num_label_tokens=num_label_tokens,
+                    tag=f"step={self.step_scheduler.step}:microbatch={idx}:after_loss",
                 )
                 # DSV4-style MTP loss (from main): triggers when the model emits
                 # ``mtp_per_depth_h`` / ``mtp_per_depth_logits``.
@@ -1061,6 +1661,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
             if i == 0:
                 prepare_after_first_microbatch()
+
+        _debug_grad_fingerprint(self.model_parts, tag=f"step={self.step_scheduler.step}:pre_clip")
+        _debug_top_grad_norms(self.model_parts, tag=f"step={self.step_scheduler.step}:pre_clip")
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm=max_grad_norm,
