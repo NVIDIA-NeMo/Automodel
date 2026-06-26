@@ -38,15 +38,15 @@ ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Address CVE-2025-68973; install ffmpeg dev libs for torchcodec source build
+# Address CVE-2025-68973
 RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
-    apt-get install -y --no-install-recommends ffmpeg libavdevice-dev pkg-config && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv
-ENV UV_VERSION="0.10.11"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+# Install uv; drop the base image's own /usr/local/bin copy (vulnerable rustls-webpki)
+ENV UV_VERSION="0.11.24"
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
+    rm -f /usr/local/bin/uv /usr/local/bin/uvx
 ENV PATH="/root/.local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_CACHE_DIR=/opt/uv_cache
@@ -151,6 +151,7 @@ RUN pip install "aiohttp>=3.13.3" \
         "setuptools>=80.10.2" \
         "tornado>=6.5.5" \
         "urllib3>=2.7.0" && \
+    pip uninstall -y nvidia-dali-cuda130 wandb && \
     rm -rf /opt/pytorch/pytorch/third_party/onnx
 
 FROM automodel_dep as automodel_final
@@ -171,11 +172,6 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
     fi && \
     uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS --no-cache
 
-# Rebuild torchcodec from source to match the container's PyTorch ABI
-RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
-    pip install --no-build-isolation --force-reinstall --no-deps \
-        git+https://github.com/pytorch/torchcodec.git@v0.8.0
-
 # MXFP8 MoE training (experts="torch_mm_mxfp8"): the NGC PyTorch base does not bundle
 # torchao and uv-pytorch.toml gates it off (sys_platform=='never'), so `uv sync` skips
 # it. Install explicitly AFTER the sync so it is not pruned.
@@ -187,7 +183,7 @@ RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
 # omit the kernels and MXFP8 would fall back to bf16 at runtime. setup.py has no
 # x86-only gate and cross-compiles the sm_100a kernels from the CUDA toolkit version
 # (build_for_sm100a = CUDA>=12.8; base is CUDA 13.x), so source builds on both arches.
-# --no-build-isolation reuses the container's torch ABI (same as the torchcodec rebuild).
+# --no-build-isolation reuses the container's torch ABI.
 # Pin v0.17.0 (NOT v0.14.1): v0.14.1's forward quantizes via EAGER unfused to_mx (no CUDA
 # kernel, ~49ms/iter) — a ~2.5x regression vs bf16. v0.17.0's forward is fully kernelized
 # (triton_to_mxfp8_dim0 for both activation and weight + device-side scale swizzle); it is
