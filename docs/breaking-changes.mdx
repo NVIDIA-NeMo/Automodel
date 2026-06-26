@@ -1,6 +1,6 @@
 ---
 title: "Breaking Changes"
-description: ""
+description: "Migration notes for NeMo AutoModel CLI, launcher, configuration, install, precision, and checkpoint behavior changes."
 position: 6
 ---
 ## 0.5.0
@@ -29,19 +29,19 @@ See the [mixed-precision training guide](/development/mixed-precision-training) 
 
 **Before:**
 
-```
+```bash
 automodel <command> <domain> -c <config.yaml>
 ```
 
 **After:**
 
-```
+```bash
 automodel <config.yaml> [--nproc-per-node N] [--overrides ...]
 ```
 
 A short alias `am` is also available:
 
-```
+```text
 am <config.yaml> [--nproc-per-node N] [--overrides ...]
 ```
 
@@ -72,12 +72,13 @@ Configs without this key will produce an error with guidance on which target to 
 
 ### Launcher Configuration Moved to YAML
 
-Multi-node launch settings (Kubernetes, NeMo Run) are now configured
-entirely within the YAML config file rather than through CLI arguments.
+Multi-node launch settings for SkyPilot, Kubernetes through SkyPilot, and
+NeMo Run are now configured entirely within the YAML config file rather than
+through CLI arguments.
 
 | Launcher | YAML section |
 |---|---|
-| Kubernetes | `k8s:` |
+| SkyPilot / Kubernetes | `skypilot:` with `cloud: kubernetes` for Kubernetes |
 | NeMo Run | `nemo_run:` |
 
 If none of these sections are present, the job runs locally (interactive mode).
@@ -105,15 +106,15 @@ A new `automodel[cli]` install extra is available for login nodes or environment
 where you only need to submit jobs (SLURM, k8s, NeMo-Run) without running
 training locally:
 
-```
+```bash
 pip install nemo-automodel[cli]
 ```
 
-This installs only `pyyaml` — no PyTorch, no CUDA dependencies. It is enough
-to submit jobs through SLURM or Kubernetes. If you also need NeMo Run, install it
-separately (`pip install nemo-run`). If you try to run a local/interactive job
-with the CLI-only install, you will get a clear error message with instructions
-to install the full package.
+The `cli` extra adds the job-submission dependencies declared in
+`pyproject.toml`, including `nemo-run`. It is intended for login nodes and CI
+environments that submit jobs elsewhere. For local GPU training, install the
+default package plus the extras needed by your model family, or run inside the
+NeMo AutoModel container.
 
 ### CLI Module Lives Inside the Package
 

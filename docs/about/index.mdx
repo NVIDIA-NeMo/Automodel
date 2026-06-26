@@ -1,16 +1,16 @@
 ---
 title: "About NeMo AutoModel"
-description: "Overview of NeMo AutoModel, a PyTorch DTensor-native SPMD library with optimized model implementations and a Hugging Face-compatible API for training, fine-tuning, and as an accelerated backend for other frameworks"
+description: "Overview of NeMo AutoModel, its recipe-based training model, Hugging Face-compatible APIs, distributed PyTorch stack, and where to go next."
 position: 1
 ---
-NeMo AutoModel is a PyTorch DTensor-native SPMD (Single Program, Multiple Data) open-source library under [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo). It provides **optimized model implementations** with a **Hugging Face-compatible API**, so any model on the Hub works out of the box with no checkpoint conversion. On top of that, it ships ready-made **recipes** for training and fine-tuning LLMs and VLMs at scale.
+NeMo AutoModel is a PyTorch DTensor-native SPMD (Single Program, Multiple Data) open-source library under [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo). It provides optimized implementations and Hugging Face-compatible APIs for supported model families, plus ready-made recipes for training and fine-tuning LLMs and VLMs.
 
-Because AutoModel exposes the same Autoclass interface as `transformers`, it can also be used as a **drop-in accelerated backend for other libraries** -- reinforcement learning frameworks, evaluation harnesses, or any codebase that loads Hugging Face models.
+Because AutoModel exposes familiar `transformers`-style AutoModel classes, it can also be used as an accelerated backend in reinforcement learning frameworks, evaluation harnesses, or custom training loops that already load Hugging Face models. Explore [Model Coverage](/model-coverage/overview) for supported model families and ready-to-run recipe links.
 
 ## Target Users
 
 - **Machine learning engineers**: Fine-tune and pre-train LLMs and VLMs at scale with minimal boilerplate.
-- **Researchers**: Rapidly prototype with hackable, linear training scripts and YAML-driven configuration.
+- **Researchers**: Rapidly prototype with readable, linear training scripts and YAML-driven configuration.
 - **Library and framework authors**: Use AutoModel's optimized model implementations as a drop-in replacement for `transformers` to accelerate RL, alignment, evaluation, or any downstream workflow.
 
 ## How It Works
@@ -20,13 +20,13 @@ NeMo AutoModel is built around two core ideas: **recipes** and **components**.
 - **Recipes** are executable Python scripts paired with YAML configs. Each recipe defines an end-to-end workflow -- model loading, data preparation, training loop, and checkpointing -- and can be launched with a single command.
 - **Components** are modular, self-contained building blocks (datasets, optimizers, loss functions, distribution strategies) that recipes compose together. Swap any component by changing a `_target_` field in your YAML.
 
-This design means the training loop is always visible and hackable -- no hidden abstractions. You configure parallelism, precision, and scaling through config, not code changes.
+This design keeps the training loop visible. You configure parallelism, precision, and scaling through explicit config and extension points instead of hidden framework state.
 
 ### SPMD and DTensor
 
 NeMo AutoModel uses PyTorch's native SPMD (Single Program, Multiple Data) model with DTensor and DeviceMesh:
 
-- **One program, any scale**: The same training script runs on 1 GPU or 1000+ by changing the mesh configuration.
+- **One program, multiple scales**: The same training script can run on a workstation or a multi-node job when the model, recipe, hardware, and distributed strategy support that topology.
 - **Parallelism is configuration**: Mix tensor, sequence, pipeline, and data parallelism by editing placements -- no model rewrites.
 - **Decoupled concerns**: Model code stays pure PyTorch; the parallel strategy lives in config.
 
@@ -42,10 +42,10 @@ NeMo AutoModel uses PyTorch's native SPMD (Single Program, Multiple Data) model 
 
 NeMo AutoModel builds on top of `transformers` rather than replacing it:
 
-- Load any `AutoModelForCausalLM` or `AutoModelForImageTextToText` model directly from the Hub.
+- Load supported `AutoModelForCausalLM` or `AutoModelForImageTextToText` models directly from the Hub.
 - Use Hugging Face tokenizers, datasets, and chat templates as-is.
 - Checkpoints stay in the native Hugging Face format -- no conversion step before or after training.
-- New models released on the Hub get day-0 support because AutoModel tracks the latest `transformers` version.
+- New Hugging Face model releases often work through the underlying `transformers` integration once NeMo AutoModel's pinned dependency supports them. Optimized kernels and recipes are added per model family.
 
 See the [Hugging Face API Compatibility](/get-started/hf-compatibility) guide and [Model Coverage](/model-coverage/overview) for details.
 
@@ -53,9 +53,9 @@ See the [Hugging Face API Compatibility](/get-started/hf-compatibility) guide an
 
 AutoModel ships optimized implementations for supported architectures (fused attention, TransformerEngine layers, DeepEP for MoE routing, FlexAttn) while keeping the standard `transformers` API surface. This means:
 
-- **Faster training and inference** with no code changes -- load a model the same way you would with `transformers` and get accelerated kernels automatically.
+- **Faster training and inference for supported paths** -- load a supported model the same way you would with `transformers` and use AutoModel's optimized kernels when they are available for that architecture.
 - **No checkpoint conversion** -- weights are loaded from and saved to the native Hugging Face format.
-- **Day-0 model support** -- because AutoModel builds on `transformers`, newly released models on the Hub work immediately. Optimized kernels are added incrementally for popular architectures.
+- **Broad Hugging Face compatibility** -- because AutoModel builds on `transformers`, many newly released models work once the pinned `transformers` version supports them. Optimized kernels are added incrementally for popular architectures.
 
 ## Use as a Library
 

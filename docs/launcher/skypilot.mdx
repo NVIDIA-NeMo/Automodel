@@ -1,11 +1,11 @@
 ---
 title: "Run on Any Cloud with SkyPilot"
-description: ""
+description: "Launch NeMo AutoModel recipes on cloud VMs or Kubernetes through SkyPilot, including provider setup, YAML fields, and job cleanup."
 position: 5
 ---
 In this guide, you will learn how to launch NeMo AutoModel training jobs with [SkyPilot](https://docs.skypilot.co/en/stable/docs/). SkyPilot can target public clouds such as AWS, GCP, Azure, and Lambda, and it can also submit jobs to Kubernetes clusters. For a beginner-friendly Kubernetes walkthrough, see [SkyPilot + Kubernetes tutorial](/job-launchers/skypilot-k8s). For on-premises cluster usage without SkyPilot, see [Run on a Cluster (Slurm)](/job-launchers/slurm-cluster). For single-node workstation usage, see [Run on Your Local Workstation](/job-launchers/local-workstation).
 
-SkyPilot is an open-source framework that abstracts cloud infrastructure so you can train on whichever cloud is cheapest or most available at launch time — including automatic spot-instance handling for significant cost savings.
+SkyPilot is an open-source framework that abstracts cloud infrastructure so the same AutoModel recipe can run on the provider or Kubernetes cluster you configure. It can also request spot instances when your workload can tolerate preemption.
 
 ## Before You Begin
 

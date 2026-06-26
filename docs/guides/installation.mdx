@@ -1,14 +1,16 @@
 ---
 title: "Install NeMo AutoModel"
-description: ""
+description: "Choose a NeMo AutoModel install path for PyPI, Docker, source checkouts, editable development, or login-node job submission."
 position: 3
 ---
-This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models on various platforms and environments. Depending on your use case, there are several ways to install it:
+This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models on various platforms and environments. Choose the install path based on what you are doing first:
+
+Recommended default: use the NeMo AutoModel container for GPU training, especially on clusters or when model-specific CUDA packages are involved. Use PyPI or `uv` for local Python development, CPU-only exploration, or login-node job submission. If a command uses `examples/...`, run it from a source checkout because those recipe files are not installed by the PyPI package.
 
 | Method                  | Dev Mode | Use Case                                                          | Recommended For             |
 | ----------------------- | ---------|----------------------------------------------------------------- | ---------------------------- |
-| 📦 **PyPI**             | - | Install stable release with minimal setup                         | Most users, production usage |
-| 🐳 **Docker**           | - | Use in isolated GPU environments, e.g., with NeMo container       | Multi-node deployments     |
+| 📦 **PyPI**             | - | Install stable release with minimal setup                         | Local development, CPU checks, login nodes |
+| 🐳 **Docker**           | - | Use in isolated GPU environments, e.g., with NeMo container       | GPU training and multi-node deployments |
 | 🐍 **Git Repo**         | ✅ | Use the latest code without cloning or installing extras manually | Power users, testers         |
 | 🧪 **Editable Install** | ✅ | Contribute to the codebase or make local modifications            | Contributors, researchers    |
 | 🐳 **Docker + Mount**   | ✅ | Use in isolated GPU environments, e.g., with NeMo container       | Multi-node deployments     |
@@ -50,7 +52,7 @@ Use virtualenv (PyPI, Git, or editable install) when you need:
 
 #### Linux (Debian-based: Ubuntu, Debian)
 
-**Recommended: Docker Container**
+**Recommended for GPU Training: Docker Container**
 
 Debian-based systems can have dependency conflicts with system packages. Containers provide isolation and consistency.
 
@@ -61,7 +63,7 @@ docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:26.06
 
 **Alternative: virtualenv** (if Docker is not available)
 
-Ensure CUDA 11.8+ and compatible drivers are installed:
+For bare-metal GPU training, use a CUDA and PyTorch wheel combination that matches your driver. The project lockfile currently routes Linux `uv` installs to PyTorch CUDA 13.0 wheels; Docker is the safer path if you do not control the host CUDA stack.
 
 ```bash
 # Check CUDA version
@@ -94,7 +96,7 @@ uv pip install nemo-automodel
 ```
 
 <Note>
-GPU training on macOS is not supported. Use macOS for CPU-based experimentation or remote cluster submission.
+Use macOS for CPU-based experimentation or remote cluster submission. For GPU training, start with the Linux NGC container path above or a cluster launcher.
 
 </Note>
 
@@ -133,7 +135,7 @@ Install directly in WSL2 Ubuntu environment (follow Debian instructions).
 
 ### System Requirements
 - **Python**: 3.10 or higher
-- **CUDA**: 11.8 or higher (for GPU support)
+- **GPU stack**: NVIDIA driver and CUDA/PyTorch wheels compatible with the install method you choose. For the checked-in `uv` workflow on Linux, the project currently uses PyTorch CUDA 13.0 wheels.
 - **Memory**: Minimum 16GB RAM, 32GB+ recommended
 - **Storage**: At least 50GB free space for models and datasets
 
@@ -144,11 +146,11 @@ Install directly in WSL2 Ubuntu environment (follow Debian instructions).
 - **Network**: Stable internet connection for downloading models
 
 ## Installation Options for Non-Developers
-This section explains the easiest installation options for non-developers, including using pip3 via PyPI or leveraging a preconfigured NVIDIA NeMo Docker container. Both methods offer quick access to the latest stable release of NeMo AutoModel with all required dependencies.
+This section explains the easiest installation options for non-developers, including using pip3 via PyPI or using a preconfigured NVIDIA NeMo Docker container. Use PyPI when you only need Python package access. Use the container when you need GPU training with CUDA-specific dependencies already built.
 
-### Install via PyPI (Recommended)
+### Install via PyPI
 
-For most users, the easiest way to get started is using `pip3`.
+Use PyPI when you need the Python package in an existing environment, on a login node, or for CPU-side inspection. For GPU training, prefer the container above unless you already control the CUDA and PyTorch wheel stack.
 
 ```bash
 pip3 install nemo-automodel
@@ -192,7 +194,7 @@ docker run --gpus all -it --rm \
 </Info>
 
 <Tip>
-**Models that require CUDA-specific packages (e.g., Nemotron).** Some model families—such as Nemotron Nano and Nemotron Flash—depend on packages like `mamba-ssm` and `causal-conv1d` that must be compiled against a matching CUDA toolkit. Installing these from source on a bare-metal host can be error-prone. The NeMo Automodel Docker container ships with these dependencies pre-built, so **using the container is the recommended approach** for fine-tuning Nemotron and other models with similar requirements.
+**Models that require CUDA-specific packages (e.g., Nemotron).** Some model families--such as Nemotron Nano and Nemotron Flash--depend on packages like `mamba-ssm` and `causal-conv1d` that must be compiled against a matching CUDA toolkit. Installing these from source on a bare-metal host can be error-prone. The NeMo AutoModel Docker container ships with these dependencies pre-built, so **using the container is the recommended approach** for fine-tuning Nemotron and other models with similar requirements.
 
 </Tip>
 
@@ -262,7 +264,7 @@ docker run --gpus all --network=host -it --rm \
 ```
 
 <Warning>
-The `update_pyproject_pytorch.sh` step is required. Without it, `uv sync` tries to reinstall `torch`, which causes CUDA version mismatches and TransformerEngine import failures, because `uv` cannot recognize the torch baked into the PyTorch base container.
+The `update_pyproject_pytorch.sh` step aligns the local dependency graph with the PyTorch already baked into the base container, keeping `uv sync` on the CUDA and TransformerEngine versions provided by the image.
 
 </Warning>
 
@@ -280,19 +282,17 @@ pip3 install nemo-automodel
 
 ### CLI-Only Install (Login Nodes)
 
-If you only need to **submit jobs** from a login node or CI environment (SLURM,
-SkyPilot, NeMo-Run) and do **not** need to run training locally, use the
-lightweight CLI-only install:
+If you only need to submit jobs from a login node or CI environment, install the
+CLI extra:
 
 ```bash
 pip3 install nemo-automodel[cli]
 ```
 
-This installs only `pyyaml` -- no PyTorch, no CUDA. The `automodel` and `am`
-CLI commands will be available for SLURM and SkyPilot job submission. If you
-also need the NeMo-Run launcher, install it separately (`pip install nemo-run`).
-If you accidentally try to run a local/interactive job with this install, you
-will get a clear error with instructions to install the full package.
+The `cli` extra adds the job-submission dependencies declared in
+`pyproject.toml`, including `nemo-run`. It does not make the environment a
+training image by itself. For local GPU training, use the default package plus
+the needed extras, or run inside the NeMo AutoModel container.
 
 ### VLM Dependencies
 
@@ -313,14 +313,15 @@ pip3 install nemo-automodel[cuda]
 
 ### All Extras
 
-Install everything (CUDA, VLM, NeMo-Run, etc.):
+Install the optional dependency groups intended for a broad local development
+environment:
 
 ```bash
 pip3 install nemo-automodel[all]
 ```
 
 <Tip>
-You can combine extras: `pip3 install nemo-automodel[vlm,cuda]`
+You can combine narrower extras when you know the workflow: `pip3 install nemo-automodel[vlm,cuda]`
 
 </Tip>
 
@@ -328,7 +329,7 @@ You can combine extras: `pip3 install nemo-automodel[vlm,cuda]`
 | Goal                        | Command or Method                                               |
 | --------------------------- | --------------------------------------------------------------- |
 | Stable install (PyPI)       | `pip3 install nemo-automodel`                                   |
-| CLI-only (login nodes)      | `pip3 install nemo-automodel[cli]`                              |
+| Job submission dependencies | `pip3 install nemo-automodel[cli]`                              |
 | Latest from GitHub          | `pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git` |
 | Editable install (dev mode) | `pip install -e .` after cloning                                |
 | Run without installing      | Use `PYTHONPATH=$(pwd)` to run scripts                          |

@@ -1,6 +1,6 @@
 ---
-title: "Run on a Cluster"
-description: ""
+title: "Run NeMo AutoModel on a Slurm Cluster"
+description: "Submit NeMo AutoModel training jobs on single-node or multi-node Slurm clusters using the reference sbatch script."
 position: 3
 ---
 In this guide, you will learn how to submit distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](/job-launchers/local-workstation). For setup details, refer to our [Installation Guide](/get-started/installation).
@@ -15,6 +15,10 @@ cp slurm.sub my_cluster.sub
 vim my_cluster.sub
 sbatch my_cluster.sub
 ```
+
+Expected result: Slurm prints a submitted batch job ID. Use `squeue -j <job_id>`
+to confirm the job is queued or running, and check the `slurm_jobs/` output and
+error files configured in the script for training logs.
 
 For interactive testing on a Slurm node:
   - Single node, single GPU
@@ -50,6 +54,15 @@ cp slurm.sub my_cluster.sub
 ```bash
 sbatch my_cluster.sub
 ```
+
+Verification:
+
+```bash
+squeue -j <job_id>
+tail -f slurm_jobs/<job_name>_<job_id>.out
+```
+
+The log should show `torchrun -m nemo_automodel.cli.app` starting the configured recipe. If the job exits before training starts, check the `.err` file for account/partition errors, container image access, missing mounts, Hugging Face cache or token issues, and NCCL rendezvous failures.
 
 ### How It Works
 

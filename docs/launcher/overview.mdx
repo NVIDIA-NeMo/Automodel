@@ -1,6 +1,6 @@
 ---
 title: "Job Launchers"
-description: ""
+description: "Choose how to run NeMo AutoModel locally, on Slurm, through NeMo-Run, or with SkyPilot."
 position: 1
 ---
 NeMo AutoModel provides several ways to launch training. The right choice depends on your hardware and environment.
@@ -26,10 +26,12 @@ See the [Run on Your Local Workstation](/job-launchers/local-workstation) guide.
 
 ### I Have Access to a Slurm Cluster
 
-Add a `slurm:` section to your YAML config and submit with the same `automodel` command. The CLI generates the `torchrun` invocation and calls `sbatch` for you:
+Copy the reference `slurm.sub` script, edit it for your cluster, and submit it with `sbatch`. Slurm cluster settings live in the sbatch script, not in a `slurm:` YAML section:
 
 ```bash
-automodel config_with_slurm.yaml
+cp slurm.sub my_cluster.sub
+# Edit CONFIG, SBATCH directives, container image, mounts, and secrets.
+sbatch my_cluster.sub
 ```
 
 See the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
@@ -66,4 +68,4 @@ See the [SkyPilot + Kubernetes tutorial](/job-launchers/skypilot-k8s).
 
 ## All Launchers Use the Same Config
 
-Every launcher shares the same YAML recipe format. The only difference is an optional launcher section (`slurm:`, `nemo_run:`, or `skypilot:`) that tells the CLI where to run. Without a launcher section, training runs interactively on the current machine.
+Every launcher uses the same YAML recipe format for the training workload. Local jobs need no launcher section. NeMo-Run and SkyPilot use their own YAML sections. Slurm jobs use a separate sbatch script so cluster-specific settings stay visible and editable.

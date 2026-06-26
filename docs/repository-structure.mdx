@@ -1,6 +1,6 @@
 ---
 title: "Repository Structure"
-description: ""
+description: "Map the NeMo AutoModel source tree to its core components, recipes, CLI, and extension points."
 position: 6
 ---
 This introductory guide presents the structure of the NeMo AutoModel repository, provides a brief overview of its parts, introduces concepts such as components and recipes, and explains how everything fits together.
@@ -8,8 +8,8 @@ This introductory guide presents the structure of the NeMo AutoModel repository,
 ## What is NeMo AutoModel?
 NeMo AutoModel is a PyTorch library for fine-tuning and pretraining large-scale models. In particular, it provides:
 - **Optimized implementations** for training efficiency, including fused kernels and memory-saving techniques.
-- [**Day-0 support**](/model-coverage/overview) for LLMs and VLMs available on the Hugging Face Hub.
-- **Seamless integration** with Hugging Face datasets, tokenizers, and related tools.
+- [**Hugging Face model coverage**](/model-coverage/overview) for supported LLM and VLM families.
+- **Hugging Face integration** with datasets, tokenizers, and related tools.
 - **Distributed training strategies** using FSDP2 and MegatronFSDP across multi-GPU and multi-node environments.
 - **End-to-end workflows** with recipes for data preparation, training, and evaluation.
 
@@ -25,7 +25,7 @@ Each component is designed to be dependency-light and reusable without cross-mod
 
 #### Directory Structure
 The following directory listing shows all components along with explanations of their contents.
-```
+```bash
 $ tree -L 1 nemo_automodel/components/
 
 ├── _peft/          - Implementations of PEFT methods, such as LoRA.
@@ -56,7 +56,7 @@ for a variety of tasks, such as training, fine-tuning, and knowledge distillatio
 
 #### Available Recipes
 The following directory listing shows all components along with explanations of their contents.
-```
+```bash
 $ tree -L 2 nemo_automodel/recipes/
 ├── llm
 │   ├── benchmark.py  - Benchmark recipe for LLMs
@@ -83,8 +83,6 @@ Each recipe imports the components it needs from the `nemo_automodel/components/
 The recipe/components structure enables you to:
 - Decouple individual components and replace them with custom implementations when needed.
 - Avoid rigid, class-based trainer structures by using linear scripts that expose training logic for maximum flexibility and control.
-
-{/* For an in-depth explanation of the LLM recipe please also see the [LLM recipe deep-dive guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/llm_recipe_deep_dive). */}
 
 #### Configure a Recipe
 An example YAML configuration is shown below. The complete config is available [here](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml):
@@ -116,5 +114,5 @@ SkyPilot, and NeMo-Run launchers. The CLI lives at the repository root in the
 ## Next Steps
 
 Learn how to train models with NeMo AutoModel on:
-- **Your local workstation**: See [`docs/launcher/local-workstation.md`](/job-launchers/local-workstation).
-- **A cluster**: See [`docs/launcher/slurm.md`](/job-launchers/slurm-cluster).
+- **Your local workstation**: See [`docs/launcher/local-workstation.mdx`](/job-launchers/local-workstation).
+- **A cluster**: See [`docs/launcher/slurm.mdx`](/job-launchers/slurm-cluster).

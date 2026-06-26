@@ -1,6 +1,6 @@
 ---
 title: "Run on Your Local Workstation"
-description: ""
+description: "Run NeMo AutoModel recipes on a single machine with the automodel CLI, uv, or torchrun, including single-GPU and multi-GPU launch patterns."
 position: 2
 ---
 Use this guide for local, single-node workflows on a workstation or an interactive Slurm allocation. For setup details, refer to our [Installation Guide](/get-started/installation).
@@ -10,24 +10,43 @@ NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipe
 
 ## Quick Start: Choose Your Job Launch Option
 
+The commands below use checked-in recipes, so run them from a source checkout:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv pip install -e ".[all]"
+
+# Llama is gated on Hugging Face. Accept model terms, then authenticate once.
+huggingface-cli login
+```
+
 - **CLI (recommended)**
   ```bash
-  automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+  automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+    --step_scheduler.max_steps=5 \
+    --validation_dataset.limit_dataset_samples=8
   ```
 
 - **Direct recipe script**
   - Single GPU
     ```bash
-    python nemo_automodel/recipes/llm/train_ft.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+    python nemo_automodel/recipes/llm/train_ft.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+      --step_scheduler.max_steps=5 \
+      --validation_dataset.limit_dataset_samples=8
     ```
   - Multi-GPU (single node)
     ```bash
-    torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/train_ft.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+    torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/train_ft.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+      --step_scheduler.max_steps=5 \
+      --validation_dataset.limit_dataset_samples=8
     ```
+
+Expected result: the run prints the selected recipe and model, loads the dataset, and logs `train_loss` for a few steps. The smoke-test overrides shorten the run and validation set; remove them for normal training. For gated Hugging Face models, accept the model terms and provide credentials with `HF_TOKEN` or `huggingface-cli login`.
 
 ## Run with AutoModel CLI (Single Node)
 
-The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training scaling from a local workstation (this guide) to large clusters (see our [cluster guide](/job-launchers/slurm-cluster)).
+The AutoModel CLI is the preferred method for most users. It launches the same recipe YAML locally, on a single multi-GPU node, or through the cluster launcher patterns in [Run on a Cluster](/job-launchers/slurm-cluster).
 
 ### Basic Usage
 

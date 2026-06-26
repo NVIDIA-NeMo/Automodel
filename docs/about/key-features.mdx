@@ -3,13 +3,13 @@ title: "Key Features and Concepts"
 description: "Key features and core concepts of NeMo AutoModel for scalable LLM and VLM training with Hugging Face integration"
 position: 2
 ---
-NeMo AutoModel provides GPU-accelerated, `transformers`-compatible training for LLMs and VLMs. It combines Hugging Face's model ecosystem with NVIDIA's optimized training stack, delivering high throughput without sacrificing ease of use.
+NeMo AutoModel provides GPU-accelerated, `transformers`-compatible training for supported LLMs and VLMs. It combines Hugging Face model loading with NVIDIA's distributed training stack while keeping recipes and configuration visible.
 
 ## Why NeMo AutoModel?
 
-- **Hugging Face native**: Train any model from the Hub with no checkpoint conversion -- day-0 support for new releases.
-- **High performance**: Custom CUDA kernels (TransformerEngine, DeepEP, FlexAttn) deliver up to 279 TFLOPs/sec/GPU.
-- **Any scale**: The same recipe runs on 1 GPU or across hundreds of nodes -- parallelism is configuration, not code.
+- **Hugging Face native**: Train supported Hub models without converting checkpoints into a NeMo-only format.
+- **High performance**: Custom CUDA kernels such as TransformerEngine, DeepEP, and FlexAttn are available for supported architectures. See the benchmark page for methodology and caveats.
+- **Scales through configuration**: Recipes can move from local launch to multi-node launch when the model, dataset, hardware, and distributed strategy support it.
 - **Hackable**: Linear training scripts with YAML config. No hidden trainer abstractions.
 - **Open source**: Apache 2.0 licensed, NVIDIA-supported, and actively maintained.
 
@@ -76,7 +76,7 @@ FP8 training via torchao for reduced memory and higher throughput on supported m
 </Card>
 
 <Card title="Multi-Node with SLURM">
-Add a `slurm:` section to any YAML config and launch with the `automodel` CLI. See the [Cluster guide](/job-launchers/slurm-cluster).
+Copy `slurm.sub`, edit the `CONFIG`, `#SBATCH`, container, mount, and secret settings for your cluster, then submit with `sbatch`. See the [Cluster guide](/job-launchers/slurm-cluster).
 </Card>
 
 </Cards>
@@ -142,7 +142,9 @@ The CLI simplifies job launch across environments:
 automodel config.yaml
 
 # Multi-node SLURM batch
-sbatch my_cluster.sub  # copy slurm.sub, edit CONFIG & SBATCH directives, then submit
+cp slurm.sub my_cluster.sub
+# Edit CONFIG, SBATCH directives, container image, mounts, and secrets.
+sbatch my_cluster.sub
 ```
 
 See the [Run on Your Local Workstation](/job-launchers/local-workstation) and [Cluster](/job-launchers/slurm-cluster) guides.
