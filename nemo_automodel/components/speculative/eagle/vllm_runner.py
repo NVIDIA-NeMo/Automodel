@@ -76,7 +76,9 @@ def vllm_dtype_str(dtype: Optional[torch.dtype]) -> str:
     return _VLLM_DTYPE_STRINGS[dtype]
 
 
-def _load_target_head_weights(model_path: str, device: torch.device):
+def _load_target_head_weights(
+    model_path: str, device: torch.device
+):  # pragma: no cover - reads model safetensors on the GPU server
     """Load ``(embed, final_norm, lm_head)`` weights straight from the safetensors.
 
     The real weights live inside the vLLM engine (a separate process), so the
