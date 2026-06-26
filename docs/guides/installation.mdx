@@ -304,8 +304,8 @@ pip3 install nemo-automodel[vlm]
 
 <Note>
 `[vlm]` installs the core VLM stack (image processors, tokenizers). Models that
-decode **video** or use **OpenCV / Qwen vision preprocessing** — Qwen2.5-VL,
-Qwen3-VL, Qwen3-Omni, Mistral VLMs, and Nemotron-Omni — additionally require the
+decode video or use OpenCV / Qwen vision preprocessing — Qwen2.5-VL, Qwen3-VL,
+Qwen3-Omni, Mistral VLMs, and Nemotron-Omni — additionally require the
 `vlm-media` extra (see [Media Extras](#media-extras-video--image-decode)):
 
 ```bash
@@ -317,8 +317,8 @@ pip3 install "nemo-automodel[vlm,vlm-media]"
 ### Media Extras (Video & Image Decode)
 
 Media decode dependencies (OpenCV, decord, PyAV via the Qwen utils, and
-imageio-ffmpeg) bundle **FFmpeg** and are kept **opt-in** so the default install
-and the shipped Docker image stay clear of FFmpeg CVEs. They are split by domain:
+imageio-ffmpeg) bundle FFmpeg, which is no longer packaged in the container.
+They are opt-in and split by domain:
 
 | Extra | Pulls in | Needed for |
 |-------|----------|------------|
@@ -332,8 +332,8 @@ pip3 install "nemo-automodel[diffusion,diffusion-media]"  # diffusion + media
 ```
 
 <Warning>
-**`[all]` does NOT include the media extras, and the Docker image ships without
-them** — deliberately, to keep FFmpeg out of the scanned image. After
+**`[all]` does not include the media extras**, and the Docker image ships
+without them — FFmpeg is no longer packaged in the container. After
 `pip3 install nemo-automodel[all]` (or inside the container) add media
 explicitly: `pip3 install nemo-automodel[media]`.
 
