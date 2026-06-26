@@ -43,9 +43,10 @@ RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv
+# Install uv; drop the base image's own /usr/local/bin copy (vulnerable rustls-webpki)
 ENV UV_VERSION="0.11.24"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
+    rm -f /usr/local/bin/uv /usr/local/bin/uvx
 ENV PATH="/root/.local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_CACHE_DIR=/opt/uv_cache
@@ -150,7 +151,7 @@ RUN pip install "aiohttp>=3.13.3" \
         "setuptools>=80.10.2" \
         "tornado>=6.5.5" \
         "urllib3>=2.7.0" && \
-    pip uninstall -y nvidia-dali-cuda130 && \
+    pip uninstall -y nvidia-dali-cuda130 wandb && \
     rm -rf /opt/pytorch/pytorch/third_party/onnx
 
 FROM automodel_dep as automodel_final
