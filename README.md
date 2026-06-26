@@ -188,10 +188,10 @@ uv venv
 
 # Choose ONE:
 uv sync --frozen  # LLM recipes (default)
-# uv sync --frozen --extra vlm  # VLM recipes (fixes: ImportError: qwen_vl_utils is not installed)
+# uv sync --frozen --extra vlm --extra vlm-media  # VLM recipes (Qwen/Mistral/Omni need vlm-media for video/vision; fixes: ImportError: qwen_vl_utils is not installed)
 # uv sync --frozen --extra cuda  # Optional CUDA deps (e.g., Transformer Engine, bitsandbytes)
-# uv sync --frozen --extra all  # Most optional deps (includes `vlm` and `cuda`)
-# uv sync --frozen --all-extras  # Everything (includes `fa`, `moe`, etc.)
+# uv sync --frozen --extra all  # Most optional deps (includes `vlm` and `cuda`; NOTE: excludes media — add --extra media for video/image decode)
+# uv sync --frozen --all-extras  # Everything (includes `fa`, `moe`, `media`, etc.)
 
 # One-off runs (examples):
 # uv run --extra vlm <command>
