@@ -45,12 +45,28 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
+    forced_gated_delta_net_fp32_dtype_mapping,
+    route_fp32_holder_key,
+    strip_fp32_holder_key,
+    upcast_gated_delta_net_fp32_state_tensor,
+)
 from nemo_automodel.components.models.qwen3_5.state_dict_adapter import (
     map_qwen3_5_mtp_from_hf_key,
     map_qwen3_5_mtp_to_hf_key,
 )
 from nemo_automodel.components.moe import state_dict_utils
 from nemo_automodel.components.moe.layers import MoEConfig
+
+
+def _strip_fp32_params(key: str) -> str:
+    """Strip the fp32 holder segment from GDN state-dict keys."""
+    return strip_fp32_holder_key(key)
+
+
+def _route_fp32_params(key: str) -> str:
+    """Route bare GDN fp32 params into the holder used by the native module."""
+    return route_fp32_holder_key(key)
 
 
 class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
@@ -86,17 +102,53 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         moe_config: MoEConfig,
         backend: BackendConfig,
         dtype: torch.dtype = torch.float32,
+        pretrained_model_name_or_path: str | None = None,
+        mtp_expert_hf_layout: str | None = None,
     ):
         self.config = config
         self.moe_config = moe_config
         self.backend = backend
         self.dtype = dtype
+        self.pretrained_model_name_or_path = pretrained_model_name_or_path
+        self.mtp_expert_hf_layout = mtp_expert_hf_layout
         self._uses_model_prefix = True
 
         self.hf_to_internal_map = {
             ".mlp.shared_expert.": ".mlp.shared_experts.",
         }
         self.internal_to_hf_map = {v: k for k, v in self.hf_to_internal_map.items()}
+
+    def _get_mtp_expert_hf_layout(self) -> str:
+        """Return whether MTP experts are stored as split or grouped HF tensors."""
+        layout = self.mtp_expert_hf_layout
+        if layout is None:
+            config_layout = getattr(self.config, "mtp_expert_hf_layout", None)
+            layout = config_layout if isinstance(config_layout, str) else None
+
+        if layout is not None:
+            normalized = layout.lower().replace("_", "-")
+            if normalized in {"split", "per-expert", "per-expert-safetensors"}:
+                return "split"
+            if normalized in {"grouped", "group"}:
+                return "grouped"
+            raise ValueError(f"Unsupported MTP expert HF layout: {layout!r}")
+
+        model_names = [self.pretrained_model_name_or_path]
+        for attr in ("_name_or_path", "name_or_path"):
+            value = getattr(self.config, attr, None)
+            if isinstance(value, str) and value:
+                model_names.append(value)
+
+        for model_name in model_names:
+            if not model_name:
+                continue
+            normalized_name = model_name.lower()
+            if "qwen3.5-35b-a3b" in normalized_name:
+                return "split"
+            if "qwen3.6-35b-a3b" in normalized_name:
+                return "grouped"
+
+        return "grouped"
 
     def _apply_key_mapping(self, state_dict: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
         """Apply key substring mappings to state dict keys."""
@@ -154,10 +206,15 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
 
         state_dict: dict[str, Any] = {}
         mtp_expert_parts: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
+
+        def store_native_key(native_key: str, tensor: Any) -> None:
+            native_key = route_fp32_holder_key(native_key)
+            state_dict[native_key] = upcast_gated_delta_net_fp32_state_tensor(native_key, tensor)
+
         for key, value in hf_state_dict.items():
             mapped_mtp_key = map_qwen3_5_mtp_from_hf_key(key)
             if mapped_mtp_key != key:
-                state_dict[mapped_mtp_key] = value
+                store_native_key(mapped_mtp_key, value)
                 continue
 
             match = re.match(
@@ -214,15 +271,17 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                     break
 
             if mapped_key.startswith("mtp."):
-                state_dict[mapped_key] = value
+                store_native_key(mapped_key, value)
             elif mapped_key.startswith("model.lm_head."):
-                state_dict[mapped_key.removeprefix("model.")] = value
+                store_native_key(mapped_key.removeprefix("model."), value)
             elif mapped_key.startswith("lm_head."):
-                state_dict[mapped_key] = value
+                store_native_key(mapped_key, value)
             elif key.startswith("model."):
-                state_dict[mapped_key] = value
+                store_native_key(mapped_key, value)
             else:
-                state_dict[f"{model_prefix}{mapped_key}" if not mapped_key.startswith("model.") else mapped_key] = value
+                store_native_key(
+                    f"{model_prefix}{mapped_key}" if not mapped_key.startswith("model.") else mapped_key, value
+                )
 
         for layer_num, parts in mtp_expert_parts.items():
             expert_ids = sorted(set(parts["gate_proj"]) | set(parts["up_proj"]) | set(parts["down_proj"]))
@@ -270,39 +329,43 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         value = tensor
         mtp_gate_up_match = re.match(r"mtp\.layers\.(\d+)\.mlp\.experts\.gate_and_up_projs$", fqn)
         mtp_down_match = re.match(r"mtp\.layers\.(\d+)\.mlp\.experts\.down_projs$", fqn)
-        if mtp_gate_up_match:
-            layer_num = mtp_gate_up_match.group(1)
-            splits, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
-                tensor, self.moe_config.n_routed_experts
-            )
-            result = []
-            inter_dim = self.moe_config.moe_inter_dim
-            for expert_tensor, expert_id in zip(splits, expert_ids):
-                gate = expert_tensor[:, :inter_dim].transpose(0, 1)
-                up = expert_tensor[:, inter_dim:].transpose(0, 1)
-                if not state_dict_utils.is_dtensor(gate):
-                    gate = gate.contiguous()
-                if not state_dict_utils.is_dtensor(up):
-                    up = up.contiguous()
-                result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.gate_proj.weight", gate))
-                result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.up_proj.weight", up))
-            if exclude_key_regex:
-                result = [(key, val) for key, val in result if not re.match(exclude_key_regex, key)]
-            return result
-        if mtp_down_match:
-            layer_num = mtp_down_match.group(1)
-            splits, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
-                tensor, self.moe_config.n_routed_experts
-            )
-            result = []
-            for expert_tensor, expert_id in zip(splits, expert_ids):
-                down = expert_tensor.transpose(0, 1)
-                if not state_dict_utils.is_dtensor(down):
-                    down = down.contiguous()
-                result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.down_proj.weight", down))
-            if exclude_key_regex:
-                result = [(key, val) for key, val in result if not re.match(exclude_key_regex, key)]
-            return result
+        if self._get_mtp_expert_hf_layout() == "split":
+            if mtp_gate_up_match:
+                layer_num = mtp_gate_up_match.group(1)
+                splits, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
+                    tensor, self.moe_config.n_routed_experts
+                )
+                result = []
+                inter_dim = self.moe_config.moe_inter_dim
+                for expert_tensor, expert_id in zip(splits, expert_ids):
+                    gate = expert_tensor[:, :inter_dim].transpose(0, 1)
+                    up = expert_tensor[:, inter_dim:].transpose(0, 1)
+                    if not state_dict_utils.is_dtensor(gate):
+                        gate = gate.contiguous()
+                    if not state_dict_utils.is_dtensor(up):
+                        up = up.contiguous()
+                    result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.gate_proj.weight", gate))
+                    result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.up_proj.weight", up))
+                if exclude_key_regex:
+                    result = [(key, val) for key, val in result if not re.match(exclude_key_regex, key)]
+                return result
+            if mtp_down_match:
+                layer_num = mtp_down_match.group(1)
+                splits, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
+                    tensor, self.moe_config.n_routed_experts
+                )
+                result = []
+                for expert_tensor, expert_id in zip(splits, expert_ids):
+                    down = expert_tensor.transpose(0, 1)
+                    if not state_dict_utils.is_dtensor(down):
+                        down = down.contiguous()
+                    result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.down_proj.weight", down))
+                if exclude_key_regex:
+                    result = [(key, val) for key, val in result if not re.match(exclude_key_regex, key)]
+                return result
+
+        # Qwen3.6 stores MTP experts in the same grouped layout as decoder experts,
+        # while Qwen3.5 stores MTP experts as per-expert tensors handled above.
         if ".mlp.experts.gate_and_up_projs" in fqn:
             new_fqn = fqn.replace(".mlp.experts.gate_and_up_projs", ".mlp.experts.gate_up_proj")
             value = tensor.transpose(1, 2)
@@ -316,8 +379,18 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 new_fqn = new_fqn.replace(pattern, replacement)
                 break
 
+        # Hide the GatedDeltaNet fp32 holder wrapping so saved checkpoints keep the
+        # bare HF key (``...linear_attn.A_log`` instead of
+        # ``...linear_attn._fp32_params.A_log``) and stay directly HF-loadable.
+        new_fqn = strip_fp32_holder_key(new_fqn)
+
         new_fqn = map_qwen3_5_mtp_to_hf_key(new_fqn)
+        value = upcast_gated_delta_net_fp32_state_tensor(new_fqn, value)
 
         if exclude_key_regex and re.match(exclude_key_regex, new_fqn):
             return []
         return [(new_fqn, value)]
+
+    def forced_hf_dtype_mapping(self, state_dict: dict[str, Any]) -> dict[str, str]:
+        """Return HF export dtype overrides for intrinsically-fp32 GDN tensors."""
+        return forced_gated_delta_net_fp32_dtype_mapping(state_dict)

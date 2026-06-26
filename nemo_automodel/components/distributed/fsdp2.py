@@ -99,6 +99,7 @@ class FSDP2Manager:
         self.offload_policy = config.offload_policy
         self.activation_checkpointing = config.activation_checkpointing
         self.defer_fsdp_grad_sync = config.defer_fsdp_grad_sync
+        self.reshard_after_forward = config.reshard_after_forward
         self.enable_async_tensor_parallel = config.enable_async_tensor_parallel
         self.enable_compile = config.enable_compile
         self.enable_fsdp2_prefetch = config.enable_fsdp2_prefetch
@@ -115,8 +116,8 @@ class FSDP2Manager:
         Returns:
             The parallelized model.
         """
-        if get_world_size_safe() == 1:
-            logger.info("World size is 1, skipping parallelization.")
+        if get_world_size_safe() == 1 or self.device_mesh.size() == 1:
+            logger.info("World size or FSDP mesh size is 1, skipping parallelization.")
             if self.activation_checkpointing:
                 if is_selective_activation_checkpointing(self.activation_checkpointing):
                     # Selective AC works on a plain model (no FSDP required), so
@@ -145,6 +146,7 @@ class FSDP2Manager:
             enable_fsdp2_prefetch=self.enable_fsdp2_prefetch,
             fsdp2_backward_prefetch_depth=self.fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth=self.fsdp2_forward_prefetch_depth,
+            reshard_after_forward=self.reshard_after_forward,
         )
 
         return model

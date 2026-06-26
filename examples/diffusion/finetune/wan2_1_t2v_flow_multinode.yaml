@@ -1,6 +1,7 @@
 seed: 42
 
 wandb:
+  enable: false
   project: wan-t2v-flow-matching
   mode: online
   name: wan2_1_t2v_fm_multinode_v2

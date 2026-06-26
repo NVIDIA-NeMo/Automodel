@@ -42,6 +42,45 @@ from nemo_automodel.components.distributed.parallelizer import (
 )
 
 
+def test_fsdp_accumulated_grad_guard_only_handles_missing_unsharded_param(monkeypatch):
+    """The FSDP2 guard only handles the exact missing lazy unsharded tensor case."""
+    calls = {"count": 0}
+
+    class FakeFSDPParam:
+        def __init__(self, mode="ok"):
+            self.mode = mode
+
+        def to_accumulated_grad_if_needed(self):
+            calls["count"] += 1
+            if self.mode == "missing":
+                return self._unsharded_param.grad
+            if self.mode == "other":
+                raise AttributeError("different attribute")
+            return "called"
+
+    fake_module = SimpleNamespace(FSDPParam=FakeFSDPParam)
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp._fully_shard._fsdp_param", fake_module)
+
+    parallelizer._patch_fsdp_accumulated_grad_guard()
+
+    param = FakeFSDPParam()
+    assert param.to_accumulated_grad_if_needed() == "called"
+    assert calls["count"] == 1
+
+    param.mode = "missing"
+    assert param.to_accumulated_grad_if_needed() is None
+    assert calls["count"] == 2
+
+    param.mode = "other"
+    with pytest.raises(AttributeError, match="different attribute"):
+        param.to_accumulated_grad_if_needed()
+    assert calls["count"] == 3
+
+    wrapped = FakeFSDPParam.to_accumulated_grad_if_needed
+    parallelizer._patch_fsdp_accumulated_grad_guard()
+    assert FakeFSDPParam.to_accumulated_grad_if_needed is wrapped
+
+
 class MockModel(nn.Module):
     """Mock model for testing purposes."""
 
@@ -820,6 +859,32 @@ class TestApplyFsdpShardingRecursively:
         for call in calls:
             args, kwargs = call
             assert kwargs["offload_policy"] is None
+
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    def test_apply_fsdp_sharding_module_list_respects_explicit_reshard_override(
+        self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy, mock_offload_policy
+    ):
+        """Test apply_fsdp2_sharding_recursively with an explicit reshard override."""
+        mock_mesh.mesh_dim_names = ("dp", "tp")
+
+        def mock_shard(x, **kwargs):
+            x.set_modules_to_forward_prefetch = MagicMock()
+            x.set_modules_to_backward_prefetch = MagicMock()
+            return x
+
+        mock_fully_shard.side_effect = mock_shard
+
+        apply_fsdp2_sharding_recursively(
+            module=mock_module_list,
+            mesh=mock_mesh,
+            mp_policy=mock_mp_policy,
+            offload_policy=mock_offload_policy,
+            reshard_after_forward=False,
+        )
+
+        assert mock_fully_shard.call_count == 3
+        for call in mock_fully_shard.call_args_list:
+            assert call.kwargs["reshard_after_forward"] is False
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_regular_module(

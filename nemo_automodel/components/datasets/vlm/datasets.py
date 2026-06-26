@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import json
 import logging
 import math
@@ -21,7 +22,9 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import torch
 import torch.utils.data
+from datasets import Image as HfImage
 from datasets import load_dataset
 from PIL import Image
 
@@ -111,24 +114,46 @@ def make_cord_v2_dataset(
 
 
 def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
-    """Load and preprocess the MedPix dataset for image-to-text fine-tuning."""
-    dataset = load_dataset(path_or_dataset, split=split)
+    """Load and preprocess the MedPix dataset for image-to-text fine-tuning.
 
-    def format(example):
+    Formatting is deferred to ``__getitem__`` via ``with_transform`` so the
+    dataset stays Arrow-backed (no Python-side copy of every image). Images are
+    loaded undecoded (``Image(decode=False)``) and wrapped as lazy ``PIL``
+    handles (``Image.open`` reads only the header); the actual pixel decode then
+    happens on demand in the DataLoader workers, rather than eagerly decoding the
+    whole split up front.
+    """
+    dataset = load_dataset(path_or_dataset, split=split)
+    if "image_id" in getattr(dataset, "features", {}):
+        dataset = dataset.cast_column("image_id", HfImage(decode=False))
+
+    def lazy_image(value):
+        # ``Image(decode=False)`` yields a ``{"bytes": ..., "path": ...}`` dict.
+        if isinstance(value, dict):
+            if value.get("bytes") is not None:
+                return Image.open(io.BytesIO(value["bytes"]))
+            if value.get("path"):
+                return value["path"]
+        return value
+
+    def transform(batch):
         return {
             "conversation": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": example["image_id"]},
-                        {"type": "text", "text": example["question"]},
-                    ],
-                },
-                {"role": "assistant", "content": [{"type": "text", "text": example["answer"]}]},
-            ],
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": lazy_image(image)},
+                            {"type": "text", "text": question},
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+                ]
+                for image, question, answer in zip(batch["image_id"], batch["question"], batch["answer"])
+            ]
         }
 
-    return [format(example) for example in dataset]
+    return dataset.with_transform(transform)
 
 
 def make_llava_onevision_dataset(
@@ -996,6 +1021,80 @@ def make_meta_dataset(
     return result
 
 
+def _resolve_processor_token_id(processor, attr_names, token_names):
+    """Resolve a model-specific media token id from processor/config/tokenizer."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+
+    config = getattr(processor, "config", None)
+    for source in (processor, config, tokenizer, getattr(tokenizer, "config", None)):
+        if source is None:
+            continue
+        for attr in attr_names:
+            value = getattr(source, attr, None)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str):
+                try:
+                    token_id = tokenizer.convert_tokens_to_ids(value)
+                except Exception:
+                    continue
+                if isinstance(token_id, int) and token_id != unk_id:
+                    return token_id
+    for token in token_names:
+        try:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+        except Exception:
+            continue
+        if isinstance(token_id, int) and token_id != unk_id:
+            return token_id
+    return None
+
+
+def _grid_media_token_count(grid, merge_size: int) -> int:
+    if grid is None:
+        return 0
+    grid_t = torch.as_tensor(grid)
+    if grid_t.numel() == 0:
+        return 0
+    if grid_t.ndim == 1:
+        grid_t = grid_t.view(1, -1)
+    merge_len = int(merge_size) ** 2
+    return int((grid_t.to(torch.long).prod(dim=-1) // merge_len).sum().item())
+
+
+def _media_token_mismatch(input_ids, result, processor) -> str | None:
+    """Return a mismatch description if media grids survived without tokens."""
+    image_token_id = _resolve_processor_token_id(
+        processor,
+        ("image_token_id", "image_token_index", "image_token"),
+        ("<|image_pad|>", "<image>", "<|image|>"),
+    )
+    video_token_id = _resolve_processor_token_id(
+        processor,
+        ("video_token_id", "video_token_index", "video_token"),
+        ("<|video_pad|>", "<video>", "<|video|>"),
+    )
+
+    image_grid = result.get("image_grid_thw")
+    if image_grid is not None and image_token_id is not None:
+        image_merge_size = getattr(getattr(processor, "image_processor", None), "merge_size", 2)
+        expected = _grid_media_token_count(image_grid, image_merge_size)
+        actual = int((input_ids == image_token_id).sum().item())
+        if actual != expected:
+            return f"image tokens={actual}, expected={expected}"
+
+    video_grid = result.get("video_grid_thw")
+    if video_grid is not None and video_token_id is not None:
+        video_merge_size = getattr(getattr(processor, "video_processor", None), "merge_size", 2)
+        expected = _grid_media_token_count(video_grid, video_merge_size)
+        actual = int((input_ids == video_token_id).sum().item())
+        if actual != expected:
+            return f"video tokens={actual}, expected={expected}"
+
+    return None
+
+
 class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
     """Dataset wrapper that tokenizes samples in ``__getitem__``.
 
@@ -1148,6 +1247,16 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                         for k, v in result.items()
                     }
                     seq_len = ml
+
+                mismatch = _media_token_mismatch(input_ids, result, self.processor)
+                if mismatch is not None:
+                    logger.warning(
+                        "Sample %d: media token mismatch after tokenization/truncation (%s), replacing.",
+                        idx,
+                        mismatch,
+                    )
+                    idx = random.randint(0, len(self.dataset) - 1)
+                    continue
 
                 output = {
                     "input_ids": input_ids,

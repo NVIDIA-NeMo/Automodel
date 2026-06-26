@@ -461,6 +461,11 @@ jobs:
             timeout: 20
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          - test-name: L2_MoE
+            test-folder: moe
+            timeout: 20
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
@@ -523,6 +528,9 @@ jobs:
             timeout: 20
           - test-name: L2_Retrieval
             test-folder: retrieval
+            timeout: 20
+          - test-name: L2_MoE
+            test-folder: moe
             timeout: 20
     needs: [pre-flight, cicd-unit-tests, cicd-container-build]
     runs-on: nemo-ci-gcp-gpu-x2

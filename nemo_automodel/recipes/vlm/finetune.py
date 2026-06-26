@@ -53,6 +53,7 @@ from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -81,6 +82,7 @@ from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _support
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.shared.te_patches import apply_te_patches
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -387,7 +389,38 @@ def build_dataloader(
                 )
                 _pad_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
                 _collate_max_length = packing_cfg.get("collate_max_length", None)
-                _attn_impl = get_attn_implementation(cfg_model)
+                # The packed collater builds a dense [B, 1, S, S] block-causal mask for
+                # sdpa/eager but keeps a cheap indexed [B, S] mask for flash_attention_2.
+                # At long context (e.g. 128k) the dense mask is ~S^2 bytes/sample and
+                # OOMs the dataloader workers. ``packed_sequence.attn_implementation``
+                # overrides the mask form: set it to "flash_attention_2" for
+                # context-parallel runs, where the attention mask is stripped before the
+                # model anyway (document boundaries are recovered from position_ids), so
+                # the indexed form is both sufficient and orders of magnitude cheaper.
+                # Attn computation still uses the model's backend; the attn_implementation
+                # attribute in packing_cfg only switches the collater mask format. It is
+                # therefore only safe to diverge from the model backend when cp>1, where the
+                # mask is stripped before the model. Without CP the collater mask must match
+                # the model backend, so ignore the override (and warn) and fall back to it.
+                cp_size = (
+                    device_mesh["cp"].size()
+                    if device_mesh is not None and "cp" in getattr(device_mesh, "mesh_dim_names", ())
+                    else 1
+                )
+                _model_attn_impl = get_attn_implementation(cfg_model)
+                _pack_attn_override = packing_cfg.get("attn_implementation", None)
+                if _pack_attn_override is not None and cp_size > 1:
+                    _attn_impl = _pack_attn_override
+                else:
+                    if _pack_attn_override not in (None, _model_attn_impl):
+                        logging.warning(
+                            "Ignoring packed_sequence.attn_implementation=%r at cp_size=1: the packed "
+                            "mask format must match the model attention backend (%r) when the mask is "
+                            "not stripped by context parallelism.",
+                            _pack_attn_override,
+                            _model_attn_impl,
+                        )
+                    _attn_impl = _model_attn_impl
 
                 configure_packing(attn_implementation=_attn_impl)
                 logging.info(f"Configured VLM neat packing for attn_implementation={_attn_impl}")
@@ -492,6 +525,11 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
 class FinetuneRecipeForVLM(BaseRecipe):
     """Recipe for fine-tuning a VLM model."""
 
+    # MagiAttention is disabled until setup() resolves it from config; this
+    # disabled default keeps the train step working if setup() is skipped (e.g.
+    # unit tests that exercise the step directly). It is read-only.
+    magi = MagiState()
+
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
 
@@ -534,6 +572,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         ) = self._distributed_setup_attributes(
             create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
         )
+
+        # MagiAttention (FFA) backend for the language backbone; the vision tower
+        # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
+        # model.backend.attn="magi" (custom VLMs, e.g. qwen3_vl_moe).
+        self.magi = setup_magi(self.cfg, self.device_mesh, label="VLM language backbone")
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
@@ -613,6 +656,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             distributed_setup=self.distributed_setup,
             cfg_quantization=self.cfg.get("quantization", None),
         )
+        apply_te_patches()
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
         self.optimizer = shard_optimizers_for_megatron_fsdp(
@@ -857,8 +901,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
             if not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False):
                 mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-                with torch.no_grad():
-                    prepared = _model(_pre_embed_only=True, **mm_kwargs)
+                prepared = _model(_pre_embed_only=True, **mm_kwargs)
                 for k in VLM_INPUT_KEYS:
                     batch.pop(k, None)
                 batch.update(prepared)
@@ -867,7 +910,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     if k != "input_ids":
                         batch.pop(k, None)
 
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        if self.magi.enabled:
+            # magi manages the language-backbone attention itself (vision stays on
+            # SDPA); skip the torch-native DTensor CP context.
+            train_ctx, batch = self.magi.prepare_vlm_batch(
+                self.model_parts[0], batch
+            )  # pragma: no cover - requires GPU + magi_attention
+        else:
+            train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
 
         if self.pp_enabled:

@@ -23,6 +23,7 @@ import pytest
 import torch.nn as nn
 
 from nemo_automodel._transformers.capabilities import (
+    ModelSupports,
     _build_class_dict,
     attach_capabilities_and_validate,
     validate_for_mesh,
@@ -76,6 +77,26 @@ class _WithKwargs(nn.Module):
     _supports_sdpa = True
 
     def forward(self, input_ids, **kwargs):
+        return input_ids
+
+
+class _DeepseekV4Like(nn.Module):
+    def __init__(self, backend_attn="tilelang"):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="deepseek_v4")
+        self.backend = SimpleNamespace(attn=backend_attn)
+
+    def forward(self, input_ids, seq_lens=None, **kwargs):
+        return input_ids
+
+
+class _GlmMoeDsaLike(nn.Module):
+    def __init__(self, backend_attn="tilelang"):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="glm_moe_dsa")
+        self.backend = SimpleNamespace(attn=backend_attn)
+
+    def forward(self, input_ids, seq_lens=None, **kwargs):
         return input_ids
 
 
@@ -257,6 +278,33 @@ class TestModelSupportsCP:
         _attach(model)
         assert model.supports.supports_cp is False
 
+    def test_deepseek_v4_true_with_tilelang(self):
+        model = _DeepseekV4Like(backend_attn="tilelang")
+        _attach(model)
+        assert model.supports.supports_cp is True
+
+    def test_deepseek_v4_false_with_te(self):
+        model = _DeepseekV4Like(backend_attn="te")
+        _attach(model)
+        assert model.supports.supports_cp is False
+
+    @pytest.mark.parametrize("backend_attn", ["torch", "sdpa"])
+    def test_deepseek_v4_false_without_tilelang(self, backend_attn):
+        model = _DeepseekV4Like(backend_attn=backend_attn)
+        _attach(model)
+        assert model.supports.supports_cp is False
+
+    def test_glm_moe_dsa_true_with_tilelang(self):
+        model = _GlmMoeDsaLike(backend_attn="tilelang")
+        _attach(model)
+        assert model.supports.supports_cp is True
+
+    @pytest.mark.parametrize("backend_attn", ["te", "sdpa", "torch"])
+    def test_glm_moe_dsa_false_without_tilelang(self, backend_attn):
+        model = _GlmMoeDsaLike(backend_attn=backend_attn)
+        _attach(model)
+        assert model.supports.supports_cp is False
+
 
 class TestModelSupportsEP:
     def test_ep_true_for_moe(self):
@@ -352,6 +400,35 @@ class TestModelSupportsCPWithSequencePacking:
         model._mesh = _mesh(cp=2)
         assert model.supports.supports_cp_with_sequence_packing is False
 
+    def test_deepseek_v4_cp_gt1_sequence_packing_unsupported(self):
+        model = _DeepseekV4Like()
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is False
+
+    def test_glm_moe_dsa_cp_gt1_sequence_packing_supported_with_tilelang(self):
+        model = _GlmMoeDsaLike(backend_attn="tilelang")
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is True
+
+    def test_glm_moe_dsa_cp_gt1_sequence_packing_rejects_sdpa(self):
+        model = _GlmMoeDsaLike(backend_attn="sdpa")
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is False
+
+    def test_stale_weakref_supports_descriptor_is_rebuilt(self):
+        model = _WithSDPA()
+        stale_model = _WithSDPA()
+        model._supports = ModelSupports(stale_model, _mesh())
+        del stale_model
+
+        _attach(model)
+
+        assert model.supports_cp is True
+        assert model.supports._model is model
+
 
 class TestModelSupportsRepr:
     def test_repr(self):
@@ -436,6 +513,24 @@ class TestValidateForMesh:
 
     def test_cp_passes_hf_sdpa(self):
         model = _WithSDPA()
+        _attach(model)
+        validate_for_mesh(model, _mesh(cp=2))
+
+    @pytest.mark.parametrize("backend_attn", ["te", "sdpa", "flex"])
+    def test_cp_fails_deepseek_v4_non_tilelang(self, backend_attn):
+        """DSV4 + non-tilelang + cp>1 must point the user at tilelang, not TE."""
+        model = _DeepseekV4Like(backend_attn=backend_attn)
+        _attach(model)
+        with pytest.raises(ValueError, match="Context parallelism.*TileLang attention backend"):
+            validate_for_mesh(model, _mesh(cp=2))
+
+    def test_cp_passes_deepseek_v4_tilelang(self):
+        model = _DeepseekV4Like(backend_attn="tilelang")
+        _attach(model)
+        validate_for_mesh(model, _mesh(cp=2))
+
+    def test_cp_passes_glm_moe_dsa_tilelang(self):
+        model = _GlmMoeDsaLike(backend_attn="tilelang")
         _attach(model)
         validate_for_mesh(model, _mesh(cp=2))
 

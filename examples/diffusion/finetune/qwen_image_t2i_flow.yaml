@@ -72,6 +72,7 @@ checkpoint:
   restore_from: null
 
 wandb:
+  enable: false
   project: qwen-image-finetuning
   mode: online
   name: qwen_image_finetune_run_1
@@ -79,6 +80,7 @@ wandb:
 dist_env:
   backend: "nccl"
   init_method: "env://"
+  timeout_minutes: 30
 
 seed: 42
 

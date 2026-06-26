@@ -152,7 +152,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
                 except AttributeError:
                     pass
         super().__init__(config)
-        self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_vlm_full()
+        self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_vlm_full(config)
 
         # Lazy non-persistent buffer reinit. HF's Ministral3RotaryEmbedding /
         # PixtralRotaryEmbedding compute `inv_freq` in their __init__. Under

@@ -540,7 +540,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return _retry(use_liger_kernel=False)
 
         try:
-            if use_sdpa_patching and not is_custom_model:
+            if use_sdpa_patching and (not is_custom_model or sdpa_method is not None):
                 model = _patch_attention(model, sdpa_method)  # noqa: F821
         except Exception:
             logger.warning("Retrying without SDPA patching.")
@@ -554,7 +554,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             else getattr(pretrained_model_name_or_path_or_config, "name_or_path", "")
         )
 
-        if is_hf_model:
+        if is_hf_model and attn_implementation != "magi":
             _verify_sdpa_support(model, mesh.cp_size)
 
         # HF from_pretrained on a real device loads (and potentially quantizes) weights

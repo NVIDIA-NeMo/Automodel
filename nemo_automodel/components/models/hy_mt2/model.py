@@ -279,6 +279,8 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ``from_pretrained`` / ``save_pretrained`` over the HF safetensors layout.
     """
 
+    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
