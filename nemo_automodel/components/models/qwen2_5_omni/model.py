@@ -31,9 +31,11 @@ this module is intentionally minimal:
 - does NOT inherit ``MoEFSDPSyncMixin`` (dense, no experts).
 """
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional, Union
 
 import torch
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniConfig,
     Qwen2_5OmniThinkerConfig,
@@ -42,7 +44,7 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniThinkerForConditionalGeneration as HFQwen2_5OmniThinkerForConditionalGeneration,
 )
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.qwen2_5_omni.state_dict_adapter import Qwen2_5OmniStateDictAdapter
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -61,6 +63,15 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
     HFQwen2_5OmniThinkerForConditionalGeneration,
 ):
     """Qwen2.5-Omni Thinker (audio + image + video + text → text)."""
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     @classmethod
     def from_pretrained(
@@ -134,38 +145,133 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         video_second_per_grid: torch.Tensor | None = None,
         use_audio_in_video: bool | None = None,
         position_ids: torch.Tensor | None = None,
+        past_key_values: Any = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        rope_deltas: torch.LongTensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
     ):
-        """Delegate to HF Thinker forward, passing all multimodal inputs through.
+        """Multimodal forward that mirrors HF's Thinker but supports cut-CE.
 
-        The forward signature mirrors HF's
-        ``Qwen2_5OmniThinkerForConditionalGeneration.forward``; we override
-        only to make the call site uniform with the rest of NeMo AutoModel.
+        This re-implements the body of HF's
+        ``Qwen2_5OmniThinkerForConditionalGeneration.forward`` (same
+        audio/image/video embedding merge and MRoPE index computation) so we
+        can (a) gate the ``lm_head`` projection on ``logits_to_keep`` and
+        (b) surface the FINAL hidden states (the ``lm_head`` input) on the
+        returned :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`.
+        Together these let the recipe enable
+        :class:`FusedLinearCrossEntropy` (cut-CE): it checks ``logits_to_keep``
+        is in the signature and that the output carries ``hidden_states``.
+
         Audio is mandatory for ASR; image / video paths are kept enabled so
         the same class supports the full Thinker modality set.
+
+        Args:
+            logits_to_keep: If ``0`` (default), project all positions (no slice
+                — DTensor cannot slice a full range). Otherwise compute logits
+                only for the last ``logits_to_keep`` positions before ``lm_head``.
+            output_hidden_states: When set, the returned output carries the
+                final hidden states spanning the full sequence.
+
+        Returns:
+            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with
+            ``loss`` (when ``labels`` is given), ``logits``, ``past_key_values``,
+            and ``hidden_states`` (the final hidden states when
+            ``output_hidden_states`` is set, else ``None``).
         """
-        outputs = super().forward(
-            input_ids=input_ids,
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        if inputs_embeds is None:
+            # 1. Extract the input embeddings
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        # 2. Merge text, audios, image and video
+        if input_features is not None:
+            audio_features = self.get_audio_features(
+                input_features,
+                feature_attention_mask=feature_attention_mask,
+                audio_feature_lengths=audio_feature_lengths,
+                return_dict=True,
+            ).last_hidden_state
+            audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
+            _, _, audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
+
+        if pixel_values is not None:
+            image_embeds = self.get_image_features(pixel_values, image_grid_thw, return_dict=True).pooler_output
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _, _ = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if pixel_values_videos is not None:
+            video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True).pooler_output
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            _, video_mask, _ = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+        if feature_attention_mask is not None:
+            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+        else:
+            audio_feature_lengths = None
+
+        if attention_mask is not None and position_ids is None:
+            past_key_values_length = 0 if past_key_values is None else past_key_values.get_seq_length()
+            if past_key_values_length == 0 or self.rope_deltas is None:
+                delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
+                position_ids, rope_deltas = self.get_rope_index(
+                    input_ids,
+                    image_grid_thw,
+                    video_grid_thw,
+                    attention_mask,
+                    use_audio_in_video,
+                    audio_feature_lengths,
+                    video_second_per_grid,
+                )
+                rope_deltas = rope_deltas - delta0
+                self.rope_deltas = rope_deltas
+            else:
+                batch_size, seq_length = input_ids.shape
+                delta = (past_key_values_length + self.rope_deltas).to(input_ids.device)
+                position_ids = torch.arange(seq_length, device=input_ids.device)
+                position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+                position_ids = position_ids.add(delta)
+                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+
+        outputs = self.model(
             attention_mask=attention_mask,
-            input_features=input_features,
-            feature_attention_mask=feature_attention_mask,
-            audio_feature_lengths=audio_feature_lengths,
-            pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            video_second_per_grid=video_second_per_grid,
-            use_audio_in_video=use_audio_in_video,
             position_ids=position_ids,
+            past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            labels=labels,
+            use_cache=use_cache,
+            return_dict=True,
             **kwargs,
         )
+
+        hidden_states = outputs[0]
+
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+
+        loss = None
         if labels is not None:
-            return {"logits": outputs.logits, "loss": outputs.loss}
-        return outputs.logits if hasattr(outputs, "logits") else outputs
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.get_text_config().vocab_size)
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=hidden_states if output_hidden_states else None,
+        )
 
 
 ModelClass = Qwen2_5OmniThinkerForConditionalGeneration

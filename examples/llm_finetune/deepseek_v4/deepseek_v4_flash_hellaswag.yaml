@@ -76,7 +76,7 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    dispatcher: deepep
+    dispatcher: hybridep
     experts: torch_mm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -130,3 +130,10 @@ optimizer:
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0.1
+
+ci:
+  # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
+  recipe_owner: hemildesai
+  nodes: 16
+  # Cold multi-node start + TileLang JIT runs past the 00:10:00 default.
+  time: "00:30:00"

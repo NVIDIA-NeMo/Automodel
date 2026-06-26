@@ -80,11 +80,12 @@ checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
   diffusers_compatible: true
   restore_from: null
 
 wandb:
+  enable: false
   project: flux-finetuning
   mode: online
   name: flux_pretrain_ddp_test_run_1
@@ -92,6 +93,7 @@ wandb:
 dist_env:
   backend: "nccl"
   init_method: "env://"
+  timeout_minutes: 30
 
 seed: 42
 

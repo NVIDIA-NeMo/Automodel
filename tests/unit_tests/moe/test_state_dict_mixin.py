@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, patch, MagicMock
-import re
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
@@ -244,7 +244,7 @@ class TestConcatenateExpertWeights:
                 "abstract_key2": {
                     0: torch.randn(512, 1024),
                     1: torch.randn(512, 1024),
-                }
+                },
             }
         }
 
@@ -330,14 +330,14 @@ class TestToHfWSplitExperts:
             "model.layers.0.mlp.experts.gate_and_up_projs": mock_dtensor,
         }
 
-        result = mixin._to_hf_w_split_experts(state_dict)
+        mixin._to_hf_w_split_experts(state_dict)
 
         mock_validate.assert_called_once_with(mock_dtensor, 4, "gate_and_up_projs layer 0")
 
     def test_without_model_prefix(self):
         mixin = MockMoEStateDictMixin(n_experts=4, uses_model_prefix=False)
 
-        with patch.object(mixin, '_split_experts_weights') as mock_split:
+        with patch.object(mixin, "_split_experts_weights") as mock_split:
             gate_and_up_weights = [torch.randn(1024, 1024) for _ in range(4)]
             mock_split.return_value = gate_and_up_weights
             mixin._last_expert_ids = [0, 1, 2, 3]
@@ -378,7 +378,7 @@ class TestToHfWSplitExperts:
             assert gate_key in result
             assert up_key in result
             assert result[gate_key].shape == (512, 1024)  # [inter_dim, dim]
-            assert result[up_key].shape == (512, 1024)    # [inter_dim, dim]
+            assert result[up_key].shape == (512, 1024)  # [inter_dim, dim]
 
     @patch("nemo_automodel.components.moe.state_dict_mixin.is_dtensor")
     def test_down_projs_conversion_n2(self, mock_is_dtensor):
@@ -419,10 +419,9 @@ class TestToHfWSplitExperts:
             "model.layers.0.mlp.experts.gate_and_up_projs": mock_dtensor,
         }
 
-        result = mixin._to_hf_w_split_experts(state_dict)
+        mixin._to_hf_w_split_experts(state_dict)
 
         mock_validate.assert_called_once_with(mock_dtensor, 2, "gate_and_up_projs layer 0")
-
 
     # Tests merged into TestToHfWSplitExperts
 
@@ -444,7 +443,7 @@ class TestFromHfWMergedExperts:
             key_up = f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
             hf_state_dict[key_up] = torch.randn(512, 1024)
 
-        with patch.object(mixin, '_validate_expert_availability'):
+        with patch.object(mixin, "_validate_expert_availability"):
             result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
         # Check that gate_and_up_projs tensor was created
@@ -463,10 +462,15 @@ class TestFromHfWMergedExperts:
             key_up = f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
             hf_state_dict[key_up] = torch.randn(512, 1024)
 
-        with patch.object(mixin, '_validate_expert_availability'):
-            with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank") as mock_should_load:
+        with patch.object(mixin, "_validate_expert_availability"):
+            with patch(
+                "nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank"
+            ) as mock_should_load:
                 mock_should_load.side_effect = lambda expert_id, *args: expert_id == 1  # Only load expert 1
-                with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
+                with patch(
+                    "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
+                    side_effect=lambda x, *args: x,
+                ):
                     result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
         # When only partial experts are loaded, no tensor should be created until all are available
@@ -485,9 +489,12 @@ class TestFromHfWMergedExperts:
             key_up = f"layers.0.mlp.experts.{expert_id}.up_proj.weight"
             hf_state_dict[key_up] = torch.randn(512, 1024)
 
-        with patch.object(mixin, '_validate_expert_availability'):
+        with patch.object(mixin, "_validate_expert_availability"):
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
-                with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
+                with patch(
+                    "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
+                    side_effect=lambda x, *args: x,
+                ):
                     result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
         # Result key preserves the empty prefix from input
@@ -506,9 +513,12 @@ class TestFromHfWMergedExperts:
             key_up = f"model.language_model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
             hf_state_dict[key_up] = torch.randn(512, 1024)
 
-        with patch.object(mixin, '_validate_expert_availability'):
+        with patch.object(mixin, "_validate_expert_availability"):
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
-                with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
+                with patch(
+                    "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
+                    side_effect=lambda x, *args: x,
+                ):
                     result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
         # Result key should preserve the language_model prefix
@@ -525,9 +535,12 @@ class TestFromHfWMergedExperts:
             key = f"model.language_model.layers.0.mlp.experts.{expert_id}.down_proj.weight"
             hf_state_dict[key] = torch.randn(1024, 512)  # [dim, inter_dim]
 
-        with patch.object(mixin, '_validate_expert_availability'):
+        with patch.object(mixin, "_validate_expert_availability"):
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
-                with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
+                with patch(
+                    "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
+                    side_effect=lambda x, *args: x,
+                ):
                     result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
         # Result key should preserve the language_model prefix
@@ -555,9 +568,12 @@ class TestFromHfWMergedExperts:
             "model.layers.0.mlp.experts.0.up_proj.weight": torch.randn(512, 1024),
         }
 
-        with patch.object(mixin, '_validate_expert_availability'):
+        with patch.object(mixin, "_validate_expert_availability"):
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
-                with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
+                with patch(
+                    "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
+                    side_effect=lambda x, *args: x,
+                ):
                     result = mixin._from_hf_w_merged_experts(hf_state_dict, mock_device_mesh)
 
         expected_key = "model.layers.0.mlp.experts.gate_and_up_projs"
@@ -574,10 +590,10 @@ class TestFromHfWMergedExperts:
 
         hf_state_dict = {
             "model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(512, 1024),  # [inter_dim, dim]
-            "model.layers.0.mlp.experts.0.up_proj.weight": torch.randn(512, 1024),    # [inter_dim, dim]
+            "model.layers.0.mlp.experts.0.up_proj.weight": torch.randn(512, 1024),  # [inter_dim, dim]
         }
 
-        with patch.object(mixin, '_validate_expert_availability'):
+        with patch.object(mixin, "_validate_expert_availability"):
             result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
         # Should create gate_and_up_projs tensor
@@ -597,7 +613,7 @@ class TestFromHfWMergedExperts:
             "model.layers.0.mlp.experts.0.down_proj.weight": torch.randn(1024, 512),  # [dim, inter_dim]
         }
 
-        with patch.object(mixin, '_validate_expert_availability'):
+        with patch.object(mixin, "_validate_expert_availability"):
             result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
         # Should create transposed down_projs tensor
@@ -623,10 +639,13 @@ class TestFromHfWMergedExperts:
             "model.layers.0.mlp.experts.0.up_proj.weight": mock_up_dtensor,
         }
 
-        with patch.object(mixin, '_validate_expert_availability'):
+        with patch.object(mixin, "_validate_expert_availability"):
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
-                with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
-                    result = mixin._from_hf_w_merged_experts(hf_state_dict)
+                with patch(
+                    "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
+                    side_effect=lambda x, *args: x,
+                ):
+                    mixin._from_hf_w_merged_experts(hf_state_dict)
 
         # Verify to_local was called on DTensor inputs
         mock_gate_dtensor.to_local.assert_called_once()
@@ -640,12 +659,11 @@ class TestFromHfWMergedExperts:
             "some_weight_scale_inv": torch.randn(10),  # Should be skipped
         }
 
-        with patch.object(mixin, '_validate_expert_availability'):
+        with patch.object(mixin, "_validate_expert_availability"):
             result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
         assert "some_weight" in result
         assert "some_weight_scale_inv" not in result
-
 
     # Tests merged into TestFromHfWMergedExperts
 
@@ -751,3 +769,171 @@ class TestConvertSingleMergedExpertToHfSplitExperts:
 
         mock_validate.assert_called_once_with(mock_dtensor, 2, "gate_and_up_projs layer 0")
         assert result is not None
+
+
+class TestInplaceLoadViews:
+    """to_hf returns non-contiguous views into the model's grouped tensor's
+    local storage whenever the source is a model DTensor with plain
+    (non-DTensor) per-expert splits. DCP writes safetensors data through the
+    views into model storage, and ``_from_hf_w_merged_experts`` skips the
+    rebuild for those native keys (the model already holds the data). Save
+    callers must materialize the views to contiguous before serializing —
+    see ``_materialize_to_hf_views_for_save`` in checkpointing.
+
+    The mixin re-imports ``is_dtensor`` from ``state_dict_utils`` inside the
+    conversion function, so patches must target that module path.
+    """
+
+    def _run_inplace_conversion(self, mixin, fqn, mock_dtensor, splits):
+        mixin._split_experts_weights = Mock(return_value=splits)
+        mixin._last_expert_ids = list(range(len(splits)))
+
+        with (
+            patch(
+                "nemo_automodel.components.moe.state_dict_utils.is_dtensor",
+                side_effect=lambda x: x is mock_dtensor,
+            ),
+            patch("nemo_automodel.components.moe.state_dict_utils.validate_dtensor_expert_sharding"),
+        ):
+            return mixin._convert_single_merged_expert_to_hf_split_experts(fqn, mock_dtensor)
+
+    def test_inplace_load_gate_and_up_returns_views(self):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+        # local[i] for gated has shape (dim=1024, 2*inter=1024).
+        local_storage = torch.randn(2, 1024, 1024)
+        splits = [local_storage[i] for i in range(2)]
+        mock_dtensor = Mock()
+
+        result = self._run_inplace_conversion(
+            mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
+        )
+
+        assert result is not None
+        src_ptr = local_storage.untyped_storage().data_ptr()
+        for k, v in result:
+            assert v.untyped_storage().data_ptr() == src_ptr, f"in-place view for {k} should alias model storage"
+            assert not v.is_contiguous(), f"in-place view for {k} must be the strided transpose, not a copy"
+        assert "model.layers.0.mlp.experts.gate_and_up_projs" in mixin._inplace_loaded_native_keys
+
+    def test_inplace_load_down_projs_returns_views(self):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+        # local[i] for down has shape (inter=512, dim=1024).
+        local_storage = torch.randn(2, 512, 1024)
+        splits = [local_storage[i] for i in range(2)]
+
+        # The down branch dispatches via ``tensor.shape[1] == inter_dim``, so
+        # the mock must answer that check before splits are computed.
+        mock_dtensor = Mock(spec=["ndim", "shape", "is_meta"])
+        mock_dtensor.ndim = 3
+        mock_dtensor.shape = (2, 512, 1024)
+        mock_dtensor.is_meta = False
+
+        result = self._run_inplace_conversion(mixin, "model.layers.3.mlp.experts.down_projs", mock_dtensor, splits)
+
+        assert result is not None and len(result) == 2
+        src_ptr = local_storage.untyped_storage().data_ptr()
+        for k, v in result:
+            assert v.untyped_storage().data_ptr() == src_ptr, f"in-place view for {k} should alias model storage"
+        assert "model.layers.3.mlp.experts.down_projs" in mixin._inplace_loaded_native_keys
+
+    def test_inplace_load_skips_when_source_not_dtensor(self):
+        # When tensor is a plain CPU tensor (not from the model), the in-place
+        # path must not engage — there is no model storage to alias and
+        # contiguous copies are the correct fallback.
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+        tensor = torch.randn(2, 1024, 1024)
+        fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
+
+        with patch(
+            "nemo_automodel.components.moe.state_dict_utils.is_dtensor",
+            return_value=False,
+        ):
+            result = mixin._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+
+        assert result is not None
+        for _, v in result:
+            assert v.is_contiguous(), "non-DTensor source should emit contiguous copies"
+        assert not hasattr(
+            mixin, "_inplace_loaded_native_keys"
+        ) or "model.layers.0.mlp.experts.gate_and_up_projs" not in (mixin._inplace_loaded_native_keys or set())
+
+    def test_inplace_load_writes_through_to_model_storage(self):
+        # Simulate DCP-style copy_ on the emitted views and verify the model's
+        # underlying storage is updated at the correct slice.
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+        local_storage = torch.zeros(2, 1024, 1024)
+        splits = [local_storage[i] for i in range(2)]
+        mock_dtensor = Mock()
+
+        result = self._run_inplace_conversion(
+            mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
+        )
+
+        gate0 = next(v for k, v in result if k.endswith("0.gate_proj.weight"))
+        gate0.copy_(torch.full_like(gate0, 7.0))
+        # Gated layout: local[0, :, :inter] holds gate, local[0, :, inter:] holds up.
+        assert torch.allclose(local_storage[0, :, :512], torch.full((1024, 512), 7.0))
+        assert torch.all(local_storage[0, :, 512:] == 0)
+        assert torch.all(local_storage[1] == 0)
+
+    def test_from_hf_skips_rebuild_for_inplace_loaded_keys(self):
+        # When _inplace_loaded_native_keys contains a layer's grouped key, the
+        # per-expert HF keys for that layer must NOT be merged back into a
+        # native key in the output state_dict.
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+        mixin._inplace_loaded_native_keys = {
+            "model.layers.0.mlp.experts.gate_and_up_projs",
+            "model.layers.0.mlp.experts.down_projs",
+        }
+        hf_state_dict = {}
+        for expert_id in range(2):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                hf_state_dict[f"model.layers.0.mlp.experts.{expert_id}.{proj}.weight"] = torch.randn(512, 1024)
+
+        out = mixin._from_hf_w_merged_experts(hf_state_dict)
+
+        assert "model.layers.0.mlp.experts.gate_and_up_projs" not in out
+        assert "model.layers.0.mlp.experts.down_projs" not in out
+        assert mixin._inplace_loaded_native_keys == set()
+
+    def test_inplace_load_skips_when_backend_experts_is_te_gate_and_up(self):
+        # GroupedExpertsTE (backend.experts == "te") exposes gate_and_up_projs as a
+        # torch.stack copy of per-expert weights that does not alias the model's grouped
+        # storage. Even for a DTensor source the in-place path must not engage, otherwise
+        # the copy_ would write the throwaway and the experts would never be loaded.
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+        mixin.backend.experts = "te"
+        local_storage = torch.randn(2, 1024, 1024)
+        splits = [local_storage[i] for i in range(2)]
+        mock_dtensor = Mock()
+
+        result = self._run_inplace_conversion(
+            mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
+        )
+
+        assert result is not None
+        for _, v in result:
+            assert v.is_contiguous(), "experts=='te' must emit contiguous copies, not in-place views"
+        assert not hasattr(mixin, "_inplace_loaded_native_keys") or (
+            "model.layers.0.mlp.experts.gate_and_up_projs" not in (mixin._inplace_loaded_native_keys or set())
+        )
+
+    def test_inplace_load_skips_when_backend_experts_is_te_down_projs(self):
+        # Same non-aliasing reason as the gate_and_up case, for the down_projs branch.
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+        mixin.backend.experts = "te"
+        local_storage = torch.randn(2, 512, 1024)
+        splits = [local_storage[i] for i in range(2)]
+        mock_dtensor = Mock(spec=["ndim", "shape", "is_meta"])
+        mock_dtensor.ndim = 3
+        mock_dtensor.shape = (2, 512, 1024)
+        mock_dtensor.is_meta = False
+
+        result = self._run_inplace_conversion(mixin, "model.layers.3.mlp.experts.down_projs", mock_dtensor, splits)
+
+        assert result is not None and len(result) == 2
+        for _, v in result:
+            assert v.is_contiguous(), "experts=='te' must emit contiguous copies, not in-place views"
+        assert not hasattr(mixin, "_inplace_loaded_native_keys") or (
+            "model.layers.3.mlp.experts.down_projs" not in (mixin._inplace_loaded_native_keys or set())
+        )

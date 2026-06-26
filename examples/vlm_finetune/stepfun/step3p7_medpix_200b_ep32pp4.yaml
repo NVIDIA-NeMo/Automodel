@@ -45,7 +45,7 @@ model:
     rms_norm: torch_fp32
     rope_fusion: false
     experts: gmm
-    dispatcher: deepep
+    dispatcher: hybridep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -130,7 +130,13 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 wandb:
+  enable: false
   project: <your_wandb_project>
   entity: <your_wandb_entity>
   name: <your_wandb_name>
   dir: <your_wandb_save_dir>
+
+ci:
+  time: "00:30:00"
+  # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
+  nodes: 16

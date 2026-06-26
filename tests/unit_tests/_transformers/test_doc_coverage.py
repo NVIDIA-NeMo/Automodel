@@ -20,7 +20,7 @@ lands in ``MODEL_ARCH_MAPPING`` without any corresponding page under
 import pathlib
 
 # Architectures documented under a different literal name in
-# docs/model-coverage/. Each value must appear verbatim in at least one .md
+# docs/model-coverage/. Each value must appear verbatim in at least one .mdx
 # file under docs/model-coverage/.
 #
 # Add an entry here ONLY when the documentation legitimately uses a different
@@ -76,8 +76,9 @@ _DOC_ARCH_ALIASES = {
     "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeVLForConditionalGeneration",
     # Dense Qwen3.5 text/VL backbone; grouped with the VL variants on the
     # Qwen3.5-VL page.
+    "Qwen3_5ForCausalLM": "Qwen3.5",
     "Qwen3_5ForConditionalGeneration": "Qwen3.5",
-    # HF split Seed-OSS into its own arch; the Seed page (``seed.md``) covers
+    # HF split Seed-OSS into its own arch; the Seed page (``seed.mdx``) covers
     # both Seed-Coder and Seed-OSS under the "Seed-OSS" name.
     "SeedOssForCausalLM": "Seed-OSS",
 }
@@ -89,7 +90,7 @@ def _repo_root() -> pathlib.Path:
 
 def test_every_registered_arch_has_model_coverage_doc():
     """Every architecture in ``MODEL_ARCH_MAPPING`` must be mentioned in at
-    least one ``docs/model-coverage/*.md`` file, either by its own name or by
+    least one ``docs/model-coverage/*.mdx`` file, either by its own name or by
     a mapped alias in ``_DOC_ARCH_ALIASES``.
 
     This guards against the regression where a new arch (e.g. gemma4) is
@@ -100,8 +101,8 @@ def test_every_registered_arch_has_model_coverage_doc():
     docs_dir = _repo_root() / "docs" / "model-coverage"
     assert docs_dir.is_dir(), f"docs/model-coverage/ not found at {docs_dir}"
 
-    md_contents = [p.read_text(encoding="utf-8") for p in docs_dir.rglob("*.md")]
-    assert md_contents, "No .md files found under docs/model-coverage/"
+    md_contents = [p.read_text(encoding="utf-8") for p in docs_dir.rglob("*.mdx")]
+    assert md_contents, "No .mdx files found under docs/model-coverage/"
 
     missing = []
     for arch_name in MODEL_ARCH_MAPPING:
@@ -116,9 +117,9 @@ def test_every_registered_arch_has_model_coverage_doc():
             "docs/model-coverage/:\n"
             f"{details}\n\n"
             "Fix by either:\n"
-            "  1. Adding a new .md file under docs/model-coverage/ (preferred for "
-            "new architectures — e.g., docs/model-coverage/vlm/google/gemma4.md), or\n"
-            "  2. Updating an existing .md file to mention the arch name, or\n"
+            "  1. Adding a new .mdx file under docs/model-coverage/ (preferred for "
+            "new architectures — e.g., docs/model-coverage/vlm/google/gemma4.mdx), or\n"
+            "  2. Updating an existing .mdx file to mention the arch name, or\n"
             "  3. Adding an entry to _DOC_ARCH_ALIASES in this test file with a "
             "comment explaining the mismatch."
         )
@@ -126,14 +127,14 @@ def test_every_registered_arch_has_model_coverage_doc():
 
 def test_doc_arch_aliases_target_strings_appear_in_docs():
     """Every value in ``_DOC_ARCH_ALIASES`` must literally appear in some
-    ``docs/model-coverage/*.md`` file.
+    ``docs/model-coverage/*.mdx`` file.
 
     Prevents aliases from pointing at strings that never existed or got
     removed — if the target string is missing, the aliased arch is silently
     undocumented and the doc-coverage check becomes a no-op for that entry.
     """
     docs_dir = _repo_root() / "docs" / "model-coverage"
-    md_contents = [p.read_text(encoding="utf-8") for p in docs_dir.rglob("*.md")]
+    md_contents = [p.read_text(encoding="utf-8") for p in docs_dir.rglob("*.mdx")]
 
     bad = []
     for arch, needle in _DOC_ARCH_ALIASES.items():

@@ -20,9 +20,11 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.diffusion import train as diffusion_train
 from nemo_automodel.recipes.diffusion.train import (
     TrainDiffusionRecipe,
+    _build_diffusion_parallel_manager_args,
     _calculate_throughput_metrics,
     _count_local_batch_group_samples,
     _get_diffusion_microbatch_size,
@@ -294,6 +296,111 @@ def test_transformer_engine_fp8_context_calls_transformer_engine_autocast():
     )
 
 
+def _minimal_diffusion_recipe_cfg(
+    *,
+    adapter_type="hunyuan",
+    attention_backend="flash_varlen",
+    optimize_hunyuan_flash_varlen_mask=True,
+):
+    return ConfigNode(
+        {
+            "model": {
+                "pretrained_model_name_or_path": "dummy-model",
+                "attention_backend": attention_backend,
+                "optimize_hunyuan_flash_varlen_mask": optimize_hunyuan_flash_varlen_mask,
+            },
+            "flow_matching": {"adapter_type": adapter_type},
+            "optim": {"learning_rate": 1.0e-4},
+            "performance": {},
+            "step_scheduler": {
+                "num_epochs": 1,
+                "local_batch_size": 1,
+                "global_batch_size": 1,
+                "ckpt_every_steps": 1,
+            },
+        }
+    )
+
+
+def _patch_lightweight_diffusion_recipe_setup(monkeypatch):
+    monkeypatch.setattr(
+        diffusion_train, "initialize_distributed", lambda *args, **kwargs: SimpleNamespace(is_main=False)
+    )
+    monkeypatch.setattr(diffusion_train, "setup_logging", lambda: None)
+    monkeypatch.setattr(diffusion_train, "StatefulRNG", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
+
+
+@pytest.mark.parametrize(
+    ("adapter_type", "attention_backend", "expected_error"),
+    [
+        ("simple", "flash_varlen", "adapter_type=hunyuan"),
+        ("hunyuan", "flash", "attention_backend=flash_varlen"),
+    ],
+)
+def test_diffusion_recipe_validates_hunyuan_flash_varlen_mask_requirements(
+    monkeypatch,
+    adapter_type,
+    attention_backend,
+    expected_error,
+):
+    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
+    build_model_and_optimizer_mock = MagicMock()
+    monkeypatch.setattr(diffusion_train, "build_model_and_optimizer", build_model_and_optimizer_mock)
+
+    recipe = TrainDiffusionRecipe(
+        _minimal_diffusion_recipe_cfg(adapter_type=adapter_type, attention_backend=attention_backend)
+    )
+
+    with pytest.raises(ValueError, match=expected_error):
+        recipe.setup()
+
+    build_model_and_optimizer_mock.assert_not_called()
+
+
+def test_diffusion_recipe_raises_when_hunyuan_flash_varlen_mask_optimization_fails(monkeypatch):
+    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
+    monkeypatch.setattr(
+        diffusion_train,
+        "build_model_and_optimizer",
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), object(), None)),
+    )
+
+    from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
+
+    enable_optimization = MagicMock(return_value=False)
+    monkeypatch.setattr(hunyuan_module, "enable_hunyuan_flash_varlen_mask_optimization", enable_optimization)
+
+    recipe = TrainDiffusionRecipe(_minimal_diffusion_recipe_cfg())
+
+    with pytest.raises(RuntimeError, match="Failed to enable Hunyuan flash-varlen mask optimization"):
+        recipe.setup()
+
+    enable_optimization.assert_called_once_with()
+
+
+def test_diffusion_recipe_enables_hunyuan_flash_varlen_mask_optimization_before_checkpoint_setup(monkeypatch):
+    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
+    monkeypatch.setattr(
+        diffusion_train,
+        "build_model_and_optimizer",
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), object(), None)),
+    )
+
+    from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
+
+    enable_optimization = MagicMock(return_value=True)
+    monkeypatch.setattr(hunyuan_module, "enable_hunyuan_flash_varlen_mask_optimization", enable_optimization)
+
+    recipe = TrainDiffusionRecipe(_minimal_diffusion_recipe_cfg())
+
+    with pytest.raises(ValueError, match="checkpoint config is required"):
+        recipe.setup()
+
+    enable_optimization.assert_called_once_with()
+
+
 class _TinyTransformer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -302,6 +409,101 @@ class _TinyTransformer(nn.Module):
 
     def set_attention_backend(self, attention_backend):
         self.attention_backend = attention_backend
+
+
+def test_build_diffusion_parallel_manager_args_uses_shared_fsdp_defaults():
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=None,
+        ddp_cfg=None,
+        world_size=8,
+        dtype=torch.float16,
+        lora_enabled=False,
+    )
+
+    assert manager_args["_manager_type"] == "fsdp2"
+    assert manager_args["world_size"] == 8
+    assert manager_args["dp_size"] is None
+    assert manager_args["tp_size"] == 1
+    assert manager_args["pp_size"] == 1
+    assert manager_args["cp_size"] == 1
+    assert manager_args["ep_size"] == 1
+    assert manager_args["activation_checkpointing"] is True
+    assert manager_args["defer_fsdp_grad_sync"] is True
+    assert manager_args["enable_fsdp2_prefetch"] is True
+    assert manager_args["use_hf_tp_plan"] is False
+    assert manager_args["mp_policy"].param_dtype == torch.float16
+    assert manager_args["mp_policy"].reduce_dtype == torch.float32
+    assert manager_args["mp_policy"].output_dtype == torch.float16
+
+
+def test_build_diffusion_parallel_manager_args_keeps_lora_param_dtype_uncast():
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg={},
+        ddp_cfg=None,
+        world_size=1,
+        dtype=torch.bfloat16,
+        lora_enabled=True,
+    )
+
+    assert manager_args["mp_policy"].param_dtype is None
+    assert manager_args["mp_policy"].output_dtype == torch.bfloat16
+
+
+def test_build_diffusion_parallel_manager_args_parses_ddp_config():
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=None,
+        ddp_cfg={"activation_checkpointing": True},
+        world_size=4,
+        dtype=torch.bfloat16,
+        lora_enabled=False,
+    )
+
+    assert manager_args == {
+        "_manager_type": "ddp",
+        "world_size": 4,
+        "activation_checkpointing": True,
+        "broadcast_buffers": False,
+        "find_unused_parameters": False,
+        "static_graph": False,
+        "bucket_cap_mb": None,
+        "gradient_as_bucket_view": False,
+        "autocast_dtype": None,
+    }
+
+
+def test_build_diffusion_parallel_manager_args_accepts_confignode_fsdp_config():
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=ConfigNode({"dp_size": 8, "cpu_offload": False}),
+        ddp_cfg=None,
+        world_size=8,
+        dtype=torch.bfloat16,
+        lora_enabled=False,
+    )
+
+    assert manager_args["_manager_type"] == "fsdp2"
+    assert manager_args["dp_size"] == 8
+
+
+def test_build_diffusion_parallel_manager_args_accepts_confignode_ddp_config():
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=None,
+        ddp_cfg=ConfigNode({"backend": "nccl", "activation_checkpointing": False}),
+        world_size=4,
+        dtype=torch.bfloat16,
+        lora_enabled=False,
+    )
+
+    assert manager_args == {
+        "_manager_type": "ddp",
+        "world_size": 4,
+        "activation_checkpointing": False,
+        "broadcast_buffers": False,
+        "find_unused_parameters": False,
+        "static_graph": False,
+        "bucket_cap_mb": None,
+        "gradient_as_bucket_view": False,
+        "autocast_dtype": None,
+    }
 
 
 def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(monkeypatch):
@@ -338,6 +540,7 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
             "enable_fsdp2_prefetch": False,
             "fsdp2_backward_prefetch_depth": 4,
             "fsdp2_forward_prefetch_depth": 3,
+            "reduce_dtype": "bfloat16",
         },
         attention_backend="flash",
         transformer_engine_linear=True,
@@ -364,6 +567,7 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
     assert manager_args["enable_fsdp2_prefetch"] is False
     assert manager_args["fsdp2_backward_prefetch_depth"] == 4
     assert manager_args["fsdp2_forward_prefetch_depth"] == 3
+    assert manager_args["mp_policy"].reduce_dtype is torch.bfloat16
     assert calls["transformer_engine_linear"] is True
     assert calls["transformer_engine_fp8_safe_only"] is True
     assert calls["fuse_qkv_projections"] is True

@@ -96,7 +96,7 @@ def _make_cfg() -> MagicMock:
     # ``recipe_cfg.get("trust_remote_code", False)`` style calls go through
     # ``recipe_args.get``; SimpleNamespace doesn't expose ``get`` by default,
     # so we attach one explicitly below.
-    cfg.recipe_args.get = lambda key, default=None: default
+    cfg.recipe_args.get = lambda key, default=None: "sdpa" if key == "target_attn_implementation" else default
     return cfg
 
 
@@ -164,6 +164,10 @@ def test_setup_unsharded_does_not_retrack_target_model(
     # would have raised ``RuntimeError`` before reaching the wrapper sentinel.
     tracked = recipe.__dict__["__state_tracked"]
     assert "target_model" in tracked
+
+    # EAGLE-3 forwards ``target_attn_implementation`` to the target load; EAGLE-1 ignores it.
+    expected_attn = "sdpa" if recipe_cls_name == "TrainEagle3Recipe" else None
+    assert mock_auto_model.from_pretrained.call_args.kwargs.get("attn_implementation") == expected_attn
 
 
 def test_eagle2_inherits_eagle1_fix():

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-from contextlib import nullcontext
 from functools import partial
 from typing import Optional
 
@@ -37,8 +36,6 @@ from nemo_automodel.components.moe.experts import (
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
-
-_shared_experts_stream: Optional[torch.cuda.Stream] = None
 
 
 class MLP(nn.Module):
@@ -633,7 +630,7 @@ class MoE(nn.Module):
             )
             self.experts = GroupedExperts(config, backend=backend)
         elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep"):
-            if backend.experts in ("gmm", "torch_mm"):
+            if backend.experts in ("gmm", "torch_mm", "torch_mm_mxfp8"):
                 self.experts = GroupedExpertsDeepEP(
                     config,
                     backend=backend,
@@ -689,8 +686,6 @@ class MoE(nn.Module):
         # Set during model parallelization (see parallelizer.apply_cp)
         self.cp_mesh: Optional[DeviceMesh] = None
 
-        self._disable_shared_expert_overlap = backend.disable_shared_expert_overlap
-
     def forward(
         self,
         x: torch.Tensor,
@@ -727,27 +722,15 @@ class MoE(nn.Module):
 
         weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
 
-        # Shared-expert output (optionally gated).  Run on a side CUDA stream
-        # to overlap with the grouped-expert dispatch comm, unless overlap is
-        # disabled (in which case run sequentially on the current stream).
+        # Shared-expert output (optionally gated), computed inline on the main stream.
         z = None
-        side_stream = None
         if self.shared_experts is not None:
-            if not self._disable_shared_expert_overlap:
-                global _shared_experts_stream
-                if _shared_experts_stream is None:
-                    _shared_experts_stream = torch.cuda.Stream()
-                side_stream = _shared_experts_stream
-                side_stream.wait_stream(torch.cuda.current_stream())
-            stream_ctx = torch.cuda.stream(side_stream) if side_stream is not None else nullcontext()
-            with stream_ctx:
-                z = self.shared_experts(x)
-                if self.shared_expert_gate is not None:
-                    z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
+            z = self.shared_experts(x)
+            if self.shared_expert_gate is not None:
+                z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
 
+        # Routed experts on the main stream.
         y = self.experts(x_latent, token_mask, weights, indices)
-        if side_stream is not None:
-            torch.cuda.current_stream().wait_stream(side_stream)
 
         if self.fc2_latent_proj is not None:
             y = self.fc2_latent_proj(y)

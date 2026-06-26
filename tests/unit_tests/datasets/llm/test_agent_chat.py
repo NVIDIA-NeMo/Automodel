@@ -462,30 +462,15 @@ def test_extract_eval_samples_args_already_dict():
     assert samples[0]["gt_tool_calls"] == [{"name": "f", "arguments": {"a": 1}}]
 
 
-def test_mask_labels_to_last_turn_keeps_only_final_run():
-    # Two supervised assistant runs separated by an ignored (user/tool) run.
-    labels = [-100, 1, 2, -100, -100, 3, 4, -100]
-    agent_chat._mask_labels_to_last_turn(labels)
-    assert labels == [-100, -100, -100, -100, -100, 3, 4, -100]
+def test_format_example_forwards_train_on_last_turn_only(monkeypatch):
+    # The last-turn restriction now lives in ``format_chat_template`` so it acts
+    # on the hole-free assistant mask before reasoning_content is masked.
+    # ``_format_example`` must forward the flag rather than post-process labels.
+    captured = {}
 
-
-def test_mask_labels_to_last_turn_single_run_unchanged():
-    labels = [-100, -100, 5, 6, 7]
-    agent_chat._mask_labels_to_last_turn(labels)
-    assert labels == [-100, -100, 5, 6, 7]
-
-
-def test_mask_labels_to_last_turn_no_supervised_tokens_is_noop():
-    labels = [-100, -100, -100]
-    agent_chat._mask_labels_to_last_turn(labels)
-    assert labels == [-100, -100, -100]
-
-
-def test_format_example_train_on_last_turn_only_masks_earlier_turns(monkeypatch):
-    # ``labels`` carry two supervised assistant runs; with the flag set only
-    # the final run survives. Without it, both runs stay supervised.
     def fake_format_chat_template(**kwargs):
-        return {"input_ids": [10, 11, 12, 13, 14, 15], "labels": [-100, 1, -100, -100, 2, 3]}
+        captured.update(kwargs)
+        return {"input_ids": [10, 11], "labels": [-100, 1]}
 
     monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
 
@@ -495,11 +480,11 @@ def test_format_example_train_on_last_turn_only_masks_earlier_turns(monkeypatch)
 
     example = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}]}
 
-    kept = agent_chat._format_example(example, Tok(), 0, 0)
-    assert kept["labels"] == [-100, 1, -100, -100, 2, 3]
+    agent_chat._format_example(example, Tok(), 0, 0)
+    assert captured["train_on_last_turn_only"] is False
 
-    masked = agent_chat._format_example(example, Tok(), 0, 0, train_on_last_turn_only=True)
-    assert masked["labels"] == [-100, -100, -100, -100, 2, 3]
+    agent_chat._format_example(example, Tok(), 0, 0, train_on_last_turn_only=True)
+    assert captured["train_on_last_turn_only"] is True
 
 
 def test_convert_messages_preserves_assistant_reasoning_content():
@@ -664,6 +649,103 @@ def test_format_example_wraps_missing_fields_with_example_id():
         agent_chat._format_example({"id": 7}, Tok(), 0, 0)
 
 
+class _LenTok:
+    """Tokenizer stub whose rendered length equals the total content words.
+
+    ``apply_chat_template`` returns one id per whitespace token across all
+    message contents, so a test controls the rendered length precisely.
+    """
+
+    def apply_chat_template(
+        self,
+        messages,
+        tools=None,
+        tokenize=True,
+        return_dict=True,
+        return_assistant_tokens_mask=False,
+        padding=False,
+        truncation=None,
+        max_length=None,
+    ):
+        n = sum(len(str(m.get("content", "")).split()) for m in messages)
+        return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+
+def test_truncate_messages_to_fit_unchanged_when_already_fits():
+    tok = _LenTok()
+    messages = [
+        {"role": "user", "content": "a b"},
+        {"role": "assistant", "content": "c"},
+    ]
+    assert agent_chat._truncate_messages_to_fit(tok, messages, None, seq_length=100) == messages
+
+
+def test_truncate_messages_to_fit_drops_oldest_exchanges():
+    tok = _LenTok()
+    messages = [
+        {"role": "system", "content": "s"},  # 1
+        {"role": "user", "content": "a a a"},  # 3  exchange 1
+        {"role": "assistant", "content": "b"},  # 1
+        {"role": "user", "content": "c c c"},  # 3  exchange 2
+        {"role": "assistant", "content": "d"},  # 1
+        {"role": "user", "content": "e"},  # 1  exchange 3 (final)
+        {"role": "assistant", "content": "f"},  # 1
+    ]
+    # full = 11; budget 6: system(1) + ex3(2) = 3 fits, + ex2(4) = 7 overflows.
+    out = agent_chat._truncate_messages_to_fit(tok, messages, None, seq_length=6)
+    assert [m["role"] for m in out] == ["system", "user", "assistant"]
+    assert out[1]["content"] == "e"
+
+
+def test_truncate_messages_to_fit_returns_final_exchange_when_nothing_fits():
+    tok = _LenTok()
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c c c c c"},
+        {"role": "assistant", "content": "d d d d d"},
+    ]
+    # final exchange alone = system(1) + 5 + 5 = 11 > budget 4; minimal suffix kept.
+    out = agent_chat._truncate_messages_to_fit(tok, messages, None, seq_length=4)
+    assert [m["role"] for m in out] == ["system", "user", "assistant"]
+    assert out[1]["content"] == "c c c c c"
+
+
+def test_truncate_messages_to_fit_no_user_boundary_unchanged():
+    tok = _LenTok()
+    messages = [
+        {"role": "system", "content": "s s s"},
+        {"role": "assistant", "content": "a a a"},
+    ]
+    assert agent_chat._truncate_messages_to_fit(tok, messages, None, seq_length=1) == messages
+
+
+def test_format_example_truncate_history_runs_before_render(monkeypatch):
+    # _format_example must truncate the converted messages before handing them
+    # to format_chat_template, so only the kept suffix is rendered/supervised.
+    tok = _LenTok()
+    captured = {}
+
+    def fake_format_chat_template(**kwargs):
+        captured.update(kwargs)
+        return {"input_ids": [1], "labels": [-100]}
+
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    example = {
+        "messages": [
+            {"role": "user", "content": "old old old"},
+            {"role": "assistant", "content": "x"},
+            {"role": "user", "content": "new"},
+            {"role": "assistant", "content": "y"},
+        ]
+    }
+    agent_chat._format_example(example, tok, 0, 0, seq_length=3, truncate_history=True)
+    assert [m["role"] for m in captured["formatted_text"]] == ["user", "assistant"]
+    assert captured["formatted_text"][0]["content"] == "new"
+
+
 def _patch_minimal_loader(monkeypatch):
     """Patch load_dataset / pad-token / formatter so dataset build does no real work."""
 
@@ -764,3 +846,20 @@ def test_format_example_ok_when_some_label_supervised(monkeypatch):
 
     example = {"id": 1, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}]}
     assert agent_chat._format_example(example, Tok(), 0, 0)["labels"] == [-100, 2, 3]
+
+
+def test_reasoning_content_coerced_to_str_via_both_paths():
+    # Non-string reasoning_content is coerced consistently whether it enters
+    # through the sharegpt converter or the chatml message converter.
+    sharegpt = agent_chat._sharegpt_to_chatml([{"from": "gpt", "value": "hi", "reasoning_content": 123}])
+    chatml = agent_chat._convert_messages(
+        [{"role": "assistant", "content": "hi", "reasoning_content": 123}]
+    )
+    assert sharegpt[0]["reasoning_content"] == "123"
+    assert chatml[0]["reasoning_content"] == "123"
+
+
+def test_reasoning_content_helper_treats_empty_as_absent():
+    assert agent_chat._reasoning_content({"reasoning_content": ""}) is None
+    assert agent_chat._reasoning_content({}) is None
+    assert agent_chat._reasoning_content({"reasoning_content": "x"}) == "x"

@@ -21,8 +21,14 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from nemo_automodel.components.distributed.activation_checkpointing import (
+    is_selective_activation_checkpointing,
+)
 from nemo_automodel.components.distributed.config import DDPConfig
-from nemo_automodel.components.distributed.parallelizer import _extract_model_layers
+from nemo_automodel.components.distributed.parallelizer import (
+    _extract_model_layers,
+    apply_selective_activation_checkpointing,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +56,11 @@ class DDPManager:
 
         # Extract config fields for easy access
         self.activation_checkpointing = config.activation_checkpointing
-        self.backend = config.backend
+        self.broadcast_buffers = config.broadcast_buffers
+        self.find_unused_parameters = config.find_unused_parameters
+        self.static_graph = config.static_graph
+        self.bucket_cap_mb = config.bucket_cap_mb
+        self.gradient_as_bucket_view = config.gradient_as_bucket_view
 
         # Setup distributed environment
         self._setup_distributed()
@@ -59,7 +69,7 @@ class DDPManager:
         """
         Initialize device configuration for DDP.
 
-        Sets the rank, world_size, and device based on the backend.
+        Sets the rank, world_size, and device based on the process group backend.
         """
         if not dist.is_available():
             raise RuntimeError("torch.distributed not available")
@@ -70,8 +80,8 @@ class DDPManager:
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
 
-        # Pin GPU if using NCCL
-        if self.backend == "nccl":
+        backend = str(dist.get_backend()).lower()
+        if "nccl" in backend and torch.cuda.is_available():
             local_gpu = self.rank % torch.cuda.device_count()
             torch.cuda.set_device(local_gpu)
             self.device = torch.device("cuda", index=local_gpu)
@@ -93,9 +103,13 @@ class DDPManager:
         """
         if dist.get_world_size() == 1:
             logger.info("World size is 1, skipping parallelization.")
-            model = model.to("cuda").to(torch.bfloat16)
+            model = model.to(self.device)
+            if self.device.type == "cuda":
+                model = model.to(torch.bfloat16)
             if self.activation_checkpointing:
-                if hasattr(model, "gradient_checkpointing_enable"):
+                if is_selective_activation_checkpointing(self.activation_checkpointing):
+                    apply_selective_activation_checkpointing(model)
+                elif hasattr(model, "gradient_checkpointing_enable"):
                     model.gradient_checkpointing_enable()
                 else:
                     logger.error("Model does not support gradient checkpointing. Skipping.")
@@ -110,17 +124,30 @@ class DDPManager:
                 except Exception:
                     pass
 
-            layers = _extract_model_layers(model)
-            for i, layer in enumerate(layers):
-                if hasattr(layer, "mlp"):
-                    layers[i].mlp = checkpoint_wrapper(layer.mlp)
-                if hasattr(layer, "self_attn"):
-                    layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)
+            if is_selective_activation_checkpointing(self.activation_checkpointing):
+                apply_selective_activation_checkpointing(model)
+            else:
+                layers = _extract_model_layers(model)
+                for i, layer in enumerate(layers):
+                    if hasattr(layer, "mlp"):
+                        layers[i].mlp = checkpoint_wrapper(layer.mlp)
+                    if hasattr(layer, "self_attn"):
+                        layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)
 
-                if hasattr(layer, "input_layernorm"):
-                    layers[i].input_layernorm = checkpoint_wrapper(layers[i].input_layernorm)
+                    if hasattr(layer, "input_layernorm"):
+                        layers[i].input_layernorm = checkpoint_wrapper(layers[i].input_layernorm)
 
-                if hasattr(layer, "post_attention_layernorm"):
-                    layers[i].post_attention_layernorm = checkpoint_wrapper(layers[i].post_attention_layernorm)
+                    if hasattr(layer, "post_attention_layernorm"):
+                        layers[i].post_attention_layernorm = checkpoint_wrapper(layers[i].post_attention_layernorm)
 
-        return DDP(model.to(self.device), device_ids=[self.device] if self.device.type == "cuda" else None)
+        ddp_kwargs = {
+            "device_ids": [self.device] if self.device.type == "cuda" else None,
+            "broadcast_buffers": self.broadcast_buffers,
+            "find_unused_parameters": self.find_unused_parameters,
+            "static_graph": self.static_graph,
+            "gradient_as_bucket_view": self.gradient_as_bucket_view,
+        }
+        if self.bucket_cap_mb is not None:
+            ddp_kwargs["bucket_cap_mb"] = self.bucket_cap_mb
+
+        return DDP(model.to(self.device), **ddp_kwargs)

@@ -92,7 +92,7 @@ def sdpa_backend():
         attn="sdpa",
         rms_norm="torch",
         rope_fusion=False,
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -271,7 +271,7 @@ class TestStep3p5ForCausalLM:
         with patch.object(
             model.model, "forward", return_value=torch.randn(batch, seq, config.hidden_size).to(torch.bfloat16)
         ):
-            logits = model(input_ids)
+            logits = model(input_ids).logits
 
         assert logits.shape == (batch, seq, config.vocab_size)
 

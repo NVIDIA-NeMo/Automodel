@@ -27,7 +27,7 @@ seed: 1234
 
 step_scheduler:
   global_batch_size: 512
-  local_batch_size: 4
+  local_batch_size: 8              # must be >= pp_size * pp_microbatch_size (8 * 1) so the PP schedule has >= pp_size microbatches
   ckpt_every_steps: 200
   val_every_steps: 100
   num_epochs: 1
@@ -64,7 +64,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/ling_1t_lora_pp
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
@@ -125,7 +125,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
-  recipe_owner: Hayden727
+  recipe_owner: akoumpa
   nodes: 8
   time: "01:00:00"
   env_vars:

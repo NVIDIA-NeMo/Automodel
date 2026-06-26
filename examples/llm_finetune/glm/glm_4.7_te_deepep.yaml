@@ -37,12 +37,15 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: zai-org/GLM-4.7
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    dispatcher: hybridep
 
 checkpoint:
   enabled: false
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2

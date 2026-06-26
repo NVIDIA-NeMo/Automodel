@@ -43,7 +43,7 @@ def test_contrastive_scores_and_labels_shapes_and_labels():
     assert torch.all(labels == 0) and labels.shape == (2,)
 
 
-@pytest.mark.parametrize("pool_type", ["avg", "weighted_avg", "cls", "colbert"])
+@pytest.mark.parametrize("pool_type", ["avg", "weighted_avg", "cls", "colbert", "multi_vector"])
 def test_pool_basic_modes(pool_type):
     last_hidden = torch.tensor(
         [
@@ -61,7 +61,7 @@ def test_pool_basic_modes(pool_type):
         assert torch.allclose(out[0], torch.tensor([1.0 + 3.0, 2.0 + 4.0]))
     elif pool_type == "cls":
         assert torch.allclose(out[:, :], last_hidden[:, 0])
-    elif pool_type == "colbert":
+    elif pool_type in {"colbert", "multi_vector"}:
         assert out.shape == last_hidden.shape
 
 
@@ -175,7 +175,6 @@ def test_bidirectional_attention_is_symmetric():
     )
 
 
-
 # --- Fakes for classification and encoder tests ---
 class FakeOutputs:
     def __init__(self, last_hidden_state=None, hidden_states=None):
@@ -270,9 +269,7 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
             )
 
     lm = NoTTIDLm(hidden=8)
-    model = BiEncoderModel(
-        model=lm, pooling="avg", l2_normalize=True
-    )
+    model = BiEncoderModel(model=lm, pooling="avg", l2_normalize=True)
     # encode removes token_type_ids and normalizes
     q = {
         "input_ids": torch.ones(2, 3, dtype=torch.long),
@@ -314,9 +311,7 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
             return OnlyHiddenOutputs(hidden_states)
 
     # Test with model using NoLastLM for query encoder
-    model_no_last = BiEncoderModel(
-        model=NoLastLM(hidden=8), pooling="avg", l2_normalize=True
-    )
+    model_no_last = BiEncoderModel(model=NoLastLM(hidden=8), pooling="avg", l2_normalize=True)
     v2 = model_no_last.encode(
         {"input_ids": torch.ones(2, 3, dtype=torch.long), "attention_mask": torch.ones(2, 3, dtype=torch.long)},
     )
@@ -571,10 +566,14 @@ def test_init_encoder_common_name_or_path_for_generic():
 
     # Use a class name that is NOT a retrieval arch
     FakeModel.__name__ = "Qwen3Model"
-    FakeModel = type("Qwen3Model", (nn.Module,), {
-        "__init__": FakeModel.__init__,
-        "config": property(lambda self: self._config),
-    })
+    FakeModel = type(
+        "Qwen3Model",
+        (nn.Module,),
+        {
+            "__init__": FakeModel.__init__,
+            "config": property(lambda self: self._config),
+        },
+    )
     fake = object.__new__(FakeModel)
     nn.Module.__init__(fake)
     fake._config = FakeCfg()

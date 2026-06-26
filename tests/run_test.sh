@@ -43,7 +43,15 @@ else
     export TEST_DIR="tests/functional_tests/$TEST_NAME"
 fi
 
-set +e
+# Install opt-in media extras (kept out of the default media-free image) per folder.
+case "$TEST_NAME" in
+    hf_transformer_vlm) MEDIA_EXTRA="vlm-media" ;;
+    *) MEDIA_EXTRA="" ;;
+esac
+if [[ -n "$MEDIA_EXTRA" ]]; then
+    uv pip install ".[$MEDIA_EXTRA]"
+fi
+
 coverage run \
     -m pytest \
     --durations 32 \

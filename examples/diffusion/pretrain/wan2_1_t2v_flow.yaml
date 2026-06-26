@@ -1,6 +1,7 @@
 seed: 42
 
 wandb:
+  enable: false
   project: wan-t2v-flow-matching-pretrain
   mode: online
   name: wan2_1_t2v_fm_pretrain
@@ -75,6 +76,6 @@ checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
   diffusers_compatible: true
   restore_from: null
