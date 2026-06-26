@@ -1,18 +1,23 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
-# MiniMax M3 VL (image) LoRA SFT.
-# 8-node / 64 GPUs = PP4 x DP16 with EP8 over the DP shard (ep_shard=2).
+# Recipe for cp_size=2, UNPACKED MedPix @ max_length=2048.
+# Identical to minimax_m3_vl_sft_ep32pp4.yaml in every respect EXCEPT cp_size (1 -> 2),
+# so the loss curve should track that recipe's step-for-step (only bf16 / ring-reduction
+# drift). A matching curve validates that CP shards the sequence without changing the math.
+#
+# world = pp4 * dp16 * cp2 * tp1 = 128 (16 nodes x 8);  ep32 | dp*cp = 16 * 2 = 32.
+# global_batch_size=512 / local_batch_size=8 -> grad_accum = 512/(8*16) = 4 (cp1 uses 2).
+# Unpacked short MedPix @2048 mostly shards padding under cp2 -- fine here, the goal is a
+# matched-regime CP-vs-no-CP loss check, not throughput. 2048 is divisible by 2*cp=4.
 
 recipe: FinetuneRecipeForVLM
 
 seed: 1234
 
 step_scheduler:
-  # PP4 on 64 GPUs -> dp_size = 64/4 = 16. global_batch_size must be divisible by
-  # local_batch_size * dp_size. local_batch_size=8 -> global 128 = 8 * 16 dp * 1 grad-accum.
-  global_batch_size: 128
+  global_batch_size: 512
   local_batch_size: 8
-  ckpt_every_steps: 1000
+  ckpt_every_steps: 100
   val_every_steps: 25
   log_remote_every_steps: 1
   gc_every_steps: 10
@@ -20,7 +25,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 90
+  timeout_minutes: 60
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -33,13 +38,10 @@ model:
   trust_remote_code: false
   torch_dtype: bfloat16
   text_config:
+    # The bf16 checkpoint ships no MTP weights, so this must stay 0.
     num_mtp_modules: 0
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    # sdpa (not te): M3 sparse-attention layers emit an additive [B,H,T,T] bias
-    # from the DSA indexer, which only SDPA's explicit-mask path accepts. TE's
-    # DotProductAttention treats attention_mask as a boolean padding mask and
-    # crashes on the float bias (a TE block-sparse path is a perf follow-up).
     attn: sdpa
     linear: te
     rms_norm: torch_fp32
@@ -51,45 +53,23 @@ model:
     enable_fsdp_optimizations: true
 
 processor:
-  # The checkpoint's remote-code MiniMaxVLProcessor drops chat_template during
-  # from_pretrained, so this helper reattaches chat_template.jinja afterwards.
   _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
   pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
   trust_remote_code: true
 
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: false
-  exclude_modules:
-    - "*vision_tower*"
-    - "*vision_model*"
-    - "*vision*"
-    - "*visual*"
-    - "*multi_modal_projector*"
-    - "*patch_merge_mlp*"
-    - "*lm_head*"
-    # Index branch (selection-only) and router gates are not adapted.
-    - "*indexer*"
-    - "*block_sparse_moe.gate*"
-  dim: 32
-  alpha: 32
-  dropout: 0.0
-  moe_rank_scaling: true
-
 checkpoint:
-  enabled: false
-  checkpoint_dir: vlm_checkpoints/minimax_m3_vl_lora_pp4ep8_8node/
+  enabled: false               # comparison run: don't persist a 400B checkpoint
+  checkpoint_dir: vlm_checkpoints/minimax_m3_vl_sft_cp2_medpix_2k/
   model_save_format: safetensors
   save_consolidated: false
-  # BF16 base checkpoint: weights load directly (no MXFP8 *_scale_inv / dequant).
   dequantize_base_checkpoint: false
 
 distributed:
   strategy: fsdp2
   tp_size: 1
-  cp_size: 1
+  cp_size: 2
   pp_size: 4
-  ep_size: 8
+  ep_size: 32
   sequence_parallel: false
   activation_checkpointing: true
   pipeline:
@@ -101,8 +81,6 @@ distributed:
     patch_inner_model: false
     patch_causal_lm_model: false
   moe:
-    # At pp=4 each rank holds ~15 of 60 layers, so the gathered experts fit without
-    # resharding (false matches the SFT recipe). Set true if memory is tight.
     reshard_after_forward: false
     wrap_outer_model: true
 
@@ -144,11 +122,11 @@ validation_dataloader:
     max_length: 2048
 
 optimizer:
-  _target_: torch.optim.Adam
-  betas: [0.9, 0.999]
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
   eps: 1e-8
-  lr: 1.0e-4
-  weight_decay: 0
+  lr: 1.0e-5
+  weight_decay: 0.1
 
 lr_scheduler:
   lr_decay_style: cosine
@@ -163,4 +141,4 @@ wandb:
 
 ci:
   recipe_owner: athitten
-  nodes: 8
+  nodes: 16
