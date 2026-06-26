@@ -722,7 +722,6 @@ class Checkpointer:
             state_dict,
             quantization=self.config.dequantize_base_checkpoint,
             device_mesh=self.moe_mesh,
-            is_init_step=is_init_step,
         )
 
         compat_tied_lm_head_source_key: str | None = None

@@ -23,12 +23,6 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAda
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
-from nemo_automodel.components.moe.state_dict_utils import (
-    create_dtensor_from_local,
-    get_expert_range_for_rank_from_mesh,
-    get_submesh,
-    is_dtensor,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -39,14 +33,10 @@ _LORA_EXPERT_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_
 class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """Converts between HF Qwen3-MoE checkpoints and our grouped-experts native format.
 
-    Qwen3-MoE HF experts may use legacy split keys:
+    Qwen3-MoE HF experts use keys:
       model.layers.{L}.mlp.experts.{E}.gate_proj.weight
       model.layers.{L}.mlp.experts.{E}.up_proj.weight
       model.layers.{L}.mlp.experts.{E}.down_proj.weight
-
-    or v5 fused keys:
-      model.layers.{L}.mlp.experts.gate_up_proj
-      model.layers.{L}.mlp.experts.down_proj
 
     Our native format groups them into:
       model.layers.{L}.mlp.experts.gate_and_up_projs  # [n_experts, dim, 2*moe_inter_dim]
@@ -98,33 +88,10 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         """
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
         v4_compatible = kwargs.get("v4_compatible", False)
-        is_init_step = kwargs.get("is_init_step", False)
-
-        expert_segment = self._expert_path_segment
-        if is_init_step and not v4_compatible:
-            if f".{expert_segment}.gate_and_up_projs" in fqn:
-                result = [
-                    (
-                        fqn.replace(f".{expert_segment}.gate_and_up_projs", f".{expert_segment}.gate_up_proj"),
-                        tensor.transpose(1, 2),
-                    )
-                ]
-                if exclude_key_regex:
-                    result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
-                return result
-            if f".{expert_segment}.down_projs" in fqn:
-                result = [
-                    (
-                        fqn.replace(f".{expert_segment}.down_projs", f".{expert_segment}.down_proj"),
-                        tensor.transpose(1, 2),
-                    )
-                ]
-                if exclude_key_regex:
-                    result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
-                return result
 
         # Check if this is a LoRA expert tensor eligible for ParamWrapper conversion
         if not v4_compatible:
+            expert_segment = self._expert_path_segment
             for suffix in _LORA_EXPERT_SUFFIXES:
                 if fqn.endswith(f".{suffix}") and f".{expert_segment}.{suffix}" in fqn:
                     result = self._convert_lora_to_paramwrapper(fqn, tensor)
@@ -152,7 +119,7 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
 
         Shape mapping (automodel native -> ParamWrapper):
 
-        down_proj (outer wrapper, NO ``base_layer`` prefix):
+        down_proj (outer wrapper, NO ``base_layer`` prefix — processed first alphabetically):
           - ``lora_down_B``  (E, r, H) -> ``lora_A.weight``  (r*E, H)  reshape
           - ``lora_down_A``  (E, I, r) -> ``lora_B.weight``  (I, r*E)  permute+reshape
 
@@ -217,61 +184,10 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
                 self._uses_model_prefix = key.startswith("model.")
                 break
 
-        # Convert fused base expert tensors and any ParamWrapper-format LoRA
-        # keys to native grouped format before the legacy split-expert fallback.
-        hf_state_dict = self._convert_fused_experts_to_native(hf_state_dict, device_mesh)
+        # Convert any ParamWrapper-format LoRA keys to native grouped format
         hf_state_dict = self._convert_paramwrapper_to_native(hf_state_dict)
 
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
-
-    def _convert_fused_experts_to_native(
-        self, state_dict: dict[str, Any], device_mesh: Optional["DeviceMesh"] = None
-    ) -> dict[str, Any]:
-        """Convert HF v5 fused Qwen3 MoE expert tensors to native grouped tensors.
-
-        HF stores expert base weights as direct 3-D parameters:
-          - ``gate_up_proj``: (E, 2*I, H)
-          - ``down_proj``: (E, H, I)
-
-        Native grouped experts use the transposed layout:
-          - ``gate_and_up_projs``: (E, H, 2*I)
-          - ``down_projs``: (E, I, H)
-        """
-        expert_segment = re.escape(self._expert_path_segment)
-        pattern = re.compile(
-            rf"(?P<prefix>.*)layers\.(?P<layer>\d+)\.{expert_segment}\."
-            rf"(?P<which>gate_up_proj|down_proj)$"
-        )
-
-        n_experts = self.moe_config.n_routed_experts
-        start_expert, end_expert, rank = 0, n_experts, None
-        if device_mesh is not None:
-            start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
-            rank = (
-                get_submesh(device_mesh, ("ep",)).get_rank()
-                if "ep" in device_mesh.mesh_dim_names
-                else device_mesh.get_rank()
-            )
-
-        result: dict[str, Any] = {}
-        for key, value in state_dict.items():
-            match = pattern.match(key)
-            if match is None:
-                result[key] = value
-                continue
-
-            native_suffix = "gate_and_up_projs" if match.group("which") == "gate_up_proj" else "down_projs"
-            native_key = (
-                f"{match.group('prefix')}layers.{match.group('layer')}.{self._expert_path_segment}.{native_suffix}"
-            )
-
-            if is_dtensor(value):
-                result[native_key] = value.transpose(1, 2)
-            else:
-                local_tensor = value[start_expert:end_expert].transpose(1, 2).to(self.dtype)
-                result[native_key] = create_dtensor_from_local(local_tensor, device_mesh, rank)
-
-        return result
 
     def _convert_paramwrapper_to_native(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Convert PEFT ParamWrapper LoRA keys to native grouped MoE LoRA format.
