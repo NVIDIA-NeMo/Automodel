@@ -37,7 +37,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B-Base
+  pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
@@ -78,7 +78,7 @@ dataset:
   padding: max_length
   truncation: true
   tokenizer:
-    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B-Base
+    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -94,7 +94,7 @@ validation_dataset:
   padding: max_length
   truncation: true
   tokenizer:
-    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B-Base
+    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
