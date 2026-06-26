@@ -152,6 +152,41 @@ def test_reject_unsupported_tied_word_embeddings_uses_top_level_for_composite():
         checkpoint_utils.reject_unsupported_tied_word_embeddings(tied, "Qwen3VLMoeForConditionalGeneration")
 
 
+def test_get_controlling_tie_word_embeddings_omni_wrapper_reads_thinker_config():
+    """Full Omni wrapper config nests the controlling flag under thinker_config.
+
+    Qwen2_5OmniConfig / Qwen3OmniMoeConfig do not expose tie_word_embeddings at the
+    top level; the controlling flag lives on config.thinker_config.
+    """
+    wrapper_tied = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=True))
+    wrapper_untied = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=False))
+    for cls in (
+        "Qwen2_5OmniThinkerForConditionalGeneration",
+        "Qwen3OmniMoeThinkerForConditionalGeneration",
+    ):
+        assert checkpoint_utils.get_controlling_tie_word_embeddings(wrapper_tied, cls) is True
+        assert checkpoint_utils.get_controlling_tie_word_embeddings(wrapper_untied, cls) is False
+    # When the thinker config itself is passed (no nested thinker_config), read its own flag.
+    direct = SimpleNamespace(tie_word_embeddings=True)
+    assert (
+        checkpoint_utils.get_controlling_tie_word_embeddings(direct, "Qwen2_5OmniThinkerForConditionalGeneration")
+        is True
+    )
+
+
+def test_reject_unsupported_tied_word_embeddings_omni_wrapper_path():
+    """The guard raises for a full Omni wrapper whose thinker_config requests tying."""
+    wrapper = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=True))
+    with pytest.raises(NotImplementedError):
+        checkpoint_utils.reject_unsupported_tied_word_embeddings(
+            wrapper, "Qwen2_5OmniThinkerForConditionalGeneration"
+        )
+    wrapper_untied = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=False))
+    checkpoint_utils.reject_unsupported_tied_word_embeddings(
+        wrapper_untied, "Qwen3OmniMoeThinkerForConditionalGeneration"
+    )  # no raise
+
+
 class _DraftLikeModel(nn.Module):
     """Minimal stand-in for an EAGLE-3 draft model.
 
