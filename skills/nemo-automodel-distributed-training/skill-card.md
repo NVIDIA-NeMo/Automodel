@@ -9,14 +9,14 @@ NVIDIA <br>
 ### License/Terms of Use: <br>
 Apache 2.0 <br>
 ## Use Case: <br>
-Developers and engineers selecting and configuring distributed training strategies (FSDP2, HSDP, DDP, tensor/pipeline/context/expert parallelism) for large-scale model training with NeMo AutoModel. <br>
+Developers and engineers configuring distributed training strategies (FSDP2, HSDP, DDP, tensor/pipeline/context/expert parallelism) for large language models, vision-language models, and mixture-of-experts models using NeMo AutoModel. <br>
 
 ### Deployment Geography for Use: <br>
 Global <br>
 
 ## Requirements / Dependencies: <br>
-**Requires API Key or External Credential:** [No] <br>
-**Credential Type(s):** [None] <br>  
+**Requires API Key or External Credential:** [Not Specified] <br>
+**Credential Type(s):** [None identified] <br>  
 
 Do not include secrets in prompts/logs/output; use least-privilege credentials; rotate keys as appropriate. <br>
 
@@ -26,12 +26,12 @@ Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
 - [NeMo AutoModel Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) <br>
-- [NVIDIA-NeMo/Automodel GitHub Repository](https://github.com/NVIDIA-NeMo/Automodel) <br>
+- [NeMo AutoModel GitHub Repository](https://github.com/NVIDIA-NeMo/Automodel) <br>
 
 
 ## Skill Output: <br>
-**Output Type(s):** [Configuration instructions, Code] <br>
-**Output Format:** [Markdown with inline YAML code blocks] <br>
+**Output Type(s):** [Configuration instructions, Shell commands] <br>
+**Output Format:** [Markdown with inline YAML and bash code blocks] <br>
 **Output Parameters:** [1D] <br>
 **Other Properties Related to Output:** [None] <br>
 
@@ -42,7 +42,7 @@ Mitigation: Review and scan skill before deployment. <br>
 
 
 ## Evaluation Tasks: <br>
-Evaluated against 3 evaluation tasks via NVSkills-Eval external profile in astra-sandbox environment. <br>
+Evaluated against 3 internal evaluation tasks covering strategy selection, MoE expert parallelism, and MegatronFSDP limitations. <br>
 
 ## Evaluation Metrics Used: <br>
 Reported benchmark dimensions: <br>
@@ -67,10 +67,10 @@ Underlying evaluation signals used in this run: <br>
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
 | Security | 3 | 100% (+0%) | 100% (+0%) |
-| Correctness | 3 | 100% (+68%) | 94% (+29%) |
-| Discoverability | 3 | 100% (+92%) | 85% (+49%) |
-| Effectiveness | 3 | 94% (+60%) | 94% (+34%) |
-| Efficiency | 3 | 94% (+68%) | 84% (+46%) |
+| Correctness | 3 | 100% (+64%) | 94% (+29%) |
+| Discoverability | 3 | 100% (+82%) | 85% (+60%) |
+| Effectiveness | 3 | 97% (+63%) | 93% (+30%) |
+| Efficiency | 3 | 94% (+61%) | 84% (+57%) |
 
 ## Skill Version(s): <br>
 v1.2.1+7febc6e (source: pyproject.toml) <br>

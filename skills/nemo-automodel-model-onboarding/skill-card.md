@@ -9,7 +9,7 @@ NVIDIA <br>
 ### License/Terms of Use: <br>
 Apache 2.0 <br>
 ## Use Case: <br>
-Developers and engineers adding new model architecture support (LLM, VLM, MoE) to NeMo AutoModel, including implementing model files, state-dict adapters, registry entries, and validation tests. <br>
+Developers and engineers adding or modifying model architecture support in NeMo AutoModel, such as LLM, VLM, and MoE model files, custom layers, state-dict adapters, registry entries, and capability flags. <br>
 
 ### Deployment Geography for Use: <br>
 Global <br>
@@ -25,10 +25,10 @@ Risk: Review before execution as proposals could introduce incorrect or misleadi
 Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
-- [LLM Patterns](llm-patterns.md) <br>
-- [MoE Patterns](moe-patterns.md) <br>
-- [VLM Patterns](vlm-patterns.md) <br>
-- [Capabilities and Precision](capabilities-and-precision.md) <br>
+- [llm-patterns.md](llm-patterns.md) <br>
+- [moe-patterns.md](moe-patterns.md) <br>
+- [vlm-patterns.md](vlm-patterns.md) <br>
+- [capabilities-and-precision.md](capabilities-and-precision.md) <br>
 - [NeMo AutoModel Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) <br>
 
 
@@ -39,13 +39,13 @@ Mitigation: Review and scan skill before deployment. <br>
 **Other Properties Related to Output:** [None] <br>
 
 ## Evaluation Agents Used: <br>
-- claude-code <br>
-- codex <br>
+- `claude-code` <br>
+- `codex` <br>
 
 
 
 ## Evaluation Tasks: <br>
-Evaluated against 3 internal evaluation tasks (3 positive skill-activation cases). <br>
+Evaluated against 3 internal skill-activation tasks in an astra-sandbox environment with 1 attempt per task and a 50% pass threshold. <br>
 
 ## Evaluation Metrics Used: <br>
 Reported benchmark dimensions: <br>
@@ -70,10 +70,10 @@ Underlying evaluation signals used in this run: <br>
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
 | Security | 3 | 100% (+0%) | 100% (+0%) |
-| Correctness | 3 | 100% (+43%) | 94% (+46%) |
-| Discoverability | 3 | 100% (+75%) | 83% (+48%) |
-| Effectiveness | 3 | 96% (+49%) | 92% (+51%) |
-| Efficiency | 3 | 94% (+70%) | 79% (+35%) |
+| Correctness | 3 | 100% (+48%) | 95% (+32%) |
+| Discoverability | 3 | 100% (+75%) | 83% (+49%) |
+| Effectiveness | 3 | 95% (+56%) | 94% (+41%) |
+| Efficiency | 3 | 94% (+70%) | 74% (+36%) |
 
 ## Skill Version(s): <br>
 v1.2.1+7febc6e (source: pyproject.toml) <br>

@@ -9,7 +9,7 @@ NVIDIA <br>
 ### License/Terms of Use: <br>
 Apache 2.0 <br>
 ## Use Case: <br>
-Developers and engineers creating or modifying NeMo AutoModel training, SFT, or evaluation recipes, debugging recipe construction or trainer issues, or understanding the recipe execution flow. <br>
+Developers and engineers creating or modifying training, SFT, or evaluation recipes for NeMo AutoModel, including YAML config structure, builder functions, CLI routing, and recipe-specific tests. <br>
 
 ### Deployment Geography for Use: <br>
 Global <br>
@@ -42,7 +42,7 @@ Mitigation: Review and scan skill before deployment. <br>
 
 
 ## Evaluation Tasks: <br>
-Evaluated against 3 evaluation tasks in the NVSkills-Eval external profile (astra-sandbox environment, 1 attempt per task, 50% pass threshold). Overall verdict: PASS. <br>
+Evaluated against 3 internal evaluation tasks in the astra-sandbox environment using the NVSkills-Eval external profile. <br>
 
 ## Evaluation Metrics Used: <br>
 Reported benchmark dimensions: <br>
@@ -67,10 +67,10 @@ Underlying evaluation signals used in this run: <br>
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
 | Security | 3 | 100% (+0%) | 100% (+0%) |
-| Correctness | 3 | 83% (+45%) | 97% (+43%) |
-| Discoverability | 3 | 67% (+58%) | 71% (+34%) |
-| Effectiveness | 3 | 90% (+47%) | 100% (+59%) |
-| Efficiency | 3 | 72% (+46%) | 57% (+14%) |
+| Correctness | 3 | 73% (+35%) | 95% (+41%) |
+| Discoverability | 3 | 67% (+58%) | 71% (+45%) |
+| Effectiveness | 3 | 72% (+29%) | 93% (+44%) |
+| Efficiency | 3 | 72% (+46%) | 59% (+27%) |
 
 ## Skill Version(s): <br>
 v1.2.1+7febc6e (source: pyproject.toml) <br>

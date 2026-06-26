@@ -55,10 +55,10 @@ Task composition is derived from the evaluation dataset when possible. Entries w
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
 | Security | 3 | 100% (+0%) | 100% (+0%) |
-| Correctness | 3 | 100% (+43%) | 94% (+46%) |
-| Discoverability | 3 | 100% (+75%) | 83% (+48%) |
-| Effectiveness | 3 | 96% (+49%) | 92% (+51%) |
-| Efficiency | 3 | 94% (+70%) | 79% (+35%) |
+| Correctness | 3 | 100% (+48%) | 95% (+32%) |
+| Discoverability | 3 | 100% (+75%) | 83% (+49%) |
+| Effectiveness | 3 | 95% (+56%) | 94% (+41%) |
+| Efficiency | 3 | 94% (+70%) | 74% (+36%) |
 
 Score values show skill-assisted performance. Values in parentheses show uplift versus the no-skill baseline when baseline data is available.
 
@@ -69,9 +69,9 @@ Tier 1 validation passed with observations. NVSkills-Eval ran 1 checks and found
 Top findings:
 
 - LOW SCHEMA/unexpected_file: Unexpected 'vlm-patterns.md' in skill root (`skills/nemo-automodel-model-onboarding/vlm-patterns.md`)
-- LOW SCHEMA/unexpected_file: Unexpected 'llm-patterns.md' in skill root (`skills/nemo-automodel-model-onboarding/llm-patterns.md`)
 - LOW SCHEMA/unexpected_file: Unexpected 'moe-patterns.md' in skill root (`skills/nemo-automodel-model-onboarding/moe-patterns.md`)
 - LOW SCHEMA/unexpected_file: Unexpected 'capabilities-and-precision.md' in skill root (`skills/nemo-automodel-model-onboarding/capabilities-and-precision.md`)
+- LOW SCHEMA/unexpected_file: Unexpected 'llm-patterns.md' in skill root (`skills/nemo-automodel-model-onboarding/llm-patterns.md`)
 - LOW SCHEMA/author_format: Author must be of the form 'Name <email@host>' (`skills/nemo-automodel-model-onboarding/SKILL.md`)
 
 ## Tier 2: Deduplication Summary
