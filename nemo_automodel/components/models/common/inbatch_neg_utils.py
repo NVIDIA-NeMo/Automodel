@@ -27,10 +27,62 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn_func
 
 
+class _AllGatherIntoTensor(torch.autograd.Function):
+    """Autograd-aware all-gather using tensor collectives.
+
+    ``torch.distributed.nn.functional.all_gather`` returns a tuple of tensors.
+    For large equal-shaped retrieval embeddings, the tensor collective avoids
+    that list allocation/concat path while preserving the same reduce-scatter
+    backward semantics.
+    """
+
+    @staticmethod
+    def forward(ctx, t: torch.Tensor) -> torch.Tensor:
+        t = t.contiguous()
+        world_size = dist.get_world_size()
+        ctx.local_shape = tuple(t.shape)
+        gathered = torch.empty((world_size * t.shape[0], *t.shape[1:]), device=t.device, dtype=t.dtype)
+        dist.all_gather_into_tensor(gathered, t)
+        return gathered
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
+        grad_output = grad_output.contiguous()
+        grad_input = torch.empty(ctx.local_shape, device=grad_output.device, dtype=grad_output.dtype)
+        dist.reduce_scatter_tensor(grad_input, grad_output, op=dist.ReduceOp.SUM)
+        return (grad_input,)
+
+
+def _can_use_tensor_collectives(t: torch.Tensor) -> bool:
+    return (
+        t.is_cuda
+        and hasattr(dist, "all_gather_into_tensor")
+        and hasattr(dist, "reduce_scatter_tensor")
+        and dist.get_backend() == "nccl"
+    )
+
+
+def _all_gather_into_tensor(t: torch.Tensor) -> torch.Tensor:
+    world_size = dist.get_world_size()
+    gathered = torch.empty((world_size * t.shape[0], *t.shape[1:]), device=t.device, dtype=t.dtype)
+    dist.all_gather_into_tensor(gathered, t)
+    return gathered
+
+
 def _all_gather_tensor(t: torch.Tensor, preserve_grad: bool = False) -> torch.Tensor:
     """All-gather ``t`` along dim 0, preserving autograd only when needed."""
     if preserve_grad and t.requires_grad:
+        if _can_use_tensor_collectives(t):
+            return _AllGatherIntoTensor.apply(t)
         return torch.cat(dist_nn_func.all_gather(t), dim=0)
+
+    if _can_use_tensor_collectives(t):
+        gathered_tensor = _all_gather_into_tensor(t.detach() if t.requires_grad else t)
+        if not t.requires_grad:
+            return gathered_tensor
+        gathered = list(gathered_tensor.split(t.shape[0], dim=0))
+        gathered[dist.get_rank()] = t
+        return torch.cat(gathered, dim=0)
 
     gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, t)
