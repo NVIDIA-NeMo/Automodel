@@ -72,7 +72,7 @@ def _tiny_target_config() -> Qwen3Config:
     )
 
 
-def _tiny_model_args() -> _Args:
+def _tiny_model_args(markov_head_type: str = "vanilla") -> _Args:
     return _Args(
         num_draft_layers=2,
         target_layer_ids=list(TARGET_LAYER_IDS),
@@ -80,7 +80,7 @@ def _tiny_model_args() -> _Args:
         mask_token_id=5,
         num_anchors=NUM_ANCHORS,
         markov_rank=16,
-        markov_head_type="vanilla",
+        markov_head_type=markov_head_type,
         confidence_head_alpha=1.0,
         confidence_head_with_markov=True,
         loss_decay_gamma=4.0,
@@ -89,8 +89,8 @@ def _tiny_model_args() -> _Args:
     )
 
 
-def _build_model(device: str = "cpu") -> Qwen3DSparkModel:
-    draft_config = build_draft_config(_tiny_target_config(), _tiny_model_args())
+def _build_model(device: str = "cpu", markov_head_type: str = "vanilla") -> Qwen3DSparkModel:
+    draft_config = build_draft_config(_tiny_target_config(), _tiny_model_args(markov_head_type))
     model = Qwen3DSparkModel(draft_config).to(device=device, dtype=torch.float32).eval()
     # Seed the frozen embedding + head from a fake target, exactly as the recipe will.
     fake_embed = torch.nn.Embedding(VOCAB, HIDDEN)
@@ -132,6 +132,18 @@ def test_forward_shapes():
     # Confidence head + L1 target logits are enabled in this config.
     assert out.confidence_pred.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE)
     assert out.aligned_target_logits.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE, VOCAB)
+    assert torch.isfinite(out.draft_logits).all()
+
+
+@pytest.mark.parametrize("head", ["vanilla", "gated", "rnn"])
+def test_markov_head_variants_forward(head):
+    """All three Markov head variants (incl. the recurrent RNN head) run and bias the logits."""
+    model = _build_model(markov_head_type=head)
+    assert model.markov_head is not None
+    assert model.markov_head.markov_head_type == head
+    with torch.no_grad():
+        out = _forward(model, _batch())
+    assert out.draft_logits.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE, VOCAB)
     assert torch.isfinite(out.draft_logits).all()
 
 
