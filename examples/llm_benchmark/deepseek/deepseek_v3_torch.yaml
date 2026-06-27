@@ -109,3 +109,4 @@ ci:
   nodes: 32
   env_vars:
     RDZV_TIMEOUT: "900"
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
