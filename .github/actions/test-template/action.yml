@@ -168,6 +168,14 @@ runs:
         docker exec -t nemo_container_${{ github.run_id }} /opt/venv/bin/coverage report -i || true
         echo "::endgroup::"
 
+        echo "::group::Failed tests (summary)"
+        docker exec -t nemo_container_${{ github.run_id }} cat /opt/Automodel/failed_summary.txt 2>/dev/null || echo "(no failed-tests report found)"
+        echo "::endgroup::"
+
+        echo "::group::Failed tests (stack traces)"
+        docker exec -t nemo_container_${{ github.run_id }} cat /opt/Automodel/failed_traces.txt 2>/dev/null || echo "(no failed-tests report found)"
+        echo "::endgroup::"
+
         if [[ "$IS_ALLOWED_FAILURE" == "true" ]]; then
           echo -e "\033[1;33m╔══════════════════════════════════════════════════════════════════════════╗\033[0m"
           echo -e "\033[1;33m║                                                                          ║\033[0m"
