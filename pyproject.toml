@@ -444,6 +444,7 @@ convention = "google"
 "nemo_automodel/components/speculative/dspark/loss.py" = ["D103"]
 "nemo_automodel/components/speculative/dspark/markov_head.py" = ["D101", "D103"]
 "nemo_automodel/components/speculative/dspark/draft_qwen3.py" = ["D101"]
+"nemo_automodel/components/speculative/dspark/draft_gemma4.py" = ["D101"]
 
 
 [tool.ruff.lint.isort]

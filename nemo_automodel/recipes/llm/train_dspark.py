@@ -50,7 +50,9 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
+from nemo_automodel.components.speculative.dspark.config import build_gemma4_draft_config
 from nemo_automodel.components.speculative.dspark.core import DSparkTrainerModule
+from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSparkModel
 from nemo_automodel.components.speculative.dspark.registry import (
     build_target_layer_ids,
     resolve_dspark_draft_spec,
@@ -69,6 +71,18 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+_GEMMA4_MODEL_TYPES = ("gemma4", "gemma4_unified")
+
+
+class _DraftArgs(dict):
+    """Dict with attribute access for the per-architecture draft-config builders."""
+
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError as exc:  # pragma: no cover - defensive
+            raise AttributeError(key) from exc
 
 
 class TrainDSparkRecipe(BaseRecipe):
@@ -96,7 +110,7 @@ class TrainDSparkRecipe(BaseRecipe):
             target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
         )
         architectures = getattr(target_config, "architectures", []) or []
-        draft_spec = resolve_dspark_draft_spec(architectures)
+        is_gemma4_target = getattr(target_config, "model_type", "") in _GEMMA4_MODEL_TYPES
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(
             target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
@@ -159,39 +173,55 @@ class TrainDSparkRecipe(BaseRecipe):
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
             )
 
-        # DSpark draft config: a small non-causal Qwen3 stack reusing the target's
-        # architecture defaults (head_dim, rope_theta, rms_norm_eps, ...), plus the
-        # DSpark-specific fields the draft reads at construction time.
-        confidence_head_alpha = float(recipe_cfg.get("confidence_head_alpha", 1.0))
-        markov_rank = int(recipe_cfg.get("markov_rank", 256))
-        draft_config = target_config.to_dict()
-        draft_config["architectures"] = ["Qwen3DSparkModel"]
-        draft_config["num_hidden_layers"] = draft_num_hidden_layers
-        draft_config["layer_types"] = ["full_attention"] * draft_num_hidden_layers
-        draft_config["max_window_layers"] = draft_num_hidden_layers
-        draft_config["num_target_layers"] = num_target_layers
-        draft_config["target_layer_ids"] = target_layer_ids
-        draft_config["block_size"] = self.block_size
-        draft_config["num_anchors"] = self.num_anchors
-        draft_config["mask_token_id"] = self.mask_token_id
-        draft_config["markov_rank"] = markov_rank
-        if markov_rank > 0:
-            draft_config["markov_head_type"] = str(recipe_cfg.get("markov_head_type", "vanilla"))
-        draft_config["enable_confidence_head"] = confidence_head_alpha > 0.0
-        if confidence_head_alpha > 0.0:
-            draft_config["confidence_head_with_markov"] = bool(recipe_cfg.get("confidence_head_with_markov", True))
-        # The draft owns an independent (frozen) lm_head seeded from the target, so
-        # never tie it to embed_tokens here.
-        draft_config["tie_word_embeddings"] = False
-
         # DSpark's block attention mask is a flex_attention BlockMask; the draft
         # only supports the flex attention path during training.
         attention_backend = recipe_cfg.get("attention_backend", "flex_attention")
         if attention_backend != "flex_attention":
             raise ValueError(f"DSpark training requires attention_backend='flex_attention', got {attention_backend!r}.")
-        draft_config_obj = Qwen3Config.from_dict(draft_config)
+        confidence_head_alpha = float(recipe_cfg.get("confidence_head_alpha", 1.0))
+        markov_rank = int(recipe_cfg.get("markov_rank", 256))
+
+        if is_gemma4_target:
+            # Gemma4 draft is built from the target's text sub-config (text_config).
+            margs = _DraftArgs(
+                num_draft_layers=draft_num_hidden_layers,
+                target_layer_ids=target_layer_ids,
+                block_size=self.block_size,
+                num_anchors=self.num_anchors,
+                mask_token_id=self.mask_token_id,
+                markov_rank=markov_rank,
+                markov_head_type=str(recipe_cfg.get("markov_head_type", "vanilla")),
+                confidence_head_alpha=confidence_head_alpha,
+                confidence_head_with_markov=bool(recipe_cfg.get("confidence_head_with_markov", True)),
+            )
+            draft_config_obj = build_gemma4_draft_config(target_config, margs)
+            draft_cls = Gemma4DSparkModel
+        else:
+            # Qwen3-style draft: a small non-causal stack reusing the target's
+            # architecture defaults plus the DSpark-specific fields.
+            draft_config = target_config.to_dict()
+            draft_config["architectures"] = ["Qwen3DSparkModel"]
+            draft_config["num_hidden_layers"] = draft_num_hidden_layers
+            draft_config["layer_types"] = ["full_attention"] * draft_num_hidden_layers
+            draft_config["max_window_layers"] = draft_num_hidden_layers
+            draft_config["num_target_layers"] = num_target_layers
+            draft_config["target_layer_ids"] = target_layer_ids
+            draft_config["block_size"] = self.block_size
+            draft_config["num_anchors"] = self.num_anchors
+            draft_config["mask_token_id"] = self.mask_token_id
+            draft_config["markov_rank"] = markov_rank
+            if markov_rank > 0:
+                draft_config["markov_head_type"] = str(recipe_cfg.get("markov_head_type", "vanilla"))
+            draft_config["enable_confidence_head"] = confidence_head_alpha > 0.0
+            if confidence_head_alpha > 0.0:
+                draft_config["confidence_head_with_markov"] = bool(recipe_cfg.get("confidence_head_with_markov", True))
+            # The draft owns an independent (frozen) lm_head seeded from the target.
+            draft_config["tie_word_embeddings"] = False
+            draft_config_obj = Qwen3Config.from_dict(draft_config)
+            draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
+
         draft_config_obj._attn_implementation = attention_backend
-        self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
 
         # DSpark shares the target's embeddings + lm_head and keeps them frozen,
         # training only the backbone, fc, Markov head, and confidence head.
