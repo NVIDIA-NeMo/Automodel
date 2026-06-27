@@ -370,14 +370,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 apply_selective_checkpointing_to_layers(model, layers, _has_kv_sharing, enable_compile=enable_compile)
             elif _apply_bagel_full_layer_activation_checkpointing(model):
                 logger.info("Using BAGEL full-layer activation checkpointing; skipping submodule checkpoint wrappers.")
-            if not _has_kv_sharing:
-                if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
-                    try:
-                        model.config.use_cache = False
-                    except Exception:
-                        pass
-
-            if _detect_ffpa_impl(model):
+            elif _detect_ffpa_impl(model):
                 # Selective AC: mark FFPA fwd ops MUST_SAVE so CuTeDSL kernels aren't replayed in backward.
                 from functools import partial
 
