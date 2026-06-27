@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Gemma 4 31B (dense) MedPix-VQA SFT, sequence-packed to 16k under Ring P2P CP8.
+# Gemma 4 31B (dense) VLM perf recipe: sequence-packed to 16k under Ring P2P CP8.
 # The head_dim=512 full-attention ring chunks run through the FFPA CuTeDSL varlen
-# kernel; sliding-window layers use Flex. MedPix-VQA is pulled from the HF Hub at
-# runtime, so the recipe is CI-runnable with no local data prep.
-# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_31b_ffpa_medpix_packing_cp8_16k.yaml
+# kernel; sliding-window layers use Flex. Data is the built-in synthetic VLM mock
+# (nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset) — random
+# images + responses sized so each packed 16k sequence is full — so the recipe is
+# fully self-contained and CI-runnable with no data download or local prep.
+# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_31b_ffpa_mock_packing_cp8_16k.yaml
 
 recipe: FinetuneRecipeForVLM
 
@@ -26,7 +28,7 @@ step_scheduler:
   ckpt_every_steps: 999999
   val_every_steps: 999999
   max_steps: 200
-  num_epochs: 1
+  num_epochs: 50
 
 dist_env:
   backend: nccl
@@ -68,9 +70,12 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
-  path_or_dataset: mmoukouba/MedPix-VQA
-  split: train[:1000]
+  _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
+  num_samples: 256
+  num_images_per_sample: 1
+  image_size: [896, 896]
+  max_length: 2048
+  seed: 42
 
 # pack_size must be divisible by 2*cp_size (16 here): 16384 / 16 = 1024.
 packed_sequence:
@@ -88,9 +93,12 @@ dataloader:
   pin_memory: true
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
-  path_or_dataset: mmoukouba/MedPix-VQA
-  split: validation[:500]
+  _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
+  num_samples: 16
+  num_images_per_sample: 1
+  image_size: [896, 896]
+  max_length: 2048
+  seed: 43
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
