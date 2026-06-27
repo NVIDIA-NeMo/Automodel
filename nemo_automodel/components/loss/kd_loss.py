@@ -182,18 +182,10 @@ class KDLoss(nn.Module):
         Returns:
             Scalar KD loss.
         """
-        # Exclude padding / ignored tokens from the loss.
-        valid_mask = (labels != self.ignore_index).view(-1)
-        if valid_mask.sum() == 0:
-            # Entire batch contains only padding - return zero to keep gradients finite.
-            return student_logits.new_tensor(0.0)
-
         if student_logits.ndim > 2:
             student_logits = student_logits.view(-1, student_logits.shape[-1])
         if teacher_logits.ndim > 2:
             teacher_logits = teacher_logits.view(-1, teacher_logits.shape[-1])
-        if labels.ndim > 1:
-            labels = labels.view(-1)
 
         # Determine TP group: prefer explicit argument, then auto-detect from DTensor.
         tp_group = self.tp_group
@@ -206,6 +198,8 @@ class KDLoss(nn.Module):
                 student_logits = student_logits.to_local()
             if _HAVE_DTENSOR and isinstance(teacher_logits, DTensor):
                 teacher_logits = teacher_logits.to_local()
+            if _HAVE_DTENSOR and isinstance(labels, DTensor):
+                labels = labels.to_local()
         else:
             # Non-TP path: materialise full tensors.
             if _HAVE_DTENSOR and isinstance(student_logits, DTensor):
@@ -214,6 +208,16 @@ class KDLoss(nn.Module):
                 teacher_logits = teacher_logits.full_tensor()
             if _HAVE_DTENSOR and isinstance(labels, DTensor):
                 labels = labels.full_tensor()
+
+        if labels.ndim > 1:
+            labels = labels.view(-1)
+
+        # Exclude padding / ignored tokens from the loss after labels have been
+        # localized/materialized so the boolean mask matches the logits layout.
+        valid_mask = (labels != self.ignore_index).view(-1)
+        if valid_mask.sum() == 0:
+            # Entire batch contains only padding - return zero to keep gradients finite.
+            return student_logits.new_tensor(0.0)
 
         t_logits = teacher_logits[valid_mask]
         s_logits = student_logits[valid_mask]
