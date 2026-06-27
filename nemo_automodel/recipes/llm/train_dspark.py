@@ -559,6 +559,9 @@ class TrainDSparkRecipe(BaseRecipe):
                     self.train_dataloader.sampler.set_epoch(epoch_idx)
 
                 running_loss = 0.0
+                running_ce = 0.0
+                running_l1 = 0.0
+                running_conf = 0.0
                 running_micro = 0
                 epoch_loss = 0.0
                 micro_step = 0
@@ -589,6 +592,9 @@ class TrainDSparkRecipe(BaseRecipe):
                         loss.backward()
 
                     running_loss += metrics.loss.detach().item()
+                    running_ce += metrics.ce_loss.detach().item()
+                    running_l1 += metrics.l1_loss.detach().item()
+                    running_conf += metrics.confidence_loss.detach().item()
                     running_micro += 1
                     epoch_loss += metrics.loss.detach().item()
                     micro_step += 1
@@ -607,14 +613,23 @@ class TrainDSparkRecipe(BaseRecipe):
                         self._maybe_save_step_checkpoint(epoch_idx)
 
                         if self.runtime.global_step % self.log_every_steps == 0:
-                            window_loss = self._dp_allreduce(
-                                torch.tensor(running_loss, device=self.device, dtype=torch.float32)
-                            ).item()
-                            window_count = self._dp_allreduce(
-                                torch.tensor(float(running_micro), device=self.device, dtype=torch.float32)
-                            ).item()
-                            avg_loss = window_loss / max(1.0, window_count)
-                            running_loss = 0.0
+                            # One collective: window sums of loss + its three terms and the
+                            # micro-batch count, summed across DP ranks, then divided -> global means.
+                            window = self._dp_allreduce(
+                                torch.tensor(
+                                    [running_loss, running_ce, running_l1, running_conf, float(running_micro)],
+                                    device=self.device,
+                                    dtype=torch.float32,
+                                )
+                            ).tolist()
+                            count = max(1.0, window[4])
+                            avg = {
+                                "loss": window[0] / count,
+                                "ce_loss": window[1] / count,
+                                "l1_loss": window[2] / count,
+                                "confidence_loss": window[3] / count,
+                            }
+                            running_loss = running_ce = running_l1 = running_conf = 0.0
                             running_micro = 0
                             if self.dist_env.is_main:
                                 current_lr = self.lr_scheduler.get_last_lr()[0]
@@ -623,16 +638,19 @@ class TrainDSparkRecipe(BaseRecipe):
                                     MetricsSample(
                                         step=self.runtime.global_step,
                                         epoch=epoch_idx,
-                                        metrics={"loss": avg_loss, "lr": current_lr, "mem": mem},
+                                        metrics={**avg, "lr": current_lr, "mem": mem},
                                     )
                                 )
                                 if pbar is not None:
-                                    pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{current_lr:.2e}")
+                                    pbar.set_postfix(loss=f"{avg['loss']:.4f}", lr=f"{current_lr:.2e}")
                                 logger.info(
-                                    "step %d | epoch %d | loss %.4f | lr %.2e | mem %.2f GiB",
+                                    "step %d | epoch %d | loss %.4f | ce %.4f | tv %.4f | conf %.4f | lr %.2e | mem %.2f GiB",
                                     self.runtime.global_step,
                                     epoch_idx,
-                                    avg_loss,
+                                    avg["loss"],
+                                    avg["ce_loss"],
+                                    avg["l1_loss"],
+                                    avg["confidence_loss"],
                                     current_lr,
                                     mem,
                                 )

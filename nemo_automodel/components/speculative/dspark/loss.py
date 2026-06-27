@@ -259,6 +259,7 @@ def compute_dspark_loss(
     ce_loss_alpha: float,
     l1_loss_alpha: float,
     confidence_head_alpha: float,
+    return_terms: bool = False,
 ):
     loss_terms, has_confidence = _collect_local_terms(
         outputs=outputs,
@@ -320,6 +321,14 @@ def compute_dspark_loss(
         has_confidence=has_confidence,
         world_size=world_size,
     )
+    if return_terms:
+        terms = {
+            "loss": local_loss.detach(),
+            "ce_loss": local_ce_loss.detach(),
+            "l1_loss": local_l1_loss.detach(),
+            "confidence_loss": local_confidence_loss.detach(),
+        }
+        return backward_loss, terms
     return backward_loss
 
 

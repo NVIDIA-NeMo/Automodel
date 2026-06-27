@@ -34,9 +34,12 @@ from nemo_automodel.components.speculative.dspark.loss import compute_dspark_los
 
 @dataclass
 class DSparkStepMetrics:
-    """Per-step training output for the DSpark draft."""
+    """Per-step training outputs for the DSpark draft (loss + its three terms)."""
 
     loss: torch.Tensor
+    ce_loss: torch.Tensor
+    l1_loss: torch.Tensor
+    confidence_loss: torch.Tensor
 
 
 class DSparkTrainerModule(nn.Module):
@@ -72,14 +75,20 @@ class DSparkTrainerModule(nn.Module):
             loss_mask=loss_mask,
             target_last_hidden_states=target_last_hidden_states,
         )
-        loss = compute_dspark_loss(
+        loss, terms = compute_dspark_loss(
             outputs=outputs,
             loss_decay_gamma=self.loss_decay_gamma,
             ce_loss_alpha=self.ce_loss_alpha,
             l1_loss_alpha=self.l1_loss_alpha,
             confidence_head_alpha=self.confidence_head_alpha,
+            return_terms=True,
         )
-        return DSparkStepMetrics(loss=loss)
+        return DSparkStepMetrics(
+            loss=loss,
+            ce_loss=terms["ce_loss"],
+            l1_loss=terms["l1_loss"],
+            confidence_loss=terms["confidence_loss"],
+        )
 
 
 __all__ = ["DSparkTrainerModule", "DSparkStepMetrics"]
