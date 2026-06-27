@@ -72,9 +72,24 @@ def _infer_vocab_size(model_cfg):
         model_config = config_cls.from_pretrained(config_section.pretrained_model_name_or_path)
 
     if model_config is None:
-        model_config = AutoConfig.from_pretrained(
-            config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
-        )
+        try:
+            model_config = AutoConfig.from_pretrained(
+                config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+            )
+        except Exception as exc:
+            # Step-3.5 publishes MTP layer metadata in ``layer_types`` in addition
+            # to its transformer-layer count.  Newer Transformers validates those
+            # lengths while loading a config even though benchmark setup only needs
+            # ``vocab_size``.  Reuse the tokenizer compatibility patch, then retry.
+            message = str(exc)
+            if "num_hidden_layers" not in message or "layer_types" not in message:
+                raise
+            from nemo_automodel._transformers.v4_patches.layer_types import relax_layer_types_validator
+
+            relax_layer_types_validator()
+            model_config = AutoConfig.from_pretrained(
+                config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+            )
 
     if hasattr(model_config, "vocab_size"):
         return model_config.vocab_size
