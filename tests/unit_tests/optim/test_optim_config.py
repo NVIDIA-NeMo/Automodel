@@ -177,8 +177,28 @@ class TestOptimizerFromFactoryConfig:
         assert captured["master_weight_dtype"] is torch.bfloat16
 
     def test_build_requires_callable_factory(self):
-        with pytest.raises(AssertionError, match="must be a callable"):
+        with pytest.raises(TypeError, match="must be a callable"):
             OptimizerFromFactoryConfig(factory=None).build(_model())
+
+    def test_build_from_param_groups_requires_callable_factory(self):
+        with pytest.raises(TypeError, match="must be a callable"):
+            OptimizerFromFactoryConfig(factory=None).build_from_param_groups([])
+
+    def test_build_rejects_empty_trainable_params(self):
+        model = _model()
+        for param in model.parameters():
+            param.requires_grad = False
+
+        with pytest.raises(ValueError, match="No trainable parameters found"):
+            AdamWConfig().build(model)
+
+    def test_factory_build_rejects_empty_trainable_params(self):
+        model = _model()
+        for param in model.parameters():
+            param.requires_grad = False
+
+        with pytest.raises(ValueError, match="No trainable parameters found"):
+            OptimizerFromFactoryConfig(factory=torch.optim.SGD, kwargs={"lr": 0.01}).build(model)
 
     def test_build_from_param_groups_uses_factory(self):
         cfg = OptimizerFromFactoryConfig(

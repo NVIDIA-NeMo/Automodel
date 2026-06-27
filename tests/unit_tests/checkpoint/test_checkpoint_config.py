@@ -72,7 +72,7 @@ class TestCheckpointingConfig:
         assert str(cfg.checkpoint_dir) == "/tmp/ckpt"
 
     def test_invalid_format_raises(self):
-        with pytest.raises(AssertionError, match="Unsupported model save format"):
+        with pytest.raises(ValueError, match="Unsupported model save format"):
             CheckpointingConfig(
                 enabled=True,
                 checkpoint_dir="/tmp/ckpt",
