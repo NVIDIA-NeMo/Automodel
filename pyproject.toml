@@ -439,6 +439,11 @@ convention = "google"
 "nemo_automodel/components/models/qwen3_vl_moe/model.py" = ["D101"]
 "nemo_automodel/recipes/retrieval/train_bi_encoder.py" = ["D103"]
 "nemo_automodel/recipes/retrieval/train_cross_encoder.py" = ["D101", "D103"]
+"nemo_automodel/components/speculative/dspark/common.py" = ["D101", "D103"]
+"nemo_automodel/components/speculative/dspark/config.py" = ["D103"]
+"nemo_automodel/components/speculative/dspark/loss.py" = ["D103"]
+"nemo_automodel/components/speculative/dspark/markov_head.py" = ["D101", "D103"]
+"nemo_automodel/components/speculative/dspark/draft_qwen3.py" = ["D101"]
 
 
 [tool.ruff.lint.isort]
