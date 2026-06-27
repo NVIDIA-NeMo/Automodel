@@ -41,6 +41,7 @@ model:
   l2_normalize: true
   use_liger_kernel: true
   use_sdpa_patching: true
+  use_te_norms: true
   torch_dtype: bfloat16
   attn_implementation: flash_attention_2
   do_distributed_inbatch_negative: true
