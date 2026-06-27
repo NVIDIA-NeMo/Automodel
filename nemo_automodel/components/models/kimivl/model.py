@@ -27,6 +27,7 @@ from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
 LOGGER = logging.getLogger(__name__)
 
@@ -655,6 +656,7 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(self, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):
+        warn_deprecated_model_class("KimiVLForConditionalGeneration")
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
