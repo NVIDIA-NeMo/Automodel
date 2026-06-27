@@ -53,6 +53,9 @@ def _make_recipe(world_size: int = 1, device: str = "cuda") -> TrainEagle3Recipe
     recipe.device = torch.device(device)
     recipe.dist_env = SimpleNamespace(world_size=world_size)
     recipe.compute_dtype = torch.bfloat16
+    # ``_setup_online_target`` reads ``cfg.get("distributed.cp_size", ...)`` for the
+    # CP gate; an empty config stand-in defaults it to cp_size=1 (no CP).
+    recipe.cfg = _RecipeCfg()
     return recipe
 
 
