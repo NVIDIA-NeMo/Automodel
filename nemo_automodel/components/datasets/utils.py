@@ -384,6 +384,25 @@ def packed_sequence_thd_collater(batch):
     }
 
 
+def packed_sequence_thd_collater_vlm(examples, processor=None, **kwargs):
+    """THD collater adapter for the VLM recipe's ``(examples, processor)`` call convention.
+
+    ``recipes/vlm/finetune.py:build_dataloader`` invokes the configured collate as
+    ``collate_cfg.instantiate(examples=examples, processor=processor)``, whereas
+    :func:`packed_sequence_thd_collater` takes only ``batch``. This thin adapter accepts
+    (and ignores) ``processor`` and any extra kwargs so pre-tokenized ``ChatDataset``
+    samples can use THD / context-parallel batching inside the VLM recipe.
+
+    Args:
+        examples: Batch of samples, forwarded to :func:`packed_sequence_thd_collater`.
+        processor: Unused; accepted only for VLM-recipe call-convention compatibility.
+
+    Returns:
+        dict: THD-format batch (see :func:`packed_sequence_thd_collater`).
+    """
+    return packed_sequence_thd_collater(examples)
+
+
 def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tensor:
     """Convert an indexed attention mask to a 4D block-causal mask.
 
