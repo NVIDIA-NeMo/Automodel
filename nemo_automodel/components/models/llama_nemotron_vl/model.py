@@ -159,6 +159,34 @@ _USE_PLURAL_CACHE_PARAM = "past_key_values" in _decoder_forward_params
 _DYNAMIC_CACHE_ACCEPTS_CONFIG = "config" in _dynamic_cache_init_params
 
 
+def _prepare_flash_bidirectional_attention_mask(
+    config: PretrainedConfig,
+    attention_mask: torch.Tensor | None,
+    attention_mask_has_padding: bool | None = None,
+) -> tuple[torch.Tensor | None, bool | None]:
+    """Prepare the FA2 bidirectional padding mask before expensive GPU work.
+
+    Transformers' ``flash_attention_mask`` checks ``if attention_mask.all()`` to
+    skip the mask when it has no padding. When ``attention_mask`` is a CUDA
+    tensor, that Python branch forces ``aten::item`` / ``cudaStreamSynchronize``.
+
+    We still need to distinguish the no-padding case from the padded case:
+    always passing a 2D mask forces FA2's varlen unpad path, which is slower for
+    all-ones masks. Prefer a CPU-computed collator flag when available. Older
+    callers fall back to a single early scalar check before vision and language
+    kernels have queued substantial work.
+    """
+    if attention_mask is None:
+        return None, None
+    if getattr(config, "_attn_implementation", None) != "flash_attention_2":
+        return attention_mask, None
+
+    has_padding = attention_mask_has_padding
+    if has_padding is None:
+        has_padding = not bool(attention_mask.all())
+    return (attention_mask if has_padding else None), has_padding
+
+
 def split_model(model_path, device):
     device_map = {}
     world_size = torch.cuda.device_count()
@@ -275,9 +303,16 @@ class LlamaBidirectionalModel(LlamaModel):
         self,
         input_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None,
+        attention_mask_has_padding: bool | None = None,
     ) -> torch.Tensor | None:
         if attention_mask is None:
             return None
+
+        if getattr(self.config, "_attn_implementation", None) == "flash_attention_2":
+            if attention_mask_has_padding is False:
+                return None
+            if attention_mask_has_padding is True:
+                return attention_mask
 
         if _HAS_NATIVE_BIDIRECTIONAL_MASK:
             return create_bidirectional_mask(
@@ -303,6 +338,7 @@ class LlamaBidirectionalModel(LlamaModel):
         cache_position: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         output_hidden_states: bool | None = None,
+        attention_mask_has_padding: bool | None = None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -329,7 +365,11 @@ class LlamaBidirectionalModel(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        bidirectional_mask = self._create_bidirectional_mask(inputs_embeds, attention_mask)
+        bidirectional_mask = self._create_bidirectional_mask(
+            inputs_embeds,
+            attention_mask,
+            attention_mask_has_padding=attention_mask_has_padding,
+        )
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -552,6 +592,7 @@ class LlamaNemotronVLModel(PreTrainedModel):
         image_flags: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         labels: Optional[torch.LongTensor] = None,
+        attention_mask_has_padding: Optional[bool] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -560,6 +601,12 @@ class LlamaNemotronVLModel(PreTrainedModel):
         run_dummy_vision: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        language_attention_mask, attention_mask_has_padding = _prepare_flash_bidirectional_attention_mask(
+            self.language_model.config,
+            attention_mask,
+            attention_mask_has_padding=attention_mask_has_padding,
+        )
 
         # Get text embeddings
         input_embeds = self.language_model.get_input_embeddings()(input_ids)
@@ -586,15 +633,18 @@ class LlamaNemotronVLModel(PreTrainedModel):
             input_embeds = input_embeds + dummy_output.sum().to(input_embeds.dtype) * 0.0
 
         # Forward through language model
-        outputs = self.language_model(
-            inputs_embeds=input_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-        )
+        language_model_kwargs = {
+            "inputs_embeds": input_embeds,
+            "attention_mask": language_attention_mask,
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache,
+            "output_attentions": output_attentions,
+            "output_hidden_states": output_hidden_states,
+        }
+        if isinstance(self.language_model, LlamaBidirectionalModel):
+            language_model_kwargs["attention_mask_has_padding"] = attention_mask_has_padding
+        outputs = self.language_model(**language_model_kwargs)
         logits = None
         loss = None
 

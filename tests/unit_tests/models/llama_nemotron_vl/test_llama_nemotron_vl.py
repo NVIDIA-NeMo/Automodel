@@ -23,6 +23,7 @@ from transformers.processing_utils import ProcessorMixin
 
 from nemo_automodel.components.models.llama_nemotron_vl.model import (
     LlamaBidirectionalConfig,
+    LlamaBidirectionalModel,
     LlamaNemotronVLConfig,
     LlamaNemotronVLModel,
 )
@@ -188,10 +189,18 @@ def test_processor_initializes_tokenizer_for_pixel_values(processor):
     assert processor.tokenizer.model_input_names == ["input_ids", "attention_mask", "pixel_values"]
 
 
+def test_processor_call_text_adds_cpu_padding_flag(processor):
+    output = processor(text=["short", "longer"])
+
+    assert set(output) == {"input_ids", "attention_mask", "attention_mask_has_padding"}
+    assert output["attention_mask_has_padding"] is False
+
+
 def test_processor_process_queries_prefixes_and_tokenizes(processor):
     output = processor.process_queries(["What is shown?"])
 
-    assert set(output) == {"input_ids", "attention_mask"}
+    assert set(output) == {"input_ids", "attention_mask", "attention_mask_has_padding"}
+    assert output["attention_mask_has_padding"] is False
     call = processor.tokenizer.calls[-1]
     assert call["texts"] == ["query: What is shown?"]
     assert call["kwargs"] == {
@@ -220,7 +229,8 @@ def test_processor_process_queries_handles_multiple_queries_and_options(processo
 def test_processor_process_documents_supports_text_only_inputs(processor):
     output = processor.process_documents({"images": ["", None], "texts": ["Document A", "Document B"]})
 
-    assert set(output) == {"input_ids", "attention_mask", "pixel_values"}
+    assert set(output) == {"input_ids", "attention_mask", "attention_mask_has_padding", "pixel_values"}
+    assert output["attention_mask_has_padding"] is False
     assert output["pixel_values"] is None
     call = processor.tokenizer.calls[-1]
     assert call["texts"] == ["passage: Document A", "passage: Document B"]
@@ -241,7 +251,8 @@ def test_processor_process_documents_supports_pil_images_and_text(processor):
 
     output = processor.process_documents({"images": images, "texts": ["text 1", "text 2"]})
 
-    assert set(output) == {"input_ids", "attention_mask", "pixel_values"}
+    assert set(output) == {"input_ids", "attention_mask", "attention_mask_has_padding", "pixel_values"}
+    assert output["attention_mask_has_padding"] is True
     assert output["pixel_values"].shape == (4, 3, 4, 4)
     assert output["pixel_values"].dtype == torch.bfloat16
 
@@ -275,6 +286,7 @@ def test_processor_process_documents_can_return_per_image_tiles(processor):
     assert len(output["pixel_values"]) == 2
     assert output["pixel_values"][0].shape == (1, 3, 4, 4)
     assert output["pixel_values"][1].shape == (3, 3, 4, 4)
+    assert output["attention_mask_has_padding"] is True
 
 
 def test_processor_biencoder_collator_merges_query_document_batches(processor):
@@ -288,13 +300,17 @@ def test_processor_biencoder_collator_merges_query_document_batches(processor):
     assert set(output) == {
         "q_input_ids",
         "q_attention_mask",
+        "q_attention_mask_has_padding",
         "d_input_ids",
         "d_attention_mask",
+        "d_attention_mask_has_padding",
         "d_pixel_values",
         "labels",
     }
     assert output["q_input_ids"].shape[0] == 2
     assert output["d_input_ids"].shape[0] == 4
+    assert output["q_attention_mask_has_padding"] is False
+    assert output["d_attention_mask_has_padding"] is False
     assert output["d_pixel_values"] is None
     assert output["labels"].dtype == torch.long
     assert torch.equal(output["labels"], torch.zeros(2, dtype=torch.long))
@@ -381,6 +397,30 @@ def test_model_forward_injects_image_embeddings_into_text_sequence(tiny_model, m
     assert torch.allclose(injected_embeds[0, 3], torch.full((hidden_size,), 2.0))
     assert output.logits.shape == (1, 4, tiny_model.language_model.config.vocab_size)
     assert torch.allclose(output.hidden_states[-1], injected_embeds + 1.0)
+
+
+def test_bidirectional_fa2_mask_bypasses_hf_all_sync(monkeypatch):
+    import nemo_automodel.components.models.llama_nemotron_vl.model as model_module
+
+    def _unexpected_hf_mask_call(*args, **kwargs):
+        raise AssertionError("FA2 bidirectional mask path must not call HF create_bidirectional_mask")
+
+    monkeypatch.setattr(model_module, "create_bidirectional_mask", _unexpected_hf_mask_call)
+
+    config = LlamaBidirectionalConfig(**_tiny_llm_config())
+    config._attn_implementation = "flash_attention_2"
+    model = object.__new__(LlamaBidirectionalModel)
+    model.config = config
+
+    input_embeds = torch.zeros(2, 4, config.hidden_size)
+    attention_mask = torch.ones(2, 4, dtype=torch.long)
+
+    assert model._create_bidirectional_mask(input_embeds, None) is None
+    assert model._create_bidirectional_mask(input_embeds, attention_mask, attention_mask_has_padding=False) is None
+    assert (
+        model._create_bidirectional_mask(input_embeds, attention_mask, attention_mask_has_padding=True)
+        is attention_mask
+    )
 
 
 def _target_ratios(max_num=6):

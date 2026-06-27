@@ -287,6 +287,16 @@ class LlamaNemotronVLProcessorConfig(PretrainedConfig):
     pass
 
 
+def _attention_mask_has_padding(attention_mask: Any) -> bool | None:
+    if attention_mask is None:
+        return None
+    if isinstance(attention_mask, torch.Tensor):
+        return not bool(attention_mask.all())
+    if hasattr(attention_mask, "all"):
+        return not bool(attention_mask.all())
+    return any(token == 0 for row in attention_mask for token in row)
+
+
 class LlamaNemotronVLProcessor(ProcessorMixin):
     """Processor for LlamaNemotronVL model."""
 
@@ -393,7 +403,7 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
         max_length = None
         if truncation:
             max_length = self.p_max_length or self.tokenizer.model_max_length
-        return self.tokenizer(
+        model_inputs = self.tokenizer(
             text,
             padding=padding,
             truncation=truncation,
@@ -401,6 +411,8 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors=return_tensors,
         )
+        model_inputs["attention_mask_has_padding"] = _attention_mask_has_padding(model_inputs["attention_mask"])
+        return model_inputs
 
     def process_documents(
         self,
@@ -564,6 +576,7 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
         batch_docs = {
             "input_ids": model_inputs["input_ids"],
             "attention_mask": model_inputs["attention_mask"],
+            "attention_mask_has_padding": _attention_mask_has_padding(model_inputs["attention_mask"]),
             "pixel_values": pixel_values_return_value,
         }
 
@@ -622,6 +635,7 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors=return_tensors,
         )
+        batch_query["attention_mask_has_padding"] = _attention_mask_has_padding(batch_query["attention_mask"])
 
         return batch_query
 
