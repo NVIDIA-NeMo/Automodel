@@ -36,7 +36,7 @@ help:
 	@echo "  make docs-login             FIRST-TIME SETUP — provision Fern account + CLI auth"
 	@echo "  make docs                   Generate library reference and start Fern dev server"
 	@echo "  make docs-stitch            Restore frozen backward-version pages from the $(ARCHIVE_REF) branch"
-	@echo "  make docs-check             Run 'fern check' (config + MDX validation)"
+	@echo "  make docs-check             Run MDX syntax validation + 'fern check'"
 	@echo "  make docs-mdx-check         Run MDX syntax validation"
 	@echo "  make docs-preview           Build a shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)"
 	@echo "  make docs-publish           Trigger the 'Publish Fern Docs' workflow on origin/main"
