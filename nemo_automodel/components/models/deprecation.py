@@ -122,7 +122,7 @@ def warn_deprecated_model_class(model_cls_name: str) -> None:
 
     yaml_list = ", ".join(yaml_paths)
     warnings.warn(
-        f"{model_cls_name} is deprecated and will be removed in NeMo AutoModel 26.10. "
+        f"{model_cls_name} is deprecated and will be removed in NeMo AutoModel 26.10 container release and NeMo-Automodel v0.7.0. "
         f"Associated example configs: {yaml_list}",
         category=FutureWarning,
         stacklevel=3,
