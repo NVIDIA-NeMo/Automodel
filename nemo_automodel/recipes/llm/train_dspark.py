@@ -87,6 +87,9 @@ class TrainDSparkRecipe(BaseRecipe):
 
         recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
+        # The draft is sharded directly with fully_shard over the default world
+        # mesh (no explicit MeshContext), so _dp_allreduce reduces over the world group.
+        self.device_mesh = None
 
         target_path = recipe_cfg.target_model_name_or_path
         target_config = AutoConfig.from_pretrained(
