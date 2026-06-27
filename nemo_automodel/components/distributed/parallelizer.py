@@ -252,7 +252,7 @@ class ParallelizationStrategy(ABC):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
-        reshard_after_forward: Optional[bool] = None,
+        reshard_after_forward: Optional[Union[bool, int]] = None,
         **kwargs,
     ) -> nn.Module:
         """Apply parallelization strategy to the model."""
@@ -279,7 +279,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         enable_fsdp2_prefetch: bool = True,
         fsdp2_backward_prefetch_depth: int = 2,
         fsdp2_forward_prefetch_depth: int = 1,
-        reshard_after_forward: Optional[bool] = None,
+        reshard_after_forward: Optional[Union[bool, int]] = None,
+        fsdp2_shard_group_size: int = 1,
         fully_shard_fn=None,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
@@ -413,6 +414,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth,
             reshard_after_forward,
+            fsdp2_shard_group_size,
             fully_shard_fn=fully_shard_fn,
         )
 
@@ -463,7 +465,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
-        reshard_after_forward: Optional[bool] = None,
+        reshard_after_forward: Optional[Union[bool, int]] = None,
         **kwargs,
     ) -> nn.Module:
         """Apply NemotronH-specific parallelization."""
@@ -783,6 +785,8 @@ class WanParallelizationStrategy(ParallelizationStrategy):
             kwargs.get("enable_fsdp2_prefetch", True),
             kwargs.get("fsdp2_backward_prefetch_depth", 2),
             kwargs.get("fsdp2_forward_prefetch_depth", 1),
+            kwargs.get("reshard_after_forward", None),
+            kwargs.get("fsdp2_shard_group_size", 1),
         )
 
         return fully_shard(
@@ -837,6 +841,8 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
             kwargs.get("enable_fsdp2_prefetch", True),
             kwargs.get("fsdp2_backward_prefetch_depth", 2),
             kwargs.get("fsdp2_forward_prefetch_depth", 1),
+            kwargs.get("reshard_after_forward", None),
+            kwargs.get("fsdp2_shard_group_size", 1),
         )
 
         return fully_shard(
@@ -1021,7 +1027,8 @@ def apply_fsdp2_sharding_recursively(
     enable_fsdp2_prefetch: bool = True,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
-    reshard_after_forward: Optional[bool] = None,
+    reshard_after_forward: Optional[Union[bool, int]] = None,
+    fsdp2_shard_group_size: int = 1,
     fully_shard_fn=None,
 ) -> None:
     """
@@ -1045,14 +1052,18 @@ def apply_fsdp2_sharding_recursively(
         enable_fsdp2_prefetch (bool): Enable explicit forward/backward prefetch chains.
         fsdp2_backward_prefetch_depth (int): Backward prefetch depth.
         fsdp2_forward_prefetch_depth (int): Forward prefetch depth.
-        reshard_after_forward (Optional[bool]): Optional override for each layer's
+        reshard_after_forward (Optional[bool | int]): Optional override for each layer's
             ``fully_shard`` reshard behavior.
+        fsdp2_shard_group_size (int): Number of consecutive layers to group into
+            one FSDP2 communication unit.
     Note:
         This function modifies the module in-place by replacing modules with their
         FSDP2-subclassed versions.
     """
     if fully_shard_fn is None:
         fully_shard_fn = fully_shard
+    if fsdp2_shard_group_size < 1:
+        raise ValueError("fsdp2_shard_group_size must be >= 1")
 
     pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
 
@@ -1081,10 +1092,16 @@ def apply_fsdp2_sharding_recursively(
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
                 reshard_after_forward,
+                fsdp2_shard_group_size,
                 fully_shard_fn=fully_shard_fn,
             )
 
-        for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
+        fsdp_layer_groups = [
+            flat_layer_items[i : i + fsdp2_shard_group_size]
+            for i in range(0, len(flat_layer_items), fsdp2_shard_group_size)
+        ]
+        fsdp_units = []
+        for enum_id, layer_group in enumerate(fsdp_layer_groups):
             # With PP: keep weights gathered across microbatches (no per-microbatch all-gather).
             # Without PP: reshard all but last layer to enable forward+backward weight prefetching.
             if reshard_after_forward is not None:
@@ -1092,15 +1109,27 @@ def apply_fsdp2_sharding_recursively(
             elif pp_enabled:
                 layer_reshard_after_forward = False
             else:
-                layer_reshard_after_forward = enum_id < len(flat_layer_items) - 1
-            fully_shard_fn(
-                child_module,
+                layer_reshard_after_forward = enum_id < len(fsdp_layer_groups) - 1
+            shard_target = layer_group[0][1] if len(layer_group) == 1 else [child for _, child in layer_group]
+            sharded_target = fully_shard_fn(
+                shard_target,
                 mesh=mesh,
                 mp_policy=mp_policy,
                 reshard_after_forward=layer_reshard_after_forward,
                 offload_policy=offload_policy,
             )
-            module[layer_key] = child_module
+            if isinstance(sharded_target, list):
+                if len(sharded_target) != len(layer_group):
+                    raise RuntimeError(
+                        "fully_shard returned a different number of modules than were passed for grouped FSDP2"
+                    )
+                for (layer_key, _), sharded_child in zip(layer_group, sharded_target):
+                    module[layer_key] = sharded_child
+                fsdp_units.append(sharded_target[0])
+            else:
+                layer_key, _ = layer_group[0]
+                module[layer_key] = sharded_target
+                fsdp_units.append(sharded_target)
 
         # Set up explicit forward/backward prefetch chains when layers are being resharded.
         # With PP or an explicit no-reshard override, weights are always gathered -- no prefetch needed.
@@ -1109,7 +1138,6 @@ def apply_fsdp2_sharding_recursively(
         else:
             should_prefetch = not pp_enabled and enable_fsdp2_prefetch
         if should_prefetch:
-            fsdp_units = [c for _, c in flat_layer_items if not _is_container(c)]
             if fsdp2_forward_prefetch_depth > 0:
                 for i in range(len(fsdp_units) - 1):
                     targets = [
@@ -1146,6 +1174,7 @@ def apply_fsdp2_sharding_recursively(
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
                 reshard_after_forward,
+                fsdp2_shard_group_size,
                 fully_shard_fn=fully_shard_fn,
             )
 
@@ -1908,7 +1937,8 @@ def fsdp2_strategy_parallelize(
     enable_fsdp2_prefetch: bool = True,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
-    reshard_after_forward: Optional[bool] = None,
+    reshard_after_forward: Optional[Union[bool, int]] = None,
+    fsdp2_shard_group_size: int = 1,
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -1968,6 +1998,7 @@ def fsdp2_strategy_parallelize(
         fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
         fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
         reshard_after_forward=reshard_after_forward,
+        fsdp2_shard_group_size=fsdp2_shard_group_size,
     )
 
 

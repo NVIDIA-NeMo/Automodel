@@ -182,13 +182,16 @@ class FSDP2Config:
             ``"full"`` keeps the existing full activation checkpointing behavior. ``"selective"`` wraps transformer
             blocks with PyTorch selective activation checkpointing.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
-        reshard_after_forward (Optional[bool]): Override layer-level FSDP2 resharding.
+        reshard_after_forward (Optional[bool | int]): Override layer-level FSDP2 resharding.
             ``None`` preserves AutoModel's heuristic: pipeline-parallel layers do
             not reshard after forward, while non-pipeline layers reshard all but
             the last layer. Set ``False`` for a ZeRO-2-like benchmark where
             gathered parameters stay resident after forward. Set ``True`` to force
             resharding everywhere, including pipeline-parallel layers, which may
             reduce throughput by adding per-microbatch all-gathers.
+        fsdp2_shard_group_size (int): Number of consecutive transformer layers to
+            group into one FSDP2 communication unit via ``fully_shard([layer, ...])``.
+            ``1`` preserves the default layer-by-layer sharding behavior.
         enable_async_tensor_parallel (bool): Enable async tensor parallelism via
             ``torch._inductor.config._micro_pipeline_tp``.  Overlaps ReduceScatter with
             compute in row-parallel layers.  Requires ``sequence_parallel=True`` (forced
@@ -222,7 +225,8 @@ class FSDP2Config:
     autocast_dtype: Optional[torch.dtype] = None
     activation_checkpointing: ActivationCheckpointingMode = False
     defer_fsdp_grad_sync: bool = True
-    reshard_after_forward: Optional[bool] = None
+    reshard_after_forward: Optional[Union[bool, int]] = None
+    fsdp2_shard_group_size: int = 1
     enable_async_tensor_parallel: bool = False
     enable_compile: bool = False
     enable_fsdp2_prefetch: bool = False
@@ -230,6 +234,8 @@ class FSDP2Config:
     fsdp2_forward_prefetch_depth: int = 1
 
     def __post_init__(self):
+        if self.fsdp2_shard_group_size < 1:
+            raise ValueError("fsdp2_shard_group_size must be >= 1")
         if self.mp_policy is None:
             # FSDP2 default: bf16 compute and fp32 gradient reduction. Pair with
             # ``model.torch_dtype: float32`` for fp32 optimizer state. See

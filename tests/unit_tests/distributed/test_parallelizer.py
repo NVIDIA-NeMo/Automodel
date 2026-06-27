@@ -887,6 +887,45 @@ class TestApplyFsdpShardingRecursively:
             assert call.kwargs["reshard_after_forward"] is False
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    def test_apply_fsdp_sharding_module_list_groups_consecutive_layers(
+        self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy, mock_offload_policy
+    ):
+        """Test apply_fsdp2_sharding_recursively can group consecutive layers."""
+
+        def mock_shard(x, **kwargs):
+            if isinstance(x, list):
+                for module in x:
+                    module.set_modules_to_forward_prefetch = MagicMock()
+                    module.set_modules_to_backward_prefetch = MagicMock()
+                return x
+            x.set_modules_to_forward_prefetch = MagicMock()
+            x.set_modules_to_backward_prefetch = MagicMock()
+            return x
+
+        mock_fully_shard.side_effect = mock_shard
+
+        apply_fsdp2_sharding_recursively(
+            module=mock_module_list,
+            mesh=mock_mesh,
+            mp_policy=mock_mp_policy,
+            offload_policy=mock_offload_policy,
+            fsdp2_shard_group_size=2,
+        )
+
+        assert mock_fully_shard.call_count == 2
+
+        first_call = mock_fully_shard.call_args_list[0]
+        assert first_call.args[0] == [mock_module_list[0], mock_module_list[1]]
+        assert first_call.kwargs["reshard_after_forward"] is True
+
+        second_call = mock_fully_shard.call_args_list[1]
+        assert second_call.args[0] is mock_module_list[2]
+        assert second_call.kwargs["reshard_after_forward"] is False
+
+        mock_module_list[0].set_modules_to_forward_prefetch.assert_called_once_with([mock_module_list[2]])
+        mock_module_list[2].set_modules_to_backward_prefetch.assert_called_once_with([mock_module_list[0]])
+
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_regular_module(
         self, mock_fully_shard, mock_single_module, mock_mesh, mock_mp_policy, mock_offload_policy
     ):

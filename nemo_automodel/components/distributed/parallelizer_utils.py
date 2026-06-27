@@ -122,7 +122,7 @@ def _fully_shard(
     mesh: DeviceMesh,
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy],
-    reshard_after_forward: Optional[bool] = None,
+    reshard_after_forward: Optional[Union[bool, int]] = None,
 ) -> None:
     if isinstance(module, nn.ModuleList):
         for layer in module:
@@ -214,7 +214,7 @@ def fully_shard_by_dtype(
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy],
     fp32_compute_module_names: Tuple[str, ...] = (),
-    reshard_after_forward: Optional[bool] = None,
+    reshard_after_forward: Optional[Union[bool, int]] = None,
 ) -> None:
     """Fully shard a module so every parameter computes in its required dtype.
 

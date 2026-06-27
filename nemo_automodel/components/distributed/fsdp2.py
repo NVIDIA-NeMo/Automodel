@@ -100,6 +100,7 @@ class FSDP2Manager:
         self.activation_checkpointing = config.activation_checkpointing
         self.defer_fsdp_grad_sync = config.defer_fsdp_grad_sync
         self.reshard_after_forward = config.reshard_after_forward
+        self.fsdp2_shard_group_size = config.fsdp2_shard_group_size
         self.enable_async_tensor_parallel = config.enable_async_tensor_parallel
         self.enable_compile = config.enable_compile
         self.enable_fsdp2_prefetch = config.enable_fsdp2_prefetch
@@ -147,6 +148,7 @@ class FSDP2Manager:
             fsdp2_backward_prefetch_depth=self.fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth=self.fsdp2_forward_prefetch_depth,
             reshard_after_forward=self.reshard_after_forward,
+            fsdp2_shard_group_size=self.fsdp2_shard_group_size,
         )
 
         return model
