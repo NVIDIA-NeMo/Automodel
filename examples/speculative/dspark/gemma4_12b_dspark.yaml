@@ -65,4 +65,4 @@ checkpoint:
   enabled: true
   checkpoint_dir: ./outputs/dspark_gemma4_12b/checkpoints
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final

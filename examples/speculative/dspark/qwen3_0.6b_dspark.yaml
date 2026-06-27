@@ -76,5 +76,5 @@ checkpoint:
   enabled: true
   checkpoint_dir: ./outputs/dspark_qwen3_0.6b/checkpoints
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
   # restore_from: LATEST
