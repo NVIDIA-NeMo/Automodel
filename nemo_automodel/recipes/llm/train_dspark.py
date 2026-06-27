@@ -134,7 +134,9 @@ class TrainDSparkRecipe(BaseRecipe):
         # Resolve the captured target layers once and share them between the
         # target wrapper (what to capture) and the draft config (the ``fc`` input
         # width) so the two never disagree.
-        num_target_layers = int(target_config.num_hidden_layers)
+        # Gemma4 nests its layer count under text_config (multimodal top config).
+        layer_count_config = target_config.text_config if is_gemma4_target else target_config
+        num_target_layers = int(layer_count_config.num_hidden_layers)
         draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 5))
         target_layer_ids = list(
             recipe_cfg.get("target_layer_ids", None)

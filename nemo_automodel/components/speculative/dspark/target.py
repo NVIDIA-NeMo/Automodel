@@ -59,7 +59,23 @@ class HFDSparkTargetModel:
         self.target_layer_ids = validate_target_layer_ids(list(target_layer_ids), self._num_layers)
 
     def _inner_model(self) -> nn.Module:
-        """Return the base transformer module (the one owning ``layers`` and ``norm``)."""
+        """Return the base transformer module that owns ``layers`` and ``norm``.
+
+        Handles the common nestings: a plain causal LM (``model.model``), a
+        decoder-only base (``model``), and multimodal targets whose text stack is
+        under ``language_model`` (e.g. Gemma4: ``model.model.language_model``).
+        """
+        seen = set()
+        queue = [self.model, getattr(self.model, "model", None)]
+        while queue:
+            module = queue.pop(0)
+            if module is None or id(module) in seen:
+                continue
+            seen.add(id(module))
+            if hasattr(module, "layers"):
+                return module
+            queue.append(getattr(module, "language_model", None))
+            queue.append(getattr(module, "model", None))
         return self.model.model if hasattr(self.model, "model") else self.model
 
     def _get_transformer_layers(self) -> list[nn.Module]:
