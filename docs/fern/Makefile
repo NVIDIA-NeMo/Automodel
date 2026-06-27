@@ -23,7 +23,7 @@ REPO_ROOT := $(shell git rev-parse --show-toplevel)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch
+.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch docs-mdx-check
 
 help:
 	@echo ""
