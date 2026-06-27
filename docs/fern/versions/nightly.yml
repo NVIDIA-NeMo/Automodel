@@ -379,6 +379,9 @@ navigation:
       - page: "Train an EAGLE Drafter for Speculative Decoding"
         path: ../../guides/speculative/eagle.mdx
         slug: eagle-speculative-decoding
+      - page: "Train a DSpark Drafter for Speculative Decoding"
+        path: ../../guides/speculative/dspark.mdx
+        slug: dspark-speculative-decoding
       - page: "dLLM Fine-Tuning"
         path: ../../guides/dllm/finetune.mdx
         slug: dllm-fine-tuning
