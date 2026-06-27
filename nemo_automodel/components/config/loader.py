@@ -33,7 +33,7 @@ import yaml
 ALLOWED_IMPORT_PREFIXES = ("nemo_automodel", "torch", "transformers", "torchdata", "torchao", "liger_kernel")
 
 # Define a safe base dir for loading modules from files (default: repo root)
-SAFE_BASE_DIR = Path(__file__).resolve().parents[2]
+SAFE_BASE_DIR = Path(__file__).resolve().parents[3]
 
 # Opt-in flag that allows loading user-defined code. Default: disabled
 ENABLE_USER_MODULES = os.environ.get("NEMO_ENABLE_USER_MODULES", "").lower() in ("1", "true", "yes")
@@ -279,7 +279,13 @@ def _resolve_target(dotted_path: str) -> Any:
             raise AssertionError("Left side of ':' must be a .py file")
         if not p.exists():
             raise AssertionError(f"Python script does not exist: {file_part}")
-        module = load_module_from_file(str(p.resolve()))
+        resolved_path = p.resolve()
+        if not ENABLE_USER_MODULES and not _is_safe_path(resolved_path):
+            raise ImportError(
+                "Loading Python files outside the safe base directory is disabled by default. "
+                "To allow out-of-tree code, set NEMO_ENABLE_USER_MODULES=1 or call set_enable_user_modules(True)."
+            )
+        module = load_module_from_file(str(resolved_path))
         if not _is_safe_attr(attr):
             raise ImportError(
                 "Access to private or dunder attributes is disabled by default. "
