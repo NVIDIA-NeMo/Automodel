@@ -57,6 +57,14 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Validate MDX syntax
+        run: |
+          mdx_lint_dir="${RUNNER_TEMP}/mdx-lint"
+          mkdir -p "$mdx_lint_dir"
+          printf '%s\n' '{"private":true,"type":"module"}' > "$mdx_lint_dir/package.json"
+          npm --prefix "$mdx_lint_dir" install --silent @mdx-js/mdx@3 remark-frontmatter@5 remark-math@6 >/dev/null
+          MDX_LINT_PREFIX="$mdx_lint_dir" node tools/validate_mdx_syntax.mjs docs
+
       - name: Validate Fern configuration
         working-directory: ./docs/fern
         run: |
