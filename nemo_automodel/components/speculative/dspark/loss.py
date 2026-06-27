@@ -17,8 +17,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from nemo_automodel.components.speculative.dspark._metrics import add_metric
-
 from .common import DSparkForwardOutput
 
 
@@ -49,26 +47,6 @@ def _build_loss_weight_mask(
         decay_weights = torch.exp(-positions.float() / float(loss_decay_gamma))
         loss_weight_mask = loss_weight_mask * decay_weights
     return loss_weight_mask
-
-
-def _compute_local_probabilistic_stats(
-    *,
-    outputs: DSparkForwardOutput,
-    accept_rate_3d: Optional[torch.Tensor],
-    valid_block_weights: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    _, _, block_size, _ = outputs.draft_logits.shape
-    device = outputs.draft_logits.device
-    pos_accept_sums = torch.zeros(block_size, device=device, dtype=torch.float32)
-    if accept_rate_3d is None:
-        return outputs.draft_logits.new_zeros((), dtype=torch.float32), pos_accept_sums
-
-    valid_accept_rate = accept_rate_3d * outputs.eval_mask.to(torch.float32)
-    pos_accept_sums = valid_accept_rate.sum(dim=(0, 1))
-    expected_draft_accepted = valid_accept_rate.cumprod(dim=-1).sum(dim=-1)
-    tau_prob_per_block = expected_draft_accepted + 1.0
-    tau_prob_sum = (tau_prob_per_block * valid_block_weights).sum()
-    return tau_prob_sum, pos_accept_sums
 
 
 def _compute_accept_rate_3d(
@@ -110,7 +88,6 @@ def _collect_local_terms(
     draft_logits = outputs.draft_logits
     target_ids = outputs.target_ids
     eval_mask = outputs.eval_mask
-    block_keep_mask = outputs.block_keep_mask
     _, _, block_size, vocab_size = draft_logits.shape
     device = draft_logits.device
 
@@ -127,10 +104,9 @@ def _collect_local_terms(
     ce_loss_num = (loss_per_token * flat_weights).sum()
     ce_loss_den = flat_weights.sum()
     aligned_target_logits = outputs.aligned_target_logits
-    accept_rate_3d = _compute_accept_rate_3d(
-        outputs=outputs,
-        aligned_target_logits=aligned_target_logits,
-    )
+    if aligned_target_logits is not None:
+        # Teacher signal: never backprop into the (possibly trainable) lm_head through it.
+        aligned_target_logits = aligned_target_logits.detach()
     zero = ce_loss_num.new_zeros(())
     assert l1_loss_alpha <= 0 or aligned_target_logits is not None, (
         "aligned_target_logits is required when l1_loss_alpha > 0."
@@ -145,26 +121,12 @@ def _collect_local_terms(
         l1_loss_num = zero
         l1_loss_den = zero
 
-    with torch.no_grad():
-        pos_total_counts = eval_mask.to(torch.float32).sum(dim=(0, 1))
-        valid_pred_tokens = eval_mask.any(dim=-1)
-        valid_blocks = block_keep_mask & valid_pred_tokens
-        valid_block_weights = valid_blocks.to(torch.float32)
-        accept_block_count = valid_block_weights.sum()
-        tau_prob_sum, pos_accept_sums = _compute_local_probabilistic_stats(
-            outputs=outputs,
-            accept_rate_3d=accept_rate_3d,
-            valid_block_weights=valid_block_weights,
-        )
-
     has_confidence = outputs.confidence_pred is not None
     confidence_loss_num = zero
     confidence_loss_den = zero
-    confidence_abs_error_num = zero
-    confidence_bias_num = zero
-    confidence_cumprod_bias_num = zero
     if has_confidence:
-        assert accept_rate_3d is not None, "aligned_target_logits is required when confidence head is enabled."
+        accept_rate_3d = _compute_accept_rate_3d(outputs=outputs, aligned_target_logits=aligned_target_logits)
+        assert accept_rate_3d is not None, "aligned_target_logits is required when the confidence head is enabled."
         confidence_targets = accept_rate_3d.detach()
         confidence_errors = (
             F.binary_cross_entropy_with_logits(
@@ -176,17 +138,6 @@ def _collect_local_terms(
         )
         confidence_loss_num = confidence_errors.sum()
         confidence_loss_den = loss_weight_mask.sum()
-        with torch.no_grad():
-            confidence_probs = outputs.confidence_pred.float().sigmoid()
-            confidence_error = confidence_probs - accept_rate_3d
-            confidence_abs_error_num = (confidence_error.abs() * loss_weight_mask).sum()
-            confidence_bias_num = (confidence_error * loss_weight_mask).sum()
-            valid_mask = outputs.eval_mask.to(torch.float32)
-            confidence_prefix_probs = (confidence_probs * valid_mask).cumprod(dim=-1)
-            confidence_prefix_targets = (accept_rate_3d * valid_mask).cumprod(dim=-1)
-            confidence_cumprod_bias_num = (
-                (confidence_prefix_probs - confidence_prefix_targets) * loss_weight_mask
-            ).sum()
 
     loss_terms = {
         "ce_loss_num": ce_loss_num,
@@ -196,39 +147,6 @@ def _collect_local_terms(
         "confidence_loss_num": confidence_loss_num,
         "confidence_loss_den": confidence_loss_den,
     }
-
-    for pos_idx in range(block_size):
-        add_metric(
-            f"accept_rate@{pos_idx}",
-            pos_accept_sums[pos_idx],
-            den=pos_total_counts[pos_idx],
-            tag="train",
-        )
-    add_metric(
-        "tau_probabilistic",
-        tau_prob_sum,
-        den=accept_block_count,
-        tag="train",
-    )
-    if has_confidence:
-        add_metric(
-            "confidence_abs_error",
-            confidence_abs_error_num,
-            den=confidence_loss_den,
-            tag="train",
-        )
-        add_metric(
-            "confidence_bias",
-            confidence_bias_num,
-            den=confidence_loss_den,
-            tag="train",
-        )
-        add_metric(
-            "confidence_cumprod_bias",
-            confidence_cumprod_bias_num,
-            den=confidence_loss_den,
-            tag="train",
-        )
     return loss_terms, has_confidence
 
 
@@ -286,32 +204,6 @@ def compute_dspark_loss(
         ce_loss_alpha * local_ce_loss + l1_loss_alpha * local_l1_loss + confidence_head_alpha * local_confidence_loss
     )
 
-    add_metric(
-        "ce_loss",
-        loss_terms["ce_loss_num"],
-        den=loss_terms["ce_loss_den"],
-        tag="train",
-    )
-    if global_denominators["l1_loss_den"].item() > 0:
-        add_metric(
-            "l1_loss",
-            loss_terms["l1_loss_num"],
-            den=loss_terms["l1_loss_den"],
-            tag="train",
-        )
-    if has_confidence:
-        add_metric(
-            "confidence_loss",
-            loss_terms["confidence_loss_num"],
-            den=loss_terms["confidence_loss_den"],
-            tag="train",
-        )
-    add_metric(
-        "loss",
-        local_loss,
-        reduction="mean",
-        tag="train",
-    )
     backward_loss = _build_loss(
         loss_terms=loss_terms,
         global_denominators=global_denominators,

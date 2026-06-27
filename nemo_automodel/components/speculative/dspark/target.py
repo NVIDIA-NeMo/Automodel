@@ -29,6 +29,8 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
+
 
 @dataclass
 class DSparkTargetBatch:
@@ -50,17 +52,11 @@ class HFDSparkTargetModel:
 
     def __init__(self, model: nn.Module, target_layer_ids: Sequence[int]):
         self.model = model.eval()
-        self.target_layer_ids = self._validate_layer_ids(target_layer_ids)
-
-    def _validate_layer_ids(self, target_layer_ids: Sequence[int]) -> list[int]:
-        num_layers = self.model.config.num_hidden_layers
-        target_layer_ids = list(target_layer_ids)
-        if len(target_layer_ids) == 0:
-            raise ValueError("DSpark requires at least one target_layer_id.")
-        for layer_id in target_layer_ids:
-            if layer_id < 0 or layer_id >= num_layers:
-                raise ValueError(f"target layer id {layer_id} is out of bounds for model with {num_layers} layers")
-        return target_layer_ids
+        self._num_layers = len(self._get_transformer_layers())
+        # ``-1`` (the embedding output) is accepted, matching
+        # ``common.extract_context_feature`` and the draft ``fc`` sizing in the
+        # config builders.
+        self.target_layer_ids = validate_target_layer_ids(list(target_layer_ids), self._num_layers)
 
     def _inner_model(self) -> nn.Module:
         """Return the base transformer module (the one owning ``layers`` and ``norm``)."""
@@ -102,24 +98,33 @@ class HFDSparkTargetModel:
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
     ) -> DSparkTargetBatch:
-        """Run the target model once and capture the DSpark context + last hidden state."""
+        """Run the target model once and capture the DSpark context + last hidden state.
+
+        Features follow ``common.extract_context_feature`` exactly: ``-1`` is the
+        embedding output, the final layer is the post-norm hidden state (HF
+        ``output_hidden_states[num_layers]``), and any other id is that decoder
+        layer's output. The final-norm output is also returned as the last hidden
+        state for the TV / confidence losses.
+        """
         layers = self._get_transformer_layers()
-        captured: dict[int, torch.Tensor] = {}
-        last_hidden: dict[str, torch.Tensor] = {}
+        last = self._num_layers - 1
+        captured: dict[object, torch.Tensor] = {}
         handles = []
 
-        def _make_layer_hook(layer_id: int):
+        def _make_hook(key):
             def _hook(_module, _inputs, outputs):
-                captured[layer_id] = outputs[0] if isinstance(outputs, tuple) else outputs
+                captured[key] = outputs[0] if isinstance(outputs, tuple) else outputs
 
             return _hook
 
-        def _norm_hook(_module, _inputs, outputs):
-            last_hidden["h"] = outputs[0] if isinstance(outputs, tuple) else outputs
-
+        if -1 in self.target_layer_ids:
+            handles.append(self.model.get_input_embeddings().register_forward_hook(_make_hook("embed")))
         for layer_id in self.target_layer_ids:
-            handles.append(layers[layer_id].register_forward_hook(_make_layer_hook(layer_id)))
-        handles.append(self._get_final_norm().register_forward_hook(_norm_hook))
+            if 0 <= layer_id < last:
+                handles.append(layers[layer_id].register_forward_hook(_make_hook(layer_id)))
+        # The final norm gives both the post-norm last hidden state and the
+        # last-layer feature (post-norm), matching the HF offset-1 convention.
+        handles.append(self._get_final_norm().register_forward_hook(_make_hook("norm")))
 
         try:
             self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
@@ -127,16 +132,20 @@ class HFDSparkTargetModel:
             for handle in handles:
                 handle.remove()
 
-        if len(captured) != len(self.target_layer_ids) or "h" not in last_hidden:
-            raise RuntimeError(
-                f"Incomplete DSpark capture: layers {sorted(captured)} of {self.target_layer_ids}, "
-                f"last_hidden={'h' in last_hidden}"
-            )
+        if "norm" not in captured:
+            raise RuntimeError("DSpark target capture did not record the final-norm output.")
 
-        target_hidden_states = torch.cat([captured[layer_id] for layer_id in self.target_layer_ids], dim=-1)
+        def _feature(layer_id: int) -> torch.Tensor:
+            if layer_id == -1:
+                return captured["embed"]
+            if layer_id == last:
+                return captured["norm"]
+            return captured[layer_id]
+
+        target_hidden_states = torch.cat([_feature(layer_id) for layer_id in self.target_layer_ids], dim=-1)
         return DSparkTargetBatch(
             target_hidden_states=target_hidden_states,
-            target_last_hidden_states=last_hidden["h"],
+            target_last_hidden_states=captured["norm"],
             input_ids=input_ids,
             loss_mask=loss_mask,
         )

@@ -18,8 +18,6 @@ import torch
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
 
-from nemo_automodel.components.speculative.dspark._metrics import add_metric
-
 
 @dataclass
 class DSparkForwardOutput:
@@ -201,64 +199,6 @@ def build_eval_mask(
     return eval_mask.to(torch.int32).cumprod(dim=-1).bool()
 
 
-@torch.no_grad()
-def log_sampler_stats(
-    *,
-    seq_len: int,
-    loss_mask: torch.Tensor,
-    block_keep_mask: torch.Tensor,
-    eval_mask: torch.Tensor,
-    block_size: int,
-    num_anchors: int,
-) -> None:
-    valid_anchor_mask = build_anchor_candidate_mask(
-        seq_len=seq_len,
-        loss_mask=loss_mask,
-    )
-    valid_anchor_counts = valid_anchor_mask.sum(dim=1).to(torch.float32)
-    valid_anchor_ratios = valid_anchor_counts / max(float(seq_len), 1.0)
-    sampled_anchor_counts = block_keep_mask.sum(dim=1).to(torch.float32)
-    sampled_anchor_ratios = sampled_anchor_counts / max(float(num_anchors), 1.0)
-    sample_count = loss_mask.new_tensor(float(loss_mask.shape[0]), dtype=torch.float32)
-    add_metric(
-        "valid_anchors_abs",
-        valid_anchor_counts.sum(),
-        den=sample_count,
-        tag="train",
-    )
-    add_metric(
-        "valid_anchors_ratio",
-        valid_anchor_ratios.sum(),
-        den=sample_count,
-        tag="train",
-    )
-    add_metric(
-        "sampled_anchors_abs",
-        sampled_anchor_counts.sum(),
-        den=sample_count,
-        tag="train",
-    )
-    add_metric(
-        "sampled_anchors_ratio",
-        sampled_anchor_ratios.sum(),
-        den=sample_count,
-        tag="train",
-    )
-    block_supervised_tokens = eval_mask.to(torch.float32).sum(dim=(1, 2)) / (sampled_anchor_counts.clamp_min(1.0))
-    add_metric(
-        "block_supervised_tokens_abs",
-        block_supervised_tokens.sum(),
-        den=sample_count,
-        tag="train",
-    )
-    add_metric(
-        "block_supervised_tokens_ratio",
-        (block_supervised_tokens / float(block_size)).sum(),
-        den=sample_count,
-        tag="train",
-    )
-
-
 def create_position_ids(
     anchor_positions: torch.Tensor,
     block_size: int,
@@ -318,7 +258,6 @@ __all__ = [
     "build_anchor_candidate_mask",
     "sample_anchor_positions",
     "build_eval_mask",
-    "log_sampler_stats",
     "create_position_ids",
     "create_noise_embed",
 ]

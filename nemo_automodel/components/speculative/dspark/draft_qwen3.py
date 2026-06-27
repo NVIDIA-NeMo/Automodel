@@ -37,7 +37,6 @@ from nemo_automodel.components.speculative.dspark.common import (
     create_dspark_attention_mask,
     create_noise_embed,
     create_position_ids,
-    log_sampler_stats,
     sample_anchor_positions,
 )
 from nemo_automodel.components.speculative.dspark.markov_head import build_markov_head
@@ -469,15 +468,6 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                 token_ids=prev_token_ids,
                 hidden_states=output_hidden_4d,
             )
-
-        log_sampler_stats(
-            seq_len=seq_len,
-            loss_mask=loss_mask,
-            eval_mask=eval_mask,
-            block_keep_mask=block_keep_mask,
-            block_size=self.block_size,
-            num_anchors=self.num_anchors,
-        )
 
         confidence_pred = None
         if self.confidence_head is not None:
