@@ -351,7 +351,7 @@ def write_analyzed_jsonl(dataset, path: str, reward_threshold: Optional[float]) 
                 "messages": messages,
                 "tools": tools,
             }
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.write(json.dumps(record, ensure_ascii=True) + "\n")
             lengths.append(row["n_tokens"])
     logger.info(
         "Analyzed cache written: %d trajectories in %.1fs (skipped %d invalid, %d below reward) -> %s",
@@ -401,7 +401,7 @@ def write_filtered_jsonl(analyzed_path: str, out_dir: str, seq_length: int) -> i
                         "messages": record["messages"],
                         "tools": record["tools"],
                     },
-                    ensure_ascii=False,
+                    ensure_ascii=True,
                 )
                 + "\n"
             )
