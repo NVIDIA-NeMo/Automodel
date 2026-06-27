@@ -63,6 +63,73 @@ class TextQADataset(AbstractDataset):
         return sorted(list(self.docid2idx.keys()))
 
 
+class ColPaliDataset(AbstractDataset):
+    """Load ColPali corpus documents from a dataset path."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = load_dataset(path)["train"]
+        docid2idx = {}
+        for idx, docid in enumerate(self.data["image_filename"]):
+            docid2idx[str(docid)] = idx
+        self.docid2idx = docid2idx
+
+    def get_document_by_id(self, id):
+        example = deepcopy(EXAMPLE_TEMPLATE)
+        doc = self.data[self.docid2idx[id]]
+        example["image"] = doc["image"]
+        if "nr_ocr" in doc:
+            example["nr_ocr"] = doc["nr_ocr"]
+        if "complex_ocr" in doc:
+            example["complex_ocr"] = doc["complex_ocr"]
+        return example
+
+    def get_all_ids(self):
+        return sorted(list(self.docid2idx.keys()))
+
+
+class WikiSSNQDataset(AbstractDataset):
+    """Load Wiki-SS corpus documents from a dataset path."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = load_dataset(path)["train"]
+        docid2idx = {}
+        for idx, docid in enumerate(self.data["docid"]):
+            docid2idx[str(docid)] = idx
+        self.docid2idx = docid2idx
+
+    def get_document_by_id(self, id):
+        example = deepcopy(EXAMPLE_TEMPLATE)
+        doc = self.data[self.docid2idx[id]]
+        example["image"] = doc["image"]
+        if "nr_ocr" in doc:
+            example["nr_ocr"] = doc["nr_ocr"]
+        if "complex_ocr" in doc:
+            example["complex_ocr"] = doc["complex_ocr"]
+        return example
+
+    def get_all_ids(self):
+        return sorted(list(self.docid2idx.keys()))
+
+
+class DocMatixDataset(AbstractDataset):
+    """Load DocMatix corpus documents from a dataset path."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = load_dataset(path, "images")["train"]
+
+    def get_document_by_id(self, id):
+        example = deepcopy(EXAMPLE_TEMPLATE)
+        example_idx, image_idx = id.split("_")
+        example["image"] = self.data[int(example_idx)]["images"][int(image_idx)]
+        return example
+
+    def get_all_ids(self):
+        return [str(x) + "_" + str(0) for x in list(range(len(self.data)))]
+
+
 class HFCorpusDataset(AbstractDataset):
     """Wraps an already-loaded HuggingFace Dataset as a corpus (in-memory, no local Parquet)."""
 
@@ -82,6 +149,9 @@ class HFCorpusDataset(AbstractDataset):
 
 DATASETS = {
     "TextQADataset": TextQADataset,
+    "ColPaliDataset": ColPaliDataset,
+    "WikiSSNQDataset": WikiSSNQDataset,
+    "DocMatixDataset": DocMatixDataset,
 }
 
 
