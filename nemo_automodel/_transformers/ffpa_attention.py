@@ -14,17 +14,21 @@
 
 """FFPA attention bindings for HF ``ALL_ATTENTION_FUNCTIONS`` / ``ALL_MASK_ATTENTION_FUNCTIONS``.
 
-Routes ``head_dim=512`` bf16/fp16 layers through the CuTeDSL FFPA kernel and
-falls back to SDPA (or eager for softcap) for unsupported configurations.
+Routes ``head_dim=512`` bf16/fp16 layers through the CuTeDSL FFPA kernel,
+sliding-window (flex ``BlockMask``) layers through FlexAttention, and falls back
+to SDPA (or eager for softcap) for other unsupported configurations.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 from torch import nn
+
+if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +41,7 @@ _VARLEN_WIN_NONE = -(2**31)
 
 _SDPA_FN: Callable | None = None
 _EAGER_FN: Callable | None = None
+_FLEX_FN: Callable | None = None
 _FFPA_FN: Callable | None = None
 _CUTEDSL_BACKEND: Any = None
 _FFPA_LOW_LEVEL_READY: bool | None = None
@@ -71,6 +76,27 @@ def _get_eager() -> Callable | None:
         except Exception:
             return None
     return _EAGER_FN
+
+
+def _get_flex() -> Callable | None:
+    global _FLEX_FN
+    if _FLEX_FN is None:
+        try:
+            from transformers.integrations.flex_attention import flex_attention_forward
+
+            _FLEX_FN = flex_attention_forward
+        except Exception:
+            return None
+    return _FLEX_FN
+
+
+def _is_block_mask(mask: Any) -> bool:
+    """True for a flex ``BlockMask`` — the marker that a layer should run on FlexAttention."""
+    try:
+        from torch.nn.attention.flex_attention import BlockMask
+    except Exception:
+        return False
+    return isinstance(mask, BlockMask)
 
 
 def _ffpa_low_level_ready() -> bool:
@@ -237,7 +263,7 @@ def ffpa_mask(
     attention_mask: torch.Tensor | None = None,
     dtype: torch.dtype = torch.float32,
     **kwargs: Any,
-) -> torch.Tensor | None:
+) -> "torch.Tensor | BlockMask | None":
     """Mask factory for ``ALL_MASK_ATTENTION_FUNCTIONS["ffpa"]``."""
     # Vision / audio sub-encoders share this registry but need 4D float masks.
     cfg = kwargs.get("config")
@@ -247,10 +273,15 @@ def ffpa_mask(
             return None
 
     if mask_function is not None:
-        from transformers.masking_utils import causal_mask_function, eager_mask
+        from transformers.masking_utils import causal_mask_function, flex_attention_mask
 
         if mask_function is not causal_mask_function:
-            return eager_mask(
+            # Sliding-window / vision-bidirectional (non-causal) layers route to FlexAttention:
+            # build the block-sparse BlockMask HF builds under attn_implementation="flex_attention"
+            # so the sliding sparsity is exploited (cheaper than the dense SDPA fallback). The
+            # returned BlockMask is the marker ffpa_attention_forward uses to pick the flex path.
+            device = kwargs.pop("device", None) or (attention_mask.device if attention_mask is not None else None)
+            return flex_attention_mask(
                 batch_size=batch_size,
                 q_length=q_length,
                 kv_length=kv_length,
@@ -258,7 +289,7 @@ def ffpa_mask(
                 kv_offset=kv_offset,
                 mask_function=mask_function,
                 attention_mask=attention_mask,
-                dtype=dtype,
+                device=device,
                 **kwargs,
             )
 
@@ -285,6 +316,15 @@ def ffpa_attention_forward(
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """HF attention-interface forward backed by ``torch.ops.ffpa_attn._fwd_cute``."""
+    # Sliding-window / vision-bidirectional layers carry a flex BlockMask (built by ffpa_mask);
+    # FlexAttention is their backend -- there is no SDPA/eager fallback for them.
+    if _is_block_mask(attention_mask):
+        flex = _get_flex()
+        if flex is None:
+            raise RuntimeError("ffpa_attention_forward: flex_attention is unavailable for sliding-window layers")
+        return flex(module, query, key, value, attention_mask, scaling=scaling, softcap=softcap, **kwargs)
+
+    # Full-attention (head_dim=512) path: run FFPA when eligible, else fall back to SDPA/eager below.
     # softcap must go to eager: SDPA silently drops the kwarg.
     use_sdpa = softcap is None
 

@@ -30,6 +30,7 @@ def _reset_module_state():
     ffpa_mod._FALLBACK_WARNED.clear()
     ffpa_mod._SDPA_FN = None
     ffpa_mod._EAGER_FN = None
+    ffpa_mod._FLEX_FN = None
     ffpa_mod._FFPA_FN = None
     ffpa_mod._CUTEDSL_BACKEND = None
     ffpa_mod._FFPA_LOW_LEVEL_READY = None
@@ -197,3 +198,45 @@ def test_dense_path_calls_high_level_func_with_fa_layout():
     assert used_backend is backend
     assert out.shape == (B, S, Hq, D)
     assert weights is None
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_ffpa_mask_routes_only_sliding_to_flex(causal):
+    from transformers.masking_utils import causal_mask_function
+
+    mask_function = causal_mask_function if causal else (lambda b, h, qi, ki: ki <= qi)
+    sentinel = object()
+    with mock.patch("transformers.masking_utils.flex_attention_mask", return_value=sentinel) as mock_flex_mask:
+        out = ffpa_mod.ffpa_mask(
+            batch_size=1, q_length=8, kv_length=8, mask_function=mask_function, attention_mask=None, device="cpu"
+        )
+    assert (mock_flex_mask.call_count == 1) is (not causal)
+    assert out is (None if causal else sentinel)
+
+
+def test_block_mask_routes_to_flex_not_sdpa():
+    q, k, v = _qkv(1, 8, 4, 16, 256)
+    flex_out = (torch.zeros(1, 16, 8, 256), None)
+    fake_flex = mock.Mock(return_value=flex_out)
+    with (
+        mock.patch.object(ffpa_mod, "_is_block_mask", return_value=True),
+        mock.patch.object(ffpa_mod, "_get_flex", return_value=fake_flex),
+        _patch_sdpa() as mock_sdpa,
+    ):
+        out, weights = ffpa_attention_forward(_module(256), q, k, v, attention_mask=object(), scaling=0.0625)
+    fake_flex.assert_called_once()
+    mock_sdpa.assert_not_called()
+    assert out is flex_out[0]
+    assert weights is None
+
+
+def test_block_mask_requires_flex_no_sdpa_fallback():
+    q, k, v = _qkv(1, 8, 4, 16, 256)
+    with (
+        mock.patch.object(ffpa_mod, "_is_block_mask", return_value=True),
+        mock.patch.object(ffpa_mod, "_get_flex", return_value=None),
+        _patch_sdpa() as mock_sdpa,
+        pytest.raises(RuntimeError),
+    ):
+        ffpa_attention_forward(_module(256), q, k, v, attention_mask=object(), scaling=0.0625)
+    mock_sdpa.assert_not_called()
