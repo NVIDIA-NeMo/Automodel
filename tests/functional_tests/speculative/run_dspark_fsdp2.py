@@ -23,8 +23,6 @@ parameters become DTensors, and trains a few steps to confirm the objective runs
 and the loss goes down under data-parallel sharding.
 """
 
-import os
-
 import torch
 import torch.distributed as dist
 import torch.nn as nn
