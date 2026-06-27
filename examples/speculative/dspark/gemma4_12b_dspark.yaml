@@ -37,7 +37,10 @@ recipe_args:
   mask_token_id: 4                       # reserved Gemma4 token for non-anchor block positions
   target_layer_ids: [5, 17, 29, 41, 46]  # 5 feature layers across the Gemma4-12B target
   freeze_embeddings: true
-  attention_backend: flex_attention
+  attention_backend: flex_attention        # draft attention (block mask); requires flex
+  # The Gemma4 target's head_dim exceeds FlashAttention's limit, so run the target
+  # replay / hidden-state capture with sdpa (the draft still uses flex_attention).
+  target_attn_implementation: sdpa
 
   markov_rank: 256
   markov_head_type: vanilla

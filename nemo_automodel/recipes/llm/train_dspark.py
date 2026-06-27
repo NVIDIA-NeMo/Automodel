@@ -134,9 +134,9 @@ class TrainDSparkRecipe(BaseRecipe):
         # Resolve the captured target layers once and share them between the
         # target wrapper (what to capture) and the draft config (the ``fc`` input
         # width) so the two never disagree.
-        # Gemma4 nests its layer count under text_config (multimodal top config).
-        layer_count_config = target_config.text_config if is_gemma4_target else target_config
-        num_target_layers = int(layer_count_config.num_hidden_layers)
+        # Gemma4 nests its text fields (layer count, vocab) under text_config.
+        target_text_config = target_config.text_config if is_gemma4_target else target_config
+        num_target_layers = int(target_text_config.num_hidden_layers)
         draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 5))
         target_layer_ids = list(
             recipe_cfg.get("target_layer_ids", None)
@@ -146,7 +146,7 @@ class TrainDSparkRecipe(BaseRecipe):
 
         self.block_size = int(recipe_cfg.get("block_size", 7))
         self.num_anchors = int(recipe_cfg.get("num_anchors", 512))
-        self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_config.vocab_size)
+        self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_text_config.vocab_size)
 
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
