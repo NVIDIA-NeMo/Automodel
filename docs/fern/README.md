@@ -95,7 +95,7 @@ From this directory (`cd docs/fern` first, or use `make -C docs/fern <target>` f
 ```bash
 make docs           # docs-stitch + `fern docs md generate` + `fern docs dev` → http://localhost:3002
 make docs-stitch    # restore frozen backward-version pages from the docs-archive branch
-make docs-check     # docs-stitch + `fern check` (config + MDX validation)
+make docs-check     # docs-stitch + MDX syntax validation + `fern check`
 make docs-preview   # docs-stitch + shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)
 make docs-publish   # trigger the `Publish Fern Docs` workflow on origin/main
 ```
@@ -180,7 +180,7 @@ When the next GA cuts (e.g. `v0.5`):
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `fern-docs-ci.yml` | `push: pull-request/[0-9]+` (FW-CI mirror) | `fern check` on PRs |
+| `fern-docs-ci.yml` | `push: pull-request/[0-9]+` (FW-CI mirror) | MDX syntax validation + `fern check` on PRs |
 | `fern-docs-preview-build.yml` | `pull_request` | Untrusted half: collect `docs/fern/` artifact (no secrets) |
 | `fern-docs-preview-comment.yml` | `workflow_run` after build | Trusted half: build preview with `DOCS_FERN_TOKEN`, post 🌿 comment |
 | `publish-fern-docs.yml` | push to `main` (`docs/**`), `docs/v*` tag, or manual | Publish to docs.nvidia.com/nemo/automodel |
@@ -206,6 +206,7 @@ PR titles follow Conventional Commits (e.g., `docs(fern): add gemma4 fine-tuning
 | `fern check` YAML error | 2-space indent; `- page:` inside `contents:`; `path:` is relative to the version YAML (so nightly paths reach back up via `../../`) |
 | Page 404 in preview | `slug:` collision in the same section, or missing `slug:` override (default slugifies the long display title) |
 | `Folder not found: ./product-docs/...` in `fern docs dev` | Run `make docs` once; library generation populates `product-docs/` |
+| `Unexpected closing tag`, especially after raw HTML such as `<img>` | Use valid MDX/JSX syntax, for example self-close void elements as `<img ... />`; `make docs-check` catches this before publish |
 | `[ERR_PNPM_IGNORED_BUILDS]` on first `fern docs dev` | pnpm 10+ blocks esbuild's postinstall — `pnpm config set onlyBuiltDependencies '["esbuild"]' --location global`, then `rm -rf ~/.fern/app-preview` and retry |
 | Broken-link warning for version-agnostic path | `fern docs broken-links` false-positives on links without a version slug; the URLMap-based `validate_fern_internal_links.py` is authoritative |
 | `JSX expressions must have one parent element` | Wrap multi-element JSX in `<>...</>` or a `<div>` |
