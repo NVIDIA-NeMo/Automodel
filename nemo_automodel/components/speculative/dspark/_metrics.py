@@ -12,54 +12,91 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dependency-free metric recorder for the DSpark training code.
+"""Distributed-correct metric recorder for the DSpark objective.
 
-Records training-step scalars without requiring an initialized process group,
-so the model and loss run under single-process / CPU tests. Records the most
-recent scalar per ``tag/name``; recipe-level logging (W&B / TensorBoard) is
-wired separately in the trainer, not here.
+Ratio metrics (accept-rate, the loss terms, supervision density) are recorded as
+separate numerator/denominator sums and only divided after a cross-rank sum, so a
+data-parallel run reports the global ``sum(num) / sum(den)`` rather than each
+rank's local ratio. Scalar metrics accumulate ``(sum, count)`` and reduce to a
+global mean. ``add_metric`` matches the call sites in the objective; the recipe
+calls :func:`reduce_metrics` (a collective) on every rank, then logs on rank 0.
 """
 
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 
-_metrics: dict[str, float] = {}
+_ratio: dict[str, list[float]] = {}  # key -> [num_sum, den_sum]
+_scalar: dict[str, list[float]] = {}  # key -> [value_sum, count]
 
 
-def _scalar(value) -> torch.Tensor:
-    """Detach and reduce ``value`` to a 0-dim float tensor (no autograd graph)."""
+def _to_float(value) -> float:
     if torch.is_tensor(value):
         value = value.detach()
-        return value.reshape(()).float() if value.numel() == 1 else value.float().mean()
-    return torch.tensor(float(value), dtype=torch.float32)
+        return float(value.reshape(()) if value.numel() == 1 else value.float().mean())
+    return float(value)
 
 
-def add_metric(name, value, *, den=None, reduction: str = "dp_sum", tag: str = "train") -> float:
-    """Record one scalar (or ``num/den`` ratio) metric for later inspection.
+def add_metric(name, value, *, den=None, reduction: str = "dp_sum", tag: str = "train") -> None:
+    """Record one metric for the current logging window.
 
-    Does no cross-rank reduction -- the DSpark loss already all-reduces its own
-    denominators where it matters for the backward value.
+    With ``den`` the metric is a ratio accumulated as ``(num, den)`` sums; without
+    it the metric accumulates ``(value, count)`` for a mean. Reduction across ranks
+    happens in :func:`reduce_metrics`, not here.
     """
-    del reduction  # accepted for signature compatibility; not used here
+    del reduction  # accepted for call-site compatibility; reduction is dp_sum
     key = f"{tag}/{name}"
     if den is not None:
-        denom = _scalar(den)
-        result = (_scalar(value) / denom).item() if denom.item() != 0 else 0.0
+        entry = _ratio.setdefault(key, [0.0, 0.0])
+        entry[0] += _to_float(value)
+        entry[1] += _to_float(den)
     else:
-        result = _scalar(value).item()
-    _metrics[key] = result
-    return result
+        entry = _scalar.setdefault(key, [0.0, 0.0])
+        entry[0] += _to_float(value)
+        entry[1] += 1.0
+
+
+def _reduce_pairs(pairs: list[list[float]]) -> list[list[float]]:
+    """All-reduce (SUM) a list of ``[a, b]`` pairs across ranks when distributed."""
+    if not pairs or not (dist.is_available() and dist.is_initialized()):
+        return pairs
+    flat = torch.tensor(pairs, dtype=torch.float64)
+    if torch.cuda.is_available():
+        flat = flat.cuda()
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    return flat.cpu().tolist()
+
+
+def reduce_metrics() -> dict[str, float]:
+    """Collective: all-reduce numerators/denominators across ranks, return globals.
+
+    Must be called on every rank (it issues collectives). Keys are sorted so the
+    reduction order matches across ranks; the recorded key set is deterministic.
+    """
+    out: dict[str, float] = {}
+    ratio_keys = sorted(_ratio)
+    reduced = _reduce_pairs([_ratio[k] for k in ratio_keys])
+    for key, (num, den) in zip(ratio_keys, reduced):
+        out[key] = num / den if den > 0 else 0.0
+    scalar_keys = sorted(_scalar)
+    reduced = _reduce_pairs([_scalar[k] for k in scalar_keys])
+    for key, (total, count) in zip(scalar_keys, reduced):
+        out[key] = total / count if count > 0 else 0.0
+    return out
 
 
 def get_metrics() -> dict[str, float]:
-    """Return a snapshot of the most recently recorded metrics."""
-    return dict(_metrics)
+    """Return locally-reduced metrics (no cross-rank collective; for tests / single process)."""
+    out = {k: (n / d if d > 0 else 0.0) for k, (n, d) in _ratio.items()}
+    out.update({k: (s / c if c > 0 else 0.0) for k, (s, c) in _scalar.items()})
+    return out
 
 
 def reset_metrics() -> None:
-    """Clear all recorded metrics."""
-    _metrics.clear()
+    """Clear the current logging window."""
+    _ratio.clear()
+    _scalar.clear()
 
 
-__all__ = ["add_metric", "get_metrics", "reset_metrics"]
+__all__ = ["add_metric", "reduce_metrics", "get_metrics", "reset_metrics"]

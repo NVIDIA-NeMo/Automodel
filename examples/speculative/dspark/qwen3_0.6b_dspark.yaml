@@ -22,6 +22,10 @@ dist_env:
   backend: nccl
   timeout_minutes: 30
 
+distributed:
+  strategy: fsdp2            # fsdp2 (default, shards the draft per block) | ddp
+  defer_fsdp_grad_sync: true
+
 recipe_args:
   target_model_name_or_path: Qwen/Qwen3-0.6B
   train_data_path: /path/to/perfectblend_qwen3-0.6b_regen.jsonl   # regenerate responses with the target first
