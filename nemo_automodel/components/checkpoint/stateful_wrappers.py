@@ -91,6 +91,41 @@ def _has_expert_parallelism(model: torch.nn.Module) -> bool:
     return any(getattr(m, "ep_size", 1) > 1 for m in model.modules())
 
 
+def _zeros_like_param(param: torch.Tensor) -> torch.Tensor:
+    try:
+        return torch.zeros_like(param, memory_format=torch.preserve_format)
+    except TypeError:
+        return torch.zeros_like(param)
+
+
+def _materialize_missing_adam_state(optimizer: torch.optim.Optimizer) -> None:
+    """Create Adam state for optimizer params that have not received gradients yet."""
+    if not isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+        return
+
+    for group in optimizer.param_groups:
+        step_dtype = (
+            torch.float32
+            if group.get("fused", False)
+            else torch.float64
+            if torch.get_default_dtype() == torch.float64
+            else torch.float32
+        )
+        for param in group["params"]:
+            state = optimizer.state[param]
+            if "step" not in state:
+                if group.get("capturable", False) or group.get("fused", False):
+                    state["step"] = torch.zeros((), dtype=step_dtype, device=param.device)
+                else:
+                    state["step"] = torch.tensor(0.0, dtype=step_dtype)
+            if "exp_avg" not in state:
+                state["exp_avg"] = _zeros_like_param(param)
+            if "exp_avg_sq" not in state:
+                state["exp_avg_sq"] = _zeros_like_param(param)
+            if group.get("amsgrad", False) and "max_exp_avg_sq" not in state:
+                state["max_exp_avg_sq"] = _zeros_like_param(param)
+
+
 def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
     """Extract only trainable PEFT adapter weights, bypassing DCP.
 
@@ -401,6 +436,7 @@ class OptimizerState:
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[Any] = None,
         is_peft: bool = False,
+        materialize_missing_adam_state: bool = False,
     ):
         """
         Initialize an OptimizerState instance.
@@ -419,11 +455,14 @@ class OptimizerState:
             scheduler (Optional[Any], optional): Learning-rate scheduler to track
                 alongside the optimizer. Pass ``None`` if no scheduler is used.
             is_peft (bool): Whether the model uses PEFT adapters (e.g. LoRA/QLoRA).
+            materialize_missing_adam_state (bool): Whether to create zero Adam state for optimizer parameters that
+                have not received gradients yet. This is used on save so DCP metadata is complete.
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.optimizer = [optimizer] if isinstance(optimizer, torch.optim.Optimizer) else optimizer
         self.scheduler = [scheduler] if isinstance(scheduler, torch.optim.lr_scheduler.LRScheduler) else scheduler
         self.is_peft = is_peft
+        self.materialize_missing_adam_state = materialize_missing_adam_state
 
     def state_dict(self) -> dict[str, Any]:
         """
@@ -432,6 +471,10 @@ class OptimizerState:
         Returns:
             dict: Dictionary containing the optimizer and scheduler state dicts with CPU offloading enabled.
         """
+        if self.materialize_missing_adam_state:
+            for optimizer in self.optimizer:
+                _materialize_missing_adam_state(optimizer)
+
         # For PEFT models with quantized parameters or expert parallelism, bypass
         # PyTorch DCP's get_optimizer_state_dict() which fails because DCP cannot
         # build a consistent parameter-ID-to-FQN mapping when the model contains
