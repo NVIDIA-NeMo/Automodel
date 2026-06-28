@@ -38,6 +38,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
@@ -66,6 +67,22 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
         value = value / dist.get_world_size()
     return value
+
+
+def _submesh_or_none(device_mesh, name: str):
+    """Return the named (flattened) submesh, or None if absent / no mesh.
+
+    Uses ``get_flat_mesh`` so ``_flatten()``-created axes ("dp") resolve across
+    torch versions. The "dp" axis excludes "tp", so keying the draft DDP group
+    and the dataloader sampler on it replicates the draft across tensor-parallel
+    ranks (every TP rank in a draft replica sees the same batch).
+    """
+    if device_mesh is None:
+        return None
+    try:
+        return get_flat_mesh(device_mesh, name)
+    except KeyError:
+        return None
 
 
 class TrainEagle1Recipe(BaseRecipe):
@@ -115,11 +132,19 @@ class TrainEagle1Recipe(BaseRecipe):
         self.distributed_config = None
         self.device_mesh = None
         self.moe_mesh = None
+        self.dp_mesh = None
         if self.cfg.get("distributed", None) is not None:
             self.dist_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
             self.distributed_config = self.dist_setup.strategy_config
             self.device_mesh = self.dist_setup.mesh_context.device_mesh
             self.moe_mesh = self.dist_setup.mesh_context.moe_mesh
+            # Tensor parallelism (distributed.tp_size>1) shards the target's
+            # linears in place via ``from_pretrained`` below; the draft is small
+            # and stays replicated. The flattened "dp" axis excludes "tp", so the
+            # draft DDP group and the dataloader sampler key on it to replicate
+            # across TP ranks (the target wrapper gathers the vocab-sharded
+            # logits). EAGLE-1/2 has no context parallelism, so only "dp" matters.
+            self.dp_mesh = _submesh_or_none(self.device_mesh, "dp")
             target_kwargs.update(
                 distributed_setup=self.dist_setup,
             )
@@ -143,6 +168,7 @@ class TrainEagle1Recipe(BaseRecipe):
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            dp_mesh=self.dp_mesh,
         )
         self.val_dataloader = None
         if recipe_cfg.get("val_data_path", None):
@@ -157,6 +183,7 @@ class TrainEagle1Recipe(BaseRecipe):
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                dp_mesh=self.dp_mesh,
             )
 
         draft_config = target_config.to_dict()
@@ -183,12 +210,24 @@ class TrainEagle1Recipe(BaseRecipe):
             feature_noise=float(recipe_cfg.get("feature_noise", 0.1)),
         ).to(self.device)
         if self.dist_env.world_size > 1:
+            # Restrict the draft's gradient all-reduce to the "dp" sub-axis. With
+            # tensor parallelism the draft is replicated across tp ranks, so a
+            # full-world all-reduce would average duplicate gradients; the dp
+            # group (which excludes tp) reduces only across real data replicas.
+            # Without a mesh (tp_size=1) dp_mesh is None -> full-world DDP,
+            # unchanged.
+            dp_process_group = (
+                self.dp_mesh.get_group()
+                if self.dp_mesh is not None and self.dp_mesh.size() < self.dist_env.world_size
+                else None
+            )
             trainer_module = DistributedDataParallel(
                 trainer_module,
                 device_ids=[self.device.index] if self.device.type == "cuda" else None,
                 output_device=self.device.index if self.device.type == "cuda" else None,
                 broadcast_buffers=False,
                 find_unused_parameters=False,
+                process_group=dp_process_group,
             )
         self.trainer_module = trainer_module
 
@@ -287,7 +326,15 @@ class TrainEagle1Recipe(BaseRecipe):
             ckpt_kwargs["model_state_dict_keys"] = draft_state_dict_keys
 
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
-        dp_rank = dist.get_rank() if dist.is_initialized() else 0
+        # The draft is replicated (never TP-sharded), so key the checkpoint shard
+        # on the dp coordinate -- identical for every tp rank in a replica --
+        # rather than the global rank. dp_mesh is None without a mesh (tp_size=1)
+        # -> global rank, unchanged. tp_rank stays 0 (the draft is not sharded).
+        dp_rank = (
+            self.dp_mesh.get_local_rank()
+            if getattr(self, "dp_mesh", None) is not None
+            else (dist.get_rank() if dist.is_initialized() else 0)
+        )
         self.checkpointer = self.checkpoint_config.build(
             dp_rank=dp_rank,
             tp_rank=0,
