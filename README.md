@@ -21,33 +21,8 @@
 </div>
 
 ## 📣 News and Discussions
-<table>
-<tr>
-<td width="100%">
-
-### ✨ Speculative Decoding Spotlight ✨
-
-<p>
-<strong>Train spec now with NeMo AutoModel.</strong> Build target-aligned drafters end to end, from data regeneration and target-output caching to training, checkpoint export, and SGLang serving.
-</p>
-
-<p>
-<a href="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/speculative/eagle.mdx"><img alt="EAGLE-1/2/3" src="https://img.shields.io/badge/EAGLE--1%2F2%2F3-trainable-76B900"></a>
-<a href="https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/speculative"><img alt="P-EAGLE and DFlash" src="https://img.shields.io/badge/P--EAGLE%20%2B%20DFlash-ready-0A66C2"></a>
-<a href="https://github.com/deepseek-ai/DeepSpec"><img alt="DSpark" src="https://img.shields.io/badge/DeepSeek%20DSpark-supported-7C3AED"></a>
-<a href="https://github.com/sgl-project/sglang"><img alt="SGLang serving" src="https://img.shields.io/badge/SGLang-serving-FFB000"></a>
-</p>
-
-<p>
-Includes support for DeepSeek's newly released <a href="https://github.com/deepseek-ai/DeepSpec">DSpark</a> speculative decoding algorithm. Thanks to <a href="https://github.com/khazic">@Khazic</a> for the speculative decoding stack and <a href="https://github.com/kashif">@kashif</a> for DSpark support.
-</p>
-
-</td>
-</tr>
-</table>
-
-- [06/27/2026][**GLM-5.2**](https://huggingface.co/zai-org/GLM-5.2) We now support finetuning `zai-org/GLM-5.2` with IndexShare DSA, optional TileLang sparse kernels, and long-context CP recipes. Check out our [HellaSwag recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml), [Tulu3 TileLang recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml), and [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm/thudm/glm5-moe-dsa.mdx).
-- [06/27/2026][**Speculative decoding in NeMo AutoModel**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/speculative/eagle.mdx) We can now train speculative-decoding drafters end to end, from target-aligned data regeneration to SGLang serving. AutoModel supports EAGLE-1/2/3, P-EAGLE, DFlash, and DeepSeek's newly released DSpark algorithm. Huge thanks to [@Khazic](https://github.com/khazic) for the speculative decoding stack and [@kashif](https://github.com/kashif) for DSpark support.
+- [06/27/2026] ✨ [**Speculative decoding in NeMo AutoModel**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/speculative/eagle.mdx) Train target-aligned drafters end to end: EAGLE-1/2/3, P-EAGLE, DFlash, and DeepSeek's newly released [DSpark](https://github.com/deepseek-ai/DeepSpec). Huge thanks to [@Khazic](https://github.com/khazic) for the speculative decoding stack and [@kashif](https://github.com/kashif) for DSpark support.
+- [06/21/2026][**GLM-5.2**](https://huggingface.co/zai-org/GLM-5.2) We now support finetuning `zai-org/GLM-5.2` with IndexShare DSA, optional TileLang sparse kernels, and long-context CP recipes. Check out our [HellaSwag recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml), [Tulu3 TileLang recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml), and [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm/thudm/glm5-moe-dsa.mdx).
 - [06/15/2026][**DiffusionGemma**](https://huggingface.co/google/diffusiongemma-26B-A4B-it) We now support finetuning the `google/diffusiongemma-26B-A4B-it` model. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) and [guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/dllm/diffusiongemma.mdx).
 - [06/12/2026][**MiniMax M3**](https://huggingface.co/MiniMaxAI/MiniMax-M3) We now support finetuning MiniMax's MiniMax-M3. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) and [guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/vlm/minimax-m3.mdx).
 - [06/04/2026][**Nemotron-3 Ultra**](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16) We now support finetuning NVIDIA's Nemotron 3 Ultra 550B A55B. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml) and [guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/nemotron-3-ultra.md).
