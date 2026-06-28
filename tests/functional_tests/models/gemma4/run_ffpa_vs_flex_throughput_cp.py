@@ -1,4 +1,4 @@
-#!/usr/bin/env -S /home/jovyan/Automodel/.pixi/envs/nemo/bin/python
+#!/usr/bin/env python
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
