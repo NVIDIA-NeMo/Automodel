@@ -41,11 +41,11 @@ description: ""
 
 | Recipe | Description |
 |---|---|
+| [glm_5.2_tulu3_32k_tilelang_cp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml) | SFT — GLM-5.2 on Tulu3 with packed 32K sequences, CP=8, TileLang DSA, EP=64, PP=4 |
+| [glm_5.2_tulu3_4k_tilelang_100k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml) | SFT — GLM-5.2 on Tulu3 with packed 4K sequences and TileLang DSA |
+| [glm_5.2_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml) | SFT — GLM-5.2 on HellaSwag with EP=64, PP=4 on 32 nodes |
 | [glm_5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml) | SFT — GLM-5 with EP=64, PP=4 on 32 nodes |
 | [glm_5.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml) | SFT — GLM-5.1 with EP=64, PP=4 on 32 nodes |
-| [glm_5.2_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml) | SFT — GLM-5.2 on HellaSwag with EP=64, PP=4 on 32 nodes |
-| [glm_5.2_tulu3_4k_tilelang_100k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml) | SFT — GLM-5.2 on Tulu3 with packed 4K sequences and TileLang DSA |
-| [glm_5.2_tulu3_32k_tilelang_cp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml) | SFT — GLM-5.2 on Tulu3 with packed 32K sequences, CP=8, TileLang DSA, EP=64, PP=4 |
 
 ## Parallel Setup
 
@@ -104,14 +104,14 @@ cd Automodel
 ```
 
 <Note>
-This recipe was validated on **32 nodes × 8 GPUs (256 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
+This is a long-context multi-node recipe that uses CP=8, EP=64, and PP=4. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
 
 </Note>
 
 **3. Run the recipe** from inside the repo:
 
 ```bash
-automodel --nproc-per-node=8 examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml
+automodel --nproc-per-node=8 examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml
 ```
 
 <Accordion title="Run with Docker">
@@ -133,7 +133,7 @@ cd /opt/Automodel
 **3. Run the recipe**:
 
 ```bash
-automodel --nproc-per-node=8 examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml
+automodel --nproc-per-node=8 examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml
 ```
 </Accordion>
 
