@@ -254,25 +254,29 @@ def make_selective_checkpoint_context_fn():
 
 
 def ffpa_selective_checkpoint_policy():
-    """Return a ``context_fn`` factory marking FFPA forward ops as ``MUST_SAVE``.
+    """Return a ``context_fn`` factory marking FFPA forward ops as ``MUST_RECOMPUTE``.
 
     Applied under full activation checkpointing for ``attn_implementation="ffpa"``
-    models so the CuTeDSL FFPA forward kernels are saved (not replayed) in backward
-    while the rest of the layer is recomputed.
+    models. The CuTeDSL FFPA forward kernels are RECOMPUTED in backward (not saved),
+    so the full-attention output ``O`` (~256 MiB/global-layer, ~2.5 GiB at 8K) is not
+    held in the live set across backward. This lowers peak/reserved memory -- at the
+    cost of replaying the kernel once -- to avoid the 8K memory-ceiling ->
+    allocator-retry/fragmentation -> FSDP2 overlap-loss chain that erodes FFPA's E2E
+    tps win (verify via ``cuda_mem/peak_reserved_GiB`` and ``cuda_mem/num_alloc_retries``).
     """
     from nemo_automodel._transformers.ffpa_attention import _ffpa_low_level_ready
 
     _ffpa_low_level_ready()
-    must_save_ops = set()
+    ffpa_fwd_ops = set()
     for name in ("_fwd_cute", "_varlen_fwd_cute"):
         try:
-            must_save_ops.add(getattr(torch.ops.ffpa_attn, name).default)
+            ffpa_fwd_ops.add(getattr(torch.ops.ffpa_attn, name).default)
         except Exception:
             pass
 
     def _policy_fn(ctx, op, *args, **kwargs):
-        if op in must_save_ops:
-            return CheckpointPolicy.MUST_SAVE
+        if op in ffpa_fwd_ops:
+            return CheckpointPolicy.MUST_RECOMPUTE
         return CheckpointPolicy.PREFER_RECOMPUTE
 
     return lambda: create_selective_checkpoint_contexts(_policy_fn)

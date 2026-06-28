@@ -371,7 +371,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             elif _apply_bagel_full_layer_activation_checkpointing(model):
                 logger.info("Using BAGEL full-layer activation checkpointing; skipping submodule checkpoint wrappers.")
             elif _detect_ffpa_impl(model):
-                # Selective AC: mark FFPA fwd ops MUST_SAVE so CuTeDSL kernels aren't replayed in backward.
+                # Selective AC: mark FFPA fwd ops MUST_RECOMPUTE (replay CuTeDSL kernels in backward)
+                # so the full-attention output O is not held resident -> lower 8K peak/reserved memory.
                 from functools import partial
 
                 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (

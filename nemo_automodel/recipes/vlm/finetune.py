@@ -1183,8 +1183,40 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
                 "num_tokens_per_step": num_tokens_in_batch,
                 "num_label_tokens": num_label_tokens,
+                **self._cuda_mem_diagnostics(),
             },
         )
+
+    def _cuda_mem_diagnostics(self) -> dict[str, float | int]:
+        """CUDA caching-allocator diagnostics (for the FFPA-vs-flex 8K memory-ceiling audit).
+
+        Distinguishes "high allocation" from "allocator under pressure": near the
+        memory ceiling the caching allocator fragments and falls back to synchronous
+        ``cudaFree``+``cudaMalloc`` retries (each stalls the stream), and FSDP2 loses
+        the headroom it needs to prefetch/overlap the next all-gather -- which is the
+        suspected reason the 8K FFPA step keeps only +5.2% of its predicted ~+33% win.
+
+        Emitted under a ``cuda_mem/`` wandb group (separate from the flat ``mem`` key):
+          - peak_reserved/alloc_GiB, frag_gap_GiB: per-step, because
+            ``log_train_metrics`` calls ``reset_peak_memory_stats`` every step.
+          - num_alloc_retries: lifetime counter (NOT reset by reset_peak_memory_stats);
+            also emit a per-step delta so a spike pinpoints the step that fragmented.
+        """
+        if not torch.cuda.is_available():
+            return {}
+        ms = torch.cuda.memory_stats()
+        retries = ms.get("num_alloc_retries", 0)
+        prev = getattr(self, "_prev_cuda_alloc_retries", 0)
+        self._prev_cuda_alloc_retries = retries
+        peak_reserved = ms.get("reserved_bytes.all.peak", 0) / 1024**3
+        peak_alloc = ms.get("allocated_bytes.all.peak", 0) / 1024**3
+        return {
+            "cuda_mem/peak_reserved_GiB": peak_reserved,
+            "cuda_mem/peak_alloc_GiB": peak_alloc,
+            "cuda_mem/frag_gap_GiB": peak_reserved - peak_alloc,
+            "cuda_mem/num_alloc_retries": retries,
+            "cuda_mem/alloc_retries_delta": retries - prev,
+        }
 
     @torch.no_grad()
     def _run_validation_epoch(self, val_dataloader):
@@ -1328,13 +1360,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | "
+            "frag {:.2f} GiB | retries +{} ({} tot) | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
                 log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],
+                log_data.metrics.get("cuda_mem/frag_gap_GiB", 0.0),
+                log_data.metrics.get("cuda_mem/alloc_retries_delta", 0),
+                log_data.metrics.get("cuda_mem/num_alloc_retries", 0),
                 log_data.metrics["tps"],
                 log_data.metrics["tps_per_gpu"],
                 log_data.metrics["num_label_tokens"],
