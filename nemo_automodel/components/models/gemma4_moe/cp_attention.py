@@ -26,7 +26,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel._transformers.ffpa_attention import (
+from nemo_automodel.components.attention.ffpa_attention import (
     _FFPA_HEAD_DIM,
     _ffpa_dense_bwd,
     _ffpa_dense_fwd,

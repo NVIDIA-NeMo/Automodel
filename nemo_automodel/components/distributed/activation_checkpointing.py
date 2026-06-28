@@ -264,7 +264,7 @@ def ffpa_selective_checkpoint_policy():
     allocator-retry/fragmentation -> FSDP2 overlap-loss chain that erodes FFPA's E2E
     tps win (verify via ``cuda_mem/peak_reserved_GiB`` and ``cuda_mem/num_alloc_retries``).
     """
-    from nemo_automodel._transformers.ffpa_attention import _ffpa_low_level_ready
+    from nemo_automodel.components.attention.ffpa_attention import _ffpa_low_level_ready
 
     _ffpa_low_level_ready()
     ffpa_fwd_ops = set()

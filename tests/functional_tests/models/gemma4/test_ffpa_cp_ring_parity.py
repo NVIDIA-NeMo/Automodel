@@ -57,7 +57,7 @@ def _stub_attn_module(head_dim: int, groups: int) -> nn.Module:
 def test_ffpa_vs_eager_bf16_parity(Hq, Hkv):
     """ffpa_attention_forward (head_dim=512) matches HF eager causal attention."""
     eager = pytest.importorskip("transformers.models.gemma4.modeling_gemma4").eager_attention_forward
-    from nemo_automodel._transformers.ffpa_attention import ffpa_attention_forward
+    from nemo_automodel.components.attention.ffpa_attention import ffpa_attention_forward
 
     B, S, D, dev, dt = 1, 64, 512, "cuda", torch.bfloat16
     torch.manual_seed(42)

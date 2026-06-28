@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for nemo_automodel/_transformers/ffpa_attention.py."""
+"""Unit tests for nemo_automodel/components/attention/ffpa_attention.py."""
 
 import logging
 from unittest import mock
@@ -21,8 +21,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel._transformers import ffpa_attention as ffpa_mod
-from nemo_automodel._transformers.ffpa_attention import (
+from nemo_automodel.components.attention import ffpa_attention as ffpa_mod
+from nemo_automodel.components.attention.ffpa_attention import (
     ffpa_attention_forward,
     register_ffpa_attention,
     setup_ffpa_backend,

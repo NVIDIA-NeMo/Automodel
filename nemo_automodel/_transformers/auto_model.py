@@ -425,7 +425,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # before _apply_preload_overrides, which would otherwise rewrite ffpa → sdpa/
         # flash_attention_2 for HF models.
         if attn_implementation == "ffpa":
-            from nemo_automodel._transformers.ffpa_attention import setup_ffpa_backend
+            from nemo_automodel.components.attention.ffpa_attention import setup_ffpa_backend
 
             setup_ffpa_backend(mesh.cp_size, has_packed_sequence)
 
@@ -1052,7 +1052,7 @@ class _NeMoAutoModelForRetrievalBase:
         encoder_cls = getattr(_enc_mod, cls._ENCODER_CLS_NAME)
 
         if attn_implementation == "ffpa":
-            from nemo_automodel._transformers.ffpa_attention import register_ffpa_attention
+            from nemo_automodel.components.attention.ffpa_attention import register_ffpa_attention
 
             register_ffpa_attention()
 
