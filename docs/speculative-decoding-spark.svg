@@ -1,33 +1,47 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="112" height="24" viewBox="0 0 112 24" role="img" aria-label="speculative decoding">
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="28" viewBox="0 0 128 28" role="img" aria-label="cute speculative decoding">
   <defs>
-    <linearGradient id="spec-bg" x1="0" x2="1" y1="0" y2="0">
-      <stop offset="0" stop-color="#101820"/>
-      <stop offset="0.52" stop-color="#23303d"/>
-      <stop offset="1" stop-color="#101820"/>
+    <linearGradient id="cute-bg" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#fff1f7"/>
+      <stop offset="0.48" stop-color="#eef7ff"/>
+      <stop offset="1" stop-color="#f5fff0"/>
     </linearGradient>
-    <linearGradient id="pulse" x1="0" x2="1" y1="0" y2="0">
-      <stop offset="0" stop-color="#76b900" stop-opacity="0"/>
-      <stop offset="0.5" stop-color="#76b900" stop-opacity="0.85"/>
-      <stop offset="1" stop-color="#76b900" stop-opacity="0"/>
-    </linearGradient>
+    <filter id="soft-shadow" x="-20%" y="-40%" width="140%" height="180%">
+      <feDropShadow dx="0" dy="1" stdDeviation="1.2" flood-color="#7c3aed" flood-opacity="0.22"/>
+    </filter>
   </defs>
-  <rect x="0.5" y="2.5" width="111" height="19" rx="9.5" fill="url(#spec-bg)" stroke="#76b900" stroke-opacity="0.85"/>
-  <rect x="-42" y="3" width="34" height="18" rx="9" fill="url(#pulse)">
-    <animate attributeName="x" values="-42;120" dur="1.45s" repeatCount="indefinite"/>
-  </rect>
-  <text x="12" y="16" fill="#ffffff" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="700" letter-spacing="0">SPEC DEC</text>
-  <g fill="#ffb000">
-    <path d="M75 7 L82 12 L75 17 L75 14 L68 14 L68 10 L75 10 Z">
-      <animateTransform attributeName="transform" type="translate" values="-6 0;0 0;-6 0" dur="0.9s" repeatCount="indefinite"/>
-      <animate attributeName="opacity" values="0.35;1;0.35" dur="0.9s" repeatCount="indefinite"/>
+
+  <rect x="1" y="3" width="126" height="22" rx="11" fill="url(#cute-bg)" stroke="#ff8ab3" stroke-width="1.2" filter="url(#soft-shadow)"/>
+  <path d="M7 14 C12 8, 18 8, 23 14 C18 20, 12 20, 7 14Z" fill="#ff8ab3" opacity="0.28">
+    <animateTransform attributeName="transform" type="translate" values="0 0;4 0;0 0" dur="1.4s" repeatCount="indefinite"/>
+  </path>
+
+  <g transform="translate(17 14)">
+    <path d="M0 -8 L1.8 -2 L8 0 L1.8 2 L0 8 L-1.8 2 L-8 0 L-1.8 -2 Z" fill="#ffb000">
+      <animateTransform attributeName="transform" type="scale" values="0.82;1.08;0.82" dur="1.05s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.65;1;0.65" dur="1.05s" repeatCount="indefinite"/>
     </path>
-    <path d="M90 7 L97 12 L90 17 L90 14 L83 14 L83 10 L90 10 Z">
-      <animateTransform attributeName="transform" type="translate" values="-6 0;0 0;-6 0" dur="0.9s" begin="0.15s" repeatCount="indefinite"/>
-      <animate attributeName="opacity" values="0.35;1;0.35" dur="0.9s" begin="0.15s" repeatCount="indefinite"/>
+  </g>
+
+  <text x="31" y="12" fill="#7c3aed" font-family="Arial, Helvetica, sans-serif" font-size="8" font-weight="700" letter-spacing="0">DRAFT</text>
+  <text x="31" y="21" fill="#0a66c2" font-family="Arial, Helvetica, sans-serif" font-size="8" font-weight="700" letter-spacing="0">VERIFY</text>
+
+  <g fill="#76b900">
+    <path d="M71 9 L81 14 L71 19 L71 16 L62 16 L62 12 L71 12 Z">
+      <animateTransform attributeName="transform" type="translate" values="-3 0;4 0;-3 0" dur="1.05s" repeatCount="indefinite"/>
     </path>
-    <circle cx="104" cy="12" r="2">
-      <animate attributeName="r" values="1.2;3;1.2" dur="0.9s" repeatCount="indefinite"/>
-      <animate attributeName="opacity" values="0.45;1;0.45" dur="0.9s" repeatCount="indefinite"/>
+    <path d="M91 9 L101 14 L91 19 L91 16 L82 16 L82 12 L91 12 Z" opacity="0.72">
+      <animateTransform attributeName="transform" type="translate" values="-3 0;4 0;-3 0" dur="1.05s" begin="0.18s" repeatCount="indefinite"/>
+    </path>
+  </g>
+
+  <g fill="#ff5c8a">
+    <path d="M112 9 C112 6.8 115.1 6.6 115.8 8.8 C116.5 6.6 119.7 6.8 119.7 9 C119.7 12 115.8 14.1 115.8 14.1 C115.8 14.1 112 12 112 9Z">
+      <animateTransform attributeName="transform" type="translate" values="0 1;0 -1;0 1" dur="1.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.55;1;0.55" dur="1.2s" repeatCount="indefinite"/>
+    </path>
+    <circle cx="108" cy="20" r="1.5">
+      <animate attributeName="r" values="1;2.2;1" dur="1.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="1;0.35;1" dur="1.2s" repeatCount="indefinite"/>
     </circle>
   </g>
 </svg>
