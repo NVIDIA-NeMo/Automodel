@@ -71,11 +71,18 @@ uv sync --locked --all-groups                          # base + dev groups
 uv sync --locked --all-groups --extra cuda             # CUDA support
 uv sync --locked --all-groups --extra fa               # flash-attention
 uv sync --locked --all-groups --extra moe              # mixture-of-experts
-uv sync --locked --all-groups --extra vlm              # vision-language models
+uv sync --locked --all-groups --extra vlm              # vision-language models (core)
+uv sync --locked --all-groups --extra vlm-media        # + video/Qwen/Mistral decode (opencv, decord, qwen-utils; FFmpeg-bearing)
 uv sync --locked --all-groups --extra diffusion        # diffusion models
+uv sync --locked --all-groups --extra diffusion-media  # + diffusion preprocessing/export (imageio-ffmpeg, opencv)
+uv sync --locked --all-groups --extra media            # vlm-media + diffusion-media (union)
 uv sync --locked --all-groups --extra delta-databricks # Delta Lake / Databricks
-uv sync --locked --all-groups --extra all              # everything
+uv sync --locked --all-groups --extra all              # all standard extras (EXCLUDES media — FFmpeg kept opt-in)
 ```
+
+The media extras (`vlm-media`, `diffusion-media`, `media`) bundle FFmpeg and are
+deliberately **excluded from `all`** and from the container image — add them
+explicitly for video/image decode.
 
 ### Option 3: pip
 
@@ -146,4 +153,5 @@ automodel finetune llm -c config.yaml --model.name_or_path meta-llama/Llama-3.2-
 |---|---|---|
 | Stale `.venv` after switching branches | Cached environment out of sync | Delete `.venv` and re-run `uv sync --locked` |
 | Import errors for optional features (TE, flash-attn, MoE) | Missing extras | Install the matching `uv` extra (`--extra fa`, `--extra moe`, etc.) |
+| Import errors for media (`cv2`, `decord`, `qwen_vl_utils`, `imageio_ffmpeg`) | Media extras are opt-in (not in `all`) | Install `--extra vlm-media` (VLM/Qwen/Mistral) or `--extra diffusion-media` (diffusion) |
 | TransformerEngine version mismatch | The TE installed by `uv sync` takes precedence over the version baked into the container | Set the desired TE version in `pyproject.toml` / `uv.lock` and re-run `uv sync` — the venv's TE wins, not the container's |

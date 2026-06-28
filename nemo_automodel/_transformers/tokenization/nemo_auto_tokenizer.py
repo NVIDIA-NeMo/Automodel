@@ -386,6 +386,24 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
                     raise
             else:
                 raise
+        except AttributeError as e:
+            # DeepSeek-V3.2's remote config is intentionally loaded through
+            # Automodel's local config class, but AutoTokenizer independently
+            # creates a generic config only to discover the tokenizer.  Recent
+            # Transformers validates RoPE during that generic construction and
+            # requires this otherwise irrelevant field.  Supply a minimal config
+            # for tokenizer discovery; model construction still uses the recipe's
+            # DeepseekV32Config.
+            if "max_position_embeddings" not in str(e):
+                raise
+            from transformers import PretrainedConfig
+
+            tokenizer = super().from_pretrained(
+                pretrained_model_name_or_path,
+                *args,
+                config=PretrainedConfig(max_position_embeddings=1),
+                **kwargs,
+            )
 
         # Convert TikToken-based tokenizers to fast (Rust-backed) tokenizers so that
         # char_to_token() works natively for {% generation %} mask computation.
