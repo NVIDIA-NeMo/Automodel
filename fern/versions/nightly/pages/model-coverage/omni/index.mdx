@@ -15,6 +15,10 @@ pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
 
 For other installation options, see our [NeMo AutoModel Installation Guide](/get-started/installation).
 
+<Note>
+Omni models such as Qwen3-Omni need the `vlm-media` extra (`pip install "nemo-automodel[vlm,vlm-media]"`) for video/vision preprocessing, which is not installed in the Docker container by default. See [Media Extras](/get-started/installation#media-extras-video--image-decode).
+</Note>
+
 ## Supported Models
 
 | Owner | Model | Modalities | Architecture |

@@ -19,6 +19,10 @@ pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
 
 For other installation options, see our [Installation Guide](/get-started/installation).
 
+<Note>
+VLMs that decode video or use Qwen / Mistral vision preprocessing also need the `vlm-media` extra (`pip install "nemo-automodel[vlm,vlm-media]"`), which is not installed in the Docker container by default. See [Media Extras](/get-started/installation#media-extras-video--image-decode).
+</Note>
+
 ## Supported Models
 
 NeMo AutoModel supports [AutoModelForImageTextToText](https://huggingface.co/docs/transformers/main/model_doc/auto#transformers.AutoModelForImageTextToText) in the [Image-Text-to-Text](https://huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending) category.
