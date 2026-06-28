@@ -216,23 +216,24 @@ class DominoTrainerModule(DFlashTrainerModule):
         target_ids: torch.Tensor,
         weight_mask: torch.Tensor,
         lambda_base: float,
-    ) -> Tuple[torch.Tensor, ...]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decay-weighted CE on both logits, mixed by the curriculum weight."""
-        flat_logits = final_logits.reshape(-1, final_logits.size(-1))
-        flat_base_logits = base_logits.reshape(-1, base_logits.size(-1))
         flat_targets = target_ids.reshape(-1)
         flat_weights = weight_mask.reshape(-1)
-
         valid_token_count = flat_weights.sum() + 1e-6
 
-        final_loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+        final_loss_per_token = F.cross_entropy(
+            final_logits.reshape(-1, final_logits.size(-1)), flat_targets, reduction="none"
+        )
         final_loss = (final_loss_per_token * flat_weights).sum() / valid_token_count
 
-        base_loss_per_token = F.cross_entropy(flat_base_logits, flat_targets, reduction="none")
+        base_loss_per_token = F.cross_entropy(
+            base_logits.reshape(-1, base_logits.size(-1)), flat_targets, reduction="none"
+        )
         base_loss = (base_loss_per_token * flat_weights).sum() / valid_token_count
 
         loss = (1.0 - lambda_base) * final_loss + lambda_base * base_loss
-        return loss, final_loss, base_loss, flat_logits, flat_base_logits, flat_targets
+        return loss, final_loss, base_loss
 
     def _compute_extra_metrics(
         self,
@@ -340,8 +341,10 @@ class DominoTrainerModule(DFlashTrainerModule):
         gathered_loss_mask = torch.gather(loss_mask.unsqueeze(1).expand(-1, n, -1), 2, safe_target_indices)
         weight_mask = weight_mask * gathered_loss_mask
 
-        # Binary eval mask (pre-decay) for accuracy / acceptance-length stats.
-        eval_weight_mask = weight_mask.clone()
+        # Binary eval mask (pre-decay) for accuracy / acceptance-length stats. The
+        # decay below rebinds weight_mask to a fresh tensor (out-of-place), so these
+        # keep referencing the pre-decay mask without a clone.
+        eval_weight_mask = weight_mask
         binary_eval_mask = weight_mask.view(-1)
 
         # --- Block-position loss decay: first valid position keeps weight 1.0 ---
@@ -351,7 +354,7 @@ class DominoTrainerModule(DFlashTrainerModule):
             decay_weights = torch.exp(-(k - offset).clamp(min=0).float() / self.loss_decay_gamma)
             weight_mask = weight_mask * decay_weights
 
-        loss, final_loss, base_loss, flat_logits, flat_base_logits, flat_targets = self._compute_weighted_losses(
+        loss, final_loss, base_loss = self._compute_weighted_losses(
             final_logits=final_logits,
             base_logits=base_logits,
             target_ids=target_ids,
@@ -360,6 +363,9 @@ class DominoTrainerModule(DFlashTrainerModule):
         )
 
         with torch.no_grad():
+            flat_logits = final_logits.reshape(-1, final_logits.size(-1))
+            flat_base_logits = base_logits.reshape(-1, base_logits.size(-1))
+            flat_targets = target_ids.reshape(-1)
             pred_ids = torch.argmax(flat_logits, dim=-1)
             correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
             actual_token_count = binary_eval_mask.sum() + 1e-6
