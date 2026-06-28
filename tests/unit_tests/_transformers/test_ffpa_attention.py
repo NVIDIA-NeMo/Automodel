@@ -22,7 +22,11 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel._transformers import ffpa_attention as ffpa_mod
-from nemo_automodel._transformers.ffpa_attention import ffpa_attention_forward, register_ffpa_attention
+from nemo_automodel._transformers.ffpa_attention import (
+    ffpa_attention_forward,
+    register_ffpa_attention,
+    setup_ffpa_backend,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +80,25 @@ def test_registration_idempotent_and_visible():
     assert register_ffpa_attention() is True
     assert ALL_ATTENTION_FUNCTIONS._global_mapping["ffpa"] is ffpa_attention_forward
     assert register_ffpa_attention() is False
+
+
+# The HF 'ffpa' backend calls the op directly, bypassing the SDPA swap ring CP installs
+# and packed-sequence masking; both must be rejected (for custom models like Gemma4 this
+# is the only check before a silently-wrong run).
+@pytest.mark.parametrize(
+    "cp_size, has_packed_sequence, match",
+    [(8, False, "context parallelism"), (1, True, "packed sequences")],
+)
+def test_setup_ffpa_backend_rejects_unsupported(cp_size, has_packed_sequence, match):
+    with pytest.raises(ValueError, match=match):
+        setup_ffpa_backend(cp_size, has_packed_sequence)
+
+
+def test_setup_ffpa_backend_registers_when_eligible():
+    # Patch the registrar so the eligible path doesn't mutate the global HF registry.
+    with mock.patch.object(ffpa_mod, "register_ffpa_attention") as reg:
+        setup_ffpa_backend(cp_size=1, has_packed_sequence=False)
+    reg.assert_called_once_with()
 
 
 def test_non_512_head_dim_routes_to_sdpa_silently(caplog):

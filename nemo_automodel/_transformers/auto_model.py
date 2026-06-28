@@ -421,22 +421,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             logger.info("attn_implementation='te' requested: using 'sdpa' for model init and will inject TE post-init.")
             attn_implementation = "sdpa"
 
-        # Check before _apply_preload_overrides, which would otherwise rewrite ffpa → sdpa/flash_attention_2.
+        # FFPA backend setup (validate + register) lives in ffpa_attention; run it
+        # before _apply_preload_overrides, which would otherwise rewrite ffpa → sdpa/
+        # flash_attention_2 for HF models.
         if attn_implementation == "ffpa":
-            if mesh.cp_size > 1:
-                raise ValueError(
-                    "attn_implementation='ffpa' cannot be combined with context parallelism "
-                    f"(got cp_size={mesh.cp_size}): the HF 'ffpa' backend calls the FFPA op directly and "
-                    "bypasses the F.scaled_dot_product_attention swap that ring CP installs, so the "
-                    "cross-rank K/V rotation never runs. For CP + FFPA, keep attn_implementation='sdpa' "
-                    "and set text_config.cp_full_attn_backend='ffpa', which routes the ring's head_dim=512 "
-                    "full-attention chunks through the FFPA CuTeDSL kernel."
-                )
-            if has_packed_sequence:
-                raise ValueError("attn_implementation='ffpa' is incompatible with packed sequences.")
-            from nemo_automodel._transformers.ffpa_attention import register_ffpa_attention
+            from nemo_automodel._transformers.ffpa_attention import setup_ffpa_backend
 
-            register_ffpa_attention()
+            setup_ffpa_backend(mesh.cp_size, has_packed_sequence)
 
         if is_hf_model:
             attn_implementation, use_liger_kernel = _apply_preload_overrides(

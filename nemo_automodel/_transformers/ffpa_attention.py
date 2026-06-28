@@ -424,10 +424,28 @@ def register_ffpa_attention() -> bool:
     return True
 
 
+def setup_ffpa_backend(cp_size: int, has_packed_sequence: bool) -> None:
+    """Validate FFPA preconditions, then register the HF ``"ffpa"`` backend.
+
+    The ``"ffpa"`` backend calls the FFPA op directly, bypassing both the ring-CP
+    SDPA swap and packed-sequence masking; for CP or packing use
+    ``attn_implementation="sdpa"`` + ``text_config.cp_full_attn_backend="ffpa"`` instead.
+    """
+    if cp_size > 1:
+        raise ValueError(
+            f"attn_implementation='ffpa' cannot be combined with context parallelism (cp_size={cp_size}); "
+            "use attn_implementation='sdpa' + text_config.cp_full_attn_backend='ffpa' for CP + FFPA."
+        )
+    if has_packed_sequence:
+        raise ValueError("attn_implementation='ffpa' is incompatible with packed sequences.")
+    register_ffpa_attention()
+
+
 __all__ = [
     "ffpa_attention_forward",
     "ffpa_mask",
     "register_ffpa_attention",
+    "setup_ffpa_backend",
     "_ffpa_dense_fwd",
     "_ffpa_dense_bwd",
 ]
