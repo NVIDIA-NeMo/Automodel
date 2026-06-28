@@ -115,6 +115,24 @@ separately (`pip install nemo-run`). If you try to run a local/interactive job
 with the CLI-only install, you will get a clear error message with instructions
 to install the full package.
 
+### Media Dependencies Are Opt-In
+
+The FFmpeg-bearing media dependencies (OpenCV, decord, the Qwen vision utils, and
+imageio-ffmpeg) are now opt-in extras, installed neither by default nor in the
+Docker container.
+
+```bash
+pip install "nemo-automodel[vlm,vlm-media]"              # VLM video / Qwen / Mistral
+pip install "nemo-automodel[diffusion,diffusion-media]"  # diffusion preprocessing / export
+```
+
+Two consequences when upgrading:
+
+- `[vlm]` alone no longer trains Qwen2.5-VL, Qwen3-Omni, or Mistral VLMs — add `vlm-media`.
+- `[all]` no longer includes the media extras — add them with `pip install nemo-automodel[media]`.
+
+See the [Installation Guide](/get-started/installation#media-extras-video--image-decode) for details.
+
 ### CLI Module Lives Inside the Package
 
 The CLI entry-point lives at `nemo_automodel/cli/app.py` and is registered as
