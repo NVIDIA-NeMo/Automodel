@@ -471,6 +471,8 @@ modules = [
     "nemo_automodel.components.utils",
 ]
 ignore_imports = [
+    # Dion needs the FSDP DP mesh resolver so its optimizer mesh matches parameter sharding.
+    "nemo_automodel.components.optim.dion -> nemo_automodel.components.distributed.mesh_utils",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.llama.model",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.gemma4_moe.model",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.mistral3_vlm.model",
