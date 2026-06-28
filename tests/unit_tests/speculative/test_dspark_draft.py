@@ -29,11 +29,16 @@ from nemo_automodel.components.speculative.dspark import (
 )
 
 # FlexAttention's block-sparse kernel has no CPU backward; the training-path
-# tests therefore require a GPU. Forward-only checks run on CPU under no_grad.
+# tests therefore require a GPU. Forward-only checks run under no_grad.
 _gpu_only = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="FlexAttention backward requires a GPU",
 )
+
+# Forward runs on CUDA when available (Triton flex kernel); on CPU otherwise
+# (inductor CPU codegen). The GPU CI container cannot C++-compile the CPU flex
+# path, so forward-only tests must use CUDA there rather than CPU.
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 class _Args(dict):
@@ -121,9 +126,9 @@ def _forward(model: Qwen3DSparkModel, batch: dict, seed: int = 1234):
 
 
 def test_forward_shapes():
-    model = _build_model()
+    model = _build_model(device=_DEVICE)
     with torch.no_grad():
-        out = _forward(model, _batch())
+        out = _forward(model, _batch(device=_DEVICE))
 
     assert out.draft_logits.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE, VOCAB)
     assert out.target_ids.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE)
@@ -138,11 +143,11 @@ def test_forward_shapes():
 @pytest.mark.parametrize("head", ["vanilla", "gated", "rnn"])
 def test_markov_head_variants_forward(head):
     """All three Markov head variants (incl. the recurrent RNN head) run and bias the logits."""
-    model = _build_model(markov_head_type=head)
+    model = _build_model(device=_DEVICE, markov_head_type=head)
     assert model.markov_head is not None
     assert model.markov_head.markov_head_type == head
     with torch.no_grad():
-        out = _forward(model, _batch())
+        out = _forward(model, _batch(device=_DEVICE))
     assert out.draft_logits.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE, VOCAB)
     assert torch.isfinite(out.draft_logits).all()
 
@@ -157,8 +162,8 @@ def test_embeddings_and_head_frozen():
 
 
 def test_forward_deterministic_under_seed():
-    model = _build_model()
-    batch = _batch()
+    model = _build_model(device=_DEVICE)
+    batch = _batch(device=_DEVICE)
     with torch.no_grad():
         a = _forward(model, batch, seed=7)
         b = _forward(model, batch, seed=7)

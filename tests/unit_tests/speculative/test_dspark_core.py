@@ -23,6 +23,8 @@ from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics,
 VOCAB = 256
 HIDDEN = 64
 TARGET_LAYER_IDS = [1, 3]
+# flex_attention forward uses CUDA (Triton) when available, else CPU inductor.
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 class _Args(dict):
@@ -51,7 +53,7 @@ def _build_draft():
         confidence_head_alpha=1.0,
         confidence_head_with_markov=True,
     )
-    model = Qwen3DSparkModel(build_draft_config(target_config, margs)).to(dtype=torch.float32).eval()
+    model = Qwen3DSparkModel(build_draft_config(target_config, margs)).to(device=_DEVICE, dtype=torch.float32).eval()
     model.initialize_embeddings_and_head(
         embed_tokens=torch.nn.Embedding(VOCAB, HIDDEN),
         lm_head=torch.nn.Linear(HIDDEN, VOCAB, bias=False),
@@ -69,10 +71,10 @@ def test_trainer_module_forward_returns_finite_metrics():
     with torch.no_grad():
         torch.manual_seed(1234)
         out = trainer(
-            input_ids=torch.randint(0, VOCAB, (b, s), generator=gen),
-            target_hidden_states=torch.randn(b, s, len(TARGET_LAYER_IDS) * HIDDEN, generator=gen),
-            loss_mask=torch.ones(b, s, dtype=torch.uint8),
-            target_last_hidden_states=torch.randn(b, s, HIDDEN, generator=gen),
+            input_ids=torch.randint(0, VOCAB, (b, s), generator=gen).to(_DEVICE),
+            target_hidden_states=torch.randn(b, s, len(TARGET_LAYER_IDS) * HIDDEN, generator=gen).to(_DEVICE),
+            loss_mask=torch.ones(b, s, dtype=torch.uint8, device=_DEVICE),
+            target_last_hidden_states=torch.randn(b, s, HIDDEN, generator=gen).to(_DEVICE),
         )
     assert isinstance(out, DSparkStepMetrics)
     for term in (out.loss, out.ce_loss, out.l1_loss, out.confidence_loss):

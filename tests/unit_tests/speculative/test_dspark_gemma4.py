@@ -31,6 +31,8 @@ from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSpa
 VOCAB = 256
 HIDDEN = 64
 TARGET_LAYER_IDS = [1, 3]
+# flex_attention forward uses CUDA (Triton) when available, else CPU inductor.
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 class _Args(dict):
@@ -65,7 +67,7 @@ def _build_gemma4_draft():
     draft_config = build_gemma4_draft_config(target_config, margs)
     assert draft_config.architectures == ["Gemma4DSparkModel"]
     assert draft_config.num_hidden_layers == 2
-    model = Gemma4DSparkModel(draft_config).to(dtype=torch.float32).eval()
+    model = Gemma4DSparkModel(draft_config).to(device=_DEVICE, dtype=torch.float32).eval()
     model.initialize_embeddings_and_head(
         embed_tokens=torch.nn.Embedding(VOCAB, HIDDEN),
         lm_head=torch.nn.Linear(HIDDEN, VOCAB, bias=False),
@@ -81,10 +83,10 @@ def test_gemma4_draft_forward_shapes():
     with torch.no_grad():
         torch.manual_seed(7)
         out = model(
-            input_ids=torch.randint(0, VOCAB, (b, s), generator=gen),
-            target_hidden_states=torch.randn(b, s, len(TARGET_LAYER_IDS) * HIDDEN, generator=gen),
-            loss_mask=torch.ones(b, s, dtype=torch.uint8),
-            target_last_hidden_states=torch.randn(b, s, HIDDEN, generator=gen),
+            input_ids=torch.randint(0, VOCAB, (b, s), generator=gen).to(_DEVICE),
+            target_hidden_states=torch.randn(b, s, len(TARGET_LAYER_IDS) * HIDDEN, generator=gen).to(_DEVICE),
+            loss_mask=torch.ones(b, s, dtype=torch.uint8, device=_DEVICE),
+            target_last_hidden_states=torch.randn(b, s, HIDDEN, generator=gen).to(_DEVICE),
         )
     assert out.draft_logits.shape == (b, anchors, block, VOCAB)
     assert out.confidence_pred.shape == (b, anchors, block)
