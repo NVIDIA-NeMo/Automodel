@@ -114,8 +114,9 @@ navigation:
           - page: "GLM-4 MoE (GLM-4.5 / GLM-4.7)"
             path: ../../model-coverage/llm/thudm/glm4-moe.mdx
             slug: glm-4-moe-glm-4-5-glm-4-7
-          - page: "GLM-5 MoE (DSA)"
+          - page: "GLM-5 / GLM-5.2 MoE (DSA)"
             path: ../../model-coverage/llm/thudm/glm5-moe-dsa.mdx
+            slug: glm-5-moe-dsa
           - page: "Granite"
             path: ../../model-coverage/llm/ibm/granite.mdx
           - page: "Granite MoE"
