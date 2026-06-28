@@ -263,6 +263,36 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             raise ValueError(f"Unknown draft projector_type: {self.projector_type}")
         self.post_init()
 
+    def _apply(self, fn, recurse=True):
+        """Keep the RoPE ``inv_freq`` buffer in fp32 across dtype casts.
+
+        ``Qwen3RotaryEmbedding`` computes the rotary angles in fp32 but reads the
+        frequencies from a stored ``inv_freq`` buffer. ``model.to(bfloat16)`` -- the
+        training build path -- rounds that buffer to bf16, whereas the serving
+        runtime (SGLang keeps an fp32 RoPE cache) and HF's ``from_pretrained`` reload
+        keep it in fp32. The resulting train/inference RoPE mismatch grows with
+        absolute position (the bf16 frequencies dephase) and erodes draft
+        acceptance, so ``inv_freq`` must stay fp32 on both the training and reload
+        paths. A bf16 round-trip cannot be undone by upcasting, so when a cast
+        rounds the buffer we recompute fresh fp32 frequencies from the rotary
+        config (the same values HF derives on the fp32 paths) instead of upcasting
+        the corrupted ones.
+        """
+        module = super()._apply(fn, recurse=recurse)
+        rotary_emb = getattr(self, "rotary_emb", None)
+        inv_freq = getattr(rotary_emb, "inv_freq", None) if rotary_emb is not None else None
+        if (
+            inv_freq is not None
+            and inv_freq.is_floating_point()
+            and not inv_freq.is_meta
+            and inv_freq.dtype != torch.float32
+        ):
+            fresh = type(rotary_emb)(rotary_emb.config).inv_freq.to(device=inv_freq.device)
+            rotary_emb.inv_freq = fresh
+            if hasattr(rotary_emb, "original_inv_freq"):
+                rotary_emb.original_inv_freq = fresh.clone()
+        return module
+
     def forward(
         self,
         position_ids: torch.LongTensor,
