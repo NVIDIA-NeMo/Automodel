@@ -472,12 +472,28 @@ class TrainDFlashRecipe(BaseRecipe):
         self._load_extra_state(ckpt_dir)
 
     def _load_extra_state(self, ckpt_dir: str) -> None:
-        """Restore DFlash meta: global_step and epoch."""
+        """Restore DFlash meta: global_step and epoch, and validate mask_token_id."""
         meta_path = os.path.join(ckpt_dir, "dflash_meta.pt")
         if os.path.exists(meta_path):
             meta = torch.load(meta_path, weights_only=False, map_location="cpu")
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
+            # ``mask_token_id`` comes only from the resume YAML (it is not
+            # restored from the checkpoint); the draft's ``embed_tokens`` row at
+            # that id is the learned "predict here" signal and the inference
+            # runtime fills block slots with the same id. A resume YAML whose
+            # ``mask_token_id`` disagrees with the trained one silently points the
+            # mask slots at an untrained embedding row and degrades acceptance
+            # with no error, so fail loudly on a mismatch. Legacy checkpoints
+            # saved before this field existed (``None``) skip the check.
+            saved_mask_token_id = meta.get("mask_token_id", None)
+            if saved_mask_token_id is not None and int(saved_mask_token_id) != int(self.mask_token_id):
+                raise ValueError(
+                    f"mask_token_id mismatch on resume: the checkpoint at {ckpt_dir} was trained with "
+                    f"mask_token_id={int(saved_mask_token_id)}, but recipe_args.mask_token_id="
+                    f"{int(self.mask_token_id)}. The draft's mask-slot embedding was learned at the "
+                    f"checkpoint's id; set recipe_args.mask_token_id={int(saved_mask_token_id)} to resume."
+                )
 
     def _log_saved_checkpoint(self, kind: str, epoch: int, step: int) -> None:
         """Log a saved checkpoint on rank 0 when checkpointing is enabled."""
