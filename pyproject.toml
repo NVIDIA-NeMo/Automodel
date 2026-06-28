@@ -330,6 +330,19 @@ name = "nv_grouped_gemm"
 version = "1.1.4.post8"
 requires-dist = ["torch", "packaging", "ninja", "setuptools"]
 
+# Drop ffpa-attn's upstream torch>=2.11.0 pin so the lock stays on the repo's container-matched torch 2.10.0 (build group caps torch<=2.10.0).
+[[tool.uv.dependency-metadata]]
+name = "ffpa-attn"
+requires-dist = [
+    "packaging",
+    "ninja",
+    "numpy",
+    "ray",
+    "quack-kernels>=0.4.1",
+    "nvidia-cutlass-dsl>=4.5.1",
+    "apache-tvm-ffi<0.2,>=0.1.11",
+]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 
