@@ -32,7 +32,9 @@ import nemo_automodel.components.distributed.parallelizer as parallelizer
 from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
 from nemo_automodel.components.distributed.parallelizer import (
     _attention_is_head_sharded,
+    _extract_model_layer_groups,
     _extract_model_layers,
+    _filter_layer_groups_for_activation_checkpointing,
     _get_parallel_plan,
     _update_attention_head_counts_for_tp,
     apply_fsdp2_sharding_recursively,
@@ -1400,7 +1402,7 @@ class TestActivationCheckpointingKVSharing:
             lambda mesh, *a, **kw: MagicMock(),
         )
 
-    def _run_parallelize(self, model, activation_checkpointing=True):
+    def _run_parallelize(self, model, activation_checkpointing=True, activation_checkpointing_scope="all"):
         """Invoke the strategy under test and return the model."""
         from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
@@ -1413,6 +1415,7 @@ class TestActivationCheckpointingKVSharing:
             model=model,
             device_mesh=mesh,
             activation_checkpointing=activation_checkpointing,
+            activation_checkpointing_scope=activation_checkpointing_scope,
         )
 
     # ------------------------------------------------------------------ #
@@ -1452,8 +1455,8 @@ class TestActivationCheckpointingKVSharing:
     def test_no_config_does_not_crash(self, monkeypatch):
         """Model without a config attribute must not raise."""
         monkeypatch.setattr(
-            "nemo_automodel.components.distributed.parallelizer._extract_model_layers",
-            lambda m: [],
+            "nemo_automodel.components.distributed.parallelizer._extract_model_layer_groups",
+            lambda m: {},
         )
         model = nn.Module()
         model.forward = lambda x: x  # type: ignore[attr-defined]
@@ -1500,6 +1503,118 @@ class TestActivationCheckpointingKVSharing:
             for layer in model.model.layers:
                 assert isinstance(layer.input_layernorm, self._Wrapped)
                 assert isinstance(layer.post_attention_layernorm, self._Wrapped)
+
+    def test_vision_style_child_names_are_wrapped(self):
+        """Vision/Ministral-style blocks use ``attention`` and ``feed_forward`` names."""
+
+        class _VisionStyleLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attention = nn.Linear(16, 16)
+                self.feed_forward = nn.Linear(16, 16)
+                self.attention_norm = nn.Linear(16, 16)
+                self.ffn_norm = nn.Linear(16, 16)
+
+            def forward(self, x):
+                return x
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.model.layers = nn.ModuleList([_VisionStyleLayer() for _ in range(2)])
+
+        self._run_parallelize(model)
+
+        for layer in model.model.layers:
+            assert isinstance(layer.attention, self._Wrapped)
+            assert isinstance(layer.feed_forward, self._Wrapped)
+            assert isinstance(layer.attention_norm, self._Wrapped)
+            assert isinstance(layer.ffn_norm, self._Wrapped)
+
+    def test_activation_checkpointing_scope_language_only(self):
+        """``language`` scope leaves extracted vision layers unwrapped."""
+
+        class Mistral3BidirectionalModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = nn.ModuleList([_FakeLayer()])
+                self.vision_tower = nn.Module()
+                self.vision_tower.transformer = nn.Module()
+                self.vision_tower.transformer.layers = nn.ModuleList([_FakeLayer()])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Mistral3BidirectionalModel()
+                self.config = SimpleNamespace(use_cache=True, text_config=SimpleNamespace(num_kv_shared_layers=0))
+
+            def forward(self, x):
+                return x
+
+        model = BiEncoderModel()
+        self._run_parallelize(model, activation_checkpointing_scope="language")
+
+        language_layer = model.model.language_model.layers[0]
+        vision_layer = model.model.vision_tower.transformer.layers[0]
+        assert isinstance(language_layer.mlp, self._Wrapped)
+        assert not isinstance(vision_layer.mlp, self._Wrapped)
+
+    def test_activation_checkpointing_scope_all_wraps_custom_vlm_language_and_vision(self):
+        """Default ``all`` scope should not let the retrieval wrapper hide the vision tower."""
+
+        class Mistral3BidirectionalModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = nn.ModuleList([_FakeLayer()])
+                self.vision_tower = nn.Module()
+                self.vision_tower.transformer = nn.Module()
+                self.vision_tower.transformer.layers = nn.ModuleList([_FakeLayer()])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Mistral3BidirectionalModel()
+                self.config = SimpleNamespace(use_cache=True, text_config=SimpleNamespace(num_kv_shared_layers=0))
+
+            def forward(self, x):
+                return x
+
+        model = BiEncoderModel()
+        self._run_parallelize(model)
+
+        language_layer = model.model.language_model.layers[0]
+        vision_layer = model.model.vision_tower.transformer.layers[0]
+        assert isinstance(language_layer.mlp, self._Wrapped)
+        assert isinstance(vision_layer.mlp, self._Wrapped)
+
+    def test_activation_checkpointing_scope_vision_only(self):
+        """``vision`` scope leaves extracted language layers unwrapped."""
+
+        class Mistral3BidirectionalModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = nn.ModuleList([_FakeLayer()])
+                self.vision_tower = nn.Module()
+                self.vision_tower.transformer = nn.Module()
+                self.vision_tower.transformer.layers = nn.ModuleList([_FakeLayer()])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Mistral3BidirectionalModel()
+                self.config = SimpleNamespace(use_cache=True, text_config=SimpleNamespace(num_kv_shared_layers=0))
+
+            def forward(self, x):
+                return x
+
+        model = BiEncoderModel()
+        self._run_parallelize(model, activation_checkpointing_scope="vision")
+
+        language_layer = model.model.language_model.layers[0]
+        vision_layer = model.model.vision_tower.transformer.layers[0]
+        assert not isinstance(language_layer.mlp, self._Wrapped)
+        assert isinstance(vision_layer.mlp, self._Wrapped)
 
     def test_no_wrapping_without_activation_checkpointing(self):
         """When activation_checkpointing=False, nothing is wrapped."""
@@ -2172,6 +2287,65 @@ class TestExtractModelLayers:
         # 3 text-decoder + 2 vision tower layers, all flattened.
         assert len(result) == 5
         assert not any(isinstance(r, nn.ModuleList) for r in result)
+
+    def test_retrieval_wrapper_unwraps_custom_mistral3_vlm_groups(self):
+        """Retrieval wrappers should not fall back to the largest-layer heuristic."""
+
+        class Mistral3BidirectionalModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = self._mklayers(4)
+                self.vision_tower = nn.Module()
+                self.vision_tower.transformer = nn.Module()
+                self.vision_tower.transformer.layers = self._mklayers(2)
+
+            @staticmethod
+            def _mklayers(n):
+                return nn.ModuleList([_FakeLayer() for _ in range(n)])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Mistral3BidirectionalModel()
+
+        model = BiEncoderModel()
+
+        groups = _extract_model_layer_groups(model)
+        result = _extract_model_layers(model)
+
+        assert set(groups) == {"language", "vision"}
+        assert len(groups["language"]) == 4
+        assert len(groups["vision"]) == 2
+        assert result == groups["language"] + groups["vision"]
+
+    def test_activation_checkpointing_scope_filtering(self):
+        language = [_FakeLayer(), _FakeLayer()]
+        vision = [_FakeLayer()]
+        audio = [_FakeLayer()]
+        vision[0].requires_grad_(False)
+
+        groups = {"language": language, "vision": vision, "audio": audio}
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "language")
+        assert scopes == ("language",)
+        assert selected == language
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "multimodal")
+        assert scopes == ("multimodal",)
+        assert selected == vision + audio
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, ["language", "vision"])
+        assert scopes == ("language", "vision")
+        assert selected == language + vision
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "trainable")
+        assert scopes == ("trainable",)
+        assert selected == language + audio
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "trainable+vision")
+        assert scopes == ("trainable", "vision")
+        assert selected == language + audio + vision
 
     def test_string_keyed_bagel_extracts_language_and_vision_layers(self):
         """BAGEL exposes Qwen decoder layers and SigLIP encoder layers."""
