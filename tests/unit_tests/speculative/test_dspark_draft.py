@@ -28,17 +28,6 @@ from nemo_automodel.components.speculative.dspark import (
     compute_dspark_loss,
 )
 
-# FlexAttention's block-sparse kernel has no CPU backward; the training-path
-# tests therefore require a GPU. Forward-only checks run under no_grad.
-_gpu_only = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="FlexAttention backward requires a GPU",
-)
-
-# Forward runs on CUDA when available (Triton flex kernel); on CPU otherwise
-# (inductor CPU codegen). The GPU CI container cannot C++-compile the CPU flex
-# path, so forward-only tests must use CUDA there rather than CPU.
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 class _Args(dict):
@@ -94,8 +83,14 @@ def _tiny_model_args(markov_head_type: str = "vanilla") -> _Args:
     )
 
 
-def _build_model(device: str = "cpu", markov_head_type: str = "vanilla") -> Qwen3DSparkModel:
+def _build_model(
+    device: str = "cpu", markov_head_type: str = "vanilla", attn_implementation: str = "sdpa"
+) -> Qwen3DSparkModel:
+    # Unit tests default to the sdpa (dense-mask) backend so they run on CPU
+    # without flex_attention / inductor, matching the DFlash tests. The flex
+    # path is exercised by the GPU functional tests.
     draft_config = build_draft_config(_tiny_target_config(), _tiny_model_args(markov_head_type))
+    draft_config._attn_implementation = attn_implementation
     model = Qwen3DSparkModel(draft_config).to(device=device, dtype=torch.float32).eval()
     # Seed the frozen embedding + head from a fake target, exactly as the recipe will.
     fake_embed = torch.nn.Embedding(VOCAB, HIDDEN)
@@ -126,9 +121,9 @@ def _forward(model: Qwen3DSparkModel, batch: dict, seed: int = 1234):
 
 
 def test_forward_shapes():
-    model = _build_model(device=_DEVICE)
+    model = _build_model()
     with torch.no_grad():
-        out = _forward(model, _batch(device=_DEVICE))
+        out = _forward(model, _batch())
 
     assert out.draft_logits.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE, VOCAB)
     assert out.target_ids.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE)
@@ -143,11 +138,11 @@ def test_forward_shapes():
 @pytest.mark.parametrize("head", ["vanilla", "gated", "rnn"])
 def test_markov_head_variants_forward(head):
     """All three Markov head variants (incl. the recurrent RNN head) run and bias the logits."""
-    model = _build_model(device=_DEVICE, markov_head_type=head)
+    model = _build_model(markov_head_type=head)
     assert model.markov_head is not None
     assert model.markov_head.markov_head_type == head
     with torch.no_grad():
-        out = _forward(model, _batch(device=_DEVICE))
+        out = _forward(model, _batch())
     assert out.draft_logits.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE, VOCAB)
     assert torch.isfinite(out.draft_logits).all()
 
@@ -162,8 +157,8 @@ def test_embeddings_and_head_frozen():
 
 
 def test_forward_deterministic_under_seed():
-    model = _build_model(device=_DEVICE)
-    batch = _batch(device=_DEVICE)
+    model = _build_model()
+    batch = _batch()
     with torch.no_grad():
         a = _forward(model, batch, seed=7)
         b = _forward(model, batch, seed=7)
@@ -171,10 +166,9 @@ def test_forward_deterministic_under_seed():
     assert torch.equal(a.target_ids, b.target_ids)
 
 
-@_gpu_only
 def test_loss_is_finite_scalar_and_backprops():
-    model = _build_model(device="cuda")
-    out = _forward(model, _batch(device="cuda"))
+    model = _build_model()
+    out = _forward(model, _batch())
     loss = compute_dspark_loss(
         outputs=out,
         loss_decay_gamma=4.0,
@@ -191,11 +185,10 @@ def test_loss_is_finite_scalar_and_backprops():
     assert model.fc.weight.grad is not None and torch.isfinite(model.fc.weight.grad).all()
 
 
-@_gpu_only
 def test_loss_decreases_on_fixed_batch():
-    model = _build_model(device="cuda")
+    model = _build_model()
     model.train()
-    batch = _batch(seed=3, device="cuda")
+    batch = _batch(seed=3)
     optim = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=5e-3)
 
     losses = []

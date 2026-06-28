@@ -16,7 +16,6 @@ from typing import Optional
 
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import create_block_mask
 
 
 @dataclass
@@ -82,37 +81,6 @@ def validate_target_layer_ids(layer_ids, num_target_layers: int):
         assert previous is None or layer_id > previous, "target_layer_ids must be strictly increasing."
         previous = layer_id
     return layer_ids
-
-
-def create_dspark_attention_mask(
-    *,
-    anchor_positions: torch.Tensor,
-    block_keep_mask: torch.Tensor,
-    seq_len: int,
-    block_size: int,
-    device: torch.device,
-):
-    def dspark_mask_mod(b, h, q_idx, kv_idx):
-        del h
-        q_block_id = q_idx // block_size
-        anchor_pos = anchor_positions[b, q_block_id]
-        is_context = kv_idx < seq_len
-        mask_context = is_context & (kv_idx < anchor_pos)
-        is_draft = kv_idx >= seq_len
-        kv_block_id = (kv_idx - seq_len) // block_size
-        mask_draft = is_draft & (q_block_id == kv_block_id)
-        is_valid_block = block_keep_mask[b, q_block_id]
-        return (mask_context | mask_draft) & is_valid_block
-
-    bsz, num_blocks = anchor_positions.shape
-    return create_block_mask(
-        dspark_mask_mod,
-        B=bsz,
-        H=None,
-        Q_LEN=num_blocks * block_size,
-        KV_LEN=seq_len + num_blocks * block_size,
-        device=device,
-    )
 
 
 def build_anchor_candidate_mask(
@@ -254,7 +222,6 @@ __all__ = [
     "AcceptRatePredictor",
     "extract_context_feature",
     "validate_target_layer_ids",
-    "create_dspark_attention_mask",
     "build_anchor_candidate_mask",
     "sample_anchor_positions",
     "build_eval_mask",

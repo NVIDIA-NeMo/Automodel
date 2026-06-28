@@ -32,12 +32,12 @@ from transformers.models.gemma4.modeling_gemma4 import (
     apply_rotary_pos_emb as apply_gemma4_rotary_pos_emb,
 )
 
+from nemo_automodel.components.attention.dflash_mask import create_dflash_block_mask, create_dflash_sdpa_mask
 from nemo_automodel.components.speculative.dspark._sampling import sample_tokens
 from nemo_automodel.components.speculative.dspark.common import (
     AcceptRatePredictor,
     DSparkForwardOutput,
     build_eval_mask,
-    create_dspark_attention_mask,
     create_noise_embed,
     create_position_ids,
     sample_anchor_positions,
@@ -477,13 +477,14 @@ class Gemma4DSparkModel(Gemma4PreTrainedModel):
         )
         draft_position_ids = create_position_ids(anchor_positions, self.block_size)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-        dspark_attn_mask = create_dspark_attention_mask(
-            anchor_positions=anchor_positions,
-            block_keep_mask=block_keep_mask,
-            seq_len=seq_len,
-            block_size=self.block_size,
-            device=device,
-        )
+        if self.config._attn_implementation == "flex_attention":
+            dspark_attn_mask = create_dflash_block_mask(
+                anchor_positions, block_keep_mask, seq_len, self.block_size, device
+            )
+        else:
+            dspark_attn_mask = create_dflash_sdpa_mask(
+                anchor_positions, block_keep_mask, seq_len, self.block_size, device, noise_embedding.dtype
+            )
         output_hidden = self._forward_backbone(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
