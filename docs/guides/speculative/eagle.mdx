@@ -89,6 +89,18 @@ For SGLang serving (Step 5), install it in the same environment:
 uv pip install "sglang>=0.5.9"
 ```
 
+<Note>
+**SGLang / transformers version compatibility.** SGLang `0.5.9` pins
+`transformers==4.57.1`. The SGLang target backend (`target_model_backend: sglang`)
+and `serve_sglang` run in that environment without issue. The `--compare-hf`
+check in `smoke_sglang_target.py` additionally builds the HuggingFace target
+through `NeMoAutoModelForCausalLM`, which imports `AutoModelForMultimodalLM`
+(available only in `transformers` 5.x), so that single-process comparison cannot
+run as written under `transformers==4.57.1`. To compare the two backends, use a
+`transformers` build that satisfies both, or load the HuggingFace side with plain
+`transformers.AutoModelForCausalLM` wrapped in `HFEagle3TargetModel`.
+</Note>
+
 ---
 
 ## Step 1 — Understand EAGLE Architecture
