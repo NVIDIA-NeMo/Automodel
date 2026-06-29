@@ -84,6 +84,17 @@ def validate_eagle3_aux_layer_ids(aux_layer_ids: Sequence[int], num_layers: int)
     return aux_layer_ids
 
 
+def _to_full_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialise a (possibly tensor-parallel) tensor as a plain local tensor.
+
+    With a tensor-parallel target the lm_head is column-parallel, so its logits
+    come back as a vocab-sharded ``DTensor``. The draft consumes plain tensors,
+    so gather the full tensor before handing it on. A no-op for an already-plain
+    (unsharded or pure-FSDP-replicated) tensor.
+    """
+    return tensor.full_tensor() if hasattr(tensor, "full_tensor") else tensor
+
+
 @dataclass
 class Eagle3TargetBatch:
     """Target-model supervision for one draft-training batch.
@@ -339,6 +350,11 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         finally:
             for handle in handles:
                 handle.remove()
+        # A tensor-parallel target returns vocab-sharded (DTensor) logits from its
+        # column-parallel lm_head; gather to a full tensor before the draft-vocab
+        # projection and shift. No-op without TP. (TP is gated off with CP for now,
+        # so the CP branch above never produces a TP-sharded logits tensor.)
+        target_logits = _to_full_tensor(target_logits)
         shifted_logits = _shift_left_with_zero(target_logits)
         shifted_input_ids = _shift_left_with_zero(input_ids)
         shifted_loss_mask = _shift_left_with_zero(loss_mask)
