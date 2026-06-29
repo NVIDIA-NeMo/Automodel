@@ -19,15 +19,12 @@ from unittest.mock import MagicMock
 import torch
 from PIL import Image as PILImage
 
-from nemo_automodel.shared.import_utils import MISSING_QWEN_VL_UTILS_MSG
-
 try:
-    from qwen_vl_utils import process_vision_info
+    import qwen_vl_utils  # noqa: F401
 
     HAVE_QWEN_VL_UTILS = True
 except ImportError:
     HAVE_QWEN_VL_UTILS = False
-    process_vision_info = MagicMock()
 
 try:
     from qwen_omni_utils import process_mm_info
@@ -1256,9 +1253,6 @@ def default_collate_fn(
             (e.g. Gemma4 thinking-channel injection) to transform the
             tokenized batch and the prefix tokens without duplicating the rest of the pipeline.
     """
-    if not HAVE_QWEN_VL_UTILS:
-        raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
-
     conversations = _ensure_rgb([example["conversation"] for example in examples])
 
     # Optionally drop overlong samples before processing

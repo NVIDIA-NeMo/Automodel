@@ -666,14 +666,23 @@ def test_nemotron_parse_collate_shifts_and_casts(collate_mod, monkeypatch):
     assert torch.equal(batch["decoder_attention_mask"], torch.tensor([[1, 1, 1]]))
 
 
-@pytest.mark.parametrize("fn_name", ["default_collate_fn", "qwen3_omni_collate_fn"])
-def test_import_error_when_qwen_utils_missing(collate_mod, fn_name, monkeypatch):
+def test_qwen3_omni_collate_fn_import_error_when_qwen_utils_missing(collate_mod, monkeypatch):
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", False, raising=True)
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_OMNI_UTILS", False, raising=True)
-    func = getattr(collate_mod, fn_name)
 
     with pytest.raises(ImportError):
-        func([], None)
+        collate_mod.qwen3_omni_collate_fn([], None)
+
+
+def test_default_collate_fn_without_qwen_vl_utils(collate_mod, monkeypatch):
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", False, raising=True)
+
+    processor = DummyDefaultProcessor()
+    batch = collate_mod.default_collate_fn([{"conversation": CONVERSATION}], processor)
+
+    assert batch["input_ids"].shape == (1, 3)
+    assert batch["labels"].shape == (1, 3)
+    assert batch["pixel_values"].dtype == torch.bfloat16
 
 
 def test_default_collate_fn_with_max_length(collate_mod, fake_qwen_utils, monkeypatch):
