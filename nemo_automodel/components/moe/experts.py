@@ -958,6 +958,8 @@ class GroupedExpertsTE(nn.Module):
         self.dispatcher_hybridep_rank_capacity_factor = (
             backend.dispatcher_hybridep_rank_capacity_factor if backend is not None else None
         )
+        self._cache_static_m_splits = self._should_cache_static_m_splits(backend, dispatcher_backend)
+        self._cached_static_m_splits: Optional[list[int]] = None
 
         self._build_grouped_linears(config.n_routed_experts)
         self.expert_activation = get_expert_activation_for_deepep(config)
@@ -974,6 +976,33 @@ class GroupedExpertsTE(nn.Module):
         self.ep_mesh = None
         self.moe_mesh = None
         self.ep_rank = 0
+
+    @staticmethod
+    def _should_cache_static_m_splits(backend: Optional["BackendConfig"], dispatcher_backend: str) -> bool:
+        """Whether regular TE experts can reuse host split sizes after the first dispatch."""
+        return bool(
+            backend is not None
+            and backend.dispatcher_hybridep_cache_static_m_splits
+            and backend.experts == "te"
+            and backend.dispatcher == "hybridep"
+            and dispatcher_backend == "hybridep"
+            and backend.dispatcher_hybridep_rank_capacity_factor is not None
+            and backend.fake_balanced_gate
+            and backend.fake_gate_noise == 0.0
+        )
+
+    def _get_m_splits(self, tokens_per_expert: torch.Tensor | list[int]) -> list[int]:
+        """Convert TE split sizes to a host list, caching only the static benchmark path."""
+        if not isinstance(tokens_per_expert, torch.Tensor):
+            return list(tokens_per_expert)
+
+        if self._cache_static_m_splits and self._cached_static_m_splits is not None:
+            return self._cached_static_m_splits
+
+        m_splits = tokens_per_expert.tolist()
+        if self._cache_static_m_splits:
+            self._cached_static_m_splits = m_splits
+        return m_splits
 
     def _build_grouped_linears(self, num_experts: int) -> None:
         """Build the selected TE grouped-MLP implementation on the meta device."""
@@ -1327,6 +1356,7 @@ class GroupedExpertsTE(nn.Module):
         self.num_local_experts = self.config.n_routed_experts // self.ep_size
 
         self._build_grouped_linears(self.num_local_experts)
+        self._cached_static_m_splits = None
 
         token_dispatcher_config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
@@ -1423,10 +1453,7 @@ class GroupedExpertsTE(nn.Module):
             return self.token_dispatcher.token_unpermutation(output2)
 
         permuted_probs = permuted_probs.unsqueeze(-1)
-        if isinstance(tokens_per_expert, torch.Tensor):
-            m_splits = tokens_per_expert.tolist()
-        else:
-            m_splits = list(tokens_per_expert)
+        m_splits = self._get_m_splits(tokens_per_expert)
 
         actual_m_splits = None
         if fp8_active:

@@ -247,6 +247,47 @@ class TestBackendConfigHybridEP:
         with pytest.raises(ValueError, match="fake_balanced_gate=True"):
             BackendConfig(dispatcher="hybridep", dispatcher_hybridep_rank_capacity_factor=1.0)
 
+    def test_hybridep_static_m_splits_cache_defaults_disabled(self):
+        """Host split-size caching must remain an explicit benchmark-only opt-in."""
+        assert BackendConfig().dispatcher_hybridep_cache_static_m_splits is False
+
+    def test_hybridep_static_m_splits_cache_accepts_exact_contract(self):
+        """The cache accepts regular TE with deterministic, capacity-bounded HybridEP routing."""
+        config = BackendConfig(
+            experts="te",
+            dispatcher="hybridep",
+            dispatcher_hybridep_rank_capacity_factor=1.0,
+            dispatcher_hybridep_cache_static_m_splits=True,
+            fake_balanced_gate=True,
+            fake_gate_noise=0.0,
+        )
+        assert config.dispatcher_hybridep_cache_static_m_splits is True
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"experts": "te_ops"},
+            {"dispatcher": "deepep"},
+            {"dispatcher_hybridep_rank_capacity_factor": None},
+            {"fake_balanced_gate": False},
+            {"fake_gate_noise": 0.1},
+        ],
+    )
+    def test_hybridep_static_m_splits_cache_rejects_unsafe_config(self, override):
+        """Every mechanically checkable part of the static-split correctness contract is required."""
+        kwargs = {
+            "experts": "te",
+            "dispatcher": "hybridep",
+            "dispatcher_hybridep_rank_capacity_factor": 1.0,
+            "dispatcher_hybridep_cache_static_m_splits": True,
+            "fake_balanced_gate": True,
+            "fake_gate_noise": 0.0,
+        }
+        kwargs.update(override)
+
+        with pytest.raises(ValueError, match="dispatcher_hybridep_cache_static_m_splits requires"):
+            BackendConfig(**kwargs)
+
     def test_te_experts_falls_back_with_hybridep(self):
         """Test that te experts with hybridep dispatcher is valid (no fallback)."""
         config = BackendConfig(experts="te", dispatcher="hybridep")
