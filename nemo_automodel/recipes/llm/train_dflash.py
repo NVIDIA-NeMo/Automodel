@@ -190,10 +190,7 @@ class TrainDFlashRecipe(BaseRecipe):
         draft_config["max_window_layers"] = draft_num_hidden_layers
         draft_config["num_target_layers"] = num_target_layers
         draft_config["block_size"] = self.block_size
-        draft_config["dflash_config"] = {
-            "mask_token_id": self.mask_token_id,
-            "target_layer_ids": target_layer_ids,
-        }
+        draft_config["dflash_config"] = self._build_dflash_config(recipe_cfg, target_layer_ids)
         # A single knob drives both the trainer's mask format and the draft's
         # attention function -- they must agree (a flex BlockMask only works with
         # the flex attention fn, a dense bool mask only with sdpa/eager).
@@ -202,16 +199,7 @@ class TrainDFlashRecipe(BaseRecipe):
         draft_config_obj._attn_implementation = attention_backend
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
 
-        trainer_module = DFlashTrainerModule(
-            draft_model=self.draft_model,
-            target_lm_head=self.target_model.get_output_embeddings(),
-            target_embed_tokens=self.target_model.get_input_embeddings(),
-            mask_token_id=self.mask_token_id,
-            block_size=self.block_size,
-            attention_backend=attention_backend,
-            num_anchors=int(recipe_cfg.get("num_anchors", 512)),
-            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
-        ).to(self.device)
+        trainer_module = self._build_trainer_module(attention_backend, recipe_cfg).to(self.device)
         if self.dist_env.world_size > 1:
             trainer_module = DistributedDataParallel(
                 trainer_module,
@@ -263,6 +251,37 @@ class TrainDFlashRecipe(BaseRecipe):
         self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)), ranked=self.dist_env.world_size > 1)
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
+
+    def _build_dflash_config(self, recipe_cfg, target_layer_ids: list[int]) -> dict:
+        """Build the draft ``dflash_config`` block. Subclasses extend it (e.g. Domino)."""
+        return {
+            "mask_token_id": self.mask_token_id,
+            "target_layer_ids": target_layer_ids,
+        }
+
+    def _build_trainer_module(self, attention_backend: str, recipe_cfg):
+        """Build the trainer wrapper. Subclasses override to swap the wrapper (e.g. Domino)."""
+        return DFlashTrainerModule(
+            draft_model=self.draft_model,
+            target_lm_head=self.target_model.get_output_embeddings(),
+            target_embed_tokens=self.target_model.get_input_embeddings(),
+            mask_token_id=self.mask_token_id,
+            block_size=self.block_size,
+            attention_backend=attention_backend,
+            num_anchors=int(recipe_cfg.get("num_anchors", 512)),
+            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
+        )
+
+    def _run_trainer_step(self, target_batch):
+        """Run one trainer-module forward. Subclasses override to inject extra inputs (e.g. lambda_base)."""
+        return self.trainer_module(
+            input_ids=target_batch.input_ids,
+            hidden_states=target_batch.hidden_states,
+            loss_mask=target_batch.loss_mask,
+        )
+
+    def _log_extra_train_metrics(self, epoch_idx: int) -> None:
+        """Hook for subclasses to log extra per-step metrics at a log point (no-op here)."""
 
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
@@ -596,11 +615,7 @@ class TrainDFlashRecipe(BaseRecipe):
                     with sync_ctx:
                         local_has_valid = 1
                         try:
-                            metrics = self.trainer_module(
-                                input_ids=target_batch.input_ids,
-                                hidden_states=target_batch.hidden_states,
-                                loss_mask=target_batch.loss_mask,
-                            )
+                            metrics = self._run_trainer_step(target_batch)
                             loss = metrics.loss / self.grad_accumulation_steps
                         except NoValidAnchorsError:
                             # Every sample in this micro-batch is too short to form a
@@ -658,6 +673,7 @@ class TrainDFlashRecipe(BaseRecipe):
                                 avg_acc,
                                 current_lr,
                             )
+                            self._log_extra_train_metrics(epoch_idx)
                             running_loss = 0.0
                             running_acc = 0.0
                             running_micro = 0

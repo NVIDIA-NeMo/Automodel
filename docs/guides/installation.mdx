@@ -302,6 +302,43 @@ For vision-language model training, add the VLM extras:
 pip3 install nemo-automodel[vlm]
 ```
 
+<Note>
+`[vlm]` installs the core VLM stack (image processors, tokenizers). Models that
+decode video or use OpenCV / Qwen vision preprocessing — Qwen2.5-VL, Qwen3-VL,
+Qwen3-Omni, Mistral VLMs, and Nemotron-Omni — additionally require the
+`vlm-media` extra (see [Media Extras](#media-extras-video--image-decode)):
+
+```bash
+pip3 install "nemo-automodel[vlm,vlm-media]"
+```
+
+</Note>
+
+### Media Extras (Video & Image Decode)
+
+Media decode dependencies (OpenCV, decord, PyAV via the Qwen utils, and
+imageio-ffmpeg) bundle FFmpeg, which is no longer packaged in the container.
+They are opt-in and split by domain:
+
+| Extra | Pulls in | Needed for |
+|-------|----------|------------|
+| `vlm-media` | OpenCV, decord, qwen-vl-utils, qwen-omni-utils | VLM video reading, Qwen vision preprocessing, Mistral image tokenization |
+| `diffusion-media` | imageio-ffmpeg, OpenCV | Diffusion image/video preprocessing and T2V export |
+| `media` | both of the above | Convenience union |
+
+```bash
+pip3 install "nemo-automodel[vlm,vlm-media]"              # VLM + media
+pip3 install "nemo-automodel[diffusion,diffusion-media]"  # diffusion + media
+```
+
+<Warning>
+**`[all]` does not include the media extras**, and they are not installed in
+the Docker container by default — FFmpeg is no longer packaged in the container.
+After `pip3 install nemo-automodel[all]` (or inside the container) add media
+explicitly: `pip3 install nemo-automodel[media]`.
+
+</Warning>
+
 ### CUDA-Specific Packages
 
 For models requiring TransformerEngine, bitsandbytes, Mamba, or other
@@ -313,11 +350,18 @@ pip3 install nemo-automodel[cuda]
 
 ### All Extras
 
-Install everything (CUDA, VLM, NeMo-Run, etc.):
+Install all standard extras (CUDA, VLM, NeMo-Run, diffusion, etc.):
 
 ```bash
 pip3 install nemo-automodel[all]
 ```
+
+<Note>
+`[all]` intentionally **excludes the media extras** (FFmpeg-bearing). Add them
+explicitly if you need video/image decode:
+`pip3 install nemo-automodel[all,media]`.
+
+</Note>
 
 <Tip>
 You can combine extras: `pip3 install nemo-automodel[vlm,cuda]`
@@ -329,6 +373,8 @@ You can combine extras: `pip3 install nemo-automodel[vlm,cuda]`
 | --------------------------- | --------------------------------------------------------------- |
 | Stable install (PyPI)       | `pip3 install nemo-automodel`                                   |
 | CLI-only (login nodes)      | `pip3 install nemo-automodel[cli]`                              |
+| VLM + media (Qwen/Mistral/video) | `pip3 install "nemo-automodel[vlm,vlm-media]"`             |
+| Diffusion + media           | `pip3 install "nemo-automodel[diffusion,diffusion-media]"`      |
 | Latest from GitHub          | `pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git` |
 | Editable install (dev mode) | `pip install -e .` after cloning                                |
 | Run without installing      | Use `PYTHONPATH=$(pwd)` to run scripts                          |
