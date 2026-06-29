@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU unit tests for the co-located SGLang target backend in the EAGLE-3 recipe.
+"""CPU unit tests for the co-located vLLM target backend in the EAGLE-3 recipe.
 
-The real SGLang construction needs a GPU and is validated on the server; here
-``SGLangEagle3TargetModel.from_pretrained`` is mocked and the tests pin the
+The real vLLM construction needs a GPU and is validated on the server; here
+``VLLMEagle3TargetModel.from_pretrained`` is mocked and the tests pin the
 recipe-side wiring: backend dispatch, environment guards (CUDA-only,
-single-process-only), and how ``recipe_args`` flow into the SGLang kwargs.
+single-process-only), and how ``recipe_args`` flow into the vLLM kwargs.
 """
 
 from __future__ import annotations
@@ -59,26 +59,26 @@ def _make_recipe(world_size: int = 1, device: str = "cuda") -> TrainEagle3Recipe
     return recipe
 
 
-_FROM_PRETRAINED = "nemo_automodel.components.speculative.eagle.sglang_target.SGLangEagle3TargetModel.from_pretrained"
+_FROM_PRETRAINED = "nemo_automodel.components.speculative.eagle.vllm_target.VLLMEagle3TargetModel.from_pretrained"
 
 
-def test_setup_sglang_target_requires_cuda():
+def test_setup_vllm_target_requires_cuda():
     recipe = _make_recipe(device="cpu")
     with pytest.raises(ValueError, match="requires CUDA"):
-        recipe._setup_sglang_target(_RecipeCfg(), "target/path")
+        recipe._setup_vllm_target(_RecipeCfg(), "target/path")
 
 
-def test_setup_sglang_target_rejects_multi_process():
+def test_setup_vllm_target_rejects_multi_process():
     recipe = _make_recipe(world_size=2)
     with pytest.raises(ValueError, match="single-process training only"):
-        recipe._setup_sglang_target(_RecipeCfg(), "target/path")
+        recipe._setup_vllm_target(_RecipeCfg(), "target/path")
 
 
-def test_setup_sglang_target_builds_wrapper_with_defaults():
+def test_setup_vllm_target_builds_wrapper_with_defaults():
     recipe = _make_recipe()
     wrapper = object()
     with patch(_FROM_PRETRAINED, MagicMock(return_value=wrapper)) as from_pretrained:
-        recipe._setup_sglang_target(_RecipeCfg(), "target/path")
+        recipe._setup_vllm_target(_RecipeCfg(), "target/path")
 
     assert recipe.target_wrapper is wrapper
     assert recipe.target_model is None
@@ -87,30 +87,30 @@ def test_setup_sglang_target_builds_wrapper_with_defaults():
         aux_layer_ids=None,
         dtype=torch.bfloat16,
         trust_remote_code=False,
-        mem_fraction_static=0.5,
+        gpu_memory_utilization=0.5,
     )
 
 
 @pytest.mark.parametrize("as_node", [False, True], ids=["plain-dict", "to_dict-node"])
-def test_setup_sglang_target_forwards_sglang_args(as_node):
-    """``recipe_args.sglang_args`` overrides the defaults and passes extras through."""
+def test_setup_vllm_target_forwards_vllm_args(as_node):
+    """``recipe_args.vllm_args`` overrides the defaults and passes extras through."""
     recipe = _make_recipe()
-    args = {"mem_fraction_static": 0.35, "page_size": 32}
+    args = {"gpu_memory_utilization": 0.35, "max_model_len": 2048}
     cfg = _RecipeCfg(
-        sglang_args=_ToDictNode(args) if as_node else args,
+        vllm_args=_ToDictNode(args) if as_node else args,
         aux_layer_ids=[1, 2, 3],
         trust_remote_code=True,
     )
     with patch(_FROM_PRETRAINED, MagicMock(return_value=object())) as from_pretrained:
-        recipe._setup_sglang_target(cfg, "target/path")
+        recipe._setup_vllm_target(cfg, "target/path")
 
     from_pretrained.assert_called_once_with(
         "target/path",
         aux_layer_ids=[1, 2, 3],
         dtype=torch.bfloat16,
         trust_remote_code=True,
-        mem_fraction_static=0.35,
-        page_size=32,
+        gpu_memory_utilization=0.35,
+        max_model_len=2048,
     )
 
 
@@ -122,40 +122,17 @@ def _sentinel(self, *args, **kwargs):
     raise _DispatchReached()
 
 
-@pytest.mark.parametrize(
-    "backend, method",
-    [
-        ("sglang", "_setup_sglang_target"),
-        ("colocated", "_setup_colocated_target"),
-        ("remote", "_setup_remote_target"),
-    ],
-)
-def test_online_target_dispatches_backend(monkeypatch, backend, method):
+def test_online_target_dispatches_vllm(monkeypatch):
     recipe = _make_recipe()
-    monkeypatch.setattr(TrainEagle3Recipe, method, _sentinel)
+    monkeypatch.setattr(TrainEagle3Recipe, "_setup_vllm_target", _sentinel)
     with pytest.raises(_DispatchReached):
-        recipe._setup_online_target(_RecipeCfg(target_model_backend=backend), "target/path", None)
+        recipe._setup_online_target(_RecipeCfg(target_model_backend="vllm"), "target/path", None)
 
 
-def test_online_target_rejects_unknown_backend():
-    recipe = _make_recipe()
-    with pytest.raises(ValueError, match="expected 'colocated', 'sglang', 'vllm', or 'remote'"):
-        recipe._setup_online_target(_RecipeCfg(target_model_backend="bogus"), "target/path", None)
-
-
-@pytest.mark.parametrize("backend", ["sglang", "remote"])
+@pytest.mark.parametrize("backend", ["sglang", "vllm", "remote"])
 def test_online_target_rejects_packing_on_non_colocated(backend):
-    """packed_sequence_size > 0 is colocated-only; SGLang/remote leak across docs."""
+    """packed_sequence_size > 0 is colocated-only; vLLM/SGLang/remote leak across docs."""
     recipe = _make_recipe()
     cfg = _RecipeCfg(target_model_backend=backend, packed_sequence_size=4)
     with pytest.raises(NotImplementedError, match="only supported with the colocated"):
-        recipe._setup_online_target(cfg, "target/path", None)
-
-
-def test_online_target_allows_packing_on_colocated(monkeypatch):
-    """packed_sequence_size > 0 passes the guard for the colocated backend."""
-    recipe = _make_recipe()
-    monkeypatch.setattr(TrainEagle3Recipe, "_setup_colocated_target", _sentinel)
-    cfg = _RecipeCfg(target_model_backend="colocated", packed_sequence_size=4)
-    with pytest.raises(_DispatchReached):
         recipe._setup_online_target(cfg, "target/path", None)
