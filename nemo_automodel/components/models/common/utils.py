@@ -22,8 +22,9 @@ import torch
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-logger = logging.getLogger(__name__)
 from nemo_automodel.shared.utils import dtype_from_str
+
+logger = logging.getLogger(__name__)
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
@@ -193,6 +194,10 @@ class BackendConfig:
         enable_fsdp_optimizations: Whether to enable FSDP2 optimizations.
         gate_precision: Optional dtype override for the gate computation. Accepts
             torch.dtype or string (e.g., "torch.float32", "float32").
+        moe_router_fusion: Use Transformer Engine's fused top-k router for the
+            learned GPT-OSS-style gate. The fused kernel produces the dense routing
+            metadata consumed directly by HybridEP, so this requires
+            dispatcher="hybridep" and fake_balanced_gate=False.
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
@@ -206,6 +211,10 @@ class BackendConfig:
         partial_cuda_graph_experts: Benchmark-only opt-in that captures GPT-OSS TE-ops
             expert compute. Real routing can change the received-token shape, so calls
             whose metadata differs from the captured sample fall back to eager execution.
+        partial_cuda_graph_expert_bucket_tokens: Optional fixed physical token capacity
+            for partial expert graphs. HybridEP still receives the exact dynamic token
+            count; expert inputs at or below this capacity are padded locally for TE and
+            sliced back before combine. Larger calls remain eager without dropping tokens.
         partial_cuda_graph_layer_limit: Positive number of leading GPT-OSS layers to graph.
             Limiting the layer count bounds persistent forward/backward graph buffers.
     """
@@ -236,6 +245,7 @@ class BackendConfig:
     enable_fsdp_optimizations: bool = False
     te_fp8: TEFp8Config | None = None
     gate_precision: str | torch.dtype | None = None
+    moe_router_fusion: bool = False
     # When True, torch.compile(fullgraph=True) the attention module's forward to fuse its many
     # small ops (projections, RoPE, reshapes, SDPA). Applies to both the DeepSeek-V3 MLA and
     # standard GQA attention (e.g. Qwen3-MoE). The compiled region must contain no TE
@@ -247,6 +257,7 @@ class BackendConfig:
     partial_cuda_graph_moe_router: bool = False
     partial_cuda_graph_moe_preprocess: bool = False
     partial_cuda_graph_experts: bool = False
+    partial_cuda_graph_expert_bucket_tokens: int | None = None
     partial_cuda_graph_layer_limit: int = 0
 
     def __post_init__(self):
@@ -309,6 +320,23 @@ class BackendConfig:
             raise ValueError("partial_cuda_graph_moe_preprocess requires dispatcher='hybridep'")
         if self.partial_cuda_graph_experts and self.experts != "te_ops":
             raise ValueError("partial_cuda_graph_experts requires experts='te_ops'")
+        if self.partial_cuda_graph_expert_bucket_tokens is not None:
+            bucket_tokens = self.partial_cuda_graph_expert_bucket_tokens
+            if isinstance(bucket_tokens, bool) or not isinstance(bucket_tokens, int) or bucket_tokens <= 0:
+                raise ValueError("partial_cuda_graph_expert_bucket_tokens must be a positive integer")
+            if not self.partial_cuda_graph_experts:
+                raise ValueError("partial_cuda_graph_expert_bucket_tokens requires partial_cuda_graph_experts=True")
+            if bucket_tokens % 128 != 0:
+                raise ValueError("partial_cuda_graph_expert_bucket_tokens must be divisible by 128")
+        if self.moe_router_fusion and self.dispatcher != "hybridep":
+            raise ValueError("moe_router_fusion requires dispatcher='hybridep'")
+        if self.moe_router_fusion and self.fake_balanced_gate:
+            raise ValueError("moe_router_fusion requires the learned Gate (fake_balanced_gate=False)")
+        if self.moe_router_fusion and self.partial_cuda_graph_moe_preprocess:
+            raise ValueError(
+                "moe_router_fusion already emits HybridEP preprocessing metadata; "
+                "partial_cuda_graph_moe_preprocess must be False"
+            )
 
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
         if self.te_fp8 is not None and self.linear != "te" and self.experts not in ("te", "te_ops"):

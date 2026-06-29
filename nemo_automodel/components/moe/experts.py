@@ -150,6 +150,18 @@ def _permute_tokens_for_grouped_mm(
     return sorted_token_ids, sorted_weights, tokens_per_expert, offs
 
 
+def _mask_routing_metadata(
+    weights: torch.Tensor,
+    indices: torch.Tensor,
+    token_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mask compact top-k or TE's dense HybridEP routing metadata."""
+    if indices.dtype == torch.bool:
+        valid_tokens = token_mask.unsqueeze(-1)
+        return weights * valid_tokens.to(weights.dtype), indices & valid_tokens
+    return weights, indices.masked_fill(~token_mask.unsqueeze(-1), -1)
+
+
 def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     """Apply per-expert bias to grouped GEMM output.
 
@@ -786,7 +798,7 @@ class GroupedExpertsDeepEP(nn.Module):
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
 
-        indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
+        weights, indices = _mask_routing_metadata(weights, indices, token_mask)
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
             hidden_states=x,
             num_local_tokens=x.size(0),
@@ -1378,7 +1390,7 @@ class GroupedExpertsTE(nn.Module):
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
 
-        indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
+        weights, indices = _mask_routing_metadata(weights, indices, token_mask)
 
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
             hidden_states=x,

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-from functools import partial
+from functools import cache, partial
 from typing import Optional
 
 import torch
@@ -37,6 +37,25 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
+from nemo_automodel.shared.import_utils import safe_import_from
+
+
+@cache
+def _get_te_fused_topk_with_score_function():
+    """Load TE's router once without making it an AutoModel import dependency."""
+    message = "moe_router_fusion requires transformer_engine.pytorch.router.fused_topk_with_score_function"
+    available, fused_topk_with_score_function = safe_import_from(
+        "transformer_engine.pytorch.router",
+        "fused_topk_with_score_function",
+        msg=message,
+    )
+    if not available:
+        raise ImportError(message)
+    return fused_topk_with_score_function
+
+
+def _te_fused_topk_with_score_function(**kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+    return _get_te_fused_topk_with_score_function()(**kwargs)
 
 
 class MLP(nn.Module):
@@ -217,7 +236,7 @@ class _GateRoutingCore(nn.Module):
     independent, parameterless CUDA graph boundary and survives model copies.
     """
 
-    def forward(self, scores: torch.Tensor, gate: "Gate") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, scores: torch.Tensor, gate: "Gate") -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Select experts and compute routing probabilities from projected scores."""
         return gate._route_scores(scores)
 
@@ -242,6 +261,8 @@ class Gate(nn.Module):
         self,
         config: MoEConfig,
         gate_precision: torch.dtype | None = None,
+        *,
+        fuse_router: bool = False,
     ):
         """
         Initializes the Gate module.
@@ -249,6 +270,9 @@ class Gate(nn.Module):
         Args:
             config (MoEConfig): Model configuration containing gating parameters.
             gate_precision (torch.dtype | None): Precision for gate computations (linear, softmax/sigmoid).
+            fuse_router (bool): Use TE's fused top-k router and return its dense
+                HybridEP metadata. This is intentionally limited to the exact
+                GPT-OSS softmax-after-top-k routing contract.
         """
         super().__init__()
         self.dim = config.dim
@@ -264,6 +288,7 @@ class Gate(nn.Module):
         self.aux_loss_coeff = config.aux_loss_coeff
         self.norm_topk_prob = config.norm_topk_prob
         self.gate_precision = gate_precision
+        self.fuse_router = fuse_router
 
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
@@ -308,8 +333,49 @@ class Gate(nn.Module):
         self.routing_core = _GateRoutingCore()
         self.use_routing_core = False
 
-    def _route_scores(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.fuse_router:
+            unsupported = []
+            if self.score_func != "softmax":
+                unsupported.append("score_func must be 'softmax'")
+            if self.softmax_before_topk:
+                unsupported.append("softmax_before_topk must be False")
+            if self.norm_topk_prob:
+                unsupported.append("norm_topk_prob must be False")
+            if self.n_groups not in (0, 1):
+                unsupported.append("expert-group routing is not supported")
+            if self.e_score_correction_bias is not None:
+                unsupported.append("expert correction bias is not supported")
+            if self.router_replay is not None:
+                unsupported.append("routing replay is not supported")
+            if self.gate_precision == torch.float64:
+                unsupported.append("float64 router precision is not supported by TE")
+            if unsupported:
+                raise ValueError("moe_router_fusion requires GPT-OSS routing semantics: " + "; ".join(unsupported))
+
+    def _route_scores(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Apply fixed-shape expert selection and probability math to router logits."""
+        if self.fuse_router:
+            # TE returns dense [tokens, experts] probabilities and a boolean
+            # routing map. HybridEP consumes those tensors directly, avoiding a
+            # top-k-indices-to-multihot conversion. Only materialize the full
+            # all-expert softmax when training actually enables auxiliary loss.
+            routing_probs, routing_map = _te_fused_topk_with_score_function(
+                logits=scores,
+                topk=self.topk,
+                use_pre_softmax=False,
+                num_groups=None,
+                group_topk=None,
+                scaling_factor=self.route_scale,
+                score_function="softmax",
+                expert_bias=None,
+            )
+            original_scores = (
+                scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+                if self.aux_loss_coeff > 0 and self.training
+                else None
+            )
+            return routing_probs, routing_map, original_scores
+
         num_tokens = scores.size(0)
 
         if self.score_func == "softmax":
@@ -326,7 +392,11 @@ class Gate(nn.Module):
                     values = scores.gather(1, replayed)
                     indices = replayed
                 weights = values.softmax(dim=1, dtype=self.gate_precision or torch.float32)
-                original_scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+                original_scores = (
+                    scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+                    if self.aux_loss_coeff > 0 and self.training
+                    else None
+                )
         elif self.score_func == "softmax_with_bias":
             scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
             original_scores = scores
@@ -395,9 +465,10 @@ class Gate(nn.Module):
 
         if self.norm_topk_prob and self.topk > 1:
             denom_w = weights.sum(dim=-1, keepdim=True) + 1e-20
-            denom_s = original_scores.sum(dim=-1, keepdim=True) + 1e-20
             weights = weights / denom_w
-            original_scores = original_scores / denom_s
+            if original_scores is not None:
+                denom_s = original_scores.sum(dim=-1, keepdim=True) + 1e-20
+                original_scores = original_scores / denom_s
 
         return weights * self.route_scale, indices, original_scores
 
@@ -439,7 +510,8 @@ class Gate(nn.Module):
 
         if self.gate_precision is not None:
             weights = weights.to(dtype=original_dtype)
-            original_scores = original_scores.to(dtype=original_dtype)
+            if original_scores is not None:
+                original_scores = original_scores.to(dtype=original_dtype)
 
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0 or self._track_load_balance:
             expert_load = self._compute_expert_load(indices, token_mask)
@@ -455,6 +527,7 @@ class Gate(nn.Module):
 
         aux_loss = None
         if self.aux_loss_coeff > 0 and self.training:
+            assert original_scores is not None
             aux_loss = self._compute_aux_loss(original_scores, expert_load, token_mask, cp_mesh)
             # Scale the aux_loss by the number of tokens.
             # Training scales all gradients by 1/(number of tokens).
@@ -545,6 +618,13 @@ class Gate(nn.Module):
             torch.Tensor: Load of each expert (number of tokens routed to each expert).
                 Shape is [num_local_experts].
         """
+        if indices.dtype == torch.bool and indices.shape[-1] == self.n_experts:
+            # TE router fusion returns HybridEP-native dense routing metadata.
+            # Count the current call's actual assignments; never retain routing
+            # state across batches or activation-checkpoint recomputation.
+            routing_map = indices & token_mask.unsqueeze(-1)
+            return routing_map.sum(dim=0, dtype=torch.long)
+
         # Create a mask for the experts based on the selected indices.
         expert_mask = indices.new_zeros((indices.shape[0], self.n_experts))
         contribution = token_mask.to(dtype=expert_mask.dtype).unsqueeze(-1).expand(-1, indices.shape[1])
@@ -640,13 +720,20 @@ class MoE(nn.Module):
         self.dim = config.dim
         self.n_routed_experts = config.n_routed_experts
         self.n_activated_experts = config.n_activated_experts
+        world_size = get_world_size_safe()
 
         if backend.fake_balanced_gate:
             self.gate = FakeBalancedGate(config, noise=backend.fake_gate_noise)
         else:
-            self.gate = Gate(config, gate_precision=backend.gate_precision)
+            self.gate = Gate(
+                config,
+                gate_precision=backend.gate_precision,
+                # HybridEP is unavailable in the existing single-rank fallback,
+                # whose local experts retain the compact [tokens, top-k] API.
+                fuse_router=backend.moe_router_fusion and world_size > 1,
+            )
             self.gate.use_routing_core = backend.partial_cuda_graph_moe_router
-        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
+        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and world_size == 1:
             warnings.warn(
                 f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "
                 "Expert parallelism requires multiple GPUs. Falling back to standard GroupedExperts.",

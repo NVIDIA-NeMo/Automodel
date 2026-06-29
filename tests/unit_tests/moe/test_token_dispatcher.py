@@ -137,3 +137,34 @@ def test_hybridep_metadata_processor_matches_manager_and_preserves_prob_grads():
 
     multihot_probs.sum().backward()
     torch.testing.assert_close(probs.grad, torch.ones_like(probs))
+
+
+def test_hybridep_metadata_processor_accepts_te_dense_router_output():
+    """TE's dense map/probs pass straight to HybridEP without losing gradients."""
+    processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=True)
+    routing_map = torch.tensor(
+        [
+            [True, False, False, True, False, False, False, False],
+            [False, True, False, False, False, True, False, False],
+        ]
+    )
+    probs = torch.tensor(
+        [
+            [0.6, 0.0, 0.0, 0.4, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.7, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0],
+        ],
+        requires_grad=True,
+    )
+
+    processed_map, processed_probs = processor(routing_map, probs)
+
+    assert processed_map is routing_map
+    assert processed_probs is probs
+    processed_probs.sum().backward()
+    torch.testing.assert_close(probs.grad, torch.ones_like(probs))
+
+
+def test_hybridep_metadata_processor_rejects_invalid_dense_shape():
+    processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=True)
+    with pytest.raises(ValueError, match="Dense HybridEP routing metadata must have shape"):
+        processor(torch.ones(2, 7, dtype=torch.bool), torch.ones(2, 7))

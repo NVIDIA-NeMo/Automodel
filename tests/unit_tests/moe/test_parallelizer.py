@@ -288,8 +288,10 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.distributed.pipelining.hf_utils",
         "nemo_automodel.components.distributed.mesh_utils",
     ]:
-        if mod in sys.modules:
-            sys.modules.pop(mod)
+        # Track removals through monkeypatch so the real modules are restored
+        # after each stubbed-import test.  A raw ``sys.modules.pop`` leaves the
+        # process with a second module instance and breaks later patch targets.
+        monkeypatch.delitem(sys.modules, mod, raising=False)
 
     _install_torch_and_layers_stubs(monkeypatch)
 

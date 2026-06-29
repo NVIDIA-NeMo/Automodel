@@ -70,12 +70,13 @@ class _FakeMoEPreprocess(nn.Module):
         return indices >= 0, probs
 
 
-def _make_entry(module, *, canonicalizer=None, fp8_enabled=False):
+def _make_entry(module, *, canonicalizer=None, fp8_enabled=False, expert_bucket_tokens=None):
     return partial_graphs._PartialGraphEntry(
         name="test.dynamic_experts",
         target=module,
         fp8_enabled=fp8_enabled,
         canonicalizer=canonicalizer,
+        expert_bucket_tokens=expert_bucket_tokens,
     )
 
 
@@ -106,6 +107,7 @@ class _FSDPStyleGptOssWrapper(nn.Module):
         moe_router=False,
         moe_preprocess=False,
         experts=True,
+        expert_bucket_tokens=None,
     ):
         super().__init__()
         self.config = SimpleNamespace(model_type="gpt_oss")
@@ -114,6 +116,7 @@ class _FSDPStyleGptOssWrapper(nn.Module):
             partial_cuda_graph_moe_router=moe_router,
             partial_cuda_graph_moe_preprocess=moe_preprocess,
             partial_cuda_graph_experts=experts,
+            partial_cuda_graph_expert_bucket_tokens=expert_bucket_tokens,
             partial_cuda_graph_layer_limit=layer_limit,
             te_fp8=None,
         )
@@ -320,6 +323,153 @@ def test_expert_replay_keeps_changed_split_values_and_aliases(monkeypatch):
     torch.testing.assert_close(graph_probs.grad, torch.full_like(graph_probs, 36), rtol=0, atol=0)
     torch.testing.assert_close(module.scale.grad, reference.scale.grad, rtol=0, atol=0)
     assert manager.stats() == {"captured": 1, "replayed": 1, "fallback": 0}
+
+
+def test_expert_bucket_replays_changed_token_count_and_preserves_gradients(monkeypatch):
+    _install_fake_graph(monkeypatch)
+    model = _FSDPStyleGptOssWrapper(attention=False, expert_bucket_tokens=4)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+    assert manager is not None
+    module = model.model.layers["0"].mlp.experts._te_grouped_mlp
+    entry = manager.entries[0]
+
+    first_x = torch.randn(2, 3, requires_grad=True)
+    first_probs = torch.randn(2, 1, requires_grad=True)
+    first_splits = torch.tensor([1, 1], dtype=torch.int64)
+    module(first_x, first_splits, first_probs, first_splits, first_probs)
+
+    assert entry.captured_call is not None
+    assert entry.captured_call.sample_tensors[0].shape == (4, 3)
+    torch.testing.assert_close(entry.captured_call.sample_tensors[1], first_splits)
+    assert entry.captured_call.sample_tensors[2].shape == (4, 1)
+    manager.capture()
+
+    graph_x = torch.randn(3, 3, requires_grad=True)
+    graph_probs = torch.randn(3, 1, requires_grad=True)
+    changed_splits = torch.tensor([2, 1], dtype=torch.int64)
+    graph_output = module(graph_x, changed_splits, graph_probs, changed_splits, graph_probs)
+    graph_output.sum().backward()
+    graph_scale_grad = module.scale.grad.detach().clone()
+    module.zero_grad(set_to_none=True)
+
+    ref_x = graph_x.detach().clone().requires_grad_(True)
+    ref_probs = graph_probs.detach().clone().requires_grad_(True)
+    ref_output = entry.original_forward(ref_x, changed_splits, ref_probs, changed_splits, ref_probs)
+    ref_output.sum().backward()
+
+    torch.testing.assert_close(graph_output, ref_output)
+    torch.testing.assert_close(graph_x.grad, ref_x.grad)
+    torch.testing.assert_close(graph_probs.grad, ref_probs.grad)
+    torch.testing.assert_close(graph_scale_grad, module.scale.grad)
+    assert graph_output.shape == (3, 3)
+    assert manager.stats() == {"captured": 1, "replayed": 1, "fallback": 0}
+    assert manager.expert_bucket_stats() == {
+        "entries": 1,
+        "capacity_tokens": 4,
+        "bucketed_replay": 1,
+        "padding_tokens": 1,
+        "overflow_fallback": 0,
+        "empty_fallback": 0,
+        "capture_overflow_skip": 0,
+        "capture_empty_skip": 0,
+    }
+
+
+def test_expert_bucket_overflow_and_empty_calls_fall_back_without_token_loss(monkeypatch):
+    _install_fake_graph(monkeypatch)
+    model = _FSDPStyleGptOssWrapper(attention=False, expert_bucket_tokens=4)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+    assert manager is not None
+    module = model.model.layers["0"].mlp.experts._te_grouped_mlp
+    entry = manager.entries[0]
+
+    first_splits = torch.tensor([1, 1], dtype=torch.int64)
+    first_probs = torch.randn(2, 1)
+    module(torch.randn(2, 3), first_splits, first_probs, first_splits, first_probs)
+    manager.capture()
+
+    overflow_x = torch.randn(5, 3)
+    overflow_probs = torch.randn(5, 1)
+    overflow_splits = torch.tensor([2, 3], dtype=torch.int64)
+    overflow_output = module(
+        overflow_x,
+        overflow_splits,
+        overflow_probs,
+        overflow_splits,
+        overflow_probs,
+    )
+    expected_overflow = entry.original_forward(
+        overflow_x,
+        overflow_splits,
+        overflow_probs,
+        overflow_splits,
+        overflow_probs,
+    )
+
+    empty_x = torch.empty(0, 3)
+    empty_probs = torch.empty(0, 1)
+    empty_splits = torch.tensor([0, 0], dtype=torch.int64)
+    empty_output = module(empty_x, empty_splits, empty_probs, empty_splits, empty_probs)
+
+    torch.testing.assert_close(overflow_output, expected_overflow)
+    assert overflow_output.shape[0] == 5
+    assert empty_output.shape == (0, 3)
+    assert manager.stats() == {"captured": 1, "replayed": 0, "fallback": 2}
+    bucket_stats = manager.expert_bucket_stats()
+    assert bucket_stats["overflow_fallback"] == 1
+    assert bucket_stats["empty_fallback"] == 1
+
+
+def test_iteration_zero_overflow_skips_expert_bucket_even_after_fitting_call(monkeypatch, caplog):
+    _install_fake_graph(monkeypatch)
+    model = _FSDPStyleGptOssWrapper(attention=False, expert_bucket_tokens=4)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+    assert manager is not None
+    module = model.model.layers["0"].mlp.experts._te_grouped_mlp
+
+    fitting_splits = torch.tensor([1, 1], dtype=torch.int64)
+    fitting_probs = torch.randn(2, 1)
+    module(torch.randn(2, 3), fitting_splits, fitting_probs, fitting_splits, fitting_probs)
+    overflow_splits = torch.tensor([2, 3], dtype=torch.int64)
+    overflow_probs = torch.randn(5, 1)
+    module(torch.randn(5, 3), overflow_splits, overflow_probs, overflow_splits, overflow_probs)
+
+    with caplog.at_level("WARNING"):
+        manager.capture()
+
+    assert "iteration 0 routed token count 5 exceeds expert bucket capacity 4" in caplog.text
+    assert manager.stats() == {"captured": 0, "replayed": 0, "fallback": 0}
+    assert manager.expert_bucket_stats()["capture_overflow_skip"] == 1
+    assert manager.expert_bucket_stats()["capture_empty_skip"] == 0
+
+
+def test_unobserved_iteration_zero_expert_bucket_is_counted_as_empty_skip(caplog):
+    model = _FSDPStyleGptOssWrapper(attention=False, expert_bucket_tokens=4)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+    assert manager is not None
+
+    with caplog.at_level("WARNING"):
+        manager.capture()
+
+    assert "received no iteration-0 expert tokens" in caplog.text
+    assert manager.stats() == {"captured": 0, "replayed": 0, "fallback": 0}
+    assert manager.expert_bucket_stats()["capture_empty_skip"] == 1
+
+
+def test_expert_bucket_skips_impossible_zero_local_expert_split_tensor(caplog):
+    model = _FSDPStyleGptOssWrapper(attention=False, expert_bucket_tokens=4)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+    assert manager is not None
+    module = model.model.layers["0"].mlp.experts._te_grouped_mlp
+
+    splits = torch.empty(0, dtype=torch.int64)
+    probs = torch.randn(2, 1)
+    module(torch.randn(2, 3), splits, probs, splits, probs)
+    with caplog.at_level("WARNING"):
+        manager.capture()
+
+    assert "expert split tensor has no local experts" in caplog.text
+    assert manager.stats() == {"captured": 0, "replayed": 0, "fallback": 0}
 
 
 def test_tensor_metadata_change_falls_back_eagerly(monkeypatch):

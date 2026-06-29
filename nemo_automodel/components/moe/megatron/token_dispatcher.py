@@ -335,6 +335,20 @@ class _HybridEPMetadataProcessor(nn.Module):
 
     def forward(self, token_indices: torch.Tensor, token_probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Convert top-k metadata to HybridEP's multihot representation."""
+        if token_indices.dtype == torch.bool:
+            expected_shape = (token_indices.shape[0], self.num_experts)
+            if token_indices.shape != expected_shape or token_probs.shape != expected_shape:
+                raise ValueError(
+                    "Dense HybridEP routing metadata must have shape "
+                    f"[num_tokens, {self.num_experts}], got map={tuple(token_indices.shape)} "
+                    f"and probs={tuple(token_probs.shape)}"
+                )
+            # TE's fused router already emits exactly the dense routing map and
+            # probabilities expected by HybridEP. Keep the autograd edge from
+            # probabilities to router logits and avoid converting metadata back
+            # through compact top-k indices.
+            return token_indices, token_probs
+
         if self.permute_fusion:
             return fused_indices_to_multihot(token_indices, token_probs, self.num_experts)
 

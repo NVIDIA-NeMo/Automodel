@@ -133,6 +133,7 @@ class TestBackendConfigPartialCudaGraphs:
         assert config.partial_cuda_graph_moe_router is False
         assert config.partial_cuda_graph_moe_preprocess is False
         assert config.partial_cuda_graph_experts is False
+        assert config.partial_cuda_graph_expert_bucket_tokens is None
         assert config.partial_cuda_graph_layer_limit == 0
 
     def test_enabled_scope_requires_positive_layer_limit(self):
@@ -182,6 +183,41 @@ class TestBackendConfigPartialCudaGraphs:
         )
         assert config.partial_cuda_graph_experts is True
 
+    def test_expert_bucket_accepts_fixed_local_capacity(self):
+        config = BackendConfig(
+            experts="te_ops",
+            dispatcher="hybridep",
+            partial_cuda_graph_experts=True,
+            partial_cuda_graph_expert_bucket_tokens=1024,
+            partial_cuda_graph_layer_limit=1,
+        )
+        assert config.partial_cuda_graph_expert_bucket_tokens == 1024
+
+    def test_expert_bucket_requires_expert_graph(self):
+        with pytest.raises(ValueError, match="requires partial_cuda_graph_experts=True"):
+            BackendConfig(partial_cuda_graph_expert_bucket_tokens=128)
+
+    @pytest.mark.parametrize("capacity", [0, -128, 1.5, True])
+    def test_expert_bucket_requires_positive_integer(self, capacity):
+        with pytest.raises(ValueError, match="must be a positive integer"):
+            BackendConfig(
+                experts="te_ops",
+                dispatcher="hybridep",
+                partial_cuda_graph_experts=True,
+                partial_cuda_graph_expert_bucket_tokens=capacity,
+                partial_cuda_graph_layer_limit=1,
+            )
+
+    def test_expert_bucket_requires_mxfp8_compatible_alignment(self):
+        with pytest.raises(ValueError, match="must be divisible by 128"):
+            BackendConfig(
+                experts="te_ops",
+                dispatcher="hybridep",
+                partial_cuda_graph_experts=True,
+                partial_cuda_graph_expert_bucket_tokens=130,
+                partial_cuda_graph_layer_limit=1,
+            )
+
     def test_moe_preprocess_scope_requires_router_scope(self):
         with pytest.raises(ValueError, match="requires partial_cuda_graph_moe_router=True"):
             BackendConfig(
@@ -216,6 +252,43 @@ class TestBackendConfigPartialCudaGraphs:
                 dispatcher="hybridep",
                 fake_balanced_gate=True,
                 partial_cuda_graph_moe_router=True,
+                partial_cuda_graph_layer_limit=1,
+            )
+
+
+class TestBackendConfigRouterFusion:
+    """TE router fusion is opt-in and uses HybridEP-native dense metadata."""
+
+    def test_default_disabled(self):
+        assert BackendConfig().moe_router_fusion is False
+
+    def test_accepts_learned_gate_with_hybridep(self):
+        config = BackendConfig(
+            dispatcher="hybridep",
+            fake_balanced_gate=False,
+            moe_router_fusion=True,
+        )
+        assert config.moe_router_fusion is True
+
+    def test_requires_hybridep(self):
+        with pytest.raises(ValueError, match="requires dispatcher='hybridep'"):
+            BackendConfig(dispatcher="deepep", moe_router_fusion=True)
+
+    def test_rejects_fake_balanced_gate(self):
+        with pytest.raises(ValueError, match="requires the learned Gate"):
+            BackendConfig(
+                dispatcher="hybridep",
+                fake_balanced_gate=True,
+                moe_router_fusion=True,
+            )
+
+    def test_rejects_redundant_preprocess_graph(self):
+        with pytest.raises(ValueError, match="already emits HybridEP preprocessing metadata"):
+            BackendConfig(
+                dispatcher="hybridep",
+                moe_router_fusion=True,
+                partial_cuda_graph_moe_router=True,
+                partial_cuda_graph_moe_preprocess=True,
                 partial_cuda_graph_layer_limit=1,
             )
 

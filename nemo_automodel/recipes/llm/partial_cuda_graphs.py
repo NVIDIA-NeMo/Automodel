@@ -16,9 +16,10 @@
 
 The convergence-safe dropless-MoE path mirrors Megatron-LM: graph attention,
 the fixed-shape router, and fixed-shape HybridEP preprocessing while keeping
-variable-size dispatch and expert compute eager. Direct expert graphs remain a
-benchmark experiment and fall back to eager whenever routed-token metadata
-changes from the captured sample.
+variable-size dispatch dynamic. Expert graphs can optionally use a fixed local
+compute bucket after dispatch: inputs are padded for Transformer Engine, outputs
+are sliced back to the exact routed-token count before HybridEP combine, and
+overflow calls stay eager without dropping or retrying tokens.
 """
 
 from __future__ import annotations
@@ -203,18 +204,27 @@ class _PartialGraphEntry:
         target: nn.Module,
         fp8_enabled: bool,
         canonicalizer: _Canonicalizer | None = None,
+        expert_bucket_tokens: int | None = None,
     ):
         self.name = name
         self.target = target
         self.fp8_enabled = fp8_enabled
         self.canonicalizer = canonicalizer
+        self.expert_bucket_tokens = expert_bucket_tokens
         self.original_forward = target.forward
         self.captured_call: _CapturedCall | None = None
         self.adapter: _TensorOnlyCallAdapter | None = None
         self.capture_count = 0
         self.replay_count = 0
         self.fallback_count = 0
+        self.bucketed_replay_count = 0
+        self.bucket_padding_tokens = 0
+        self.bucket_overflow_fallback_count = 0
+        self.bucket_empty_fallback_count = 0
+        self.bucket_capture_overflow_skip_count = 0
+        self.bucket_capture_empty_skip_count = 0
         self._record_hook: Any = None
+        self._capture_skip_reason: str | None = None
         self._captured_training: bool | None = None
         self._parameter_signature: tuple[tuple[Any, ...], ...] = ()
         self._logged_replay = False
@@ -225,14 +235,76 @@ class _PartialGraphEntry:
             return args, kwargs
         return self.canonicalizer(args, kwargs)
 
+    def _apply_expert_bucket(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> tuple[tuple[Any, ...], dict[str, Any], int | None, str]:
+        """Pad one post-dispatch expert call to its fixed compute capacity."""
+        capacity = self.expert_bucket_tokens
+        if capacity is None:
+            return args, kwargs, None, ""
+
+        hidden_states, split_sizes, probs, _, _ = args
+        token_count = hidden_states.shape[0]
+        if token_count == 0:
+            return args, kwargs, token_count, "routed token count is zero"
+        if split_sizes.numel() == 0:
+            return args, kwargs, token_count, "expert split tensor has no local experts"
+        if token_count > capacity:
+            return (
+                args,
+                kwargs,
+                token_count,
+                f"routed token count {token_count} exceeds expert bucket capacity {capacity}",
+            )
+
+        padding = capacity - token_count
+        if padding == 0:
+            return args, kwargs, token_count, ""
+
+        hidden_padding = hidden_states.new_zeros((padding, *hidden_states.shape[1:]))
+        probs_padding = probs.new_zeros((padding, *probs.shape[1:]))
+        padded_hidden_states = torch.cat((hidden_states, hidden_padding), dim=0)
+        padded_probs = torch.cat((probs, probs_padding), dim=0)
+        # TE's graph-safe GroupedTensor and fused grouped-MLP paths explicitly
+        # support paged-stash buffers where physical B > sum(split_sizes). The
+        # tail is unused capacity, so keep the real per-expert sizes unchanged;
+        # assigning the tail to an expert would change the routing metadata and
+        # force that expert to compute the padding. numel()/shape checks above
+        # inspect tensor metadata only and do not synchronize with the device.
+        return (
+            (padded_hidden_states, split_sizes, padded_probs, split_sizes, padded_probs),
+            kwargs,
+            token_count,
+            "",
+        )
+
     def start_recording(self) -> None:
         """Record the first eager call through a temporary pre-hook."""
 
         def record_call(_module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
-            if self.captured_call is not None:
+            if self._capture_skip_reason is not None:
+                return
+            if self.captured_call is not None and self.expert_bucket_tokens is None:
                 return
             canonical_args, canonical_kwargs = self._canonicalize(args, kwargs)
-            self.captured_call = _CapturedCall.from_call(canonical_args, canonical_kwargs)
+            canonical_args, canonical_kwargs, bucket_token_count, bucket_reason = self._apply_expert_bucket(
+                canonical_args,
+                canonical_kwargs,
+            )
+            if bucket_reason:
+                self.captured_call = None
+                self._capture_skip_reason = f"iteration 0 {bucket_reason}"
+                if self.expert_bucket_tokens is not None:
+                    if bucket_token_count:
+                        if bucket_token_count > self.expert_bucket_tokens:
+                            self.bucket_capture_overflow_skip_count = 1
+                    else:
+                        self.bucket_capture_empty_skip_count = 1
+                return
+            if self.captured_call is None:
+                self.captured_call = _CapturedCall.from_call(canonical_args, canonical_kwargs)
 
         self._record_hook = self.target.register_forward_pre_hook(record_call, with_kwargs=True)
 
@@ -279,10 +351,18 @@ class _PartialGraphEntry:
         self._parameter_signature = tuple(state for state in parameter_signature if state is not None)
 
         def dispatch(*args: Any, **kwargs: Any) -> Any:
+            bucket_token_count: int | None = None
             try:
                 canonical_args, canonical_kwargs = self._canonicalize(args, kwargs)
-                assert self.captured_call is not None
-                valid, reason, tensors = self.captured_call.validate(canonical_args, canonical_kwargs)
+                canonical_args, canonical_kwargs, bucket_token_count, reason = self._apply_expert_bucket(
+                    canonical_args,
+                    canonical_kwargs,
+                )
+                if reason:
+                    valid, tensors = False, ()
+                else:
+                    assert self.captured_call is not None
+                    valid, reason, tensors = self.captured_call.validate(canonical_args, canonical_kwargs)
             except Exception as error:  # a changed dynamic call must stay correct via eager fallback
                 valid, reason, tensors = False, f"call canonicalization failed: {error}", ()
 
@@ -293,19 +373,38 @@ class _PartialGraphEntry:
 
             if valid:
                 self.replay_count += 1
+                if bucket_token_count is not None:
+                    self.bucketed_replay_count += 1
+                    assert self.expert_bucket_tokens is not None
+                    self.bucket_padding_tokens += self.expert_bucket_tokens - bucket_token_count
                 if not self._logged_replay:
                     logger.info("Partial CUDA graph replay active for %s", self.name)
                     self._logged_replay = True
                 assert self.adapter is not None
-                return self.adapter(*tensors)
+                output = self.adapter(*tensors)
+                if bucket_token_count is not None:
+                    if not isinstance(output, torch.Tensor):
+                        raise RuntimeError("Partial expert CUDA graph bucket expects one tensor output")
+                    output = output.narrow(0, 0, bucket_token_count)
+                return output
 
             self.fallback_count += 1
+            if self.expert_bucket_tokens is not None and bucket_token_count is not None:
+                if bucket_token_count == 0:
+                    self.bucket_empty_fallback_count += 1
+                elif bucket_token_count > self.expert_bucket_tokens:
+                    self.bucket_overflow_fallback_count += 1
             if not self._logged_fallback:
                 logger.warning("Partial CUDA graph eager fallback for %s: %s", self.name, reason)
                 self._logged_fallback = True
             return self.original_forward(*args, **kwargs)
 
         self.target.forward = dispatch
+
+    def mark_unobserved_expert_bucket(self) -> None:
+        """Record that iteration 0 never reached this bucketed expert target."""
+        if self.expert_bucket_tokens is not None and self._capture_skip_reason is None:
+            self.bucket_capture_empty_skip_count = 1
 
 
 def _canonicalize_bf16_fused_attention(
@@ -481,6 +580,11 @@ class PartialCudaGraphManager:
                         target=target,
                         fp8_enabled=backend.te_fp8 is not None,
                         canonicalizer=_canonicalize_te_ops_experts,
+                        expert_bucket_tokens=getattr(
+                            backend,
+                            "partial_cuda_graph_expert_bucket_tokens",
+                            None,
+                        ),
                     )
                 )
 
@@ -514,11 +618,19 @@ class PartialCudaGraphManager:
                 f"missing samples for {unexpected_skips}"
             )
         for entry in skipped_entries:
-            logger.warning(
-                "Skipping partial CUDA graph capture for %s because it received no iteration-0 expert tokens; "
-                "the target will remain eager",
-                entry.name,
-            )
+            entry.mark_unobserved_expert_bucket()
+            if entry._capture_skip_reason is not None:
+                logger.warning(
+                    "Skipping partial CUDA graph capture for %s because %s; the target will remain eager",
+                    entry.name,
+                    entry._capture_skip_reason,
+                )
+            else:
+                logger.warning(
+                    "Skipping partial CUDA graph capture for %s because it received no iteration-0 expert tokens; "
+                    "the target will remain eager",
+                    entry.name,
+                )
 
         captured_entries = tuple(entry for entry in self.entries if entry.captured_call is not None)
         if not captured_entries:
@@ -575,6 +687,20 @@ class PartialCudaGraphManager:
             "fallback": sum(entry.fallback_count for entry in self.entries),
         }
 
+    def expert_bucket_stats(self) -> dict[str, int]:
+        """Return counters specific to fixed-capacity post-dispatch expert graphs."""
+        bucket_entries = tuple(entry for entry in self.entries if entry.expert_bucket_tokens is not None)
+        return {
+            "entries": len(bucket_entries),
+            "capacity_tokens": sum(entry.expert_bucket_tokens or 0 for entry in bucket_entries),
+            "bucketed_replay": sum(entry.bucketed_replay_count for entry in bucket_entries),
+            "padding_tokens": sum(entry.bucket_padding_tokens for entry in bucket_entries),
+            "overflow_fallback": sum(entry.bucket_overflow_fallback_count for entry in bucket_entries),
+            "empty_fallback": sum(entry.bucket_empty_fallback_count for entry in bucket_entries),
+            "capture_overflow_skip": sum(entry.bucket_capture_overflow_skip_count for entry in bucket_entries),
+            "capture_empty_skip": sum(entry.bucket_capture_empty_skip_count for entry in bucket_entries),
+        }
+
     def log_stats(self, phase: str) -> None:
         """Log visible aggregate graph activity counters."""
         stats = self.stats()
@@ -585,6 +711,22 @@ class PartialCudaGraphManager:
             stats["replayed"],
             stats["fallback"],
         )
+        bucket_stats = self.expert_bucket_stats()
+        if bucket_stats["entries"]:
+            logger.info(
+                "Partial expert bucket stats (%s): entries=%d capacity_tokens=%d bucketed_replay=%d "
+                "padding_tokens=%d overflow_fallback=%d empty_fallback=%d capture_overflow_skip=%d "
+                "capture_empty_skip=%d",
+                phase,
+                bucket_stats["entries"],
+                bucket_stats["capacity_tokens"],
+                bucket_stats["bucketed_replay"],
+                bucket_stats["padding_tokens"],
+                bucket_stats["overflow_fallback"],
+                bucket_stats["empty_fallback"],
+                bucket_stats["capture_overflow_skip"],
+                bucket_stats["capture_empty_skip"],
+            )
         for entry in self.entries:
             logger.info(
                 "Partial CUDA graph entry stats (%s): name=%s captured=%d replayed=%d fallback=%d",

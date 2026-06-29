@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from contextlib import ExitStack
 from unittest.mock import patch
 
@@ -22,7 +23,8 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gpt_oss.model import Block, GptOssForCausalLM, GptOssModel
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.moe.layers import MLP, Gate, MoE
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
 
 @pytest.fixture
@@ -379,6 +381,61 @@ class TestGptOssModel:
             assert not torch.equal(model.embed_tokens.weight, original_embed_weight)
             # Verify device was set on rotary embedding
             assert model.rotary_emb.device == device
+
+
+def _resolve_default_moe_config(gpt_config, backend_config, *, moe_overrides=None) -> MoEConfig:
+    """Build only GPT-OSS configuration plumbing without allocating CUDA state."""
+    gpt_config.num_hidden_layers = 0
+    gpt_config.layer_types = []
+    gpt_config.torch_dtype = torch.float32
+    with (
+        patch("nemo_automodel.components.models.gpt_oss.model.torch.cuda.current_device", return_value=0),
+        patch("nemo_automodel.components.models.gpt_oss.model.RotaryEmbedding"),
+    ):
+        return GptOssModel(gpt_config, backend_config, moe_overrides=moe_overrides).moe_config
+
+
+def test_router_aux_loss_default_is_preserved_and_explicit_override_disables_it(gpt_config, backend_config):
+    """Preserve AutoModel's objective while allowing benchmarks to disable its aux loss."""
+    gpt_config.router_aux_loss_coef = 0.9
+    gpt_config.output_router_logits = False
+    default_moe_config = _resolve_default_moe_config(gpt_config, backend_config)
+    disabled_moe_config = _resolve_default_moe_config(
+        copy.deepcopy(gpt_config),
+        backend_config,
+        moe_overrides={"aux_loss_coeff": 0.0},
+    )
+
+    assert default_moe_config.aux_loss_coeff == pytest.approx(0.9)
+    assert disabled_moe_config.aux_loss_coeff == 0.0
+
+    torch.manual_seed(1234)
+    default_gate = Gate(default_moe_config)
+    disabled_gate = Gate(disabled_moe_config)
+    with torch.no_grad():
+        default_gate.weight.normal_(mean=0.0, std=0.02)
+        default_gate.bias.zero_()
+    disabled_gate.load_state_dict(copy.deepcopy(default_gate.state_dict()))
+    hidden_states = torch.randn(32, default_moe_config.dim)
+    token_mask = torch.ones(32, dtype=torch.bool)
+
+    previous_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
+    MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(1.0)
+    try:
+        default_weights, _, default_aux = default_gate(hidden_states, token_mask, cp_mesh=None)
+        disabled_weights, _, disabled_aux = disabled_gate(hidden_states, token_mask, cp_mesh=None)
+        assert default_aux is not None
+        assert disabled_aux is None
+
+        # A zero main objective isolates the gradient injected by the auxiliary
+        # loss autograd edge.
+        (default_weights.sum() * 0.0).backward()
+        (disabled_weights.sum() * 0.0).backward()
+    finally:
+        MoEAuxLossAutoScaler.main_loss_backward_scale = previous_scale
+
+    assert torch.count_nonzero(default_gate.weight.grad) > 0
+    assert torch.count_nonzero(disabled_gate.weight.grad) == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

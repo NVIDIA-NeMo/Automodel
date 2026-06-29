@@ -166,6 +166,7 @@ def _make_manager(
     *,
     expert_fp8_enabled: bool = False,
     fp8_recipe=None,
+    expert_bucket_tokens: int | None = None,
 ) -> partial_graphs.PartialCudaGraphManager:
     attention_entry = partial_graphs._PartialGraphEntry(
         name="test.attention",
@@ -178,6 +179,7 @@ def _make_manager(
         target=model.expert,
         fp8_enabled=expert_fp8_enabled,
         canonicalizer=partial_graphs._canonicalize_te_ops_experts,
+        expert_bucket_tokens=expert_bucket_tokens,
     )
     manager = partial_graphs.PartialCudaGraphManager([attention_entry, expert_entry], fp8_recipe=fp8_recipe)
     manager.start_recording()
@@ -796,7 +798,7 @@ def test_te_ops_multistep_ga_optimizer_state_parity_with_changed_split_contents(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA and Transformer Engine are required")
-def test_te_ops_non_reentrant_checkpoint_recompute_and_changed_total_fallback():
+def test_te_ops_bf16_bucket_replays_changed_total_under_non_reentrant_checkpoint():
     pytest.importorskip("transformer_engine")
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     graph_expert = _make_te_expert(device)
@@ -816,7 +818,7 @@ def test_te_ops_non_reentrant_checkpoint_recompute_and_changed_total_fallback():
         expert=reference_expert,
     )
     reference_model.router_gain.data.copy_(graph_model.router_gain.data)
-    manager = _make_manager(graph_model)
+    manager = _make_manager(graph_model, expert_bucket_tokens=128)
     graph_optimizer = torch.optim.AdamW(graph_model.parameters(), lr=0.002)
     reference_optimizer = torch.optim.AdamW(reference_model.parameters(), lr=0.002)
     graph_losses, reference_losses = _run_checkpointed_optimizer_steps(
@@ -843,9 +845,12 @@ def test_te_ops_non_reentrant_checkpoint_recompute_and_changed_total_fallback():
     assert graph_model.checkpoint_phases.count("forward") == 8
     assert graph_model.checkpoint_phases.count("recompute") == 8
     assert manager.entries[0].replay_count == 12
-    assert manager.entries[1].replay_count == 10
-    assert manager.entries[1].fallback_count == 2
-    assert manager.stats() == {"captured": 2, "replayed": 22, "fallback": 2}
+    assert manager.entries[1].replay_count == 12
+    assert manager.entries[1].fallback_count == 0
+    assert manager.stats() == {"captured": 2, "replayed": 24, "fallback": 0}
+    bucket_stats = manager.expert_bucket_stats()
+    assert bucket_stats["bucketed_replay"] == 12
+    assert bucket_stats["padding_tokens"] > 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Blackwell and Transformer Engine are required")
@@ -883,6 +888,7 @@ def test_te_ops_mxfp8_non_reentrant_checkpoint_keeps_attention_bf16():
         graph_model,
         expert_fp8_enabled=True,
         fp8_recipe=recipe,
+        expert_bucket_tokens=1024,
     )
     assert manager.entries[0].fp8_enabled is False
     assert manager.entries[1].fp8_enabled is True
@@ -917,6 +923,9 @@ def test_te_ops_mxfp8_non_reentrant_checkpoint_keeps_attention_bf16():
     assert graph_model.checkpoint_phases.count("forward") == 6
     assert graph_model.checkpoint_phases.count("recompute") == 6
     assert manager.entries[0].replay_count == 8
-    assert manager.entries[1].replay_count == 6
-    assert manager.entries[1].fallback_count == 2
-    assert manager.stats() == {"captured": 2, "replayed": 14, "fallback": 2}
+    assert manager.entries[1].replay_count == 8
+    assert manager.entries[1].fallback_count == 0
+    assert manager.stats() == {"captured": 2, "replayed": 16, "fallback": 0}
+    bucket_stats = manager.expert_bucket_stats()
+    assert bucket_stats["bucketed_replay"] == 8
+    assert bucket_stats["padding_tokens"] > 0
