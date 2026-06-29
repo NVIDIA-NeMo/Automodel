@@ -46,15 +46,15 @@ class Fp32SafeQwen3VLMoeTextRotaryEmbedding(Qwen3VLMoeTextRotaryEmbedding):
     """Ensure inv_freq stays in float32"""
 
     def _apply(self, fn: Any, recurse: bool = True):
-        # Keep an fp32 copy before super mutates the registered buffer
-        inv_freq_fp32 = self.inv_freq.detach().clone().to(torch.float32)
+        fp32_buffers = {
+            name: buf.detach().clone().to(torch.float32)
+            for name, buf in self.named_buffers(recurse=False)
+            if name in ("inv_freq", "original_inv_freq")
+        }
         result = super()._apply(fn, recurse=recurse)
-        # Restore dtype while honoring the new device placement
-        self.register_buffer(
-            "inv_freq",
-            inv_freq_fp32.to(device=self.inv_freq.device),
-            persistent=False,
-        )
+        for name, fp32_buffer in fp32_buffers.items():
+            current = getattr(self, name)
+            self.register_buffer(name, fp32_buffer.to(device=current.device), persistent=False)
         return result
 
 
@@ -62,13 +62,15 @@ class Fp32SafeQwen3VLMoeVisionRotaryEmbedding(Qwen3VLMoeVisionRotaryEmbedding):
     """Ensure the vision rotary inv_freq buffer remains float32."""
 
     def _apply(self, fn: Any, recurse: bool = True):
-        inv_freq_fp32 = self.inv_freq.detach().clone().to(torch.float32)
+        fp32_buffers = {
+            name: buf.detach().clone().to(torch.float32)
+            for name, buf in self.named_buffers(recurse=False)
+            if name in ("inv_freq", "original_inv_freq")
+        }
         result = super()._apply(fn, recurse=recurse)
-        self.register_buffer(
-            "inv_freq",
-            inv_freq_fp32.to(device=self.inv_freq.device),
-            persistent=False,
-        )
+        for name, fp32_buffer in fp32_buffers.items():
+            current = getattr(self, name)
+            self.register_buffer(name, fp32_buffer.to(device=current.device), persistent=False)
         return result
 
 

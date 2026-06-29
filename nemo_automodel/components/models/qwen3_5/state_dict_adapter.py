@@ -30,7 +30,10 @@ import re
 from typing import Any, Optional
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
-from nemo_automodel.components.models.common.gated_delta_net_fp32 import upcast_gated_delta_net_fp32_state_tensor
+from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
+    forced_gated_delta_net_fp32_dtype_mapping,
+    upcast_gated_delta_net_fp32_state_tensor,
+)
 
 _FP32_PARAMS_TO_BARE = re.compile(r"(\.linear_attn)\._fp32_params\.")
 # Both SSM-gating params live in the fp32 ``SSMGate`` holder; route both on load.
@@ -98,6 +101,10 @@ class Qwen3_5DenseStateDictAdapter(StateDictAdapter):
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
         hf_key = map_qwen3_5_mtp_to_hf_key(_strip_fp32_prefix(fqn))
         return [(hf_key, upcast_gated_delta_net_fp32_state_tensor(hf_key, tensor))]
+
+    def forced_hf_dtype_mapping(self, state_dict: dict[str, Any]) -> dict[str, str]:
+        """Return HF export dtype overrides for intrinsically-fp32 GDN tensors."""
+        return forced_gated_delta_net_fp32_dtype_mapping(state_dict)
 
     def _map_from_hf_key(self, key: str) -> str:
         key = map_qwen3_5_mtp_from_hf_key(key)

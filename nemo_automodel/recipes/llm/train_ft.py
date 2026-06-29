@@ -595,10 +595,8 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             val_ds_name = "default"
         return val_ds_name
 
-    # Pack the validation set the same way as training when the attention backend
-    # consumes a THD/cu_seqlens layout. Besides TE, the magi backend also packs (and,
-    # at cp>1, shards) THD sequences; leaving validation unpacked would feed magi tiny
-    # per-example sequences that cp-sharding splits degenerately, inflating val loss.
+    # Pack validation when it explicitly consumes THD/cu_seqlens metadata, or
+    # when a backend/model requires validation to follow training's THD layout.
     _magi_backend = (
         str(cfg.get("model.backend.attn", "")) == "magi" or str(cfg.get("model.attn_implementation", "")) == "magi"
     )
@@ -607,9 +605,13 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
         and callable(getattr(model, "should_pack_validation_with_training", None))
         and model.should_pack_validation_with_training()
     )
-    _pack_val = (
-        _uses_te_dot_product_attention(cfg.model) or _magi_backend or _model_packs_validation
-    ) and _uses_thd_collater(cfg.dataloader)
+    _backend_packs_validation = _uses_te_dot_product_attention(cfg.model) or _magi_backend or _model_packs_validation
+    cfg_validation_dataloader = cfg.get("validation_dataloader", None)
+    _validation_uses_thd = _uses_thd_collater(cfg_validation_dataloader)
+    _training_uses_thd = _uses_thd_collater(cfg.get("dataloader", None))
+    _pack_val = cfg.get("packed_sequence.packed_sequence_size", 0) > 0 and (
+        _validation_uses_thd or (_backend_packs_validation and _training_uses_thd)
+    )
 
     # Build validation dataloader if the config provides it
     val_dataloaders = {}
@@ -618,7 +620,7 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
         val_ds_name = _prepare_val_ds_name(val_ds_name)
         val_dataloaders[val_ds_name] = build_dataloader(
             val_ds_cfg,
-            cfg.validation_dataloader,
+            cfg_validation_dataloader,
             cfg.model,
             cfg_ps=cfg.get("packed_sequence", None) if _pack_val else None,
             seed=cfg.get("seed", 42),
@@ -1616,7 +1618,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             return
 
         if wandb.run is not None:
-            wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+            if val_name == "default":
+                wandb.log(log_data.metrics, step=log_data.step)
+            else:
+                metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
+                wandb.log(metrics, step=log_data.step)
 
         if mlflow.active_run() is not None:
             mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
