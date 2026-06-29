@@ -96,7 +96,12 @@ def create_dflash_sdpa_mask(
     noise_visible = is_noise & (q_block == kv_block)
 
     keep = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
-    bool_mask = (ctx_visible | noise_visible) & keep
+    # A padding block (``keep`` False) keeps only its in-block (noise) attention,
+    # so its query rows are never fully masked. A fully-masked row makes the dense
+    # softmax (the sdpa/eager backends) return NaN, which then contaminates the
+    # rest of the sample through the next layer's ``0 * NaN`` value aggregation.
+    # The block's output is discarded downstream by the loss block mask anyway.
+    bool_mask = (ctx_visible & keep) | noise_visible
 
     neg_inf = torch.tensor(float("-inf"), device=device, dtype=dtype)
     zero = torch.tensor(0.0, device=device, dtype=dtype)
@@ -151,7 +156,10 @@ def create_dflash_block_mask(
 
         keep = block_keep_mask[b, safe_q_block]
         in_bounds = q_block < N
-        return (ctx_visible | noise_visible) & keep & in_bounds
+        # Padding blocks keep in-block attention so no query row is fully masked
+        # (see create_dflash_sdpa_mask; kept consistent across backends, and the
+        # output is dropped by the loss block mask anyway).
+        return ((ctx_visible & keep) | noise_visible) & in_bounds
 
     # ``BLOCK_SIZE`` is left at the default (128). It MUST be a multiple of the
     # underlying flex_attention kernel's BLOCK_M / BLOCK_N (128 on H100); setting
