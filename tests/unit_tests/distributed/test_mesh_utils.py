@@ -21,8 +21,9 @@ import pytest
 import torch
 
 import nemo_automodel.components.distributed.mesh_utils as mesh_utils
-from nemo_automodel.components.distributed.mesh import MeshAxisName
+from nemo_automodel.components.distributed.mesh import MeshAxisName, ParallelismSizes
 from nemo_automodel.components.distributed.mesh_utils import (
+    _create_fsdp2_device_mesh,
     _create_moe_mesh,
     _init_named_mesh,
     _MeshSpec,
@@ -112,6 +113,43 @@ def test_flattened_axes_inherit_nccl_timeout():
     assert backend == "nccl"
     assert options._timeout == datetime.timedelta(minutes=30)
     assert device_mesh._flatten_mapping[MeshAxisName.DP_CP] is flattened_mesh
+
+
+def test_flattened_axes_omit_nccl_timeout_when_unconfigured():
+    source_mesh = Mock()
+    device_mesh = Mock()
+    device_mesh.device_type = "cuda"
+    device_mesh._flatten_mapping = {}
+    device_mesh.__getitem__ = Mock(return_value=source_mesh)
+
+    _register_flattened_axes(
+        device_mesh,
+        {MeshAxisName.DP_CP: (MeshAxisName.DP_SHARD, MeshAxisName.CP)},
+    )
+
+    assert source_mesh._flatten.call_args.kwargs["backend_override"] is None
+
+
+def test_fsdp2_forwards_nccl_timeout_to_moe_mesh(monkeypatch):
+    device_mesh = Mock()
+    moe_mesh = Mock()
+    monkeypatch.setattr(mesh_utils, "_init_named_mesh", Mock(return_value=device_mesh))
+    create_moe_mesh = Mock(return_value=moe_mesh)
+    monkeypatch.setattr(mesh_utils, "_create_moe_mesh", create_moe_mesh)
+
+    result = _create_fsdp2_device_mesh(
+        ParallelismSizes(dp_size=8, ep_size=2),
+        world_size=8,
+        timeout_minutes=30,
+    )
+
+    assert result == (device_mesh, moe_mesh)
+    create_moe_mesh.assert_called_once_with(
+        device_mesh,
+        ep_shard_size=4,
+        ep_size=2,
+        timeout_minutes=30,
+    )
 
 
 def test_moe_ep_groups_inherit_nccl_timeout():
@@ -324,6 +362,23 @@ class TestUnflattenCompat:
         for backend, options in backend_override.values():
             assert backend == "nccl"
             assert options._timeout == datetime.timedelta(minutes=30)
+        assert result is expected
+
+    def test_native_unflatten_omits_backend_override_for_cpu(self):
+        expected = Mock()
+        flat_mesh = Mock()
+        flat_mesh.device_type = "cpu"
+        flat_mesh._unflatten = Mock(return_value=expected)
+
+        result = _unflatten_compat(
+            flat_mesh,
+            0,
+            (4, 32),
+            ("ep_shard", "ep"),
+            timeout_minutes=30,
+        )
+
+        flat_mesh._unflatten.assert_called_once_with(0, (4, 32), ("ep_shard", "ep"))
         assert result is expected
 
     def test_fallback_when_unflatten_missing(self):
