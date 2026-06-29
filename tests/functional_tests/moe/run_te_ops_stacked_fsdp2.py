@@ -27,7 +27,8 @@ isolates the stacked-parameter/FSDP contract from DeepEP or HybridEP communicati
 * TE-ops projections register ordinary stacked ``nn.Parameter`` owners on meta;
 * AutoModel's production meta materializer and initializer preserve owner identity;
 * FSDP shards TE-layout weights on dim 2 and biases on dim 1;
-* three BF16 forward/backward/optimizer steps use different per-expert token splits;
+* three activation-checkpointed BF16 forward/backward/optimizer steps use different
+  per-expert token splits in both the original forward and recomputation;
 * ``reshard_after_forward=True`` repeatedly invalidates and rebuilds runtime views;
 * canonical expert state keys survive a distributed-checkpoint round trip.
 """
@@ -43,6 +44,9 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper as ptd_checkpoint_wrapper,
+)
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy
@@ -130,6 +134,23 @@ class _LocalPermutationDispatcher:
             device=hidden_states.device,
         )
         return output.index_add(0, self._token_ids, hidden_states)
+
+
+class _ExpertsBlock(nn.Module):
+    """Put the experts behind the same non-reentrant AC boundary used in production."""
+
+    def __init__(self, experts: GroupedExpertsTeOps) -> None:
+        super().__init__()
+        self.experts = experts
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.experts(hidden_states, token_mask, weights, indices)
 
 
 def _moe_config() -> MoEConfig:
@@ -289,6 +310,15 @@ def main() -> None:
     _assert_plain_stacked_owners(experts)
     _assert_canonical_state(experts.state_dict())
 
+    # Production wires the full MoE mesh in init_token_dispatcher before FSDP.
+    # The canonical state adapter needs it to reconstruct global DTensor metadata
+    # from the input-dimension shards exposed by FSDP outside an unshard window.
+    experts.set_moe_mesh(moe_mesh)
+    checkpointed_block = ptd_checkpoint_wrapper(
+        _ExpertsBlock(experts),
+        preserve_rng_state=True,
+    )
+
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
         reduce_dtype=torch.float32,
@@ -359,7 +389,7 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         hidden_states = _input(rank, step, device).requires_grad_(True)
         indices, weights = _routes(rank, step, device)
-        output = experts(hidden_states, token_mask, weights, indices)
+        output = checkpointed_block(hidden_states, token_mask, weights, indices)
         assert output.shape == hidden_states.shape
         assert torch.isfinite(output).all()
         # reshard_after_forward=True must restore every persistent owner to its
@@ -383,7 +413,9 @@ def main() -> None:
         optimizer.step()
 
     assert len(set(observed_splits)) == STEPS, f"expert splits did not vary: {observed_splits}"
-    assert alias_checks[0] == STEPS
+    # One call in the original forward and one in non-reentrant checkpoint
+    # recomputation during backward for every optimizer step.
+    assert alias_checks[0] == 2 * STEPS
     all_splits: list[list[tuple[int, ...]] | None] = [None for _ in range(world_size)]
     dist.all_gather_object(all_splits, observed_splits)
     assert len({split for rank_splits in all_splits for split in rank_splits}) >= STEPS
@@ -406,7 +438,7 @@ def main() -> None:
     if rank == 0:
         print(
             "PASS: GroupedExpertsTeOps plain stacked owners + FSDP2 ep_shard=2 + "
-            "dynamic splits + optimizer + DCP roundtrip",
+            "activation checkpointing + dynamic splits + optimizer + DCP roundtrip",
             flush=True,
         )
     dist.barrier()
