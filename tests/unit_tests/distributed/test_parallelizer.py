@@ -1529,6 +1529,48 @@ class TestActivationCheckpointingKVSharing:
             assert isinstance(layer.attention_norm, self._Wrapped)
             assert isinstance(layer.ffn_norm, self._Wrapped)
 
+    def test_qwen_clip_style_vision_child_names_are_wrapped(self):
+        """Qwen/SigLIP/CLIP-style vision blocks use ``attn`` or layer/norm pairs."""
+
+        class _QwenStyleLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = nn.Linear(16, 16)
+                self.mlp = nn.Linear(16, 16)
+                self.norm1 = nn.Linear(16, 16)
+                self.norm2 = nn.Linear(16, 16)
+
+            def forward(self, x):
+                return x
+
+        class _ClipStyleLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = nn.Linear(16, 16)
+                self.mlp = nn.Linear(16, 16)
+                self.layer_norm1 = nn.Linear(16, 16)
+                self.layer_norm2 = nn.Linear(16, 16)
+
+            def forward(self, x):
+                return x
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.model.layers = nn.ModuleList([_QwenStyleLayer(), _ClipStyleLayer()])
+
+        self._run_parallelize(model)
+
+        qwen_layer = model.model.layers[0]
+        assert isinstance(qwen_layer.attn, self._Wrapped)
+        assert isinstance(qwen_layer.mlp, self._Wrapped)
+        assert isinstance(qwen_layer.norm1, self._Wrapped)
+        assert isinstance(qwen_layer.norm2, self._Wrapped)
+
+        clip_layer = model.model.layers[1]
+        assert isinstance(clip_layer.self_attn, self._Wrapped)
+        assert isinstance(clip_layer.mlp, self._Wrapped)
+        assert isinstance(clip_layer.layer_norm1, self._Wrapped)
+        assert isinstance(clip_layer.layer_norm2, self._Wrapped)
+
     def test_activation_checkpointing_scope_language_only(self):
         """``language`` scope leaves extracted vision layers unwrapped."""
 

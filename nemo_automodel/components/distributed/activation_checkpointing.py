@@ -282,7 +282,7 @@ def _wrap_first_existing_attr(module: nn.Module, attr_names: tuple[str, ...], *,
         return 0
     for attr in attr_names:
         child = getattr(module, attr, None)
-        if child is not None:
+        if isinstance(child, nn.Module):
             setattr(module, attr, checkpoint_wrapper(child))
             return 1
     return 0
@@ -311,16 +311,19 @@ def apply_submodule_checkpointing(layers: List[nn.Module], has_kv_sharing: bool)
         "mot": 0,
     }
     for layer in layers:
-        wrapped_counts["mlp"] += _wrap_first_existing_attr(layer, ("mlp", "feed_forward"))
+        wrapped_counts["mlp"] += _wrap_first_existing_attr(layer, ("mlp", "feed_forward", "ffn"))
         wrapped_counts["attention"] += _wrap_first_existing_attr(
             layer,
-            ("self_attn", "attention"),
+            ("self_attn", "attention", "attn"),
             skip=has_kv_sharing,
         )
-        wrapped_counts["pre_norm"] += _wrap_first_existing_attr(layer, ("input_layernorm", "attention_norm"))
+        wrapped_counts["pre_norm"] += _wrap_first_existing_attr(
+            layer,
+            ("input_layernorm", "attention_norm", "layer_norm1", "norm1"),
+        )
         wrapped_counts["post_norm"] += _wrap_first_existing_attr(
             layer,
-            ("post_attention_layernorm", "ffn_norm"),
+            ("post_attention_layernorm", "ffn_norm", "layer_norm2", "norm2"),
         )
 
         # MoT (mixture-of-transformers) sibling submodules -- present in BAGEL's

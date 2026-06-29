@@ -386,7 +386,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 # (and other trainable) weight gradients.  Wrapping must happen BEFORE FSDP2
                 # sharding so the module structure is stable when fully_shard() indexes params.
                 for layer in ac_layers:
-                    for attr in ("self_attn", "attention", "mlp", "feed_forward"):
+                    for attr in ("self_attn", "attention", "attn", "mlp", "feed_forward", "ffn"):
                         m = getattr(layer, attr, None)
                         if m is not None:
                             setattr(layer, attr, checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
