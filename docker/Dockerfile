@@ -172,7 +172,7 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     pip install nvidia-mathdx==25.1.1 "nvidia-cudnn-frontend[cutedsl]==1.23.0" && \
     env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v . && \
     cd ../ && rm -rf TransformerEngine && \
-    python -c "from importlib.metadata import version; from packaging.version import Version; import transformer_engine.pytorch; assert Version(version('transformer-engine')).base_version == '2.16.1'; assert Version(version('nvidia-cudnn-frontend')) >= Version('1.23'); from cudnn import grouped_gemm_dglu_wrapper_sm100, grouped_gemm_glu_wrapper_sm100, grouped_gemm_quant_wrapper_sm100, grouped_gemm_wgrad_wrapper_sm100"; \
+    python -c "import ctypes.util; from importlib.metadata import version; from packaging.version import Version; import transformer_engine.pytorch; assert Version(version('transformer-engine')).base_version == '2.16.1'; assert Version(version('nvidia-cudnn-frontend')) >= Version('1.23'); names = ('grouped_gemm_dglu_wrapper_sm100', 'grouped_gemm_glu_wrapper_sm100', 'grouped_gemm_quant_wrapper_sm100', 'grouped_gemm_wgrad_wrapper_sm100'); cudnn = __import__('cudnn', fromlist=names) if ctypes.util.find_library('cuda') else None; assert cudnn is None or all(hasattr(cudnn, name) for name in names)"; \
     fi
 
 # MXFP8 MoE training (experts="torch_mm_mxfp8"): the NGC PyTorch base does not bundle
