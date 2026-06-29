@@ -172,5 +172,11 @@ def destroy_global_state():
     except Exception:  # pragma: no cover - best effort; deep_ep may be absent
         pass
     if torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            from nemo_automodel.components.moe.megatron.fused_a2a import destroy_deepep_v2_buffer
+
+            destroy_deepep_v2_buffer()
+        except ImportError:
+            pass
         torch.distributed.destroy_process_group()
     signal.signal(signal.SIGINT, signal.SIG_DFL)
