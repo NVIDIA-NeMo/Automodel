@@ -47,7 +47,7 @@ description: ""
 **1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
-pip install nemo-automodel
+pip install "nemo-automodel[vlm,vlm-media]"
 ```
 
 **2. Clone the repo** to get the example recipes:
@@ -79,7 +79,13 @@ docker run --gpus all -it --rm \
 cd /opt/Automodel
 ```
 
-**3. Run the recipe**:
+**3. Install media dependencies** (not installed in the container by default):
+
+```bash
+uv pip install ".[vlm-media]"
+```
+
+**4. Run the recipe**:
 
 ```bash
 automodel --nproc-per-node=8 examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml
