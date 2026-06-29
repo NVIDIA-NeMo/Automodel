@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -158,8 +159,8 @@ def test_resolve_reads_keys_and_remaps_index(tmp_path: Path):
     assert set(exported_index["weight_map"]) == {"embed_tokens.weight", "lm_head.weight", "d2t"}
 
 
-def test_export_is_cached_until_source_changes(tmp_path: Path):
-    """A second resolve reuses the export; touching the source weights rebuilds it."""
+def test_export_is_cached_when_source_unchanged(tmp_path: Path):
+    """A second resolve over an unchanged source reuses the export instead of rebuilding."""
     model_dir = tmp_path / "model"
     _write_draft_checkpoint(model_dir, architectures=["LlamaEagle3DraftModel"])
     export_config = model_dir / "vllm_export" / "config.json"
@@ -168,6 +169,42 @@ def test_export_is_cached_until_source_changes(tmp_path: Path):
     first_mtime = export_config.stat().st_mtime_ns
     resolve_draft_artifacts(str(model_dir))
     assert export_config.stat().st_mtime_ns == first_mtime, "fresh export must be reused, not rebuilt"
+
+
+def test_export_rebuilt_when_source_weights_or_config_change(tmp_path: Path):
+    """A stale export is rebuilt when either the source weights or the source config change.
+
+    The config alone drives the architectures / pard_token fixups, so a config-only
+    edit (e.g. toggling ``parallel_drafting`` or changing ``mask_token_id``) must
+    invalidate the export even when the weights are untouched.
+    """
+    model_dir = tmp_path / "model"
+    src_config = _write_draft_checkpoint(model_dir, architectures=["LlamaEagle3DraftModel"])
+    src_weights = model_dir / "model.safetensors"
+    export_config = model_dir / "vllm_export" / "config.json"
+
+    def _stamp_sentinel_then_age_source(source: Path) -> None:
+        # Tag the current export so a rebuild is detectable, then make ``source``
+        # strictly newer than the export to force a rebuild on the next resolve.
+        marked = json.loads(export_config.read_text(encoding="utf-8"))
+        marked["_sentinel"] = True
+        export_config.write_text(json.dumps(marked), encoding="utf-8")
+        newer_ns = export_config.stat().st_mtime_ns + 1_000_000_000
+        os.utime(source, ns=(newer_ns, newer_ns))
+
+    resolve_draft_artifacts(str(model_dir))
+
+    _stamp_sentinel_then_age_source(src_config)
+    resolve_draft_artifacts(str(model_dir))
+    assert "_sentinel" not in json.loads(export_config.read_text(encoding="utf-8")), (
+        "a source config change must rebuild the export"
+    )
+
+    _stamp_sentinel_then_age_source(src_weights)
+    resolve_draft_artifacts(str(model_dir))
+    assert "_sentinel" not in json.loads(export_config.read_text(encoding="utf-8")), (
+        "a source weight change must rebuild the export"
+    )
 
 
 def test_resolve_dry_run_returns_export_path_without_writing(tmp_path: Path):

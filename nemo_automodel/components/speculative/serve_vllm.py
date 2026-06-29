@@ -235,12 +235,16 @@ def _load_safetensors_io():
 
 
 def _export_is_fresh(draft_dir: Path, export_dir: Path) -> bool:
-    """True when ``export_dir`` holds a complete config + weights newer than the source."""
+    """True when ``export_dir`` holds a complete config + weights newer than the source weights or config."""
     exported_config = export_dir / "config.json"
     if not exported_config.exists() or not _has_hf_weight_file(export_dir):
         return False
-    src_weights = [*draft_dir.glob("model-*.safetensors"), draft_dir / "model.safetensors"]
-    src_mtime = max((w.stat().st_mtime_ns for w in src_weights if w.exists()), default=0)
+    src_files = [
+        *draft_dir.glob("model-*.safetensors"),
+        draft_dir / "model.safetensors",
+        draft_dir / "config.json",
+    ]
+    src_mtime = max((f.stat().st_mtime_ns for f in src_files if f.exists()), default=0)
     return exported_config.stat().st_mtime_ns >= src_mtime
 
 
