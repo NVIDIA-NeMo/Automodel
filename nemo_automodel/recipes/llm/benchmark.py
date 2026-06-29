@@ -121,6 +121,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self._bench_nsys_end = bench_cfg.nsys_end
         self._bench_nsys_ranks = bench_cfg.nsys_ranks
         self._bench_json_output_path = getattr(bench_cfg, "json_output_path", None)
+        # Detailed forward/backward and optimizer timers synchronize CUDA at every
+        # context boundary. That is useful for diagnosis, but it perturbs throughput
+        # measurements by preventing work from adjacent gradient-accumulation steps
+        # from remaining asynchronously queued. Keep the legacy behavior by default
+        # and let performance recipes retain only the synchronized outer iteration
+        # timer.
+        self._bench_detailed_timers = getattr(bench_cfg, "detailed_timers", True)
         self._wandb_enabled = cfg.get("wandb", None) is not None
 
         # Infer max_steps from step_scheduler
@@ -145,7 +152,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 logger.info(f"Using batch_size={local_batch_size} from step_scheduler.local_batch_size")
 
         super().__init__(cfg)
-        self.timers = Timers(log_level=2, log_option="minmax")
+        self.timers = Timers(log_level=2 if self._bench_detailed_timers else 1, log_option="minmax")
 
     def setup(self):
         """Setup the benchmarking environment.
@@ -439,7 +446,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             logger.info(f"MFU: {mfu:.6f}%")
 
         # Log detailed timers
-        timer_names = [iter_timer, "optimizer"] + [f"forward_backward_{ga_step_idx}" for ga_step_idx in range(ga_steps)]
+        timer_names = [iter_timer]
+        if self._bench_detailed_timers:
+            timer_names += ["optimizer"] + [f"forward_backward_{ga_step_idx}" for ga_step_idx in range(ga_steps)]
         # Log timers to wandb
         if self._wandb_enabled:
             self.timers.write_to_wandb(
