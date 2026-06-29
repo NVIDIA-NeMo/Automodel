@@ -45,6 +45,11 @@ distributed:
   cp_size: 1
   pp_size: 4
   ep_size: 64
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: bfloat16
+    output_dtype: bfloat16
+    cast_forward_inputs: true
 
   sequence_parallel: false
   activation_checkpointing: true
@@ -56,7 +61,7 @@ distributed:
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
-    layers_per_stage: 2
+    layers_per_stage: 4
 
   moe:
     reshard_after_forward: false
@@ -116,3 +121,13 @@ ci:
   nodes: 32
   env_vars:
     RDZV_TIMEOUT: "900"
+    NVTE_FUSED_ATTN: "1"
+    NVTE_UNFUSED_ATTN: "0"
+    NVTE_FLASH_ATTN: "0"
+    NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
+    NVTE_NORM_FWD_USE_CUDNN: "1"
+    NVTE_NORM_BWD_USE_CUDNN: "1"
+    NVTE_FWD_LAYERNORM_SM_MARGIN: "16"
+    NVTE_BWD_LAYERNORM_SM_MARGIN: "16"
+    TORCH_NCCL_AVOID_RECORD_STREAMS: "0"
+    NCCL_P2P_NET_CHUNKSIZE: "2097152"
