@@ -1,6 +1,7 @@
 instances:
 - url: https://nemo-automodel.docs.buildwithfern.com/nemo/automodel
   custom-domain: docs.nvidia.com/nemo/automodel
+  multi-source: true
 title: NVIDIA NeMo AutoModel
 
 # Version-root landing: each version YAML's first nav entry is the index page
