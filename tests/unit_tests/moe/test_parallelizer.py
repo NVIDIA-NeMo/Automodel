@@ -352,8 +352,8 @@ def test_expert_parallel_partition_fn_shards_and_dispatcher(monkeypatch):
             super().__init__()
             self.dispatch_called_with = None
 
-        def init_token_dispatcher(self, ep_mesh):
-            self.dispatch_called_with = ep_mesh
+        def init_token_dispatcher(self, ep_mesh, num_max_tokens_per_rank=None):
+            self.dispatch_called_with = (ep_mesh, num_max_tokens_per_rank)
 
         # override register_parameter to avoid strict type checks
         def register_parameter(self, name, param):
@@ -374,7 +374,7 @@ def test_expert_parallel_partition_fn_shards_and_dispatcher(monkeypatch):
     monkeypatch.setattr(P, "Shard", fake_shard)
     monkeypatch.setattr(P, "distribute_tensor", distribute_tensor_mock)
 
-    ep = P.ExpertParallel()
+    ep = P.ExpertParallel(num_max_tokens_per_rank=4096)
     module = DummyGrouped()
     device_mesh = type("Mesh", (), {"ndim": 1})()
 
@@ -392,7 +392,7 @@ def test_expert_parallel_partition_fn_shards_and_dispatcher(monkeypatch):
         assert isinstance(args[2], list) and args[2][0] is shard_sentinel
 
     # dispatcher must be initialized
-    assert module.dispatch_called_with is device_mesh
+    assert module.dispatch_called_with == (device_mesh, 4096)
 
 
 def test_expert_parallel_partition_fn_preserves_requires_grad(monkeypatch):
