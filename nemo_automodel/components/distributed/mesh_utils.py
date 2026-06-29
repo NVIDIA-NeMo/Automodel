@@ -157,6 +157,8 @@ def _nccl_backend_override(
     for axis in axes:
         options = dist.ProcessGroupNCCL.Options()
         options._timeout = timeout
+        if axis == MeshAxisName.PP:
+            options.config.blocking = 0
         override[axis] = ("nccl", options)
     return override
 

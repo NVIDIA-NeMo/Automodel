@@ -75,6 +75,7 @@ def test_init_named_mesh_sets_nccl_timeout_backend_override(monkeypatch):
     backend, options = captured["backend_override"][MeshAxisName.PP]
     assert backend == "nccl"
     assert options._timeout == datetime.timedelta(minutes=30)
+    assert options.config.blocking == 0
 
 
 def test_init_named_mesh_omits_backend_override_for_cpu(monkeypatch):
