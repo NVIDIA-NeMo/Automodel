@@ -16,6 +16,7 @@ import gc
 import glob
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1070,6 +1071,52 @@ class Checkpointer:
             path: Path to load stateful object
         """
         state_dir = os.path.join(path, state_name)
+        if hasattr(state, "load_state_dict_from_dp_rank_states"):
+            current_state_path = os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt")
+            current_rank_state = None
+            can_load_single_rank = getattr(state, "can_load_single_dp_rank_state", None)
+            rank_states = {}
+
+            if os.path.exists(current_state_path):
+                current_rank_state = torch.load(current_state_path, weights_only=False)
+                if can_load_single_rank is not None and can_load_single_rank(current_rank_state):
+                    state.load_state_dict_from_dp_rank_states({self.dp_rank: current_rank_state})
+                    return
+                rank_states[self.dp_rank] = current_rank_state
+
+            state_paths = sorted(glob.glob(os.path.join(state_dir, f"{state_name}_dp_rank_*.pt")))
+            if (
+                current_rank_state is not None
+                and can_load_single_rank is not None
+                and can_load_single_rank(current_rank_state, saved_dp_world_size=len(state_paths))
+            ):
+                state.load_state_dict(current_rank_state)
+                return
+
+            if current_rank_state is None and can_load_single_rank is not None:
+                for state_path in state_paths:
+                    match = re.search(r"_dp_rank_(\d+)\.pt$", state_path)
+                    if match is None:
+                        continue
+                    saved_dp_rank = int(match.group(1))
+                    rank_state = torch.load(state_path, weights_only=False)
+                    rank_states[saved_dp_rank] = rank_state
+                    if can_load_single_rank(rank_state, saved_dp_world_size=len(state_paths)):
+                        state.load_state_dict_from_dp_rank_states({saved_dp_rank: rank_state})
+                        return
+                    break
+
+            for state_path in state_paths:
+                match = re.search(r"_dp_rank_(\d+)\.pt$", state_path)
+                if match is None:
+                    continue
+                saved_dp_rank = int(match.group(1))
+                if saved_dp_rank not in rank_states:
+                    rank_states[saved_dp_rank] = torch.load(state_path, weights_only=False)
+            if rank_states:
+                state.load_state_dict_from_dp_rank_states(rank_states)
+                return
+
         state.load_state_dict(
             torch.load(os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"), weights_only=False)
         )
