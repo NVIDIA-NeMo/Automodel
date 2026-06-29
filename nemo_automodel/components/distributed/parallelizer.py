@@ -1659,15 +1659,15 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
                 "model.vision_tower.transformer.layers",
             ],
         },
-        # Retrieval custom VLM in components.models.ministral_bidirectional.model.
-        # Unlike HF Mistral3ForConditionalGeneration, the VLM body is the model
-        # itself rather than nested under `.model`.
-        "Mistral3BidirectionalModel": {
+        # Retrieval text encoder in components.models.ministral_bidirectional.model.
+        "Ministral3BidirectionalModel": {"language": ["layers"]},
+        # Retrieval VLM in components.models.llama_nemotron_vl.model. String-keyed
+        # to keep distributed core from importing optional model-specific deps.
+        "LlamaNemotronVLModel": {
             "language": ["language_model.layers"],
             "vision": [
-                "vision_tower.encoder.layers",
-                "vision_tower.vision_model.encoder.layers",
-                "vision_tower.transformer.layers",
+                "vision_model.vision_model.encoder.layers",
+                "vision_model.encoder.layers",
             ],
         },
         Llama4ForConditionalGeneration: {
