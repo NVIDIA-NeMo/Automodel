@@ -1129,6 +1129,8 @@ def test_forward_backward_step_pp_uses_step_for_training(monkeypatch):
     # Should use step, not eval
     assert len(pp_info.schedule.step_calls) == 1, "schedule.step() should be called once for training"
     assert len(pp_info.schedule.eval_calls) == 0, "schedule.eval() should not be called for training"
+    _, kwargs = pp_info.schedule.step_calls[0]
+    assert kwargs["return_outputs"] is False
 
 
 def test_forward_backward_step_pp_non_first_stage_uses_eval_for_validation(monkeypatch):
@@ -1201,6 +1203,7 @@ def test_forward_backward_step_pp_non_first_stage_uses_step_for_training(monkeyp
     args, kwargs = pp_info.schedule.step_calls[0]
     assert len(args) == 0, "Non-first stage should not pass input_ids as positional arg"
     assert "target" in kwargs
+    assert kwargs["return_outputs"] is False
 
 
 def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch):

@@ -1217,9 +1217,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
+                        self.pp.info.schedule.step(
+                            input_ids, target=targets, losses=losses, return_outputs=False, **batch_filtered
+                        )
                     else:
-                        self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
+                        self.pp.info.schedule.step(
+                            target=targets, losses=losses, return_outputs=False, **batch_filtered
+                        )
                 else:
                     # Use eval for validation (forward only, no backward)
                     if self.pp.info.has_first_stage:
