@@ -17,7 +17,10 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from nemo_automodel.components.moe.megatron.token_dispatcher import _HybridEPManager
+from nemo_automodel.components.moe.megatron.token_dispatcher import (
+    _HybridEPManager,
+    _HybridEPMetadataProcessor,
+)
 
 
 @pytest.fixture
@@ -115,3 +118,22 @@ def test_hybridep_manager_accepts_expert_padding_multiple():
         )
 
     assert manager.pad_multiple == 256
+
+
+def test_hybridep_metadata_processor_matches_manager_and_preserves_prob_grads():
+    """The graphable preprocess boundary is pure and differentiable in probabilities."""
+    processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
+    indices = torch.tensor([[0, 3], [1, 5]])
+    probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]], requires_grad=True)
+
+    routing_map, multihot_probs = processor(indices, probs)
+
+    assert routing_map.shape == (2, 8)
+    assert routing_map.sum() == 4
+    torch.testing.assert_close(
+        multihot_probs,
+        torch.tensor([[0.6, 0.0, 0.0, 0.4, 0.0, 0.0, 0.0, 0.0], [0.0, 0.7, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0]]),
+    )
+
+    multihot_probs.sum().backward()
+    torch.testing.assert_close(probs.grad, torch.ones_like(probs))

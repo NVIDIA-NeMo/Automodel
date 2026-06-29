@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 
 import nemo_automodel.recipes.llm.partial_cuda_graphs as partial_graphs
 
@@ -39,6 +40,36 @@ class _DynamicSplitModule(nn.Module):
         return x * self.scale + probs * split_factor + probs_alias * alias_split_factor
 
 
+class _FakeRouterCore(nn.Module):
+    def forward(self, scores, gate):
+        assert isinstance(gate, _FakeRouter)
+        weights = scores[:, :2]
+        indices = torch.zeros_like(weights, dtype=torch.long)
+        return weights, indices, scores
+
+
+class _FakeRouter(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(1.0))
+        self.routing_core = _FakeRouterCore()
+        self.router_replay = None
+        self.e_score_correction_bias = None
+
+    def forward(self, x, token_mask, cp_mesh=None):
+        del cp_mesh
+        scores = x * self.scale * token_mask.unsqueeze(-1)
+        weights, indices, _ = self.routing_core(scores, self)
+        return weights, indices, None
+
+
+class _FakeMoEPreprocess(nn.Module):
+    permute_fusion = True
+
+    def forward(self, indices, probs):
+        return indices >= 0, probs
+
+
 def _make_entry(module, *, canonicalizer=None, fp8_enabled=False):
     return partial_graphs._PartialGraphEntry(
         name="test.dynamic_experts",
@@ -55,20 +86,34 @@ class _FakeLayer(nn.Module):
         self.self_attn.attn_module = nn.Module()
         self.self_attn.attn_module.fused_attention = nn.Identity()
         self.mlp = nn.Module()
+        self.mlp.gate = _FakeRouter()
         self.mlp.experts = nn.Module()
         self.mlp.experts.use_te_ops = True
         self.mlp.experts.__dict__["_te_grouped_mlp"] = _DynamicSplitModule(expert_device)
+        self.mlp.experts.token_dispatcher = SimpleNamespace(hybridep_metadata_processor=_FakeMoEPreprocess())
 
 
 class _FSDPStyleGptOssWrapper(nn.Module):
     """Match the attribute structure retained by FSDP2's dynamic wrapper class."""
 
-    def __init__(self, *, layer_count=1, layer_limit=1, expert_device="cpu"):
+    def __init__(
+        self,
+        *,
+        layer_count=1,
+        layer_limit=1,
+        expert_device="cpu",
+        attention=True,
+        moe_router=False,
+        moe_preprocess=False,
+        experts=True,
+    ):
         super().__init__()
         self.config = SimpleNamespace(model_type="gpt_oss")
         self.backend = SimpleNamespace(
-            partial_cuda_graph_attention=True,
-            partial_cuda_graph_experts=True,
+            partial_cuda_graph_attention=attention,
+            partial_cuda_graph_moe_router=moe_router,
+            partial_cuda_graph_moe_preprocess=moe_preprocess,
+            partial_cuda_graph_experts=experts,
             partial_cuda_graph_layer_limit=layer_limit,
             te_fp8=None,
         )
@@ -109,6 +154,72 @@ def test_discovers_targets_through_fsdp_style_gpt_oss_wrapper():
         entry.stop_recording()
 
 
+def test_discovers_megatron_style_dropless_moe_scopes():
+    model = _FSDPStyleGptOssWrapper(moe_router=True, moe_preprocess=True, experts=False)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+
+    assert manager is not None
+    assert [entry.name for entry in manager.entries] == [
+        "gpt_oss.layers.0.fused_attention",
+        "gpt_oss.layers.0.moe_router",
+        "gpt_oss.layers.0.moe_preprocess",
+    ]
+    for entry in manager.entries:
+        entry.stop_recording()
+
+
+def test_discovers_targets_below_pytorch_checkpoint_wrapper():
+    model = _FSDPStyleGptOssWrapper()
+    model.model.layers["0"] = checkpoint_wrapper(model.model.layers["0"])
+
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts(
+        [model],
+        activation_checkpointing=True,
+    )
+
+    assert manager is not None
+    assert [entry.name for entry in manager.entries] == [
+        "gpt_oss.layers.0.fused_attention",
+        "gpt_oss.layers.0.te_ops_experts",
+    ]
+    for entry in manager.entries:
+        entry.stop_recording()
+
+
+def test_scoped_router_and_preprocess_replay_dynamic_values(monkeypatch):
+    _install_fake_graph(monkeypatch)
+    model = _FSDPStyleGptOssWrapper(moe_router=True, moe_preprocess=True, experts=False)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+    assert manager is not None
+
+    layer = model.model.layers["0"]
+    attention = layer.self_attn.attn_module.fused_attention
+    router = layer.mlp.gate
+    preprocess = layer.mlp.experts.token_dispatcher.hybridep_metadata_processor
+
+    attention(torch.ones(2, 3))
+    router(torch.ones(2, 3), torch.ones(2, dtype=torch.bool), None)
+    preprocess(torch.zeros(2, 2, dtype=torch.long), torch.ones(2, 2))
+    manager.capture()
+
+    weights, indices, aux_loss = router(
+        torch.full((2, 3), 2.0),
+        torch.tensor([True, False]),
+        None,
+    )
+    routing_map, probs = preprocess(
+        torch.tensor([[0, -1], [1, 2]]),
+        torch.tensor([[0.75, 0.0], [0.6, 0.4]]),
+    )
+
+    torch.testing.assert_close(weights, torch.tensor([[2.0, 2.0], [0.0, 0.0]]))
+    assert indices.shape == (2, 2)
+    assert aux_loss is None
+    torch.testing.assert_close(routing_map, torch.tensor([[True, False], [True, True]]))
+    torch.testing.assert_close(probs, torch.tensor([[0.75, 0.0], [0.6, 0.4]]))
+    assert manager.stats() == {"captured": 3, "replayed": 2, "fallback": 0}
+
+
 def test_empty_expert_sample_is_skipped_while_attention_is_captured(monkeypatch, caplog):
     _install_fake_graph(monkeypatch)
     model = _FSDPStyleGptOssWrapper()
@@ -142,10 +253,24 @@ def test_missing_attention_sample_still_fails_capture():
         manager.capture()
 
 
-def test_rejects_activation_checkpointing():
+def test_allows_activation_checkpointing_for_guarded_graph_scopes():
     model = _FSDPStyleGptOssWrapper()
-    with pytest.raises(RuntimeError, match="activation_checkpointing=false"):
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model], activation_checkpointing=True)
+    assert manager is not None
+    for entry in manager.entries:
+        entry.stop_recording()
+
+
+def test_rejects_activation_checkpointing_across_router_preprocess_scope():
+    model = _FSDPStyleGptOssWrapper(moe_router=True, moe_preprocess=True, experts=False)
+    with pytest.raises(RuntimeError, match="cannot recompute across the partial MoE router/preprocess"):
         partial_graphs.PartialCudaGraphManager.from_model_parts([model], activation_checkpointing=True)
+
+
+def test_rejects_pipeline_parallel_with_one_local_model_part():
+    model = _FSDPStyleGptOssWrapper()
+    with pytest.raises(RuntimeError, match="pipeline parallel size 1"):
+        partial_graphs.PartialCudaGraphManager.from_model_parts([model], pipeline_parallel=True)
 
 
 def test_rejects_layer_limit_larger_than_discovered_model():

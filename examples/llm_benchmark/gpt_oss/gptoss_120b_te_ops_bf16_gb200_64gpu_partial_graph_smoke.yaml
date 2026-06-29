@@ -69,6 +69,8 @@ model:
     enable_hf_state_dict_adapter: false
     enable_fsdp_optimizations: true
     partial_cuda_graph_attention: false
+    partial_cuda_graph_moe_router: false
+    partial_cuda_graph_moe_preprocess: false
     partial_cuda_graph_experts: false
     partial_cuda_graph_layer_limit: 0
 

@@ -71,6 +71,8 @@ model:
       recipe: mxfp8
       fp8_dpa: false
     partial_cuda_graph_attention: false
+    partial_cuda_graph_moe_router: false
+    partial_cuda_graph_moe_preprocess: false
     partial_cuda_graph_experts: false
     partial_cuda_graph_layer_limit: 0
 

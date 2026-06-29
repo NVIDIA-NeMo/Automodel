@@ -198,8 +198,14 @@ class BackendConfig:
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
         partial_cuda_graph_attention: Benchmark-only opt-in that captures GPT-OSS TE
             FusedAttention after one eager iteration. The DPA compute must remain BF16.
+        partial_cuda_graph_moe_router: Opt-in that captures the fixed-shape GPT-OSS MoE
+            router while leaving variable-shape expert dispatch and compute eager.
+        partial_cuda_graph_moe_preprocess: Opt-in that captures HybridEP's fixed-shape
+            top-k-to-multihot preprocessing. Requires the router graph, matching
+            Megatron-LM's scoped dropless-MoE CUDA graph contract.
         partial_cuda_graph_experts: Benchmark-only opt-in that captures GPT-OSS TE-ops
-            expert compute while leaving routing and token dispatch eager.
+            expert compute. Real routing can change the received-token shape, so calls
+            whose metadata differs from the captured sample fall back to eager execution.
         partial_cuda_graph_layer_limit: Positive number of leading GPT-OSS layers to graph.
             Limiting the layer count bounds persistent forward/backward graph buffers.
     """
@@ -238,6 +244,8 @@ class BackendConfig:
     # rope_fusion=False. Default False.
     compile_attn: bool = False
     partial_cuda_graph_attention: bool = False
+    partial_cuda_graph_moe_router: bool = False
+    partial_cuda_graph_moe_preprocess: bool = False
     partial_cuda_graph_experts: bool = False
     partial_cuda_graph_layer_limit: int = 0
 
@@ -279,7 +287,12 @@ class BackendConfig:
             self.dispatcher = "torch"
             self.experts = "torch_mm"
 
-        partial_cuda_graph_enabled = self.partial_cuda_graph_attention or self.partial_cuda_graph_experts
+        partial_cuda_graph_enabled = (
+            self.partial_cuda_graph_attention
+            or self.partial_cuda_graph_moe_router
+            or self.partial_cuda_graph_moe_preprocess
+            or self.partial_cuda_graph_experts
+        )
         if partial_cuda_graph_enabled and self.partial_cuda_graph_layer_limit <= 0:
             raise ValueError("partial_cuda_graph_layer_limit must be positive when partial CUDA graphs are enabled")
         if self.partial_cuda_graph_attention and self.attn != "te":
@@ -288,6 +301,12 @@ class BackendConfig:
             recipe_fp8_dpa = getattr(self.te_fp8.recipe, "fp8_dpa", False)
             if self.te_fp8.fp8_dpa or recipe_fp8_dpa:
                 raise ValueError("partial_cuda_graph_attention requires BF16 dot-product attention (fp8_dpa=False)")
+        if self.partial_cuda_graph_moe_preprocess and not self.partial_cuda_graph_moe_router:
+            raise ValueError("partial_cuda_graph_moe_preprocess requires partial_cuda_graph_moe_router=True")
+        if self.partial_cuda_graph_moe_router and self.fake_balanced_gate:
+            raise ValueError("partial_cuda_graph_moe_router requires the learned Gate (fake_balanced_gate=False)")
+        if self.partial_cuda_graph_moe_preprocess and self.dispatcher != "hybridep":
+            raise ValueError("partial_cuda_graph_moe_preprocess requires dispatcher='hybridep'")
         if self.partial_cuda_graph_experts and self.experts != "te_ops":
             raise ValueError("partial_cuda_graph_experts requires experts='te_ops'")
 

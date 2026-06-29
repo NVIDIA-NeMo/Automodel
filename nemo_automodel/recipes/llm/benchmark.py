@@ -182,6 +182,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self.partial_cuda_graph_manager = PartialCudaGraphManager.from_model_parts(
             self.model_parts,
             activation_checkpointing=bool(getattr(self, "activation_checkpointing", False)),
+            pipeline_parallel=bool(self.pp_enabled),
         )
         self._validate_partial_graph_optimizers()
 

@@ -130,6 +130,8 @@ class TestBackendConfigPartialCudaGraphs:
     def test_defaults_disabled(self):
         config = BackendConfig()
         assert config.partial_cuda_graph_attention is False
+        assert config.partial_cuda_graph_moe_router is False
+        assert config.partial_cuda_graph_moe_preprocess is False
         assert config.partial_cuda_graph_experts is False
         assert config.partial_cuda_graph_layer_limit == 0
 
@@ -179,6 +181,43 @@ class TestBackendConfigPartialCudaGraphs:
             partial_cuda_graph_layer_limit=2,
         )
         assert config.partial_cuda_graph_experts is True
+
+    def test_moe_preprocess_scope_requires_router_scope(self):
+        with pytest.raises(ValueError, match="requires partial_cuda_graph_moe_router=True"):
+            BackendConfig(
+                dispatcher="hybridep",
+                partial_cuda_graph_moe_preprocess=True,
+                partial_cuda_graph_layer_limit=1,
+            )
+
+    def test_moe_preprocess_scope_requires_hybridep(self):
+        with pytest.raises(ValueError, match="requires dispatcher='hybridep'"):
+            BackendConfig(
+                dispatcher="deepep",
+                partial_cuda_graph_moe_router=True,
+                partial_cuda_graph_moe_preprocess=True,
+                partial_cuda_graph_layer_limit=1,
+            )
+
+    def test_scoped_dropless_moe_graphs_allow_learned_routing(self):
+        config = BackendConfig(
+            dispatcher="hybridep",
+            fake_balanced_gate=False,
+            partial_cuda_graph_moe_router=True,
+            partial_cuda_graph_moe_preprocess=True,
+            partial_cuda_graph_layer_limit=2,
+        )
+        assert config.partial_cuda_graph_moe_router is True
+        assert config.partial_cuda_graph_moe_preprocess is True
+
+    def test_router_scope_rejects_fake_balanced_gate(self):
+        with pytest.raises(ValueError, match="requires the learned Gate"):
+            BackendConfig(
+                dispatcher="hybridep",
+                fake_balanced_gate=True,
+                partial_cuda_graph_moe_router=True,
+                partial_cuda_graph_layer_limit=1,
+            )
 
 
 class TestBackendConfigFakeGateNoise:

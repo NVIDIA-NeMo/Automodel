@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark-only partial CUDA graphs for GPT-OSS attention and expert compute."""
+"""Scoped partial CUDA graphs for GPT-OSS attention and MoE compute.
+
+The convergence-safe dropless-MoE path mirrors Megatron-LM: graph attention,
+the fixed-shape router, and fixed-shape HybridEP preprocessing while keeping
+variable-size dispatch and expert compute eager. Direct expert graphs remain a
+benchmark experiment and fall back to eager whenever routed-token metadata
+changes from the captured sample.
+"""
 
 from __future__ import annotations
 
@@ -342,20 +349,40 @@ class PartialCudaGraphManager:
         model_parts: list[nn.Module],
         *,
         activation_checkpointing: bool = False,
+        pipeline_parallel: bool = False,
     ) -> PartialCudaGraphManager | None:
         """Discover graph targets from an already-built GPT-OSS benchmark model."""
         enabled_parts = [
             part
             for part in model_parts
             if getattr(getattr(part, "backend", None), "partial_cuda_graph_attention", False) is True
+            or getattr(getattr(part, "backend", None), "partial_cuda_graph_moe_router", False) is True
+            or getattr(getattr(part, "backend", None), "partial_cuda_graph_moe_preprocess", False) is True
             or getattr(getattr(part, "backend", None), "partial_cuda_graph_experts", False) is True
         ]
         if not enabled_parts:
             return None
+        if pipeline_parallel:
+            raise RuntimeError(
+                "Partial GPT-OSS CUDA graphs require pipeline parallel size 1; multiple in-flight pipeline "
+                "microbatches can overwrite a graph's static forward buffers before backward"
+            )
         if activation_checkpointing:
-            raise RuntimeError("Partial CUDA graphs require activation_checkpointing=false")
+            if any(
+                getattr(part.backend, "partial_cuda_graph_moe_router", False)
+                or getattr(part.backend, "partial_cuda_graph_moe_preprocess", False)
+                for part in enabled_parts
+            ):
+                raise RuntimeError(
+                    "PyTorch activation checkpointing cannot recompute across the partial MoE router/preprocess "
+                    "CUDA graph scope; use attention/exact-shape expert graphs or disable router/preprocess graphs"
+                )
+            logger.info(
+                "Partial CUDA graphs are enabled with PyTorch activation checkpointing; "
+                "checkpoint recomputation will use the same guarded graph entry points"
+            )
         if len(model_parts) != 1:
-            raise RuntimeError("Partial GPT-OSS CUDA graphs currently require pipeline parallel size 1")
+            raise RuntimeError("Partial GPT-OSS CUDA graphs currently require one local model part")
 
         model = model_parts[0]
         if getattr(getattr(model, "config", None), "model_type", None) != "gpt_oss":
@@ -370,7 +397,11 @@ class PartialCudaGraphManager:
         selected_layers = layers[:limit]
         entries: list[_PartialGraphEntry] = []
 
-        for layer_name, block in selected_layers:
+        for layer_name, wrapped_block in selected_layers:
+            block = wrapped_block
+            while hasattr(block, "_checkpoint_wrapped_module"):
+                block = block._checkpoint_wrapped_module
+
             if backend.partial_cuda_graph_attention:
                 dpa = getattr(block.self_attn, "attn_module", None)
                 target = getattr(dpa, "fused_attention", None)
@@ -384,6 +415,48 @@ class PartialCudaGraphManager:
                         target=target,
                         fp8_enabled=False,
                         canonicalizer=_canonicalize_bf16_fused_attention,
+                    )
+                )
+
+            if backend.partial_cuda_graph_moe_router:
+                gate = getattr(getattr(block, "mlp", None), "gate", None)
+                target = getattr(gate, "routing_core", None)
+                if not isinstance(target, nn.Module):
+                    raise RuntimeError(f"GPT-OSS layer {layer_name} does not expose a graphable MoE routing core")
+                if (
+                    getattr(gate, "router_replay", None) is not None
+                    or getattr(gate, "e_score_correction_bias", None) is not None
+                ):
+                    raise RuntimeError(
+                        "Partial MoE router graphs require routing replay and score-correction bias to be disabled"
+                    )
+                if any(True for _ in target.parameters()):
+                    raise RuntimeError("The partial MoE routing-core boundary must be parameterless")
+                entries.append(
+                    _PartialGraphEntry(
+                        name=f"gpt_oss.layers.{layer_name}.moe_router",
+                        target=target,
+                        fp8_enabled=False,
+                    )
+                )
+
+            if backend.partial_cuda_graph_moe_preprocess:
+                experts = getattr(getattr(block, "mlp", None), "experts", None)
+                dispatcher = getattr(experts, "token_dispatcher", None)
+                target = getattr(dispatcher, "hybridep_metadata_processor", None)
+                if not isinstance(target, nn.Module):
+                    raise RuntimeError(
+                        f"GPT-OSS layer {layer_name} does not expose graphable HybridEP metadata preprocessing"
+                    )
+                if not getattr(target, "permute_fusion", False):
+                    raise RuntimeError(
+                        "Partial HybridEP preprocess graphs require fused fixed-shape metadata conversion"
+                    )
+                entries.append(
+                    _PartialGraphEntry(
+                        name=f"gpt_oss.layers.{layer_name}.moe_preprocess",
+                        target=target,
+                        fp8_enabled=False,
                     )
                 )
 
@@ -454,32 +527,40 @@ class PartialCudaGraphManager:
             return
 
         adapters = tuple(entry.build_adapter() for entry in captured_entries)
-        captured_calls = tuple(entry.captured_call for entry in captured_entries)
-        sample_args = tuple(call.sample_tensors for call in captured_calls if call is not None)
-        enabled = tuple(entry.fp8_enabled for entry in captured_entries)
-        if any(enabled) and self.fp8_recipe is None:
+        if any(entry.fp8_enabled for entry in captured_entries) and self.fp8_recipe is None:
             raise RuntimeError("FP8 expert graph capture requires a Transformer Engine FP8 recipe")
 
-        kwargs = {
-            "num_warmup_iters": 3,
-            "allow_unused_input": True,
-            "sample_kwargs": tuple({} for _ in adapters),
-            "enabled": enabled,
-        }
-        if self.fp8_recipe is not None:
-            kwargs["recipe"] = self.fp8_recipe
+        # Give every guarded entry its own graph pool. Any entry may deliberately
+        # fall back when metadata changes; sharing a pool would require replaying
+        # all graphs in capture order and could corrupt another entry's buffers
+        # when one dynamic expert call is skipped.
+        graphed_adapters = []
+        for entry, adapter in zip(captured_entries, adapters):
+            assert entry.captured_call is not None
+            kwargs = {
+                "num_warmup_iters": 3,
+                "allow_unused_input": True,
+                "sample_kwargs": ({},),
+                "enabled": (entry.fp8_enabled,),
+            }
+            if self.fp8_recipe is not None:
+                kwargs["recipe"] = self.fp8_recipe
+            try:
+                result = _get_make_graphed_callables()(
+                    (adapter,),
+                    (entry.captured_call.sample_tensors,),
+                    **kwargs,
+                )
+            except Exception as error:
+                raise RuntimeError(f"Explicit partial CUDA graph capture failed for {entry.name}") from error
+            if not isinstance(result, tuple):
+                result = (result,)
+            if len(result) != 1:
+                raise RuntimeError(
+                    f"Transformer Engine returned {len(result)} graphs for partial target {entry.name!r}"
+                )
+            graphed_adapters.append(result[0])
 
-        try:
-            graphed_adapters = _get_make_graphed_callables()(adapters, sample_args, **kwargs)
-        except Exception as error:
-            raise RuntimeError("Explicit partial CUDA graph capture failed") from error
-
-        if not isinstance(graphed_adapters, tuple):
-            graphed_adapters = (graphed_adapters,)
-        if len(graphed_adapters) != len(captured_entries):
-            raise RuntimeError(
-                f"Transformer Engine returned {len(graphed_adapters)} graphs for {len(captured_entries)} targets"
-            )
         for entry, graphed_adapter in zip(captured_entries, graphed_adapters):
             entry.install(graphed_adapter)
 
