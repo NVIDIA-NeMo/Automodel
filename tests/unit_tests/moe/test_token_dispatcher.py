@@ -98,3 +98,20 @@ class TestIndicesToMultihot:
         assert routing_map.shape == (1, 8)
         assert routing_map.sum() == 2
         assert routing_map[0, 0] and routing_map[0, 7]
+
+
+def test_hybridep_manager_accepts_expert_padding_multiple():
+    """HybridEP keeps the alignment requested by the TE grouped-MLP backend."""
+    with patch(
+        "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+        new=lambda *args, **kwargs: None,
+    ):
+        manager = _HybridEPManager(
+            group=None,
+            num_local_experts=2,
+            num_experts=8,
+            router_topk=2,
+            moe_router_expert_pad_multiple=256,
+        )
+
+    assert manager.pad_multiple == 256

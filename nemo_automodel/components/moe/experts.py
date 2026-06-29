@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import math
+import os
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -38,6 +41,8 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
+
+logger = logging.getLogger(__name__)
 
 # ── EP variable-length collective helpers ──
 
@@ -922,8 +927,6 @@ class GroupedExpertsTE(nn.Module):
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
-        from transformer_engine.pytorch import GroupedLinear
-
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
         _patch_te_modules()
@@ -936,35 +939,22 @@ class GroupedExpertsTE(nn.Module):
         self.dim = config.dim
         self.moe_inter_dim = config.moe_inter_dim
         self.is_gated = is_gated_activation(config.expert_activation)
+        self.use_te_ops = backend is not None and backend.experts == "te_ops"
+        configured_fp8_recipe = getattr(getattr(backend, "te_fp8", None), "recipe", None)
+        configured_mxfp8 = configured_fp8_recipe == "mxfp8" or (
+            callable(getattr(configured_fp8_recipe, "mxfp8", None)) and configured_fp8_recipe.mxfp8()
+        )
+        self._te_ops_mxfp8_fusion_requested = (
+            self.use_te_ops and configured_mxfp8 and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) > 0
+        )
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
 
-        # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
-        # Non-gated (ReLU²): out_features = moe_inter_dim
-        gate_up_out_features = config.moe_inter_dim * 2 if self.is_gated else config.moe_inter_dim
-
-        # Create TE GroupedLinear layers with full expert count on meta device first
-        self.gate_up_linear = GroupedLinear(
-            num_gemms=config.n_routed_experts,
-            in_features=config.expert_dim,
-            out_features=gate_up_out_features,
-            bias=self.expert_bias,
-            params_dtype=config.dtype,
-            device="meta",
-        )
-        # down_linear: [moe_inter_dim] -> [dim]
-        self.down_linear = GroupedLinear(
-            num_gemms=config.n_routed_experts,
-            in_features=config.moe_inter_dim,
-            out_features=config.expert_dim,
-            bias=self.expert_bias,
-            params_dtype=config.dtype,
-            device="meta",
-        )
-
+        self._build_grouped_linears(config.n_routed_experts)
         self.expert_activation = get_expert_activation_for_deepep(config)
+        self._te_ops_fusion_checked = False
 
         # FP8 padding/unpadding for GEMM alignment (initialized with full expert count,
         # re-created in init_token_dispatcher with num_local_experts for EP)
@@ -978,14 +968,119 @@ class GroupedExpertsTE(nn.Module):
         self.moe_mesh = None
         self.ep_rank = 0
 
+    def _build_grouped_linears(self, num_experts: int) -> None:
+        """Build the selected TE grouped-MLP implementation on the meta device."""
+        gate_up_out_features = self.config.moe_inter_dim * 2 if self.is_gated else self.config.moe_inter_dim
+
+        if not self.use_te_ops:
+            from transformer_engine.pytorch import GroupedLinear
+
+            self.gate_up_linear = GroupedLinear(
+                num_gemms=num_experts,
+                in_features=self.config.expert_dim,
+                out_features=gate_up_out_features,
+                bias=self.expert_bias,
+                params_dtype=self.config.dtype,
+                device="meta",
+            )
+            self.down_linear = GroupedLinear(
+                num_gemms=num_experts,
+                in_features=self.config.moe_inter_dim,
+                out_features=self.config.expert_dim,
+                bias=self.expert_bias,
+                params_dtype=self.config.dtype,
+                device="meta",
+            )
+            self.__dict__["_te_grouped_mlp"] = None
+            return
+
+        try:
+            from transformer_engine.pytorch import ops as te_ops
+        except ImportError as error:
+            raise ImportError("experts='te_ops' requires Transformer Engine 2.15 or newer") from error
+
+        if self.config.expert_activation != "quick_geglu":
+            raise ValueError(
+                "experts='te_ops' currently supports expert_activation='quick_geglu', "
+                f"not {self.config.expert_activation!r}"
+            )
+        if self._te_ops_mxfp8_fusion_requested and (
+            not math.isclose(self.config.activation_alpha, 1.702, abs_tol=1e-3)
+            or not math.isclose(self.config.activation_limit, 7.0, abs_tol=1e-6)
+        ):
+            raise ValueError("TE's fused MXFP8 QGeGLU kernel requires activation_alpha=1.702 and activation_limit=7.0")
+
+        self.gate_up_linear = te_ops.GroupedLinear(
+            num_groups=num_experts,
+            in_features=self.config.expert_dim,
+            out_features=gate_up_out_features,
+            bias=self.expert_bias,
+            dtype=self.config.dtype,
+            device="meta",
+        )
+        self.down_linear = te_ops.GroupedLinear(
+            num_groups=num_experts,
+            in_features=self.config.moe_inter_dim,
+            out_features=self.config.expert_dim,
+            bias=self.expert_bias,
+            dtype=self.config.dtype,
+            device="meta",
+            scale_bias=self.expert_bias,
+        )
+        activation = te_ops.ScaledClampedQGeGLU(
+            glu_interleave_size=32,
+            limit=self.config.activation_limit,
+            alpha=self.config.activation_alpha,
+        )
+
+        # Keep gate_up_linear/down_linear as the registered children so FSDP sees each
+        # parameter exactly once. Sequential holds the same module objects and is kept as
+        # an unregistered execution wrapper solely for TE's operation pattern matcher.
+        self.__dict__["_te_grouped_mlp"] = te_ops.Sequential(
+            self.gate_up_linear,
+            activation,
+            self.down_linear,
+        )
+
+    @staticmethod
+    def _group_count(linear: nn.Module) -> int:
+        num_gemms = getattr(linear, "num_gemms", None)
+        return num_gemms if num_gemms is not None else linear.num_groups
+
+    @staticmethod
+    def _interleave_glu_blocks(tensor: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+        """Convert GPT-OSS ``[gate0, up0, ...]`` rows to TE's 32-wide GLU blocks."""
+        if tensor.shape[1] % (2 * block_size) != 0:
+            raise ValueError(f"GLU width {tensor.shape[1]} must be divisible by {2 * block_size}")
+        tail = tensor.shape[2:]
+        pairs = tensor.reshape(tensor.shape[0], -1, 2, *tail)
+        blocks = pairs.reshape(tensor.shape[0], -1, block_size, 2, *tail)
+        blocks = blocks.permute(0, 1, 3, 2, *range(4, blocks.ndim))
+        return blocks.flatten(1, 3)
+
+    @staticmethod
+    def _deinterleave_glu_blocks(tensor: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+        """Convert TE's 32-wide GLU blocks back to GPT-OSS elementwise gate/up rows."""
+        if tensor.shape[1] % (2 * block_size) != 0:
+            raise ValueError(f"GLU width {tensor.shape[1]} must be divisible by {2 * block_size}")
+        tail = tensor.shape[2:]
+        blocks = tensor.reshape(tensor.shape[0], -1, 2, block_size, *tail)
+        pairs = blocks.permute(0, 1, 3, 2, *range(4, blocks.ndim))
+        return pairs.flatten(1, 3)
+
+    def _uses_interleaved_glu(self, linear: nn.Module) -> bool:
+        return self.use_te_ops and self.is_gated and linear is self.gate_up_linear
+
     def _get_stacked_weight(self, linear: "GroupedLinear", transpose: bool = False) -> torch.Tensor:
         weights = []
-        for i in range(linear.num_gemms):
+        for i in range(self._group_count(linear)):
             w = getattr(linear, f"weight{i}")
             if isinstance(w, DTensor):
                 w = w.to_local()
             weights.append(w)
         stacked = torch.stack(weights, dim=0)  # [num_experts, out, in]
+        if self._uses_interleaved_glu(linear):
+            stacked = self._deinterleave_glu_blocks(stacked)
         if transpose:
             stacked = stacked.transpose(-1, -2)  # [num_experts, in, out]
         return stacked
@@ -994,17 +1089,22 @@ class GroupedExpertsTE(nn.Module):
         if not linear.use_bias:
             return None
         biases = []
-        for i in range(linear.num_gemms):
+        for i in range(self._group_count(linear)):
             b = getattr(linear, f"bias{i}")
             if isinstance(b, DTensor):
                 b = b.to_local()
             biases.append(b)
-        return torch.stack(biases, dim=0)  # [num_experts, out_features]
+        stacked = torch.stack(biases, dim=0)  # [num_experts, out_features]
+        if self._uses_interleaved_glu(linear):
+            stacked = self._deinterleave_glu_blocks(stacked)
+        return stacked
 
     def _set_stacked_weight(self, linear: "GroupedLinear", stacked: torch.Tensor, transpose: bool = False):
         if transpose:
             stacked = stacked.transpose(-1, -2)  # [num_experts, out, in]
-        for i in range(linear.num_gemms):
+        if self._uses_interleaved_glu(linear):
+            stacked = self._interleave_glu_blocks(stacked)
+        for i in range(self._group_count(linear)):
             weight_param = getattr(linear, f"weight{i}")
             if isinstance(weight_param, DTensor):
                 weight_param = weight_param.to_local()
@@ -1013,7 +1113,9 @@ class GroupedExpertsTE(nn.Module):
     def _set_stacked_bias(self, linear: "GroupedLinear", stacked: torch.Tensor):
         if not linear.use_bias or stacked is None:
             return
-        for i in range(linear.num_gemms):
+        if self._uses_interleaved_glu(linear):
+            stacked = self._interleave_glu_blocks(stacked)
+        for i in range(self._group_count(linear)):
             bias_param = getattr(linear, f"bias{i}")
             if isinstance(bias_param, DTensor):
                 bias_param = bias_param.to_local()
@@ -1203,8 +1305,6 @@ class GroupedExpertsTE(nn.Module):
         Args:
             ep_mesh: Device mesh for expert parallelism.
         """
-        from transformer_engine.pytorch import GroupedLinear
-
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
         _patch_te_modules()
@@ -1219,26 +1319,7 @@ class GroupedExpertsTE(nn.Module):
         )
         self.num_local_experts = self.config.n_routed_experts // self.ep_size
 
-        gate_up_out_features = self.config.moe_inter_dim * 2 if self.is_gated else self.config.moe_inter_dim
-
-        self.gate_up_linear = GroupedLinear(
-            num_gemms=self.num_local_experts,
-            in_features=self.config.expert_dim,
-            out_features=gate_up_out_features,
-            bias=self.expert_bias,
-            params_dtype=self.config.dtype,
-            device="meta",
-        )
-
-        # down_linear: [moe_inter_dim] -> [dim]
-        self.down_linear = GroupedLinear(
-            num_gemms=self.num_local_experts,
-            in_features=self.config.moe_inter_dim,
-            out_features=self.config.expert_dim,
-            bias=self.expert_bias,
-            params_dtype=self.config.dtype,
-            device="meta",
-        )
+        self._build_grouped_linears(self.num_local_experts)
 
         token_dispatcher_config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
@@ -1250,6 +1331,11 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            # The CuTe DSL grouped-MLP kernel requires each expert M dimension
+            # to be 256-aligned. Let the dispatcher create/remove padding so the
+            # GPU split-size tensor can flow directly into TE without a .tolist()
+            # synchronization on the critical path.
+            moe_router_expert_pad_multiple=256 if self._te_ops_mxfp8_fusion_requested else None,
         )
 
         local_expert_indices_offset = self.ep_rank * self.num_local_experts
@@ -1300,16 +1386,40 @@ class GroupedExpertsTE(nn.Module):
             token_probs=weights,
             token_indices=indices,
         )
-        permuted_probs = permuted_probs.unsqueeze(-1)
 
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        fp8_active = FP8GlobalStateManager.is_fp8_enabled()
+
+        if self.use_te_ops:
+            if not isinstance(tokens_per_expert, torch.Tensor):
+                tokens_per_expert = torch.tensor(
+                    tokens_per_expert,
+                    dtype=torch.int64,
+                    device=permuted_local_hidden_states.device,
+                )
+            else:
+                tokens_per_expert = tokens_per_expert.to(
+                    device=permuted_local_hidden_states.device,
+                    dtype=torch.int64,
+                )
+            permuted_probs = permuted_probs.reshape(-1).to(permuted_local_hidden_states.dtype)
+            fc2_extra_inputs = (tokens_per_expert, permuted_probs) if self.expert_bias else (tokens_per_expert,)
+            output2 = self._te_grouped_mlp(
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                permuted_probs,
+                *fc2_extra_inputs,
+            )
+            self._check_te_ops_fusion(fp8_active)
+            return self.token_dispatcher.token_unpermutation(output2)
+
+        permuted_probs = permuted_probs.unsqueeze(-1)
         if isinstance(tokens_per_expert, torch.Tensor):
             m_splits = tokens_per_expert.tolist()
         else:
             m_splits = list(tokens_per_expert)
 
-        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
-
-        fp8_active = FP8GlobalStateManager.is_fp8_enabled()
         actual_m_splits = None
         if fp8_active:
             actual_m_splits = m_splits
@@ -1352,8 +1462,59 @@ class GroupedExpertsTE(nn.Module):
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
 
+    def _check_te_ops_fusion(self, fp8_active: bool) -> None:
+        """Fail loudly if an explicitly requested MXFP8 fusion silently fell back."""
+        if self._te_ops_fusion_checked or not fp8_active:
+            return
+
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        recipe = FP8GlobalStateManager.get_fp8_recipe()
+        fusion_requested = (
+            recipe is not None and recipe.mxfp8() and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) > 0
+        )
+        if not fusion_requested:
+            return
+
+        self._te_ops_fusion_checked = True
+        module_groups = getattr(self._te_grouped_mlp, "_module_groups", None) or []
+        forward_ops = getattr(module_groups[0], "_forward_ops", []) if module_groups else []
+        backward_ops = getattr(module_groups[0], "_backward_ops", []) if module_groups else []
+        forward_fusion_active = any(
+            "ForwardGroupedMLP_CuTeGEMM" in type(op_and_indices[0]).__name__ for op_and_indices in forward_ops
+        )
+        backward_fusion_active = any(
+            "BackwardGroupedMLP_CuTeGEMM" in type(op_and_indices[0]).__name__ for op_and_indices in backward_ops
+        )
+        if not forward_fusion_active or not backward_fusion_active:
+            raise RuntimeError(
+                "TE CuTe DSL grouped-MLP forward/backward fusion was requested but did not fully activate. "
+                "Check Transformer Engine >=2.15, nvidia-cudnn-frontend >=1.23, "
+                "SM100, MXFP8 autocast, and 32-wide GLU interleaving."
+            )
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.warning("TE CuTe DSL MXFP8 grouped-MLP forward/backward fusion is active.")
+
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         """Initialize weights using reset_parameters()"""
+        if self.use_te_ops:
+            # TE ops GroupedLinear.reset_parameters() replaces every Parameter object.
+            # At this point EP/FSDP has already attached sharding metadata, so initialize
+            # the materialized storage in-place instead of invalidating those wrappers.
+            with torch.no_grad():
+                for linear in (self.gate_up_linear, self.down_linear):
+                    bound = 1 / math.sqrt(linear.in_features)
+                    for group_idx in range(self._group_count(linear)):
+                        weight = getattr(linear, f"weight{group_idx}")
+                        if isinstance(weight, DTensor):
+                            weight = weight.to_local()
+                        weight.uniform_(-bound, bound)
+                        if linear.use_bias:
+                            bias = getattr(linear, f"bias{group_idx}")
+                            if isinstance(bias, DTensor):
+                                bias = bias.to_local()
+                            bias.zero_()
+            return
         self.gate_up_linear.reset_parameters()
         self.down_linear.reset_parameters()
 

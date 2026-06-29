@@ -173,6 +173,19 @@ class TestBenchmarkingRecipeInitialization:
 
             assert recipe._bench_steps == mock_config.step_scheduler.max_steps
 
+    def test_init_can_disable_synchronizing_detailed_timers(self, mock_config):
+        """Performance recipes can retain only the synchronized iteration timer."""
+        mock_config.benchmark.detailed_timers = False
+
+        with (
+            patch("nemo_automodel.recipes.llm.benchmark._infer_vocab_size", return_value=50257),
+            patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"),
+        ):
+            recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
+
+        assert recipe._bench_detailed_timers is False
+        assert recipe.timers._log_level == 1
+
     def test_init_infers_vocab_size(self, mock_config):
         """Test that vocab_size is inferred from model config."""
         mock_model_config = MagicMock()

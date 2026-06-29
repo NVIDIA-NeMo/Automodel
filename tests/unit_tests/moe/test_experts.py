@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import math
 from unittest.mock import Mock, patch
 
 import pytest
@@ -1036,6 +1037,53 @@ class TestNonGatedActivations:
             swiglu_config.dim,
             swiglu_config.moe_inter_dim * 2,
         )
+
+
+@pytest.mark.parametrize("tail_shape", [(), (3,)])
+def test_te_ops_glu_block_interleave_roundtrip(tail_shape):
+    """TE's 32-wide GLU layout round-trips weights and biases without reordering values."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    canonical = torch.arange(2 * 128 * max(1, int(torch.tensor(tail_shape).prod())), dtype=torch.float32)
+    canonical = canonical.reshape(2, 128, *tail_shape)
+
+    interleaved = GroupedExpertsTE._interleave_glu_blocks(canonical)
+    expected_prefix = torch.cat((canonical[:, :64:2], canonical[:, 1:64:2]), dim=1)
+
+    torch.testing.assert_close(interleaved[:, :64], expected_prefix)
+    torch.testing.assert_close(GroupedExpertsTE._deinterleave_glu_blocks(interleaved), canonical)
+
+
+def test_te_ops_init_weights_preserves_parameter_objects():
+    """TE-ops initialization must not replace parameters after FSDP has wrapped them."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_groups = 2
+            self.in_features = 8
+            self.use_bias = True
+            for group_idx in range(self.num_groups):
+                self.register_parameter(f"weight{group_idx}", torch.nn.Parameter(torch.zeros(8, 8)))
+                self.register_parameter(f"bias{group_idx}", torch.nn.Parameter(torch.ones(8)))
+
+    experts = GroupedExpertsTE.__new__(GroupedExpertsTE)
+    torch.nn.Module.__init__(experts)
+    experts.use_te_ops = True
+    experts.gate_up_linear = FakeGroupedLinear()
+    experts.down_linear = FakeGroupedLinear()
+    parameter_ids = {name: id(param) for name, param in experts.named_parameters()}
+
+    experts.init_weights(torch.device("cpu"))
+
+    assert {name: id(param) for name, param in experts.named_parameters()} == parameter_ids
+    for name, param in experts.named_parameters():
+        if "bias" in name:
+            torch.testing.assert_close(param, torch.zeros_like(param))
+        else:
+            assert torch.count_nonzero(param) > 0
+            assert param.abs().max() <= 1 / math.sqrt(8)
 
 
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import json
 import logging
 import pathlib
@@ -121,6 +122,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self._bench_nsys_end = bench_cfg.nsys_end
         self._bench_nsys_ranks = bench_cfg.nsys_ranks
         self._bench_json_output_path = getattr(bench_cfg, "json_output_path", None)
+        # Detailed forward/backward and optimizer timers synchronize CUDA at every
+        # context boundary. That is useful for diagnosis, but it perturbs throughput
+        # measurements by preventing work from adjacent gradient-accumulation steps
+        # from remaining asynchronously queued. Keep the legacy behavior by default
+        # and let performance recipes retain only the synchronized outer iteration
+        # timer.
+        self._bench_detailed_timers = getattr(bench_cfg, "detailed_timers", True)
         self._wandb_enabled = cfg.get("wandb", None) is not None
 
         # Infer max_steps from step_scheduler
@@ -145,7 +153,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 logger.info(f"Using batch_size={local_batch_size} from step_scheduler.local_batch_size")
 
         super().__init__(cfg)
-        self.timers = Timers(log_level=2, log_option="minmax")
+        self.timers = Timers(log_level=2 if self._bench_detailed_timers else 1, log_option="minmax")
+        self.partial_cuda_graph_manager = None
 
     def setup(self):
         """Setup the benchmarking environment.
@@ -164,6 +173,17 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Clear validation dataloader (not needed for benchmarking)
         self.val_dataloader = None
+
+        # Partial CUDA graphs are benchmark-only and deliberately start with one
+        # fully eager iteration. Temporary hooks record detached call samples;
+        # capture happens after that iteration's optimizer step, outside its timer.
+        from nemo_automodel.recipes.llm.partial_cuda_graphs import PartialCudaGraphManager
+
+        self.partial_cuda_graph_manager = PartialCudaGraphManager.from_model_parts(
+            self.model_parts,
+            activation_checkpointing=bool(getattr(self, "activation_checkpointing", False)),
+        )
+        self._validate_partial_graph_optimizers()
 
         # Get step_scheduler config
         seq_len = self._bench_seq_len
@@ -236,6 +256,33 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             reset=True,
             barrier=True,
         )
+
+    def _validate_partial_graph_optimizers(self) -> None:
+        """Require zeroing that preserves TE's persistent graph grad buffers."""
+        if self.partial_cuda_graph_manager is None:
+            return
+        for optimizer in self.optimizer:
+            try:
+                inspect.signature(optimizer.zero_grad).bind(set_to_none=False)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(
+                    "Partial CUDA graphs require optimizer.zero_grad(set_to_none=False) support"
+                ) from error
+
+    def _zero_optimizer_gradients(self) -> None:
+        """Zero gradients without releasing static buffers when graphs are active."""
+        for optimizer in self.optimizer:
+            if self.partial_cuda_graph_manager is None:
+                optimizer.zero_grad()
+            else:
+                # Replacing TE's static grad buffers with None can lose or double
+                # accumulation across graph-replayed GA microbatches.
+                try:
+                    optimizer.zero_grad(set_to_none=False)
+                except TypeError as error:
+                    raise RuntimeError(
+                        "Partial CUDA graphs require optimizer.zero_grad(set_to_none=False) support"
+                    ) from error
 
     def _mtp_tflops(self, global_batch_size, seq_len):
         """TFLOPs added by a Multi-Token-Prediction (MTP) head, if the model has one.
@@ -333,8 +380,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 logger.info(f"Rank {rank} | Iteration {i}")
 
             # Zero gradients
-            for opt in self.optimizer:
-                opt.zero_grad()
+            self._zero_optimizer_gradients()
 
             # Time the iteration
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
@@ -376,6 +422,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         opt.step()
                     logger.debug("Optimizer step")
 
+            if i == 0 and self.partial_cuda_graph_manager is not None:
+                self.partial_cuda_graph_manager.capture()
+
             # Synchronize num_label_tokens across DP ranks
             num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
             num_label_tokens_tensor = self._dp_allreduce(num_label_tokens_tensor)
@@ -412,6 +461,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
             # Calculate and log MFU
             self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
+            if self.partial_cuda_graph_manager is not None and (i == 1 or i == steps - 1):
+                self.partial_cuda_graph_manager.log_stats(f"iteration-{i}")
 
             # Stop nsys profiling if configured
             if i == nsys_end and rank in nsys_ranks:
@@ -439,7 +490,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             logger.info(f"MFU: {mfu:.6f}%")
 
         # Log detailed timers
-        timer_names = [iter_timer, "optimizer"] + [f"forward_backward_{ga_step_idx}" for ga_step_idx in range(ga_steps)]
+        timer_names = [iter_timer]
+        if self._bench_detailed_timers:
+            timer_names += ["optimizer"] + [f"forward_backward_{ga_step_idx}" for ga_step_idx in range(ga_steps)]
         # Log timers to wandb
         if self._wandb_enabled:
             self.timers.write_to_wandb(

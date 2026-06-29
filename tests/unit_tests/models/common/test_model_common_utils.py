@@ -99,6 +99,10 @@ class TestTEFp8Config:
         cfg = TEFp8Config(recipe="block")
         assert cfg.recipe == "block"
 
+    def test_fp8_dpa(self):
+        cfg = TEFp8Config(recipe="mxfp8", fp8_dpa=True)
+        assert cfg.fp8_dpa is True
+
     def test_passthrough_recipe_object(self):
         """Non-string recipe objects are passed through directly."""
         sentinel = object()
@@ -127,9 +131,10 @@ class TestBackendConfigTeFp8:
 
     def test_te_fp8_dict_normalized(self):
         """A dict te_fp8 is converted to TEFp8Config."""
-        cfg = BackendConfig(te_fp8={"recipe": "block"}, experts="te", dispatcher="deepep")
+        cfg = BackendConfig(te_fp8={"recipe": "block", "fp8_dpa": True}, experts="te", dispatcher="deepep")
         assert isinstance(cfg.te_fp8, TEFp8Config)
         assert cfg.te_fp8.recipe == "block"
+        assert cfg.te_fp8.fp8_dpa is True
 
     def test_te_fp8_requires_te_backend(self):
         """te_fp8 requires linear='te' or experts='te'."""

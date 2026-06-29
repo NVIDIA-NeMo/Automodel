@@ -108,9 +108,13 @@ class TEFp8Config:
     scales). Unlike torchao's MXFP8 grouped GEMM, TE's MXFP8 backward is mature (no
     e8m0-overflow NaN), which is why GPT-OSS experts (grouped + bias) use the
     ``experts="te"`` path with this recipe instead of ``experts="torch_mm_mxfp8"``.
+
+    Set ``fp8_dpa=True`` to let TE run dot-product attention in FP8 as well. This
+    mirrors Megatron's ``fp8_dot_product_attention`` option for the MXFP8 recipe.
     """
 
     recipe: Literal["current", "block", "mxfp8"] | Any = "current"
+    fp8_dpa: bool = False
 
     def build_recipe(self):
         """Build and return the TE FP8 recipe object.
@@ -137,7 +141,7 @@ class TEFp8Config:
                     "(TE >= ~2.3). The installed TE does not provide it; rebuild on a newer TE image."
                 ) from e
             logger.warning("te_fp8.recipe='mxfp8': using TE MXFP8BlockScaling (mature MXFP8 backward).")
-            return MXFP8BlockScaling()
+            return MXFP8BlockScaling(fp8_dpa=self.fp8_dpa)
         if self.recipe == "block":
             return Float8BlockScaling()
         return Float8CurrentScaling()
@@ -163,7 +167,8 @@ class BackendConfig:
         rms_norm: RMSNorm backend ("torch", "torch_fp32", or "te").
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
-            "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
+            "te" uses TE GroupedLinear, "te_ops" uses TE's fusible ops graph,
+            "gmm" uses grouped_gemm.ops.gmm,
             "torch_mm" uses torch._grouped_mm, "torch_mm_mxfp8" uses torch._grouped_mm
             dispatch but routes the expert grouped GEMMs through torchao's MXFP8
             scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
@@ -191,13 +196,19 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
+        partial_cuda_graph_attention: Benchmark-only opt-in that captures GPT-OSS TE
+            FusedAttention after one eager iteration. The DPA compute must remain BF16.
+        partial_cuda_graph_experts: Benchmark-only opt-in that captures GPT-OSS TE-ops
+            expert compute while leaving routing and token dispatch eager.
+        partial_cuda_graph_layer_limit: Positive number of leading GPT-OSS layers to graph.
+            Limiting the layer count bounds persistent forward/backward graph buffers.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
-    experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
+    experts: Literal["torch", "te", "te_ops", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
     dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep"] = (
@@ -226,6 +237,9 @@ class BackendConfig:
     # fullgraph can't trace), so it requires attn="sdpa", linear="torch", rms_norm="torch",
     # rope_fusion=False. Default False.
     compile_attn: bool = False
+    partial_cuda_graph_attention: bool = False
+    partial_cuda_graph_experts: bool = False
+    partial_cuda_graph_layer_limit: int = 0
 
     def __post_init__(self):
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
@@ -249,7 +263,11 @@ class BackendConfig:
             self.enable_deepep = None
 
         # Backward compatibility
-        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep"):
+        if self.experts in ("te", "te_ops", "gmm") and self.dispatcher not in (
+            "deepep",
+            "hybridep",
+            "uccl_ep",
+        ):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():
@@ -261,11 +279,24 @@ class BackendConfig:
             self.dispatcher = "torch"
             self.experts = "torch_mm"
 
+        partial_cuda_graph_enabled = self.partial_cuda_graph_attention or self.partial_cuda_graph_experts
+        if partial_cuda_graph_enabled and self.partial_cuda_graph_layer_limit <= 0:
+            raise ValueError("partial_cuda_graph_layer_limit must be positive when partial CUDA graphs are enabled")
+        if self.partial_cuda_graph_attention and self.attn != "te":
+            raise ValueError("partial_cuda_graph_attention requires attn='te'")
+        if self.partial_cuda_graph_attention and self.te_fp8 is not None:
+            recipe_fp8_dpa = getattr(self.te_fp8.recipe, "fp8_dpa", False)
+            if self.te_fp8.fp8_dpa or recipe_fp8_dpa:
+                raise ValueError("partial_cuda_graph_attention requires BF16 dot-product attention (fp8_dpa=False)")
+        if self.partial_cuda_graph_experts and self.experts != "te_ops":
+            raise ValueError("partial_cuda_graph_experts requires experts='te_ops'")
+
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
-        if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":
+        if self.te_fp8 is not None and self.linear != "te" and self.experts not in ("te", "te_ops"):
             raise ValueError(
                 "te_fp8 requires at least one TE backend "
-                f"(linear='te' or experts='te'), but got linear='{self.linear}', experts='{self.experts}'"
+                f"(linear='te' or experts in ('te', 'te_ops')), but got "
+                f"linear='{self.linear}', experts='{self.experts}'"
             )
 
 

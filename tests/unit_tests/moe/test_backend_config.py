@@ -71,6 +71,28 @@ class TestBackendConfigExpertsDispatcherValidation:
         assert config.experts == "te"
         assert config.dispatcher == "deepep"
 
+    def test_te_ops_experts_with_hybridep_valid(self):
+        """Test that the TE fusible-ops backend is valid with HybridEP."""
+        config = BackendConfig(experts="te_ops", dispatcher="hybridep")
+        assert config.experts == "te_ops"
+        assert config.dispatcher == "hybridep"
+
+    def test_te_ops_experts_without_ep_dispatcher_falls_back(self):
+        """Test that TE fusible ops follow regular TE dispatcher validation."""
+        config = BackendConfig(experts="te_ops", dispatcher="torch")
+        assert config.experts == "torch_mm"
+        assert config.dispatcher == "torch"
+
+    def test_te_ops_experts_accept_mxfp8(self):
+        """Test that MXFP8 accepts TE fusible ops as its only TE backend."""
+        config = BackendConfig(
+            linear="torch",
+            experts="te_ops",
+            dispatcher="hybridep",
+            te_fp8={"recipe": "mxfp8"},
+        )
+        assert config.te_fp8.recipe == "mxfp8"
+
     def test_gmm_experts_with_deepep_valid(self):
         """Test that gmm experts with deepep dispatcher is valid."""
         config = BackendConfig(experts="gmm", dispatcher="deepep")
@@ -100,6 +122,63 @@ class TestBackendConfigExpertsDispatcherValidation:
         config = BackendConfig(experts="torch_mm", dispatcher="deepep")
         assert config.experts == "torch_mm"
         assert config.dispatcher == "deepep"
+
+
+class TestBackendConfigPartialCudaGraphs:
+    """Partial CUDA graphs stay explicit, bounded, and BF16 for attention."""
+
+    def test_defaults_disabled(self):
+        config = BackendConfig()
+        assert config.partial_cuda_graph_attention is False
+        assert config.partial_cuda_graph_experts is False
+        assert config.partial_cuda_graph_layer_limit == 0
+
+    def test_enabled_scope_requires_positive_layer_limit(self):
+        with pytest.raises(ValueError, match="layer_limit must be positive"):
+            BackendConfig(attn="te", partial_cuda_graph_attention=True)
+
+    def test_attention_scope_requires_te(self):
+        with pytest.raises(ValueError, match="requires attn='te'"):
+            BackendConfig(attn="sdpa", partial_cuda_graph_attention=True, partial_cuda_graph_layer_limit=1)
+
+    def test_attention_scope_accepts_bf16_dpa_inside_mxfp8_recipe(self):
+        config = BackendConfig(
+            attn="te",
+            linear="te",
+            te_fp8={"recipe": "mxfp8", "fp8_dpa": False},
+            partial_cuda_graph_attention=True,
+            partial_cuda_graph_layer_limit=1,
+        )
+        assert config.te_fp8.fp8_dpa is False
+
+    def test_attention_scope_rejects_fp8_dpa(self):
+        with pytest.raises(ValueError, match="BF16 dot-product attention"):
+            BackendConfig(
+                attn="te",
+                linear="te",
+                te_fp8={"recipe": "mxfp8", "fp8_dpa": True},
+                partial_cuda_graph_attention=True,
+                partial_cuda_graph_layer_limit=1,
+            )
+
+    def test_expert_scope_requires_te_ops(self):
+        with pytest.raises(ValueError, match="requires experts='te_ops'"):
+            BackendConfig(
+                experts="te",
+                dispatcher="hybridep",
+                partial_cuda_graph_experts=True,
+                partial_cuda_graph_layer_limit=1,
+            )
+
+    def test_expert_scope_allows_learned_dynamic_routing(self):
+        config = BackendConfig(
+            experts="te_ops",
+            dispatcher="hybridep",
+            fake_balanced_gate=False,
+            partial_cuda_graph_experts=True,
+            partial_cuda_graph_layer_limit=2,
+        )
+        assert config.partial_cuda_graph_experts is True
 
 
 class TestBackendConfigFakeGateNoise:

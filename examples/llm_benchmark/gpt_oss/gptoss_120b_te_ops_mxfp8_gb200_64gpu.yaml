@@ -1,0 +1,109 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# GPT-OSS 120B MXFP8 throughput recipe at the 26.06 Megatron comparison
+# geometry: 16 GB200 nodes x 4 GPUs, EP64, MBS4, GBS1280 (GA5).
+# The expert MLP uses TE's CuTe-DSL GroupedLinear + QGeGLU + GroupedLinear
+# forward/backward fusion. No activation recompute is used. Detailed sub-step
+# timers are disabled so their CUDA synchronizations do not serialize gradient
+# accumulation; the synchronized outer iteration timer remains enabled.
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+seed: 1234
+
+benchmark:
+  warmup_steps: 10
+  peak_tflops: 5000
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+  num_nodes: 16
+  detailed_timers: false
+
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 1280
+  local_batch_size: 4
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 30
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: false
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
+  moe:
+    reshard_after_forward: false
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: openai/gpt-oss-120b
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: true
+    experts: te_ops
+    dispatcher: hybridep
+    dispatcher_num_sms: 32
+    fake_balanced_gate: true
+    enable_hf_state_dict_adapter: false
+    enable_fsdp_optimizations: true
+    te_fp8:
+      recipe: mxfp8
+      # Keep dot-product attention in BF16; MXFP8 is restricted to the MLP path.
+      fp8_dpa: false
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  seq_len: 4096
+  num_samples: 100000
+
+dataloader:
+  batch_size: null
+  _target_: torch.utils.data.DataLoader
+  num_workers: 0
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 0.0001
+  weight_decay: 0
+  foreach: false
+
+ci:
+  time: "00:40:00"
+  nodes: 16
+  cluster_tag: gb200
+  ep_size: 64
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    NVTE_CUTEDSL_FUSED_GROUPED_MLP: "1"

@@ -658,7 +658,7 @@ class MoE(nn.Module):
                     dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
             else:
-                # experts == "te"
+                # experts in ("te", "te_ops")
                 self.experts = GroupedExpertsTE(
                     config,
                     backend=backend,
