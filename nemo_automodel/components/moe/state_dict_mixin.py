@@ -644,12 +644,16 @@ class MoESplitExpertsStateDictMixin:
         # rebuild path: never mark these keys in-place-loaded when ``quantization`` is set.
         quantization = kwargs.get("quantization", False)
 
-        # GroupedExpertsTE (backend.experts == "te") exposes gate_and_up_projs/down_projs as a
+        # GroupedExpertsTE (backend.experts in ("te", "te_ops")) exposes
+        # gate_and_up_projs/down_projs as a
         # torch.stack COPY of TE's per-expert weight{i} params; it does not alias the model's
         # grouped storage, so an in-place copy_ would write that throwaway buffer and leave the TE
         # experts at their initial values. Force the rebuild path for it. Other expert backends
         # keep a real aliasing stacked Parameter and are unaffected.
-        experts_alias_grouped_storage = getattr(getattr(self, "backend", None), "experts", None) != "te"
+        experts_alias_grouped_storage = getattr(getattr(self, "backend", None), "experts", None) not in (
+            "te",
+            "te_ops",
+        )
 
         from nemo_automodel.components.moe.state_dict_utils import (
             is_dtensor,

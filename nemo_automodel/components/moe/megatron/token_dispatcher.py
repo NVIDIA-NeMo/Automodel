@@ -342,6 +342,7 @@ class _HybridEPManager(_DispatchManager):
         router_topk: int,
         permute_fusion: bool = False,
         moe_hybridep_num_sms: int = 24,
+        moe_router_expert_pad_multiple: Optional[int] = None,
     ):
         self.group = group
         self.num_local_experts = num_local_experts
@@ -356,7 +357,7 @@ class _HybridEPManager(_DispatchManager):
         self.routing_map: Optional[torch.Tensor] = None
         # Handle used for combine operation
         self.handle = None
-        self.pad_multiple = None
+        self.pad_multiple = moe_router_expert_pad_multiple
 
         if hybrid_ep_dispatch is None:
             raise ImportError(
@@ -600,6 +601,7 @@ class MoEFlexTokenDispatcher:
                         router_topk=self.tp_size * self.config.moe_router_topk,
                         permute_fusion=self.config.moe_permute_fusion,
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
+                        moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
             else:
@@ -610,6 +612,7 @@ class MoEFlexTokenDispatcher:
                     router_topk=self.tp_size * self.config.moe_router_topk,
                     permute_fusion=self.config.moe_permute_fusion,
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
+                    moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
                 )
         else:
             raise ValueError(

@@ -71,6 +71,28 @@ class TestBackendConfigExpertsDispatcherValidation:
         assert config.experts == "te"
         assert config.dispatcher == "deepep"
 
+    def test_te_ops_experts_with_hybridep_valid(self):
+        """Test that the TE fusible-ops backend is valid with HybridEP."""
+        config = BackendConfig(experts="te_ops", dispatcher="hybridep")
+        assert config.experts == "te_ops"
+        assert config.dispatcher == "hybridep"
+
+    def test_te_ops_experts_without_ep_dispatcher_falls_back(self):
+        """Test that TE fusible ops follow regular TE dispatcher validation."""
+        config = BackendConfig(experts="te_ops", dispatcher="torch")
+        assert config.experts == "torch_mm"
+        assert config.dispatcher == "torch"
+
+    def test_te_ops_experts_accept_mxfp8(self):
+        """Test that MXFP8 accepts TE fusible ops as its only TE backend."""
+        config = BackendConfig(
+            linear="torch",
+            experts="te_ops",
+            dispatcher="hybridep",
+            te_fp8={"recipe": "mxfp8"},
+        )
+        assert config.te_fp8.recipe == "mxfp8"
+
     def test_gmm_experts_with_deepep_valid(self):
         """Test that gmm experts with deepep dispatcher is valid."""
         config = BackendConfig(experts="gmm", dispatcher="deepep")

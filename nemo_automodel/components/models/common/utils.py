@@ -163,7 +163,8 @@ class BackendConfig:
         rms_norm: RMSNorm backend ("torch", "torch_fp32", or "te").
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
-            "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
+            "te" uses TE GroupedLinear, "te_ops" uses TE's fusible ops graph,
+            "gmm" uses grouped_gemm.ops.gmm,
             "torch_mm" uses torch._grouped_mm, "torch_mm_mxfp8" uses torch._grouped_mm
             dispatch but routes the expert grouped GEMMs through torchao's MXFP8
             scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
@@ -197,7 +198,7 @@ class BackendConfig:
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
-    experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
+    experts: Literal["torch", "te", "te_ops", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
     dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep"] = (
@@ -249,7 +250,11 @@ class BackendConfig:
             self.enable_deepep = None
 
         # Backward compatibility
-        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep"):
+        if self.experts in ("te", "te_ops", "gmm") and self.dispatcher not in (
+            "deepep",
+            "hybridep",
+            "uccl_ep",
+        ):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():
@@ -262,10 +267,11 @@ class BackendConfig:
             self.experts = "torch_mm"
 
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
-        if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":
+        if self.te_fp8 is not None and self.linear != "te" and self.experts not in ("te", "te_ops"):
             raise ValueError(
                 "te_fp8 requires at least one TE backend "
-                f"(linear='te' or experts='te'), but got linear='{self.linear}', experts='{self.experts}'"
+                f"(linear='te' or experts in ('te', 'te_ops')), but got "
+                f"linear='{self.linear}', experts='{self.experts}'"
             )
 
 

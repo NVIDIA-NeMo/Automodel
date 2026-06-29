@@ -61,20 +61,6 @@ RUN if [ -f /usr/local/bin/torchrun ]; then \
 
 FROM update_base_container AS automodel_dep
 
-# Install TE
-ARG INSTALL_TE=True
-ARG TE_COMMIT=release_v2.14
-RUN if [ "$INSTALL_TE" = "True" ]; then \
-    git clone https://github.com/NVIDIA/TransformerEngine.git && \
-    cd TransformerEngine && \
-    git fetch origin $TE_COMMIT && \
-    git checkout FETCH_HEAD && \
-    git submodule init && git submodule update && \
-    pip install nvidia-mathdx==25.1.1 && \
-    env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v . && \
-    cd ../ && rm -rf TransformerEngine; \
-    fi
-
 # Install HybridEP / DeepEP. Build with apt rdma-core v60 (so build==runtime libibverbs)
 # and RDMA_CORE_HOME symlinked to the system install; create the libnvshmem_host.so->.so.3
 # symlink required for DeepEP fabric handle ops; use the nvshmem wheel 3.6.5 and pin
@@ -171,6 +157,23 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
     uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS --no-cache
+
+# Install TE after uv sync so the lockfile cannot replace this source build with
+# an older wheel. CuTe-DSL grouped-MLP fusion requires TE 2.16.1 and cuDNN FE 1.23.
+ARG INSTALL_TE=True
+ARG TE_COMMIT=v2.16.1
+RUN if [ "$INSTALL_TE" = "True" ]; then \
+    pip uninstall -y transformer-engine transformer-engine-torch transformer-engine-cu12 transformer-engine-cu13 && \
+    git clone https://github.com/NVIDIA/TransformerEngine.git && \
+    cd TransformerEngine && \
+    git fetch origin $TE_COMMIT && \
+    git checkout FETCH_HEAD && \
+    git submodule init && git submodule update && \
+    pip install nvidia-mathdx==25.1.1 "nvidia-cudnn-frontend[cutedsl]==1.23.0" && \
+    env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v . && \
+    cd ../ && rm -rf TransformerEngine && \
+    python -c "from importlib.metadata import version; from packaging.version import Version; import transformer_engine.pytorch; assert Version(version('transformer-engine')).base_version == '2.16.1'; assert Version(version('nvidia-cudnn-frontend')) >= Version('1.23'); from cudnn import grouped_gemm_dglu_wrapper_sm100, grouped_gemm_glu_wrapper_sm100, grouped_gemm_quant_wrapper_sm100, grouped_gemm_wgrad_wrapper_sm100"; \
+    fi
 
 # MXFP8 MoE training (experts="torch_mm_mxfp8"): the NGC PyTorch base does not bundle
 # torchao and uv-pytorch.toml gates it off (sys_platform=='never'), so `uv sync` skips
