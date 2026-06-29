@@ -1387,10 +1387,6 @@ class GroupedExpertsTE(nn.Module):
             token_indices=indices,
         )
 
-        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
-
-        fp8_active = FP8GlobalStateManager.is_fp8_enabled()
-
         if self.use_te_ops:
             if not isinstance(tokens_per_expert, torch.Tensor):
                 tokens_per_expert = torch.tensor(
@@ -1404,6 +1400,21 @@ class GroupedExpertsTE(nn.Module):
                     dtype=torch.int64,
                 )
             permuted_probs = permuted_probs.reshape(-1).to(permuted_local_hidden_states.dtype)
+
+            if permuted_local_hidden_states.shape[0] == 0:
+                # Preserve the dispatch autograd edge so every EP rank participates in
+                # the reverse communication, even when this rank received no tokens.
+                zero = permuted_local_hidden_states.sum() * 0 + permuted_probs.sum() * 0
+                for linear in (self.gate_up_linear, self.down_linear):
+                    for parameter in linear.parameters():
+                        local_parameter = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+                        zero = zero + local_parameter.reshape(-1)[0].to(zero.dtype) * 0
+                output2 = permuted_local_hidden_states * 0 + zero
+                return self.token_dispatcher.token_unpermutation(output2)
+
+            from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+            fp8_active = FP8GlobalStateManager.is_fp8_enabled()
             fc2_extra_inputs = (tokens_per_expert, permuted_probs) if self.expert_bias else (tokens_per_expert,)
             output2 = self._te_grouped_mlp(
                 permuted_local_hidden_states,
@@ -1413,6 +1424,10 @@ class GroupedExpertsTE(nn.Module):
             )
             self._check_te_ops_fusion(fp8_active)
             return self.token_dispatcher.token_unpermutation(output2)
+
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        fp8_active = FP8GlobalStateManager.is_fp8_enabled()
 
         permuted_probs = permuted_probs.unsqueeze(-1)
         if isinstance(tokens_per_expert, torch.Tensor):

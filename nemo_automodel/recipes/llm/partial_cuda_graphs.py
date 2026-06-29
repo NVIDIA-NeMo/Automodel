@@ -425,18 +425,38 @@ class PartialCudaGraphManager:
             entry.start_recording()
 
     def capture(self) -> None:
-        """Batch-capture all recorded targets in real forward order."""
+        """Batch-capture all observed targets in real forward order."""
         if self._captured:
             return
         for entry in self.entries:
             entry.stop_recording()
 
-        adapters = tuple(entry.build_adapter() for entry in self.entries)
-        captured_calls = tuple(entry.captured_call for entry in self.entries)
-        if any(call is None for call in captured_calls):
-            raise RuntimeError("Every partial CUDA graph target must have an iteration-0 sample")
+        skipped_entries = tuple(entry for entry in self.entries if entry.captured_call is None)
+        unexpected_skips = tuple(
+            entry.name for entry in skipped_entries if entry.canonicalizer is not _canonicalize_te_ops_experts
+        )
+        if unexpected_skips:
+            raise RuntimeError(
+                "Every non-expert partial CUDA graph target must have an iteration-0 sample; "
+                f"missing samples for {unexpected_skips}"
+            )
+        for entry in skipped_entries:
+            logger.warning(
+                "Skipping partial CUDA graph capture for %s because it received no iteration-0 expert tokens; "
+                "the target will remain eager",
+                entry.name,
+            )
+
+        captured_entries = tuple(entry for entry in self.entries if entry.captured_call is not None)
+        if not captured_entries:
+            self._captured = True
+            self.log_stats("capture")
+            return
+
+        adapters = tuple(entry.build_adapter() for entry in captured_entries)
+        captured_calls = tuple(entry.captured_call for entry in captured_entries)
         sample_args = tuple(call.sample_tensors for call in captured_calls if call is not None)
-        enabled = tuple(entry.fp8_enabled for entry in self.entries)
+        enabled = tuple(entry.fp8_enabled for entry in captured_entries)
         if any(enabled) and self.fp8_recipe is None:
             raise RuntimeError("FP8 expert graph capture requires a Transformer Engine FP8 recipe")
 
@@ -456,11 +476,11 @@ class PartialCudaGraphManager:
 
         if not isinstance(graphed_adapters, tuple):
             graphed_adapters = (graphed_adapters,)
-        if len(graphed_adapters) != len(self.entries):
+        if len(graphed_adapters) != len(captured_entries):
             raise RuntimeError(
-                f"Transformer Engine returned {len(graphed_adapters)} graphs for {len(self.entries)} targets"
+                f"Transformer Engine returned {len(graphed_adapters)} graphs for {len(captured_entries)} targets"
             )
-        for entry, graphed_adapter in zip(self.entries, graphed_adapters):
+        for entry, graphed_adapter in zip(captured_entries, graphed_adapters):
             entry.install(graphed_adapter)
 
         self._captured = True

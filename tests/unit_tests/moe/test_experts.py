@@ -1086,6 +1086,87 @@ def test_te_ops_init_weights_preserves_parameter_objects():
             assert param.abs().max() <= 1 / math.sqrt(8)
 
 
+def test_te_ops_empty_rank_preserves_dispatch_backward_and_explicit_zero_grads():
+    """An empty destination rank must retain EP autograd edges and real expert parameters."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    class FakeExpertLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(4, 4))
+            self.bias = torch.nn.Parameter(torch.randn(4))
+
+    class EmptyDispatch(torch.autograd.Function):
+        backward_called = False
+
+        @staticmethod
+        def forward(ctx, hidden_states, token_probs):
+            ctx.hidden_shape = hidden_states.shape
+            ctx.prob_shape = token_probs.shape
+            return hidden_states[:0], token_probs.reshape(-1)[:0]
+
+        @staticmethod
+        def backward(ctx, grad_hidden_states, grad_token_probs):
+            EmptyDispatch.backward_called = True
+            assert grad_hidden_states.shape[0] == 0
+            assert grad_token_probs.shape[0] == 0
+            return (
+                grad_hidden_states.new_zeros(ctx.hidden_shape),
+                grad_token_probs.new_zeros(ctx.prob_shape),
+            )
+
+    class FakeTokenDispatcher:
+        def __init__(self):
+            self.unpermutation_input = None
+
+        def token_permutation2(self, hidden_states, num_local_tokens, token_probs, token_indices):
+            del num_local_tokens, token_indices
+            dispatched_hidden, dispatched_probs = EmptyDispatch.apply(hidden_states, token_probs)
+            return dispatched_hidden, torch.zeros(2, dtype=torch.int64), dispatched_probs
+
+        def token_unpermutation(self, hidden_states):
+            self.unpermutation_input = hidden_states
+            return hidden_states
+
+    experts = GroupedExpertsTE.__new__(GroupedExpertsTE)
+    torch.nn.Module.__init__(experts)
+    experts.config = Mock(n_routed_experts=2)
+    experts.ep_size = 1
+    experts.use_te_ops = True
+    experts.expert_bias = True
+    experts.gate_up_linear = FakeExpertLinear()
+    experts.down_linear = FakeExpertLinear()
+    experts.__dict__["_te_grouped_mlp"] = Mock(side_effect=AssertionError("empty ranks must bypass TE"))
+    experts.token_dispatcher = FakeTokenDispatcher()
+
+    parameter_ids = {name: id(parameter) for name, parameter in experts.named_parameters()}
+    optimizer = torch.optim.AdamW(experts.parameters(), lr=0.1, weight_decay=0.2)
+    parameters_before_step = {name: parameter.detach().clone() for name, parameter in experts.named_parameters()}
+    hidden_states = torch.randn(3, 4, requires_grad=True)
+    token_probs = torch.randn(3, 2, requires_grad=True)
+    token_indices = torch.zeros(3, 2, dtype=torch.int64)
+
+    output = experts(hidden_states, torch.ones(3, dtype=torch.bool), token_probs, token_indices)
+    assert output.shape == (0, 4)
+    assert experts.token_dispatcher.unpermutation_input is not None
+    experts._te_grouped_mlp.assert_not_called()
+    output.sum().backward()
+
+    assert EmptyDispatch.backward_called
+    assert hidden_states.grad is not None
+    assert token_probs.grad is not None
+    assert torch.count_nonzero(hidden_states.grad) == 0
+    assert torch.count_nonzero(token_probs.grad) == 0
+    assert {name: id(parameter) for name, parameter in experts.named_parameters()} == parameter_ids
+    for parameter in experts.parameters():
+        assert parameter.grad is not None
+        assert torch.count_nonzero(parameter.grad) == 0
+
+    optimizer.step()
+    for name, parameter in experts.named_parameters():
+        torch.testing.assert_close(parameter, parameters_before_step[name] * (1 - 0.1 * 0.2))
+
+
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
 class TestGroupedExpertsTE:
     """Test GroupedExpertsTE module using Transformer Engine's GroupedLinear."""

@@ -109,6 +109,39 @@ def test_discovers_targets_through_fsdp_style_gpt_oss_wrapper():
         entry.stop_recording()
 
 
+def test_empty_expert_sample_is_skipped_while_attention_is_captured(monkeypatch, caplog):
+    _install_fake_graph(monkeypatch)
+    model = _FSDPStyleGptOssWrapper()
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+    assert manager is not None
+
+    attention = model.model.layers["0"].self_attn.attn_module.fused_attention
+    experts = model.model.layers["0"].mlp.experts._te_grouped_mlp
+    attention(torch.ones(2, 3))
+
+    with caplog.at_level("WARNING"):
+        manager.capture()
+
+    attention(torch.ones(2, 3))
+    splits = torch.tensor([1, 1], dtype=torch.int64)
+    probs = torch.ones(2, 1)
+    experts(torch.ones(2, 3), splits, probs, splits, probs)
+
+    assert "received no iteration-0 expert tokens" in caplog.text
+    assert manager.stats() == {"captured": 1, "replayed": 1, "fallback": 0}
+    assert manager.entries[0].capture_count == 1
+    assert manager.entries[1].capture_count == 0
+
+
+def test_missing_attention_sample_still_fails_capture():
+    model = _FSDPStyleGptOssWrapper()
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+    assert manager is not None
+
+    with pytest.raises(RuntimeError, match="non-expert partial CUDA graph target"):
+        manager.capture()
+
+
 def test_rejects_activation_checkpointing():
     model = _FSDPStyleGptOssWrapper()
     with pytest.raises(RuntimeError, match="activation_checkpointing=false"):
