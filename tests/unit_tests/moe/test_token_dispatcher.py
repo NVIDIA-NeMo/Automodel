@@ -115,26 +115,3 @@ def test_hybridep_manager_accepts_expert_padding_multiple():
         )
 
     assert manager.pad_multiple == 256
-
-
-def test_hybridep_manager_builds_aligned_static_receive_budget():
-    """A configured capacity removes dynamic receive sizing and honors TE alignment."""
-    with patch(
-        "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
-        new=lambda *args, **kwargs: None,
-    ):
-        manager = _HybridEPManager(
-            group=None,
-            num_local_experts=2,
-            num_experts=8,
-            router_topk=2,
-            moe_router_expert_pad_multiple=256,
-            moe_hybridep_rank_capacity_factor=1.0,
-        )
-
-    manager.setup_metadata_from_indices(
-        torch.zeros((129, 2), dtype=torch.long),
-        torch.ones((129, 2)),
-    )
-
-    assert manager.num_permuted_tokens == 512

@@ -180,18 +180,6 @@ class BackendConfig:
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
             and allocate dispatched tensors on the communication stream.
-        dispatcher_hybridep_rank_capacity_factor: Optional static upper bound for HybridEP's
-            received-token buffer, as a multiple of local_tokens * router_topk. Supplying a
-            bound avoids HybridEP's dynamic-size host synchronization. AutoModel does not yet
-            retry HybridEP overflow, so this must only be used when the bound is guaranteed
-            (for example, deterministic fake-balanced benchmark routing).
-        dispatcher_hybridep_cache_static_m_splits: Benchmark-only optimization that caches the
-            first GPU ``tokens_per_expert.tolist()`` result in each regular-TE expert layer.
-            Enabling it is a correctness promise that every subsequent forward for that layer
-            has identical expert split sizes. It requires fixed microbatch shape and token masks;
-            variable padding or masks can silently produce incorrect results. The config validator
-            additionally requires regular TE, HybridEP, static capacity, fake-balanced routing,
-            and zero gate noise, but those conditions alone do not prove split-size invariance.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -227,8 +215,6 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
-    dispatcher_hybridep_rank_capacity_factor: float | None = None
-    dispatcher_hybridep_cache_static_m_splits: bool = False
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
@@ -253,32 +239,6 @@ class BackendConfig:
 
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
-
-        if self.dispatcher_hybridep_cache_static_m_splits and (
-            self.experts != "te"
-            or self.dispatcher != "hybridep"
-            or self.dispatcher_hybridep_rank_capacity_factor is None
-            or not self.fake_balanced_gate
-            or self.fake_gate_noise != 0.0
-        ):
-            raise ValueError(
-                "dispatcher_hybridep_cache_static_m_splits requires experts='te', "
-                "dispatcher='hybridep', dispatcher_hybridep_rank_capacity_factor to be configured, "
-                "fake_balanced_gate=True, and fake_gate_noise=0"
-            )
-
-        if (
-            self.dispatcher_hybridep_rank_capacity_factor is not None
-            and self.dispatcher_hybridep_rank_capacity_factor <= 0
-        ):
-            raise ValueError("dispatcher_hybridep_rank_capacity_factor must be positive")
-        if self.dispatcher_hybridep_rank_capacity_factor is not None and (
-            self.dispatcher != "hybridep" or not self.fake_balanced_gate or self.fake_gate_noise != 0.0
-        ):
-            raise ValueError(
-                "dispatcher_hybridep_rank_capacity_factor currently requires dispatcher='hybridep', "
-                "fake_balanced_gate=True, and fake_gate_noise=0"
-            )
 
         # enable_deepep was removed. It is no longer honored; warn (once, on rank 0) if a stale
         # config still sets it so the user migrates to explicit dispatcher/experts. The field is

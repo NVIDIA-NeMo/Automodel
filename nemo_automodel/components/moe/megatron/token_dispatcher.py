@@ -343,7 +343,6 @@ class _HybridEPManager(_DispatchManager):
         permute_fusion: bool = False,
         moe_hybridep_num_sms: int = 24,
         moe_router_expert_pad_multiple: Optional[int] = None,
-        moe_hybridep_rank_capacity_factor: Optional[float] = None,
     ):
         self.group = group
         self.num_local_experts = num_local_experts
@@ -352,7 +351,6 @@ class _HybridEPManager(_DispatchManager):
         self.permute_fusion = permute_fusion
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
         self.num_permuted_tokens = None
-        self.rank_capacity_factor = moe_hybridep_rank_capacity_factor
 
         # Metadata
         self.token_probs: Optional[torch.Tensor] = None
@@ -367,21 +365,11 @@ class _HybridEPManager(_DispatchManager):
                 "https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep."
             )
 
-    def _set_static_token_budget(self, num_tokens: int) -> None:
-        """Set a host-sync-free HybridEP receive bound when one is configured."""
-        if self.rank_capacity_factor is None:
-            self.num_permuted_tokens = None
-            return
-        budget = int(num_tokens * self.router_topk * self.rank_capacity_factor)
-        alignment = self.pad_multiple or 1
-        self.num_permuted_tokens = budget + (-budget % alignment)
-
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         """Process routing map and probabilities to prepare dispatch metadata."""
         num_tokens = routing_map.shape[0]
         self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
         self.token_probs = probs.reshape(num_tokens, self.num_experts)
-        self._set_static_token_budget(num_tokens)
 
     def _indices_to_multihot(self, indices: torch.Tensor, probs: torch.Tensor):
         """Converts a tensor of indices to a multihot vector."""
@@ -411,7 +399,6 @@ class _HybridEPManager(_DispatchManager):
             self.routing_map, self.token_probs = fused_indices_to_multihot(token_indices, token_probs, self.num_experts)
         else:
             self.routing_map, self.token_probs = self._indices_to_multihot(token_indices, token_probs)
-        self._set_static_token_budget(token_indices.shape[0])
 
     def dispatch(
         self,
@@ -419,6 +406,9 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
+        # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
+        # This can happen in non-reentrant activation checkpointing mode.
+        self.num_permuted_tokens = None
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
@@ -434,8 +424,7 @@ class _HybridEPManager(_DispatchManager):
         )
 
         self.tokens_per_expert = tokens_per_expert
-        if self.num_permuted_tokens is None:
-            self.num_permuted_tokens = self.tokens_per_expert.sum()
+        self.num_permuted_tokens = self.tokens_per_expert.sum()
 
         return dispatched_hidden
 
@@ -511,9 +500,6 @@ class TokenDispatcherConfig:
 
     moe_deepep_async_dispatch: bool = False
     """Use asynchronous DeepEP/UCCL-EP dispatch and allocate dispatched tensors on the communication stream."""
-
-    moe_hybridep_rank_capacity_factor: Optional[float] = None
-    """Static HybridEP receive bound relative to local tokens * top-k, or None for dynamic sizing."""
 
 
 class MoEFlexTokenDispatcher:
@@ -616,7 +602,6 @@ class MoEFlexTokenDispatcher:
                         permute_fusion=self.config.moe_permute_fusion,
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                         moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
-                        moe_hybridep_rank_capacity_factor=self.config.moe_hybridep_rank_capacity_factor,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
             else:
@@ -628,7 +613,6 @@ class MoEFlexTokenDispatcher:
                     permute_fusion=self.config.moe_permute_fusion,
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                     moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
-                    moe_hybridep_rank_capacity_factor=self.config.moe_hybridep_rank_capacity_factor,
                 )
         else:
             raise ValueError(

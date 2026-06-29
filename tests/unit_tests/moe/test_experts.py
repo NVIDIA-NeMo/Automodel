@@ -1086,67 +1086,6 @@ def test_te_ops_init_weights_preserves_parameter_objects():
             assert param.abs().max() <= 1 / math.sqrt(8)
 
 
-def test_te_static_m_splits_cache_requires_exact_benchmark_path():
-    """Only deterministic, capacity-bounded HybridEP with regular TE may cache split sizes."""
-    from nemo_automodel.components.moe.experts import GroupedExpertsTE
-
-    backend_kwargs = {
-        "experts": "te",
-        "dispatcher": "hybridep",
-        "dispatcher_hybridep_rank_capacity_factor": 1.0,
-        "dispatcher_hybridep_cache_static_m_splits": True,
-        "fake_balanced_gate": True,
-        "fake_gate_noise": 0.0,
-    }
-    backend = Mock(**backend_kwargs)
-    assert GroupedExpertsTE._should_cache_static_m_splits(backend, "hybridep")
-
-    for attribute, value in (
-        ("dispatcher_hybridep_cache_static_m_splits", False),
-        ("experts", "te_ops"),
-        ("dispatcher", "deepep"),
-        ("dispatcher_hybridep_rank_capacity_factor", None),
-        ("fake_balanced_gate", False),
-        ("fake_gate_noise", 0.1),
-    ):
-        dynamic_backend = Mock(**backend_kwargs)
-        setattr(dynamic_backend, attribute, value)
-        assert not GroupedExpertsTE._should_cache_static_m_splits(dynamic_backend, "hybridep")
-
-    assert not GroupedExpertsTE._should_cache_static_m_splits(backend, "deepep")
-    assert not GroupedExpertsTE._should_cache_static_m_splits(None, "hybridep")
-
-
-def test_te_static_m_splits_cache_reuses_first_tensor_values():
-    """The static path performs one tensor-to-list conversion and reuses that per-layer result."""
-    from nemo_automodel.components.moe.experts import GroupedExpertsTE
-
-    experts = GroupedExpertsTE.__new__(GroupedExpertsTE)
-    experts._cache_static_m_splits = True
-    experts._cached_static_m_splits = None
-
-    assert experts._get_m_splits(torch.tensor([3, 5])) == [3, 5]
-    assert experts._cached_static_m_splits == [3, 5]
-    assert experts._get_m_splits(torch.tensor([1, 7])) == [3, 5]
-
-
-def test_te_m_splits_stays_dynamic_off_static_tensor_path():
-    """Tensor values and dispatcher-provided lists remain dynamic when caching is disabled/inapplicable."""
-    from nemo_automodel.components.moe.experts import GroupedExpertsTE
-
-    experts = GroupedExpertsTE.__new__(GroupedExpertsTE)
-    experts._cache_static_m_splits = False
-    experts._cached_static_m_splits = None
-
-    assert experts._get_m_splits(torch.tensor([3, 5])) == [3, 5]
-    assert experts._get_m_splits(torch.tensor([1, 7])) == [1, 7]
-    assert experts._cached_static_m_splits is None
-
-    experts._cache_static_m_splits = True
-    experts._cached_static_m_splits = [3, 5]
-    assert experts._get_m_splits([1, 7]) == [1, 7]
-
-
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
 class TestGroupedExpertsTE:
     """Test GroupedExpertsTE module using Transformer Engine's GroupedLinear."""

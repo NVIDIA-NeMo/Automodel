@@ -66,13 +66,13 @@ model:
     experts: te_ops
     dispatcher: hybridep
     dispatcher_num_sms: 32
-    dispatcher_hybridep_rank_capacity_factor: 1.0
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
     enable_fsdp_optimizations: true
     te_fp8:
       recipe: mxfp8
-      fp8_dpa: true
+      # Keep dot-product attention in BF16; MXFP8 is restricted to the MLP path.
+      fp8_dpa: false
 
 checkpoint:
   enabled: false
