@@ -138,6 +138,7 @@ class MLA(nn.Module):
         # with a compilable attention backend — TE's fused attention is a custom-autograd
         # black box that fullgraph can't trace. seq_len is fixed here so dynamic=False.
         # Driven by the generic backend.compile_attn flag (the MLA is one attention module).
+        self._compile_attn = False
         self._compiled_forward = None
         if backend.compile_attn:
             if attn_impl != "sdpa":
@@ -148,7 +149,7 @@ class MLA(nn.Module):
                 )
             else:  # pragma: no cover - torch.compile path exercised on GPU benchmark runs only
                 logger.warning("compile MLA forward: torch.compile(fullgraph=True) the MLA forward (attn=sdpa).")
-                self._compiled_forward = torch.compile(self._forward_impl, fullgraph=True, dynamic=False)
+                self._compile_attn = True
 
     def forward(
         self,
@@ -157,6 +158,10 @@ class MLA(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ):
+        # Pipeline splitting deep-copies this module. Compiling in __init__ would leave
+        # the copied stage's function bound to the original meta-device module.
+        if self._compile_attn and self._compiled_forward is None:
+            self._compiled_forward = torch.compile(self._forward_impl, fullgraph=True, dynamic=False)
         if self._compiled_forward is not None:  # pragma: no cover - compiled path only on GPU benchmark runs
             return self._compiled_forward(x, freqs_cis, attention_mask, **attn_kwargs)
         return self._forward_impl(x, freqs_cis, attention_mask, **attn_kwargs)
