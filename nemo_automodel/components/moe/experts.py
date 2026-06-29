@@ -699,6 +699,9 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
+        self.dispatcher_hybridep_rank_capacity_factor = (
+            backend.dispatcher_hybridep_rank_capacity_factor if backend is not None else None
+        )
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -732,6 +735,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_hybridep_rank_capacity_factor=self.dispatcher_hybridep_rank_capacity_factor,
         )
 
         self.n_routed_experts = self.config.n_routed_experts
@@ -951,6 +955,9 @@ class GroupedExpertsTE(nn.Module):
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
+        self.dispatcher_hybridep_rank_capacity_factor = (
+            backend.dispatcher_hybridep_rank_capacity_factor if backend is not None else None
+        )
 
         self._build_grouped_linears(config.n_routed_experts)
         self.expert_activation = get_expert_activation_for_deepep(config)
@@ -1331,6 +1338,7 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_hybridep_rank_capacity_factor=self.dispatcher_hybridep_rank_capacity_factor,
             # The CuTe DSL grouped-MLP kernel requires each expert M dimension
             # to be 256-aligned. Let the dispatcher create/remove padding so the
             # GPU split-size tensor can flow directly into TE without a .tolist()

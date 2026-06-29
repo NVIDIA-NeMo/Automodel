@@ -228,6 +228,25 @@ class TestBackendConfigHybridEP:
         config = BackendConfig(dispatcher="deepep", dispatcher_async_dispatch=True)
         assert config.dispatcher_async_dispatch is True
 
+    def test_hybridep_static_capacity_factor(self):
+        """HybridEP static receive sizing can be enabled for balanced benchmarks."""
+        config = BackendConfig(
+            dispatcher="hybridep",
+            dispatcher_hybridep_rank_capacity_factor=1.0,
+            fake_balanced_gate=True,
+        )
+        assert config.dispatcher_hybridep_rank_capacity_factor == 1.0
+
+    def test_hybridep_static_capacity_factor_must_be_positive(self):
+        """Invalid static capacity bounds fail during config construction."""
+        with pytest.raises(ValueError, match="must be positive"):
+            BackendConfig(dispatcher="hybridep", dispatcher_hybridep_rank_capacity_factor=0.0)
+
+    def test_hybridep_static_capacity_rejects_unbounded_routing(self):
+        """Static sizing stays benchmark-only until overflow replay is implemented."""
+        with pytest.raises(ValueError, match="fake_balanced_gate=True"):
+            BackendConfig(dispatcher="hybridep", dispatcher_hybridep_rank_capacity_factor=1.0)
+
     def test_te_experts_falls_back_with_hybridep(self):
         """Test that te experts with hybridep dispatcher is valid (no fallback)."""
         config = BackendConfig(experts="te", dispatcher="hybridep")

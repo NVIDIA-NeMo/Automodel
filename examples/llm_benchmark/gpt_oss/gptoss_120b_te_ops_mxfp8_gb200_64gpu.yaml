@@ -66,6 +66,7 @@ model:
     experts: te_ops
     dispatcher: hybridep
     dispatcher_num_sms: 64
+    dispatcher_hybridep_rank_capacity_factor: 1.0
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
     enable_fsdp_optimizations: true
