@@ -111,10 +111,10 @@ overrides = [
     { name = "nvidia-cublas", marker = "sys_platform == 'linux'", specifier = "==13.4.1.1" },
     { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'", specifier = ">=2.30.4" },
     { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' and extra == 'cu13'", specifier = ">=2.30,<2.31" },
-    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' and extra == 'cu13-legacy'", specifier = "==2.29.7" },
+    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' and extra == 'cu13-legacy'", specifier = ">=2.30,<2.31" },
     { name = "nvidia-nvshmem-cu12", marker = "sys_platform == 'linux'", specifier = ">=3.7.0" },
     { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' and extra == 'cu13'", specifier = ">=3.7,<3.8" },
-    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' and extra == 'cu13-legacy'", specifier = "==3.4.5" },
+    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' and extra == 'cu13-legacy'", specifier = ">=3.7,<3.8" },
     { name = "thrift", specifier = ">=0.23.0" },
     { name = "urllib3", specifier = ">=2.7.0" },
 ]
@@ -1757,7 +1757,7 @@ wheels = [
 [[package]]
 name = "deep-ep"
 version = "2.0.0+local"
-source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca#7febc6e25660af0f54d95dd781ecdcd62265ecca" }
+source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=567632dd59810d77b3cc05553df953cc0f779799#567632dd59810d77b3cc05553df953cc0f779799" }
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.13.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
@@ -4175,15 +4175,15 @@ cu12 = [
     { name = "transformer-engine", extra = ["core-cu12", "pytorch"], marker = "(sys_platform == 'linux' and extra == 'extra-14-nemo-automodel-cu12') or (extra == 'extra-14-nemo-automodel-cu12' and extra == 'extra-14-nemo-automodel-cu13') or (extra == 'extra-14-nemo-automodel-cu12' and extra == 'extra-14-nemo-automodel-cu13-legacy') or (extra == 'extra-14-nemo-automodel-cu12' and extra == 'extra-14-nemo-automodel-deepep-v1') or (extra == 'extra-14-nemo-automodel-cu13' and extra == 'extra-14-nemo-automodel-cu13-legacy') or (extra == 'extra-14-nemo-automodel-cu13' and extra == 'extra-14-nemo-automodel-deepep-v1') or (extra == 'extra-14-nemo-automodel-cu13-legacy' and extra == 'extra-14-nemo-automodel-deepep-v2') or (extra == 'extra-14-nemo-automodel-cu13-legacy' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-cu13-legacy' and extra == 'extra-14-nemo-automodel-moe') or (extra == 'extra-14-nemo-automodel-deepep-v1' and extra == 'extra-14-nemo-automodel-deepep-v2') or (extra == 'extra-14-nemo-automodel-deepep-v1' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-deepep-v1' and extra == 'extra-14-nemo-automodel-moe') or (extra == 'extra-14-nemo-automodel-deepep-v2' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-hybridep' and extra == 'extra-14-nemo-automodel-moe')" },
 ]
 cu13 = [
-    { name = "nvidia-nccl-cu13", version = "2.30.7", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-14-nemo-automodel-deepep-v2' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-hybridep' and extra == 'extra-14-nemo-automodel-moe')" },
-    { name = "nvidia-nvshmem-cu13", version = "3.7.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-14-nemo-automodel-deepep-v2' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-hybridep' and extra == 'extra-14-nemo-automodel-moe')" },
+    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-14-nemo-automodel-deepep-v2' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-hybridep' and extra == 'extra-14-nemo-automodel-moe')" },
+    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-14-nemo-automodel-deepep-v2' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-hybridep' and extra == 'extra-14-nemo-automodel-moe')" },
     { name = "torch", version = "2.12.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or (extra == 'extra-14-nemo-automodel-deepep-v2' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-hybridep' and extra == 'extra-14-nemo-automodel-moe')" },
     { name = "torchvision", version = "0.27.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or (extra == 'extra-14-nemo-automodel-deepep-v2' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-hybridep' and extra == 'extra-14-nemo-automodel-moe')" },
     { name = "transformer-engine", extra = ["core-cu13", "pytorch"], marker = "(sys_platform == 'linux' and extra == 'extra-14-nemo-automodel-cu13') or (extra == 'extra-14-nemo-automodel-cu13' and extra == 'extra-14-nemo-automodel-cu13-legacy') or (extra == 'extra-14-nemo-automodel-cu13' and extra == 'extra-14-nemo-automodel-deepep-v1') or (extra == 'extra-14-nemo-automodel-cu12' and extra == 'extra-14-nemo-automodel-cu13') or (extra == 'extra-14-nemo-automodel-cu12' and extra == 'extra-14-nemo-automodel-cu13-legacy') or (extra == 'extra-14-nemo-automodel-cu12' and extra == 'extra-14-nemo-automodel-deepep-v1') or (extra == 'extra-14-nemo-automodel-cu13-legacy' and extra == 'extra-14-nemo-automodel-deepep-v2') or (extra == 'extra-14-nemo-automodel-cu13-legacy' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-cu13-legacy' and extra == 'extra-14-nemo-automodel-moe') or (extra == 'extra-14-nemo-automodel-deepep-v1' and extra == 'extra-14-nemo-automodel-deepep-v2') or (extra == 'extra-14-nemo-automodel-deepep-v1' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-deepep-v1' and extra == 'extra-14-nemo-automodel-moe') or (extra == 'extra-14-nemo-automodel-deepep-v2' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-hybridep' and extra == 'extra-14-nemo-automodel-moe')" },
 ]
 cu13-legacy = [
-    { name = "nvidia-nccl-cu13", version = "2.29.7", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nvshmem-cu13", version = "3.4.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux'" },
     { name = "torch", version = "2.12.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
     { name = "torchvision", version = "0.27.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
     { name = "transformer-engine", extra = ["core-cu13", "pytorch"], marker = "(sys_platform == 'linux' and extra == 'extra-14-nemo-automodel-cu13-legacy') or (extra == 'extra-14-nemo-automodel-cu13-legacy' and extra == 'extra-14-nemo-automodel-deepep-v2') or (extra == 'extra-14-nemo-automodel-cu13-legacy' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-cu13-legacy' and extra == 'extra-14-nemo-automodel-moe') or (extra == 'extra-14-nemo-automodel-cu12' and extra == 'extra-14-nemo-automodel-cu13') or (extra == 'extra-14-nemo-automodel-cu12' and extra == 'extra-14-nemo-automodel-cu13-legacy') or (extra == 'extra-14-nemo-automodel-cu12' and extra == 'extra-14-nemo-automodel-deepep-v1') or (extra == 'extra-14-nemo-automodel-cu13' and extra == 'extra-14-nemo-automodel-cu13-legacy') or (extra == 'extra-14-nemo-automodel-cu13' and extra == 'extra-14-nemo-automodel-deepep-v1') or (extra == 'extra-14-nemo-automodel-deepep-v1' and extra == 'extra-14-nemo-automodel-deepep-v2') or (extra == 'extra-14-nemo-automodel-deepep-v1' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-deepep-v1' and extra == 'extra-14-nemo-automodel-moe') or (extra == 'extra-14-nemo-automodel-deepep-v2' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-hybridep' and extra == 'extra-14-nemo-automodel-moe')" },
@@ -4204,13 +4204,13 @@ cuda-source = [
 deepep-v1 = [
     { name = "apache-tvm-ffi" },
     { name = "causal-conv1d" },
-    { name = "deep-ep", version = "2.0.0+local", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca#7febc6e25660af0f54d95dd781ecdcd62265ecca" }, marker = "sys_platform == 'linux'" },
+    { name = "deep-ep", version = "2.0.0+local", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=567632dd59810d77b3cc05553df953cc0f779799#567632dd59810d77b3cc05553df953cc0f779799" }, marker = "sys_platform == 'linux'" },
     { name = "flash-linear-attention" },
     { name = "mamba-ssm" },
     { name = "nv-grouped-gemm" },
     { name = "nvidia-ml-py", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nccl-cu13", version = "2.29.7", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nvshmem-cu13", version = "3.4.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux'" },
     { name = "onnxscript" },
     { name = "tile-kernels" },
     { name = "tilelang" },
@@ -4378,7 +4378,7 @@ requires-dist = [
     { name = "databricks-sql-connector", marker = "extra == 'delta-databricks'", specifier = ">=3.0.0" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "decord", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm-media'" },
-    { name = "deep-ep", marker = "sys_platform == 'linux' and extra == 'deepep-v1'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca" },
+    { name = "deep-ep", marker = "sys_platform == 'linux' and extra == 'deepep-v1'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=567632dd59810d77b3cc05553df953cc0f779799" },
     { name = "deep-ep", marker = "sys_platform == 'linux' and extra == 'deepep-v2'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=af9a0403188392824fc3057452822235873e0612" },
     { name = "deep-ep", marker = "sys_platform == 'linux' and extra == 'hybridep'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=e0a5b1d9848ab3e7b4a67842bf06f067bfac67f8" },
     { name = "deltalake", marker = "extra == 'delta-databricks'", specifier = ">=1.0.0" },
@@ -4424,10 +4424,10 @@ requires-dist = [
     { name = "nvidia-ml-py", marker = "sys_platform == 'linux' and extra == 'hybridep'" },
     { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux' and extra == 'cu12'", specifier = ">=2.30.4" },
     { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' and extra == 'cu13'", specifier = ">=2.30,<2.31" },
-    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' and extra == 'cu13-legacy'", specifier = "==2.29.7" },
+    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' and extra == 'cu13-legacy'", specifier = ">=2.30,<2.31" },
     { name = "nvidia-nvshmem-cu12", marker = "sys_platform == 'linux' and extra == 'cu12'", specifier = ">=3.7.0" },
     { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' and extra == 'cu13'", specifier = ">=3.7,<3.8" },
-    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' and extra == 'cu13-legacy'", specifier = "==3.4.5" },
+    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' and extra == 'cu13-legacy'", specifier = ">=3.7,<3.8" },
     { name = "onnxscript", marker = "extra == 'cuda'", specifier = ">=0.5.6" },
     { name = "open-clip-torch", marker = "extra == 'vlm'" },
     { name = "opencv-python-headless", marker = "extra == 'diffusion-media'", specifier = "==4.10.0.84" },
@@ -5174,51 +5174,8 @@ wheels = [
 
 [[package]]
 name = "nvidia-nccl-cu13"
-version = "2.29.7"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.14' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and platform_machine == 's390x' and sys_platform == 'linux'",
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/72/0d/daf50d44177ee0cbc7ff0a0c91eb5ff676c82be42f9a970bc7597f440c3a/nvidia_nccl_cu13-2.29.7-py3-none-manylinux_2_18_aarch64.whl", hash = "sha256:674a12383e3c38a1bcccae7d4f3633b37852230b6047883cb2f4c2d1b36d9bf5", size = 206014712, upload-time = "2026-03-03T05:34:20.843Z" },
-    { url = "https://files.pythonhosted.org/packages/67/f4/58e4e91b6919367c7aafb8e36fce9aad1a3047e536bf7e2fd560927d3a4c/nvidia_nccl_cu13-2.29.7-py3-none-manylinux_2_18_x86_64.whl", hash = "sha256:edd81538446786ec3b73972543e53bb43bcaf0bfc8ef76cb679fcc390ffe136d", size = 205976000, upload-time = "2026-03-03T05:36:24.472Z" },
-]
-
-[[package]]
-name = "nvidia-nccl-cu13"
 version = "2.30.7"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.14' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and platform_machine == 's390x' and sys_platform == 'linux'",
-]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/21/a73174c6157101bdf1ffc22b517f76ff0082613989dd9bc8f43e8034caac/nvidia_nccl_cu13-2.30.7-py3-none-manylinux_2_18_aarch64.whl", hash = "sha256:ca786ffa5a647c75d4d1f5cc72a6c4f537947e2ba8823d7c8aaf768e7a7b9f77", size = 215983881, upload-time = "2026-06-09T03:23:15.633Z" },
     { url = "https://files.pythonhosted.org/packages/3f/34/c500f90c7ae641b8e0f98965b36b8a7ac79cc8b296e8d251fe3eb592ee54/nvidia_nccl_cu13-2.30.7-py3-none-manylinux_2_18_x86_64.whl", hash = "sha256:cefa7fdb9710efd0f39c5f1be1d61ff6fc9a996c451265bd7fbdcf9455ed4b50", size = 215965170, upload-time = "2026-06-09T03:23:39.73Z" },
@@ -5258,53 +5215,10 @@ wheels = [
 
 [[package]]
 name = "nvidia-nvshmem-cu13"
-version = "3.4.5"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.14' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and platform_machine == 's390x' and sys_platform == 'linux'",
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/dc/0f/05cc9c720236dcd2db9c1ab97fff629e96821be2e63103569da0c9b72f19/nvidia_nvshmem_cu13-3.4.5-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:6dc2a197f38e5d0376ad52cd1a2a3617d3cdc150fd5966f4aee9bcebb1d68fe9", size = 60215947, upload-time = "2025-09-06T00:32:20.022Z" },
-    { url = "https://files.pythonhosted.org/packages/3c/35/a9bf80a609e74e3b000fef598933235c908fcefcef9026042b8e6dfde2a9/nvidia_nvshmem_cu13-3.4.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:290f0a2ee94c9f3687a02502f3b9299a9f9fe826e6d0287ee18482e78d495b80", size = 60412546, upload-time = "2025-09-06T00:32:41.564Z" },
-]
-
-[[package]]
-name = "nvidia-nvshmem-cu13"
 version = "3.7.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.14' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and platform_machine != 'aarch64' and platform_machine != 's390x' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and platform_machine == 's390x' and sys_platform == 'linux'",
-]
 dependencies = [
-    { name = "nvidia-cuda-cccl", marker = "sys_platform == 'linux' or (extra == 'extra-14-nemo-automodel-deepep-v2' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-hybridep' and extra == 'extra-14-nemo-automodel-moe')" },
+    { name = "nvidia-cuda-cccl", marker = "(sys_platform == 'linux' and extra == 'extra-14-nemo-automodel-cu13') or (sys_platform == 'linux' and extra == 'extra-14-nemo-automodel-cu13-legacy') or (sys_platform == 'linux' and extra == 'extra-14-nemo-automodel-deepep-v1') or (extra == 'extra-14-nemo-automodel-cu12' and extra == 'extra-14-nemo-automodel-cu13') or (extra == 'extra-14-nemo-automodel-cu12' and extra == 'extra-14-nemo-automodel-cu13-legacy') or (extra == 'extra-14-nemo-automodel-cu12' and extra == 'extra-14-nemo-automodel-deepep-v1') or (extra == 'extra-14-nemo-automodel-cu13' and extra == 'extra-14-nemo-automodel-cu13-legacy') or (extra == 'extra-14-nemo-automodel-cu13' and extra == 'extra-14-nemo-automodel-deepep-v1') or (extra == 'extra-14-nemo-automodel-cu13-legacy' and extra == 'extra-14-nemo-automodel-deepep-v2') or (extra == 'extra-14-nemo-automodel-cu13-legacy' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-cu13-legacy' and extra == 'extra-14-nemo-automodel-moe') or (extra == 'extra-14-nemo-automodel-deepep-v1' and extra == 'extra-14-nemo-automodel-deepep-v2') or (extra == 'extra-14-nemo-automodel-deepep-v1' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-deepep-v1' and extra == 'extra-14-nemo-automodel-moe') or (extra == 'extra-14-nemo-automodel-deepep-v2' and extra == 'extra-14-nemo-automodel-hybridep') or (extra == 'extra-14-nemo-automodel-hybridep' and extra == 'extra-14-nemo-automodel-moe')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8c/e0/1285daedb2f320f1e5a73c36bf416e6906016f3a32f240531ec713422629/nvidia_nvshmem_cu13-3.7.0-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:3ca9a6dc205b6592840d294bead361e0136620a8c87f04466401057ccf0b95f2", size = 135254149, upload-time = "2026-06-11T12:41:00.063Z" },

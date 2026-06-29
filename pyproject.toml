@@ -134,8 +134,8 @@ cu12 = [
 cu13 = [
     "torch==2.12.1+cu130 ; sys_platform == 'linux'",
     "torchvision ; sys_platform == 'linux'",
-    # DeepEP v2 elastic uses NCCL GIN APIs from the 2.30 line and requires the
-    # NVSHMEM 3.7 wheel stack to avoid the Torch 2.12/cu13 first-backward OOM.
+    # DeepEP v2 elastic uses NCCL GIN, but upstream still builds and links its
+    # legacy NVSHMEM extension.
     "nvidia-nccl-cu13>=2.30,<2.31 ; sys_platform == 'linux'",
     "nvidia-nvshmem-cu13>=3.7,<3.8 ; sys_platform == 'linux'",
     "transformer-engine[pytorch,core-cu13]>=2.16.0 ; sys_platform == 'linux'",
@@ -143,9 +143,9 @@ cu13 = [
 cu13_legacy = [
     "torch==2.12.1+cu130 ; sys_platform == 'linux'",
     "torchvision ; sys_platform == 'linux'",
-    # Legacy DeepEP v1 matches the 26.04 baseline NVSHMEM stack.
-    "nvidia-nccl-cu13==2.29.7 ; sys_platform == 'linux'",
-    "nvidia-nvshmem-cu13==3.4.5 ; sys_platform == 'linux'",
+    # DeepEP v1 requires NVSHMEM; use the current NCCL/NVSHMEM stack.
+    "nvidia-nccl-cu13>=2.30,<2.31 ; sys_platform == 'linux'",
+    "nvidia-nvshmem-cu13>=3.7,<3.8 ; sys_platform == 'linux'",
     "transformer-engine[pytorch,core-cu13]>=2.16.0 ; sys_platform == 'linux'",
 ]
 cuda_source = [
@@ -307,11 +307,9 @@ constraint-dependencies = [
 override-dependencies = [
     "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
     "nvidia-nccl-cu12>=2.30.4; sys_platform == 'linux'",
-    "nvidia-nccl-cu13==2.29.7; sys_platform == 'linux' and extra == 'cu13-legacy'",
-    "nvidia-nccl-cu13>=2.30,<2.31; sys_platform == 'linux' and extra == 'cu13'",
+    "nvidia-nccl-cu13>=2.30,<2.31; sys_platform == 'linux'",
     "nvidia-nvshmem-cu12>=3.7.0; sys_platform == 'linux'",
-    "nvidia-nvshmem-cu13==3.4.5; sys_platform == 'linux' and extra == 'cu13-legacy'",
-    "nvidia-nvshmem-cu13>=3.7,<3.8; sys_platform == 'linux' and extra == 'cu13'",
+    "nvidia-nvshmem-cu13>=3.7,<3.8; sys_platform == 'linux'",
     # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin
     "urllib3>=2.7.0",
     "thrift>=0.23.0",
@@ -374,9 +372,9 @@ conflicts = [
 
 [tool.uv.sources]
 deep_ep = [
-  # Last v1 source used by the legacy Buffer path (`dispatcher: deepep`) before
-  # the DeepEP v2 upgrade.
-  { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "7febc6e25660af0f54d95dd781ecdcd62265ecca", marker = "sys_platform == 'linux'", extra = "deepep_v1" },
+  # Last pre-v2 commit on DeepEP main. This includes the NVSHMEM 3.5+ state
+  # layout compatibility fix from deepseek-ai/DeepEP#564.
+  { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "567632dd59810d77b3cc05553df953cc0f779799", marker = "sys_platform == 'linux'", extra = "deepep_v1" },
   # Current DeepEP main, used by the v2 elastic Buffer path (`dispatcher:
   # deepep_v2`) and by the default `moe` extra.
   { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "af9a0403188392824fc3057452822235873e0612", marker = "sys_platform == 'linux'", extra = "deepep_v2" },
