@@ -21,19 +21,20 @@ reads it back via ``cached_target_path`` instead of loading or running the
 target at all.
 
 ==============================  READ THIS  =================================
-This is the SpecForge **offline** training path. It is **extremely disk
-intensive** -- ``aux_hidden_states`` alone is ``3 * target_hidden_size`` wide,
-so an 8B target at seq-len 2048 costs ~80 MB *per sample* (tens of TB for a
-large corpus). Modern practice trains **online**, where the target forward is
-cheap next to that I/O, so this path is largely **deprecated**. It is provided
-for completeness / reproducing the SpecForge offline recipe and for the niche
-case of repeatedly re-training a draft on a fixed, bounded dataset. Prefer the
-online recipe (no ``cached_target_path``) unless you specifically need this.
+This is the SpecForge **offline** training path. It is **disk intensive** -- the
+draft-vocab ``target_probs`` (``draft_vocab`` wide) and ``aux_hidden_states``
+(``3 * target_hidden_size`` wide) together cost on the order of 100+ MB per
+sample for an 8B target at seq-len 2048, i.e. multiple TB for a large corpus.
+Modern practice trains **online**, where the target forward is cheap next to that
+I/O; prefer the online recipe unless you re-train a draft repeatedly on a fixed,
+bounded dataset. ``--target-probs-topk`` can shrink the ``target_probs`` field by
+storing only its top-k mass, but that is a real disk/fidelity trade-off (a real
+LLM distribution has a fat tail), so it is **off by default** -- see the flag's
+help.
 ===========================================================================
 
 Only EAGLE-3 is supported. EAGLE-1/2 supervise on the *full*-vocab target
-distribution (no draft-vocab compression), which is ~0.5 GB per sample -- not
-worth caching -- so they keep the online path only.
+distribution, which the recipe keeps on the online path only.
 
 Typical usage (single device; large MoE targets that need sharding must use the
 online path instead):
@@ -62,9 +63,10 @@ from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader, build_eagle3_token_mapping
 from nemo_automodel.components.datasets.llm.eagle3_cache import (
-    CACHE_KEYS,
     DTYPE_MAP,
+    compress_target_probs,
     existing_shard_indices,
+    is_compressed,
     manifest_path,
     read_manifest,
     write_manifest,
@@ -82,12 +84,15 @@ def _compute_batch_cache(
     selected_token_ids: torch.Tensor,
     selected_token_mask: torch.Tensor,
     cache_dtype: torch.dtype,
+    target_probs_topk: int,
 ) -> dict[str, torch.Tensor]:
     """Turn one target-model batch into the per-sample tensors the trainer caches.
 
     Reuses ``_compute_target_distribution`` -- the exact function the online
-    trainer calls -- so the cached ``target_probs`` / ``position_mask`` are
-    numerically identical to the live path. Float fields are downcast to
+    trainer calls -- so the cached supervision is numerically identical to the
+    live path. The draft-vocab ``target_probs`` is stored in full, or -- when
+    ``target_probs_topk`` compresses (a positive k below the draft vocab) -- as
+    its top-k ``(values, indices)`` factorization. Float fields are downcast to
     ``cache_dtype``; everything is moved to CPU for writing.
     """
     target_probs, position_mask = _compute_target_distribution(
@@ -96,14 +101,20 @@ def _compute_batch_cache(
         selected_token_mask=selected_token_mask,
         loss_mask=target_batch.loss_mask,
     )
-    return {
+    sample = {
         "input_ids": target_batch.input_ids.to(torch.long).cpu(),
         "attention_mask": target_batch.attention_mask.to(torch.long).cpu(),
         "loss_mask": target_batch.loss_mask.to(torch.long).cpu(),
         "aux_hidden_states": target_batch.aux_hidden_states.to(cache_dtype).cpu(),
-        "target_probs": target_probs.to(cache_dtype).cpu(),
         "position_mask": position_mask.to(torch.bool).cpu(),
     }
+    if is_compressed(target_probs_topk, target_probs.shape[-1]):
+        topk_values, topk_indices = compress_target_probs(target_probs, target_probs_topk)
+        sample["target_probs_values"] = topk_values.to(cache_dtype).cpu()
+        sample["target_probs_indices"] = topk_indices.cpu()
+    else:
+        sample["target_probs"] = target_probs.to(cache_dtype).cpu()
+    return sample
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -119,6 +130,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if args.draft_vocab_size is not None and args.draft_vocab_size < 1:
         raise ValueError(f"--draft-vocab-size must be >= 1 or omitted, got {args.draft_vocab_size}")
+    if args.target_probs_topk < 0:
+        raise ValueError(f"--target-probs-topk must be >= 0 (0 = lossless), got {args.target_probs_topk}")
     if args.dtype not in DTYPE_MAP:
         raise ValueError(f"--dtype must be one of {sorted(DTYPE_MAP)}, got {args.dtype!r}")
 
@@ -217,6 +230,7 @@ def _run(args: argparse.Namespace) -> int:
         "dtype": args.dtype,
         "num_samples": num_samples,
         "shard_size": args.shard_size,
+        "target_probs_topk": args.target_probs_topk,
         "aux_hidden_dim": int(target_model.config.hidden_size) * len(target_wrapper.aux_layer_ids),
         "aux_layer_ids": list(target_wrapper.aux_layer_ids),
         "selected_token_ids": selected_token_ids.cpu().tolist(),
@@ -249,7 +263,9 @@ def _run(args: argparse.Namespace) -> int:
         if buffered == 0:
             return
         if shard_index not in existing:
-            merged = {k: torch.cat([c[k] for c in chunks], dim=0)[: args.shard_size] for k in CACHE_KEYS}
+            # Every chunk came from _compute_batch_cache with the same topk, so they
+            # share one key set (full vs top-k) -- merge whatever that batch produced.
+            merged = {k: torch.cat([c[k] for c in chunks], dim=0)[: args.shard_size] for k in chunks[0]}
             path = write_shard(args.output_dir, shard_index, merged)
             logger.info("Wrote %s (%d samples)", path, merged["input_ids"].shape[0])
         chunks = []
@@ -274,7 +290,11 @@ def _run(args: argparse.Namespace) -> int:
                 attention_mask=batch["attention_mask"],
                 loss_mask=batch["loss_mask"],
             )
-            chunks.append(_compute_batch_cache(target_batch, selected_token_ids, selected_token_mask, cache_dtype))
+            chunks.append(
+                _compute_batch_cache(
+                    target_batch, selected_token_ids, selected_token_mask, cache_dtype, args.target_probs_topk
+                )
+            )
             buffered += batch_size
             if buffered >= args.shard_size:
                 _flush()
@@ -298,6 +318,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Draft vocabulary size (None = full target vocab; defeats most of the storage saving).",
+    )
+    parser.add_argument(
+        "--target-probs-topk",
+        type=int,
+        default=0,
+        help="Compress the dominant cache field by storing only the top-k of each token's "
+        "draft-vocab target distribution (0 = off = store it in full, the default and exact). "
+        "This is a real disk/fidelity trade-off, NOT free: a real LLM next-token distribution has "
+        "a fat tail (top-64 of a Qwen3-8B distribution keeps only ~0.92 of the mass, KL ~1.3), so "
+        "small k distorts the soft-CE target. Use a large k (or leave it off) for fidelity.",
     )
     parser.add_argument("--batch-size", type=int, default=4, help="Target forward batch size.")
     parser.add_argument(
