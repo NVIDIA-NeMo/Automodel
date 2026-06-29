@@ -22,7 +22,7 @@ to SDPA (or eager for softcap) for other unsupported configurations.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 import torch
 from torch import nn
@@ -141,7 +141,13 @@ def _ffpa_varlen_fwd(
 
     Wraps ``_varlen_fwd_cute`` with the fixed no-window/no-softcap/no-pack-gqa sentinels.
     """
-    return torch.ops.ffpa_attn._varlen_fwd_cute(
+    # ``torch.ops.<ns>.<op>`` is a dynamically-dispatched OpOverloadPacket whose
+    # ParamSpec the type checker cannot bind; cast to the concrete signature.
+    varlen_fwd_cute = cast(
+        "Callable[..., tuple[torch.Tensor, torch.Tensor]]",
+        torch.ops.ffpa_attn._varlen_fwd_cute,
+    )
+    return varlen_fwd_cute(
         q_pack.contiguous(),
         k_pack.contiguous(),
         v_pack.contiguous(),
@@ -178,7 +184,13 @@ def _ffpa_varlen_bwd(
     Exposed as an explicit op call (not the package's varlen autograd) because the
     ring backward feeds the globally merged out/lse, not a chunk-local one.
     """
-    return torch.ops.ffpa_attn._varlen_bwd_cute(
+    # ``torch.ops.<ns>.<op>`` is a dynamically-dispatched OpOverloadPacket whose
+    # ParamSpec the type checker cannot bind; cast to the concrete signature.
+    varlen_bwd_cute = cast(
+        "Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]]",
+        torch.ops.ffpa_attn._varlen_bwd_cute,
+    )
+    return varlen_bwd_cute(
         q_pack.contiguous(),
         k_pack.contiguous(),
         v_pack.contiguous(),
@@ -280,7 +292,7 @@ def ffpa_mask(
             # build the block-sparse BlockMask HF builds under attn_implementation="flex_attention"
             # so the sliding sparsity is exploited (cheaper than the dense SDPA fallback). The
             # returned BlockMask is the marker ffpa_attention_forward uses to pick the flex path.
-            device = kwargs.pop("device", None) or (attention_mask.device if attention_mask is not None else None)
+            device = kwargs.pop("device", None) or (attention_mask.device if attention_mask is not None else "cpu")
             return flex_attention_mask(
                 batch_size=batch_size,
                 q_length=q_length,
