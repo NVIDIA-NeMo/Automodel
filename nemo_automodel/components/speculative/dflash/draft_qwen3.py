@@ -236,7 +236,62 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
         self.mask_token_id = dflash_config.get("mask_token_id", None)
+        # Optional Domino correction head (ported from SpecForge#571). DFlash drafts
+        # a block in parallel and is non-causal; the Domino head adds a *causal*
+        # low-rank logit correction conditioned on a GRU state built from the
+        # block's previous tokens. ``projector_type=None`` leaves DFlash untouched.
+        self.projector_type = dflash_config.get("projector_type", None)
+        self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
+        self.shift_label = dflash_config.get("shift_label", False)
+        if self.projector_type == "domino":
+            self.emb_dim = dflash_config["emb_dim"]
+            self.gru_hidden_dim = dflash_config["gru_hidden_dim"]
+            self.prefix_gru = nn.GRU(
+                input_size=config.hidden_size,
+                hidden_size=self.gru_hidden_dim,
+                num_layers=1,
+                batch_first=True,
+                bias=False,
+            )
+            in_dim = config.hidden_size + self.gru_hidden_dim
+            self.embed_proj = nn.Sequential(
+                nn.Linear(in_dim, self.emb_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(self.emb_dim, config.vocab_size, bias=False),
+            )
+        elif self.projector_type is not None:
+            raise ValueError(f"Unknown draft projector_type: {self.projector_type}")
         self.post_init()
+
+    def _apply(self, fn, recurse=True):
+        """Keep the RoPE ``inv_freq`` buffer in fp32 across dtype casts.
+
+        ``Qwen3RotaryEmbedding`` computes the rotary angles in fp32 but reads the
+        frequencies from a stored ``inv_freq`` buffer. ``model.to(bfloat16)`` -- the
+        training build path -- rounds that buffer to bf16, whereas the serving
+        runtime (SGLang keeps an fp32 RoPE cache) and HF's ``from_pretrained`` reload
+        keep it in fp32. The resulting train/inference RoPE mismatch grows with
+        absolute position (the bf16 frequencies dephase) and erodes draft
+        acceptance, so ``inv_freq`` must stay fp32 on both the training and reload
+        paths. A bf16 round-trip cannot be undone by upcasting, so when a cast
+        rounds the buffer we recompute fresh fp32 frequencies from the rotary
+        config (the same values HF derives on the fp32 paths) instead of upcasting
+        the corrupted ones.
+        """
+        module = super()._apply(fn, recurse=recurse)
+        rotary_emb = getattr(self, "rotary_emb", None)
+        inv_freq = getattr(rotary_emb, "inv_freq", None) if rotary_emb is not None else None
+        if (
+            inv_freq is not None
+            and inv_freq.is_floating_point()
+            and not inv_freq.is_meta
+            and inv_freq.dtype != torch.float32
+        ):
+            fresh = type(rotary_emb)(rotary_emb.config).inv_freq.to(device=inv_freq.device)
+            rotary_emb.inv_freq = fresh
+            if hasattr(rotary_emb, "original_inv_freq"):
+                rotary_emb.original_inv_freq = fresh.clone()
+        return module
 
     def forward(
         self,

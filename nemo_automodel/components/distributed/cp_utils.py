@@ -320,9 +320,8 @@ def make_cp_batch_and_ctx(
     tp_mesh = _get_submesh(device_mesh, "tp")
 
     # A model that owns its CP attention can attach a batch-sharding callable to
-    # the batch in its pre-embed step (e.g. Gemma4's contiguous ring shard); honor
-    # it instead of the default load-balanced context_parallel path. This keeps
-    # make_cp_batch_and_ctx model-agnostic -- the implementation lives with the model.
+    # the batch in its pre-embed step. Honor it instead of the default
+    # load-balanced context_parallel path so the implementation stays with the model.
     cp_make_batch_fn = batch.pop("_cp_make_batch_fn", None)
     if cp_make_batch_fn is not None and _get_mesh_size(cp_mesh) > 1:
         return cp_make_batch_fn(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)

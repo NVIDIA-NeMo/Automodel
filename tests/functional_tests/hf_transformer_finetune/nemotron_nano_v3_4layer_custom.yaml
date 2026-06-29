@@ -33,7 +33,7 @@ model:
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-    trust_remote_code: true
+    trust_remote_code: false
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     dispatcher: torch

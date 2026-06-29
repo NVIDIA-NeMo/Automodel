@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.models.deepseek_v4 import layers as dsv4_layers
+from nemo_automodel.components.models.deepseek_v4 import optimized_kernels as dsv4_optimized_kernels
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import build_dsv4_cp_causal_padding_mask
 from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
@@ -768,6 +769,34 @@ class TestDeepseekV4HyperConnection:
 class TestDeepseekV4OptimizedKernels:
     """Numerical equivalence tests for optional DSV4 kernel dispatch."""
 
+    def test_full_tensor_if_dtensor_clones_gathered_value(self, monkeypatch):
+        """Returned fp32 holder values must not alias storage FSDP may reshard."""
+        full = torch.arange(4, dtype=torch.float32, requires_grad=True)
+
+        class FakeDTensor:
+            def full_tensor(self):
+                return full
+
+        monkeypatch.setattr(dsv4_layers, "DTensor", FakeDTensor)
+
+        gathered = dsv4_layers._full_tensor_if_dtensor(FakeDTensor())
+
+        assert torch.equal(gathered, full)
+        assert gathered.data_ptr() != full.data_ptr()
+        gathered.sum().backward()
+        assert torch.equal(full.grad, torch.ones_like(full))
+
+    def test_full_tensor_if_dtensor_clones_regular_tensor(self):
+        """FSDP can reshard a regular-looking tensor returned from an fp32 holder."""
+        tensor = torch.arange(4, dtype=torch.float32, requires_grad=True)
+
+        gathered = dsv4_layers._full_tensor_if_dtensor(tensor)
+
+        assert torch.equal(gathered, tensor)
+        assert gathered.data_ptr() != tensor.data_ptr()
+        gathered.sum().backward()
+        assert torch.equal(tensor.grad, torch.ones_like(tensor))
+
     def test_eager_attention_with_sink_passes_reference_to_sinks_holder(self):
         """FSDP2-wrapped fp32 sink holders need a tensor input during recompute."""
         batch, heads, seq_len, dim = 1, 2, 3, 4
@@ -908,6 +937,32 @@ class TestDeepseekV4OptimizedKernels:
         )
         torch.testing.assert_close(actual, expected)
         torch.testing.assert_close(actual_grad, expected_grad)
+
+    def test_sinkhorn_auto_backend_falls_back_to_torch_when_tilekernels_missing(self, monkeypatch):
+        monkeypatch.setattr(dsv4_optimized_kernels, "is_dsv4_kernel_available", lambda name: False)
+        torch.manual_seed(123)
+        x = torch.randn(2, 3, 4, 4)
+        grad = torch.randn_like(x)
+
+        expected, (expected_grad,) = _run_forward_backward(
+            lambda x_: sinkhorn_normalize_torch(x_, repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        actual, (actual_grad,) = _run_forward_backward(
+            lambda x_: dsv4_sinkhorn_normalize(x_, backend="auto", repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+    def test_tilelang_attention_keeps_sinkhorn_optional(self):
+        backend = type("Backend", (), {"attn": "tilelang"})()
+
+        assert dsv4_layers._dsv4_kernel_backend(backend) == "tilelang"
+        assert dsv4_layers._dsv4_sinkhorn_backend(backend) == "auto"
 
     def test_vendored_tilelang_module_imports_with_phony_decorator(self, monkeypatch):
         import builtins

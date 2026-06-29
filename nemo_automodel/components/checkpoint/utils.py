@@ -101,9 +101,55 @@ def resolve_trust_remote_code(pretrained_model_name_or_path):
     return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
 
 
+def get_controlling_tie_word_embeddings(config: object, model_class_name: str) -> bool:
+    """Resolve the ``tie_word_embeddings`` flag that actually controls lm_head tying.
+
+    HF ties ``lm_head`` based on the *top-level* config flag, not a nested
+    ``text_config`` (verified by construction for Gemma4, Mistral3, and
+    Qwen2.5-Omni under transformers 5.8.1: the top-level flag decides tying
+    regardless of the nested value). So prefer the top-level flag, and only fall
+    back to ``text_config`` for configs that don't expose a top-level
+    ``tie_word_embeddings``.
+
+    Args:
+        config: The model's config (or anything exposing ``tie_word_embeddings``
+            and optionally ``get_text_config``).
+        model_class_name: ``type(model).__name__`` of the owning model class.
+
+    Returns:
+        bool: The controlling ``tie_word_embeddings`` value.
+    """
+    # Composite models whose top-level / thinker config owns the lm_head tying
+    # decision; their nested ``text_config`` flag can disagree and must be ignored.
+    # Return the top-level flag (not a forced ``False``) so a constructor guard can
+    # still see and reject an unsupported ``top-level=True``. The checkpoint save
+    # path stays safe through the storage-based ``has_local_tied_lm_head()`` check,
+    # which only drops ``lm_head.weight`` when the tensors actually share storage.
+    composite_top_level_models = (
+        "Qwen2_5OmniThinkerForConditionalGeneration",
+        "Mistral3FP8VLMForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3OmniMoeThinkerForConditionalGeneration",
+    )
+    if any(name in model_class_name for name in composite_top_level_models):
+        return bool(getattr(config, "tie_word_embeddings", False))
+
+    # General rule: the top-level config wins when it exposes the flag.
+    if hasattr(config, "tie_word_embeddings"):
+        return bool(config.tie_word_embeddings)
+
+    # Fallback only for configs that do not expose a top-level tie flag.
+    text_config = getattr(config, "get_text_config", lambda: None)()
+    return bool(getattr(text_config, "tie_word_embeddings", False))
+
+
 def is_tied_word_embeddings(model: nn.Module) -> bool:
     """
     Check if the model's word embeddings are tied.
+
+    Delegates to :func:`get_controlling_tie_word_embeddings`, which follows HF's
+    top-level-first tying semantics (replacing the previous ``text_config``-first
+    resolution).
 
     Args:
         model (nn.Module): The model to check.
@@ -111,17 +157,10 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
     Returns:
         bool: True if the model's word embeddings are tied, False otherwise.
     """
-    non_tied_lm_head_models = {
-        "Qwen3OmniMoeThinkerForConditionalGeneration",  # complicated config structure
-        "Qwen3VLMoeForConditionalGeneration",  # top-level lm_head is untied despite nested text config
-    }
-    model_class_name = type(model).__name__
-    for m in non_tied_lm_head_models:
-        if m in model_class_name:
-            return False
     config = getattr(model, "config", None)
-    text_config = getattr(config, "get_text_config", lambda: None)()
-    return bool(getattr(text_config, "tie_word_embeddings", getattr(config, "tie_word_embeddings", False)))
+    if config is None:
+        return False
+    return get_controlling_tie_word_embeddings(config, type(model).__name__)
 
 
 def _normalize_param_name(name: str) -> str:

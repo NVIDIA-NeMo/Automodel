@@ -51,3 +51,27 @@ def test_ddp_manager_forwards_ddp_constructor_flags(monkeypatch):
     assert ddp_ctor.call_args.kwargs["static_graph"] is True
     assert ddp_ctor.call_args.kwargs["bucket_cap_mb"] == 64
     assert ddp_ctor.call_args.kwargs["gradient_as_bucket_view"] is True
+
+
+def test_ddp_manager_applies_selective_activation_checkpointing(monkeypatch):
+    monkeypatch.setattr(ddp_mod.dist, "is_available", lambda: True, raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "is_initialized", lambda: True, raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "get_rank", lambda: 0, raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda: 2, raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "get_backend", lambda: "gloo", raising=True)
+
+    ddp_ctor = MagicMock(return_value="wrapped")
+    apply_selective_ac = MagicMock()
+    checkpoint_wrapper = MagicMock()
+    monkeypatch.setattr(ddp_mod, "DDP", ddp_ctor, raising=True)
+    monkeypatch.setattr(ddp_mod, "apply_selective_activation_checkpointing", apply_selective_ac, raising=True)
+    monkeypatch.setattr(ddp_mod, "checkpoint_wrapper", checkpoint_wrapper, raising=True)
+
+    manager = ddp_mod.DDPManager(DDPConfig(activation_checkpointing="selective"))
+
+    model = nn.Linear(2, 2)
+    assert manager.parallelize(model) == "wrapped"
+
+    apply_selective_ac.assert_called_once_with(model)
+    checkpoint_wrapper.assert_not_called()
+    ddp_ctor.assert_called_once()

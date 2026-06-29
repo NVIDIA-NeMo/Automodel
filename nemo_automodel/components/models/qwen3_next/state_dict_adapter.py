@@ -21,6 +21,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
+    forced_gated_delta_net_fp32_dtype_mapping,
     route_fp32_holder_key,
     strip_fp32_holder_key,
     upcast_gated_delta_net_fp32_state_tensor,
@@ -170,3 +171,7 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
             mapped_result = [(k, v) for k, v in mapped_result if not re.match(exclude_key_regex, k)]
 
         return mapped_result
+
+    def forced_hf_dtype_mapping(self, state_dict: dict[str, Any]) -> dict[str, str]:
+        """Return HF export dtype overrides for intrinsically-fp32 GDN tensors."""
+        return forced_gated_delta_net_fp32_dtype_mapping(state_dict)

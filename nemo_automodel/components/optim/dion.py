@@ -20,6 +20,8 @@ from typing import Any, Optional, Protocol
 
 import torch.nn as nn
 
+from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
+
 
 class _DionFamilyConfig(Protocol):
     """Structural type for the dion-family optimizer configs build_dion_optimizer reads."""
@@ -147,14 +149,11 @@ def _get_dion_mesh(device_mesh: Any) -> Any:
     if not hasattr(device_mesh, "ndim") or device_mesh.ndim == 1:
         return device_mesh
     try:
-        logger.info(f"[Dion] Extracting dp_shard_cp 1D submesh from device_mesh: {device_mesh}")
-        dp_mesh_2d = device_mesh[("dp_replicate", "dp_shard_cp")]
-        submesh = dp_mesh_2d["dp_shard_cp"]
-        if hasattr(submesh, "ndim") and submesh.ndim == 1:
-            logger.info(f"[Dion] Extracted dp_shard_cp 1D submesh via 2D mesh: {submesh}")
-            return submesh
-    except (KeyError, RuntimeError, TypeError) as e:
-        logger.debug(f"[Dion] Could not access via (dp_replicate, dp_shard_cp): {e}")
+        dion_mesh = get_fsdp_dp_mesh(device_mesh)
+        logger.info(f"[Dion] Resolved FSDP DP mesh from device_mesh: {dion_mesh}")
+        return dion_mesh
+    except (AttributeError, KeyError, RuntimeError, TypeError) as e:
+        logger.debug(f"[Dion] Could not resolve FSDP DP mesh: {e}")
     return device_mesh
 
 
