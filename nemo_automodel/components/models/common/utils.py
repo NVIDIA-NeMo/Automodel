@@ -168,7 +168,8 @@ class BackendConfig:
         rms_norm: RMSNorm backend ("torch", "torch_fp32", or "te").
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
-            "te" uses TE GroupedLinear, "te_ops" uses TE's fusible ops graph,
+            "te" uses TE GroupedLinear, "te_ops" uses TE's fusible ops graph with
+            one stacked weight and bias owner per projection,
             "gmm" uses grouped_gemm.ops.gmm,
             "torch_mm" uses torch._grouped_mm, "torch_mm_mxfp8" uses torch._grouped_mm
             dispatch but routes the expert grouped GEMMs through torchao's MXFP8

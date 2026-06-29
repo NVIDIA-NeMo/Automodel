@@ -28,6 +28,7 @@ from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
     GroupedExpertsTE,
+    GroupedExpertsTeOps,
     is_gated_activation,
 )
 from nemo_automodel.components.moe.experts import (
@@ -751,8 +752,17 @@ class MoE(nn.Module):
                     dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
                     dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
+            elif backend.experts == "te_ops":
+                self.experts = GroupedExpertsTeOps(
+                    config,
+                    backend=backend,
+                    dispatcher_backend=backend.dispatcher,
+                    dispatcher_num_sms=backend.dispatcher_num_sms,
+                    dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                    dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
+                )
             else:
-                # experts in ("te", "te_ops")
+                # experts == "te"
                 self.experts = GroupedExpertsTE(
                     config,
                     backend=backend,

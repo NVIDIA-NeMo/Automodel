@@ -1042,21 +1042,21 @@ class TestNonGatedActivations:
 @pytest.mark.parametrize("tail_shape", [(), (3,)])
 def test_te_ops_glu_block_interleave_roundtrip(tail_shape):
     """TE's 32-wide GLU layout round-trips weights and biases without reordering values."""
-    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+    from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
 
     canonical = torch.arange(2 * 128 * max(1, int(torch.tensor(tail_shape).prod())), dtype=torch.float32)
     canonical = canonical.reshape(2, 128, *tail_shape)
 
-    interleaved = GroupedExpertsTE._interleave_glu_blocks(canonical)
+    interleaved = GroupedExpertsTeOps._interleave_glu_blocks(canonical)
     expected_prefix = torch.cat((canonical[:, :64:2], canonical[:, 1:64:2]), dim=1)
 
     torch.testing.assert_close(interleaved[:, :64], expected_prefix)
-    torch.testing.assert_close(GroupedExpertsTE._deinterleave_glu_blocks(interleaved), canonical)
+    torch.testing.assert_close(GroupedExpertsTeOps._deinterleave_glu_blocks(interleaved), canonical)
 
 
 def test_te_ops_init_weights_preserves_parameter_objects():
     """TE-ops initialization must not replace parameters after FSDP has wrapped them."""
-    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+    from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
 
     class FakeGroupedLinear(torch.nn.Module):
         def __init__(self):
@@ -1064,13 +1064,16 @@ def test_te_ops_init_weights_preserves_parameter_objects():
             self.num_groups = 2
             self.in_features = 8
             self.use_bias = True
-            for group_idx in range(self.num_groups):
-                self.register_parameter(f"weight{group_idx}", torch.nn.Parameter(torch.zeros(8, 8)))
-                self.register_parameter(f"bias{group_idx}", torch.nn.Parameter(torch.ones(8)))
+            self._stacked_weight = torch.nn.Parameter(torch.zeros(2, 8, 8))
+            self._stacked_bias = torch.nn.Parameter(torch.ones(2, 8))
 
-    experts = GroupedExpertsTE.__new__(GroupedExpertsTE)
+        def reset_parameters(self):
+            with torch.no_grad():
+                self._stacked_weight.uniform_(-1 / math.sqrt(self.in_features), 1 / math.sqrt(self.in_features))
+                self._stacked_bias.zero_()
+
+    experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
     torch.nn.Module.__init__(experts)
-    experts.use_te_ops = True
     experts.gate_up_linear = FakeGroupedLinear()
     experts.down_linear = FakeGroupedLinear()
     parameter_ids = {name: id(param) for name, param in experts.named_parameters()}
@@ -1088,7 +1091,7 @@ def test_te_ops_init_weights_preserves_parameter_objects():
 
 def test_te_ops_empty_rank_preserves_dispatch_backward_and_explicit_zero_grads():
     """An empty destination rank must retain EP autograd edges and real expert parameters."""
-    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+    from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
 
     class FakeExpertLinear(torch.nn.Module):
         def __init__(self):
@@ -1128,11 +1131,10 @@ def test_te_ops_empty_rank_preserves_dispatch_backward_and_explicit_zero_grads()
             self.unpermutation_input = hidden_states
             return hidden_states
 
-    experts = GroupedExpertsTE.__new__(GroupedExpertsTE)
+    experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
     torch.nn.Module.__init__(experts)
     experts.config = Mock(n_routed_experts=2)
     experts.ep_size = 1
-    experts.use_te_ops = True
     experts.expert_bias = True
     experts.gate_up_linear = FakeExpertLinear()
     experts.down_linear = FakeExpertLinear()
@@ -1165,6 +1167,91 @@ def test_te_ops_empty_rank_preserves_dispatch_backward_and_explicit_zero_grads()
     optimizer.step()
     for name, parameter in experts.named_parameters():
         torch.testing.assert_close(parameter, parameters_before_step[name] * (1 - 0.1 * 0.2))
+
+
+@pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
+class TestGroupedExpertsTeOps:
+    """Test the stacked-owner contract for TE fusible expert ops."""
+
+    @pytest.fixture
+    def te_ops_config(self):
+        return MoEConfig(
+            n_routed_experts=2,
+            n_shared_experts=0,
+            n_activated_experts=1,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=64,
+            inter_dim=64,
+            moe_inter_dim=64,
+            norm_topk_prob=False,
+            router_bias=False,
+            expert_bias=True,
+            expert_activation="quick_geglu",
+            activation_alpha=1.702,
+            activation_limit=7.0,
+            dtype=torch.bfloat16,
+        )
+
+    def test_stacked_owner_alias_and_materialization_identity(self, te_ops_config):
+        from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
+        from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
+
+        backend = BackendConfig(experts="te_ops", dispatcher="hybridep")
+        experts = GroupedExpertsTeOps(te_ops_config, backend=backend, dispatcher_backend="hybridep")
+        expected_names = {
+            "gate_up_linear._stacked_weight",
+            "gate_up_linear._stacked_bias",
+            "down_linear._stacked_weight",
+            "down_linear._stacked_bias",
+        }
+        assert set(dict(experts.named_parameters())) == expected_names
+
+        parameter_ids = {name: id(parameter) for name, parameter in experts.named_parameters()}
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        to_empty_parameters_only(experts, device=device)
+        experts.init_weights(device)
+        assert {name: id(parameter) for name, parameter in experts.named_parameters()} == parameter_ids
+
+        for linear in (experts.gate_up_linear, experts.down_linear):
+            assert [id(parameter) for parameter in linear.parameters()] == [
+                id(linear._stacked_weight),
+                id(linear._stacked_bias),
+            ]
+            weight_alias = linear.weight
+            bias_alias = linear.bias
+            assert type(weight_alias).__name__ == "GroupedTensor"
+            assert type(bias_alias).__name__ == "GroupedTensor"
+            assert weight_alias.rowwise_data.data_ptr() == linear._stacked_weight.data_ptr()
+            assert bias_alias.rowwise_data.data_ptr() == linear._stacked_bias.data_ptr()
+            assert weight_alias.requires_grad == linear._stacked_weight.requires_grad
+            assert bias_alias.requires_grad == linear._stacked_bias.requires_grad
+
+    def test_virtual_state_dict_roundtrip_preserves_stacked_owners(self, te_ops_config):
+        from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
+        from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
+
+        backend = BackendConfig(experts="te_ops", dispatcher="hybridep")
+        source = GroupedExpertsTeOps(te_ops_config, backend=backend, dispatcher_backend="hybridep")
+        destination = GroupedExpertsTeOps(te_ops_config, backend=backend, dispatcher_backend="hybridep")
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        to_empty_parameters_only(source, device=device)
+        to_empty_parameters_only(destination, device=device)
+        source.init_weights(device)
+        destination.init_weights(device)
+
+        state = source.state_dict()
+        assert set(state) == {"gate_and_up_projs", "down_projs", "gate_up_proj_bias", "down_proj_bias"}
+        destination_ids = {name: id(parameter) for name, parameter in destination.named_parameters()}
+        destination.load_state_dict(state)
+        assert {name: id(parameter) for name, parameter in destination.named_parameters()} == destination_ids
+        for key, value in state.items():
+            torch.testing.assert_close(destination.state_dict()[key], value)
 
 
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")

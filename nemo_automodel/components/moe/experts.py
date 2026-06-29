@@ -15,7 +15,7 @@
 import logging
 import math
 import os
-from functools import partial
+from functools import cache, partial
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
@@ -951,14 +951,11 @@ class GroupedExpertsTE(nn.Module):
         self.dim = config.dim
         self.moe_inter_dim = config.moe_inter_dim
         self.is_gated = is_gated_activation(config.expert_activation)
-        self.use_te_ops = backend is not None and backend.experts == "te_ops"
-        configured_fp8_recipe = getattr(getattr(backend, "te_fp8", None), "recipe", None)
-        configured_mxfp8 = configured_fp8_recipe == "mxfp8" or (
-            callable(getattr(configured_fp8_recipe, "mxfp8", None)) and configured_fp8_recipe.mxfp8()
-        )
-        self._te_ops_mxfp8_fusion_requested = (
-            self.use_te_ops and configured_mxfp8 and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) > 0
-        )
+        # Compatibility attributes retained for graph-discovery code written before
+        # the TE module and TE-ops expert implementations were split into classes.
+        self.__dict__.setdefault("use_te_ops", False)
+        self.__dict__.setdefault("_te_ops_mxfp8_fusion_requested", False)
+        self.__dict__.setdefault("_te_ops_fusion_checked", False)
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -966,7 +963,6 @@ class GroupedExpertsTE(nn.Module):
 
         self._build_grouped_linears(config.n_routed_experts)
         self.expert_activation = get_expert_activation_for_deepep(config)
-        self._te_ops_fusion_checked = False
 
         # FP8 padding/unpadding for GEMM alignment (initialized with full expert count,
         # re-created in init_token_dispatcher with num_local_experts for EP)
@@ -981,107 +977,32 @@ class GroupedExpertsTE(nn.Module):
         self.ep_rank = 0
 
     def _build_grouped_linears(self, num_experts: int) -> None:
-        """Build the selected TE grouped-MLP implementation on the meta device."""
+        """Build TE module GroupedLinear projections on the meta device."""
         gate_up_out_features = self.config.moe_inter_dim * 2 if self.is_gated else self.config.moe_inter_dim
+        from transformer_engine.pytorch import GroupedLinear
 
-        if not self.use_te_ops:
-            from transformer_engine.pytorch import GroupedLinear
-
-            self.gate_up_linear = GroupedLinear(
-                num_gemms=num_experts,
-                in_features=self.config.expert_dim,
-                out_features=gate_up_out_features,
-                bias=self.expert_bias,
-                params_dtype=self.config.dtype,
-                device="meta",
-            )
-            self.down_linear = GroupedLinear(
-                num_gemms=num_experts,
-                in_features=self.config.moe_inter_dim,
-                out_features=self.config.expert_dim,
-                bias=self.expert_bias,
-                params_dtype=self.config.dtype,
-                device="meta",
-            )
-            self.__dict__["_te_grouped_mlp"] = None
-            return
-
-        try:
-            from transformer_engine.pytorch import ops as te_ops
-        except ImportError as error:
-            raise ImportError("experts='te_ops' requires Transformer Engine 2.15 or newer") from error
-
-        if self.config.expert_activation != "quick_geglu":
-            raise ValueError(
-                "experts='te_ops' currently supports expert_activation='quick_geglu', "
-                f"not {self.config.expert_activation!r}"
-            )
-        if self._te_ops_mxfp8_fusion_requested and (
-            not math.isclose(self.config.activation_alpha, 1.702, abs_tol=1e-3)
-            or not math.isclose(self.config.activation_limit, 7.0, abs_tol=1e-6)
-        ):
-            raise ValueError("TE's fused MXFP8 QGeGLU kernel requires activation_alpha=1.702 and activation_limit=7.0")
-
-        self.gate_up_linear = te_ops.GroupedLinear(
-            num_groups=num_experts,
+        self.gate_up_linear = GroupedLinear(
+            num_gemms=num_experts,
             in_features=self.config.expert_dim,
             out_features=gate_up_out_features,
             bias=self.expert_bias,
-            dtype=self.config.dtype,
+            params_dtype=self.config.dtype,
             device="meta",
         )
-        self.down_linear = te_ops.GroupedLinear(
-            num_groups=num_experts,
+        self.down_linear = GroupedLinear(
+            num_gemms=num_experts,
             in_features=self.config.moe_inter_dim,
             out_features=self.config.expert_dim,
             bias=self.expert_bias,
-            dtype=self.config.dtype,
+            params_dtype=self.config.dtype,
             device="meta",
-            scale_bias=self.expert_bias,
         )
-        activation = te_ops.ScaledClampedQGeGLU(
-            glu_interleave_size=32,
-            limit=self.config.activation_limit,
-            alpha=self.config.activation_alpha,
-        )
-
-        # Keep gate_up_linear/down_linear as the registered children so FSDP sees each
-        # parameter exactly once. Sequential holds the same module objects and is kept as
-        # an unregistered execution wrapper solely for TE's operation pattern matcher.
-        self.__dict__["_te_grouped_mlp"] = te_ops.Sequential(
-            self.gate_up_linear,
-            activation,
-            self.down_linear,
-        )
+        self.__dict__["_te_grouped_mlp"] = None
 
     @staticmethod
     def _group_count(linear: nn.Module) -> int:
         num_gemms = getattr(linear, "num_gemms", None)
         return num_gemms if num_gemms is not None else linear.num_groups
-
-    @staticmethod
-    def _interleave_glu_blocks(tensor: torch.Tensor, block_size: int = 32) -> torch.Tensor:
-        """Convert GPT-OSS ``[gate0, up0, ...]`` rows to TE's 32-wide GLU blocks."""
-        if tensor.shape[1] % (2 * block_size) != 0:
-            raise ValueError(f"GLU width {tensor.shape[1]} must be divisible by {2 * block_size}")
-        tail = tensor.shape[2:]
-        pairs = tensor.reshape(tensor.shape[0], -1, 2, *tail)
-        blocks = pairs.reshape(tensor.shape[0], -1, block_size, 2, *tail)
-        blocks = blocks.permute(0, 1, 3, 2, *range(4, blocks.ndim))
-        return blocks.flatten(1, 3)
-
-    @staticmethod
-    def _deinterleave_glu_blocks(tensor: torch.Tensor, block_size: int = 32) -> torch.Tensor:
-        """Convert TE's 32-wide GLU blocks back to GPT-OSS elementwise gate/up rows."""
-        if tensor.shape[1] % (2 * block_size) != 0:
-            raise ValueError(f"GLU width {tensor.shape[1]} must be divisible by {2 * block_size}")
-        tail = tensor.shape[2:]
-        blocks = tensor.reshape(tensor.shape[0], -1, 2, block_size, *tail)
-        pairs = blocks.permute(0, 1, 3, 2, *range(4, blocks.ndim))
-        return pairs.flatten(1, 3)
-
-    def _uses_interleaved_glu(self, linear: nn.Module) -> bool:
-        return self.use_te_ops and self.is_gated and linear is self.gate_up_linear
 
     def _get_stacked_weight(self, linear: "GroupedLinear", transpose: bool = False) -> torch.Tensor:
         weights = []
@@ -1091,8 +1012,6 @@ class GroupedExpertsTE(nn.Module):
                 w = w.to_local()
             weights.append(w)
         stacked = torch.stack(weights, dim=0)  # [num_experts, out, in]
-        if self._uses_interleaved_glu(linear):
-            stacked = self._deinterleave_glu_blocks(stacked)
         if transpose:
             stacked = stacked.transpose(-1, -2)  # [num_experts, in, out]
         return stacked
@@ -1107,15 +1026,11 @@ class GroupedExpertsTE(nn.Module):
                 b = b.to_local()
             biases.append(b)
         stacked = torch.stack(biases, dim=0)  # [num_experts, out_features]
-        if self._uses_interleaved_glu(linear):
-            stacked = self._deinterleave_glu_blocks(stacked)
         return stacked
 
     def _set_stacked_weight(self, linear: "GroupedLinear", stacked: torch.Tensor, transpose: bool = False):
         if transpose:
             stacked = stacked.transpose(-1, -2)  # [num_experts, out, in]
-        if self._uses_interleaved_glu(linear):
-            stacked = self._interleave_glu_blocks(stacked)
         for i in range(self._group_count(linear)):
             weight_param = getattr(linear, f"weight{i}")
             if isinstance(weight_param, DTensor):
@@ -1125,8 +1040,6 @@ class GroupedExpertsTE(nn.Module):
     def _set_stacked_bias(self, linear: "GroupedLinear", stacked: torch.Tensor):
         if not linear.use_bias or stacked is None:
             return
-        if self._uses_interleaved_glu(linear):
-            stacked = self._interleave_glu_blocks(stacked)
         for i in range(self._group_count(linear)):
             bias_param = getattr(linear, f"bias{i}")
             if isinstance(bias_param, DTensor):
@@ -1151,6 +1064,10 @@ class GroupedExpertsTE(nn.Module):
 
     def set_moe_mesh(self, moe_mesh: Optional[DeviceMesh]) -> None:
         self.moe_mesh = self._normalize_moe_mesh(moe_mesh)
+
+    def _router_expert_pad_multiple(self) -> int | None:
+        """Return the dispatcher padding multiple required by this expert kernel."""
+        return None
 
     @property
     def gate_and_up_projs(self) -> torch.Tensor:
@@ -1343,11 +1260,7 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
-            # The CuTe DSL grouped-MLP kernel requires each expert M dimension
-            # to be 256-aligned. Let the dispatcher create/remove padding so the
-            # GPU split-size tensor can flow directly into TE without a .tolist()
-            # synchronization on the critical path.
-            moe_router_expert_pad_multiple=256 if self._te_ops_mxfp8_fusion_requested else None,
+            moe_router_expert_pad_multiple=self._router_expert_pad_multiple(),
         )
 
         local_expert_indices_offset = self.ep_rank * self.num_local_experts
@@ -1398,44 +1311,6 @@ class GroupedExpertsTE(nn.Module):
             token_probs=weights,
             token_indices=indices,
         )
-
-        if self.use_te_ops:
-            if not isinstance(tokens_per_expert, torch.Tensor):
-                tokens_per_expert = torch.tensor(
-                    tokens_per_expert,
-                    dtype=torch.int64,
-                    device=permuted_local_hidden_states.device,
-                )
-            else:
-                tokens_per_expert = tokens_per_expert.to(
-                    device=permuted_local_hidden_states.device,
-                    dtype=torch.int64,
-                )
-            permuted_probs = permuted_probs.reshape(-1).to(permuted_local_hidden_states.dtype)
-
-            if permuted_local_hidden_states.shape[0] == 0:
-                # Preserve the dispatch autograd edge so every EP rank participates in
-                # the reverse communication, even when this rank received no tokens.
-                zero = permuted_local_hidden_states.sum() * 0 + permuted_probs.sum() * 0
-                for linear in (self.gate_up_linear, self.down_linear):
-                    for parameter in linear.parameters():
-                        local_parameter = parameter.to_local() if isinstance(parameter, DTensor) else parameter
-                        zero = zero + local_parameter.reshape(-1)[0].to(zero.dtype) * 0
-                output2 = permuted_local_hidden_states * 0 + zero
-                return self.token_dispatcher.token_unpermutation(output2)
-
-            from transformer_engine.pytorch.quantization import FP8GlobalStateManager
-
-            fp8_active = FP8GlobalStateManager.is_fp8_enabled()
-            fc2_extra_inputs = (tokens_per_expert, permuted_probs) if self.expert_bias else (tokens_per_expert,)
-            output2 = self._te_grouped_mlp(
-                permuted_local_hidden_states,
-                tokens_per_expert,
-                permuted_probs,
-                *fc2_extra_inputs,
-            )
-            self._check_te_ops_fusion(fp8_active)
-            return self.token_dispatcher.token_unpermutation(output2)
 
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
@@ -1489,6 +1364,409 @@ class GroupedExpertsTE(nn.Module):
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
 
+    def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
+        """Initialize weights using reset_parameters()"""
+        self.gate_up_linear.reset_parameters()
+        self.down_linear.reset_parameters()
+
+
+@cache
+def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
+    """Build the TE-ops GroupedLinear variant with FSDP-safe stacked owners."""
+    try:
+        from transformer_engine.pytorch import ops as te_ops
+        from transformer_engine.pytorch.tensor import GroupedTensor
+    except ImportError as error:
+        raise ImportError("experts='te_ops' stacked parameters require Transformer Engine 2.16.1 or newer") from error
+
+    class _StackedTeOpsGroupedLinear(te_ops.GroupedLinear):
+        """TE GroupedLinear backed by plain stacked Parameters.
+
+        PyTorch FSDP2 cannot shard TE's GroupedTensor parameter directly. The registered
+        owners here are ordinary tensors in TE layout (``[experts, out, in]`` and
+        ``[experts, out]``). TE sees transient GroupedTensor aliases over the currently
+        unsharded owner storage, while OperationFuser records the plain owners as its
+        autograd inputs and maps TE's packed gradients back to them.
+        """
+
+        def __init__(
+            self,
+            num_groups: int,
+            in_features: int,
+            out_features: int,
+            *,
+            bias: bool,
+            dtype: torch.dtype,
+            device: torch.device | str,
+            scale_bias: bool = False,
+        ) -> None:
+            previous_single_param_env = os.environ.get("NVTE_GROUPED_LINEAR_SINGLE_PARAM")
+            os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = "1"
+            try:
+                super().__init__(
+                    num_groups=num_groups,
+                    in_features=in_features,
+                    out_features=out_features,
+                    bias=bias,
+                    dtype=dtype,
+                    device=device,
+                    single_grouped_weight=True,
+                    single_grouped_bias=bias,
+                    scale_bias=scale_bias,
+                )
+            finally:
+                if previous_single_param_env is None:
+                    del os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"]
+                else:
+                    os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = previous_single_param_env
+
+            if not self.single_grouped_weight or (bias and not self.single_grouped_bias):
+                raise RuntimeError(
+                    "Transformer Engine disabled single grouped parameters for experts='te_ops'. "
+                    "Use a TE build with single_grouped_weight/single_grouped_bias support."
+                )
+            if self._accumulate_into_main_grad or self.wgrad_store.delay_wgrad_compute():
+                raise ValueError("Stacked TE-ops experts do not support main-grad accumulation or delayed wgrad")
+
+            weight_shape = (num_groups, out_features, in_features)
+            grouped_weight = self._parameters.pop("weight", None)
+            if grouped_weight is not None:
+                weight_data = grouped_weight.rowwise_data.view(weight_shape)
+            else:
+                weight_data = torch.stack(
+                    [self._parameters[f"weight{group_idx}"] for group_idx in range(num_groups)], dim=0
+                )
+            weight_owner = nn.Parameter(weight_data, requires_grad=True)
+            weight_owner._te_ops_stacked_weight = True
+            for group_idx in range(num_groups):
+                self.register_parameter(f"weight{group_idx}", None)
+            self.register_parameter("_stacked_weight", weight_owner)
+
+            if bias:
+                bias_shape = (num_groups, out_features)
+                grouped_bias = self._parameters.pop("bias", None)
+                if grouped_bias is not None:
+                    bias_data = grouped_bias.rowwise_data.view(bias_shape)
+                else:
+                    bias_data = torch.stack(
+                        [self._parameters[f"bias{group_idx}"] for group_idx in range(num_groups)], dim=0
+                    )
+                bias_owner = nn.Parameter(bias_data, requires_grad=True)
+                bias_owner._te_ops_stacked_bias = True
+                for group_idx in range(num_groups):
+                    self.register_parameter(f"bias{group_idx}", None)
+                self.register_parameter("_stacked_bias", bias_owner)
+
+            self.__dict__["_stacked_weight_alias"] = None
+            self.__dict__["_stacked_weight_alias_key"] = None
+            self.__dict__["_stacked_bias_alias"] = None
+            self.__dict__["_stacked_bias_alias_key"] = None
+
+        def _owner_local_tensor(self, name: str, expected_shape: tuple[int, ...]) -> torch.Tensor:
+            owner = self._parameters[name]
+            local_owner = owner.to_local() if isinstance(owner, DTensor) else owner
+            if tuple(local_owner.shape) != expected_shape:
+                raise RuntimeError(
+                    f"TE-ops stacked owner {name} has local shape {tuple(local_owner.shape)}, "
+                    f"expected unsharded shape {expected_shape}. The GroupedTensor runtime view "
+                    "must be created inside the expert FSDP pre-forward unshard window."
+                )
+            if not local_owner.is_contiguous():
+                raise RuntimeError(f"TE-ops stacked owner {name} must be contiguous after FSDP unshard")
+            return local_owner
+
+        def _grouped_alias(
+            self,
+            owner_name: str,
+            member_shape: tuple[int, ...],
+            alias_name: str,
+        ) -> torch.Tensor:
+            expected_shape = (self.num_groups, *member_shape)
+            owner = self._parameters[owner_name]
+            local_owner = self._owner_local_tensor(owner_name, expected_shape)
+            cache_key = (
+                id(local_owner),
+                local_owner.data_ptr(),
+                local_owner.device,
+                local_owner.dtype,
+                tuple(local_owner.shape),
+            )
+            alias_key_name = f"{alias_name}_key"
+            if self.__dict__.get(alias_key_name) == cache_key:
+                return self.__dict__[alias_name]
+
+            alias = GroupedTensor.make_grouped_tensor_from_rowwise_data(
+                num_tensors=self.num_groups,
+                tensor_shape=member_shape,
+                rowwise_data=local_owner.view(-1),
+                dtype=local_owner.dtype,
+            )
+            alias.requires_grad_(owner.requires_grad)
+            self.__dict__[alias_name] = alias
+            self.__dict__[alias_key_name] = cache_key
+            return alias
+
+        def __getattr__(self, name: str):
+            parameters = self.__dict__.get("_parameters", {})
+            if name == "weight" and parameters.get("_stacked_weight") is not None:
+                return self._grouped_alias(
+                    "_stacked_weight",
+                    (self.out_features, self.in_features),
+                    "_stacked_weight_alias",
+                )
+            if name == "bias" and parameters.get("_stacked_bias") is not None:
+                return self._grouped_alias(
+                    "_stacked_bias",
+                    (self.out_features,),
+                    "_stacked_bias_alias",
+                )
+            return super().__getattr__(name)
+
+        def stacked_weight_local(self) -> torch.Tensor:
+            """Return the registered stacked weight owner's current local tensor."""
+            owner = self._parameters["_stacked_weight"]
+            return owner.to_local() if isinstance(owner, DTensor) else owner
+
+        def stacked_bias_local(self) -> torch.Tensor | None:
+            """Return the registered stacked bias owner's current local tensor."""
+            owner = self._parameters.get("_stacked_bias")
+            if owner is None:
+                return None
+            return owner.to_local() if isinstance(owner, DTensor) else owner
+
+        def clear_grouped_aliases(self) -> None:
+            """Drop aliases after owner storage is replaced or reshaped."""
+            self.__dict__["_stacked_weight_alias"] = None
+            self.__dict__["_stacked_weight_alias_key"] = None
+            self.__dict__["_stacked_bias_alias"] = None
+            self.__dict__["_stacked_bias_alias_key"] = None
+
+        def reset_parameters(self) -> None:
+            """Initialize stacked owners in-place without replacing Parameters."""
+            if self.__dict__.get("_parameters", {}).get("_stacked_weight") is None:
+                super().reset_parameters()
+                return
+            with torch.no_grad():
+                bound = 1 / math.sqrt(self.in_features)
+                self.stacked_weight_local().uniform_(-bound, bound)
+                bias = self.stacked_bias_local()
+                if bias is not None:
+                    bias.zero_()
+            self.clear_grouped_aliases()
+
+        def _load_from_state_dict(
+            self,
+            state_dict: Dict[str, Any],
+            prefix: str,
+            local_metadata,
+            strict: bool,
+            missing_keys: list[str],
+            unexpected_keys: list[str],
+            error_msgs: list[str],
+        ) -> None:
+            """Skip internal owner keys; the parent loads canonical expert tensors."""
+            del state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+
+    return _StackedTeOpsGroupedLinear
+
+
+class GroupedExpertsTeOps(GroupedExpertsTE):
+    """MoE experts using TE fusible ops with one stacked owner per projection."""
+
+    def __init__(
+        self,
+        config: MoEConfig,
+        backend: Optional["BackendConfig"] = None,
+        dispatcher_backend: str = "deepep",
+        dispatcher_num_sms: int = 20,
+        dispatcher_share_token_dispatcher: bool = True,
+        dispatcher_async_dispatch: bool = False,
+    ) -> None:
+        if backend is None or backend.experts != "te_ops":
+            raise ValueError("GroupedExpertsTeOps requires BackendConfig(experts='te_ops')")
+        configured_fp8_recipe = getattr(getattr(backend, "te_fp8", None), "recipe", None)
+        configured_mxfp8 = configured_fp8_recipe == "mxfp8" or (
+            callable(getattr(configured_fp8_recipe, "mxfp8", None)) and configured_fp8_recipe.mxfp8()
+        )
+        self._te_ops_mxfp8_fusion_requested = (
+            configured_mxfp8 and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) > 0
+        )
+        self._te_ops_fusion_checked = False
+        self.use_te_ops = True
+        super().__init__(
+            config,
+            backend=backend,
+            dispatcher_backend=dispatcher_backend,
+            dispatcher_num_sms=dispatcher_num_sms,
+            dispatcher_share_token_dispatcher=dispatcher_share_token_dispatcher,
+            dispatcher_async_dispatch=dispatcher_async_dispatch,
+        )
+
+    def _build_grouped_linears(self, num_experts: int) -> None:
+        """Build stacked-owner TE ops projections on the meta device."""
+        if self.config.expert_activation != "quick_geglu":
+            raise ValueError(
+                "experts='te_ops' currently supports expert_activation='quick_geglu', "
+                f"not {self.config.expert_activation!r}"
+            )
+        if self._te_ops_mxfp8_fusion_requested and (
+            not math.isclose(self.config.activation_alpha, 1.702, abs_tol=1e-3)
+            or not math.isclose(self.config.activation_limit, 7.0, abs_tol=1e-6)
+        ):
+            raise ValueError("TE's fused MXFP8 QGeGLU kernel requires activation_alpha=1.702 and activation_limit=7.0")
+
+        from transformer_engine.pytorch import ops as te_ops
+
+        stacked_linear = _get_stacked_te_ops_grouped_linear_class()
+        gate_up_out_features = self.config.moe_inter_dim * 2
+        self.gate_up_linear = stacked_linear(
+            num_groups=num_experts,
+            in_features=self.config.expert_dim,
+            out_features=gate_up_out_features,
+            bias=self.expert_bias,
+            dtype=self.config.dtype,
+            device="meta",
+        )
+        self.down_linear = stacked_linear(
+            num_groups=num_experts,
+            in_features=self.config.moe_inter_dim,
+            out_features=self.config.expert_dim,
+            bias=self.expert_bias,
+            dtype=self.config.dtype,
+            device="meta",
+            scale_bias=self.expert_bias,
+        )
+        activation = te_ops.ScaledClampedQGeGLU(
+            glu_interleave_size=32,
+            limit=self.config.activation_limit,
+            alpha=self.config.activation_alpha,
+        )
+
+        # Sequential is intentionally unregistered because these same linear objects
+        # are already registered above. Its OperationFuser is created lazily on the
+        # first forward, after FSDP has unsharded the stacked owners.
+        self.__dict__["_te_grouped_mlp"] = te_ops.Sequential(
+            self.gate_up_linear,
+            activation,
+            self.down_linear,
+        )
+
+    @staticmethod
+    def _interleave_glu_blocks(tensor: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+        """Convert GPT-OSS ``[gate0, up0, ...]`` rows to TE's 32-wide GLU blocks."""
+        if tensor.shape[1] % (2 * block_size) != 0:
+            raise ValueError(f"GLU width {tensor.shape[1]} must be divisible by {2 * block_size}")
+        tail = tensor.shape[2:]
+        pairs = tensor.reshape(tensor.shape[0], -1, 2, *tail)
+        blocks = pairs.reshape(tensor.shape[0], -1, block_size, 2, *tail)
+        blocks = blocks.permute(0, 1, 3, 2, *range(4, blocks.ndim))
+        return blocks.flatten(1, 3)
+
+    @staticmethod
+    def _deinterleave_glu_blocks(tensor: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+        """Convert TE's 32-wide GLU blocks back to GPT-OSS elementwise gate/up rows."""
+        if tensor.shape[1] % (2 * block_size) != 0:
+            raise ValueError(f"GLU width {tensor.shape[1]} must be divisible by {2 * block_size}")
+        tail = tensor.shape[2:]
+        blocks = tensor.reshape(tensor.shape[0], -1, 2, block_size, *tail)
+        pairs = blocks.permute(0, 1, 3, 2, *range(4, blocks.ndim))
+        return pairs.flatten(1, 3)
+
+    def _get_stacked_weight(self, linear: nn.Module, transpose: bool = False) -> torch.Tensor:
+        stacked = linear.stacked_weight_local()
+        if linear is self.gate_up_linear:
+            stacked = self._deinterleave_glu_blocks(stacked)
+        if transpose:
+            stacked = stacked.transpose(-1, -2)
+        return stacked
+
+    def _get_stacked_bias(self, linear: nn.Module) -> torch.Tensor | None:
+        stacked = linear.stacked_bias_local()
+        if stacked is not None and linear is self.gate_up_linear:
+            stacked = self._deinterleave_glu_blocks(stacked)
+        return stacked
+
+    def _set_stacked_weight(self, linear: nn.Module, stacked: torch.Tensor, transpose: bool = False) -> None:
+        if transpose:
+            stacked = stacked.transpose(-1, -2)
+        if linear is self.gate_up_linear:
+            stacked = self._interleave_glu_blocks(stacked)
+        with torch.no_grad():
+            linear.stacked_weight_local().copy_(stacked)
+        linear.clear_grouped_aliases()
+
+    def _set_stacked_bias(self, linear: nn.Module, stacked: torch.Tensor) -> None:
+        if not linear.use_bias or stacked is None:
+            return
+        if linear is self.gate_up_linear:
+            stacked = self._interleave_glu_blocks(stacked)
+        bias = linear.stacked_bias_local()
+        if bias is None:
+            raise RuntimeError("TE-ops grouped bias owner is missing")
+        with torch.no_grad():
+            bias.copy_(stacked)
+        linear.clear_grouped_aliases()
+
+    def _router_expert_pad_multiple(self) -> int | None:
+        return 256 if self._te_ops_mxfp8_fusion_requested else None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run dispatched tokens through the fused TE-ops grouped MLP."""
+        assert not isinstance(x, DTensor), "Input should not be a DTensor"
+        assert self.config.n_routed_experts % self.ep_size == 0, (
+            f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
+        )
+
+        weights, indices = _mask_routing_metadata(weights, indices, token_mask)
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = self.token_dispatcher.token_permutation2(
+            hidden_states=x,
+            num_local_tokens=x.size(0),
+            token_probs=weights,
+            token_indices=indices,
+        )
+        if not isinstance(tokens_per_expert, torch.Tensor):
+            tokens_per_expert = torch.tensor(
+                tokens_per_expert,
+                dtype=torch.int64,
+                device=permuted_local_hidden_states.device,
+            )
+        else:
+            tokens_per_expert = tokens_per_expert.to(
+                device=permuted_local_hidden_states.device,
+                dtype=torch.int64,
+            )
+        permuted_probs = permuted_probs.reshape(-1).to(permuted_local_hidden_states.dtype)
+
+        if permuted_local_hidden_states.shape[0] == 0:
+            # Keep dispatch and all stacked owners in the graph so empty EP ranks
+            # participate in reverse communication and receive explicit zero grads.
+            zero = permuted_local_hidden_states.sum() * 0 + permuted_probs.sum() * 0
+            for linear in (self.gate_up_linear, self.down_linear):
+                for parameter in linear.parameters():
+                    local_parameter = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+                    zero = zero + local_parameter.reshape(-1)[0].to(zero.dtype) * 0
+            output = permuted_local_hidden_states * 0 + zero
+            return self.token_dispatcher.token_unpermutation(output)
+
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        fp8_active = FP8GlobalStateManager.is_fp8_enabled()
+        fc2_extra_inputs = (tokens_per_expert, permuted_probs) if self.expert_bias else (tokens_per_expert,)
+        output = self._te_grouped_mlp(
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            permuted_probs,
+            *fc2_extra_inputs,
+        )
+        self._check_te_ops_fusion(fp8_active)
+        return self.token_dispatcher.token_unpermutation(output)
+
     def _check_te_ops_fusion(self, fp8_active: bool) -> None:
         """Fail loudly if an explicitly requested MXFP8 fusion silently fell back."""
         if self._te_ops_fusion_checked or not fp8_active:
@@ -1516,32 +1794,15 @@ class GroupedExpertsTE(nn.Module):
         if not forward_fusion_active or not backward_fusion_active:
             raise RuntimeError(
                 "TE CuTe DSL grouped-MLP forward/backward fusion was requested but did not fully activate. "
-                "Check Transformer Engine >=2.15, nvidia-cudnn-frontend >=1.23, "
+                "Check Transformer Engine >=2.16.1, nvidia-cudnn-frontend >=1.23, "
                 "SM100, MXFP8 autocast, and 32-wide GLU interleaving."
             )
         if not dist.is_initialized() or dist.get_rank() == 0:
             logger.warning("TE CuTe DSL MXFP8 grouped-MLP forward/backward fusion is active.")
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
-        """Initialize weights using reset_parameters()"""
-        if self.use_te_ops:
-            # TE ops GroupedLinear.reset_parameters() replaces every Parameter object.
-            # At this point EP/FSDP has already attached sharding metadata, so initialize
-            # the materialized storage in-place instead of invalidating those wrappers.
-            with torch.no_grad():
-                for linear in (self.gate_up_linear, self.down_linear):
-                    bound = 1 / math.sqrt(linear.in_features)
-                    for group_idx in range(self._group_count(linear)):
-                        weight = getattr(linear, f"weight{group_idx}")
-                        if isinstance(weight, DTensor):
-                            weight = weight.to_local()
-                        weight.uniform_(-bound, bound)
-                        if linear.use_bias:
-                            bias = getattr(linear, f"bias{group_idx}")
-                            if isinstance(bias, DTensor):
-                                bias = bias.to_local()
-                            bias.zero_()
-            return
+        """Initialize stacked owners in-place, preserving FSDP and optimizer identity."""
+        del buffer_device, init_std
         self.gate_up_linear.reset_parameters()
         self.down_linear.reset_parameters()
 

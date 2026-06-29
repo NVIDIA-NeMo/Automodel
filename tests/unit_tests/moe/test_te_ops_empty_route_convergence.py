@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nemo_automodel.components.moe.experts import GroupedExpertsTE
+from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
 
 _ROUTE_SEQUENCE = (True, False, True)
 _NUM_EXPERTS = 2
@@ -128,11 +128,10 @@ def _grouped_mlp(owner, hidden_states, tokens_per_expert, token_probs):
 
 
 def _build_experts_under_test():
-    experts = GroupedExpertsTE.__new__(GroupedExpertsTE)
+    experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
     nn.Module.__init__(experts)
     experts.config = SimpleNamespace(n_routed_experts=_NUM_EXPERTS)
     experts.ep_size = 1
-    experts.use_te_ops = True
     experts.expert_bias = True
     experts.gate_up_linear = _TinyGroupedLinear()
     experts.down_linear = _TinyGroupedLinear()

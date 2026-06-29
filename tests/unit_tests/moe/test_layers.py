@@ -1296,6 +1296,19 @@ class TestMoE:
         assert isinstance(moe.gate, Gate)
         assert isinstance(moe.experts, GroupedExpertsTE)
 
+    def test_moe_init_with_te_ops_uses_distinct_expert_class(self, moe_config, backend_config):
+        """The TE-ops backend must not instantiate the legacy TE module class."""
+        backend_config.experts = "te_ops"
+        backend_config.dispatcher = "hybridep"
+        with (
+            patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2),
+            patch("nemo_automodel.components.moe.layers.GroupedExpertsTeOps") as te_ops_experts,
+        ):
+            moe = MoE(moe_config, backend_config)
+
+        te_ops_experts.assert_called_once()
+        assert moe.experts is te_ops_experts.return_value
+
     def test_moe_init_with_gmm_experts_with_deepep(self, moe_config, backend_config):
         """GMM experts with deepep dispatcher should use GroupedExpertsDeepEP."""
         backend_config.experts = "gmm"

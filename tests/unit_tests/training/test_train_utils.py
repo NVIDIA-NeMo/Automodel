@@ -375,6 +375,34 @@ class _MoEModule(nn.Module):
         self.mlp = nn.ModuleDict({"experts": _ExpertsModule()})
 
 
+class _TEOpsStackedGroupedLinearMock(nn.Module):
+    """Mock TE-ops GroupedLinear with stacked owner naming."""
+
+    def __init__(self):
+        super().__init__()
+        self._stacked_weight = nn.Parameter(torch.randn(2, 4, 2))
+        self._stacked_bias = nn.Parameter(torch.randn(2, 4))
+
+
+class _TEOpsStackedExpertsModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_up_linear = _TEOpsStackedGroupedLinearMock()
+        self.down_linear = _TEOpsStackedGroupedLinearMock()
+
+
+class _TEOpsStackedMoEModule(nn.Module):
+    def __init__(self, expert_parent_name: str, activation_checkpointed: bool):
+        super().__init__()
+        self.dense = nn.Linear(4, 2, bias=False)
+        parent = nn.Module()
+        setattr(parent, expert_parent_name, nn.ModuleDict({"experts": _TEOpsStackedExpertsModule()}))
+        if activation_checkpointed:
+            self._checkpoint_wrapped_module = parent
+        else:
+            setattr(self, expert_parent_name, getattr(parent, expert_parent_name))
+
+
 class TestScaleGradsAndClipGradNorm:
     """Tests for scale_grads_and_clip_grad_norm with EP scaling."""
 
@@ -403,6 +431,37 @@ class TestScaleGradsAndClipGradNorm:
         # Non-expert params (gate) should NOT be scaled
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 2.0)
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 1.0)
+
+    @pytest.mark.parametrize("expert_parent_name", ["mlp", "moe"])
+    @pytest.mark.parametrize("activation_checkpointed", [False, True])
+    def test_ep_scaling_for_te_ops_stacked_owners(self, expert_parent_name, activation_checkpointed):
+        """Stacked TE-ops weights and biases receive the same EP scaling."""
+        model = _TEOpsStackedMoEModule(expert_parent_name, activation_checkpointed)
+        model.dense.weight.grad = torch.full_like(model.dense.weight, 8.0)
+        stacked_parameters = {
+            name: parameter
+            for name, parameter in model.named_parameters()
+            if name.endswith(("_stacked_weight", "_stacked_bias"))
+        }
+        assert len(stacked_parameters) == 4
+        for parameter in stacked_parameters.values():
+            parameter.grad = torch.full_like(parameter, 8.0)
+
+        moe_mesh = Mock()
+        moe_mesh.mesh_dim_names = ["ep_shard"]
+        moe_mesh.__getitem__ = Mock(return_value=Mock(size=Mock(return_value=2)))
+
+        scale_grads_and_clip_grad_norm(
+            max_grad_norm=None,
+            model_parts=[model],
+            pp_enabled=False,
+            moe_mesh=moe_mesh,
+            dp_group_size=4,
+        )
+
+        torch.testing.assert_close(model.dense.weight.grad, torch.full_like(model.dense.weight, 8.0))
+        for parameter in stacked_parameters.values():
+            torch.testing.assert_close(parameter.grad, torch.full_like(parameter, 4.0))
 
     def test_no_ep_scaling_without_moe_mesh(self):
         """Test that no EP scaling occurs when moe_mesh is None."""

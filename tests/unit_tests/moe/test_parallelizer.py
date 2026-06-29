@@ -616,6 +616,26 @@ def _find_call_by_first_arg(mock_obj, target_first_arg):
     return None
 
 
+def test_te_ops_stacked_owner_shard_placements(monkeypatch):
+    """TE-layout stacked weights shard input dim 2; stacked biases shard output dim 1."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    shard_dims = []
+
+    def fake_shard(dim):
+        shard_dims.append(dim)
+        return dim
+
+    monkeypatch.setattr(P, "Shard", fake_shard)
+    weight = type("Weight", (), {"ndim": 3, "_te_ops_stacked_weight": True})()
+    bias = type("Bias", (), {"ndim": 2, "_te_ops_stacked_bias": True})()
+    ordinary = type("Ordinary", (), {"ndim": 3})()
+
+    assert P._moe_shard_placement(weight) == 2
+    assert P._moe_shard_placement(bias) == 1
+    assert P._moe_shard_placement(ordinary) == 1
+    assert shard_dims == [2, 1, 1]
+
+
 def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     # Patch MoE symbol for isinstance

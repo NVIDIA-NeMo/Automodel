@@ -43,12 +43,15 @@ _CP_STREAM = None
 def _moe_shard_placement(param):
     """FSDP shard placement for grouped-expert params.
 
-    Shard on dim=1 for the (>=2D) expert weights since there may be more shards than
-    experts (dim=0). A 1D param (e.g. the per-expert bias of the experts="te"
-    GroupedLinear path, shape [out_features]) has no dim 1, so shard it on dim 0
-    instead. FSDP all-gathers before use, so the shard dim is a storage detail and does
-    not change compute.
+    Canonical expert weights use ``[expert, in, out]`` and shard dim 1. TE-ops
+    stacked owners use TE layout ``[expert, out, in]``, so their equivalent input
+    dimension is dim 2. Stacked TE-ops biases use ``[expert, out]`` and shard dim 1.
+    A 1D param from the legacy experts="te" path has no dim 1 and shards on dim 0.
     """
+    if getattr(param, "_te_ops_stacked_weight", False):
+        return Shard(2)
+    if getattr(param, "_te_ops_stacked_bias", False):
+        return Shard(1)
     return Shard(0) if param.ndim < 2 else Shard(1)
 
 
