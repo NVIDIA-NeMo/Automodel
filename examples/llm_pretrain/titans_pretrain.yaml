@@ -1,0 +1,81 @@
+# From-scratch pretraining of a small linear-memory Titans model
+# (Gated DeltaNet + data-dependent momentum + forget gate).
+#
+# The token mixer is the NeuralMemory module
+# (nemo_automodel.components.models.titans.layers.NeuralMemory), which wraps fla's
+# chunk_gated_delta_rule for the momentum-disabled (Gated DeltaNet) path. Set
+# momentum: false below to recover the exact GDN baseline.
+#
+# To run this recipe (single node):
+#   automodel pretrain llm -c examples/llm_pretrain/titans_pretrain.yaml --nproc-per-node 1
+# Point `dataset.file_pattern` at your tokenized *.bin shards first. The optimizer
+# is plain torch AdamW so this runs without Transformer Engine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 4
+  ckpt_every_steps: 2000
+  num_epochs: 1
+  max_steps: 2000
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+# Model: build a fresh linear-memory Titans from an explicit HF config.
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.titans.config.TitansConfig
+    architectures: [TitansForCausalLM]
+    vocab_size: 50258
+    hidden_size: 512
+    num_hidden_layers: 6
+    num_attention_heads: 8     # neural-memory heads
+    head_dim: 64               # per-head memory (mem_dim); inner width = 8 * 64 = 512
+    intermediate_size: 1376    # SwiGLU MLP inner dim
+    hidden_act: silu
+    max_position_embeddings: 2048
+    rms_norm_eps: 1.0e-6
+    momentum: true             # Titans data-dependent momentum (false => Gated DeltaNet)
+    forget: true               # data-dependent decay/forget gate (A_log/dt_bias, fp32)
+    mem_depth: 1               # linear memory (Phase 1); >=2 is deep memory (Phase 2)
+    chunk_size: 16
+    tie_word_embeddings: true
+    initializer_range: 0.02
+    torch_dtype: bfloat16
+    bos_token_id: 50256
+    eos_token_id: 50256
+
+# Dataset: nanoGPT-style binary token shards. Point this at your own shards.
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
+  file_pattern: "modded-nanogpt/data/fineweb_10BT_max_500M/fineweb_train_*.bin"
+  seq_len: 1024
+  shuffle_files: true
+  align_to_bos: false
+  bos_token: 50256
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+# Plain torch AdamW (no Transformer Engine dependency).
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 3.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
