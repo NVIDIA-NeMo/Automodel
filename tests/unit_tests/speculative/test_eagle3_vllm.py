@@ -63,6 +63,70 @@ def test_vllm_model_shim_exposes_config_and_device():
     assert len(params) == 1 and params[0].device.type == "cpu"
 
 
+def _patch_runner_init_deps(monkeypatch, hf_config):
+    """Stub out the CUDA + HF-config touch points in ``VLLMTargetRunner.__init__``.
+
+    ``__init__`` reads the HF config, allocates a CUDA device marker via the model
+    shim, and queries ``torch.cuda.current_device()`` -- none of which work on the
+    CPU editing host. Patch all three so the pure-Python wiring can be exercised.
+    Returns a dict the model-shim stub records its ``(config, device)`` into.
+    """
+    import transformers
+
+    from nemo_automodel.components.speculative.eagle import vllm_runner
+
+    recorded = {}
+
+    class _StubShim:
+        def __init__(self, config, device):
+            recorded["config"] = config
+            recorded["device"] = device
+
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *a, **k: hf_config)
+    monkeypatch.setattr(vllm_runner, "_VLLMModelShim", _StubShim)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    return recorded
+
+
+def test_vllm_target_runner_init_parses_config_and_defaults(monkeypatch):
+    """``__init__`` reads dims off the HF config and picks safe lazy defaults."""
+    from nemo_automodel.components.speculative.eagle import vllm_runner
+
+    hf_config = SimpleNamespace(num_hidden_layers=28, hidden_size=3584, vocab_size=152064, rms_norm_eps=1e-5)
+    recorded = _patch_runner_init_deps(monkeypatch, hf_config)
+    monkeypatch.setenv("TMPDIR", "/scratch/tmp")
+
+    runner = vllm_runner.VLLMTargetRunner("org/model", tp_size=2)
+
+    assert (runner._num_layers, runner._hidden, runner._rms_eps) == (28, 3584, 1e-5)
+    assert runner._tp_size == 2
+    # The engine + capture layers + cached weights are all built lazily later.
+    assert runner._llm is None and runner._aux_layer_ids is None
+    assert runner._embed_w is None and runner._norm_w is None and runner._lm_head_w is None
+    # No explicit storage path -> rooted under TMPDIR.
+    assert runner._shared_storage_path == "/scratch/tmp/vllm_eagle3_hidden_states"
+    # The shim carries the HF config and a CUDA device marker.
+    assert recorded["config"] is hf_config and recorded["device"].type == "cuda"
+
+
+def test_vllm_target_runner_init_honors_explicit_args(monkeypatch):
+    """Explicit storage path / vllm_kwargs are kept; missing rms eps defaults to 1e-6."""
+    from nemo_automodel.components.speculative.eagle import vllm_runner
+
+    hf_config = SimpleNamespace(num_hidden_layers=32, hidden_size=4096, vocab_size=128000)
+    _patch_runner_init_deps(monkeypatch, hf_config)
+
+    runner = vllm_runner.VLLMTargetRunner(
+        "org/model",
+        shared_storage_path="/shared/hs",
+        vllm_kwargs={"max_model_len": 2048},
+    )
+
+    assert runner._rms_eps == 1e-6  # getattr fallback when the config omits rms_norm_eps
+    assert runner._shared_storage_path == "/shared/hs"
+    assert runner._vllm_kwargs == {"max_model_len": 2048}
+
+
 def test_serve_target_arg_defaults_includes_vllm():
     from nemo_automodel.components.speculative import serve_target
 
