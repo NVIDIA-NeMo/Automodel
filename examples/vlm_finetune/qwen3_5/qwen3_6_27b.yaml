@@ -68,6 +68,7 @@ distributed:
   ep_size: 1
   sequence_parallel: false
   activation_checkpointing: true
+  activation_checkpointing_scope: language
 
   pipeline:
     pp_schedule: interleaved1f1b
