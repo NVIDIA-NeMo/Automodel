@@ -108,9 +108,13 @@ class TEFp8Config:
     scales). Unlike torchao's MXFP8 grouped GEMM, TE's MXFP8 backward is mature (no
     e8m0-overflow NaN), which is why GPT-OSS experts (grouped + bias) use the
     ``experts="te"`` path with this recipe instead of ``experts="torch_mm_mxfp8"``.
+
+    Set ``fp8_dpa=True`` to let TE run dot-product attention in FP8 as well. This
+    mirrors Megatron's ``fp8_dot_product_attention`` option for the MXFP8 recipe.
     """
 
     recipe: Literal["current", "block", "mxfp8"] | Any = "current"
+    fp8_dpa: bool = False
 
     def build_recipe(self):
         """Build and return the TE FP8 recipe object.
@@ -137,7 +141,7 @@ class TEFp8Config:
                     "(TE >= ~2.3). The installed TE does not provide it; rebuild on a newer TE image."
                 ) from e
             logger.warning("te_fp8.recipe='mxfp8': using TE MXFP8BlockScaling (mature MXFP8 backward).")
-            return MXFP8BlockScaling()
+            return MXFP8BlockScaling(fp8_dpa=self.fp8_dpa)
         if self.recipe == "block":
             return Float8BlockScaling()
         return Float8CurrentScaling()
