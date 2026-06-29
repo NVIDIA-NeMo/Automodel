@@ -54,7 +54,7 @@ DistributedStrategyConfig = Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfi
 # Backwards-compatible alias for external / type-checking references.
 DistributedConfig = DistributedStrategyConfig
 
-_VALID_ACTIVATION_CHECKPOINTING_SCOPES = {"all", "language", "vision", "audio", "multimodal", "trainable"}
+_VALID_ACTIVATION_CHECKPOINTING_SCOPES = {"all", "language", "vision", "audio", "multimodal"}
 
 
 def normalize_activation_checkpointing_scope(value: Any) -> Tuple[str, ...]:
@@ -219,10 +219,11 @@ class FSDP2Config:
         activation_checkpointing (bool | "full" | "selective"): Enable activation checkpointing. ``True`` or
             ``"full"`` keeps the existing full activation checkpointing behavior. ``"selective"`` wraps transformer
             blocks with PyTorch selective activation checkpointing.
-        activation_checkpointing_scope (str | list[str]): Which extracted layer
-            groups activation checkpointing should wrap. ``"all"`` preserves
-            existing behavior. Other useful values are ``"language"``,
-            ``"vision"``, ``"multimodal"``, and ``"trainable"``.
+        activation_checkpointing_scope (str | list[str]): Which extracted
+            layer groups activation checkpointing should wrap. ``"all"``
+            selects every extracted group. Scoped values such as
+            ``"language"``, ``"vision"``, and ``"multimodal"`` are filtered
+            to trainable layers before generic wrapping.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
         reshard_after_forward (Optional[bool]): Override layer-level FSDP2 resharding.
             ``None`` preserves AutoModel's heuristic: pipeline-parallel layers do
@@ -356,10 +357,11 @@ class DDPConfig:
         activation_checkpointing (bool | "full" | "selective"): Enable activation checkpointing. ``True`` or
             ``"full"`` keeps the existing full activation checkpointing behavior. ``"selective"`` wraps transformer
             blocks with PyTorch selective activation checkpointing.
-        activation_checkpointing_scope (str | list[str]): Which extracted layer
-            groups activation checkpointing should wrap. ``"all"`` preserves
-            existing behavior. Other useful values are ``"language"``,
-            ``"vision"``, ``"multimodal"``, and ``"trainable"``.
+        activation_checkpointing_scope (str | list[str]): Which extracted
+            layer groups activation checkpointing should wrap. ``"all"``
+            selects every extracted group. Scoped values such as
+            ``"language"``, ``"vision"``, and ``"multimodal"`` are filtered
+            to trainable layers before generic wrapping.
         broadcast_buffers (bool): Synchronize module buffers before each forward.
         find_unused_parameters (bool): Forwarded to PyTorch DDP for models with
             conditionally unused trainable parameters.

@@ -50,14 +50,18 @@ your requested parallelism sizes. It is intentionally forgiving about input
 types — `strategy` accepts a string or a config object, and the pipeline / MoE
 configs accept either a dataclass or a plain dict.
 
-| Argument | Type | Default | Purpose |
+| Argument / field | Type | Default | Purpose |
 |---|---|---|---|
 | `strategy` | `str \| DistributedStrategyConfig` | `"fsdp2"` | Sharding strategy: `"fsdp2"`, `"ddp"`, or `"megatron_fsdp"` (or a config object such as `FSDP2Config`/`DDPConfig`). |
 | `parallelism_sizes` | `ParallelismSizes \| None` | `None` | Requested parallel dimensions (`tp_size`, `pp_size`, `cp_size`, `ep_size`, `dp_size`, `dp_replicate_size`). `dp_replicate_size` is FSDP2-only. |
 | `pipeline_config` | `PipelineConfig \| dict \| None` | `None` | Pipeline-parallel options; **requires `pp_size > 1`**. |
 | `moe_parallel_config` | `MoEParallelizerConfig \| dict \| None` | `None` | Expert-parallel options; **requires `ep_size > 1`**. |
 | `activation_checkpointing` | `bool \| "full" \| "selective"` | `False` | `True` or `"full"` enables full activation checkpointing; `"selective"` enables selective AC for FSDP2 or DDP. |
+| `activation_checkpointing_scope` | `str \| list[str]` | `"all"` | FSDP2/DDP strategy field that limits AC to model parts such as `language`, `vision`, `audio`, or `multimodal`. In Python, set it on `FSDP2Config` or `DDPConfig`; in YAML, place it under `distributed:`. See [Use Gradient (Activation) Checkpointing](/guides/gradient-checkpointing#scope-activation-checkpointing). |
 | `world_size` | `int \| None` | `None` | Total ranks; auto-detected from the process group when omitted. |
+
+YAML `distributed:` sections also forward strategy-specific fields to FSDP2 or
+DDP.
 
 `ParallelismSizes` is durable user intent (what you requested). The resolved
 runtime topology lives on `DistributedSetup.mesh_context`

@@ -136,7 +136,7 @@ def test_activation_checkpointing_scope_normalization(value, expected):
     assert DDPConfig(activation_checkpointing_scope=value).activation_checkpointing_scope == expected
 
 
-@pytest.mark.parametrize("value", ["all+vision", "encoder", [1]])
+@pytest.mark.parametrize("value", ["all+vision", "encoder", "trainable", [1]])
 def test_activation_checkpointing_scope_normalization_rejects_invalid_values(value):
     with pytest.raises(ValueError, match="activation_checkpointing_scope"):
         normalize_activation_checkpointing_scope(value)

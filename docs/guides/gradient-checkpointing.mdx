@@ -42,6 +42,52 @@ distributed:
 
 Use `true` or `full` for full activation checkpointing. Use `selective` for PyTorch selective activation checkpointing on FSDP2 or DDP configs. Selective checkpointing saves expensive operations such as attention, collectives, and part of the matrix multiplications while recomputing cheaper operations during backward.
 
+### Scope Activation Checkpointing
+
+For multimodal and VLM models, AutoModel can checkpoint only selected model
+parts. Use `activation_checkpointing_scope` with FSDP2 or DDP when you want to
+keep the memory/speed profile focused on part of the model:
+
+```yaml
+distributed:
+  strategy: fsdp2
+  activation_checkpointing: true
+  activation_checkpointing_scope: language
+```
+
+Valid scopes are `all`, `language`, `vision`, `audio`, and `multimodal`.
+`all` is the default. `multimodal` means the non-language towers currently
+identified by AutoModel, such as vision and audio. You can also pass a list,
+for example:
+
+```yaml
+distributed:
+  strategy: fsdp2
+  activation_checkpointing: true
+  activation_checkpointing_scope: [language, vision]
+```
+
+Use a narrower scope when only part of a multimodal model is memory-limited or
+when checkpointing trainable vision/audio towers costs more throughput than the
+memory savings are worth. Use `all` when you prefer the maximum
+activation-memory reduction across trainable model parts.
+
+<Note>
+If a vision, audio, or other tower is fully frozen, AutoModel leaves it out of
+activation checkpointing. This avoids extra recomputation for model parts that
+do not need parameter gradients. Layers with trainable adapters, such as LoRA,
+can still be checkpointed when their model part is selected by the scope because
+those adapter weights need gradients.
+</Note>
+
+Programmatically, pass the scope on the strategy config:
+
+```python
+from nemo_automodel.components.distributed.config import FSDP2Config
+
+strategy = FSDP2Config(activation_checkpointing_scope="language")
+```
+
 <Note>
 `selective` is supported for FSDP2 and DDP. Megatron-FSDP raises an error when `selective` is requested. KV-sharing models (e.g., Gemma4) automatically fall back to sub-module checkpointing, because attention cannot be recomputed through the KV cache.
 </Note>

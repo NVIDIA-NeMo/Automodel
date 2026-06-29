@@ -1845,6 +1845,17 @@ class TestActivationCheckpointingKVSharing:
             gradient_checkpointing_kwargs={"use_reentrant": True}
         )
 
+    def test_hf_native_grad_ckpt_skips_frozen_layers(self, monkeypatch):
+        """Frozen layers force scoped submodule wrapping instead of whole-model HF native GC."""
+        model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=0)
+        model.model.layers[0].requires_grad_(False)
+
+        self._run_parallelize(model)
+
+        model.gradient_checkpointing_enable.assert_not_called()
+        assert not isinstance(model.model.layers[0].mlp, self._Wrapped)
+        assert isinstance(model.model.layers[1].mlp, self._Wrapped)
+
 
 class TestSelectiveCheckpointNumerics:
     """Real forward/backward parity for the selective-AC op policy.
@@ -2401,19 +2412,94 @@ class TestExtractModelLayers:
 
         selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "multimodal")
         assert scopes == ("multimodal",)
-        assert selected == vision + audio
+        assert selected == audio
 
         selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, ["language", "vision"])
         assert scopes == ("language", "vision")
-        assert selected == language + vision
+        assert selected == language
 
-        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "trainable")
-        assert scopes == ("trainable",)
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "all")
+        assert scopes == ("all",)
         assert selected == language + audio
 
-        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "trainable+vision")
-        assert scopes == ("trainable", "vision")
-        assert selected == language + audio + vision
+    def test_activation_checkpointing_scope_filtering_warns_when_scope_has_only_frozen_layers(self, caplog):
+        vision = [_FakeLayer()]
+        vision[0].requires_grad_(False)
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing({"vision": vision}, "vision")
+
+        assert scopes == ("vision",)
+        assert selected == []
+        assert "selected no layers" in caplog.text
+
+    def test_string_keyed_new_vlm_families_extract_language_and_vision_layers(self):
+        """Native VLM families in examples should not fall back to the largest-layer heuristic."""
+
+        def _layers(count):
+            return nn.ModuleList([_FakeLayer() for _ in range(count)])
+
+        def _assert_counts(model, language_count, vision_count):
+            groups = _extract_model_layer_groups(model)
+            result = _extract_model_layers(model)
+            assert set(groups) == {"language", "vision"}
+            assert len(groups["language"]) == language_count
+            assert len(groups["vision"]) == vision_count
+            assert result == groups["language"] + groups["vision"]
+
+        class KimiVLForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(3)
+                self.model.vision_tower = nn.Module()
+                self.model.vision_tower.encoder = nn.Module()
+                self.model.vision_tower.encoder.blocks = _layers(2)
+
+        class KimiK25VLForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(4)
+                self.model.vision_tower = nn.Module()
+                self.model.vision_tower.encoder = nn.Module()
+                self.model.vision_tower.encoder.blocks = _layers(2)
+
+        class MiniMaxM3SparseForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleDict({str(i): _FakeLayer() for i in range(5)})
+                self.vision_tower = nn.Module()
+                self.vision_tower.vision_model = nn.Module()
+                self.vision_tower.vision_model.encoder = nn.Module()
+                self.vision_tower.vision_model.encoder.layers = _layers(2)
+
+        class Qwen3_5MoeForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(6)
+                self.model.visual = nn.Module()
+                self.model.visual.blocks = _layers(3)
+
+        class Step3p7ForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(7)
+                self.model.vision_model = nn.Module()
+                self.model.vision_model.transformer = nn.Module()
+                self.model.vision_model.transformer.resblocks = _layers(2)
+
+        _assert_counts(KimiVLForConditionalGeneration(), 3, 2)
+        _assert_counts(KimiK25VLForConditionalGeneration(), 4, 2)
+        _assert_counts(MiniMaxM3SparseForConditionalGeneration(), 5, 2)
+        _assert_counts(Qwen3_5MoeForConditionalGeneration(), 6, 3)
+        _assert_counts(Step3p7ForConditionalGeneration(), 7, 2)
 
     def test_string_keyed_bagel_extracts_language_and_vision_layers(self):
         """BAGEL exposes Qwen decoder layers and SigLIP encoder layers."""

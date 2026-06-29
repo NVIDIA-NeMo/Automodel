@@ -1681,9 +1681,29 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
             "language": ["model.language_model.layers"],
             "vision": ["model.visual.blocks"],
         },
+        "Qwen3_5MoeForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.visual.blocks"],
+        },
         Gemma4ForConditionalGeneration: {"language": ["model.language_model.layers"]},
         # String fallback in case of class identity mismatch across imports.
         "Gemma4ForConditionalGeneration": {"language": ["model.language_model.layers"]},
+        "KimiVLForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.vision_tower.encoder.blocks"],
+        },
+        "KimiK25VLForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.vision_tower.encoder.blocks"],
+        },
+        "MiniMaxM3SparseForConditionalGeneration": {
+            "language": ["model.layers"],
+            "vision": ["vision_tower.vision_model.encoder.layers"],
+        },
+        "Step3p7ForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.vision_model.transformer.resblocks"],
+        },
         # BAGEL (text-to-image + understanding). String-keyed to avoid an
         # import cycle: parallelizer is core distributed code, the BAGEL
         # model lives under components/models/bagel/. Lists both the Qwen2
@@ -1789,7 +1809,7 @@ def _filter_layer_groups_for_activation_checkpointing(
     layer_groups: Dict[str, List[nn.Module]],
     activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
 ) -> Tuple[List[nn.Module], Tuple[str, ...]]:
-    """Select activation-checkpointed layers from grouped model layers."""
+    """Select trainable activation-checkpointed layers from grouped model layers."""
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     all_layers = [layer for group_layers in layer_groups.values() for layer in group_layers]
 
@@ -1798,27 +1818,30 @@ def _filter_layer_groups_for_activation_checkpointing(
         selected = all_layers
     else:
         for scope in scopes:
-            if scope == "trainable":
-                selected.extend(layer for layer in all_layers if _has_trainable_parameters(layer))
-            elif scope == "multimodal":
+            if scope == "multimodal":
                 selected.extend(layer_groups.get("vision", []))
                 selected.extend(layer_groups.get("audio", []))
             else:
                 selected.extend(layer_groups.get(scope, []))
 
     selected = _dedupe_layers(selected)
+    skipped_frozen = [layer for layer in selected if not _has_trainable_parameters(layer)]
+    if skipped_frozen:
+        selected = [layer for layer in selected if _has_trainable_parameters(layer)]
     group_counts = {name: len(layers) for name, layers in layer_groups.items()}
     selected_counts = {
         name: sum(1 for layer in layers if any(layer is selected_layer for selected_layer in selected))
         for name, layers in layer_groups.items()
     }
     logger.info(
-        "Activation checkpointing scope %s selected %d/%d layers; groups=%s selected_groups=%s",
+        "Activation checkpointing scope %s selected %d/%d trainable layers; groups=%s selected_groups=%s "
+        "skipped_frozen=%d",
         scopes,
         len(selected),
         len(all_layers),
         group_counts,
         selected_counts,
+        len(skipped_frozen),
     )
     if all_layers and not selected:
         logger.warning("Activation checkpointing scope %s selected no layers.", scopes)
@@ -1839,6 +1862,8 @@ def _should_use_hf_native_gradient_checkpointing(
         return False
     language_layers = layer_groups.get("language", [])
     if not language_layers:
+        return False
+    if any(not _has_trainable_parameters(layer) for layer in language_layers):
         return False
     try:
         from transformers.modeling_layers import GradientCheckpointingLayer as _HFGradLayer
