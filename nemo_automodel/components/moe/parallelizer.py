@@ -138,6 +138,9 @@ class ExpertParallel(ParallelStyle):
     Dim `0` of each parameter is sharded since that is the expert dimension.
     """
 
+    def __init__(self, num_max_tokens_per_rank: int | None = None):
+        self.num_max_tokens_per_rank = num_max_tokens_per_rank
+
     def _partition_fn(self, name, module, device_mesh):
         # shard on the expert dimension
         assert device_mesh.ndim == 1
@@ -148,7 +151,10 @@ class ExpertParallel(ParallelStyle):
             module.register_parameter(name, dist_param)
 
         if isinstance(module, GroupedExpertsDeepEP):
-            module.init_token_dispatcher(ep_mesh=device_mesh)
+            module.init_token_dispatcher(
+                ep_mesh=device_mesh,
+                num_max_tokens_per_rank=self.num_max_tokens_per_rank,
+            )
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         return distribute_module(
@@ -180,7 +186,12 @@ def _iter_moe_blocks(model_wrapper: nn.Module, backbone: nn.Module):
         yield from mtp_module.layers.children()
 
 
-def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None = None):
+def apply_ep(
+    model: nn.Module,
+    ep_mesh: DeviceMesh,
+    moe_mesh: DeviceMesh | None = None,
+    num_max_tokens_per_rank: int | None = None,
+):
     """Applies EP to MoE module."""
     assert ep_mesh.size() > 1
 
@@ -204,7 +215,7 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
             parallelize_module(
                 module=moe_module.experts,
                 device_mesh=ep_mesh,
-                parallelize_plan=ExpertParallel(),
+                parallelize_plan=ExpertParallel(num_max_tokens_per_rank),
             )
 
 
@@ -647,6 +658,7 @@ def parallelize_model(
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
+    num_max_tokens_per_rank: int | None = None,
 ):
     """Apply context, expert, activation-checkpointing, and FSDP parallelism."""
 
@@ -666,7 +678,12 @@ def parallelize_model(
             f"expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
         )
 
-        apply_ep(model, moe_mesh[ep_axis_name], moe_mesh=moe_mesh)
+        apply_ep(
+            model,
+            moe_mesh[ep_axis_name],
+            moe_mesh=moe_mesh,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+        )
 
     if activation_checkpointing:
         apply_ac(
