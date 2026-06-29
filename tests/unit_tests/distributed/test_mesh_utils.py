@@ -23,8 +23,10 @@ import torch
 import nemo_automodel.components.distributed.mesh_utils as mesh_utils
 from nemo_automodel.components.distributed.mesh import MeshAxisName
 from nemo_automodel.components.distributed.mesh_utils import (
+    _create_moe_mesh,
     _init_named_mesh,
     _MeshSpec,
+    _register_flattened_axes,
     _unflatten_compat,
     get_flat_mesh,
     get_fsdp_dp_mesh,
@@ -88,6 +90,50 @@ def test_init_named_mesh_omits_backend_override_for_cpu(monkeypatch):
     _init_named_mesh(_MeshSpec(shape=(2,), axes=(MeshAxisName.PP,)), timeout_minutes=30)
 
     assert captured["backend_override"] is None
+
+
+def test_flattened_axes_inherit_nccl_timeout():
+    flattened_mesh = Mock()
+    source_mesh = Mock()
+    source_mesh.device_type = "cuda"
+    source_mesh._flatten = Mock(return_value=flattened_mesh)
+    device_mesh = Mock()
+    device_mesh.device_type = "cuda"
+    device_mesh._flatten_mapping = {}
+    device_mesh.__getitem__ = Mock(return_value=source_mesh)
+
+    _register_flattened_axes(
+        device_mesh,
+        {MeshAxisName.DP_CP: (MeshAxisName.DP_SHARD, MeshAxisName.CP)},
+        timeout_minutes=30,
+    )
+
+    backend, options = source_mesh._flatten.call_args.kwargs["backend_override"]
+    assert backend == "nccl"
+    assert options._timeout == datetime.timedelta(minutes=30)
+    assert device_mesh._flatten_mapping[MeshAxisName.DP_CP] is flattened_mesh
+
+
+def test_moe_ep_groups_inherit_nccl_timeout():
+    moe_mesh = Mock()
+    flat_mesh = Mock()
+    flat_mesh.device_type = "cuda"
+    flat_mesh._unflatten = Mock(return_value=moe_mesh)
+    source_mesh = Mock()
+    source_mesh._flatten = Mock(return_value=flat_mesh)
+    device_mesh = Mock()
+    device_mesh.device_type = "cuda"
+    device_mesh.__getitem__ = Mock(return_value=source_mesh)
+
+    result = _create_moe_mesh(device_mesh, ep_shard_size=4, ep_size=32, timeout_minutes=30)
+
+    source_mesh._flatten.assert_called_once_with()
+    unflatten_override = flat_mesh._unflatten.call_args.kwargs["backend_override"]
+    for axis in (MeshAxisName.EP_SHARD, MeshAxisName.EP):
+        backend, options = unflatten_override[axis]
+        assert backend == "nccl"
+        assert options._timeout == datetime.timedelta(minutes=30)
+    assert result is moe_mesh
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +304,26 @@ class TestUnflattenCompat:
         result = _unflatten_compat(flat_mesh, 0, (2, 4), ("dp_replicate", "dp_shard_cp"))
 
         flat_mesh._unflatten.assert_called_once_with(0, (2, 4), ("dp_replicate", "dp_shard_cp"))
+        assert result is expected
+
+    def test_native_unflatten_receives_backend_override(self):
+        expected = Mock()
+        flat_mesh = Mock()
+        flat_mesh.device_type = "cuda"
+        flat_mesh._unflatten = Mock(return_value=expected)
+
+        result = _unflatten_compat(
+            flat_mesh,
+            0,
+            (4, 32),
+            ("ep_shard", "ep"),
+            timeout_minutes=30,
+        )
+
+        backend_override = flat_mesh._unflatten.call_args.kwargs["backend_override"]
+        for backend, options in backend_override.values():
+            assert backend == "nccl"
+            assert options._timeout == datetime.timedelta(minutes=30)
         assert result is expected
 
     def test_fallback_when_unflatten_missing(self):
