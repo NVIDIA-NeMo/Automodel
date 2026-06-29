@@ -21,6 +21,11 @@ import nemo_automodel.components.moe.megatron.fused_a2a as fused_a2a
 def _patch_common(monkeypatch, calls, *, initialized: bool):
     monkeypatch.setattr(init_utils.signal, "signal", lambda *a, **k: None)
     monkeypatch.setattr(fused_a2a, "free_buffer", lambda: calls.append("free_buffer"))
+    monkeypatch.setattr(
+        fused_a2a,
+        "destroy_deepep_v2_buffer",
+        lambda: calls.append("destroy_deepep_v2_buffer"),
+    )
     monkeypatch.setattr(init_utils.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(init_utils.torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(init_utils.torch.distributed, "is_initialized", lambda: initialized)
@@ -35,7 +40,7 @@ def test_frees_deepep_buffer_before_destroying_process_group(monkeypatch):
 
     init_utils.destroy_global_state()
 
-    assert calls == ["free_buffer", "destroy_pg"]
+    assert calls == ["free_buffer", "destroy_deepep_v2_buffer", "destroy_pg"]
 
 
 def test_frees_buffer_even_without_process_group(monkeypatch):
@@ -61,4 +66,4 @@ def test_buffer_free_failure_does_not_block_pg_destroy(monkeypatch):
 
     init_utils.destroy_global_state()
 
-    assert calls == ["destroy_pg"]
+    assert calls == ["destroy_deepep_v2_buffer", "destroy_pg"]
