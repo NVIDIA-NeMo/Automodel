@@ -117,6 +117,28 @@ def _validate_cp_gates(cp_size: int, backend: str, packed_sequence_size: int) ->
         )
 
 
+def _validate_tp_gates(tp_size: int, backend: str, cp_size: int) -> None:
+    """Reject tensor-parallel combinations the EAGLE-3 target path cannot honor.
+
+    TP shards only the colocated target (the FSDP2 parallelize plan column/row
+    shards its linears and makes the lm_head logits a vocab-sharded ``DTensor``,
+    which the target wrapper gathers). It is therefore meaningless with the remote
+    backend (the target runs out-of-process), and combined TP+CP is not yet wired:
+    the CP gather path does not handle a TP-sharded (DTensor) sequence.
+    """
+    if tp_size > 1 and backend != "colocated":
+        raise NotImplementedError(
+            "Tensor parallelism (tp_size>1) is only supported with the colocated target backend; "
+            f"the {backend!r} backend runs the target out-of-process."
+        )
+    if tp_size > 1 and cp_size > 1:
+        raise NotImplementedError(
+            "Tensor parallelism (tp_size>1) combined with context parallelism (cp_size>1) is not "
+            "yet supported; the CP sequence gather does not handle a TP-sharded target output. "
+            "Set tp_size=1 or cp_size=1."
+        )
+
+
 def _best_effort(label: str, fn) -> None:
     """Run a teardown step, logging (never raising) on failure so one failed step
     does not abort the rest of cleanup."""
@@ -430,10 +452,12 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 "packed_sequence_size > 0 is only supported with the colocated target backend; "
                 f"the {backend!r} backend does not propagate per-document masking."
             )
-        # Context parallelism gates (read from config: the cp submesh is only
-        # built later, inside the colocated path).
+        # Context- and tensor-parallel gates (read from config: the cp/tp
+        # submeshes are only built later, inside the colocated path).
         cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
+        tp_size = int(self.cfg.get("distributed.tp_size", 1) or 1)
         _validate_cp_gates(cp_size, backend, packed_sequence_size)
+        _validate_tp_gates(tp_size, backend, cp_size)
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
         elif backend == "sglang":
@@ -522,6 +546,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             # Capture the cp/dp submeshes: the target forward runs CP on "cp",
             # while the draft DDP group, dataloader sampler, and checkpointer key
             # on "dp" (cp ranks within a dp group share data and draft weights).
+            # Tensor parallelism (distributed.tp_size>1) needs no submesh here: the
+            # target's linears are sharded in place by ``from_pretrained`` below
+            # (its FSDP2 parallelize plan), the wrapper gathers the resulting
+            # vocab-sharded logits, and the flattened "dp" axis already excludes
+            # the "tp" axis so the draft and sampler replicate across TP ranks.
             self.cp_mesh = _submesh_or_none(self.device_mesh, "cp")
             self.dp_mesh = _submesh_or_none(self.device_mesh, "dp")
             target_kwargs.update(
