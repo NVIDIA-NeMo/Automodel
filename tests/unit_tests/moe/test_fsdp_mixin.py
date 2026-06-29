@@ -120,7 +120,7 @@ class TestIterFSDPModules:
     def test_iterates_model_only(self, mock_isinstance):
         # Mock isinstance to return True only for the model
         def isinstance_side_effect(obj, cls):
-            if cls.__name__ == "FSDPModule":
+            if getattr(cls, "__name__", None) == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return isinstance(obj, cls)
 
@@ -476,6 +476,24 @@ class TestRunPostBackwardHooks:
         # Verify callback is returned (not called yet)
         assert result is mock_callback
 
+    @patch("nemo_automodel.components.moe.fsdp_mixin.fully_shard")
+    def test_runs_all_torch_2_12_param_groups(self, mock_fully_shard):
+        fsdp_module = MockFSDPModule()
+        param_groups = [Mock(), Mock()]
+        state = Mock(_fsdp_param_groups=param_groups)
+        state_ctx = Mock(all_states=[state])
+        callback = Mock()
+        mock_fully_shard.state.return_value = Mock(
+            _state_ctx=state_ctx,
+            _root_post_backward_final_callback=callback,
+        )
+
+        result = _run_post_backward_hooks(fsdp_module)
+
+        for param_group in param_groups:
+            param_group.post_backward.assert_called_once()
+        assert result is callback
+
 
 class TestDisableFsdpForMoeModule:
     """Test _disable_fsdp_for_moe_module helper function."""
@@ -491,27 +509,18 @@ class TestDisableFsdpForMoeModule:
 
         model = MockFSDPModule()
         model.layers = Mock()
-        blocks = []
         block = Mock()
         block.mlp = Mock()
         block.mlp.experts = MockFSDPModule()
-        blocks.append(("layer_0", block))
-        model.layers.named_children = Mock(return_value=blocks)
-
+        model.layers.named_children = Mock(return_value=[("layer_0", block)])
         moe_model = MockMoEModel(MockBackend(), model, has_lm_head=True)
 
         _disable_fsdp_for_moe_module(moe_model)
 
-        # Verify all modules are disabled
-        assert model._is_last_backward is False
-        assert model._reshard_after_backward is False
-        assert model._requires_gradient_sync is False
-        assert moe_model.lm_head._is_last_backward is False
-        assert moe_model.lm_head._reshard_after_backward is False
-        assert moe_model.lm_head._requires_gradient_sync is False
-        assert block.mlp.experts._is_last_backward is False
-        assert block.mlp.experts._reshard_after_backward is False
-        assert block.mlp.experts._requires_gradient_sync is False
+        for fsdp_module in (model, moe_model.lm_head, block.mlp.experts):
+            assert fsdp_module._is_last_backward is False
+            assert fsdp_module._reshard_after_backward is False
+            assert fsdp_module._requires_gradient_sync is False
 
 
 class TestRunPostBackwardForMoeModule:
@@ -521,7 +530,7 @@ class TestRunPostBackwardForMoeModule:
     @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
     def test_enables_and_runs_post_backward(self, mock_isinstance, mock_fully_shard):
         def isinstance_side_effect(obj, cls):
-            if cls.__name__ == "FSDPModule":
+            if getattr(cls, "__name__", None) == "FSDPModule":
                 return isinstance(obj, MockFSDPModule)
             return isinstance(obj, cls)
 
@@ -529,44 +538,56 @@ class TestRunPostBackwardForMoeModule:
 
         model = MockFSDPModule()
         model.layers = Mock()
-        blocks = []
         block = Mock()
         block.mlp = Mock()
         block.mlp.experts = MockFSDPModule()
-        blocks.append(("layer_0", block))
-        model.layers.named_children = Mock(return_value=blocks)
-
+        model.layers.named_children = Mock(return_value=[("layer_0", block)])
         moe_model = MockMoEModel(MockBackend(), model, has_lm_head=True)
 
-        # Create mock FSDP states
         def create_mock_fsdp_state():
-            mock_state = Mock()
-            mock_state._fsdp_param_group = Mock()
-            mock_state_ctx = Mock()
-            mock_state_ctx.all_states = [mock_state]
-            mock_fsdp_state = Mock()
-            mock_fsdp_state._state_ctx = mock_state_ctx
-            mock_fsdp_state._root_post_backward_final_callback = Mock()
-            return mock_fsdp_state
+            mock_state = Mock(_fsdp_param_group=Mock())
+            state_context = Mock(all_states=[mock_state])
+            return Mock(
+                _state_ctx=state_context,
+                _root_post_backward_final_callback=Mock(),
+            )
 
-        mock_fully_shard.state.side_effect = [
-            create_mock_fsdp_state(),
-            create_mock_fsdp_state(),
-            create_mock_fsdp_state(),
-        ]
+        mock_fully_shard.state.side_effect = [create_mock_fsdp_state() for _ in range(3)]
 
         _run_post_backward_for_moe_module(moe_model)
 
-        # Verify all modules are enabled
-        assert model._is_last_backward is True
-        assert model._reshard_after_backward is True
-        assert model._requires_gradient_sync is True
-        assert moe_model.lm_head._is_last_backward is True
-        assert moe_model.lm_head._reshard_after_backward is True
-        assert moe_model.lm_head._requires_gradient_sync is True
-        assert block.mlp.experts._is_last_backward is True
-        assert block.mlp.experts._reshard_after_backward is True
-        assert block.mlp.experts._requires_gradient_sync is True
+        for fsdp_module in (model, moe_model.lm_head, block.mlp.experts):
+            assert fsdp_module._is_last_backward is True
+            assert fsdp_module._reshard_after_backward is True
+            assert fsdp_module._requires_gradient_sync is True
+
+    @patch("nemo_automodel.components.moe.fsdp_mixin.fully_shard")
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
+    def test_shared_state_context_is_finalized_once(self, mock_isinstance, mock_fully_shard):
+        mock_isinstance.side_effect = lambda obj, cls: (
+            isinstance(obj, MockFSDPModule) if getattr(cls, "__name__", None) == "FSDPModule" else isinstance(obj, cls)
+        )
+
+        model = MockFSDPModule()
+        model.layers = Mock()
+        block = Mock()
+        block.mlp = Mock()
+        block.mlp.experts = MockFSDPModule()
+        model.layers.named_children = Mock(return_value=[("layer_0", block)])
+        moe_model = MockMoEModel(MockBackend(), model)
+
+        param_group = Mock()
+        state_context = Mock(all_states=[Mock(_fsdp_param_groups=[param_group])])
+        callback = Mock()
+        mock_fully_shard.state.return_value = Mock(
+            _state_ctx=state_context,
+            _root_post_backward_final_callback=callback,
+        )
+
+        _run_post_backward_for_moe_module(moe_model)
+
+        param_group.post_backward.assert_called_once()
+        callback.assert_called_once()
 
 
 class TestPatchedBackwardMaybeWithNosync:
@@ -634,12 +655,12 @@ class TestPatchedBackwardMaybeWithNosync:
             assert grads == ((), None)
             assert param_groups is None
 
-    @patch("nemo_automodel.components.moe.fsdp_mixin.fully_shard")
-    def test_fsdp_module_last_backward(self, mock_fully_shard):
-        """Test FSDP module path with last_backward=True."""
+    def test_fsdp_module_reduces_on_last_backward(self):
+        """Test FSDP reduction runs on the last backward."""
         mock_stage = Mock()
         mock_fsdp_module = MockFSDPModule()
         mock_stage.submod = mock_fsdp_module
+        mock_stage._reduce_grad_per_microbatch = False
 
         bwd_kwargs = {
             "stage_output": Mock(),
@@ -647,35 +668,29 @@ class TestPatchedBackwardMaybeWithNosync:
             "input_values": Mock(),
         }
 
-        # Create mock FSDP state
-        mock_state = Mock()
-        mock_state._fsdp_param_group = Mock()
-        mock_state_ctx = Mock()
-        mock_state_ctx.all_states = [mock_state]
-        mock_fsdp_state = Mock()
-        mock_fsdp_state._state_ctx = mock_state_ctx
-        mock_fsdp_state._root_post_backward_final_callback = Mock()
-        mock_fully_shard.state.return_value = mock_fsdp_state
-
         with patch("nemo_automodel.components.moe.fsdp_mixin.stage_backward") as mock_stage_backward:
             with patch("nemo_automodel.components.moe.fsdp_mixin.isinstance") as mock_isinstance:
-                # Make isinstance return True for FSDPModule check
-                mock_isinstance.side_effect = lambda obj, cls: cls.__name__ == "FSDPModule"
-                mock_stage_backward.return_value = ((), None)
+                with patch("nemo_automodel.components.moe.fsdp_mixin._run_post_backward_hooks") as run_post:
+                    root_callback = Mock()
+                    run_post.return_value = root_callback
+                    mock_isinstance.side_effect = lambda obj, cls: cls.__name__ == "FSDPModule"
+                    mock_stage_backward.return_value = ((), None)
 
-                result = patched_backward_maybe_with_nosync(mock_stage, "full", bwd_kwargs, last_backward=True)
+                    result = patched_backward_maybe_with_nosync(mock_stage, "full", bwd_kwargs, last_backward=True)
 
-                # Verify post_backward was called
-                mock_state._fsdp_param_group.post_backward.assert_called_once()
-                mock_fsdp_state._root_post_backward_final_callback.assert_called_once()
+                assert mock_fsdp_module._is_last_backward is True
+                assert mock_fsdp_module._reshard_after_backward is True
+                assert mock_fsdp_module._requires_gradient_sync is True
+                run_post.assert_called_once_with(mock_fsdp_module)
+                root_callback.assert_called_once()
                 grads, param_groups = result
                 assert grads == ((), None)
                 assert param_groups is None
 
-    @patch("nemo_automodel.components.moe.fsdp_mixin.get_is_optim_step")
+    @patch("nemo_automodel.components.moe.fsdp_mixin.get_is_optim_step", return_value=True)
     @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
-    def test_moe_fsdp_mixin_last_backward_with_optim_step(self, mock_isinstance, mock_get_optim):
-        """Test MoEFSDPSyncMixin path with last_backward=True and IS_OPTIM_STEP=True."""
+    def test_moe_fsdp_mixin_reduces_on_last_backward(self, mock_isinstance, _mock_get_optim):
+        """Test MoE FSDP reduction runs on the last optimizer backward."""
 
         def isinstance_side_effect(obj, cls):
             if cls == MoEFSDPSyncMixin:
@@ -685,7 +700,6 @@ class TestPatchedBackwardMaybeWithNosync:
             return False
 
         mock_isinstance.side_effect = isinstance_side_effect
-        mock_get_optim.return_value = True
 
         mock_stage = Mock()
         model = MockFSDPModule()
@@ -704,7 +718,6 @@ class TestPatchedBackwardMaybeWithNosync:
 
                 result = patched_backward_maybe_with_nosync(mock_stage, "full", bwd_kwargs, last_backward=True)
 
-                # Verify post backward was called
                 mock_run_post.assert_called_once_with(moe_model)
                 grads, param_groups = result
                 assert grads == ((), None)
