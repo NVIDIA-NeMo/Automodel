@@ -408,13 +408,18 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         #   - ``sglang``: like ``colocated`` but the in-process forward runs
         #     through SGLang's ModelRunner, which is substantially faster than
         #     the HF eager forward for mainstream architectures.
+        #   - ``vllm``: like ``sglang`` but the in-process forward runs through
+        #     vLLM (via its native ``extract_hidden_states`` path); supervision is
+        #     numerically equivalent to the co-located HF backend.
         #   - ``remote``: the target runs as a standalone server (see
         #     ``serve_target``); this process only holds the draft and pulls
         #     precomputed supervision over HTTP + NCCL. No target weights are
         #     loaded here, which frees the training GPU's memory.
         backend = recipe_cfg.get("target_model_backend", "colocated")
-        if backend not in ("colocated", "sglang", "remote"):
-            raise ValueError(f"Unknown target_model_backend={backend!r}; expected 'colocated', 'sglang', or 'remote'.")
+        if backend not in ("colocated", "sglang", "vllm", "remote"):
+            raise ValueError(
+                f"Unknown target_model_backend={backend!r}; expected 'colocated', 'sglang', 'vllm', or 'remote'."
+            )
         # Sequence packing is colocated-only: neither the remote server nor the
         # SGLang runner honors per-document masking (SGLang treats each row as one
         # full causal sequence), so a packed row would leak supervision across
@@ -433,6 +438,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             self._setup_remote_target(recipe_cfg)
         elif backend == "sglang":
             self._setup_sglang_target(recipe_cfg, target_path)
+        elif backend == "vllm":
+            self._setup_vllm_target(recipe_cfg, target_path)
         else:  # colocated
             self._setup_colocated_target(recipe_cfg, target_path)
 
@@ -572,6 +579,44 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             dtype=self.compute_dtype,
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             **sglang_kwargs,
+        )
+
+    def _setup_vllm_target(self, recipe_cfg, target_path):
+        """Co-located vLLM target: serve the frozen target through vLLM on this GPU.
+
+        Same supervision contract as ``colocated`` (full-vocab logits shipped to
+        the trainer, draft-vocab projection trainer-side), but the target forward
+        runs through vLLM's ``extract_hidden_states`` path. vLLM carves its weight
+        + KV pool out of this GPU up front (``gpu_memory_utilization``), and the
+        draft trains in the remainder.
+        """
+        if self.device.type != "cuda":
+            raise ValueError("target_model_backend='vllm' requires CUDA; use 'colocated' for CPU runs.")
+        if self.dist_env.world_size > 1:
+            # vLLM owns its own engine process group, so per-rank tp=1 engines
+            # cannot share a multi-rank training process group. Multi-GPU runs
+            # split target and draft onto separate processes instead:
+            # ``serve_target --engine vllm`` + ``target_model_backend='remote'``.
+            raise ValueError(
+                "target_model_backend='vllm' supports single-process training only; "
+                "for multi-GPU runs serve the target separately (serve_target --engine vllm) "
+                "and set target_model_backend='remote'."
+            )
+        from nemo_automodel.components.speculative.eagle.vllm_target import VLLMEagle3TargetModel
+
+        vllm_args = recipe_cfg.get("vllm_args", None) or {}
+        vllm_kwargs = vllm_args.to_dict() if hasattr(vllm_args, "to_dict") else dict(vllm_args)
+        # vLLM's default (~0.9 of GPU memory) would starve the draft's optimizer
+        # states and activations; default to half the GPU and let
+        # ``recipe_args.vllm_args.gpu_memory_utilization`` override.
+        vllm_kwargs.setdefault("gpu_memory_utilization", 0.5)
+        self.target_model = None
+        self.target_wrapper = VLLMEagle3TargetModel.from_pretrained(
+            target_path,
+            aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
+            dtype=self.compute_dtype,
+            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
+            **vllm_kwargs,
         )
 
     def _setup_remote_target(self, recipe_cfg):
