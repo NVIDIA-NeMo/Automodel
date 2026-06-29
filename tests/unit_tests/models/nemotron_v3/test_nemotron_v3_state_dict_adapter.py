@@ -144,7 +144,7 @@ class TestNemotronV3AdapterDense:
 
         assert "model.embed_tokens.weight" in native
         assert "model.norm.weight" in native
-        assert "model.layers.0.mixer.A_log" in native
+        assert "model.layers.0.mixer._fp32_params.A_log" in native
         assert "model.layers.1.mixer.up_proj.weight" in native
         assert "lm_head.weight" in native
         assert not any(k.startswith("backbone.") for k in native)
