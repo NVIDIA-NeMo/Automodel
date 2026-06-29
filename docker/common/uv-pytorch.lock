@@ -1521,7 +1521,7 @@ wheels = [
 [[package]]
 name = "deep-ep"
 version = "2.0.0+local"
-source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca#7febc6e25660af0f54d95dd781ecdcd62265ecca" }
+source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=567632dd59810d77b3cc05553df953cc0f779799#567632dd59810d77b3cc05553df953cc0f779799" }
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.13.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
@@ -3928,7 +3928,7 @@ cuda-source = [
 deepep-v1 = [
     { name = "apache-tvm-ffi" },
     { name = "causal-conv1d" },
-    { name = "deep-ep", version = "2.0.0+local", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca#7febc6e25660af0f54d95dd781ecdcd62265ecca" }, marker = "sys_platform == 'linux'" },
+    { name = "deep-ep", version = "2.0.0+local", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=567632dd59810d77b3cc05553df953cc0f779799#567632dd59810d77b3cc05553df953cc0f779799" }, marker = "sys_platform == 'linux'" },
     { name = "flash-linear-attention" },
     { name = "mamba-ssm" },
     { name = "nv-grouped-gemm" },
@@ -4092,7 +4092,7 @@ requires-dist = [
     { name = "databricks-sql-connector", marker = "extra == 'delta-databricks'", specifier = ">=3.0.0" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "decord", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm-media'" },
-    { name = "deep-ep", marker = "sys_platform == 'linux' and extra == 'deepep-v1'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca" },
+    { name = "deep-ep", marker = "sys_platform == 'linux' and extra == 'deepep-v1'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=567632dd59810d77b3cc05553df953cc0f779799" },
     { name = "deep-ep", marker = "sys_platform == 'linux' and extra == 'deepep-v2'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=af9a0403188392824fc3057452822235873e0612" },
     { name = "deep-ep", marker = "sys_platform == 'linux' and extra == 'hybridep'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=e0a5b1d9848ab3e7b4a67842bf06f067bfac67f8" },
     { name = "deltalake", marker = "extra == 'delta-databricks'", specifier = ">=1.0.0" },
@@ -4138,10 +4138,10 @@ requires-dist = [
     { name = "nvidia-ml-py", marker = "sys_platform == 'linux' and extra == 'hybridep'" },
     { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux' and extra == 'cu12'", specifier = ">=2.30.4" },
     { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' and extra == 'cu13'", specifier = ">=2.30,<2.31" },
-    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' and extra == 'cu13-legacy'", specifier = "==2.29.7" },
+    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' and extra == 'cu13-legacy'", specifier = ">=2.30,<2.31" },
     { name = "nvidia-nvshmem-cu12", marker = "sys_platform == 'linux' and extra == 'cu12'", specifier = ">=3.7.0" },
     { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' and extra == 'cu13'", specifier = ">=3.7,<3.8" },
-    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' and extra == 'cu13-legacy'", specifier = "==3.4.5" },
+    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' and extra == 'cu13-legacy'", specifier = ">=3.7,<3.8" },
     { name = "onnxscript", marker = "extra == 'cuda'", specifier = ">=0.5.6" },
     { name = "open-clip-torch", marker = "extra == 'vlm'" },
     { name = "opencv-python-headless", marker = "extra == 'diffusion-media'", specifier = "==4.10.0.84" },
