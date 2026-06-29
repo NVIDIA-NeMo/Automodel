@@ -1685,6 +1685,10 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
             "language": ["model.language_model.layers"],
             "vision": ["model.visual.blocks"],
         },
+        "Qwen3VLMoeForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.visual.blocks"],
+        },
         Gemma4ForConditionalGeneration: {"language": ["model.language_model.layers"]},
         # String fallback in case of class identity mismatch across imports.
         "Gemma4ForConditionalGeneration": {"language": ["model.language_model.layers"]},

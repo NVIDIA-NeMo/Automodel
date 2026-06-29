@@ -2485,6 +2485,15 @@ class TestExtractModelLayers:
                 self.model.visual = nn.Module()
                 self.model.visual.blocks = _layers(3)
 
+        class Qwen3VLMoeForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(8)
+                self.model.visual = nn.Module()
+                self.model.visual.blocks = _layers(3)
+
         class Step3p7ForConditionalGeneration(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -2499,6 +2508,7 @@ class TestExtractModelLayers:
         _assert_counts(KimiK25VLForConditionalGeneration(), 4, 2)
         _assert_counts(MiniMaxM3SparseForConditionalGeneration(), 5, 2)
         _assert_counts(Qwen3_5MoeForConditionalGeneration(), 6, 3)
+        _assert_counts(Qwen3VLMoeForConditionalGeneration(), 8, 3)
         _assert_counts(Step3p7ForConditionalGeneration(), 7, 2)
 
     def test_string_keyed_bagel_extracts_language_and_vision_layers(self):
