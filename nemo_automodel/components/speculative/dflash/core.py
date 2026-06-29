@@ -38,6 +38,17 @@ from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 
+def _to_full_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialise a (possibly tensor-parallel) tensor as a plain local tensor.
+
+    Under tensor parallelism the target's column-parallel ``lm_head`` and
+    vocab-parallel ``embed_tokens`` return ``DTensor`` outputs. The draft and the
+    block-wise loss consume plain tensors, so gather the full tensor. A no-op for
+    an already-plain (unsharded / replicated) tensor.
+    """
+    return tensor.full_tensor() if hasattr(tensor, "full_tensor") else tensor
+
+
 class NoValidAnchorsError(ValueError):
     """Raised when a batch has no sample long enough to form a DFlash block.
 
@@ -73,8 +84,14 @@ class DFlashTrainerModule(nn.Module):
     ):
         super().__init__()
         self.draft_model = draft_model
-        self.lm_head = target_lm_head
-        self.embed_tokens = target_embed_tokens
+        # Keep the frozen target lm_head / embed_tokens as NON-registered
+        # references. Under tensor parallelism their weights are DTensors; a
+        # registered (DDP-wrapped) sharded param would break DDP's parameter
+        # broadcast/bucketing. Non-registering keeps the DDP-wrapped trainer to
+        # the plain draft params only, while ``self.lm_head`` / ``self.embed_tokens``
+        # attribute access still works. (Mirrors EAGLE core_v12's _target_lm_head.)
+        object.__setattr__(self, "lm_head", target_lm_head)
+        object.__setattr__(self, "embed_tokens", target_embed_tokens)
         self.block_size = block_size
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
@@ -151,7 +168,9 @@ class DFlashTrainerModule(nn.Module):
             anchor_tokens,
             torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
         )
-        return self.embed_tokens(noise_ids)
+        # A tensor-parallel target's embed_tokens is vocab-parallel and returns a
+        # DTensor; gather it so the (plain) draft can consume the noise embedding.
+        return _to_full_tensor(self.embed_tokens(noise_ids))
 
     def forward(
         self,
@@ -185,7 +204,9 @@ class DFlashTrainerModule(nn.Module):
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
         )
-        logits = self.lm_head(output_hidden)
+        # A tensor-parallel target's lm_head is column-parallel and returns
+        # vocab-sharded (DTensor) logits; gather to a full tensor for the loss.
+        logits = _to_full_tensor(self.lm_head(output_hidden))
 
         n = anchor_positions.size(1)
         bs = self.block_size
