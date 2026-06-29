@@ -1,0 +1,214 @@
+# syntax=docker/dockerfile:1
+
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Build one backend (the default):
+#   docker buildx build -f docker/Dockerfile.cuda \
+#     --build-arg EP_BACKENDS=deepep_v2 .
+#
+# Build separate DeepEP v2 and HybridEP environments in one image:
+#   docker buildx build -f docker/Dockerfile.cuda \
+#     --build-arg 'EP_BACKENDS=deepep_v2 hybridep' .
+#
+# Supported backend extras are deepep_v1, deepep_v2, and hybridep. The first
+# entry is exposed at /opt/venv; source /opt/ep-envs/<backend>.sh to select a
+# different environment at runtime.
+
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04
+FROM ${BASE_IMAGE}
+
+USER root
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        git \
+        ibverbs-providers \
+        ibverbs-utils \
+        infiniband-diags \
+        libibverbs-dev \
+        libmlx5-1 \
+        libnuma-dev \
+        libnvidia-ml-dev \
+        librdmacm-dev \
+        ninja-build \
+        pkg-config \
+        rdma-core && \
+    rm -rf /var/lib/apt/lists/*
+
+ARG UV_VERSION=0.11.24
+ARG PYTHON_VERSION=3.12
+ENV PATH="/root/.local/bin:${PATH}"
+RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh && \
+    uv python install "${PYTHON_VERSION}"
+
+ENV CUDA_HOME=/usr/local/cuda \
+    CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl \
+    DEEPEP_ENABLE_LEGACY_NVSHMEM=1 \
+    HYBRID_EP_MULTINODE=1 \
+    MAX_JOBS=8 \
+    RDMA_CORE_HOME=/usr \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
+    UV_LINK_MODE=copy
+
+WORKDIR /opt/Automodel
+
+# Keep dependency compilation cached when only project sources change.
+COPY pyproject.toml uv.lock ./
+
+ARG CUDA_EXTRA=cu13
+ARG EP_BACKENDS="deepep_v2"
+ARG UV_SYNC_ARGS="--locked --no-default-groups --group test"
+
+RUN --mount=type=cache,target=/root/.cache/uv <<"EOF" bash -eux
+base_ld_library_path="/usr/local/cuda/lib64:/usr/lib/$(gcc -dumpmachine)"
+mkdir -p /opt/venvs /opt/ep-envs /opt/ep-runtime
+
+case "${CUDA_EXTRA}" in
+    cu12|cu13) ;;
+    *)
+        echo "CUDA_EXTRA must be cu12 or cu13, got: ${CUDA_EXTRA}" >&2
+        exit 2
+        ;;
+esac
+
+for backend in ${EP_BACKENDS}; do
+    case "${backend}" in
+        deepep_v1)
+            cuda_extra=cu13_legacy
+            ;;
+        deepep_v2|hybridep)
+            cuda_extra=${CUDA_EXTRA}
+            ;;
+        *)
+            echo "EP_BACKENDS contains unsupported backend: ${backend}" >&2
+            exit 2
+            ;;
+    esac
+
+    venv="/opt/venvs/${backend}"
+    export UV_PROJECT_ENVIRONMENT="${venv}"
+    export LD_LIBRARY_PATH="${base_ld_library_path}"
+    unset EP_NCCL_ROOT_DIR EP_NVSHMEM_ROOT_DIR NCCL_DIR NVSHMEM_DIR LD_PRELOAD
+
+    # Install Torch/NCCL/NVSHMEM first so DeepEP's build can use their headers
+    # and libraries. The second sync builds only the selected DeepEP variant.
+    uv sync ${UV_SYNC_ARGS} --extra "${cuda_extra}" --extra "${backend}" \
+        --no-install-package deep-ep --no-install-project
+
+    eval "$("${venv}/bin/python" - "${backend}" "${cuda_extra}" <<'PY'
+import importlib.metadata as metadata
+import shlex
+import sys
+from pathlib import Path
+
+backend, cuda_extra = sys.argv[1:]
+cuda_suffix = "cu13" if cuda_extra.startswith("cu13") else "cu12"
+
+
+def package_root(package_name: str, library_name: str) -> Path:
+    distribution = metadata.distribution(package_name)
+    for file in distribution.files or ():
+        path = Path(distribution.locate_file(file))
+        if library_name in path.name:
+            return path.parent.parent if path.parent.name == "lib" else path.parent
+    raise RuntimeError(f"{library_name} was not found in {package_name}")
+
+
+nvshmem_root = package_root(f"nvidia-nvshmem-{cuda_suffix}", "libnvshmem_host")
+nccl_root = package_root(f"nvidia-nccl-{cuda_suffix}", "libnccl")
+library_dirs = [nvshmem_root / "lib", nccl_root / "lib"]
+
+exports = {
+    "EP_NVSHMEM_ROOT_DIR": str(nvshmem_root),
+    "LD_LIBRARY_PATH": ":".join(str(path) for path in library_dirs),
+    "NCCL_RUNTIME_ROOT": str(nccl_root),
+    "NVSHMEM_RUNTIME_ROOT": str(nvshmem_root),
+}
+if backend != "deepep_v1":
+    exports["EP_NCCL_ROOT_DIR"] = str(nccl_root)
+    exports["NCCL_DIR"] = str(nccl_root)
+    exports["LD_PRELOAD"] = str(nccl_root / "lib" / "libnccl.so.2")
+if backend == "deepep_v2":
+    exports["NVSHMEM_DIR"] = str(nvshmem_root)
+
+for name, value in exports.items():
+    print(f"export {name}={shlex.quote(value)}")
+PY
+)"
+    export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${base_ld_library_path}"
+
+    uv sync ${UV_SYNC_ARGS} --extra "${cuda_extra}" --extra "${backend}" \
+        --reinstall-package deep-ep --no-install-project
+
+    runtime_dir="/opt/ep-runtime/${backend}"
+    mkdir -p "${runtime_dir}/lib"
+    ln -sfn "${NVSHMEM_RUNTIME_ROOT}" "${runtime_dir}/nvshmem"
+    ln -sfn "${NCCL_RUNTIME_ROOT}" "${runtime_dir}/nccl"
+    find "${NVSHMEM_RUNTIME_ROOT}/lib" "${NCCL_RUNTIME_ROOT}/lib" \
+        -maxdepth 1 -type f -name '*.so*' -exec ln -sfn '{}' "${runtime_dir}/lib/" \;
+
+    {
+        printf 'unset EP_NCCL_ROOT_DIR EP_NVSHMEM_ROOT_DIR NCCL_DIR NVSHMEM_DIR LD_PRELOAD\n'
+        printf 'export UV_PROJECT_ENVIRONMENT=%q\n' "${venv}"
+        printf 'export PATH=%q:$PATH\n' "${venv}/bin"
+        printf 'export EP_NVSHMEM_ROOT_DIR=%q\n' "${NVSHMEM_RUNTIME_ROOT}"
+        printf 'export LD_LIBRARY_PATH=%q:$LD_LIBRARY_PATH\n' "${runtime_dir}/lib"
+        printf 'export LD_PRELOAD=%q\n' "${runtime_dir}/lib/libnccl.so.2"
+        if [[ "${backend}" != "deepep_v1" ]]; then
+            printf 'export EP_NCCL_ROOT_DIR=%q\n' "${NCCL_RUNTIME_ROOT}"
+            printf 'export NCCL_DIR=%q\n' "${NCCL_RUNTIME_ROOT}"
+        fi
+        if [[ "${backend}" == "deepep_v2" ]]; then
+            printf 'export NVSHMEM_DIR=%q\n' "${NVSHMEM_RUNTIME_ROOT}"
+        fi
+    } > "/opt/ep-envs/${backend}.sh"
+done
+
+set -- ${EP_BACKENDS}
+test "$#" -gt 0
+ln -sfn "/opt/venvs/$1" /opt/venv
+ln -sfn "/opt/ep-runtime/$1" /opt/ep-runtime/default
+ln -sfn "/opt/ep-envs/$1.sh" /opt/automodel-env.sh
+EOF
+
+COPY . /opt/Automodel
+
+# Install the project itself after the dependency-only layer. This is a no-op
+# for compiled dependencies unless pyproject.toml or uv.lock changed.
+RUN --mount=type=cache,target=/root/.cache/uv <<"EOF" bash -eux
+for backend in ${EP_BACKENDS}; do
+    if [[ "${backend}" == "deepep_v1" ]]; then
+        cuda_extra=cu13_legacy
+    else
+        cuda_extra=${CUDA_EXTRA}
+    fi
+    unset EP_NCCL_ROOT_DIR EP_NVSHMEM_ROOT_DIR NCCL_DIR NVSHMEM_DIR LD_PRELOAD
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/lib/$(gcc -dumpmachine)"
+    source "/opt/ep-envs/${backend}.sh"
+    uv sync ${UV_SYNC_ARGS} --extra "${cuda_extra}" --extra "${backend}"
+done
+EOF
+
+ENV AUTOMODEL_EP_BACKENDS="${EP_BACKENDS}" \
+    LD_LIBRARY_PATH="/opt/ep-runtime/default/lib:/usr/local/cuda/lib64" \
+    LD_PRELOAD="/opt/ep-runtime/default/lib/libnccl.so.2" \
+    PATH="/opt/venv/bin:/root/.local/bin:${PATH}" \
+    UV_PROJECT_ENVIRONMENT=/opt/venv
+
+CMD ["/bin/bash"]
