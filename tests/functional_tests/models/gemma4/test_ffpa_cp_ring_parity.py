@@ -77,21 +77,12 @@ def test_ffpa_vs_eager_bf16_parity(Hq, Hkv):
     assert cos > 0.9999, cos
 
 
-def test_ffpa_selective_checkpoint_policy_importable_and_marks_fwd_ops():
-    """The relocated ffpa_selective_checkpoint_policy builds a context_fn and marks
-    the FFPA forward ops MUST_SAVE (the full-AC contract for Gemma4-31B)."""
-    from torch.utils.checkpoint import CheckpointPolicy
+def test_ffpa_forward_ops_join_selective_ac_save_set():
+    """FFPA forward ops join the declarative selective-AC save-set (MUST_SAVE)."""
+    from nemo_automodel.components.distributed.activation_checkpointing import _SELECTIVE_AC_MUST_SAVE_OPS
 
-    from nemo_automodel.components.distributed.activation_checkpointing import ffpa_selective_checkpoint_policy
-
-    assert callable(ffpa_selective_checkpoint_policy())
-    must_save = {torch.ops.ffpa_attn._fwd_cute.default, torch.ops.ffpa_attn._varlen_fwd_cute.default}
-
-    def policy(_ctx, op, *a, **k):
-        return CheckpointPolicy.MUST_SAVE if op in must_save else CheckpointPolicy.PREFER_RECOMPUTE
-
-    assert policy(None, torch.ops.ffpa_attn._varlen_fwd_cute.default) == CheckpointPolicy.MUST_SAVE
-    assert policy(None, torch.ops.aten.mm.default) == CheckpointPolicy.PREFER_RECOMPUTE
+    assert torch.ops.ffpa_attn._fwd_cute.default in _SELECTIVE_AC_MUST_SAVE_OPS
+    assert torch.ops.ffpa_attn._varlen_fwd_cute.default in _SELECTIVE_AC_MUST_SAVE_OPS
 
 
 # --------------------------------------------------------------------------- #
