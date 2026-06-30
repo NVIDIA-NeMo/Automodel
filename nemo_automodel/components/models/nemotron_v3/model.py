@@ -412,6 +412,12 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         else:
             self.mtp = None
 
+        # When True, the MTP heads also run under eval mode (``self.training``
+        # False) so validation can measure per-head token acceptance. Defaults
+        # to False so generation/decoding never pays the MTP cost; the training
+        # harness toggles it around the validation forward only.
+        self.compute_mtp_in_eval = False
+
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = NemotronV3StateDictAdapter(
                 config=config,
@@ -779,7 +785,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         # MTP head: last PP stage in training only. Other stages / eval emit
         # placeholder empties below so the tuple arity stays 1 + D.
         mtp_per_depth_h: list[torch.Tensor] | None = None
-        if self.mtp is not None and self.training:
+        # Run the MTP heads in training, or in eval when explicitly requested for
+        # validation acceptance metrics. Never on the cached generation path —
+        # decoding feeds one token at a time and must not pay the MTP cost.
+        mtp_active = self.mtp is not None and (self.training or (self.compute_mtp_in_eval and not use_cache))
+        if mtp_active:
             mtp_attention_mask = (
                 causal_mask_mapping.get("full_attention") if causal_mask_mapping is not None else attention_mask
             )
