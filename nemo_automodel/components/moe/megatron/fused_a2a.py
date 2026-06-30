@@ -456,6 +456,7 @@ class DeepEPV2FusedDispatch(torch.autograd.Function):
             grad_output.contiguous(),
             handle,
             topk_weights=grad_token_probs.float() if grad_token_probs is not None else None,
+            num_sms=_deepep_v2_num_sms,
             num_qps=_deepep_v2_num_qps,
             async_with_compute_stream=ctx.async_finish,
             allocate_on_comm_stream=ctx.allocate_on_comm_stream,
