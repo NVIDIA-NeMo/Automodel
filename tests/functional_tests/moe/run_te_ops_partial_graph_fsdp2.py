@@ -897,7 +897,11 @@ def main() -> None:
     observed_splits.append(post_overflow_splits)
     observed_real_splits.append(post_overflow_real_splits)
 
-    assert len(set(replay_route_counts)) == len(REPLAY_VALID_TOKENS) + 1
+    # Reuse one physical-call size after the eager overflow. This proves that
+    # the captured graph remains valid for a previously seen shape after the
+    # shared TE Sequential executes its eager fallback path.
+    assert len(set(replay_route_counts)) == len(REPLAY_VALID_TOKENS)
+    assert replay_route_counts[-1] == replay_route_counts[1]
     assert len(set(observed_real_splits)) == len(observed_real_splits), (
         f"real expert splits did not vary: {observed_real_splits}"
     )
