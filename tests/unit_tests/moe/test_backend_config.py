@@ -98,6 +98,43 @@ class TestBackendConfigExpertsDispatcherValidation:
 
         assert config.te_ops_mxfp8_weight_cache is False
 
+    def test_te_ops_unstacked_parameters_is_default_off(self):
+        config = BackendConfig(experts="te_ops", dispatcher="hybridep")
+
+        assert config.te_ops_unstacked_parameters is False
+
+    def test_te_ops_unstacked_parameters_accepts_exact_backend(self):
+        config = BackendConfig(
+            experts="te_ops",
+            dispatcher="hybridep",
+            te_fp8={"recipe": "mxfp8"},
+            te_ops_unstacked_parameters=True,
+        )
+
+        assert config.te_ops_unstacked_parameters is True
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"experts": "torch_mm", "dispatcher": "torch"},
+            {
+                "experts": "te_ops",
+                "dispatcher": "hybridep",
+                "te_fp8": {"recipe": "mxfp8"},
+                "te_ops_mxfp8_weight_cache": True,
+            },
+            {
+                "experts": "te_ops",
+                "dispatcher": "hybridep",
+                "partial_cuda_graph_experts": True,
+                "partial_cuda_graph_layer_limit": 1,
+            },
+        ],
+    )
+    def test_te_ops_unstacked_parameters_rejects_incompatible_backends(self, kwargs):
+        with pytest.raises(ValueError, match="te_ops_unstacked_parameters"):
+            BackendConfig(**kwargs, te_ops_unstacked_parameters=True)
+
     def test_te_ops_mxfp8_weight_cache_accepts_exact_backend(self):
         config = BackendConfig(
             experts="te_ops",

@@ -66,7 +66,8 @@ from nemo_automodel.components.checkpoint.utils import (
 
 _PREFIX = "model."
 _TE_OPS_OPTIMIZER_LAYOUT_KEY = "te_ops_optimizer_layout"
-_TE_OPS_OPTIMIZER_LAYOUT_SCHEMA = 1
+_TE_OPS_STACKED_OPTIMIZER_LAYOUT_SCHEMA = 1
+_TE_OPS_UNSTACKED_OPTIMIZER_LAYOUT_SCHEMA = 2
 _TE_OPS_ACTIVATION_IDS = {
     "swiglu": 1,
     "swiglu_step": 2,
@@ -78,7 +79,7 @@ _TE_OPS_ACTIVATION_IDS = {
 
 
 def _get_te_ops_optimizer_layout(model_parts: list[torch.nn.Module]) -> dict[str, torch.Tensor]:
-    """Describe physical stacked-owner layouts whose optimizer states are raw."""
+    """Describe physical TE-ops owner layouts whose optimizer states are raw."""
     from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
 
     layouts = {}
@@ -93,13 +94,18 @@ def _get_te_ops_optimizer_layout(model_parts: list[torch.nn.Module]) -> dict[str
             key = f"model{model_idx}.{normalized_fqn}"
             if key in layouts:
                 raise RuntimeError(f"Duplicate GroupedExpertsTeOps optimizer layout key {key!r}")
+            unstacked = bool(getattr(module, "_te_ops_unstacked_parameters", False))
             layouts[key] = torch.tensor(
                 [
-                    _TE_OPS_OPTIMIZER_LAYOUT_SCHEMA,
+                    (
+                        _TE_OPS_UNSTACKED_OPTIMIZER_LAYOUT_SCHEMA
+                        if unstacked
+                        else _TE_OPS_STACKED_OPTIMIZER_LAYOUT_SCHEMA
+                    ),
                     _TE_OPS_ACTIVATION_IDS[activation],
                     int(getattr(module, "_te_glu_interleave_size", None) or 0),
-                    2,  # stacked weights shard their physical input dimension
-                    0,  # stacked biases shard experts, never gate/up rows
+                    1 if unstacked else 2,  # Physical input dimension.
+                    0,  # Physical bias output dimension (or stacked expert dimension).
                 ],
                 dtype=torch.int64,
                 device="cpu",

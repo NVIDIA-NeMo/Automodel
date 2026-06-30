@@ -224,6 +224,11 @@ class BackendConfig:
             post-step refresh. The optimized path requires EP>1 with complete local
             experts (``ep_shard=1``); an additional expert FSDP shard transparently
             uses TE's eager weight quantization instead.
+        te_ops_unstacked_parameters: Store each TE-ops expert projection in native
+            ``weight0`` ... ``weightN`` parameters instead of one stacked owner.
+            This is an experimental performance A/B for TE's discrete-weight CuTe
+            grouped-MLP kernels. It is incompatible with the stacked MXFP8 weight
+            cache and partial expert CUDA graphs.
         partial_cuda_graph_expert_bucket_tokens: Optional fixed physical token capacity
             for partial expert graphs. HybridEP still receives the exact dynamic token
             count; expert inputs at or below this capacity are padded locally for TE and
@@ -275,6 +280,7 @@ class BackendConfig:
     partial_cuda_graph_expert_bucket_tokens: int | None = None
     partial_cuda_graph_layer_limit: int = 0
     te_ops_mxfp8_weight_cache: bool = False
+    te_ops_unstacked_parameters: bool = False
 
     def __post_init__(self):
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
@@ -353,6 +359,17 @@ class BackendConfig:
             is_mxfp8 = recipe == "mxfp8" or (callable(getattr(recipe, "mxfp8", None)) and recipe.mxfp8())
             if not is_mxfp8:
                 raise ValueError("te_ops_mxfp8_weight_cache requires te_fp8.recipe='mxfp8'")
+        if self.te_ops_unstacked_parameters:
+            if self.experts != "te_ops":
+                raise ValueError("te_ops_unstacked_parameters requires experts='te_ops'")
+            if self.te_ops_mxfp8_weight_cache:
+                raise ValueError(
+                    "te_ops_unstacked_parameters is incompatible with te_ops_mxfp8_weight_cache"
+                )
+            if self.partial_cuda_graph_experts:
+                raise ValueError(
+                    "te_ops_unstacked_parameters is incompatible with partial_cuda_graph_experts"
+                )
         if self.partial_cuda_graph_expert_bucket_tokens is not None:
             bucket_tokens = self.partial_cuda_graph_expert_bucket_tokens
             if isinstance(bucket_tokens, bool) or not isinstance(bucket_tokens, int) or bucket_tokens <= 0:

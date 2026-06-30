@@ -24,13 +24,20 @@ from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
 
 
 class _ModelWithTeOps(nn.Module):
-    def __init__(self, activation: str = "quick_geglu", block_size: int | None = None) -> None:
+    def __init__(
+        self,
+        activation: str = "quick_geglu",
+        block_size: int | None = None,
+        *,
+        unstacked: bool = False,
+    ) -> None:
         super().__init__()
         self.dense = nn.Linear(2, 2, bias=False)
         experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
         nn.Module.__init__(experts)
         experts.config = SimpleNamespace(expert_activation=activation)
         experts._te_glu_interleave_size = block_size
+        experts._te_ops_unstacked_parameters = unstacked
         self.mlp = nn.Module()
         self.mlp.experts = experts
 
@@ -52,6 +59,20 @@ def test_te_ops_optimizer_state_carries_physical_layout_guard():
 
     guard = state["te_ops_optimizer_layout"]["model0.mlp.experts"]
     assert guard.tolist() == [1, 4, 32, 2, 0]
+
+
+def test_te_ops_optimizer_state_distinguishes_unstacked_parameters():
+    model = _ModelWithTeOps(block_size=32, unstacked=True)
+    wrapper = _optimizer_state(model)
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_optimizer_state_dict",
+        return_value={"state": {}, "param_groups": []},
+    ):
+        state = wrapper.state_dict()
+
+    guard = state["te_ops_optimizer_layout"]["model0.mlp.experts"]
+    assert guard.tolist() == [2, 4, 32, 1, 0]
 
 
 def test_te_ops_optimizer_load_accepts_matching_layout_and_removes_guard():

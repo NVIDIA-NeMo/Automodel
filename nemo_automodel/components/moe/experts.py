@@ -1615,6 +1615,63 @@ class _TeOpsMXFP8WeightCache:
 
 
 @cache
+def _get_unstacked_te_ops_grouped_linear_class() -> type[nn.Module]:
+    """Build TE's native per-expert-parameter GroupedLinear variant."""
+    try:
+        from transformer_engine.pytorch import ops as te_ops
+    except ImportError as error:
+        raise ImportError("experts='te_ops' requires Transformer Engine 2.16.1 or newer") from error
+
+    class _UnstackedTeOpsGroupedLinear(te_ops.GroupedLinear):
+        """TE GroupedLinear with ordinary ``weight0`` ... ``weightN`` owners.
+
+        The parent ``GroupedExpertsTeOps`` exposes a canonical virtual state dict,
+        so the physical TE parameters must not independently consume checkpoint
+        keys during recursive loading.
+        """
+
+        def __init__(
+            self,
+            num_groups: int,
+            in_features: int,
+            out_features: int,
+            *,
+            bias: bool,
+            dtype: torch.dtype,
+            device: torch.device | str,
+            scale_bias: bool = False,
+        ) -> None:
+            super().__init__(
+                num_groups=num_groups,
+                in_features=in_features,
+                out_features=out_features,
+                bias=bias,
+                dtype=dtype,
+                device=device,
+                single_grouped_weight=False,
+                single_grouped_bias=False,
+                scale_bias=scale_bias,
+            )
+            if self.single_grouped_weight or self.single_grouped_bias:
+                raise RuntimeError("TE unexpectedly replaced unstacked expert parameters")
+
+        def _load_from_state_dict(
+            self,
+            state_dict: Dict[str, Any],
+            prefix: str,
+            local_metadata,
+            strict: bool,
+            missing_keys: list[str],
+            unexpected_keys: list[str],
+            error_msgs: list[str],
+        ) -> None:
+            """Skip physical keys; the parent loads canonical expert tensors."""
+            del state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+
+    return _UnstackedTeOpsGroupedLinear
+
+
+@cache
 def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
     """Build the TE-ops GroupedLinear variant with FSDP-safe stacked owners."""
     try:
@@ -2201,7 +2258,7 @@ def _get_te_ops_custom_classes() -> tuple[type[nn.Module], type[nn.Module]]:
 
 
 class GroupedExpertsTeOps(GroupedExpertsTE):
-    """MoE experts using TE fusible ops with one stacked owner per projection."""
+    """MoE experts using TE fusible ops with stacked or native owners."""
 
     def __init__(
         self,
@@ -2221,6 +2278,7 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         )
         self._te_ops_fp8_configured = backend.te_fp8 is not None
         self._te_ops_configured_mxfp8 = configured_mxfp8
+        self._te_ops_unstacked_parameters = bool(getattr(backend, "te_ops_unstacked_parameters", False))
         self._te_ops_mxfp8_fusion_requested = (
             configured_mxfp8 and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) > 0
         )
@@ -2302,7 +2360,7 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         return True, ""
 
     def _build_grouped_linears(self, num_experts: int) -> None:
-        """Build stacked-owner TE ops projections on the meta device."""
+        """Build TE-ops projections with the selected parameter layout."""
         from transformer_engine.pytorch import ops as te_ops
 
         activation_name, activation_kwargs, activation_scales_routes, full_mxfp8_fusion = _select_te_ops_activation(
@@ -2311,9 +2369,13 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         )
         self._te_glu_interleave_size = activation_kwargs.get("glu_interleave_size")
 
-        stacked_linear = _get_stacked_te_ops_grouped_linear_class()
+        linear_class = (
+            _get_unstacked_te_ops_grouped_linear_class()
+            if self._te_ops_unstacked_parameters
+            else _get_stacked_te_ops_grouped_linear_class()
+        )
         gate_up_out_features = self.config.moe_inter_dim * 2 if self.is_gated else self.config.moe_inter_dim
-        self.gate_up_linear = stacked_linear(
+        self.gate_up_linear = linear_class(
             num_groups=num_experts,
             in_features=self.config.expert_dim,
             out_features=gate_up_out_features,
@@ -2321,7 +2383,7 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             dtype=self.config.dtype,
             device="meta",
         )
-        self.down_linear = stacked_linear(
+        self.down_linear = linear_class(
             num_groups=num_experts,
             in_features=self.config.moe_inter_dim,
             out_features=self.config.expert_dim,
@@ -2331,11 +2393,13 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             scale_bias=self.expert_bias,
         )
         for linear in (self.gate_up_linear, self.down_linear):
-            linear.set_mxfp8_weight_cache_enabled(
-                self._te_ops_mxfp8_weight_cache_enabled,
-                fallback_reason=self._te_ops_mxfp8_weight_cache_fallback_reason,
-                mode=self._te_ops_mxfp8_weight_cache_mode,
-            )
+            configure_cache = getattr(linear, "set_mxfp8_weight_cache_enabled", None)
+            if callable(configure_cache):
+                configure_cache(
+                    self._te_ops_mxfp8_weight_cache_enabled,
+                    fallback_reason=self._te_ops_mxfp8_weight_cache_fallback_reason,
+                    mode=self._te_ops_mxfp8_weight_cache_mode,
+                )
 
         if activation_name == "scaled_swiglu":
             activation = te_ops.ScaledSwiGLU(**activation_kwargs)
@@ -2388,11 +2452,13 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         self._te_ops_mxfp8_weight_cache_enabled = enabled
         self._te_ops_mxfp8_weight_cache_fallback_reason = fallback_reason
         for linear in (self.gate_up_linear, self.down_linear):
-            linear.set_mxfp8_weight_cache_enabled(
-                enabled,
-                fallback_reason=fallback_reason,
-                mode=self._te_ops_mxfp8_weight_cache_mode,
-            )
+            configure_cache = getattr(linear, "set_mxfp8_weight_cache_enabled", None)
+            if callable(configure_cache):
+                configure_cache(
+                    enabled,
+                    fallback_reason=fallback_reason,
+                    mode=self._te_ops_mxfp8_weight_cache_mode,
+                )
 
     def configure_mxfp8_weight_cache_for_partial_graph(self, *, captured: bool) -> None:
         """Use fixed storage only for expert layers selected for graph capture."""
@@ -2401,11 +2467,13 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             return
         self._te_ops_mxfp8_weight_cache_mode = mode
         for linear in (self.gate_up_linear, self.down_linear):
-            linear.set_mxfp8_weight_cache_enabled(
-                self._te_ops_mxfp8_weight_cache_enabled,
-                fallback_reason=self._te_ops_mxfp8_weight_cache_fallback_reason,
-                mode=mode,
-            )
+            configure_cache = getattr(linear, "set_mxfp8_weight_cache_enabled", None)
+            if callable(configure_cache):
+                configure_cache(
+                    self._te_ops_mxfp8_weight_cache_enabled,
+                    fallback_reason=self._te_ops_mxfp8_weight_cache_fallback_reason,
+                    mode=mode,
+                )
 
     def refresh_mxfp8_weight_cache_if_needed(self, *, force: bool = False) -> int:
         """Refresh both projection caches before entering the TE graph target."""
@@ -2420,6 +2488,31 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
 
     def mxfp8_weight_cache_diagnostics(self) -> dict[str, Any]:
         """Expose bounded per-projection counters for GB200 validation."""
+        def projection_diagnostics(linear: nn.Module) -> dict[str, Any]:
+            diagnostics = getattr(linear, "mxfp8_weight_cache_diagnostics", None)
+            if callable(diagnostics):
+                return diagnostics()
+            return {
+                "enabled": False,
+                "mode": "native_unstacked",
+                "optimize_for_gemm": False,
+                "allocations": 0,
+                "refreshes": 0,
+                "group_quantize_calls": 0,
+                "member_update_calls": 0,
+                "buffer_replacements": 0,
+                "optimizer_invalidations": 0,
+                "optimizer_refreshes": 0,
+                "hits": 0,
+                "fallbacks": 0,
+                "current": False,
+                "dirty": False,
+                "requires_fixed_identity": False,
+                "identity_policy_satisfied": True,
+                "fallback_reason": "native unstacked TE parameters use eager per-expert quantization",
+                "storage": None,
+            }
+
         return {
             "requested": getattr(self, "_te_ops_mxfp8_weight_cache_requested", False),
             "enabled": getattr(self, "_te_ops_mxfp8_weight_cache_enabled", False),
@@ -2429,13 +2522,13 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
                 _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE,
             ),
             "fallback_reason": getattr(self, "_te_ops_mxfp8_weight_cache_fallback_reason", ""),
-            "gate_up": self.gate_up_linear.mxfp8_weight_cache_diagnostics(),
-            "down": self.down_linear.mxfp8_weight_cache_diagnostics(),
+            "gate_up": projection_diagnostics(self.gate_up_linear),
+            "down": projection_diagnostics(self.down_linear),
         }
 
     def _canonical_bias_ep_shard_dim(self) -> int:
-        """Stacked TE-ops biases shard experts so layout conversion stays local."""
-        return 0
+        """Return the canonical bias shard dim for the physical owner layout."""
+        return 1 if getattr(self, "_te_ops_unstacked_parameters", False) else 0
 
     @staticmethod
     def _interleave_glu_blocks(tensor: torch.Tensor, block_size: int = 32) -> torch.Tensor:
@@ -2525,8 +2618,27 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             return GroupedExpertsTeOps._deinterleave_concatenated_glu_blocks(tensor, block_size)
         return tensor
 
+    @staticmethod
+    def _uses_single_grouped_weight(linear: nn.Module) -> bool:
+        """Return whether a TE op owns one grouped weight parameter."""
+        parameters = getattr(linear, "_parameters", {})
+        return bool(getattr(linear, "single_grouped_weight", parameters.get("_stacked_weight") is not None))
+
+    @staticmethod
+    def _uses_single_grouped_bias(linear: nn.Module) -> bool:
+        """Return whether a TE op owns one grouped bias parameter."""
+        parameters = getattr(linear, "_parameters", {})
+        return bool(getattr(linear, "single_grouped_bias", parameters.get("_stacked_bias") is not None))
+
     def _get_stacked_weight(self, linear: nn.Module, transpose: bool = False) -> torch.Tensor:
-        stacked = linear.stacked_weight_local()
+        if self._uses_single_grouped_weight(linear):
+            stacked = linear.stacked_weight_local()
+        else:
+            weights = []
+            for group_idx in range(linear.num_groups):
+                weight = getattr(linear, f"weight{group_idx}")
+                weights.append(weight.to_local() if isinstance(weight, DTensor) else weight)
+            stacked = torch.stack(weights, dim=0)
         if linear is self.gate_up_linear:
             stacked = self._from_te_gate_up_layout(
                 stacked,
@@ -2538,7 +2650,16 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         return stacked
 
     def _get_stacked_bias(self, linear: nn.Module) -> torch.Tensor | None:
-        stacked = linear.stacked_bias_local()
+        if not linear.use_bias:
+            return None
+        if self._uses_single_grouped_bias(linear):
+            stacked = linear.stacked_bias_local()
+        else:
+            biases = []
+            for group_idx in range(linear.num_groups):
+                bias = getattr(linear, f"bias{group_idx}")
+                biases.append(bias.to_local() if isinstance(bias, DTensor) else bias)
+            stacked = torch.stack(biases, dim=0)
         if stacked is not None and linear is self.gate_up_linear:
             stacked = self._from_te_gate_up_layout(
                 stacked,
@@ -2557,8 +2678,16 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
                 self._te_glu_interleave_size,
             )
         with torch.no_grad():
-            linear.stacked_weight_local().copy_(stacked)
-        linear.clear_grouped_aliases()
+            if self._uses_single_grouped_weight(linear):
+                linear.stacked_weight_local().copy_(stacked)
+            else:
+                for group_idx in range(linear.num_groups):
+                    weight = getattr(linear, f"weight{group_idx}")
+                    weight = weight.to_local() if isinstance(weight, DTensor) else weight
+                    weight.copy_(stacked[group_idx])
+        clear_aliases = getattr(linear, "clear_grouped_aliases", None)
+        if callable(clear_aliases):
+            clear_aliases()
         refresh_weight_cache = getattr(linear, "refresh_mxfp8_weight_cache_if_needed", None)
         if callable(refresh_weight_cache):
             refresh_weight_cache(force=True)
@@ -2572,12 +2701,20 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
                 self.config.expert_activation,
                 self._te_glu_interleave_size,
             )
-        bias = linear.stacked_bias_local()
-        if bias is None:
-            raise RuntimeError("TE-ops grouped bias owner is missing")
         with torch.no_grad():
-            bias.copy_(stacked)
-        linear.clear_grouped_aliases()
+            if self._uses_single_grouped_bias(linear):
+                bias = linear.stacked_bias_local()
+                if bias is None:
+                    raise RuntimeError("TE-ops grouped bias owner is missing")
+                bias.copy_(stacked)
+            else:
+                for group_idx in range(linear.num_groups):
+                    bias = getattr(linear, f"bias{group_idx}")
+                    bias = bias.to_local() if isinstance(bias, DTensor) else bias
+                    bias.copy_(stacked[group_idx])
+        clear_aliases = getattr(linear, "clear_grouped_aliases", None)
+        if callable(clear_aliases):
+            clear_aliases()
 
     def _router_expert_pad_multiple(self) -> int | None:
         if self._te_ops_uses_padded_capacity:
@@ -2585,7 +2722,7 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         return None
 
     def _assert_te_fuser_owner_identity(self) -> None:
-        """Ensure TE's lazy fuser captured the current plain stacked owners."""
+        """Ensure TE's lazy fuser captured the current parameter owners."""
         module_groups = getattr(self._te_grouped_mlp, "_module_groups", None)
         if module_groups is None:
             # Lightweight test doubles do not construct TE's OperationFuser.
@@ -2605,7 +2742,7 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
                         matches.append(tuple(group._basic_op_params[op_idx]))
             if len(matches) != 1:
                 raise RuntimeError(
-                    "TE-ops fuser did not capture each stacked GroupedLinear exactly once; "
+                    "TE-ops fuser did not capture each GroupedLinear exactly once; "
                     "the expert OperationFuser must be created lazily inside the FSDP unshard window"
                 )
             current_owners = tuple(linear.parameters())
@@ -2613,7 +2750,7 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
                 captured is not current for captured, current in zip(matches[0], current_owners)
             ):
                 raise RuntimeError(
-                    "TE-ops fuser captured stale expert parameters. Keep plain stacked owners stable "
+                    "TE-ops fuser captured stale expert parameters. Keep expert owners stable "
                     "across FSDP unshard and checkpoint recomputation."
                 )
         self._te_ops_fuser_owner_signature = current_signature
@@ -2717,17 +2854,26 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             logger.warning("TE CuTe DSL MXFP8 grouped-MLP forward/backward fusion is active.")
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
-        """Initialize canonical expert weights without replacing stacked owners."""
+        """Initialize canonical expert weights without replacing parameter owners."""
         del buffer_device
         with torch.no_grad():
             for linear in (self.gate_up_linear, self.down_linear):
-                weight = linear._parameters["_stacked_weight"]
-                weight = weight.to_local() if isinstance(weight, DTensor) else weight
-                weight.normal_(mean=0.0, std=init_std)
-                bias = linear._parameters.get("_stacked_bias")
-                if bias is not None:
-                    bias = bias.to_local() if isinstance(bias, DTensor) else bias
-                    bias.zero_()
+                if self._uses_single_grouped_weight(linear):
+                    weights = (linear._parameters["_stacked_weight"],)
+                else:
+                    weights = tuple(getattr(linear, f"weight{idx}") for idx in range(linear.num_groups))
+                for weight in weights:
+                    weight = weight.to_local() if isinstance(weight, DTensor) else weight
+                    weight.normal_(mean=0.0, std=init_std)
+
+                if linear.use_bias:
+                    if self._uses_single_grouped_bias(linear):
+                        biases = (linear._parameters["_stacked_bias"],)
+                    else:
+                        biases = tuple(getattr(linear, f"bias{idx}") for idx in range(linear.num_groups))
+                    for bias in biases:
+                        bias = bias.to_local() if isinstance(bias, DTensor) else bias
+                        bias.zero_()
                 clear_aliases = getattr(linear, "clear_grouped_aliases", None)
                 if callable(clear_aliases):
                     clear_aliases()
@@ -2850,6 +2996,7 @@ def collect_te_ops_mxfp8_weight_cache_diagnostics(model_parts: Any) -> dict[str,
     buffer_identities: list[tuple[int, ...]] = []
     result: dict[str, Any] = {
         "expert_layers": 0,
+        "unstacked_layers": 0,
         "requested_layers": 0,
         "enabled_layers": 0,
         "fallback_layers": 0,
@@ -2881,6 +3028,7 @@ def collect_te_ops_mxfp8_weight_cache_diagnostics(model_parts: Any) -> dict[str,
             seen_experts.add(id(module))
             diagnostics = module.mxfp8_weight_cache_diagnostics()
             result["expert_layers"] += 1
+            result["unstacked_layers"] += int(getattr(module, "_te_ops_unstacked_parameters", False))
             requested = bool(diagnostics["requested"])
             enabled = bool(diagnostics["enabled"])
             result["requested_layers"] += int(requested)

@@ -1993,6 +1993,7 @@ def test_collect_te_ops_mxfp8_weight_cache_diagnostics_is_bounded():
 
     assert diagnostics == {
         "expert_layers": 1,
+        "unstacked_layers": 0,
         "requested_layers": 1,
         "enabled_layers": 1,
         "fallback_layers": 0,
@@ -2778,6 +2779,49 @@ class TestGroupedExpertsTeOps:
             assert bias_alias.rowwise_data.data_ptr() == linear._stacked_bias.data_ptr()
             assert weight_alias.requires_grad == linear._stacked_weight.requires_grad
             assert bias_alias.requires_grad == linear._stacked_bias.requires_grad
+
+    def test_unstacked_owner_materialization_and_virtual_state_dict(self, te_ops_config):
+        """Native TE owners stay stable while exposing the canonical expert checkpoint."""
+        from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
+        from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
+
+        backend = BackendConfig(
+            experts="te_ops",
+            dispatcher="hybridep",
+            te_ops_unstacked_parameters=True,
+        )
+        source = GroupedExpertsTeOps(te_ops_config, backend=backend, dispatcher_backend="hybridep")
+        destination = GroupedExpertsTeOps(te_ops_config, backend=backend, dispatcher_backend="hybridep")
+        expected_names = {
+            "gate_up_linear.weight0",
+            "gate_up_linear.weight1",
+            "gate_up_linear.bias0",
+            "gate_up_linear.bias1",
+            "down_linear.weight0",
+            "down_linear.weight1",
+            "down_linear.bias0",
+            "down_linear.bias1",
+        }
+        assert set(dict(source.named_parameters())) == expected_names
+
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        to_empty_parameters_only(source, device=device)
+        to_empty_parameters_only(destination, device=device)
+        source_ids = {name: id(parameter) for name, parameter in source.named_parameters()}
+        source.init_weights(device)
+        destination.init_weights(device)
+        assert {name: id(parameter) for name, parameter in source.named_parameters()} == source_ids
+
+        state = source.state_dict()
+        destination.load_state_dict(state)
+        assert set(state) == {
+            "gate_and_up_projs",
+            "down_projs",
+            "gate_up_proj_bias",
+            "down_proj_bias",
+        }
+        for key, value in state.items():
+            torch.testing.assert_close(destination.state_dict()[key], value)
 
     @pytest.mark.parametrize("activation", ["swiglu", "swiglu_step", "swigluoai", "quick_geglu", "geglu", "relu2"])
     @pytest.mark.parametrize("expert_bias", [False, True])
