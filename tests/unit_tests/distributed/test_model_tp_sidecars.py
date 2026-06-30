@@ -22,6 +22,7 @@ from nemo_automodel.components.models.falcon_h1.parallelizer import get_tp_plan 
 from nemo_automodel.components.models.gemma3.parallelizer import get_tp_plan as get_gemma3_tp_plan
 from nemo_automodel.components.models.llama.parallelizer import get_tp_plan as get_llama_tp_plan
 from nemo_automodel.components.models.mistral3_vlm.parallelizer import get_tp_plan as get_mistral3_vlm_tp_plan
+from nemo_automodel.components.models.mixtral.parallelizer import get_tp_plan as get_mixtral_tp_plan
 from nemo_automodel.components.models.nemotron_labs_diffusion.parallelizer import get_tp_plan as get_diffusion_tp_plan
 from nemo_automodel.components.models.nemotron_nas.parallelizer import get_tp_plan as get_nemotron_nas_tp_plan
 from nemo_automodel.components.models.phi.parallelizer import get_tp_plan as get_phi_tp_plan
@@ -84,6 +85,15 @@ def test_nemotron_nas_sidecar_uses_separate_qkv_projections() -> None:
     assert "model.layers.*.self_attn.q_proj" in plan
     assert "model.layers.*.self_attn.qkv_proj" not in plan
     assert isinstance(plan["model.norm"], SequenceParallel)
+
+
+def test_mixtral_sidecar_preserves_the_legacy_decoder_plan() -> None:
+    plan = get_mixtral_tp_plan(None, sequence_parallel=True)
+
+    assert "model.layers.*.self_attn.qkv_proj" in plan
+    assert "model.layers.*.mlp.gate_up_proj" in plan
+    assert isinstance(plan["lm_head"], ColwiseParallel)
+    assert isinstance(plan["model.layers.*.input_layernorm"], SequenceParallel)
 
 
 def test_mistral_vlm_sidecar_scopes_only_the_text_decoder() -> None:

@@ -172,6 +172,9 @@ def test_model_adapter_derives_tp_sidecar_from_registry_or_model_type() -> None:
     assert _parallelizer_module_path(upstream_model, "Qwen3ForCausalLM") == (
         "nemo_automodel.components.models.qwen3.parallelizer"
     )
+    assert _parallelizer_module_path(
+        SimpleNamespace(config=SimpleNamespace(model_type="mixtral")), "MixtralForCausalLM"
+    ) == ("nemo_automodel.components.models.mixtral.parallelizer")
 
 
 def test_model_adapter_attaches_tp_factory_from_the_conventional_sidecar() -> None:
@@ -181,6 +184,17 @@ def test_model_adapter_attaches_tp_factory_from_the_conventional_sidecar() -> No
     _attach_parallelization_strategy(model, ["Qwen3ForCausalLM"])
 
     assert callable(model._nemo_tp_plan_factory)
+
+
+def test_model_adapter_attaches_mixtral_legacy_plan_by_model_type() -> None:
+    """An upstream Mixtral model gets its plan from the Mixtral sidecar."""
+    model = SimpleNamespace(config=SimpleNamespace(model_type="mixtral"))
+
+    _attach_parallelization_strategy(model, ["MixtralForCausalLM"])
+
+    plan = model._nemo_tp_plan_factory(model, sequence_parallel=True)
+    assert "model.layers.*.self_attn.qkv_proj" in plan
+    assert "model.layers.*.input_layernorm" in plan
 
 
 def test_deepseek_strategy_owns_its_custom_fsdp_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:

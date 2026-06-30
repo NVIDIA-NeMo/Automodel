@@ -62,7 +62,7 @@ individual model packages or encode model paths.
 | `llama_nemotron_vl/`, `llava_onevision/`, `kimivl/`, `kimi_k25_vl/`, `minimax_m3_vl/`, `mistral3_vlm/`, `mistral4/`, `nemotron_omni/`, `nemotron_parse/`, `qwen2_5_omni/` | Vision, audio, parsing, or omni wrappers. Keep processors, vision encoders, and multimodal checkpoint adaptation here. |
 | `gemma4_moe/`, `gemma4_drafter/` | Gemma4 MoE and drafter implementations; each keeps its own model and sidecar behavior. |
 | `nemotron_v3/` | Native Nemotron-H V3 implementation including cache, MTP, layers, and custom strategy sidecar. |
-| `falcon_h1/`, `gemma3/`, `nemotron_labs_diffusion/`, `nemotron_nas/`, `phi/`, `phi3/`, `qwen3/` | Upstream or remote-code families with model-local TP sidecars but no native `model.py`. Add native implementation files here only when Automodel takes ownership of the architecture. |
+| `falcon_h1/`, `gemma3/`, `mixtral/`, `nemotron_labs_diffusion/`, `nemotron_nas/`, `phi/`, `phi3/`, `qwen3/` | Upstream or remote-code families with model-local TP sidecars but no native `model.py`. Add native implementation files here only when Automodel takes ownership of the architecture. |
 | `qwen3_5/` | Native Qwen3.5 dense model and sidecar; related MoE/Omni variants remain in their dedicated packages. |
 
 ## Adding or changing a model package
