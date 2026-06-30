@@ -177,7 +177,10 @@ class BackendConfig:
             else falls back to torch._grouped_mm at runtime).
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP for token dispatch,
+            "hybridep" uses HybridEP for fused token dispatch and permutation,
             "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
+        dispatcher_num_sms_preprocessing: Optional number of SMs for HybridEP's routing-metadata
+            preprocessing kernel. None preserves the HybridEP library default.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
@@ -237,6 +240,7 @@ class BackendConfig:
         else "torch"
     )
     dispatcher_num_sms: int = 20
+    dispatcher_num_sms_preprocessing: int | None = None
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
@@ -283,6 +287,16 @@ class BackendConfig:
                     "and enable_deepep=False to dispatcher=torch."
                 )
             self.enable_deepep = None
+
+        if self.dispatcher_num_sms_preprocessing is not None:
+            if (
+                isinstance(self.dispatcher_num_sms_preprocessing, bool)
+                or not isinstance(self.dispatcher_num_sms_preprocessing, int)
+                or self.dispatcher_num_sms_preprocessing <= 0
+            ):
+                raise ValueError("dispatcher_num_sms_preprocessing must be a positive integer or None")
+            if self.dispatcher != "hybridep":
+                raise ValueError("dispatcher_num_sms_preprocessing requires dispatcher='hybridep'")
 
         # Backward compatibility
         if self.experts in ("te", "te_ops", "gmm") and self.dispatcher not in (

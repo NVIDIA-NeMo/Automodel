@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
+    MoEFlexTokenDispatcher,
+    TokenDispatcherConfig,
     _HybridEPManager,
     _HybridEPMetadataProcessor,
 )
@@ -118,6 +120,83 @@ def test_hybridep_manager_accepts_expert_padding_multiple():
         )
 
     assert manager.pad_multiple == 256
+
+
+def test_hybridep_manager_forwards_preprocessing_sms_with_dynamic_receive_sizing():
+    """Preprocessing tuning must not introduce a cached or static receive-token count."""
+    captured_kwargs = {}
+
+    def fake_hybrid_ep_dispatch(**kwargs):
+        captured_kwargs.update(kwargs)
+        tokens_per_expert = torch.tensor([1, 3])
+        return kwargs["x"], kwargs["probs"], None, tokens_per_expert, object()
+
+    with patch(
+        "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+        new=fake_hybrid_ep_dispatch,
+    ):
+        manager = _HybridEPManager(
+            group=None,
+            num_local_experts=2,
+            num_experts=8,
+            router_topk=2,
+            moe_hybridep_num_sms_preprocessing=32,
+        )
+        manager.setup_metadata(
+            torch.tensor([[True, False, True, False, False, False, False, False]]),
+            torch.tensor([[0.6, 0.0, 0.4, 0.0, 0.0, 0.0, 0.0, 0.0]]),
+        )
+        manager.dispatch(torch.randn(1, 8))
+
+    assert captured_kwargs["num_sms_preprocessing_api"] == 32
+    assert captured_kwargs["num_permuted_tokens"] is None
+    assert manager.num_permuted_tokens == 4
+
+
+def test_hybridep_shared_manager_identity_includes_preprocessing_sms_for_ep():
+    """EP layers share managers only when their HybridEP preprocessing configuration matches."""
+    saved_alias = MoEFlexTokenDispatcher.shared_hybridep_manager
+    saved_cache = MoEFlexTokenDispatcher._shared_hybridep_managers
+    MoEFlexTokenDispatcher.shared_hybridep_manager = None
+    MoEFlexTokenDispatcher._shared_hybridep_managers = {}
+    group = Mock()
+    group.size.return_value = 2
+    config_kwargs = {
+        "moe_flex_dispatcher_backend": "hybridep",
+        "num_moe_experts": 8,
+        "moe_router_topk": 2,
+        "moe_share_token_dispatcher": True,
+    }
+
+    try:
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+            new=lambda *args, **kwargs: None,
+        ):
+            default_dispatcher = MoEFlexTokenDispatcher(
+                num_local_experts=4,
+                local_expert_indices=list(range(4)),
+                config=TokenDispatcherConfig(**config_kwargs),
+                ep_group=group,
+            )
+            tuned_dispatcher = MoEFlexTokenDispatcher(
+                num_local_experts=4,
+                local_expert_indices=list(range(4)),
+                config=TokenDispatcherConfig(**config_kwargs, moe_hybridep_num_sms_preprocessing=32),
+                ep_group=group,
+            )
+            tuned_dispatcher_again = MoEFlexTokenDispatcher(
+                num_local_experts=4,
+                local_expert_indices=list(range(4)),
+                config=TokenDispatcherConfig(**config_kwargs, moe_hybridep_num_sms_preprocessing=32),
+                ep_group=group,
+            )
+    finally:
+        MoEFlexTokenDispatcher.shared_hybridep_manager = saved_alias
+        MoEFlexTokenDispatcher._shared_hybridep_managers = saved_cache
+
+    assert default_dispatcher._comm_manager is not tuned_dispatcher._comm_manager
+    assert tuned_dispatcher._comm_manager is tuned_dispatcher_again._comm_manager
 
 
 def test_hybridep_metadata_processor_matches_manager_and_preserves_prob_grads():

@@ -394,6 +394,7 @@ class _HybridEPManager(_DispatchManager):
         router_topk: int,
         permute_fusion: bool = False,
         moe_hybridep_num_sms: int = 24,
+        moe_hybridep_num_sms_preprocessing: Optional[int] = None,
         moe_router_expert_pad_multiple: Optional[int] = None,
     ):
         self.group = group
@@ -402,6 +403,7 @@ class _HybridEPManager(_DispatchManager):
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
+        self.moe_hybridep_num_sms_preprocessing = moe_hybridep_num_sms_preprocessing
         self.num_permuted_tokens = None
 
         # Metadata
@@ -471,6 +473,7 @@ class _HybridEPManager(_DispatchManager):
             num_local_experts=self.num_local_experts,
             num_sms_dispatch_api=self.moe_hybridep_num_sms,
             num_sms_combine_api=self.moe_hybridep_num_sms,
+            num_sms_preprocessing_api=self.moe_hybridep_num_sms_preprocessing,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
         )
@@ -546,6 +549,9 @@ class TokenDispatcherConfig:
 
     moe_hybridep_num_sms: int = 24
     """Number of SMs to use for HybridEP dispatch and combine APIs."""
+
+    moe_hybridep_num_sms_preprocessing: Optional[int] = None
+    """Optional number of SMs to use for HybridEP routing-metadata preprocessing."""
 
     moe_share_token_dispatcher: bool = True
     """Share one communication manager instance across MoE layers for the configured backend."""
@@ -683,7 +689,11 @@ class MoEFlexTokenDispatcher:
             if self.config.moe_share_token_dispatcher:
                 self._comm_manager = self._get_or_create_shared_manager(
                     "hybridep",
-                    (*shared_key, self.config.moe_hybridep_num_sms),
+                    (
+                        *shared_key,
+                        self.config.moe_hybridep_num_sms,
+                        self.config.moe_hybridep_num_sms_preprocessing,
+                    ),
                     lambda: _HybridEPManager(
                         group=ep_group,
                         num_local_experts=self.num_local_experts,
@@ -691,6 +701,7 @@ class MoEFlexTokenDispatcher:
                         router_topk=self.tp_size * self.config.moe_router_topk,
                         permute_fusion=self.config.moe_permute_fusion,
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
+                        moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                         moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
                     ),
                 )
@@ -702,6 +713,7 @@ class MoEFlexTokenDispatcher:
                     router_topk=self.tp_size * self.config.moe_router_topk,
                     permute_fusion=self.config.moe_permute_fusion,
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
+                    moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                     moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(

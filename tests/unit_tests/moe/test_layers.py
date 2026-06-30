@@ -1298,8 +1298,11 @@ class TestMoE:
 
     def test_moe_init_with_te_ops_uses_distinct_expert_class(self, moe_config, backend_config):
         """The TE-ops backend must not instantiate the legacy TE module class."""
-        backend_config.experts = "te_ops"
-        backend_config.dispatcher = "hybridep"
+        backend_config = BackendConfig(
+            experts="te_ops",
+            dispatcher="hybridep",
+            dispatcher_num_sms_preprocessing=32,
+        )
         with (
             patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2),
             patch("nemo_automodel.components.moe.layers.GroupedExpertsTeOps") as te_ops_experts,
@@ -1307,6 +1310,7 @@ class TestMoE:
             moe = MoE(moe_config, backend_config)
 
         te_ops_experts.assert_called_once()
+        assert te_ops_experts.call_args.kwargs["dispatcher_num_sms_preprocessing"] == 32
         assert moe.experts is te_ops_experts.return_value
 
     def test_moe_init_with_gmm_experts_with_deepep(self, moe_config, backend_config):
@@ -1343,17 +1347,21 @@ class TestMoE:
 
     def test_moe_forwards_dispatcher_config_to_experts(self, moe_config, backend_config):
         """MoE should pass BackendConfig dispatcher knobs to flex dispatcher experts."""
-        backend_config.experts = "torch_mm"
-        backend_config.dispatcher = "deepep"
-        backend_config.dispatcher_num_sms = 12
-        backend_config.dispatcher_share_token_dispatcher = False
-        backend_config.dispatcher_async_dispatch = True
+        backend_config = BackendConfig(
+            experts="torch_mm",
+            dispatcher="hybridep",
+            dispatcher_num_sms=12,
+            dispatcher_num_sms_preprocessing=32,
+            dispatcher_share_token_dispatcher=False,
+            dispatcher_async_dispatch=True,
+        )
         with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
             moe = MoE(moe_config, backend_config)
 
         assert isinstance(moe.experts, GroupedExpertsDeepEP)
-        assert moe.experts.dispatcher_backend == "deepep"
+        assert moe.experts.dispatcher_backend == "hybridep"
         assert moe.experts.dispatcher_num_sms == 12
+        assert moe.experts.dispatcher_num_sms_preprocessing == 32
         assert moe.experts.dispatcher_share_token_dispatcher is False
         assert moe.experts.dispatcher_async_dispatch is True
 

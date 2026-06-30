@@ -395,6 +395,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             orig_module.config,
             dispatcher_backend=orig_module.dispatcher_backend,
             dispatcher_num_sms=orig_module.dispatcher_num_sms,
+            dispatcher_num_sms_preprocessing=orig_module.dispatcher_num_sms_preprocessing,
             dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
             dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
         )

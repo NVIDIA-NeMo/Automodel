@@ -377,6 +377,22 @@ class TestBackendConfigHybridEP:
         config = BackendConfig(dispatcher="hybridep", dispatcher_num_sms=24)
         assert config.dispatcher_num_sms == 24
 
+    def test_hybridep_preprocessing_num_sms_is_opt_in(self):
+        default_config = BackendConfig(dispatcher="hybridep")
+        tuned_config = BackendConfig(dispatcher="hybridep", dispatcher_num_sms_preprocessing=32)
+
+        assert default_config.dispatcher_num_sms_preprocessing is None
+        assert tuned_config.dispatcher_num_sms_preprocessing == 32
+
+    @pytest.mark.parametrize("num_sms", [0, -1, 1.5, True])
+    def test_hybridep_preprocessing_num_sms_must_be_positive_integer(self, num_sms):
+        with pytest.raises(ValueError, match="must be a positive integer or None"):
+            BackendConfig(dispatcher="hybridep", dispatcher_num_sms_preprocessing=num_sms)
+
+    def test_hybridep_preprocessing_num_sms_requires_hybridep(self):
+        with pytest.raises(ValueError, match="requires dispatcher='hybridep'"):
+            BackendConfig(dispatcher="deepep", dispatcher_num_sms_preprocessing=32)
+
     def test_dispatcher_share_token_dispatcher_default(self):
         """Test that dispatcher_share_token_dispatcher defaults to enabled."""
         config = BackendConfig(dispatcher="deepep")
