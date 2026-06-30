@@ -74,9 +74,8 @@ model:
     te_ops_mxfp8_weight_cache: true
     te_fp8:
       recipe: mxfp8
-      # Match the 26.06 Megatron MXFP8 recipe by running dot-product attention
-      # in FP8 as well as the MLP path.
-      fp8_dpa: true
+      # Keep dot-product attention in BF16; MXFP8 is restricted to the MLP path.
+      fp8_dpa: false
 
 checkpoint:
   enabled: false
