@@ -115,7 +115,7 @@ cuda = [
     "nv-grouped-gemm",
     # This is required to prevent ONNX errors arising from TE
     "onnxscript>=0.5.6",
-    "transformer-engine[pytorch]>=2.14.1",
+    "transformer-engine[pytorch]>=2.16.0",
     # DeepSeek-V4 TileLang kernels (enable backend.attn="tilelang": sparse MLA
     # attention, lightning indexer, and the external TileKernels MHC sinkhorn).
     "tilelang>=0.1.11",
@@ -123,6 +123,30 @@ cuda = [
     # tilelang 0.1.11 does not cap its TVM ffi dependency, but 0.1.12 is
     # incompatible with its bundled TVM. Keep pip installs on the known-good ffi.
     "apache-tvm-ffi<=0.1.11",
+]
+cu12 = [
+    "torch==2.12.1+cu129 ; sys_platform == 'linux'",
+    "torchvision ; sys_platform == 'linux'",
+    "nvidia-nccl-cu12>=2.30.4 ; sys_platform == 'linux'",
+    "nvidia-nvshmem-cu12>=3.7.0 ; sys_platform == 'linux'",
+    "transformer-engine[pytorch,core-cu12]>=2.16.0 ; sys_platform == 'linux'",
+]
+cu13 = [
+    "torch==2.12.1+cu130 ; sys_platform == 'linux'",
+    "torchvision ; sys_platform == 'linux'",
+    # DeepEP v2 elastic uses NCCL GIN, but upstream still builds and links its
+    # legacy NVSHMEM extension.
+    "nvidia-nccl-cu13>=2.30,<2.31 ; sys_platform == 'linux'",
+    "nvidia-nvshmem-cu13>=3.7,<3.8 ; sys_platform == 'linux'",
+    "transformer-engine[pytorch,core-cu13]>=2.16.0 ; sys_platform == 'linux'",
+]
+cu13_legacy = [
+    "torch==2.12.1+cu130 ; sys_platform == 'linux'",
+    "torchvision ; sys_platform == 'linux'",
+    # DeepEP v1 requires NVSHMEM; use the current NCCL/NVSHMEM stack.
+    "nvidia-nccl-cu13>=2.30,<2.31 ; sys_platform == 'linux'",
+    "nvidia-nvshmem-cu13>=3.7,<3.8 ; sys_platform == 'linux'",
+    "transformer-engine[pytorch,core-cu13]>=2.16.0 ; sys_platform == 'linux'",
 ]
 cuda_source = [
     "bitsandbytes",
@@ -137,9 +161,28 @@ delta-databricks = [
     "databricks-sql-connector>=3.0.0",  # For Unity Catalog streaming access
 ]
 moe = [
+    "nemo_automodel[deepep_v2]",
+]
+deepep_v1 = [
+    "nemo_automodel[cu13_legacy]",
     "nemo_automodel[cuda]",
     "nemo_automodel[fla]",
-    "deep_ep",
+    "torch==2.12.1+cu130 ; sys_platform == 'linux'",
+    "torchvision ; sys_platform == 'linux'",
+    "deep_ep ; sys_platform == 'linux'",
+    "nvidia-ml-py ; sys_platform == 'linux'",
+]
+deepep_v2 = [
+    "nemo_automodel[cuda]",
+    "nemo_automodel[fla]",
+    "deep_ep ; sys_platform == 'linux'",
+    "nvidia-ml-py ; sys_platform == 'linux'",
+]
+hybridep = [
+    "nemo_automodel[cuda]",
+    "nemo_automodel[fla]",
+    "deep_ep ; sys_platform == 'linux'",
+    "nvidia-ml-py ; sys_platform == 'linux'",
 ]
 vlm = [
     "backoff",
@@ -196,7 +239,7 @@ automodel = "nemo_automodel.cli.app:main"
 am = "nemo_automodel.cli.app:main"
 
 [dependency-groups]
-build = ["setuptools", "torch<=2.10.0", "packaging", "psutil"]
+build = ["setuptools", "torch>=2.12.1", "packaging", "psutil"]
 docs = [
     "sphinx",
     "sphinx-autobuild",    # For live doc serving while editing docs
@@ -225,7 +268,7 @@ default-groups = ["build", "docs", "test"]
 no-build-isolation-package = [
     "bitsandbytes",
     "causal-conv1d",
-    "deep_ep",
+    "deep-ep",
     "flash-attn",
     "mamba-ssm",
     "nv-grouped-gemm",
@@ -262,25 +305,100 @@ constraint-dependencies = [
 ]
 override-dependencies = [
     "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
+    "nvidia-nccl-cu12>=2.30.4; sys_platform == 'linux'",
+    "nvidia-nccl-cu13>=2.30,<2.31; sys_platform == 'linux' and extra == 'cu13-legacy'",
+    "nvidia-nccl-cu13>=2.30,<2.31; sys_platform == 'linux' and extra == 'cu13'",
+    "nvidia-nvshmem-cu12>=3.7.0; sys_platform == 'linux'",
+    "nvidia-nvshmem-cu13>=3.7,<3.8; sys_platform == 'linux' and extra == 'cu13-legacy'",
+    "nvidia-nvshmem-cu13>=3.7,<3.8; sys_platform == 'linux' and extra == 'cu13'",
     # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin
     "urllib3>=2.7.0",
     "thrift>=0.23.0",
 ]
 prerelease = "allow"
+conflicts = [
+    [
+        { extra = "cu12" },
+        { extra = "cu13" },
+    ],
+    [
+        { extra = "cu12" },
+        { extra = "cu13_legacy" },
+    ],
+    [
+        { extra = "cu13" },
+        { extra = "cu13_legacy" },
+    ],
+    [
+        { extra = "cu12" },
+        { extra = "deepep_v1" },
+    ],
+    [
+        { extra = "cu13" },
+        { extra = "deepep_v1" },
+    ],
+    [
+        { extra = "cu13_legacy" },
+        { extra = "deepep_v2" },
+    ],
+    [
+        { extra = "cu13_legacy" },
+        { extra = "moe" },
+    ],
+    [
+        { extra = "deepep_v1" },
+        { extra = "deepep_v2" },
+    ],
+    [
+        { extra = "deepep_v1" },
+        { extra = "moe" },
+    ],
+    [
+        { extra = "deepep_v1" },
+        { extra = "hybridep" },
+    ],
+    [
+        { extra = "deepep_v2" },
+        { extra = "hybridep" },
+    ],
+    [
+        { extra = "moe" },
+        { extra = "hybridep" },
+    ],
+    [
+        { extra = "cu13_legacy" },
+        { extra = "hybridep" },
+    ],
+]
 
 [tool.uv.sources]
-deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "7febc6e25660af0f54d95dd781ecdcd62265ecca" }
+deep_ep = [
+  # Last pre-v2 commit on DeepEP main. This includes the NVSHMEM 3.5+ state
+  # layout compatibility fix from deepseek-ai/DeepEP#564.
+  { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "567632dd59810d77b3cc05553df953cc0f779799", marker = "sys_platform == 'linux'", extra = "deepep_v1" },
+  # Current DeepEP main, used by the v2 elastic Buffer path (`dispatcher:
+  # deepep_v2`) and by the default `moe` extra.
+  { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "af9a0403188392824fc3057452822235873e0612", marker = "sys_platform == 'linux'", extra = "deepep_v2" },
+  # HybridEP fork used by `dispatcher: hybridep`.
+  { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "e0a5b1d9848ab3e7b4a67842bf06f067bfac67f8", marker = "sys_platform == 'linux'", extra = "hybridep" },
+]
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
 onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+  { index = "pytorch-cu129", marker = "sys_platform == 'linux'", extra = "cu12" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'", extra = "cu13" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'", extra = "cu13_legacy" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'", extra = "deepep_v1" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 torchvision = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+  { index = "pytorch-cu129", marker = "sys_platform == 'linux'", extra = "cu12" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'", extra = "cu13" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'", extra = "cu13_legacy" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'", extra = "deepep_v1" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 
@@ -311,23 +429,40 @@ explicit = true
 
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]
-deep_ep = [{ requirement = "torch", match-runtime = true }]
+deep-ep = [
+    { requirement = "torch", match-runtime = true },
+    # NCCL/NVSHMEM are selected by the cu12/cu13 runtime extras. The Slurm
+    # container build resolves their roots before building DeepEP and exports
+    # EP_NCCL_ROOT_DIR/EP_NVSHMEM_ROOT_DIR for setup.py.
+    "packaging",
+    "ninja",
+    "setuptools",
+]
 transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 nv_grouped_gemm = ["setuptools"]
 
+[tool.uv.extra-build-variables]
+deep-ep = { TORCH_CUDA_ARCH_LIST = "9.0 10.0 12.0", HYBRID_EP_MULTINODE = "1", RDMA_CORE_HOME = "/usr", DEEPEP_ENABLE_LEGACY_NVSHMEM = "1", MAX_JOBS = "8", CPATH = "/usr/local/cuda/include/cccl:/usr/local/cuda/include:/usr/local/cuda-12.4/include/cccl:/usr/local/cuda-12.4/include:/usr/include", LIBRARY_PATH = "/usr/local/lib:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu", LD_LIBRARY_PATH = "/usr/local/lib:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu" }
+transformer-engine = { TORCH_CUDA_ARCH_LIST = "9.0 10.0 12.0", NVTE_CUDA_ARCHS = "90;100;120", NVTE_FRAMEWORK = "pytorch", MAX_JOBS = "8" }
+transformer-engine-torch = { TORCH_CUDA_ARCH_LIST = "9.0 10.0 12.0", NVTE_CUDA_ARCHS = "90;100;120", NVTE_FRAMEWORK = "pytorch", MAX_JOBS = "8" }
+
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
-name = "deep_ep"
-# This version has to match the version in the commit/rev/tag used
-version = "v1.2.1+7febc6e"
-requires-dist = ["torch", "packaging", "ninja"]
+name = "deep-ep"
+version = "2.0.0+local"
+requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "nv_grouped_gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "1.1.4.post8"
 requires-dist = ["torch", "packaging", "ninja", "setuptools"]
+
+[[tool.uv.dependency-metadata]]
+name = "transformer-engine-torch"
+version = "2.16.0"
+requires-dist = ["torch>=2.1", "einops", "onnxscript", "onnx", "packaging", "pydantic", "nvdlfw-inspect"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
