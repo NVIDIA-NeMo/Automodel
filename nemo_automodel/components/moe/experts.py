@@ -1464,6 +1464,7 @@ class _TeOpsMXFP8WeightCache:
         self.members: tuple[Any, ...] = ()
         self.storage_identity: tuple[Any, ...] | None = None
         self.owner_key: tuple[Any, ...] | None = None
+        self.invalidated = False
         self.refresh_count = 0
         self.group_quantize_count = 0
         self.member_update_count = 0
@@ -1541,13 +1542,17 @@ class _TeOpsMXFP8WeightCache:
 
     def is_current(self, owner: torch.Tensor) -> bool:
         """Return whether the cache already represents this owner generation."""
-        return self.owner_key == self._owner_key(owner)
+        return not self.invalidated and self.owner_key == self._owner_key(owner)
+
+    def invalidate(self) -> None:
+        """Mark cached compute weights stale without launching quantization."""
+        self.invalidated = True
 
     def refresh(self, owner: torch.Tensor, *, force: bool = False) -> bool:
         """Refresh the selected MXFP8 representation for a new owner generation."""
         self._validate_owner(owner)
         owner_key = self._owner_key(owner)
-        if not force and self.owner_key == owner_key:
+        if not force and not self.invalidated and self.owner_key == owner_key:
             return False
 
         if self.mode == self.GROUP_QUANTIZE_MODE:
@@ -1583,6 +1588,7 @@ class _TeOpsMXFP8WeightCache:
                     self.refresh_quantizer.update_quantized(source, destination)
             self.member_update_count += len(self.members)
         self.owner_key = owner_key
+        self.invalidated = False
         self.refresh_count += 1
         return True
 
@@ -1683,6 +1689,7 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
             self.__dict__["_mxfp8_weight_cache_allocations"] = 0
             self.__dict__["_mxfp8_weight_cache_hits"] = 0
             self.__dict__["_mxfp8_weight_cache_fallbacks"] = 0
+            self.__dict__["_mxfp8_weight_cache_optimizer_invalidations"] = 0
             self.__dict__["_mxfp8_weight_cache_optimizer_refreshes"] = 0
             self.__dict__["_mxfp8_weight_cache_fallback_reason"] = "disabled by backend config"
             self.__dict__["_mxfp8_weight_cache_mode"] = _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE
@@ -1759,7 +1766,7 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
                 self.__dict__["_mxfp8_weight_cache_fallback_reason"] = ""
 
         def refresh_mxfp8_weight_cache_if_needed(self, *, force: bool = False) -> bool:
-            """Refresh the stable cache outside the TE Sequential graph target."""
+            """Refresh the compute cache outside the TE Sequential graph target."""
             if not self.__dict__.get("_mxfp8_weight_cache_enabled", False):
                 return False
             expected_shape = (self.num_groups, self.out_features, self.in_features)
@@ -1787,16 +1794,29 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
                 self.__dict__["_mxfp8_weight_cache_fallback_reason"] = ""
             return refreshed
 
+        def invalidate_mxfp8_weight_cache(self) -> bool:
+            """Mark a graph-off grouped cache stale at an optimizer boundary."""
+            if not self.__dict__.get("_mxfp8_weight_cache_enabled", False):
+                return False
+            if self.__dict__.get("_mxfp8_weight_cache_mode") != _TeOpsMXFP8WeightCache.GROUP_QUANTIZE_MODE:
+                return False
+            cache_state = self.__dict__.get("_mxfp8_weight_cache")
+            if cache_state is not None:
+                cache_state.invalidate()
+            return True
+
         def mxfp8_weight_cache_diagnostics(self) -> dict[str, Any]:
             """Return bounded counters and stable storage identities for profiling."""
             cache_state = self.__dict__.get("_mxfp8_weight_cache")
             storage = None
             refreshes = 0
             current = False
+            dirty = False
             if cache_state is not None:
                 owner = self._parameters["_stacked_weight"]
                 owner = owner.to_local() if isinstance(owner, DTensor) else owner
                 current = cache_state.is_current(owner)
+                dirty = cache_state.invalidated
                 refreshes = cache_state.refresh_count
                 grouped = cache_state.tensor
                 storage = {
@@ -1818,10 +1838,12 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
                 "group_quantize_calls": 0 if cache_state is None else cache_state.group_quantize_count,
                 "member_update_calls": 0 if cache_state is None else cache_state.member_update_count,
                 "buffer_replacements": 0 if cache_state is None else cache_state.buffer_replacement_count,
+                "optimizer_invalidations": self.__dict__.get("_mxfp8_weight_cache_optimizer_invalidations", 0),
                 "optimizer_refreshes": self.__dict__.get("_mxfp8_weight_cache_optimizer_refreshes", 0),
                 "hits": self.__dict__.get("_mxfp8_weight_cache_hits", 0),
                 "fallbacks": self.__dict__.get("_mxfp8_weight_cache_fallbacks", 0),
                 "current": current,
+                "dirty": dirty,
                 "requires_fixed_identity": requires_fixed_identity,
                 "identity_policy_satisfied": not requires_fixed_identity
                 or (storage is not None and storage["identity_stable"]),
@@ -2578,9 +2600,11 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
         # This stays outside ``_te_grouped_mlp``, which is the partial CUDA-graph
-        # target. The optimizer post-step hook refreshes once per generation;
-        # owner-version checks additionally catch ordinary in-place edits. A
-        # checkpoint recompute sees the same generation and reuses the cache.
+        # target. For graph-off grouped quantization, the optimizer hook only
+        # marks the cache dirty and this first subsequent expert forward refreshes
+        # it. Fixed-address graph caches refresh synchronously in the hook. Owner
+        # version checks additionally catch ordinary in-place edits, while GA and
+        # checkpoint recomputation reuse the current generation.
         self.refresh_mxfp8_weight_cache_if_needed()
 
         weights, indices = _mask_routing_metadata(weights, indices, token_mask)
@@ -2683,13 +2707,14 @@ def register_te_ops_mxfp8_weight_cache_optimizer_hooks(
     model_parts: Any,
     optimizers: Any,
 ) -> tuple[Any, ...]:
-    """Refresh enabled compute caches once after each owning optimizer step.
+    """Advance enabled compute caches after each owning optimizer step.
 
     Native fused optimizers may update ``parameter.data`` without incrementing
     the registered owner's PyTorch version counter. A post-step hook is therefore
-    the generation boundary for cache correctness. The refresh is enqueued after
-    the optimizer update on the current CUDA stream, before either the next model
-    forward or direct partial-graph capture.
+    the generation boundary for cache correctness. Graph-off grouped caches are
+    invalidated without launching quantization and refresh lazily on the first
+    subsequent expert forward. Fixed-address partial-graph caches refresh in the
+    hook on the current CUDA stream so replay always observes current contents.
     """
 
     roots = (model_parts,) if isinstance(model_parts, nn.Module) else tuple(model_parts)
@@ -2760,15 +2785,23 @@ def register_te_ops_mxfp8_weight_cache_optimizer_hooks(
     try:
         for register_hook, owned_linears in registration_plan:
 
-            def refresh_after_step(_optimizer, _args, _kwargs, *, linears=owned_linears):
+            def advance_after_step(_optimizer, _args, _kwargs, *, linears=owned_linears):
                 for linear in linears:
+                    mode = linear.__dict__.get("_mxfp8_weight_cache_mode", _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE)
+                    if mode == _TeOpsMXFP8WeightCache.GROUP_QUANTIZE_MODE:
+                        invalidate = getattr(linear, "invalidate_mxfp8_weight_cache", None)
+                        if callable(invalidate) and invalidate():
+                            linear.__dict__["_mxfp8_weight_cache_optimizer_invalidations"] = (
+                                linear.__dict__.get("_mxfp8_weight_cache_optimizer_invalidations", 0) + 1
+                            )
+                        continue
                     refresh = getattr(linear, "refresh_mxfp8_weight_cache_if_needed", None)
                     if callable(refresh) and refresh(force=True):
                         linear.__dict__["_mxfp8_weight_cache_optimizer_refreshes"] = (
                             linear.__dict__.get("_mxfp8_weight_cache_optimizer_refreshes", 0) + 1
                         )
 
-            handles.append(register_hook(refresh_after_step))
+            handles.append(register_hook(advance_after_step))
     except Exception:
         for handle in handles:
             handle.remove()
@@ -2795,10 +2828,12 @@ def collect_te_ops_mxfp8_weight_cache_diagnostics(model_parts: Any) -> dict[str,
         "group_quantize_calls": 0,
         "member_update_calls": 0,
         "buffer_replacements": 0,
+        "optimizer_invalidations": 0,
         "optimizer_refreshes": 0,
         "hits": 0,
         "fallbacks": 0,
         "current_caches": 0,
+        "dirty_caches": 0,
         "group_quantize_caches": 0,
         "fixed_address_caches": 0,
         "storage_identity_stable": True,
@@ -2828,10 +2863,12 @@ def collect_te_ops_mxfp8_weight_cache_diagnostics(model_parts: Any) -> dict[str,
                 result["group_quantize_calls"] += int(projection["group_quantize_calls"])
                 result["member_update_calls"] += int(projection["member_update_calls"])
                 result["buffer_replacements"] += int(projection["buffer_replacements"])
+                result["optimizer_invalidations"] += int(projection["optimizer_invalidations"])
                 result["optimizer_refreshes"] += int(projection["optimizer_refreshes"])
                 result["hits"] += int(projection["hits"])
                 result["fallbacks"] += int(projection["fallbacks"])
                 result["current_caches"] += int(projection["current"])
+                result["dirty_caches"] += int(projection["dirty"])
                 result["identity_policy_satisfied"] &= bool(projection["identity_policy_satisfied"])
                 storage = projection["storage"]
                 if storage is None:

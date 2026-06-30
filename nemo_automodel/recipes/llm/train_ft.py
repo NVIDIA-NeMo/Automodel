@@ -985,7 +985,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._validate_partial_graph_optimizers()
 
     def _setup_te_ops_mxfp8_weight_cache_optimizer_hooks(self) -> None:
-        """Refresh fused-optimizer compute caches at the optimizer generation boundary."""
+        """Invalidate or refresh compute caches at the optimizer generation boundary."""
         from nemo_automodel.components.moe.experts import register_te_ops_mxfp8_weight_cache_optimizer_hooks
 
         for handle in getattr(self, "_te_ops_mxfp8_weight_cache_optimizer_hook_handles", ()):
