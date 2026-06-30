@@ -29,6 +29,7 @@ class CompileConfig:
     """Configuration for torch.compile."""
 
     enabled: bool = False
+    scope: str = "model"
     mode: str = "default"
     fullgraph: bool = False
     dynamic: bool = False
@@ -39,6 +40,7 @@ class CompileConfig:
     def __init__(
         self,
         enabled: bool = False,
+        scope: str = "model",
         mode: str = "default",
         fullgraph: bool = False,
         dynamic: bool = False,
@@ -47,6 +49,7 @@ class CompileConfig:
         dynamo_cache_size_limit: int = 256,
     ):
         self.enabled = enabled
+        self.scope = scope
         self.mode = mode
         self.fullgraph = fullgraph
         self.dynamic = dynamic
@@ -58,6 +61,7 @@ class CompileConfig:
         """Convert to dictionary."""
         return {
             "enabled": self.enabled,
+            "scope": self.scope,
             "mode": self.mode,
             "fullgraph": self.fullgraph,
             "dynamic": self.dynamic,
@@ -199,6 +203,65 @@ def compile_model(model: nn.Module, config: CompileConfig) -> nn.Module:
         compile_kwargs["backend"] = config.backend
     compile_kwargs.update(options_dict)
 
+    if config.scope == "vision":
+        # DDP has already been constructed by infrastructure at this point.
+        # Compile the original vision module in place so DDP's parameter hooks
+        # continue to reference the same trainable parameters.
+        owner = getattr(model, "module", model)
+        backbone = getattr(owner, "model", owner)
+        vision = getattr(backbone, "vision_model", None)
+        if vision is None:
+            logger.warning("Vision-scoped torch.compile requested but no vision_model was found")
+            return model
+        logger.info(
+            "Compiling only vision_model with backend=%s, mode=%s, dynamic=%s",
+            config.backend,
+            config.mode,
+            config.dynamic,
+        )
+        backbone.vision_model = torch.compile(vision, **compile_kwargs)
+        return model
+
+    if config.scope == "vision_encoder":
+        # Keep the SigLIP wrapper eager: it owns the image-token reshapes and
+        # output dataclass. Compile only the transformer encoder where the
+        # repeated residual/attention/MLP operations live.
+        owner = getattr(model, "module", model)
+        backbone = getattr(owner, "model", owner)
+        vision = getattr(backbone, "vision_model", None)
+        transformer = getattr(vision, "vision_model", None)
+        encoder = getattr(transformer, "encoder", None)
+        if encoder is None:
+            logger.warning("Vision-encoder torch.compile requested but no SigLIP encoder was found")
+            return model
+        logger.info(
+            "Compiling only SigLIP encoder with backend=%s, mode=%s, dynamic=%s",
+            config.backend,
+            config.mode,
+            config.dynamic,
+        )
+        transformer.encoder = torch.compile(encoder, **compile_kwargs)
+        return model
+
+    if config.scope == "language":
+        owner = getattr(model, "module", model)
+        backbone = getattr(owner, "model", owner)
+        language = getattr(backbone, "language_model", None)
+        if language is None:
+            logger.warning("Language-scoped torch.compile requested but no language_model was found")
+            return model
+        logger.info(
+            "Compiling only language_model with backend=%s, mode=%s, dynamic=%s",
+            config.backend,
+            config.mode,
+            config.dynamic,
+        )
+        backbone.language_model = torch.compile(language, **compile_kwargs)
+        return model
+
+    if config.scope != "model":
+        raise ValueError(f"Unsupported torch.compile scope: {config.scope!r}")
+
     logger.info(f"Compiling model with backend={config.backend}, mode={config.mode}, dynamic={config.dynamic}")
 
     try:
@@ -222,6 +285,7 @@ def create_compile_config_from_dict(config_dict: Dict[str, Any]) -> CompileConfi
     """
     return CompileConfig(
         enabled=config_dict.get("enabled", False),
+        scope=config_dict.get("scope", "model"),
         mode=config_dict.get("mode", "default"),
         fullgraph=config_dict.get("fullgraph", False),
         dynamic=config_dict.get("dynamic", False),
