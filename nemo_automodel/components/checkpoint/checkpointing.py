@@ -166,6 +166,20 @@ def _get_checkpoint_metadata_keys(
     return set(metadata.state_dict_metadata.keys())
 
 
+def _checkpoint_metadata_uses_split_moe_experts(checkpoint_metadata_keys: set[str]) -> bool:
+    """Return True if checkpoint metadata stores MoE experts as per-expert HF keys."""
+    expert_path = ".mlp.experts."
+    split_expert_suffixes = {"gate_proj.weight", "up_proj.weight", "down_proj.weight"}
+    for key in checkpoint_metadata_keys:
+        if expert_path not in key:
+            continue
+        expert_tail = key.split(expert_path, 1)[1]
+        expert_id, separator, projection_key = expert_tail.partition(".")
+        if separator and expert_id.isdigit() and projection_key in split_expert_suffixes:
+            return True
+    return False
+
+
 if _is_geq_torch_2_9():
     from torch.distributed.checkpoint.staging import DefaultStager
     from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType, AsyncSaveResponse
@@ -611,14 +625,27 @@ class Checkpointer:
         # renames model keys, producing a mismatch in the DCP planner.
         reader_key_mapping = None if has_state_dict_adapter else key_mapping
         storage_reader = self._get_storage_reader(model_path, reader_key_mapping, is_init_step=is_init_step)
+        checkpoint_metadata_keys: set[str] | None = None
+
+        def get_checkpoint_metadata_keys_once() -> set[str]:
+            nonlocal checkpoint_metadata_keys
+            if checkpoint_metadata_keys is None:
+                checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+            return checkpoint_metadata_keys
 
         # MoE adapters return views into model storage; DCP writes safetensors
         # data straight through them and from_hf skips the rebuild.
+        source_checkpoint_uses_split_experts = False
+        if has_state_dict_adapter:
+            source_checkpoint_uses_split_experts = _checkpoint_metadata_uses_split_moe_experts(
+                get_checkpoint_metadata_keys_once()
+            )
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
             quantization=self.config.dequantize_base_checkpoint,
             device_mesh=self.moe_mesh,
+            source_checkpoint=source_checkpoint_uses_split_experts,
         )
 
         compat_tied_lm_head_source_key: str | None = None
@@ -630,7 +657,7 @@ class Checkpointer:
             and lm_head_param_name in state_dict
         )
         if should_try_tied_lm_head_compat:
-            checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+            checkpoint_metadata_keys = get_checkpoint_metadata_keys_once()
             if lm_head_param_name not in checkpoint_metadata_keys:
                 for source_name in get_tied_lm_head_source_names(model_state.model[0], lm_head_param_name):
                     if source_name not in checkpoint_metadata_keys or source_name in state_dict:

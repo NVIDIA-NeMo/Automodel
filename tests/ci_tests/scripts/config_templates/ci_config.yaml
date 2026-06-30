@@ -77,6 +77,16 @@ conditional:
     apply:
       peft.use_triton: false
 
+  # Qwen3-MoE DeepEP's checkpoint correctness is covered by the strict
+  # Automodel reload phase.  The vanilla-HF reload phase compares against a
+  # different bf16 MoE backend, so keep that CI tolerance in the resolver
+  # rather than conditioning the public recipe on the downstream HF path.
+  - when_recipe_contains_all: [qwen3_moe_30b_te_deepep]
+    phases: [checkpoint_robustness]
+    apply:
+      ci.checkpoint_robustness.experts_implementation: eager
+      ci.checkpoint_robustness.hf_kl_threshold: 2e-2
+
 # Env var -> { target, phases }. Applied iff env is set and phase matches.
 # Values coerced to int -> float -> str.
 env:
