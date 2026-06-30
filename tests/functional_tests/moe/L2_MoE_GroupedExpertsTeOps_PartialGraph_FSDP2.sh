@@ -1,0 +1,40 @@
+#!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -xeuo pipefail
+
+export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+unset NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP
+
+TRANSFORMERS_OFFLINE=1 TE_OPS_GRAPH_MODE=bf16 TE_OPS_GRAPH_ASYMMETRIC_CAPTURE=0 \
+NVTE_CUTEDSL_FUSED_GROUPED_MLP=0 python3 \
+-m torch.distributed.run --nproc_per_node=2 --nnodes=1 --master_port=29541 \
+    tests/functional_tests/moe/run_te_ops_partial_graph_fsdp2.py
+
+TRANSFORMERS_OFFLINE=1 TE_OPS_GRAPH_MODE=bf16 TE_OPS_GRAPH_ASYMMETRIC_CAPTURE=1 \
+NVTE_CUTEDSL_FUSED_GROUPED_MLP=0 python3 \
+-m torch.distributed.run --nproc_per_node=2 --nnodes=1 --master_port=29542 \
+    tests/functional_tests/moe/run_te_ops_partial_graph_fsdp2.py
+
+TRANSFORMERS_OFFLINE=1 TE_OPS_GRAPH_MODE=mxfp8 TE_OPS_GRAPH_ASYMMETRIC_CAPTURE=0 \
+NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 python3 \
+-m torch.distributed.run --nproc_per_node=2 --nnodes=1 --master_port=29543 \
+    tests/functional_tests/moe/run_te_ops_partial_graph_fsdp2.py
+
+TRANSFORMERS_OFFLINE=1 TE_OPS_GRAPH_MODE=mxfp8 TE_OPS_GRAPH_ASYMMETRIC_CAPTURE=1 \
+NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 python3 \
+-m torch.distributed.run --nproc_per_node=2 --nnodes=1 --master_port=29544 \
+    tests/functional_tests/moe/run_te_ops_partial_graph_fsdp2.py

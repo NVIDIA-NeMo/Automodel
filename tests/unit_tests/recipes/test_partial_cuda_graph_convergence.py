@@ -28,6 +28,16 @@ from torch.utils.checkpoint import checkpoint
 import nemo_automodel.recipes.llm.partial_cuda_graphs as partial_graphs
 
 
+def _te_mxfp8_grouped_mlp_supported(te_ops) -> bool:
+    """Accept TE 2.16 and the post-2.16 grouped-MLP fuser class names."""
+    fused = getattr(te_ops, "fused", None)
+    for name in ("ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8", "GroupedMLP_CuTeGEMMGLU"):
+        op = getattr(fused, name, None)
+        if op is not None and op.is_supported():
+            return True
+    return False
+
+
 class _AttentionTransform(nn.Module):
     """Small parameter-free stand-in for the graphable fused-attention boundary."""
 
@@ -167,6 +177,7 @@ def _make_manager(
     expert_fp8_enabled: bool = False,
     fp8_recipe=None,
     expert_bucket_tokens: int | None = None,
+    expert_bucket_uses_paged_capacity: bool = False,
 ) -> partial_graphs.PartialCudaGraphManager:
     attention_entry = partial_graphs._PartialGraphEntry(
         name="test.attention",
@@ -180,6 +191,7 @@ def _make_manager(
         fp8_enabled=expert_fp8_enabled,
         canonicalizer=partial_graphs._canonicalize_te_ops_experts,
         expert_bucket_tokens=expert_bucket_tokens,
+        expert_bucket_uses_paged_capacity=expert_bucket_uses_paged_capacity,
     )
     manager = partial_graphs.PartialCudaGraphManager([attention_entry, expert_entry], fp8_recipe=fp8_recipe)
     manager.start_recording()
@@ -818,7 +830,11 @@ def test_te_ops_bf16_bucket_replays_changed_total_under_non_reentrant_checkpoint
         expert=reference_expert,
     )
     reference_model.router_gain.data.copy_(graph_model.router_gain.data)
-    manager = _make_manager(graph_model, expert_bucket_tokens=128)
+    manager = _make_manager(
+        graph_model,
+        expert_bucket_tokens=128,
+        expert_bucket_uses_paged_capacity=True,
+    )
     graph_optimizer = torch.optim.AdamW(graph_model.parameters(), lr=0.002)
     reference_optimizer = torch.optim.AdamW(reference_model.parameters(), lr=0.002)
     graph_losses, reference_losses = _run_checkpointed_optimizer_steps(
@@ -862,7 +878,7 @@ def test_te_ops_mxfp8_non_reentrant_checkpoint_keeps_attention_bf16():
 
     if torch.cuda.get_device_capability() < (10, 0):
         pytest.skip("MXFP8 grouped-MLP fusion requires Blackwell")
-    if not te_ops.fused.ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8.is_supported():
+    if not _te_mxfp8_grouped_mlp_supported(te_ops):
         pytest.skip("TE MXFP8 fused grouped MLP is not supported on this system")
 
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -889,6 +905,7 @@ def test_te_ops_mxfp8_non_reentrant_checkpoint_keeps_attention_bf16():
         expert_fp8_enabled=True,
         fp8_recipe=recipe,
         expert_bucket_tokens=1024,
+        expert_bucket_uses_paged_capacity=True,
     )
     assert manager.entries[0].fp8_enabled is False
     assert manager.entries[1].fp8_enabled is True

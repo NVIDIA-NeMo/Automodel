@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import json
 import logging
 import pathlib
@@ -174,18 +173,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Clear validation dataloader (not needed for benchmarking)
         self.val_dataloader = None
 
-        # Partial CUDA graphs are benchmark-only and deliberately start with one
-        # fully eager iteration. Temporary hooks record detached call samples;
-        # capture happens after that iteration's optimizer step, outside its timer.
-        from nemo_automodel.recipes.llm.partial_cuda_graphs import PartialCudaGraphManager
-
-        self.partial_cuda_graph_manager = PartialCudaGraphManager.from_model_parts(
-            self.model_parts,
-            activation_checkpointing=bool(getattr(self, "activation_checkpointing", False)),
-            pipeline_parallel=bool(self.pp_enabled),
-        )
-        self._validate_partial_graph_optimizers()
-
         # Get step_scheduler config
         seq_len = self._bench_seq_len
         global_batch_size = self.cfg.step_scheduler.global_batch_size
@@ -258,33 +245,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             barrier=True,
         )
 
-    def _validate_partial_graph_optimizers(self) -> None:
-        """Require zeroing that preserves TE's persistent graph grad buffers."""
-        if self.partial_cuda_graph_manager is None:
-            return
-        for optimizer in self.optimizer:
-            try:
-                inspect.signature(optimizer.zero_grad).bind(set_to_none=False)
-            except (TypeError, ValueError) as error:
-                raise RuntimeError(
-                    "Partial CUDA graphs require optimizer.zero_grad(set_to_none=False) support"
-                ) from error
-
-    def _zero_optimizer_gradients(self) -> None:
-        """Zero gradients without releasing static buffers when graphs are active."""
-        for optimizer in self.optimizer:
-            if self.partial_cuda_graph_manager is None:
-                optimizer.zero_grad()
-            else:
-                # Replacing TE's static grad buffers with None can lose or double
-                # accumulation across graph-replayed GA microbatches.
-                try:
-                    optimizer.zero_grad(set_to_none=False)
-                except TypeError as error:
-                    raise RuntimeError(
-                        "Partial CUDA graphs require optimizer.zero_grad(set_to_none=False) support"
-                    ) from error
-
     def _mtp_tflops(self, global_batch_size, seq_len):
         """TFLOPs added by a Multi-Token-Prediction (MTP) head, if the model has one.
 
@@ -330,6 +290,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         return 0.0
 
     def run_benchmark(self):
+        """Run the benchmark and always release partial graphs on exit."""
+        try:
+            return self._run_benchmark()
+        finally:
+            self._close_partial_cuda_graphs()
+
+    def _run_benchmark(self):
         """Run the benchmarking loop.
 
         This method implements a simplified training loop focused on benchmarking
@@ -424,7 +391,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     logger.debug("Optimizer step")
 
             if i == 0 and self.partial_cuda_graph_manager is not None:
-                self.partial_cuda_graph_manager.capture()
+                self._capture_partial_cuda_graphs_after_eager_step()
 
             # Synchronize num_label_tokens across DP ranks
             num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
@@ -645,8 +612,11 @@ def main(config_path=None):
 
     cfg = parse_args_and_load_config(config_path)
     recipe = BenchmarkingRecipeForNextTokenPrediction(cfg)
-    recipe.setup()
-    recipe.run_benchmark()
+    try:
+        recipe.setup()
+        recipe.run_benchmark()
+    finally:
+        recipe._close_partial_cuda_graphs()
 
 
 if __name__ == "__main__":

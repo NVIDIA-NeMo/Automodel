@@ -1,16 +1,16 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Three-step MXFP8 counterpart to the BF16 partial-graph smoke. Dot-product
-# attention remains BF16. The noisy balanced gate is only for varied-routing
-# correctness and replay/fallback visibility; do not use this recipe for timing.
+# EP64 convergence/lifecycle smoke for partial attention and expert graphs
+# under PyTorch non-reentrant activation checkpointing. Timing comparisons use
+# the AC-off counterpart; this recipe validates recomputation and teardown.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 
 benchmark:
   warmup_steps: 1
-  peak_tflops: 5000
+  peak_tflops: 2500
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
@@ -33,7 +33,7 @@ distributed:
   pp_size: 1
   ep_size: 64
   sequence_parallel: false
-  activation_checkpointing: false
+  activation_checkpointing: true
   pipeline:
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 2
@@ -67,9 +67,6 @@ model:
     fake_gate_noise: 0.1
     enable_hf_state_dict_adapter: false
     enable_fsdp_optimizations: true
-    te_fp8:
-      recipe: mxfp8
-      fp8_dpa: false
     partial_cuda_graph_attention: true
     partial_cuda_graph_moe_router: false
     partial_cuda_graph_moe_preprocess: false

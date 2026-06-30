@@ -89,6 +89,12 @@ env:
   EP_SIZE:
     target: distributed.ep_size
     phases: [nightly, release, convergence, performance]
+  PARTIAL_CUDA_GRAPH_LAYER_LIMIT:
+    target: model.backend.partial_cuda_graph_layer_limit
+    phases: [performance]
+  PARTIAL_CUDA_GRAPH_EXPERT_BUCKET_TOKENS:
+    target: model.backend.partial_cuda_graph_expert_bucket_tokens
+    phases: [performance]
 
 # Computed dynamic overrides. `format` is str.format() over env vars + built-in `date`.
 computed:

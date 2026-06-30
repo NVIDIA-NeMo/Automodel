@@ -196,28 +196,30 @@ class BackendConfig:
         gate_precision: Optional dtype override for the gate computation. Accepts
             torch.dtype or string (e.g., "torch.float32", "float32").
         moe_router_fusion: Use Transformer Engine's fused top-k router for the
-            learned GPT-OSS-style gate. The fused kernel produces the dense routing
+            learned MoE gate. The fused kernel produces the dense routing
             metadata consumed directly by HybridEP, so this requires
             dispatcher="hybridep" and fake_balanced_gate=False.
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
-        partial_cuda_graph_attention: Benchmark-only opt-in that captures GPT-OSS TE
-            FusedAttention after one eager iteration. The DPA compute must remain BF16.
-        partial_cuda_graph_moe_router: Opt-in that captures the fixed-shape GPT-OSS MoE
-            router while leaving variable-shape expert dispatch and compute eager.
+        partial_cuda_graph_attention: Opt-in that captures structurally discovered TE
+            FusedAttention boundaries after one complete eager training iteration. The
+            DPA compute must remain BF16.
+        partial_cuda_graph_moe_router: Opt-in that captures graphable fixed-shape MoE
+            routing cores while leaving variable-shape expert dispatch and compute eager.
         partial_cuda_graph_moe_preprocess: Opt-in that captures HybridEP's fixed-shape
             top-k-to-multihot preprocessing. Requires the router graph, matching
             Megatron-LM's scoped dropless-MoE CUDA graph contract.
-        partial_cuda_graph_experts: Benchmark-only opt-in that captures GPT-OSS TE-ops
+        partial_cuda_graph_experts: Opt-in that captures structurally discovered TE-ops
             expert compute. Real routing can change the received-token shape, so calls
             whose metadata differs from the captured sample fall back to eager execution.
         partial_cuda_graph_expert_bucket_tokens: Optional fixed physical token capacity
             for partial expert graphs. HybridEP still receives the exact dynamic token
             count; expert inputs at or below this capacity are padded locally for TE and
             sliced back before combine. Larger calls remain eager without dropping tokens.
-        partial_cuda_graph_layer_limit: Positive number of leading GPT-OSS layers to graph.
-            Limiting the layer count bounds persistent forward/backward graph buffers.
+        partial_cuda_graph_layer_limit: Positive number of graph-capable layers per enabled
+            partial-graph feature. Limiting the layer count bounds persistent
+            forward/backward graph buffers.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"

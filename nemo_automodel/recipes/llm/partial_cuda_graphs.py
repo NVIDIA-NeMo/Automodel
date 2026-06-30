@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Scoped partial CUDA graphs for GPT-OSS attention and MoE compute.
+"""Scoped partial CUDA graphs for Transformer Engine attention and MoE compute.
 
 The convergence-safe dropless-MoE path mirrors Megatron-LM: graph attention,
 the fixed-shape router, and fixed-shape HybridEP preprocessing while keeping
@@ -205,12 +205,16 @@ class _PartialGraphEntry:
         fp8_enabled: bool,
         canonicalizer: _Canonicalizer | None = None,
         expert_bucket_tokens: int | None = None,
+        expert_bucket_uses_paged_capacity: bool = False,
+        expert_graph_storage: Any = None,
     ):
         self.name = name
         self.target = target
         self.fp8_enabled = fp8_enabled
         self.canonicalizer = canonicalizer
         self.expert_bucket_tokens = expert_bucket_tokens
+        self.expert_bucket_uses_paged_capacity = expert_bucket_uses_paged_capacity
+        self.expert_graph_storage = expert_graph_storage
         self.original_forward = target.forward
         self.captured_call: _CapturedCall | None = None
         self.adapter: _TensorOnlyCallAdapter | None = None
@@ -229,6 +233,7 @@ class _PartialGraphEntry:
         self._parameter_signature: tuple[tuple[Any, ...], ...] = ()
         self._logged_replay = False
         self._logged_fallback = False
+        self._closed = False
 
     def _canonicalize(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
         if self.canonicalizer is None:
@@ -245,7 +250,7 @@ class _PartialGraphEntry:
         if capacity is None:
             return args, kwargs, None, ""
 
-        hidden_states, split_sizes, probs, _, _ = args
+        hidden_states, split_sizes, probs = args[:3]
         token_count = hidden_states.shape[0]
         if token_count == 0:
             return args, kwargs, token_count, "routed token count is zero"
@@ -267,14 +272,29 @@ class _PartialGraphEntry:
         probs_padding = probs.new_zeros((padding, *probs.shape[1:]))
         padded_hidden_states = torch.cat((hidden_states, hidden_padding), dim=0)
         padded_probs = torch.cat((probs, probs_padding), dim=0)
-        # TE's graph-safe GroupedTensor and fused grouped-MLP paths explicitly
-        # support paged-stash buffers where physical B > sum(split_sizes). The
-        # tail is unused capacity, so keep the real per-expert sizes unchanged;
-        # assigning the tail to an expert would change the routing metadata and
-        # force that expert to compute the padding. numel()/shape checks above
-        # inspect tensor metadata only and do not synchronize with the device.
+        # Host-split grouped ops require sum(split_sizes) to match the physical
+        # compute shape, so assign their zero-probability tail to the final local
+        # expert. TE's graph-safe GroupedTensor path supports paged capacity
+        # (physical B > sum(split_sizes)) in BF16/FP16 and MXFP8 forward and
+        # backward, including the full MXFP8 grouped-MLP fusion. Those paths
+        # must retain the real dynamic splits. Dispatch itself always uses the
+        # exact splits.
+        if self.expert_bucket_uses_paged_capacity:
+            padded_split_sizes = split_sizes
+        else:
+            padded_split_sizes = torch.cat((split_sizes[:-1], split_sizes[-1:] + padding))
+        if len(args) == 4:
+            padded_args = (padded_hidden_states, padded_split_sizes, padded_probs, padded_split_sizes)
+        else:
+            padded_args = (
+                padded_hidden_states,
+                padded_split_sizes,
+                padded_probs,
+                padded_split_sizes,
+                padded_probs,
+            )
         return (
-            (padded_hidden_states, split_sizes, padded_probs, split_sizes, padded_probs),
+            padded_args,
             kwargs,
             token_count,
             "",
@@ -282,6 +302,8 @@ class _PartialGraphEntry:
 
     def start_recording(self) -> None:
         """Record the first eager call through a temporary pre-hook."""
+        if self._closed:
+            raise RuntimeError(f"Partial CUDA graph entry {self.name!r} is closed")
 
         def record_call(_module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
             if self._capture_skip_reason is not None:
@@ -314,6 +336,46 @@ class _PartialGraphEntry:
             self._record_hook.remove()
             self._record_hook = None
 
+    def close(self) -> None:
+        """Destroy graph replay state and release retained expert storage safely."""
+        if self._closed:
+            return
+
+        self.stop_recording()
+
+        # Stop new calls from entering a graph before destroying it. TE attaches
+        # ``reset`` to the adapter returned by make_graphed_callables; that must
+        # run while every captured tensor/parameter address is still alive.
+        self.target.forward = self.original_forward
+        adapter = self.adapter
+        if adapter is not None:
+            reset = getattr(adapter, "reset", None)
+            if self.capture_count and not callable(reset):
+                raise RuntimeError(f"Captured partial CUDA graph adapter for {self.name!r} has no reset()")
+            if callable(reset):
+                reset()
+            # TE installs graph closures directly on the adapter instance.
+            # Remove them after reset so no Python attribute retains graph/static
+            # buffers while expert all-gather storage is released below.
+            adapter.__dict__.pop("forward", None)
+            adapter.__dict__.pop("backward_dw", None)
+            adapter.__dict__.pop("reset", None)
+            del reset
+
+        # Drop all graph/static-buffer references before allowing FSDP2 to free
+        # the retained all-gather allocation captured by an expert graph.
+        self.adapter = None
+        self.captured_call = None
+        self._parameter_signature = ()
+        self._captured_training = None
+        del adapter
+
+        storage = self.expert_graph_storage
+        if storage is not None:
+            storage.reset()
+            self.expert_graph_storage = None
+        self._closed = True
+
     def build_adapter(self) -> _TensorOnlyCallAdapter:
         """Build the tensor-only capture adapter after an eager sample was observed."""
         if self.captured_call is None:
@@ -342,6 +404,8 @@ class _PartialGraphEntry:
 
     def install(self, graphed_adapter: _TensorOnlyCallAdapter) -> None:
         """Install validated graph replay around the original target forward."""
+        if self._closed:
+            raise RuntimeError(f"Partial CUDA graph entry {self.name!r} is closed")
         self.adapter = graphed_adapter
         self.capture_count = 1
         self._captured_training = self.target.training
@@ -427,20 +491,167 @@ def _canonicalize_te_ops_experts(
     """Validate TE fused-MLP input aliases while keeping split values dynamic."""
     if kwargs:
         raise RuntimeError("TE-ops expert graph expects positional tensor inputs only")
-    if len(args) != 5 or not all(isinstance(arg, torch.Tensor) for arg in args):
-        raise RuntimeError("TE-ops expert graph expects (hidden, splits, probs, splits, probs)")
-    if args[1] is not args[3] or args[2] is not args[4]:
-        raise RuntimeError("TE fused grouped MLP requires repeated split/prob inputs to preserve tensor identity")
+    if len(args) not in (4, 5) or not all(isinstance(arg, torch.Tensor) for arg in args):
+        raise RuntimeError(
+            "TE-ops expert graph expects (hidden, splits, probs, splits[, probs]) for biasless or biased experts"
+        )
+    if args[1] is not args[3]:
+        raise RuntimeError("TE grouped MLP requires repeated split inputs to preserve tensor identity")
+    if len(args) == 5 and args[2] is not args[4]:
+        raise RuntimeError("TE grouped MLP with expert bias requires repeated probability inputs to preserve identity")
     return args, kwargs
 
 
+def _unwrap_checkpoint_wrappers(module: nn.Module) -> nn.Module:
+    """Return the module beneath any nested PyTorch checkpoint wrappers."""
+    while isinstance(getattr(module, "_checkpoint_wrapped_module", None), nn.Module):
+        module = module._checkpoint_wrapped_module
+    return module
+
+
+def _model_label(model: nn.Module) -> str:
+    """Return a diagnostic model label without using it as a capability gate."""
+    outer_config = getattr(model, "config", None)
+    inner_model = getattr(model, "model", None)
+    inner_config = getattr(inner_model, "config", None)
+    for config in (
+        outer_config,
+        getattr(outer_config, "text_config", None),
+        getattr(outer_config, "llm_config", None),
+        inner_config,
+        getattr(inner_config, "text_config", None),
+        getattr(inner_config, "llm_config", None),
+    ):
+        model_type = getattr(config, "model_type", None)
+        if isinstance(model_type, str) and model_type:
+            return model_type
+    return type(model).__name__
+
+
+@dataclass(frozen=True)
+class _DiscoveredBlock:
+    """One structurally discovered transformer or MTP block."""
+
+    name: str
+    module: nn.Module
+    moe: nn.Module | None
+    is_mtp: bool
+
+
+def _find_moe_module(block: nn.Module) -> nn.Module | None:
+    """Find an MoE sublayer by its gate-and-experts capability."""
+    candidates: list[nn.Module] = []
+    for attribute in ("moe", "mlp", "mixer"):
+        candidate = getattr(block, attribute, None)
+        if isinstance(candidate, nn.Module):
+            candidates.append(candidate)
+    candidates.extend(block.modules())
+
+    seen: set[int] = set()
+    for candidate in candidates:
+        candidate = _unwrap_checkpoint_wrappers(candidate)
+        if id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        if isinstance(getattr(candidate, "gate", None), nn.Module) and isinstance(
+            getattr(candidate, "experts", None), nn.Module
+        ):
+            return candidate
+    return None
+
+
+def _find_te_ops_experts(block: nn.Module) -> nn.Module | None:
+    """Find stacked TE-ops experts anywhere beneath a transformer block."""
+    for _name, module in block.named_modules():
+        if getattr(module, "use_te_ops", False) and isinstance(getattr(module, "_te_grouped_mlp", None), nn.Module):
+            return module
+    return None
+
+
+def _find_fused_attention(block: nn.Module) -> nn.Module | None:
+    """Find the parameterless TE fused-attention boundary in a transformer block."""
+    attention = getattr(block, "self_attn", None)
+    if isinstance(attention, nn.Module):
+        dpa = getattr(attention, "attn_module", None)
+        target = getattr(dpa, "fused_attention", None)
+        if isinstance(target, nn.Module):
+            return target
+
+    for module in block.modules():
+        target = getattr(module, "fused_attention", None)
+        if isinstance(target, nn.Module):
+            return target
+    return None
+
+
+def _discover_blocks(model: nn.Module) -> list[_DiscoveredBlock]:
+    """Discover main-stack and MTP blocks using the shared MoE traversal."""
+    from nemo_automodel.components.moe.parallelizer import _iter_transformer_and_mtp_blocks
+
+    label = _model_label(model)
+    mtp_layers = getattr(getattr(model, "mtp", None), "layers", None)
+    blocks = []
+    for parent_layers, layer_id, wrapped_block in _iter_transformer_and_mtp_blocks(model):
+        block = _unwrap_checkpoint_wrappers(wrapped_block)
+        is_mtp = parent_layers is mtp_layers
+        scope = "mtp.layers" if is_mtp else "layers"
+        blocks.append(
+            _DiscoveredBlock(
+                name=f"{label}.{scope}.{layer_id}",
+                module=block,
+                moe=_find_moe_module(block),
+                is_mtp=is_mtp,
+            )
+        )
+    return blocks
+
+
+def _uses_repeated_mtp_layer(model: nn.Module) -> bool:
+    """Return whether one physical MTP layer is invoked repeatedly per forward."""
+    mtp = getattr(model, "mtp", None)
+    for config in (getattr(mtp, "mtp_config", None), getattr(model, "mtp_config", None)):
+        if bool(getattr(config, "use_repeated_layer", False)):
+            return True
+    return False
+
+
+def _select_graph_targets(
+    *,
+    feature: str,
+    candidates: list[tuple[int, nn.Module]],
+    blocks: list[_DiscoveredBlock],
+    limit: int,
+    repeated_mtp_layer: bool,
+) -> dict[int, nn.Module]:
+    """Select graph targets while rejecting shared/repeated physical call sites."""
+    if len(candidates) < limit:
+        raise RuntimeError(
+            f"partial_cuda_graph_{feature} requested {limit} layers, but only {len(candidates)} "
+            f"layers expose a graphable {feature} boundary"
+        )
+    selected = candidates[:limit]
+    if repeated_mtp_layer and any(blocks[index].is_mtp for index, _target in selected):
+        raise RuntimeError(
+            f"partial_cuda_graph_{feature} cannot capture repeated-layer MTP: one physical {feature} target "
+            "is invoked multiple times before backward and requires graph replicas or ring slots"
+        )
+    target_ids = [id(target) for _index, target in selected]
+    if len(target_ids) != len(set(target_ids)):
+        raise RuntimeError(
+            f"partial_cuda_graph_{feature} selected a shared physical target more than once; "
+            "shared/repeated modules require independent graph replicas"
+        )
+    return dict(selected)
+
+
 class PartialCudaGraphManager:
-    """Capture selected GPT-OSS submodules after one eager benchmark iteration."""
+    """Capture selected TE attention and MoE submodules after one eager iteration."""
 
     def __init__(self, entries: list[_PartialGraphEntry], fp8_recipe: Any = None):
         self.entries = entries
         self.fp8_recipe = fp8_recipe
         self._captured = False
+        self._closed = False
 
     @classmethod
     def from_model_parts(
@@ -450,7 +661,7 @@ class PartialCudaGraphManager:
         activation_checkpointing: bool = False,
         pipeline_parallel: bool = False,
     ) -> PartialCudaGraphManager | None:
-        """Discover graph targets from an already-built GPT-OSS benchmark model."""
+        """Discover graph targets from an already-built MoE benchmark model."""
         enabled_parts = [
             part
             for part in model_parts
@@ -463,7 +674,7 @@ class PartialCudaGraphManager:
             return None
         if pipeline_parallel:
             raise RuntimeError(
-                "Partial GPT-OSS CUDA graphs require pipeline parallel size 1; multiple in-flight pipeline "
+                "Partial CUDA graphs require pipeline parallel size 1; multiple in-flight pipeline "
                 "microbatches can overwrite a graph's static forward buffers before backward"
             )
         if activation_checkpointing:
@@ -481,47 +692,122 @@ class PartialCudaGraphManager:
                 "checkpoint recomputation will use the same guarded graph entry points"
             )
         if len(model_parts) != 1:
-            raise RuntimeError("Partial GPT-OSS CUDA graphs currently require one local model part")
+            raise RuntimeError("Partial CUDA graphs currently require one local model part")
 
         model = model_parts[0]
-        if getattr(getattr(model, "config", None), "model_type", None) != "gpt_oss":
-            raise RuntimeError("Partial CUDA graph benchmark support is currently limited to GptOssForCausalLM")
         backend = model.backend
         limit = backend.partial_cuda_graph_layer_limit
-        layers = list(model.model.layers.items())
-        if limit > len(layers):
+        blocks = _discover_blocks(model)
+        if limit > len(blocks):
             raise RuntimeError(
-                f"partial_cuda_graph_layer_limit={limit} exceeds the {len(layers)} discovered GPT-OSS layers"
+                f"partial_cuda_graph_layer_limit={limit} exceeds the {len(blocks)} discovered transformer/MTP layers"
             )
-        selected_layers = layers[:limit]
         entries: list[_PartialGraphEntry] = []
 
-        for layer_name, wrapped_block in selected_layers:
-            block = wrapped_block
-            while hasattr(block, "_checkpoint_wrapped_module"):
-                block = block._checkpoint_wrapped_module
+        targets_by_feature: dict[str, dict[int, nn.Module]] = {}
+        unsupported_expert_graphs: list[str] = []
+        repeated_mtp_layer = _uses_repeated_mtp_layer(model)
 
-            if backend.partial_cuda_graph_attention:
-                dpa = getattr(block.self_attn, "attn_module", None)
-                target = getattr(dpa, "fused_attention", None)
-                if not isinstance(target, nn.Module):
-                    raise RuntimeError(f"GPT-OSS layer {layer_name} does not expose TE FusedAttention")
+        if backend.partial_cuda_graph_attention:
+            candidates = [
+                (index, target) for index, block in enumerate(blocks) if (target := _find_fused_attention(block.module))
+            ]
+            targets_by_feature["attention"] = _select_graph_targets(
+                feature="attention",
+                candidates=candidates,
+                blocks=blocks,
+                limit=limit,
+                repeated_mtp_layer=repeated_mtp_layer,
+            )
+
+        if backend.partial_cuda_graph_moe_router:
+            candidates = [
+                (index, target)
+                for index, block in enumerate(blocks)
+                if block.moe is not None
+                and isinstance((target := getattr(getattr(block.moe, "gate", None), "routing_core", None)), nn.Module)
+            ]
+            targets_by_feature["router"] = _select_graph_targets(
+                feature="moe_router",
+                candidates=candidates,
+                blocks=blocks,
+                limit=limit,
+                repeated_mtp_layer=repeated_mtp_layer,
+            )
+
+        if backend.partial_cuda_graph_moe_preprocess:
+            candidates = []
+            for index, block in enumerate(blocks):
+                experts = getattr(block.moe, "experts", None)
+                dispatcher = getattr(experts, "token_dispatcher", None)
+                target = getattr(dispatcher, "hybridep_metadata_processor", None)
+                if isinstance(target, nn.Module) and getattr(target, "permute_fusion", False):
+                    candidates.append((index, target))
+            targets_by_feature["preprocess"] = _select_graph_targets(
+                feature="moe_preprocess",
+                candidates=candidates,
+                blocks=blocks,
+                limit=limit,
+                repeated_mtp_layer=repeated_mtp_layer,
+            )
+
+        if backend.partial_cuda_graph_experts:
+            candidates = []
+            for index, block in enumerate(blocks):
+                experts = _find_te_ops_experts(block.module)
+                target = getattr(experts, "_te_grouped_mlp", None)
+                if isinstance(target, nn.Module):
+                    capability = getattr(experts, "_te_ops_dynamic_splits_graph_capability", None)
+                    if callable(capability):
+                        graph_safe, reason = capability()
+                    else:
+                        graph_safe = bool(getattr(experts, "_te_ops_dynamic_splits_graph_safe", False))
+                        reason = "the expert backend did not advertise on-device dynamic split support"
+                    if graph_safe:
+                        candidates.append((index, target))
+                    else:
+                        unsupported_expert_graphs.append(f"{block.name}: {reason}")
+            if len(candidates) >= limit:
+                targets_by_feature["experts"] = _select_graph_targets(
+                    feature="experts",
+                    candidates=candidates,
+                    blocks=blocks,
+                    limit=limit,
+                    repeated_mtp_layer=repeated_mtp_layer,
+                )
+            elif unsupported_expert_graphs:
+                logger.warning(
+                    "Leaving TE-ops experts eager because dynamic split replay is unsupported: %s",
+                    "; ".join(unsupported_expert_graphs),
+                )
+                targets_by_feature["experts"] = {}
+            else:
+                targets_by_feature["experts"] = _select_graph_targets(
+                    feature="experts",
+                    candidates=candidates,
+                    blocks=blocks,
+                    limit=limit,
+                    repeated_mtp_layer=repeated_mtp_layer,
+                )
+
+        for index, block in enumerate(blocks):
+            target = targets_by_feature.get("attention", {}).get(index)
+            if target is not None:
                 if any(True for _ in target.parameters()):
-                    raise RuntimeError("The partial attention boundary must be parameterless")
+                    raise RuntimeError(f"The partial attention boundary in {block.name} must be parameterless")
                 entries.append(
                     _PartialGraphEntry(
-                        name=f"gpt_oss.layers.{layer_name}.fused_attention",
+                        name=f"{block.name}.fused_attention",
                         target=target,
                         fp8_enabled=False,
                         canonicalizer=_canonicalize_bf16_fused_attention,
                     )
                 )
 
-            if backend.partial_cuda_graph_moe_router:
-                gate = getattr(getattr(block, "mlp", None), "gate", None)
-                target = getattr(gate, "routing_core", None)
-                if not isinstance(target, nn.Module):
-                    raise RuntimeError(f"GPT-OSS layer {layer_name} does not expose a graphable MoE routing core")
+            target = targets_by_feature.get("router", {}).get(index)
+            if target is not None:
+                assert block.moe is not None
+                gate = block.moe.gate
                 if (
                     getattr(gate, "router_replay", None) is not None
                     or getattr(gate, "e_score_correction_bias", None) is not None
@@ -530,53 +816,60 @@ class PartialCudaGraphManager:
                         "Partial MoE router graphs require routing replay and score-correction bias to be disabled"
                     )
                 if any(True for _ in target.parameters()):
-                    raise RuntimeError("The partial MoE routing-core boundary must be parameterless")
+                    raise RuntimeError(f"The partial MoE routing-core boundary in {block.name} must be parameterless")
                 entries.append(
                     _PartialGraphEntry(
-                        name=f"gpt_oss.layers.{layer_name}.moe_router",
+                        name=f"{block.name}.moe_router",
                         target=target,
                         fp8_enabled=False,
                     )
                 )
 
-            if backend.partial_cuda_graph_moe_preprocess:
-                experts = getattr(getattr(block, "mlp", None), "experts", None)
-                dispatcher = getattr(experts, "token_dispatcher", None)
-                target = getattr(dispatcher, "hybridep_metadata_processor", None)
-                if not isinstance(target, nn.Module):
-                    raise RuntimeError(
-                        f"GPT-OSS layer {layer_name} does not expose graphable HybridEP metadata preprocessing"
-                    )
-                if not getattr(target, "permute_fusion", False):
-                    raise RuntimeError(
-                        "Partial HybridEP preprocess graphs require fused fixed-shape metadata conversion"
-                    )
+            target = targets_by_feature.get("preprocess", {}).get(index)
+            if target is not None:
                 entries.append(
                     _PartialGraphEntry(
-                        name=f"gpt_oss.layers.{layer_name}.moe_preprocess",
+                        name=f"{block.name}.moe_preprocess",
                         target=target,
                         fp8_enabled=False,
                     )
                 )
 
-            if backend.partial_cuda_graph_experts:
-                experts = getattr(getattr(block, "mlp", None), "experts", None)
-                target = getattr(experts, "_te_grouped_mlp", None)
-                if not getattr(experts, "use_te_ops", False) or not isinstance(target, nn.Module):
-                    raise RuntimeError(f"GPT-OSS layer {layer_name} does not expose a TE-ops grouped MLP")
-                unstable_parameters = [
-                    name
-                    for name, parameter in target.named_parameters()
-                    if _PartialGraphEntry._parameter_state(parameter) is None
+            target = targets_by_feature.get("experts", {}).get(index)
+            if target is not None:
+                from torch.distributed.tensor import DTensor
+
+                experts = _find_te_ops_experts(block.module)
+                assert experts is not None
+
+                sharded_parameters = [
+                    name for name, parameter in target.named_parameters() if isinstance(parameter, DTensor)
                 ]
-                if unstable_parameters:
+                parameter_names = [name for name, _parameter in target.named_parameters()]
+                if sharded_parameters and len(sharded_parameters) != len(parameter_names):
                     raise RuntimeError(
-                        "Partial expert CUDA graphs require plain parameters with stable allocated storage; "
-                        f"found DTensor or unallocated parameters in layer {layer_name}: {unstable_parameters}"
+                        "Partial expert CUDA graphs require either an entirely FSDP2-sharded or entirely plain "
+                        f"TE-ops parameter set in {block.name}; sharded={sharded_parameters}, all={parameter_names}"
                     )
+                expert_graph_storage = None
+                if sharded_parameters:
+                    from nemo_automodel.components.moe.fsdp2_graph_storage import FSDP2ExpertGraphStorage
+
+                    expert_graph_storage = FSDP2ExpertGraphStorage(experts)
+                else:
+                    unallocated_parameters = [
+                        name
+                        for name, parameter in target.named_parameters()
+                        if _PartialGraphEntry._parameter_state(parameter) is None
+                    ]
+                    if unallocated_parameters:
+                        raise RuntimeError(
+                            "Partial expert CUDA graphs require stable allocated parameter storage; "
+                            f"found unallocated parameters in {block.name}: {unallocated_parameters}"
+                        )
                 entries.append(
                     _PartialGraphEntry(
-                        name=f"gpt_oss.layers.{layer_name}.te_ops_experts",
+                        name=f"{block.name}.te_ops_experts",
                         target=target,
                         fp8_enabled=backend.te_fp8 is not None,
                         canonicalizer=_canonicalize_te_ops_experts,
@@ -585,10 +878,16 @@ class PartialCudaGraphManager:
                             "partial_cuda_graph_expert_bucket_tokens",
                             None,
                         ),
+                        expert_bucket_uses_paged_capacity=bool(
+                            getattr(experts, "_te_ops_graph_uses_paged_capacity", False)
+                        ),
+                        expert_graph_storage=expert_graph_storage,
                     )
                 )
 
         if not entries:
+            if unsupported_expert_graphs:
+                return None
             raise RuntimeError("Partial CUDA graphs were enabled but no graph targets were found")
 
         recipe = backend.te_fp8.build_recipe() if backend.te_fp8 is not None else None
@@ -598,11 +897,15 @@ class PartialCudaGraphManager:
 
     def start_recording(self) -> None:
         """Install first-call recorders on every selected target."""
+        if self._closed:
+            raise RuntimeError("Partial CUDA graph manager is closed")
         for entry in self.entries:
             entry.start_recording()
 
     def capture(self) -> None:
         """Batch-capture all observed targets in real forward order."""
+        if self._closed:
+            raise RuntimeError("Partial CUDA graph manager is closed")
         if self._captured:
             return
         for entry in self.entries:
@@ -633,51 +936,91 @@ class PartialCudaGraphManager:
                 )
 
         captured_entries = tuple(entry for entry in self.entries if entry.captured_call is not None)
-        if not captured_entries:
-            self._captured = True
-            self.log_stats("capture")
-            return
-
-        adapters = tuple(entry.build_adapter() for entry in captured_entries)
         if any(entry.fp8_enabled for entry in captured_entries) and self.fp8_recipe is None:
             raise RuntimeError("FP8 expert graph capture requires a Transformer Engine FP8 recipe")
 
-        # Give every guarded entry its own graph pool. Any entry may deliberately
-        # fall back when metadata changes; sharing a pool would require replaying
-        # all graphs in capture order and could corrupt another entry's buffers
-        # when one dynamic expert call is skipped.
-        graphed_adapters = []
-        for entry, adapter in zip(captured_entries, adapters):
-            assert entry.captured_call is not None
-            kwargs = {
-                "num_warmup_iters": 3,
-                "allow_unused_input": True,
-                "sample_kwargs": ({},),
-                "enabled": (entry.fp8_enabled,),
-            }
-            if self.fp8_recipe is not None:
-                kwargs["recipe"] = self.fp8_recipe
-            try:
-                result = _get_make_graphed_callables()(
-                    (adapter,),
-                    (entry.captured_call.sample_tensors,),
-                    **kwargs,
-                )
-            except Exception as error:
-                raise RuntimeError(f"Explicit partial CUDA graph capture failed for {entry.name}") from error
-            if not isinstance(result, tuple):
-                result = (result,)
-            if len(result) != 1:
-                raise RuntimeError(
-                    f"Transformer Engine returned {len(result)} graphs for partial target {entry.name!r}"
-                )
-            graphed_adapters.append(result[0])
+        # Every rank in an expert FSDP group must issue the same unshard
+        # collectives even when a rank received no iteration-0 expert tokens and
+        # therefore has no local graph sample. Capture itself is local; skipped
+        # ranks release their unused retained allocation after the synchronized
+        # prepare/finish sequence.
+        storage_entries = tuple(entry for entry in self.entries if entry.expert_graph_storage is not None)
+        prepared_storage_entries = []
+        try:
+            for entry in storage_entries:
+                entry.expert_graph_storage.prepare_before_capture()
+                prepared_storage_entries.append(entry)
 
-        for entry, graphed_adapter in zip(captured_entries, graphed_adapters):
-            entry.install(graphed_adapter)
+            # Give every guarded entry its own graph pool. Any entry may
+            # deliberately fall back when metadata changes; sharing a pool would
+            # require replaying all graphs in capture order and could corrupt
+            # another entry's buffers when one dynamic expert call is skipped.
+            for entry in captured_entries:
+                adapter = entry.build_adapter()
+                assert entry.captured_call is not None
+                kwargs = {
+                    "num_warmup_iters": 3,
+                    "allow_unused_input": True,
+                    "sample_kwargs": ({},),
+                    "enabled": (entry.fp8_enabled,),
+                }
+                if self.fp8_recipe is not None:
+                    kwargs["recipe"] = self.fp8_recipe
+                try:
+                    result = _get_make_graphed_callables()(
+                        (adapter,),
+                        (entry.captured_call.sample_tensors,),
+                        **kwargs,
+                    )
+                except Exception as error:
+                    raise RuntimeError(f"Explicit partial CUDA graph capture failed for {entry.name}") from error
+                if not isinstance(result, tuple):
+                    result = (result,)
+                if len(result) != 1:
+                    raise RuntimeError(
+                        f"Transformer Engine returned {len(result)} graphs for partial target {entry.name!r}"
+                    )
+                entry.install(result[0])
+        finally:
+            for entry in prepared_storage_entries:
+                entry.expert_graph_storage.finish_capture()
+
+        for entry in captured_entries:
+            storage = entry.expert_graph_storage
+            if storage is not None:
+                logger.info(
+                    "Retaining %.2f MiB of FSDP2 all-gather storage for partial expert graph %s",
+                    storage.retained_bytes / (1024**2),
+                    entry.name,
+                )
+        for entry in skipped_entries:
+            storage = entry.expert_graph_storage
+            if storage is not None:
+                storage.reset()
 
         self._captured = True
         self.log_stats("capture")
+
+    def close(self) -> None:
+        """Idempotently destroy every partial graph before distributed teardown."""
+        if self._closed:
+            return
+
+        first_error: Exception | None = None
+        for entry in self.entries:
+            try:
+                entry.close()
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+                logger.exception("Failed to close partial CUDA graph entry %s", entry.name)
+        if first_error is not None:
+            # Successfully closed entries remain idempotent; retaining the
+            # manager lets a caller retry the entry that failed closed.
+            raise first_error
+
+        self._captured = False
+        self._closed = True
 
     def stats(self) -> dict[str, int]:
         """Return aggregate capture, replay, and eager-fallback counters."""
@@ -699,6 +1042,20 @@ class PartialCudaGraphManager:
             "empty_fallback": sum(entry.bucket_empty_fallback_count for entry in bucket_entries),
             "capture_overflow_skip": sum(entry.bucket_capture_overflow_skip_count for entry in bucket_entries),
             "capture_empty_skip": sum(entry.bucket_capture_empty_skip_count for entry in bucket_entries),
+        }
+
+    def expert_storage_stats(self) -> dict[str, int]:
+        """Return resident FSDP2 all-gather storage retained by expert graphs."""
+        storage_handles = tuple(
+            entry.expert_graph_storage for entry in self.entries if entry.expert_graph_storage is not None
+        )
+        for storage in storage_handles:
+            if storage.is_active:
+                storage.validate_stable()
+        return {
+            "entries": len(storage_handles),
+            "active": sum(int(storage.is_active) for storage in storage_handles),
+            "retained_bytes": sum(storage.retained_bytes for storage in storage_handles),
         }
 
     def log_stats(self, phase: str) -> None:
@@ -726,6 +1083,15 @@ class PartialCudaGraphManager:
                 bucket_stats["empty_fallback"],
                 bucket_stats["capture_overflow_skip"],
                 bucket_stats["capture_empty_skip"],
+            )
+        storage_stats = self.expert_storage_stats()
+        if storage_stats["entries"]:
+            logger.info(
+                "Partial expert FSDP2 storage stats (%s): entries=%d active=%d retained_bytes=%d",
+                phase,
+                storage_stats["entries"],
+                storage_stats["active"],
+                storage_stats["retained_bytes"],
             )
         for entry in self.entries:
             logger.info(

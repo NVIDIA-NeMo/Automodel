@@ -110,7 +110,10 @@ def mock_config():
 @pytest.fixture
 def mock_recipe(mock_config):
     """Create a mock benchmarking recipe instance."""
-    with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
+    with (
+        patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"),
+        patch("nemo_automodel.recipes.llm.benchmark._infer_vocab_size", return_value=50257),
+    ):
         recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
         recipe.cfg = mock_config
         recipe.timers = MagicMock()
@@ -383,6 +386,18 @@ class TestBenchmarkingRecipeRunBenchmark:
             for model_part in mock_recipe.model_parts:
                 model_part.train.assert_called_once()
 
+    def test_run_benchmark_closes_partial_graphs_on_normal_exit(self, mock_recipe):
+        manager = MagicMock()
+        mock_recipe.partial_cuda_graph_manager = manager
+        mock_recipe._partial_cuda_graph_capture_pending = True
+        mock_recipe._run_benchmark = MagicMock(return_value="complete")
+
+        assert mock_recipe.run_benchmark() == "complete"
+
+        manager.close.assert_called_once_with()
+        assert mock_recipe.partial_cuda_graph_manager is None
+        assert mock_recipe._partial_cuda_graph_capture_pending is False
+
     def test_run_benchmark_calculates_gradient_accumulation_steps(self, mock_recipe):
         """Test that gradient accumulation steps are calculated correctly."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
@@ -557,6 +572,9 @@ class TestBenchmarkingRecipeHelpers:
     def test_benchmark_with_invalid_ga_config(self, mock_recipe):
         """Test that invalid gradient accumulation config raises assertion."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
+        manager = MagicMock()
+        mock_recipe.partial_cuda_graph_manager = manager
+        mock_recipe._partial_cuda_graph_capture_pending = True
         # Set invalid batch sizes that will cause assertion error
         # global_batch_size=16, local_batch_size=4, dp_size=8
         # ga_steps = 16 / (4 * 8) = 0.5 (not divisible)
@@ -565,6 +583,10 @@ class TestBenchmarkingRecipeHelpers:
 
         with pytest.raises(AssertionError, match="Global batch size must be divisible"):
             mock_recipe.run_benchmark()
+
+        manager.close.assert_called_once_with()
+        assert mock_recipe.partial_cuda_graph_manager is None
+        assert mock_recipe._partial_cuda_graph_capture_pending is False
 
     def test_init_requires_benchmark_section(self):
         """Test that __init__ raises error if benchmark section is missing."""

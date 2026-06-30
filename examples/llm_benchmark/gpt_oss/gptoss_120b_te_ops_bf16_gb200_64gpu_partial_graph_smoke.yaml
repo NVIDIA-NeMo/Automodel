@@ -68,11 +68,14 @@ model:
     fake_gate_noise: 0.1
     enable_hf_state_dict_adapter: false
     enable_fsdp_optimizations: true
-    partial_cuda_graph_attention: false
+    partial_cuda_graph_attention: true
     partial_cuda_graph_moe_router: false
     partial_cuda_graph_moe_preprocess: false
-    partial_cuda_graph_experts: false
-    partial_cuda_graph_layer_limit: 0
+    partial_cuda_graph_experts: true
+    # EP64 receives roughly 65K routed rows/rank at MBS4; leave headroom for
+    # real noisy routing while bounding the persistent graph buffers to one layer.
+    partial_cuda_graph_expert_bucket_tokens: 73728
+    partial_cuda_graph_layer_limit: 1
 
 checkpoint:
   enabled: false

@@ -253,6 +253,22 @@ def test_end_to_end_env_overrides_ci_section(tmp_path, synthetic_recipe):
     assert resolved["step_scheduler"]["max_steps"] == 999  # env wins over ci.nightly's 7
 
 
+def test_end_to_end_performance_partial_graph_sweep_overrides(tmp_path, synthetic_recipe):
+    """One built image can sweep partial-graph capacity and layer count from pipeline variables."""
+    out = tmp_path / "resolved.yaml"
+    env = {
+        "PIPELINE_DIR": str(tmp_path),
+        "TEST_NAME": "t1",
+        "PARTIAL_CUDA_GRAPH_LAYER_LIMIT": "8",
+        "PARTIAL_CUDA_GRAPH_EXPERT_BUCKET_TOKENS": "73728",
+    }
+    _run_resolver(["--base", str(synthetic_recipe), "--phase", "performance", "--output", str(out)], env=env)
+
+    resolved = yaml.load(out.open())
+    assert resolved["model"]["backend"]["partial_cuda_graph_layer_limit"] == 8
+    assert resolved["model"]["backend"]["partial_cuda_graph_expert_bucket_tokens"] == 73728
+
+
 def test_end_to_end_robustness_ignores_max_steps_env(tmp_path, synthetic_recipe):
     """ci_config.yaml's env entry restricts MAX_STEPS to non-robustness phases, so it must not leak in."""
     out = tmp_path / "resolved.yaml"
