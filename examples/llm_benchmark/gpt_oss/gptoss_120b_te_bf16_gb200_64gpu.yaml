@@ -48,6 +48,9 @@ distributed:
     layers_per_stage: 2
   moe:
     reshard_after_forward: false
+    # Reuse process-group-owned communication buffers for dense FSDP units.
+    # This is beneficial for BF16 at EP64; MXFP8 keeps the default allocator.
+    enable_fsdp2_process_group_allocator: true
 
 dist_env:
   backend: nccl
