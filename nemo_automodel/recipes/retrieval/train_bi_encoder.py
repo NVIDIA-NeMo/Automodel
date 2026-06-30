@@ -251,6 +251,10 @@ def _as_bool(value) -> bool:
     return bool(value)
 
 
+def _get_retrieval_optimization_bool(cfg, key: str, default=False) -> bool:
+    return _as_bool(cfg.get(f"retrieval_optimization.{key}", default))
+
+
 def _patch_flash_attention_is_packed_sequence_for_non_packed_training() -> bool:
     """Avoid the HF FlashAttention packed-sequence check host sync for standard retrieval batches."""
     try:
@@ -591,7 +595,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
         setup_logging()
 
-        if _as_bool(self.cfg.get("patch_flash_attention_is_packed_sequence", False)):
+        if _get_retrieval_optimization_bool(self.cfg, "patch_flash_attention_is_packed_sequence"):
             if _patch_flash_attention_is_packed_sequence_for_non_packed_training():
                 logger.info("Patched transformers._is_packed_sequence for non-packed retrieval training")
             else:
@@ -695,7 +699,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             tokenizer.pad_token = getattr(tokenizer, "eos_token", getattr(self.tokenizer, "eos_token", None))
             tokenizer.padding_side = "left"
 
-        precompute_bidirectional_mask = _as_bool(self.cfg.get("precompute_bidirectional_mask", False))
+        precompute_bidirectional_mask = _get_retrieval_optimization_bool(self.cfg, "precompute_bidirectional_mask")
         bidirectional_mask_model_config = (
             _get_bidirectional_mask_model_config(self.model_parts[0]) if precompute_bidirectional_mask else None
         )
@@ -844,10 +848,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
             use_multi_vector_scoring = _uses_multi_vector_scoring(model)
             use_dist_neg = is_train and getattr(attr_model, "do_distributed_inbatch_negative", False)
             replicate_distributed_loss = use_dist_neg and _as_bool(self.cfg.get("replicate_distributed_loss", False))
-            gather_stream_priority = -1 if _as_bool(self.cfg.get("overlap_passage_gather_high_priority", False)) else 0
+            gather_stream_priority = (
+                -1 if _get_retrieval_optimization_bool(self.cfg, "overlap_passage_gather_high_priority") else 0
+            )
             unified_forward = _as_bool(self.cfg.get("unified_query_passage_forward", False))
             overlap_passage_gather = (
-                _as_bool(self.cfg.get("overlap_passage_gather_with_query_forward", False)) and not unified_forward
+                _get_retrieval_optimization_bool(self.cfg, "overlap_passage_gather_with_query_forward")
+                and not unified_forward
             )
             bypass_second_ddp_forward = (
                 overlap_passage_gather
@@ -866,7 +873,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             if unified_forward:
                 bidirectional_mask_model_config = None
                 bidirectional_mask_dtype = None
-                if _as_bool(self.cfg.get("precompute_bidirectional_mask", False)):
+                if _get_retrieval_optimization_bool(self.cfg, "precompute_bidirectional_mask"):
                     bidirectional_mask_model_config = _get_bidirectional_mask_model_config(model)
                     bidirectional_mask_dtype = _get_first_parameter_dtype(model)
                 combined, local_q_rows, local_p_rows, passage_attention_mask_for_scores = (
@@ -1061,7 +1068,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         """Run one optimization step with gradient accumulation."""
         loss_buffer = []
         use_batch_prefetch = (
-            _as_bool(self.cfg.get("overlap_batch_to_device_with_compute", False))
+            _get_retrieval_optimization_bool(self.cfg, "overlap_batch_to_device_with_compute")
             and torch.cuda.is_available()
             and self.dist_env.device.type == "cuda"
         )
@@ -1111,8 +1118,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         # Average loss across gradient accumulation steps and DP ranks
         reporting_loss = torch.mean(torch.stack(loss_buffer))
-        skip_loss_report_allreduce = _as_bool(self.cfg.get("skip_train_loss_report_allreduce", False))
-        if torch.distributed.is_initialized() and not skip_loss_report_allreduce:
+        if torch.distributed.is_initialized():
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
             reporting_loss = reporting_loss / self._get_dp_group_size(include_cp=True)
         reporting_loss = reporting_loss.detach()
