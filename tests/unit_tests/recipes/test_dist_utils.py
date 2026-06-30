@@ -431,6 +431,14 @@ class TestValidation:
         result = parse_distributed_section(cfg)
         assert isinstance(result["strategy_config"], FSDP2Config)
 
+    def test_fsdp2_accepts_frozen_multimodal_sharding(self):
+        result = parse_distributed_section({"strategy": "fsdp2", "frozen_multimodal_sharding": "replicate"})
+        assert result["strategy_config"].frozen_multimodal_sharding == "replicate"
+
+    def test_fsdp2_rejects_unknown_frozen_multimodal_sharding(self):
+        with pytest.raises(ValueError, match="frozen_multimodal_sharding"):
+            parse_distributed_section({"strategy": "fsdp2", "frozen_multimodal_sharding": "off"})
+
 
 # ---------------------------------------------------------------------------
 # Integration: full YAML-like dicts
