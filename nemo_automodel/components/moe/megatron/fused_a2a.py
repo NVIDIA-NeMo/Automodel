@@ -20,6 +20,8 @@
 import atexit
 import importlib
 import os
+import shutil
+from pathlib import Path
 
 import torch
 
@@ -189,16 +191,15 @@ def free_buffer() -> None:
         _buffer = None
 
 
-def destroy_deepep_v2_buffer(ignore_errors: bool = True) -> None:
+def destroy_deepep_v2_buffer() -> None:
     """Explicitly destroy the DeepEP V2 ElasticBuffer if one is allocated."""
     global _deepep_v2_buffer
 
     if _deepep_v2_buffer is not None:
         try:
             _deepep_v2_buffer.destroy()
-        except Exception:
-            if not ignore_errors:
-                raise
+        except Exception:  # pragma: no cover - best effort
+            pass
     _deepep_v2_buffer = None
 
 
@@ -649,6 +650,34 @@ except ImportError:
 _hybrid_ep_buffer = None
 
 
+def _sync_hybridep_jit_cache(*, persist: bool) -> None:
+    """Bridge HybridEP's process-local JIT directory to a persistent cache.
+
+    ``load_cached_kernels`` only scans ``proc-<pid>``, so a new process cannot
+    reuse kernels from an earlier launch without staging them into that directory.
+    """
+    cache_root = os.environ.get("HYBRID_EP_CACHE_DIR")
+    if not cache_root:
+        return
+
+    jit_dir = Path(cache_root).expanduser() / ".deepep" / "hybrid_ep" / "jit"
+    stable_dir, process_dir = jit_dir / "kernel-cache", jit_dir / f"proc-{os.getpid()}"
+    source_dir, destination_dir = (process_dir, stable_dir) if persist else (stable_dir, process_dir)
+    if source_dir.is_dir():
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        for kernel in source_dir.glob("*.so"):
+            try:
+                os.link(kernel, destination_dir / kernel.name)
+            except OSError:
+                # Cache reuse is an optimization and must not prevent training.
+                pass
+    if persist:
+        shutil.rmtree(process_dir, ignore_errors=True)
+
+
+atexit.register(_sync_hybridep_jit_cache, persist=True)
+
+
 def init_hybrid_ep_buffer(
     group: torch.distributed.ProcessGroup,
     hidden_dim: int,
@@ -675,6 +704,7 @@ def init_hybrid_ep_buffer(
     """
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
+    _sync_hybridep_jit_cache(persist=False)
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
@@ -683,6 +713,7 @@ def init_hybrid_ep_buffer(
         use_fp8=fp8_dispatch,
         num_sms_dispatch_api=num_sms_dispatch_api,
         num_sms_combine_api=num_sms_combine_api,
+        load_cached_kernels=True,
     )
 
 
@@ -789,7 +820,7 @@ class HybridEPCombine(torch.autograd.Function):
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
         )
-        return dispatched_hidden, None, None, None, None
+        return dispatched_hidden, None, None, None
 
 
 if HAVE_HYBRIDEP:
