@@ -961,6 +961,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Optionally resume
         self.load_checkpoint(restore_from)
+        self._setup_te_ops_mxfp8_weight_cache_optimizer_hooks()
 
         # Install lightweight call recorders only after model/optimizer state is
         # final. The manager owns all feature eligibility checks (including PP
@@ -982,6 +983,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         self._partial_cuda_graph_capture_pending = self.partial_cuda_graph_manager is not None
         self._validate_partial_graph_optimizers()
+
+    def _setup_te_ops_mxfp8_weight_cache_optimizer_hooks(self) -> None:
+        """Refresh fused-optimizer compute caches at the optimizer generation boundary."""
+        from nemo_automodel.components.moe.experts import register_te_ops_mxfp8_weight_cache_optimizer_hooks
+
+        for handle in getattr(self, "_te_ops_mxfp8_weight_cache_optimizer_hook_handles", ()):
+            handle.remove()
+        self._te_ops_mxfp8_weight_cache_optimizer_hook_handles = register_te_ops_mxfp8_weight_cache_optimizer_hooks(
+            self.model_parts, self.optimizer
+        )
 
     def _validate_partial_graph_optimizers(self) -> None:
         """Require zeroing that preserves persistent graph gradient buffers."""

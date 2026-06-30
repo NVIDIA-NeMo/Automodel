@@ -85,6 +85,25 @@ def test_setup_partial_graphs_stays_inert_when_no_feature_is_enabled(monkeypatch
     assert recipe._partial_cuda_graph_capture_pending is False
 
 
+def test_setup_weight_cache_optimizer_hooks_replaces_old_handles(monkeypatch):
+    import nemo_automodel.components.moe.experts as experts_module
+
+    recipe = _bare_recipe()
+    recipe.model_parts = [nn.Linear(2, 2)]
+    recipe.optimizer = [object()]
+    old_handle = SimpleNamespace(remove=MagicMock())
+    new_handle = object()
+    recipe._te_ops_mxfp8_weight_cache_optimizer_hook_handles = (old_handle,)
+    register = MagicMock(return_value=(new_handle,))
+    monkeypatch.setattr(experts_module, "register_te_ops_mxfp8_weight_cache_optimizer_hooks", register)
+
+    recipe._setup_te_ops_mxfp8_weight_cache_optimizer_hooks()
+
+    old_handle.remove.assert_called_once_with()
+    register.assert_called_once_with(recipe.model_parts, recipe.optimizer)
+    assert recipe._te_ops_mxfp8_weight_cache_optimizer_hook_handles == (new_handle,)
+
+
 def test_partial_graphs_reject_optimizer_without_preserving_zero_grad():
     recipe = _bare_recipe()
     recipe.partial_cuda_graph_manager = object()

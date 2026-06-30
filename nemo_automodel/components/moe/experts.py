@@ -1410,13 +1410,18 @@ class GroupedExpertsTE(nn.Module):
 
 
 class _TeOpsMXFP8WeightCache:
-    """Stable, non-registered MXFP8 compute storage for one stacked owner.
+    """Non-registered MXFP8 compute storage for one stacked owner.
 
     The high-precision ``nn.Parameter`` remains the sole optimizer and checkpoint
-    owner. Transformer Engine's grouped tensor is only a compute cache. Its
-    member wrappers and row/column data and scale buffers are allocated once;
-    refreshes quantize into those same buffers after the owner's version changes.
+    owner. Transformer Engine's grouped tensor is only a compute cache. Graph-off
+    training replaces it with one fused grouped quantization per owner generation.
+    Partial expert CUDA graphs instead refresh preallocated per-member storage so
+    every wrapper and backing-buffer address remains fixed across graph replay.
     """
+
+    GROUP_QUANTIZE_MODE = "group_quantize"
+    FIXED_ADDRESS_MODE = "fixed_address"
+    MODES = frozenset((GROUP_QUANTIZE_MODE, FIXED_ADDRESS_MODE))
 
     def __init__(
         self,
@@ -1425,10 +1430,16 @@ class _TeOpsMXFP8WeightCache:
         num_groups: int,
         out_features: int,
         in_features: int,
+        mode: str = FIXED_ADDRESS_MODE,
     ) -> None:
+        if mode not in self.MODES:
+            raise ValueError(
+                f"Unsupported TE-ops MXFP8 weight cache mode {mode!r}; expected one of {sorted(self.MODES)}"
+            )
         self.num_groups = num_groups
         self.out_features = out_features
         self.in_features = in_features
+        self.mode = mode
         self._validate_owner(owner)
 
         try:
@@ -1443,29 +1454,39 @@ class _TeOpsMXFP8WeightCache:
             columnwise=True,
         )
         refresh_quantizer.internal = False
-        # Keep compact scales in the persistent cache. TE creates any GEMM-swizzled
-        # views from a shallow alias, leaving these canonical storage addresses stable.
+        # Keep compact scales in the cache. TE creates any GEMM-swizzled views
+        # from a shallow alias, preserving the canonical representation needed
+        # again by dgrad during backward.
         refresh_quantizer.optimize_for_gemm = False
-        grouped_tensor = GroupedTensorStorage.make_grouped_tensor_with_shapes(
-            num_tensors=num_groups,
-            shapes=[(out_features, in_features)] * num_groups,
-            quantizer=refresh_quantizer,
-            device=owner.device,
-            dtype=owner.dtype,
-        )
-        grouped_tensor.requires_grad_(owner.requires_grad)
-
-        members = tuple(grouped_tensor.quantized_tensors)
-        if len(members) != num_groups:
-            raise RuntimeError(f"TE MXFP8 cache created {len(members)} members for {num_groups} expert weights")
-
-        self.tensor = grouped_tensor
-        self.members = members
+        self._tex = tex
         self.refresh_quantizer = refresh_quantizer
-        self.storage_identity = self._storage_identity()
+        self.tensor = None
+        self.members: tuple[Any, ...] = ()
+        self.storage_identity: tuple[Any, ...] | None = None
         self.owner_key: tuple[Any, ...] | None = None
         self.refresh_count = 0
+        self.group_quantize_count = 0
+        self.member_update_count = 0
+        self.buffer_replacement_count = 0
+
+        if mode == self.FIXED_ADDRESS_MODE:
+            grouped_tensor = GroupedTensorStorage.make_grouped_tensor_with_shapes(
+                num_tensors=num_groups,
+                shapes=[(out_features, in_features)] * num_groups,
+                quantizer=refresh_quantizer,
+                device=owner.device,
+                dtype=owner.dtype,
+            )
+            grouped_tensor.requires_grad_(owner.requires_grad)
+            members = tuple(grouped_tensor.quantized_tensors)
+            if len(members) != num_groups:
+                raise RuntimeError(f"TE MXFP8 cache created {len(members)} members for {num_groups} expert weights")
+            self.tensor = grouped_tensor
+            self.members = members
+            self.storage_identity = self._storage_identity()
         self.refresh(owner, force=True)
+        if self.storage_identity is None:
+            self.storage_identity = self._storage_identity()
 
     @property
     def expected_shape(self) -> tuple[int, int, int]:
@@ -1502,9 +1523,12 @@ class _TeOpsMXFP8WeightCache:
 
     def _storage_identity(self) -> tuple[Any, ...]:
         grouped = self.tensor
+        if grouped is None:
+            return ()
+        members = getattr(grouped, "quantized_tensors", None)
         return (
             id(grouped),
-            tuple(id(member) for member in self.members),
+            tuple(id(member) for member in members) if members is not None else (),
             grouped.rowwise_data.data_ptr(),
             grouped.columnwise_data.data_ptr(),
             grouped.scale_inv.data_ptr(),
@@ -1520,22 +1544,44 @@ class _TeOpsMXFP8WeightCache:
         return self.owner_key == self._owner_key(owner)
 
     def refresh(self, owner: torch.Tensor, *, force: bool = False) -> bool:
-        """Refresh every MXFP8 member in-place when the owner generation changes."""
+        """Refresh the selected MXFP8 representation for a new owner generation."""
         self._validate_owner(owner)
         owner_key = self._owner_key(owner)
         if not force and self.owner_key == owner_key:
             return False
 
-        if self.tensor.requires_grad != owner.requires_grad:
-            self.tensor.requires_grad_(owner.requires_grad)
-        owner_members = owner.unbind(0)
-        if len(owner_members) != len(self.members):
-            raise RuntimeError(
-                f"TE-ops MXFP8 cache has {len(self.members)} members for {len(owner_members)} owner slices"
-            )
-        with torch.no_grad():
-            for source, destination in zip(owner_members, self.members):
-                self.refresh_quantizer.update_quantized(source, destination)
+        if self.mode == self.GROUP_QUANTIZE_MODE:
+            previous_tensor = self.tensor
+            with torch.no_grad():
+                grouped_tensor = self._tex.group_quantize(
+                    owner.view(self.num_groups * self.out_features, self.in_features),
+                    self.refresh_quantizer,
+                    self.num_groups,
+                    None,
+                )
+            grouped_tensor.requires_grad_(owner.requires_grad)
+            if int(grouped_tensor.num_tensors) != self.num_groups:
+                raise RuntimeError(
+                    f"TE MXFP8 grouped quantization returned {grouped_tensor.num_tensors} tensors, "
+                    f"expected {self.num_groups}"
+                )
+            self.tensor = grouped_tensor
+            self.members = tuple(grouped_tensor.quantized_tensors or ())
+            self.group_quantize_count += 1
+            self.buffer_replacement_count += int(previous_tensor is not None)
+        else:
+            assert self.tensor is not None
+            if self.tensor.requires_grad != owner.requires_grad:
+                self.tensor.requires_grad_(owner.requires_grad)
+            owner_members = owner.unbind(0)
+            if len(owner_members) != len(self.members):
+                raise RuntimeError(
+                    f"TE-ops MXFP8 cache has {len(self.members)} members for {len(owner_members)} owner slices"
+                )
+            with torch.no_grad():
+                for source, destination in zip(owner_members, self.members):
+                    self.refresh_quantizer.update_quantized(source, destination)
+            self.member_update_count += len(self.members)
         self.owner_key = owner_key
         self.refresh_count += 1
         return True
@@ -1637,7 +1683,9 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
             self.__dict__["_mxfp8_weight_cache_allocations"] = 0
             self.__dict__["_mxfp8_weight_cache_hits"] = 0
             self.__dict__["_mxfp8_weight_cache_fallbacks"] = 0
+            self.__dict__["_mxfp8_weight_cache_optimizer_refreshes"] = 0
             self.__dict__["_mxfp8_weight_cache_fallback_reason"] = "disabled by backend config"
+            self.__dict__["_mxfp8_weight_cache_mode"] = _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE
 
         def _owner_local_tensor(self, name: str, expected_shape: tuple[int, ...]) -> torch.Tensor:
             owner = self._parameters[name]
@@ -1683,9 +1731,23 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
             self.__dict__[alias_key_name] = cache_key
             return alias
 
-        def set_mxfp8_weight_cache_enabled(self, enabled: bool, *, fallback_reason: str = "") -> None:
+        def set_mxfp8_weight_cache_enabled(
+            self,
+            enabled: bool,
+            *,
+            fallback_reason: str = "",
+            mode: str = _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE,
+        ) -> None:
             """Enable the local compute cache or drop it before expert FSDP wrapping."""
             enabled = bool(enabled)
+            if mode not in _TeOpsMXFP8WeightCache.MODES:
+                raise ValueError(
+                    f"Unsupported TE-ops MXFP8 weight cache mode {mode!r}; "
+                    f"expected one of {sorted(_TeOpsMXFP8WeightCache.MODES)}"
+                )
+            if self.__dict__.get("_mxfp8_weight_cache_mode") != mode:
+                self.__dict__["_mxfp8_weight_cache"] = None
+            self.__dict__["_mxfp8_weight_cache_mode"] = mode
             self.__dict__["_mxfp8_weight_cache_enabled"] = enabled
             if not enabled:
                 self.__dict__["_mxfp8_weight_cache"] = None
@@ -1713,6 +1775,7 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
                     num_groups=self.num_groups,
                     out_features=self.out_features,
                     in_features=self.in_features,
+                    mode=self.__dict__["_mxfp8_weight_cache_mode"],
                 )
                 self.__dict__["_mxfp8_weight_cache"] = cache_state
                 self.__dict__["_mxfp8_weight_cache_allocations"] += 1
@@ -1745,13 +1808,23 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
                     "columnwise_scale_ptr": grouped.columnwise_scale_inv.data_ptr(),
                     "identity_stable": cache_state.has_stable_storage_identity(),
                 }
+            mode = self.__dict__.get("_mxfp8_weight_cache_mode", _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE)
+            requires_fixed_identity = mode == _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE
             return {
                 "enabled": self.__dict__.get("_mxfp8_weight_cache_enabled", False),
+                "mode": mode,
                 "allocations": self.__dict__.get("_mxfp8_weight_cache_allocations", 0),
                 "refreshes": refreshes,
+                "group_quantize_calls": 0 if cache_state is None else cache_state.group_quantize_count,
+                "member_update_calls": 0 if cache_state is None else cache_state.member_update_count,
+                "buffer_replacements": 0 if cache_state is None else cache_state.buffer_replacement_count,
+                "optimizer_refreshes": self.__dict__.get("_mxfp8_weight_cache_optimizer_refreshes", 0),
                 "hits": self.__dict__.get("_mxfp8_weight_cache_hits", 0),
                 "fallbacks": self.__dict__.get("_mxfp8_weight_cache_fallbacks", 0),
                 "current": current,
+                "requires_fixed_identity": requires_fixed_identity,
+                "identity_policy_satisfied": not requires_fixed_identity
+                or (storage is not None and storage["identity_stable"]),
                 "fallback_reason": self.__dict__.get("_mxfp8_weight_cache_fallback_reason", ""),
                 "storage": storage,
             }
@@ -2100,6 +2173,11 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             configured_mxfp8 and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) > 0
         )
         self._te_ops_mxfp8_weight_cache_requested = bool(getattr(backend, "te_ops_mxfp8_weight_cache", False))
+        self._te_ops_mxfp8_weight_cache_mode = (
+            _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE
+            if bool(getattr(backend, "partial_cuda_graph_experts", False))
+            else _TeOpsMXFP8WeightCache.GROUP_QUANTIZE_MODE
+        )
         # Keep the cache disabled until EP>1 construction reports whether an
         # additional expert FSDP dimension is active. This prevents ep_shard>1
         # jobs from allocating a cache only to discard it before fully_shard.
@@ -2203,6 +2281,7 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             linear.set_mxfp8_weight_cache_enabled(
                 self._te_ops_mxfp8_weight_cache_enabled,
                 fallback_reason=self._te_ops_mxfp8_weight_cache_fallback_reason,
+                mode=self._te_ops_mxfp8_weight_cache_mode,
             )
 
         if activation_name == "scaled_swiglu":
@@ -2256,7 +2335,24 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         self._te_ops_mxfp8_weight_cache_enabled = enabled
         self._te_ops_mxfp8_weight_cache_fallback_reason = fallback_reason
         for linear in (self.gate_up_linear, self.down_linear):
-            linear.set_mxfp8_weight_cache_enabled(enabled, fallback_reason=fallback_reason)
+            linear.set_mxfp8_weight_cache_enabled(
+                enabled,
+                fallback_reason=fallback_reason,
+                mode=self._te_ops_mxfp8_weight_cache_mode,
+            )
+
+    def configure_mxfp8_weight_cache_for_partial_graph(self, *, captured: bool) -> None:
+        """Use fixed storage only for expert layers selected for graph capture."""
+        mode = _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE if captured else _TeOpsMXFP8WeightCache.GROUP_QUANTIZE_MODE
+        if mode == self._te_ops_mxfp8_weight_cache_mode:
+            return
+        self._te_ops_mxfp8_weight_cache_mode = mode
+        for linear in (self.gate_up_linear, self.down_linear):
+            linear.set_mxfp8_weight_cache_enabled(
+                self._te_ops_mxfp8_weight_cache_enabled,
+                fallback_reason=self._te_ops_mxfp8_weight_cache_fallback_reason,
+                mode=mode,
+            )
 
     def refresh_mxfp8_weight_cache_if_needed(self, *, force: bool = False) -> int:
         """Refresh both projection caches before entering the TE graph target."""
@@ -2274,6 +2370,11 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         return {
             "requested": getattr(self, "_te_ops_mxfp8_weight_cache_requested", False),
             "enabled": getattr(self, "_te_ops_mxfp8_weight_cache_enabled", False),
+            "mode": getattr(
+                self,
+                "_te_ops_mxfp8_weight_cache_mode",
+                _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE,
+            ),
             "fallback_reason": getattr(self, "_te_ops_mxfp8_weight_cache_fallback_reason", ""),
             "gate_up": self.gate_up_linear.mxfp8_weight_cache_diagnostics(),
             "down": self.down_linear.mxfp8_weight_cache_diagnostics(),
@@ -2477,9 +2578,9 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
         # This stays outside ``_te_grouped_mlp``, which is the partial CUDA-graph
-        # target. Optimizer updates bump the plain owner's version, so each cache
-        # is refreshed exactly once before the next forward. Checkpoint recompute
-        # observes the same version and reuses the same fixed-address cache.
+        # target. The optimizer post-step hook refreshes once per generation;
+        # owner-version checks additionally catch ordinary in-place edits. A
+        # checkpoint recompute sees the same generation and reuses the cache.
         self.refresh_mxfp8_weight_cache_if_needed()
 
         weights, indices = _mask_routing_metadata(weights, indices, token_mask)
@@ -2578,6 +2679,104 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         self.refresh_mxfp8_weight_cache_if_needed(force=True)
 
 
+def register_te_ops_mxfp8_weight_cache_optimizer_hooks(
+    model_parts: Any,
+    optimizers: Any,
+) -> tuple[Any, ...]:
+    """Refresh enabled compute caches once after each owning optimizer step.
+
+    Native fused optimizers may update ``parameter.data`` without incrementing
+    the registered owner's PyTorch version counter. A post-step hook is therefore
+    the generation boundary for cache correctness. The refresh is enqueued after
+    the optimizer update on the current CUDA stream, before either the next model
+    forward or direct partial-graph capture.
+    """
+
+    roots = (model_parts,) if isinstance(model_parts, nn.Module) else tuple(model_parts)
+    cache_linears: dict[int, tuple[nn.Module, nn.Parameter]] = {}
+    seen_experts: set[int] = set()
+    for root in roots:
+        modules = root.modules() if hasattr(root, "modules") else ()
+        for module in modules:
+            if not isinstance(module, GroupedExpertsTeOps) or id(module) in seen_experts:
+                continue
+            seen_experts.add(id(module))
+            if not getattr(module, "_te_ops_mxfp8_weight_cache_enabled", False):
+                continue
+            for linear in (module.gate_up_linear, module.down_linear):
+                owner = linear._parameters.get("_stacked_weight")
+                if owner is not None:
+                    cache_linears[id(linear)] = (linear, owner)
+
+    if isinstance(optimizers, torch.optim.Optimizer):
+        optimizer_list = (optimizers,)
+    else:
+        optimizer_list = tuple(optimizers)
+
+    optimizer_param_ids_by_optimizer = []
+    all_optimizer_param_ids: set[int] = set()
+    for optimizer in optimizer_list:
+        optimizer_param_ids = {
+            id(parameter) for group in getattr(optimizer, "param_groups", ()) for parameter in group.get("params", ())
+        }
+        optimizer_param_ids_by_optimizer.append(optimizer_param_ids)
+        all_optimizer_param_ids.update(optimizer_param_ids)
+
+    unowned_trainable = [
+        owner for _, owner in cache_linears.values() if owner.requires_grad and id(owner) not in all_optimizer_param_ids
+    ]
+    if unowned_trainable:
+        shapes = sorted(str(tuple(owner.shape)) for owner in unowned_trainable)
+        raise RuntimeError(
+            "Enabled TE-ops MXFP8 weight cache has trainable stacked owners missing from every "
+            f"optimizer param_group (shapes={shapes})"
+        )
+
+    overlapping_owners = [
+        owner
+        for _, owner in cache_linears.values()
+        if sum(id(owner) in optimizer_param_ids for optimizer_param_ids in optimizer_param_ids_by_optimizer) > 1
+    ]
+    if overlapping_owners:
+        shapes = sorted(str(tuple(owner.shape)) for owner in overlapping_owners)
+        raise RuntimeError(
+            f"Enabled TE-ops MXFP8 weight cache owners appear in multiple optimizer param_groups (shapes={shapes})"
+        )
+
+    registration_plan = []
+    for optimizer, optimizer_param_ids in zip(optimizer_list, optimizer_param_ids_by_optimizer):
+        owned_linears = tuple(linear for linear, owner in cache_linears.values() if id(owner) in optimizer_param_ids)
+        if not owned_linears:
+            continue
+        register_hook = getattr(optimizer, "register_step_post_hook", None)
+        if not callable(register_hook):
+            raise RuntimeError(
+                f"{type(optimizer).__name__} owns enabled TE-ops MXFP8 cache parameters but "
+                "does not support register_step_post_hook"
+            )
+        registration_plan.append((register_hook, owned_linears))
+
+    handles = []
+    try:
+        for register_hook, owned_linears in registration_plan:
+
+            def refresh_after_step(_optimizer, _args, _kwargs, *, linears=owned_linears):
+                for linear in linears:
+                    refresh = getattr(linear, "refresh_mxfp8_weight_cache_if_needed", None)
+                    if callable(refresh) and refresh(force=True):
+                        linear.__dict__["_mxfp8_weight_cache_optimizer_refreshes"] = (
+                            linear.__dict__.get("_mxfp8_weight_cache_optimizer_refreshes", 0) + 1
+                        )
+
+            handles.append(register_hook(refresh_after_step))
+    except Exception:
+        for handle in handles:
+            handle.remove()
+        raise
+
+    return tuple(handles)
+
+
 def collect_te_ops_mxfp8_weight_cache_diagnostics(model_parts: Any) -> dict[str, Any]:
     """Aggregate TE-ops weight-cache counters without emitting per-layer logs."""
     roots = (model_parts,) if isinstance(model_parts, nn.Module) else tuple(model_parts)
@@ -2593,10 +2792,17 @@ def collect_te_ops_mxfp8_weight_cache_diagnostics(model_parts: Any) -> dict[str,
         "projection_caches": 0,
         "allocations": 0,
         "refreshes": 0,
+        "group_quantize_calls": 0,
+        "member_update_calls": 0,
+        "buffer_replacements": 0,
+        "optimizer_refreshes": 0,
         "hits": 0,
         "fallbacks": 0,
         "current_caches": 0,
+        "group_quantize_caches": 0,
+        "fixed_address_caches": 0,
         "storage_identity_stable": True,
+        "identity_policy_satisfied": True,
     }
 
     for root in roots:
@@ -2619,13 +2825,21 @@ def collect_te_ops_mxfp8_weight_cache_diagnostics(model_parts: Any) -> dict[str,
             for projection in (diagnostics["gate_up"], diagnostics["down"]):
                 result["allocations"] += int(projection["allocations"])
                 result["refreshes"] += int(projection["refreshes"])
+                result["group_quantize_calls"] += int(projection["group_quantize_calls"])
+                result["member_update_calls"] += int(projection["member_update_calls"])
+                result["buffer_replacements"] += int(projection["buffer_replacements"])
+                result["optimizer_refreshes"] += int(projection["optimizer_refreshes"])
                 result["hits"] += int(projection["hits"])
                 result["fallbacks"] += int(projection["fallbacks"])
                 result["current_caches"] += int(projection["current"])
+                result["identity_policy_satisfied"] &= bool(projection["identity_policy_satisfied"])
                 storage = projection["storage"]
                 if storage is None:
                     continue
                 result["projection_caches"] += 1
+                mode = projection["mode"]
+                result["group_quantize_caches"] += int(mode == _TeOpsMXFP8WeightCache.GROUP_QUANTIZE_MODE)
+                result["fixed_address_caches"] += int(mode == _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE)
                 result["storage_identity_stable"] &= bool(storage["identity_stable"])
                 cache_ids.append(storage["cache_id"])
                 buffer_identities.append(

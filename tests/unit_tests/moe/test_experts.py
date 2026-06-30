@@ -1457,6 +1457,34 @@ def test_te_ops_empty_rank_preserves_dispatch_backward_and_explicit_zero_grads()
         torch.testing.assert_close(parameter, parameters_before_step[name] * (1 - 0.1 * 0.2))
 
 
+@pytest.mark.parametrize(
+    ("partial_expert_graphs", "expected_mode"),
+    [(False, "group_quantize"), (True, "fixed_address")],
+)
+def test_te_ops_mxfp8_weight_cache_mode_follows_partial_expert_graphs(
+    monkeypatch,
+    partial_expert_graphs,
+    expected_mode,
+):
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE, GroupedExpertsTeOps
+
+    monkeypatch.setattr(GroupedExpertsTE, "__init__", lambda self, *args, **kwargs: None)
+    backend = SimpleNamespace(
+        experts="te_ops",
+        te_fp8=SimpleNamespace(recipe="mxfp8"),
+        te_ops_mxfp8_weight_cache=True,
+        partial_cuda_graph_experts=partial_expert_graphs,
+    )
+
+    experts = GroupedExpertsTeOps(Mock(), backend=backend)
+
+    assert experts._te_ops_mxfp8_weight_cache_requested is True
+    assert experts._te_ops_mxfp8_weight_cache_mode == expected_mode
+    assert experts._te_ops_mxfp8_weight_cache_enabled is False
+
+
 def _install_te_216_mxfp8_cache_stubs(monkeypatch):
     """Install only the TE 2.16 APIs used by the persistent compute cache."""
     import sys
@@ -1470,6 +1498,7 @@ def _install_te_216_mxfp8_cache_stubs(monkeypatch):
 
     class FakeGroupedTensor:
         def __init__(self, num_tensors):
+            self.num_tensors = num_tensors
             self.rowwise_data = torch.zeros(num_tensors * 4, dtype=torch.uint8)
             self.columnwise_data = torch.zeros(num_tensors * 4, dtype=torch.uint8)
             self.scale_inv = torch.zeros(num_tensors * 2, dtype=torch.uint8)
@@ -1503,6 +1532,7 @@ def _install_te_216_mxfp8_cache_stubs(monkeypatch):
 
     class FakeGroupedTensorStorage:
         calls = []
+        group_quantize_calls = []
 
         @staticmethod
         def make_grouped_tensor_with_shapes(*, num_tensors, shapes, quantizer, device, dtype):
@@ -1517,8 +1547,25 @@ def _install_te_216_mxfp8_cache_stubs(monkeypatch):
             )
             return FakeGroupedTensor(num_tensors)
 
+    def fake_group_quantize(source, quantizer, num_tensors, first_dims):
+        FakeGroupedTensorStorage.group_quantize_calls.append(
+            {
+                "source": source,
+                "quantizer": quantizer,
+                "num_tensors": num_tensors,
+                "first_dims": first_dims,
+            }
+        )
+        grouped = FakeGroupedTensor(num_tensors)
+        for destination, value in zip(grouped.quantized_tensors, source.values):
+            destination.value = value
+            destination.rowwise_data.fill_(value)
+            destination.columnwise_data.fill_(value)
+        return grouped
+
     tex_stub = types.ModuleType("transformer_engine_torch")
     tex_stub.DType = types.SimpleNamespace(kFloat8E4M3=object())
+    tex_stub.group_quantize = fake_group_quantize
     te_stub = types.ModuleType("transformer_engine")
     te_pytorch_stub = types.ModuleType("transformer_engine.pytorch")
     te_tensor_stub = types.ModuleType("transformer_engine.pytorch.tensor")
@@ -1576,7 +1623,11 @@ def test_te_ops_mxfp8_cache_ep2_refreshes_once_ac_recompute_and_keeps_storage(mo
     assert quantizer.columnwise_usage is True
     assert quantizer.internal is False
     assert quantizer.optimize_for_gemm is False
+    assert cache.mode == cache.FIXED_ADDRESS_MODE
     assert cache.refresh_count == 1
+    assert cache.group_quantize_count == 0
+    assert cache.member_update_count == 2
+    assert storage_factory.group_quantize_calls == []
     assert [member.value for member in cache.members] == [3, 5]
     initial_identity = cache._storage_identity()
 
@@ -1609,7 +1660,84 @@ def test_te_ops_mxfp8_cache_ep2_refreshes_once_ac_recompute_and_keeps_storage(mo
     # expose a new version through a tensor wrapper.
     assert cache.refresh(owner, force=True) is True
     assert cache.refresh_count == 3
+    assert cache.member_update_count == 6
     assert cache._storage_identity() == initial_identity
+
+
+def test_te_ops_mxfp8_cache_group_quantizes_once_per_owner_generation(monkeypatch):
+    """Graph-off cache uses one grouped launch and reuses it through AC recompute."""
+    from types import SimpleNamespace
+
+    from torch.utils.checkpoint import checkpoint
+
+    from nemo_automodel.components.moe.experts import _TeOpsMXFP8WeightCache
+
+    storage_factory = _install_te_216_mxfp8_cache_stubs(monkeypatch)
+
+    class FakeOwner:
+        def __init__(self, *, data_ptr=2200, version=4, values=(2, 6)):
+            self.shape = (2, 32, 32)
+            self.device = SimpleNamespace(type="cuda")
+            self.dtype = torch.bfloat16
+            self.requires_grad = True
+            self._data_ptr = data_ptr
+            self._version = version
+            self.values = values
+
+        def data_ptr(self):
+            return self._data_ptr
+
+        def is_contiguous(self):
+            return True
+
+        def view(self, *shape):
+            assert shape == (64, 32)
+            return self
+
+    owner = FakeOwner()
+    cache = _TeOpsMXFP8WeightCache(
+        owner,
+        num_groups=2,
+        out_features=32,
+        in_features=32,
+        mode=_TeOpsMXFP8WeightCache.GROUP_QUANTIZE_MODE,
+    )
+
+    assert storage_factory.calls == []
+    assert len(storage_factory.group_quantize_calls) == 1
+    call = storage_factory.group_quantize_calls[0]
+    assert call["source"] is owner
+    assert call["num_tensors"] == 2
+    assert call["first_dims"] is None
+    assert call["quantizer"].rowwise_usage is True
+    assert call["quantizer"].columnwise_usage is True
+    assert cache.group_quantize_count == 1
+    assert cache.member_update_count == 0
+    assert cache.buffer_replacement_count == 0
+    assert [member.value for member in cache.members] == [2, 6]
+    initial_tensor = cache.tensor
+
+    recompute_alias = FakeOwner(data_ptr=owner.data_ptr(), version=owner._version, values=owner.values)
+    checkpoint_refreshes = []
+
+    def checkpointed(x):
+        checkpoint_refreshes.append(cache.refresh(recompute_alias))
+        return x.sin()
+
+    x = torch.randn(8, requires_grad=True)
+    checkpoint(checkpointed, x, use_reentrant=False).sum().backward()
+    assert checkpoint_refreshes == [False, False]
+    assert len(storage_factory.group_quantize_calls) == 1
+
+    owner.values = (8, 10)
+    owner._version += 1
+    assert cache.refresh(owner) is True
+    assert cache.refresh(owner) is False
+    assert cache.tensor is not initial_tensor
+    assert cache.group_quantize_count == 2
+    assert cache.buffer_replacement_count == 1
+    assert [member.value for member in cache.members] == [8, 10]
+    assert not cache.has_stable_storage_identity()
 
 
 def test_te_ops_mxfp8_cache_is_not_optimizer_or_checkpoint_state(monkeypatch):
@@ -1661,11 +1789,18 @@ def test_collect_te_ops_mxfp8_weight_cache_diagnostics_is_bounded():
         def mxfp8_weight_cache_diagnostics(self):
             return {
                 "enabled": True,
+                "mode": "fixed_address",
                 "allocations": 1,
                 "refreshes": 4,
+                "group_quantize_calls": 0,
+                "member_update_calls": 8,
+                "buffer_replacements": 0,
+                "optimizer_refreshes": 3,
                 "hits": 7,
                 "fallbacks": 0,
                 "current": True,
+                "requires_fixed_identity": True,
+                "identity_policy_satisfied": True,
                 "fallback_reason": "",
                 "storage": {
                     "cache_id": self.cache_id,
@@ -1682,6 +1817,7 @@ def test_collect_te_ops_mxfp8_weight_cache_diagnostics_is_bounded():
     torch.nn.Module.__init__(experts)
     experts._te_ops_mxfp8_weight_cache_requested = True
     experts._te_ops_mxfp8_weight_cache_enabled = True
+    experts._te_ops_mxfp8_weight_cache_mode = "fixed_address"
     experts._te_ops_mxfp8_weight_cache_fallback_reason = ""
     experts.gate_up_linear = FakeLinear(10, 100)
     experts.down_linear = FakeLinear(20, 200)
@@ -1697,28 +1833,37 @@ def test_collect_te_ops_mxfp8_weight_cache_diagnostics_is_bounded():
         "projection_caches": 2,
         "allocations": 2,
         "refreshes": 8,
+        "group_quantize_calls": 0,
+        "member_update_calls": 16,
+        "buffer_replacements": 0,
+        "optimizer_refreshes": 6,
         "hits": 14,
         "fallbacks": 0,
         "current_caches": 2,
+        "group_quantize_caches": 0,
+        "fixed_address_caches": 2,
         "storage_identity_stable": True,
+        "identity_policy_satisfied": True,
         "unique_cache_objects": 2,
         "unique_buffer_sets": 2,
         "fallback_reasons": {},
     }
 
 
-def test_te_ops_mxfp8_weight_cache_ep2_shard_policy_falls_back_transparently():
+@pytest.mark.parametrize("cache_mode", ["group_quantize", "fixed_address"])
+def test_te_ops_mxfp8_weight_cache_ep2_shard_policy_falls_back_transparently(cache_mode):
     from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
 
     class FakeLinear:
         def __init__(self):
             self.calls = []
 
-        def set_mxfp8_weight_cache_enabled(self, enabled, *, fallback_reason):
-            self.calls.append((enabled, fallback_reason))
+        def set_mxfp8_weight_cache_enabled(self, enabled, *, fallback_reason, mode):
+            self.calls.append((enabled, fallback_reason, mode))
 
     experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
     experts._te_ops_mxfp8_weight_cache_requested = True
+    experts._te_ops_mxfp8_weight_cache_mode = cache_mode
     experts.gate_up_linear = FakeLinear()
     experts.down_linear = FakeLinear()
 
@@ -1734,7 +1879,198 @@ def test_te_ops_mxfp8_weight_cache_ep2_shard_policy_falls_back_transparently():
     assert experts._te_ops_mxfp8_weight_cache_enabled is False
     assert experts._te_ops_mxfp8_weight_cache_fallback_reason == expected_reason
     for linear in (experts.gate_up_linear, experts.down_linear):
-        assert linear.calls == [(True, ""), (False, expected_reason)]
+        assert linear.calls == [
+            (True, "", cache_mode),
+            (False, expected_reason, cache_mode),
+        ]
+
+
+def test_te_ops_mxfp8_weight_cache_optimizer_hook_refreshes_once_per_step():
+    from nemo_automodel.components.moe.experts import (
+        GroupedExpertsTeOps,
+        register_te_ops_mxfp8_weight_cache_optimizer_hooks,
+    )
+
+    class FakeCachedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_parameter("_stacked_weight", torch.nn.Parameter(torch.ones(2, 2)))
+            self.__dict__["_mxfp8_weight_cache_enabled"] = True
+            self.refresh_calls = []
+
+        def refresh_mxfp8_weight_cache_if_needed(self, *, force=False):
+            self.refresh_calls.append(force)
+            return True
+
+    experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
+    torch.nn.Module.__init__(experts)
+    experts._te_ops_mxfp8_weight_cache_enabled = True
+    experts.gate_up_linear = FakeCachedLinear()
+    experts.down_linear = FakeCachedLinear()
+    model = torch.nn.Sequential(experts)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    # Repeated roots must not register duplicate projection refreshes.
+    handles = register_te_ops_mxfp8_weight_cache_optimizer_hooks((model, model), optimizer)
+    assert len(handles) == 1
+
+    loss = sum(parameter.sum() for parameter in model.parameters())
+    loss.backward()
+    optimizer.step()
+    for linear in (experts.gate_up_linear, experts.down_linear):
+        assert linear.refresh_calls == [True]
+        assert linear.__dict__["_mxfp8_weight_cache_optimizer_refreshes"] == 1
+
+    # A returned optimizer-internal no-op still refreshes harmlessly; no forward
+    # or activation-checkpoint recompute can trigger duplicate refreshes.
+    optimizer.zero_grad(set_to_none=True)
+    optimizer.step()
+    for linear in (experts.gate_up_linear, experts.down_linear):
+        assert linear.refresh_calls == [True, True]
+
+    for handle in handles:
+        handle.remove()
+    optimizer.step()
+    for linear in (experts.gate_up_linear, experts.down_linear):
+        assert linear.refresh_calls == [True, True]
+
+
+def test_te_ops_mxfp8_weight_cache_optimizer_hook_rejects_unowned_trainable_params():
+    from nemo_automodel.components.moe.experts import (
+        GroupedExpertsTeOps,
+        register_te_ops_mxfp8_weight_cache_optimizer_hooks,
+    )
+
+    class FakeCachedLinear(torch.nn.Module):
+        def __init__(self, *, requires_grad):
+            super().__init__()
+            self.register_parameter(
+                "_stacked_weight",
+                torch.nn.Parameter(torch.ones(2, 2), requires_grad=requires_grad),
+            )
+
+    experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
+    torch.nn.Module.__init__(experts)
+    experts._te_ops_mxfp8_weight_cache_enabled = True
+    experts.gate_up_linear = FakeCachedLinear(requires_grad=True)
+    experts.down_linear = FakeCachedLinear(requires_grad=False)
+    unrelated = torch.nn.Parameter(torch.ones(1))
+    optimizer = torch.optim.SGD([unrelated], lr=0.1)
+
+    with pytest.raises(RuntimeError, match="trainable stacked owners missing"):
+        register_te_ops_mxfp8_weight_cache_optimizer_hooks(experts, optimizer)
+
+    # Intentionally frozen caches need no generation hook.
+    experts.gate_up_linear._parameters["_stacked_weight"].requires_grad_(False)
+    assert register_te_ops_mxfp8_weight_cache_optimizer_hooks(experts, optimizer) == ()
+
+
+def test_te_ops_mxfp8_weight_cache_optimizer_hooks_reject_overlapping_owners():
+    from nemo_automodel.components.moe.experts import (
+        GroupedExpertsTeOps,
+        register_te_ops_mxfp8_weight_cache_optimizer_hooks,
+    )
+
+    class FakeCachedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_parameter("_stacked_weight", torch.nn.Parameter(torch.ones(2, 2)))
+
+    experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
+    torch.nn.Module.__init__(experts)
+    experts._te_ops_mxfp8_weight_cache_enabled = True
+    experts.gate_up_linear = FakeCachedLinear()
+    experts.down_linear = FakeCachedLinear()
+    parameters = list(experts.parameters())
+    optimizers = (torch.optim.SGD(parameters, lr=0.1), torch.optim.Adam(parameters, lr=0.1))
+
+    with pytest.raises(RuntimeError, match="multiple optimizer param_groups"):
+        register_te_ops_mxfp8_weight_cache_optimizer_hooks(experts, optimizers)
+
+
+@pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
+def test_te_fused_adam_post_step_refreshes_group_quantized_cache():
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("MXFP8 grouped quantization requires SM100+")
+
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.optimizers import FusedAdam
+    from transformer_engine.pytorch.tensor import MXFP8Quantizer
+
+    from nemo_automodel.components.moe.experts import (
+        GroupedExpertsTeOps,
+        _TeOpsMXFP8WeightCache,
+        register_te_ops_mxfp8_weight_cache_optimizer_hooks,
+    )
+
+    class CachedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            owner = torch.nn.Parameter(torch.randn(2, 32, 32, device="cuda", dtype=torch.bfloat16))
+            self.register_parameter("_stacked_weight", owner)
+            self.__dict__["_mxfp8_weight_cache_enabled"] = True
+            self.__dict__["_mxfp8_weight_cache_optimizer_refreshes"] = 0
+            self.cache = _TeOpsMXFP8WeightCache(
+                owner,
+                num_groups=2,
+                out_features=32,
+                in_features=32,
+                mode=_TeOpsMXFP8WeightCache.GROUP_QUANTIZE_MODE,
+            )
+
+        def refresh_mxfp8_weight_cache_if_needed(self, *, force=False):
+            return self.cache.refresh(self._parameters["_stacked_weight"], force=force)
+
+    experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
+    torch.nn.Module.__init__(experts)
+    experts._te_ops_mxfp8_weight_cache_enabled = True
+    experts.gate_up_linear = CachedLinear()
+    experts.down_linear = CachedLinear()
+    optimizer = FusedAdam(
+        experts.parameters(),
+        lr=0.01,
+        master_weights=True,
+        store_param_remainders=True,
+        exp_avg_dtype=torch.bfloat16,
+        exp_avg_sq_dtype=torch.bfloat16,
+    )
+    handles = register_te_ops_mxfp8_weight_cache_optimizer_hooks(experts, optimizer)
+    assert len(handles) == 1
+
+    before = {name: parameter.detach().clone() for name, parameter in experts.named_parameters()}
+    before_refreshes = {
+        id(linear): linear.cache.refresh_count for linear in (experts.gate_up_linear, experts.down_linear)
+    }
+    for parameter in experts.parameters():
+        parameter.grad = torch.ones_like(parameter)
+
+    try:
+        optimizer.step()
+        torch.cuda.synchronize()
+        for name, parameter in experts.named_parameters():
+            assert not torch.equal(parameter, before[name])
+        for linear in (experts.gate_up_linear, experts.down_linear):
+            owner = linear._parameters["_stacked_weight"]
+            cache = linear.cache
+            assert cache.refresh_count == before_refreshes[id(linear)] + 1
+            assert cache.is_current(owner)
+            assert linear.__dict__["_mxfp8_weight_cache_optimizer_refreshes"] == 1
+
+            reference_quantizer = MXFP8Quantizer(
+                tex.DType.kFloat8E4M3,
+                rowwise=True,
+                columnwise=True,
+            )
+            reference_quantizer.internal = False
+            reference_quantizer.optimize_for_gemm = False
+            reference = tex.group_quantize(owner.detach().view(64, 32), reference_quantizer, 2, None)
+            assert torch.equal(cache.tensor.rowwise_data, reference.rowwise_data)
+            assert torch.equal(cache.tensor.columnwise_data, reference.columnwise_data)
+            assert torch.equal(cache.tensor.scale_inv, reference.scale_inv)
+            assert torch.equal(cache.tensor.columnwise_scale_inv, reference.columnwise_scale_inv)
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")

@@ -216,10 +216,12 @@ class BackendConfig:
         partial_cuda_graph_experts: Opt-in that captures structurally discovered TE-ops
             expert compute. Real routing can change the received-token shape, so calls
             whose metadata differs from the captured sample fall back to eager execution.
-        te_ops_mxfp8_weight_cache: Keep a non-registered, preallocated MXFP8 compute
-            cache for ``GroupedExpertsTeOps`` weights while retaining ordinary stacked
-            ``nn.Parameter`` owners for optimization and checkpointing. The optimized
-            path requires EP>1 with complete local experts (``ep_shard=1``); an additional
+        te_ops_mxfp8_weight_cache: Keep a non-registered MXFP8 compute cache for
+            ``GroupedExpertsTeOps`` weights while retaining ordinary stacked
+            ``nn.Parameter`` owners for optimization and checkpointing. Graph-off
+            training refreshes each projection with one grouped quantization; partial
+            expert graphs use fixed-address preallocated storage. The optimized path
+            requires EP>1 with complete local experts (``ep_shard=1``); an additional
             expert FSDP shard transparently uses TE's eager weight quantization instead.
         partial_cuda_graph_expert_bucket_tokens: Optional fixed physical token capacity
             for partial expert graphs. HybridEP still receives the exact dynamic token

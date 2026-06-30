@@ -14,6 +14,7 @@
 
 import copy
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -362,10 +363,12 @@ def test_unsupported_dynamic_split_backend_leaves_experts_eager(caplog):
     model = _FSDPStyleGptOssWrapper(attention=False, experts=True)
     experts = model.model.layers["0"].mlp.experts
     experts._te_ops_dynamic_splits_graph_safe = False
+    experts.configure_mxfp8_weight_cache_for_partial_graph = MagicMock()
 
     manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
 
     assert manager is None
+    experts.configure_mxfp8_weight_cache_for_partial_graph.assert_called_once_with(captured=False)
     assert "Leaving TE-ops experts eager" in caplog.text
 
 
@@ -373,12 +376,30 @@ def test_unsupported_dynamic_split_backend_does_not_block_attention(caplog):
     model = _FSDPStyleGptOssWrapper(attention=True, experts=True)
     experts = model.model.layers["0"].mlp.experts
     experts._te_ops_dynamic_splits_graph_safe = False
+    experts.configure_mxfp8_weight_cache_for_partial_graph = MagicMock()
 
     manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
 
     assert manager is not None
     assert [entry.name for entry in manager.entries] == ["gpt_oss.layers.0.fused_attention"]
+    experts.configure_mxfp8_weight_cache_for_partial_graph.assert_called_once_with(captured=False)
     assert "Leaving TE-ops experts eager" in caplog.text
+    for entry in manager.entries:
+        entry.stop_recording()
+
+
+def test_only_selected_expert_layers_use_fixed_address_weight_cache():
+    model = _FSDPStyleGptOssWrapper(layer_count=2, layer_limit=1, attention=False, experts=True)
+    experts_by_layer = [model.model.layers[str(index)].mlp.experts for index in range(2)]
+    for experts in experts_by_layer:
+        experts.configure_mxfp8_weight_cache_for_partial_graph = MagicMock()
+
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+
+    assert manager is not None
+    assert [entry.name for entry in manager.entries] == ["gpt_oss.layers.0.te_ops_experts"]
+    experts_by_layer[0].configure_mxfp8_weight_cache_for_partial_graph.assert_called_once_with(captured=True)
+    experts_by_layer[1].configure_mxfp8_weight_cache_for_partial_graph.assert_called_once_with(captured=False)
     for entry in manager.entries:
         entry.stop_recording()
 

@@ -974,6 +974,13 @@ class PartialCudaGraphManager:
                     repeated_mtp_layer=repeated_mtp_layer,
                 )
 
+            selected_expert_indices = set(targets_by_feature["experts"])
+            for index, block in enumerate(blocks):
+                experts = _find_te_ops_experts(block.module)
+                configure_cache = getattr(experts, "configure_mxfp8_weight_cache_for_partial_graph", None)
+                if callable(configure_cache):
+                    configure_cache(captured=index in selected_expert_indices)
+
         for index, block in enumerate(blocks):
             target = targets_by_feature.get("attention", {}).get(index)
             if target is not None:
