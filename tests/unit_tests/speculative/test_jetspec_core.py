@@ -101,6 +101,28 @@ def test_forward_returns_finite_loss_and_grads_flow_to_draft():
     assert grad > 0
 
 
+def test_accuracy_is_vs_target_argmax_not_ground_truth(monkeypatch):
+    """Accuracy is the draft-vs-target greedy agreement (acceptance proxy), not vs ground truth.
+
+    Stub the draft to emit a constant hidden so the student logits are uniform and
+    ``argmax`` is token 0 everywhere; build target logits whose argmax is also token 0.
+    The draft then agrees with the target's greedy at every supervised position, so
+    accuracy must be 1.0 -- even though the (random) ground-truth tokens are almost
+    never 0, which a vs-ground-truth metric would score near 0.
+    """
+    trainer = _build_trainer(attention_backend="sdpa")
+    monkeypatch.setattr(
+        trainer.draft_model,
+        "forward",
+        lambda position_ids, noise_embedding, target_hidden, attention_mask: torch.zeros_like(noise_embedding),
+    )
+    input_ids, hidden, loss_mask, _ = _inputs()
+    target_logits = torch.full((input_ids.size(0), input_ids.size(1), VOCAB), -10.0)
+    target_logits[:, :, 0] = 10.0  # target argmax = token 0 at every position
+    out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask, target_logits=target_logits)
+    assert out.accuracy.item() == 1.0
+
+
 def test_kd_chunking_matches_unchunked_loss():
     """``kd_chunk_size`` is a memory optimisation: the loss must match the unchunked path.
 
