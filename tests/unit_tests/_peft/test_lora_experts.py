@@ -178,6 +178,7 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
         moe_config,
         dispatcher_backend="hybridep",
         dispatcher_num_sms=24,
+        dispatcher_num_qps=33,
         dispatcher_share_token_dispatcher=False,
         dispatcher_async_dispatch=True,
     )
@@ -188,6 +189,7 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
 
     assert lora_experts.dispatcher_backend == "hybridep"
     assert lora_experts.dispatcher_num_sms == 24
+    assert lora_experts.dispatcher_num_qps == 33
     assert lora_experts.dispatcher_share_token_dispatcher is False
     assert lora_experts.dispatcher_async_dispatch is True
     assert lora_experts.use_torch_mm is True

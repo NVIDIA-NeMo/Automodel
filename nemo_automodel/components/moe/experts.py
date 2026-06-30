@@ -671,6 +671,7 @@ class GroupedExpertsDeepEP(nn.Module):
         backend: Optional["BackendConfig"] = None,
         dispatcher_backend: str = "deepep",
         dispatcher_num_sms: int = 20,
+        dispatcher_num_qps: int = 0,
         dispatcher_share_token_dispatcher: bool = True,
         dispatcher_async_dispatch: bool = False,
     ):
@@ -683,6 +684,7 @@ class GroupedExpertsDeepEP(nn.Module):
                 uses torch._grouped_mm; otherwise uses grouped_gemm.ops.gmm.
             dispatcher_backend: Backend for the flex token dispatcher ("deepep", "deepep_v2", or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
+            dispatcher_num_qps: Number of QPs to use for the dispatcher backend.
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
@@ -697,6 +699,7 @@ class GroupedExpertsDeepEP(nn.Module):
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
+        self.dispatcher_num_qps = dispatcher_num_qps
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
 
@@ -733,6 +736,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_enable_deepep=True,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
             moe_deepep_num_sms=self.dispatcher_num_sms,
+            moe_deepep_num_qps=self.dispatcher_num_qps,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
@@ -926,6 +930,7 @@ class GroupedExpertsTE(nn.Module):
         backend: Optional["BackendConfig"] = None,
         dispatcher_backend: str = "deepep",
         dispatcher_num_sms: int = 20,
+        dispatcher_num_qps: int = 0,
         dispatcher_share_token_dispatcher: bool = True,
         dispatcher_async_dispatch: bool = False,
     ):
@@ -937,6 +942,7 @@ class GroupedExpertsTE(nn.Module):
             backend: Backend configuration (reserved for future use).
             dispatcher_backend: Backend for the flex token dispatcher ("deepep", "deepep_v2", or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
+            dispatcher_num_qps: Number of QPs to use for the dispatcher backend.
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
@@ -956,6 +962,7 @@ class GroupedExpertsTE(nn.Module):
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
+        self.dispatcher_num_qps = dispatcher_num_qps
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
 
@@ -1265,6 +1272,7 @@ class GroupedExpertsTE(nn.Module):
             moe_enable_deepep=True,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
             moe_deepep_num_sms=self.dispatcher_num_sms,
+            moe_deepep_num_qps=self.dispatcher_num_qps,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
