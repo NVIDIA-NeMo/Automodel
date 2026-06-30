@@ -172,6 +172,7 @@ def test_manager_warms_up_captures_and_replays(mocked_cuda_graph_runtime):
     manager = FullIterationCudaGraphManager(forward_backward, warmup_iterations=1)
     warmup_result = manager([{"x": torch.tensor([1.0])}])
     capture_result = manager([{"x": torch.tensor([2.0])}])
+    assert runtime["graphs"][0].replays == 1
     replay_result = manager([{"x": torch.tensor([3.0])}])
 
     assert warmup_result.item() == 1
@@ -182,7 +183,7 @@ def test_manager_warms_up_captures_and_replays(mocked_cuda_graph_runtime):
     assert manager.completed_warmups == 1
     assert manager.capture_count == 1
     assert manager.replay_count == 1
-    assert runtime["graphs"][0].replays == 1
+    assert runtime["graphs"][0].replays == 2
     assert runtime["stale_override_values"] == [True, False]
     copy_stream, capture_stream = runtime["streams"]
     assert capture_stream.waited_for == [runtime["current_stream"]]

@@ -445,6 +445,11 @@ class FullIterationCudaGraphManager:
                     self._result = self._forward_backward(static_batches)
             torch.cuda.synchronize()
             _distributed_capture_barrier()
+            # Ending stream capture only instantiates the graph. Launch it once
+            # so this optimizer iteration receives a real forward/backward,
+            # matching subsequent replay iterations and Megatron's wrapper.
+            graph.replay()
+            torch.cuda.current_stream().wait_stream(capture_stream)
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 logger.info("Full-iteration CUDA graph capture complete")
         except Exception:
