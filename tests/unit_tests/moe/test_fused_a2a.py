@@ -17,6 +17,7 @@
 from unittest import mock
 
 import pytest
+import torch
 
 import nemo_automodel.components.moe.megatron.fused_a2a as fused_a2a
 
@@ -198,3 +199,60 @@ def test_reset_hybrid_ep_buffer_clears_identity():
 
     assert fused_a2a._hybrid_ep_buffer is None
     assert fused_a2a._hybrid_ep_buffer_identity is None
+
+
+def test_trim_hybridep_static_budget_padding_preserves_aligned_rows():
+    tensor = torch.randn(4, 3)
+
+    result = fused_a2a.trim_hybridep_static_budget_padding(
+        tensor,
+        4,
+        tensor_name="test tensor",
+        target_name="the target",
+    )
+
+    assert result is tensor
+
+
+def test_trim_hybridep_static_budget_padding_trims_only_extra_rows():
+    tensor = torch.arange(18).reshape(6, 3)
+
+    result = fused_a2a.trim_hybridep_static_budget_padding(
+        tensor,
+        4,
+        tensor_name="test tensor",
+        target_name="the target",
+    )
+
+    torch.testing.assert_close(result, tensor[:4])
+
+
+def test_hybridep_combine_backward_trims_static_budget_rows():
+    buffer = mock.MagicMock()
+    buffer.dispatch_with_permute.return_value = (torch.randn(6, 3), None, None, None, None)
+    fused_a2a._hybrid_ep_buffer = buffer
+    ctx = mock.Mock(
+        handle=object(),
+        input_num_tokens=4,
+        pad_multiple=8,
+        num_permuted_tokens=8,
+    )
+
+    result = fused_a2a.HybridEPCombine.backward(ctx, torch.randn(2, 3))
+
+    assert result[0].shape == (4, 3)
+
+
+def test_hybridep_combine_backward_rejects_missing_rows():
+    buffer = mock.MagicMock()
+    buffer.dispatch_with_permute.return_value = (torch.randn(3, 3), None, None, None, None)
+    fused_a2a._hybrid_ep_buffer = buffer
+    ctx = mock.Mock(
+        handle=object(),
+        input_num_tokens=4,
+        pad_multiple=8,
+        num_permuted_tokens=8,
+    )
+
+    with pytest.raises(RuntimeError, match="fewer combine-backward dispatched hidden rows"):
+        fused_a2a.HybridEPCombine.backward(ctx, torch.randn(2, 3))

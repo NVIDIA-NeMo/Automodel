@@ -664,6 +664,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # eager optimizer step has supplied representative runtime inputs.
         self.partial_cuda_graph_manager = None
         self._partial_cuda_graph_capture_pending = False
+        self.full_iteration_cuda_graph_manager = None
+        self._full_iteration_num_label_tokens: int | None = None
+        self._full_iteration_num_label_tokens_tensor: torch.Tensor | None = None
+        self._full_iteration_label_normalizer_mode: bool | None = None
+        self._full_iteration_dispatchers = ()
+        self._full_iteration_backend = None
+        self._full_iteration_paged_stash_enabled = False
+        self._full_iteration_overflow_reruns = 0
 
     # ------------------ build phase ------------------
     def setup(self):
@@ -963,6 +971,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.load_checkpoint(restore_from)
         self._setup_te_ops_mxfp8_weight_cache_optimizer_hooks()
 
+        # Full-iteration graphs own the complete gradient-accumulation
+        # forward/backward region. Partial graphs remain a separate, mutually
+        # exclusive backend mode.
+        self._setup_full_iteration_cuda_graphs()
         # Install lightweight call recorders only after model/optimizer state is
         # final. The manager owns all feature eligibility checks (including PP
         # and activation-checkpointing restrictions).
@@ -984,6 +996,106 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._partial_cuda_graph_capture_pending = self.partial_cuda_graph_manager is not None
         self._validate_partial_graph_optimizers()
 
+    def _setup_full_iteration_cuda_graphs(self) -> None:
+        """Build the opt-in full forward/backward graph and guarded MoE runner."""
+        enabled_parts = [
+            part
+            for part in self.model_parts
+            if bool(getattr(getattr(part, "backend", None), "full_iteration_cuda_graph", False))
+        ]
+        if not enabled_parts:
+            return
+        if len(enabled_parts) != len(self.model_parts) or len(self.model_parts) != 1:
+            raise RuntimeError("Full-iteration CUDA graphs currently require one enabled local model part")
+        if self.pp_enabled:
+            raise RuntimeError("Full-iteration CUDA graphs currently require pipeline parallel size 1")
+        if self._get_cp_group_size() != 1:
+            raise RuntimeError("Full-iteration CUDA graphs currently require context parallel size 1")
+        if bool(getattr(self.moe_parallel_config, "enable_fsdp2_prefetch", False)):
+            raise RuntimeError(
+                "Full-iteration CUDA graph capture requires enable_fsdp2_prefetch=False until outstanding "
+                "stock FSDP2 parameter gathers can be drained explicitly before capture"
+            )
+        if self.cfg.get("moe_metrics.enabled", False):
+            raise RuntimeError(
+                "Full-iteration CUDA graphs do not update Python-owned MoE metric snapshots on replay; "
+                "disable moe_metrics"
+            )
+
+        from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
+        from nemo_automodel.components.moe.layers import Gate
+        from nemo_automodel.recipes.llm.full_iteration_cuda_graph import FullIterationCudaGraphManager
+
+        backend = enabled_parts[0].backend
+        dispatchers = []
+        seen_managers = set()
+        for module in enabled_parts[0].modules():
+            if isinstance(module, Gate):
+                if module.bias_update_factor > 0:
+                    raise RuntimeError(
+                        "Full-iteration CUDA graphs do not support Python-owned cumulative expert-load state "
+                        "for router bias updates"
+                    )
+                if module.router_replay is not None:
+                    raise RuntimeError("Full-iteration CUDA graphs do not support Python-owned routing replay state")
+            if not isinstance(module, GroupedExpertsTeOps):
+                continue
+            dispatcher = getattr(module, "token_dispatcher", None)
+            comm_manager = getattr(dispatcher, "_comm_manager", None)
+            if dispatcher is None or comm_manager is None or id(comm_manager) in seen_managers:
+                continue
+            seen_managers.add(id(comm_manager))
+            dispatchers.append(dispatcher)
+
+        rank_capacity = getattr(backend, "moe_expert_rank_capacity_factor", None)
+        if dispatchers and rank_capacity is None:
+            raise RuntimeError(
+                "Full-iteration CUDA graphs with HybridEP MoE require moe_expert_rank_capacity_factor so "
+                "dispatch has a graph-stable receive shape and can use guarded whole-step fallback"
+            )
+        for dispatcher in dispatchers:
+            dispatcher.set_static_rank_budget(rank_capacity)
+
+        paged_stash_enabled = bool(getattr(backend, "moe_paged_stash", False))
+        if self.activation_checkpointing and paged_stash_enabled:
+            # PyTorch's graph-capturable checkpoint RNG rewind is supported by
+            # the target runtime, but checkpoint and paged stash both install
+            # saved_tensors_hooks. Keep AC graphable while disabling only the
+            # unvalidated nested expert-stash hook stack.
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            get_paged_stash_manager().configure(enabled=False)
+            paged_stash_enabled = False
+            logger.warning(
+                "Full-iteration CUDA graphs are enabled with PyTorch activation checkpointing; "
+                "paged expert stashing is disabled because nested saved_tensors_hooks are not yet supported"
+            )
+
+        self._full_iteration_backend = backend
+        self._full_iteration_dispatchers = tuple(dispatchers)
+        self._full_iteration_paged_stash_enabled = paged_stash_enabled
+        self.full_iteration_cuda_graph_manager = FullIterationCudaGraphManager(
+            self._full_iteration_forward_backward,
+            warmup_iterations=backend.full_iteration_cuda_graph_warmup_steps,
+            use_single_mempool=backend.full_iteration_cuda_graph_single_mempool,
+        )
+        logger.info(
+            "Full-iteration CUDA graphs enabled: warmups=%d HybridEP managers=%d paged_stash=%s "
+            "activation_checkpointing=%s",
+            backend.full_iteration_cuda_graph_warmup_steps,
+            len(dispatchers),
+            paged_stash_enabled,
+            bool(self.activation_checkpointing),
+        )
+        self._validate_partial_graph_optimizers()
+
+    def _has_cuda_graph_manager(self) -> bool:
+        """Return whether either explicit CUDA graph mode owns gradient storage."""
+        return (
+            getattr(self, "partial_cuda_graph_manager", None) is not None
+            or getattr(self, "full_iteration_cuda_graph_manager", None) is not None
+        )
+
     def _setup_te_ops_mxfp8_weight_cache_optimizer_hooks(self) -> None:
         """Invalidate or refresh compute caches at the optimizer generation boundary."""
         from nemo_automodel.components.moe.experts import register_te_ops_mxfp8_weight_cache_optimizer_hooks
@@ -996,7 +1108,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
     def _validate_partial_graph_optimizers(self) -> None:
         """Require zeroing that preserves persistent graph gradient buffers."""
-        if self.partial_cuda_graph_manager is None:
+        if not self._has_cuda_graph_manager():
             return
         for optimizer in self.optimizer:
             try:
@@ -1009,7 +1121,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     def _zero_optimizer_gradients(self) -> None:
         """Zero gradients without releasing static buffers while graphs are active."""
         for optimizer in self.optimizer:
-            if self.partial_cuda_graph_manager is None:
+            if not self._has_cuda_graph_manager():
                 optimizer.zero_grad()
             else:
                 # Replacing a graph's persistent grad buffers with None can
@@ -1049,6 +1161,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         manager.close()
         self.partial_cuda_graph_manager = None
         self._partial_cuda_graph_capture_pending = False
+
+    def _close_full_iteration_cuda_graphs(self) -> None:
+        """Destroy the full graph before releasing any referenced page buffers."""
+        manager = getattr(self, "full_iteration_cuda_graph_manager", None)
+        if manager is not None:
+            manager.close()
+            self._release_full_iteration_backend_handles()
+            self.full_iteration_cuda_graph_manager = None
+        if getattr(self, "_full_iteration_paged_stash_enabled", False):
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            get_paged_stash_manager().close()
+        self._full_iteration_num_label_tokens = None
+        self._full_iteration_num_label_tokens_tensor = None
+        self._full_iteration_label_normalizer_mode = None
+        self._full_iteration_dispatchers = ()
+        self._full_iteration_backend = None
+        self._full_iteration_paged_stash_enabled = False
 
     def _collect_moe_load_balance(self):
         """Collect MoE load balance metrics with DP all-reduce.
@@ -1149,11 +1279,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         try:
             for mp in self.model_parts:
                 self._qat_enable_fn(mp)
-            logger.info("Enabled QAT fake-quant after step %s", step)
-            # Enable one
-            self._qat_enable_after = None
         except Exception as e:
             logger.warning("Failed to enable fake-quant: %s", e)
+            return
+
+        logger.info("Enabled QAT fake-quant after step %s", step)
+        # Enable once. Graph teardown below intentionally fails closed: after
+        # fake quant has changed the kernel schedule, continuing with a stale
+        # graph would be silently incorrect.
+        self._qat_enable_after = None
+        full_graph_manager = getattr(self, "full_iteration_cuda_graph_manager", None)
+        if full_graph_manager is not None:
+            full_graph_manager.reset()
+            self._release_full_iteration_backend_handles()
 
     # ------------------ main loop ------------------
     def _log_te_ops_mxfp8_weight_cache_diagnostics(self) -> dict[str, Any]:
@@ -1199,6 +1337,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     # Run validation every val_every_steps
                     val_losses = {}
                     if self.step_scheduler.is_val_step:
+                        if self.full_iteration_cuda_graph_manager is not None:
+                            self.full_iteration_cuda_graph_manager.reset()
+                            self._release_full_iteration_backend_handles()
                         for val_name, val_dataloader in self.val_dataloaders.items():
                             val_log_data = self._run_validation_epoch(val_dataloader)
                             val_losses[val_name] = val_log_data.metrics["val_loss"]
@@ -1208,6 +1349,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                     # Save the checkpoint every ckpt_every_steps
                     if self.step_scheduler.is_ckpt_step:
+                        if self.full_iteration_cuda_graph_manager is not None:
+                            self.full_iteration_cuda_graph_manager.reset()
+                            self._release_full_iteration_backend_handles()
                         self.save_checkpoint(
                             epoch,
                             self.step_scheduler.step,
@@ -1218,10 +1362,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     self._maybe_collect_garbage()
         finally:
             try:
-                self._close_partial_cuda_graphs()
+                self._close_full_iteration_cuda_graphs()
             finally:
-                if pbar is not None:
-                    pbar.close()
+                try:
+                    self._close_partial_cuda_graphs()
+                finally:
+                    if pbar is not None:
+                        pbar.close()
         self._log_te_ops_mxfp8_weight_cache_diagnostics()
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
@@ -1245,6 +1392,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
+        deferred_loss_normalizer = num_label_tokens if isinstance(num_label_tokens, torch.Tensor) else None
+        loss_num_label_tokens = None if deferred_loss_normalizer is not None else num_label_tokens
+        if deferred_loss_normalizer is not None and self.pp_enabled:
+            raise RuntimeError(
+                "Device-resident full-iteration loss normalization does not support pipeline parallelism"
+            )
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
             k: (
@@ -1375,7 +1528,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     model=model,
                     hidden_states=get_final_hidden_states(out),
                     lm_weight=shared_lm_weight,
-                    num_label_tokens=num_label_tokens,
+                    num_label_tokens=loss_num_label_tokens,
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
@@ -1391,7 +1544,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         labels=labels,
                         model=model,
                         scaling_factor=scaling_factor,
-                        num_label_tokens=num_label_tokens,
+                        num_label_tokens=loss_num_label_tokens,
                         ignore_index=mtp_cfg.ignore_index,
                         # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
                         cu_seqlens=batch.get("cu_seqlens"),
@@ -1407,6 +1560,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         # vocab (e.g. DSV4's 129280) overflow to inf, and inf * 0.0
                         # would be nan, poisoning local_loss and the backward pass.
                         local_loss = local_loss + logits.float().sum() * 0.0
+                local_loss = self._normalize_full_iteration_loss(local_loss, deferred_loss_normalizer)
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
@@ -1417,6 +1571,200 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         pp_src_rank = torch.distributed.get_global_rank(pp_group, torch.distributed.get_world_size(pp_group) - 1)
         torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
         return tensor
+
+    @staticmethod
+    def _normalize_full_iteration_loss(
+        local_loss: torch.Tensor,
+        num_label_tokens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Apply a replay-varying device scalar after all summed loss terms."""
+        if num_label_tokens is None:
+            return local_loss
+        if num_label_tokens.numel() != 1 or num_label_tokens.requires_grad:
+            raise RuntimeError("Full-iteration num_label_tokens must be one non-differentiable device scalar")
+        return local_loss / num_label_tokens
+
+    def _run_forward_backward_batches(
+        self,
+        batches,
+        *,
+        num_label_tokens: int | torch.Tensor | None,
+    ) -> list[torch.Tensor]:
+        """Run one fixed gradient-accumulation forward/backward schedule."""
+        loss_buffer: list[torch.Tensor] = []
+        num_batches = len(batches)
+        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+        for index, batch in enumerate(batches):
+            if index == num_batches - 1:
+                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+
+            self._forward_backward_step(
+                index,
+                batch,
+                loss_buffer=loss_buffer,
+                num_label_tokens=num_label_tokens,
+                num_batches=num_batches,
+            )
+            if index == 0:
+                prepare_after_first_microbatch()
+        return loss_buffer
+
+    def _full_iteration_forward_backward(self, batches) -> list[torch.Tensor]:
+        """Graph target for the complete gradient-accumulation F/B schedule."""
+        return self._run_forward_backward_batches(
+            batches,
+            num_label_tokens=self._full_iteration_num_label_tokens_tensor,
+        )
+
+    def _reset_full_iteration_dispatch_overflow(self) -> None:
+        """Clear every unique HybridEP static-budget overflow flag."""
+        for dispatcher in self._full_iteration_dispatchers:
+            dispatcher.reset_over_budget()
+
+    def _collect_full_iteration_overflow(self) -> tuple[int, int]:
+        """Globally reduce HybridEP and paged-stash overflow in one collective."""
+        flags = torch.zeros(2, dtype=torch.int32, device=self.dist_env.device)
+        for dispatcher in self._full_iteration_dispatchers:
+            over_budget = dispatcher.check_over_budget()
+            if over_budget is not None:
+                flags[0].logical_or_(over_budget.reshape(-1)[0])
+
+        if self._full_iteration_paged_stash_enabled:
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            stash_overflow = get_paged_stash_manager().check_overflow()
+            if stash_overflow is not None:
+                flags[1].logical_or_(stash_overflow.reshape(-1)[0].ne(0))
+
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.SUM)
+        return int(flags[0].item()), int(flags[1].item())
+
+    def _maybe_prepare_full_iteration_paged_stash(self) -> None:
+        """Allocate page pools after the first completed recording warmup."""
+        if not self._full_iteration_paged_stash_enabled:
+            return
+        from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+        stash_manager = get_paged_stash_manager()
+        graph_manager = self.full_iteration_cuda_graph_manager
+        if not stash_manager.is_active and graph_manager is not None and graph_manager.completed_warmups >= 1:
+            stash_manager.prepare()
+
+    def _release_full_iteration_backend_handles(self) -> None:
+        """Release opaque HybridEP handles after destroying the graph that owns them."""
+        for dispatcher in getattr(self, "_full_iteration_dispatchers", ()):
+            comm_manager = getattr(dispatcher, "_comm_manager", None)
+            handles = getattr(comm_manager, "_cuda_graph_handles", None)
+            if handles is not None:
+                handles.clear()
+
+    def _full_iteration_cuda_graph_diagnostics(self) -> dict[str, Any]:
+        """Return JSON-safe full-iteration graph and paged-stash counters."""
+        manager = getattr(self, "full_iteration_cuda_graph_manager", None)
+        diagnostics: dict[str, Any] = {
+            "enabled": manager is not None,
+            "captured": bool(manager is not None and manager.is_captured),
+            "completed_warmups": int(manager.completed_warmups) if manager is not None else 0,
+            "captures": int(manager.capture_count) if manager is not None else 0,
+            "replays": int(manager.replay_count) if manager is not None else 0,
+            "overflow_reruns": int(getattr(self, "_full_iteration_overflow_reruns", 0)),
+            "paged_stash_enabled": bool(getattr(self, "_full_iteration_paged_stash_enabled", False)),
+        }
+        if diagnostics["paged_stash_enabled"]:
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            stash = get_paged_stash_manager().diagnostics()
+            diagnostics["paged_stash"] = {
+                "state": stash["state"],
+                "page_size": stash["page_size"],
+                "buffer_size_factor": stash["buffer_size_factor"],
+                "buffer_tokens": {
+                    f"{dtype}:{hidden_size}": tokens for (dtype, hidden_size), tokens in stash["buffer_tokens"].items()
+                },
+                "live_groups": stash["live_groups"],
+            }
+        return diagnostics
+
+    def _run_guarded_forward_backward(self, batches, *, num_label_tokens: int | None) -> list[torch.Tensor]:
+        """Run full F/B and rerun dropless before update if a static fast path overflowed."""
+        manager = getattr(self, "full_iteration_cuda_graph_manager", None)
+        if manager is None:
+            return self._run_forward_backward_batches(batches, num_label_tokens=num_label_tokens)
+
+        uses_label_normalizer = num_label_tokens is not None
+        if self._full_iteration_label_normalizer_mode is None:
+            self._full_iteration_label_normalizer_mode = uses_label_normalizer
+        elif self._full_iteration_label_normalizer_mode != uses_label_normalizer:
+            # Benchmarking intentionally normalizes its summed losses outside
+            # the graph, while training normalizes inside. Changing that Python
+            # branch requires a new graph, but changing the scalar value does not.
+            manager.reset()
+            self._release_full_iteration_backend_handles()
+            self._full_iteration_num_label_tokens_tensor = None
+            self._full_iteration_label_normalizer_mode = uses_label_normalizer
+
+        self._full_iteration_num_label_tokens = num_label_tokens
+        if uses_label_normalizer:
+            if num_label_tokens <= 0:
+                raise RuntimeError("Full-iteration CUDA graphs require num_label_tokens to be positive")
+            if getattr(self.loss_fn, "reduction", None) != "sum":
+                raise RuntimeError("Replay-varying full-iteration loss normalization requires loss_fn.reduction='sum'")
+            if self._full_iteration_num_label_tokens_tensor is None:
+                self._full_iteration_num_label_tokens_tensor = torch.empty(
+                    (), dtype=torch.float32, device=self.dist_env.device
+                )
+            self._full_iteration_num_label_tokens_tensor.fill_(num_label_tokens)
+
+        self._maybe_prepare_full_iteration_paged_stash()
+        self._reset_full_iteration_dispatch_overflow()
+        loss_buffer = manager.run(batches)
+        over_budget_ranks, stash_overflow_ranks = self._collect_full_iteration_overflow()
+        if over_budget_ranks == 0 and stash_overflow_ranks == 0:
+            return loss_buffer
+
+        logger.warning(
+            "Discarding full-iteration CUDA graph attempt and rerunning dropless: "
+            "HybridEP over-budget ranks=%d, paged-stash overflow ranks=%d",
+            over_budget_ranks,
+            stash_overflow_ranks,
+        )
+        self._full_iteration_overflow_reruns = getattr(self, "_full_iteration_overflow_reruns", 0) + 1
+        # No optimizer action has occurred. Destroy the graph before changing
+        # dispatcher shape contracts or releasing/reprofiling page storage,
+        # then erase every gradient produced by the discarded attempt.
+        manager.reset()
+        self._release_full_iteration_backend_handles()
+        self._zero_optimizer_gradients()
+
+        backend = self._full_iteration_backend
+        rank_capacity = backend.moe_expert_rank_capacity_factor
+        for dispatcher in self._full_iteration_dispatchers:
+            dispatcher.set_static_rank_budget(None)
+
+        if self._full_iteration_paged_stash_enabled:
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            stash_manager = get_paged_stash_manager()
+            stash_context = stash_manager.disabled()
+        else:
+            stash_manager = None
+            stash_context = nullcontext()
+
+        try:
+            with stash_context:
+                loss_buffer = self._run_forward_backward_batches(batches, num_label_tokens=num_label_tokens)
+        finally:
+            for dispatcher in self._full_iteration_dispatchers:
+                dispatcher.set_static_rank_budget(rank_capacity)
+
+        if stash_manager is not None:
+            if stash_overflow_ranks:
+                stash_manager.restart_recording()
+            else:
+                stash_manager.reset_after_overflow()
+        self._reset_full_iteration_dispatch_overflow()
+        return loss_buffer
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -1451,8 +1799,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 float(self._get_dp_group_size(include_cp=True))
             )
 
-        loss_buffer = []
-
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = torch.tensor(
             sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
@@ -1460,19 +1806,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        num_batches = len(batches)
-        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
-
-        for i, batch in enumerate(batches):
-            if i == num_batches - 1:
-                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
-
-            self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
-            )
-
-            if i == 0:
-                prepare_after_first_microbatch()
+        loss_buffer = self._run_guarded_forward_backward(batches, num_label_tokens=num_label_tokens)
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
@@ -1835,7 +2169,10 @@ def main(config_path=None):
         trainer.setup()
         trainer.run_train_validation_loop()
     finally:
-        trainer._close_partial_cuda_graphs()
+        try:
+            trainer._close_full_iteration_cuda_graphs()
+        finally:
+            trainer._close_partial_cuda_graphs()
 
 
 if __name__ == "__main__":

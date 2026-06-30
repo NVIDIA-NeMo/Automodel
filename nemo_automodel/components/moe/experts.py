@@ -1300,6 +1300,7 @@ class GroupedExpertsTE(nn.Module):
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
             moe_router_expert_pad_multiple=self._router_expert_pad_multiple(),
+            moe_expert_rank_capacity_factor=getattr(self, "moe_expert_rank_capacity_factor", None),
         )
 
         local_expert_indices_offset = self.ep_rank * self.num_local_experts
@@ -2278,6 +2279,21 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         )
         self._te_ops_fp8_configured = backend.te_fp8 is not None
         self._te_ops_configured_mxfp8 = configured_mxfp8
+        self.moe_expert_rank_capacity_factor = getattr(backend, "moe_expert_rank_capacity_factor", None)
+        self.moe_paged_stash = bool(getattr(backend, "moe_paged_stash", False))
+        self._te_ops_paged_stash_requested = self.moe_paged_stash
+        if self._te_ops_paged_stash_requested and bool(getattr(backend, "partial_cuda_graph_experts", False)):
+            raise ValueError("moe_paged_stash and partial_cuda_graph_experts cannot be enabled together")
+        if self._te_ops_paged_stash_requested:
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            if float(getattr(backend, "moe_paged_stash_buffer_size_factor_cpu", 0.0)) != 0.0:
+                raise ValueError("AutoModel moe_paged_stash does not yet support pinned-host spill")
+            get_paged_stash_manager().configure(
+                enabled=True,
+                page_size=int(getattr(backend, "moe_paged_stash_page_size", 64)),
+                buffer_size_factor=float(getattr(backend, "moe_paged_stash_buffer_size_factor_cuda", 1.1)),
+            )
         self._te_ops_unstacked_parameters = bool(getattr(backend, "te_ops_unstacked_parameters", False))
         self._te_ops_mxfp8_fusion_requested = (
             configured_mxfp8 and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) > 0
@@ -2286,7 +2302,10 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         self._te_ops_mxfp8_weight_cache_graph_off_mode = _TeOpsMXFP8WeightCache.GEMM_READY_FIXED_MODE
         self._te_ops_mxfp8_weight_cache_mode = (
             _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE
-            if bool(getattr(backend, "partial_cuda_graph_experts", False))
+            if bool(
+                getattr(backend, "partial_cuda_graph_experts", False)
+                or getattr(backend, "full_iteration_cuda_graph", False)
+            )
             else self._te_ops_mxfp8_weight_cache_graph_off_mode
         )
         # Keep the cache disabled until EP>1 construction reports whether an
@@ -2315,6 +2334,13 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             dispatcher_share_token_dispatcher=dispatcher_share_token_dispatcher,
             dispatcher_async_dispatch=dispatcher_async_dispatch,
         )
+        if self._te_ops_paged_stash_requested and not self._te_ops_uses_padded_capacity:
+            raise RuntimeError(
+                "moe_paged_stash requires the TE CuTe DSL fused MXFP8 grouped-MLP path. "
+                "Set te_fp8.recipe='mxfp8' and NVTE_CUTEDSL_FUSED_GROUPED_MLP=1, and use an activation "
+                "supported by the fused path. The required TE saved-tensor markers and per-expert "
+                "128-row alignment are not available on the generic BF16/GroupedLinear path."
+            )
 
     def _te_ops_dynamic_splits_graph_capability(self) -> tuple[bool, str]:
         """Return whether TE reads grouped split values from device at replay."""
@@ -2488,6 +2514,7 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
 
     def mxfp8_weight_cache_diagnostics(self) -> dict[str, Any]:
         """Expose bounded per-projection counters for GB200 validation."""
+
         def projection_diagnostics(linear: nn.Module) -> dict[str, Any]:
             diagnostics = getattr(linear, "mxfp8_weight_cache_diagnostics", None)
             if callable(diagnostics):
@@ -2810,12 +2837,30 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
 
         fp8_active = FP8GlobalStateManager.is_fp8_enabled()
         fc2_extra_inputs = (tokens_per_expert, permuted_probs) if self.expert_bias else (tokens_per_expert,)
-        output = self._te_grouped_mlp(
-            permuted_local_hidden_states,
-            tokens_per_expert,
-            permuted_probs,
-            *fc2_extra_inputs,
-        )
+        if self._te_ops_paged_stash_requested:
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            stash_group = get_paged_stash_manager().group(
+                name="te_ops_grouped_mlp",
+                max_num_tokens=permuted_local_hidden_states.shape[0],
+                num_tokens_tensor=tokens_per_expert.sum(),
+                tokens_per_expert=tokens_per_expert,
+            )
+            with stash_group:
+                output = self._te_grouped_mlp(
+                    permuted_local_hidden_states,
+                    tokens_per_expert,
+                    permuted_probs,
+                    *fc2_extra_inputs,
+                )
+            output = stash_group.commit(output)
+        else:
+            output = self._te_grouped_mlp(
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                permuted_probs,
+                *fc2_extra_inputs,
+            )
         self._assert_te_fuser_owner_identity()
         self._check_te_ops_fusion(fp8_active)
         return self.token_dispatcher.token_unpermutation(output)

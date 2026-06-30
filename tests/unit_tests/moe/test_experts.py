@@ -1485,6 +1485,24 @@ def test_te_ops_mxfp8_weight_cache_mode_follows_partial_expert_graphs(
     assert experts._te_ops_mxfp8_weight_cache_enabled is False
 
 
+def test_te_ops_reads_static_rank_budget_from_backend_without_requiring_backend_schema(monkeypatch):
+    """The provisional HybridEP budget is threaded from the TE-ops backend by attribute."""
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE, GroupedExpertsTeOps
+
+    monkeypatch.setattr(GroupedExpertsTE, "__init__", lambda self, *args, **kwargs: None)
+    backend = SimpleNamespace(
+        experts="te_ops",
+        te_fp8=None,
+        moe_expert_rank_capacity_factor=1.25,
+    )
+
+    experts = GroupedExpertsTeOps(Mock(), backend=backend)
+
+    assert experts.moe_expert_rank_capacity_factor == 1.25
+
+
 def test_te_ops_mxfp8_internal_group_quantize_ab_mode_survives_graph_selection():
     from nemo_automodel.components.moe.experts import GroupedExpertsTeOps, _TeOpsMXFP8WeightCache
 

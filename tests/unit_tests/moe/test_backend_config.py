@@ -228,6 +228,141 @@ class TestBackendConfigPartialCudaGraphs:
                 partial_cuda_graph_layer_limit=1,
             )
 
+
+class TestBackendConfigFullIterationCudaGraphs:
+    """Full-iteration graphs use guarded HybridEP capacity and optional paged stashing."""
+
+    def test_defaults_keep_full_graph_and_paged_stash_disabled(self):
+        config = BackendConfig()
+
+        assert config.full_iteration_cuda_graph is False
+        assert config.full_iteration_cuda_graph_warmup_steps == 2
+        assert config.moe_expert_rank_capacity_factor is None
+        assert config.moe_paged_stash is False
+
+    def test_accepts_stacked_te_ops_paged_stash(self):
+        config = BackendConfig(
+            experts="te_ops",
+            dispatcher="hybridep",
+            full_iteration_cuda_graph=True,
+            moe_expert_rank_capacity_factor=1.125,
+            moe_paged_stash=True,
+            te_fp8={"recipe": "mxfp8"},
+        )
+
+        assert config.te_ops_unstacked_parameters is False
+        assert config.moe_expert_rank_capacity_factor == 1.125
+        assert config.moe_paged_stash is True
+
+    def test_rejects_partial_and_full_graph_combination(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            BackendConfig(
+                attn="te",
+                partial_cuda_graph_attention=True,
+                partial_cuda_graph_layer_limit=1,
+                full_iteration_cuda_graph=True,
+            )
+
+    @pytest.mark.parametrize("warmup_steps", [0, -1, 1.5, True])
+    def test_requires_positive_integer_warmup(self, warmup_steps):
+        with pytest.raises(ValueError, match="warmup_steps must be a positive integer"):
+            BackendConfig(full_iteration_cuda_graph_warmup_steps=warmup_steps)
+
+    @pytest.mark.parametrize("factor", [0.99, 0, -1, True, "1.1"])
+    def test_rejects_invalid_rank_capacity(self, factor):
+        with pytest.raises(ValueError, match="greater than or equal to 1.0"):
+            BackendConfig(
+                experts="te_ops",
+                dispatcher="hybridep",
+                full_iteration_cuda_graph=True,
+                moe_expert_rank_capacity_factor=factor,
+            )
+
+    def test_rank_capacity_requires_guarded_full_graph_path(self):
+        with pytest.raises(ValueError, match="requires full_iteration_cuda_graph=True"):
+            BackendConfig(
+                experts="te_ops",
+                dispatcher="hybridep",
+                moe_expert_rank_capacity_factor=1.125,
+            )
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"experts": "te_ops", "dispatcher": "deepep"},
+            {"experts": "gmm", "dispatcher": "hybridep"},
+        ],
+    )
+    def test_rank_capacity_requires_hybridep_te_ops(self, kwargs):
+        with pytest.raises(ValueError, match="dispatcher='hybridep' and experts='te_ops'"):
+            BackendConfig(
+                **kwargs,
+                full_iteration_cuda_graph=True,
+                moe_expert_rank_capacity_factor=1.125,
+            )
+
+    def test_paged_stash_requires_rank_capacity(self):
+        with pytest.raises(ValueError, match="requires moe_expert_rank_capacity_factor"):
+            BackendConfig(
+                experts="te_ops",
+                dispatcher="hybridep",
+                full_iteration_cuda_graph=True,
+                moe_paged_stash=True,
+            )
+
+    def test_paged_stash_requires_two_warmups(self):
+        with pytest.raises(ValueError, match="at least two"):
+            BackendConfig(
+                experts="te_ops",
+                dispatcher="hybridep",
+                full_iteration_cuda_graph=True,
+                full_iteration_cuda_graph_warmup_steps=1,
+                moe_expert_rank_capacity_factor=1.125,
+                moe_paged_stash=True,
+                te_fp8={"recipe": "mxfp8"},
+            )
+
+    def test_paged_stash_requires_mxfp8_saved_tensor_markers(self):
+        with pytest.raises(ValueError, match="requires the TE MXFP8 recipe"):
+            BackendConfig(
+                experts="te_ops",
+                dispatcher="hybridep",
+                full_iteration_cuda_graph=True,
+                moe_expert_rank_capacity_factor=1.125,
+                moe_paged_stash=True,
+            )
+
+    def test_paged_stash_rejects_unimplemented_host_spill(self):
+        with pytest.raises(ValueError, match="does not yet support pinned-host spill"):
+            BackendConfig(
+                experts="te_ops",
+                dispatcher="hybridep",
+                full_iteration_cuda_graph=True,
+                moe_expert_rank_capacity_factor=1.125,
+                moe_paged_stash=True,
+                moe_paged_stash_buffer_size_factor_cpu=0.25,
+                te_fp8={"recipe": "mxfp8"},
+            )
+
+    def test_full_graph_rejects_host_synchronized_noisy_fake_gate(self):
+        with pytest.raises(ValueError, match="fake_gate_noise>0"):
+            BackendConfig(
+                full_iteration_cuda_graph=True,
+                fake_balanced_gate=True,
+                fake_gate_noise=0.1,
+            )
+
+    def test_full_graph_rejects_fp8_dpa(self):
+        with pytest.raises(ValueError, match="BF16 dot-product attention"):
+            BackendConfig(
+                full_iteration_cuda_graph=True,
+                te_fp8={"recipe": "mxfp8", "fp8_dpa": True},
+            )
+
+
+class TestBackendConfigPartialCudaGraphExpertScopes:
+    """Partial expert scopes retain dynamic-routing validation."""
+
     def test_expert_scope_requires_te_ops(self):
         with pytest.raises(ValueError, match="requires experts='te_ops'"):
             BackendConfig(

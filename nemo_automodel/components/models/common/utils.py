@@ -236,6 +236,18 @@ class BackendConfig:
         partial_cuda_graph_layer_limit: Positive number of graph-capable layers per enabled
             partial-graph feature. Limiting the layer count bounds persistent
             forward/backward graph buffers.
+        full_iteration_cuda_graph: Capture and replay the complete gradient-accumulation
+            forward/backward region. Gradient clipping and the optimizer stay eager.
+        full_iteration_cuda_graph_warmup_steps: Number of eager full iterations before
+            capture. Paged stashing needs at least two to discover its schedule and allocate
+            page pools before capture.
+        full_iteration_cuda_graph_single_mempool: Share one CUDA graph memory pool across
+            full-iteration captures.
+        moe_expert_rank_capacity_factor: Static HybridEP rank receive budget multiplier for
+            the graph fast path. Any over-budget dispatch is detected globally and the whole
+            forward/backward is discarded and rerun dropless before the optimizer.
+        moe_paged_stash: Pack the live prefix of TE grouped-MLP saved tensors into GPU pages
+            while retaining fixed-capacity expert compute buffers for graph replay.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -279,6 +291,14 @@ class BackendConfig:
     partial_cuda_graph_experts: bool = False
     partial_cuda_graph_expert_bucket_tokens: int | None = None
     partial_cuda_graph_layer_limit: int = 0
+    full_iteration_cuda_graph: bool = False
+    full_iteration_cuda_graph_warmup_steps: int = 2
+    full_iteration_cuda_graph_single_mempool: bool = True
+    moe_expert_rank_capacity_factor: float | None = None
+    moe_paged_stash: bool = False
+    moe_paged_stash_page_size: int = 64
+    moe_paged_stash_buffer_size_factor_cuda: float = 1.10
+    moe_paged_stash_buffer_size_factor_cpu: float = 0.0
     te_ops_mxfp8_weight_cache: bool = False
     te_ops_unstacked_parameters: bool = False
 
@@ -336,6 +356,53 @@ class BackendConfig:
             or self.partial_cuda_graph_moe_preprocess
             or self.partial_cuda_graph_experts
         )
+        if self.full_iteration_cuda_graph and partial_cuda_graph_enabled:
+            raise ValueError("full_iteration_cuda_graph is mutually exclusive with partial CUDA graphs")
+        if (
+            isinstance(self.full_iteration_cuda_graph_warmup_steps, bool)
+            or not isinstance(self.full_iteration_cuda_graph_warmup_steps, int)
+            or self.full_iteration_cuda_graph_warmup_steps < 1
+        ):
+            raise ValueError("full_iteration_cuda_graph_warmup_steps must be a positive integer")
+        if self.full_iteration_cuda_graph and self.fake_balanced_gate and self.fake_gate_noise > 0:
+            raise ValueError(
+                "full_iteration_cuda_graph does not support fake_gate_noise>0 because that diagnostic router "
+                "performs a host synchronization; use the learned Gate for varied routing"
+            )
+        if self.full_iteration_cuda_graph and self.te_fp8 is not None:
+            recipe_fp8_dpa = getattr(self.te_fp8.recipe, "fp8_dpa", False)
+            if self.te_fp8.fp8_dpa or recipe_fp8_dpa:
+                raise ValueError("full_iteration_cuda_graph requires BF16 dot-product attention (fp8_dpa=False)")
+        if self.moe_expert_rank_capacity_factor is not None:
+            factor = self.moe_expert_rank_capacity_factor
+            if isinstance(factor, bool) or not isinstance(factor, (int, float)) or factor < 1.0:
+                raise ValueError("moe_expert_rank_capacity_factor must be a number greater than or equal to 1.0")
+            if not self.full_iteration_cuda_graph:
+                raise ValueError("moe_expert_rank_capacity_factor requires full_iteration_cuda_graph=True")
+            if self.dispatcher != "hybridep" or self.experts != "te_ops":
+                raise ValueError("moe_expert_rank_capacity_factor requires dispatcher='hybridep' and experts='te_ops'")
+        if self.moe_paged_stash:
+            if self.moe_expert_rank_capacity_factor is None:
+                raise ValueError("moe_paged_stash requires moe_expert_rank_capacity_factor")
+            configured_recipe = getattr(self.te_fp8, "recipe", None)
+            configured_mxfp8 = configured_recipe == "mxfp8" or (
+                callable(getattr(configured_recipe, "mxfp8", None)) and configured_recipe.mxfp8()
+            )
+            if not configured_mxfp8:
+                raise ValueError(
+                    "moe_paged_stash currently requires the TE MXFP8 recipe because TE 2.16.1 only marks "
+                    "the fused MXFP8 grouped-MLP saved tensors needed for safe prefix packing"
+                )
+            if self.full_iteration_cuda_graph_warmup_steps < 2:
+                raise ValueError("moe_paged_stash requires at least two full-iteration CUDA graph warmup steps")
+            if isinstance(self.moe_paged_stash_page_size, bool) or not isinstance(self.moe_paged_stash_page_size, int):
+                raise ValueError("moe_paged_stash_page_size must be a positive integer")
+            if self.moe_paged_stash_page_size <= 0:
+                raise ValueError("moe_paged_stash_page_size must be a positive integer")
+            if self.moe_paged_stash_buffer_size_factor_cuda <= 0:
+                raise ValueError("moe_paged_stash_buffer_size_factor_cuda must be positive")
+            if self.moe_paged_stash_buffer_size_factor_cpu != 0:
+                raise ValueError("AutoModel moe_paged_stash does not yet support pinned-host spill")
         if partial_cuda_graph_enabled and self.partial_cuda_graph_layer_limit <= 0:
             raise ValueError("partial_cuda_graph_layer_limit must be positive when partial CUDA graphs are enabled")
         if self.partial_cuda_graph_attention and self.attn != "te":
@@ -363,13 +430,9 @@ class BackendConfig:
             if self.experts != "te_ops":
                 raise ValueError("te_ops_unstacked_parameters requires experts='te_ops'")
             if self.te_ops_mxfp8_weight_cache:
-                raise ValueError(
-                    "te_ops_unstacked_parameters is incompatible with te_ops_mxfp8_weight_cache"
-                )
+                raise ValueError("te_ops_unstacked_parameters is incompatible with te_ops_mxfp8_weight_cache")
             if self.partial_cuda_graph_experts:
-                raise ValueError(
-                    "te_ops_unstacked_parameters is incompatible with partial_cuda_graph_experts"
-                )
+                raise ValueError("te_ops_unstacked_parameters is incompatible with partial_cuda_graph_experts")
         if self.partial_cuda_graph_expert_bucket_tokens is not None:
             bucket_tokens = self.partial_cuda_graph_expert_bucket_tokens
             if isinstance(bucket_tokens, bool) or not isinstance(bucket_tokens, int) or bucket_tokens <= 0:

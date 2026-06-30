@@ -27,6 +27,7 @@ from .fused_a2a import (
     hybrid_ep_dispatch,
     set_deepep_num_sms,
     set_uccl_num_sms,
+    trim_hybridep_static_budget_padding,
     uccl_fused_combine,
     uccl_fused_dispatch,
 )
@@ -396,6 +397,7 @@ class _HybridEPManager(_DispatchManager):
         moe_hybridep_num_sms: int = 24,
         moe_hybridep_num_sms_preprocessing: Optional[int] = None,
         moe_router_expert_pad_multiple: Optional[int] = None,
+        moe_expert_rank_capacity_factor: Optional[float] = None,
     ):
         self.group = group
         self.num_local_experts = num_local_experts
@@ -405,19 +407,53 @@ class _HybridEPManager(_DispatchManager):
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
         self.moe_hybridep_num_sms_preprocessing = moe_hybridep_num_sms_preprocessing
         self.num_permuted_tokens = None
+        self.moe_expert_rank_capacity_factor: Optional[float] = None
+        self.over_budget: Optional[torch.Tensor] = None
 
         # Metadata
         self.token_probs: Optional[torch.Tensor] = None
         self.routing_map: Optional[torch.Tensor] = None
         # Handle used for combine operation
         self.handle = None
+        self._cuda_graph_handles = []
         self.pad_multiple = moe_router_expert_pad_multiple
+        self.set_static_rank_budget(moe_expert_rank_capacity_factor)
 
         if hybrid_ep_dispatch is None:
             raise ImportError(
                 "HybridEP is not installed. Please install HybridEP package from "
                 "https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep."
             )
+
+    def set_static_rank_budget(self, capacity_factor: Optional[float]) -> None:
+        """Set the static HybridEP receive budget factor, or restore dynamic sizing."""
+        if capacity_factor is not None and (
+            isinstance(capacity_factor, bool) or not isinstance(capacity_factor, (int, float)) or capacity_factor < 1.0
+        ):
+            raise ValueError("moe_expert_rank_capacity_factor must be greater than or equal to 1.0")
+        self.moe_expert_rank_capacity_factor = capacity_factor
+        self.num_permuted_tokens = None
+        self.reset_over_budget()
+
+    def check_over_budget(self) -> Optional[torch.Tensor]:
+        """Return the device-resident flag accumulated by static-budget dispatches."""
+        return self.over_budget
+
+    def reset_over_budget(self) -> None:
+        """Reset the device-resident static-budget overflow flag in place."""
+        if self.over_budget is not None:
+            self.over_budget.zero_()
+
+    def _get_static_num_permuted_tokens(self) -> Optional[int]:
+        """Return the aligned static rank budget for the current routing metadata."""
+        if self.moe_expert_rank_capacity_factor is None:
+            return None
+        if self.routing_map is None:
+            raise RuntimeError("HybridEP routing metadata must be initialized before dispatch")
+        budget = int(self.routing_map.shape[0] * self.router_topk * self.moe_expert_rank_capacity_factor)
+        alignment = self.pad_multiple or 1
+        budget += -budget % alignment
+        return budget
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         """Process routing map and probabilities to prepare dispatch metadata."""
@@ -460,9 +496,9 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
-        # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
-        # This can happen in non-reentrant activation checkpointing mode.
-        self.num_permuted_tokens = None
+        # Recompute the receive-size contract on every call. Dynamic mode must
+        # never reuse a GPU-derived count from a prior checkpoint invocation.
+        self.num_permuted_tokens = self._get_static_num_permuted_tokens()
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
@@ -478,8 +514,23 @@ class _HybridEPManager(_DispatchManager):
             pad_multiple=self.pad_multiple,
         )
 
+        self.dispatched_probs = trim_hybridep_static_budget_padding(
+            self.dispatched_probs,
+            dispatched_hidden.shape[0],
+            tensor_name="dispatched probability",
+            target_name="the dispatched hidden state",
+        )
         self.tokens_per_expert = tokens_per_expert
-        self.num_permuted_tokens = self.tokens_per_expert.sum()
+        if self.moe_expert_rank_capacity_factor is None:
+            self.num_permuted_tokens = self.tokens_per_expert.sum()
+        else:
+            overflow_flag = self.handle[-1]
+            if not isinstance(overflow_flag, torch.Tensor):
+                raise RuntimeError("HybridEP static-budget handle must expose a device overflow tensor at handle[-1]")
+            overflow_flag = overflow_flag.ne(0)
+            if self.over_budget is None:
+                self.over_budget = torch.zeros_like(overflow_flag, dtype=torch.bool)
+            self.over_budget.logical_or_(overflow_flag)
 
         return dispatched_hidden
 
@@ -495,6 +546,9 @@ class _HybridEPManager(_DispatchManager):
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
         )
+        is_current_stream_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+        if torch.cuda.is_available() and is_current_stream_capturing is not None and is_current_stream_capturing():
+            self._cuda_graph_handles.append(self.handle)
         self.handle = None
         self.num_permuted_tokens = None
         return hidden_states
@@ -552,6 +606,12 @@ class TokenDispatcherConfig:
 
     moe_hybridep_num_sms_preprocessing: Optional[int] = None
     """Optional number of SMs to use for HybridEP routing-metadata preprocessing."""
+
+    moe_expert_rank_capacity_factor: Optional[float] = None
+    """Static HybridEP receive budget relative to balanced per-rank routing.
+
+    ``None`` preserves HybridEP's exact dynamic, dropless receive sizing.
+    """
 
     moe_share_token_dispatcher: bool = True
     """Share one communication manager instance across MoE layers for the configured backend."""
@@ -629,6 +689,7 @@ class MoEFlexTokenDispatcher:
             self.num_local_experts,
             self.config.moe_router_dtype,
             self.config.moe_router_expert_pad_multiple,
+            self.config.moe_expert_rank_capacity_factor,
         )
 
         if backend == "uccl_ep":
@@ -703,6 +764,7 @@ class MoEFlexTokenDispatcher:
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                         moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                         moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
+                        moe_expert_rank_capacity_factor=self.config.moe_expert_rank_capacity_factor,
                     ),
                 )
             else:
@@ -715,6 +777,7 @@ class MoEFlexTokenDispatcher:
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                     moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                     moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
+                    moe_expert_rank_capacity_factor=self.config.moe_expert_rank_capacity_factor,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,
@@ -724,6 +787,23 @@ class MoEFlexTokenDispatcher:
             raise ValueError(
                 f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'hybridep', or 'uccl_ep'"
             )
+
+    def set_static_rank_budget(self, capacity_factor: Optional[float]) -> None:
+        """Set HybridEP static rank budgeting, or restore dynamic receive sizing."""
+        if not isinstance(self._comm_manager, _HybridEPManager):
+            raise RuntimeError("Static rank budgeting is only supported by the HybridEP dispatcher")
+        self._comm_manager.set_static_rank_budget(capacity_factor)
+
+    def check_over_budget(self) -> Optional[torch.Tensor]:
+        """Return HybridEP's device-resident static-budget overflow flag."""
+        if not isinstance(self._comm_manager, _HybridEPManager):
+            return None
+        return self._comm_manager.check_over_budget()
+
+    def reset_over_budget(self) -> None:
+        """Reset HybridEP's static-budget overflow flag."""
+        if isinstance(self._comm_manager, _HybridEPManager):
+            self._comm_manager.reset_over_budget()
 
     def _initialize_metadata(self, num_local_tokens: int, probs: torch.Tensor) -> torch.Tensor:
         """

@@ -352,6 +352,23 @@ _hybrid_ep_buffer = None
 _hybrid_ep_buffer_identity = None
 
 
+def trim_hybridep_static_budget_padding(
+    tensor: torch.Tensor,
+    target_num_rows: int,
+    *,
+    tensor_name: str,
+    target_name: str,
+) -> torch.Tensor:
+    """Trim HybridEP static-budget padding while enforcing the row contract."""
+    if tensor.shape[0] == target_num_rows:
+        return tensor
+    if tensor.shape[0] < target_num_rows:
+        raise RuntimeError(
+            f"HybridEP returned fewer {tensor_name} rows than {target_name}: {tensor.shape[0]} < {target_num_rows}"
+        )
+    return tensor[:target_num_rows]
+
+
 def _get_hybrid_ep_buffer_identity(
     group: torch.distributed.ProcessGroup,
     hidden_dim: int,
@@ -526,6 +543,7 @@ class HybridEPCombine(torch.autograd.Function):
             hidden=x, handle=handle, pad_multiple=pad_multiple
         )
         ctx.handle = handle
+        ctx.input_num_tokens = x.shape[0]
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
         return combined_hidden
@@ -540,6 +558,12 @@ class HybridEPCombine(torch.autograd.Function):
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
+        )
+        dispatched_hidden = trim_hybridep_static_budget_padding(
+            dispatched_hidden,
+            ctx.input_num_tokens,
+            tensor_name="combine-backward dispatched hidden",
+            target_name="the combine input",
         )
         return dispatched_hidden, None, None, None
 

@@ -153,6 +153,168 @@ def test_hybridep_manager_forwards_preprocessing_sms_with_dynamic_receive_sizing
     assert manager.num_permuted_tokens == 4
 
 
+def test_hybridep_static_rank_budget_is_aligned_without_freezing_expert_counts():
+    """Static rank sizing keeps each dispatch's live device expert counts."""
+    captured_kwargs = []
+    returned_counts = [torch.tensor([1, 4]), torch.tensor([3, 2])]
+
+    def fake_hybrid_ep_dispatch(**kwargs):
+        call_index = len(captured_kwargs)
+        captured_kwargs.append(kwargs)
+        handle = (object(), torch.tensor(0))
+        return kwargs["x"], kwargs["probs"], None, returned_counts[call_index], handle
+
+    with patch(
+        "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+        new=fake_hybrid_ep_dispatch,
+    ):
+        manager = _HybridEPManager(
+            group=None,
+            num_local_experts=2,
+            num_experts=8,
+            router_topk=2,
+            moe_router_expert_pad_multiple=8,
+            moe_expert_rank_capacity_factor=1.1,
+        )
+        manager.setup_metadata(torch.zeros(5, 8, dtype=torch.bool), torch.zeros(5, 8))
+
+        manager.dispatch(torch.randn(5, 8))
+        first_counts = manager.get_number_of_tokens_per_expert()
+        manager.dispatch(torch.randn(5, 8))
+        second_counts = manager.get_number_of_tokens_per_expert()
+
+    # int(5 tokens * top-2 * 1.1) == 11, aligned up to 8.
+    assert [call["num_permuted_tokens"] for call in captured_kwargs] == [16, 16]
+    assert first_counts is returned_counts[0]
+    assert second_counts is returned_counts[1]
+    assert not torch.equal(first_counts, second_counts)
+
+
+def test_hybridep_static_rank_budget_accumulates_and_resets_device_overflow():
+    """Overflow remains a tensor and accumulates until the iteration resets it."""
+    overflow_flags = iter((torch.tensor(0), torch.tensor(1)))
+
+    def fake_hybrid_ep_dispatch(**kwargs):
+        handle = (object(), next(overflow_flags))
+        return kwargs["x"], kwargs["probs"], None, torch.tensor([2, 2]), handle
+
+    with patch(
+        "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+        new=fake_hybrid_ep_dispatch,
+    ):
+        manager = _HybridEPManager(
+            group=None,
+            num_local_experts=2,
+            num_experts=8,
+            router_topk=2,
+            moe_expert_rank_capacity_factor=1.25,
+        )
+        manager.setup_metadata(torch.zeros(2, 8, dtype=torch.bool), torch.zeros(2, 8))
+
+        manager.dispatch(torch.randn(2, 8))
+        over_budget = manager.check_over_budget()
+        assert isinstance(over_budget, torch.Tensor)
+        assert not over_budget.item()
+
+        manager.dispatch(torch.randn(2, 8))
+        assert manager.check_over_budget().item()
+        assert manager.check_over_budget() is over_budget
+
+        manager.reset_over_budget()
+        assert not manager.check_over_budget().item()
+
+
+def test_hybridep_disabling_static_rank_budget_restores_exact_dynamic_path():
+    """Fallback can restore HybridEP's original dropless dynamic receive sizing."""
+    captured_sizes = []
+
+    def fake_hybrid_ep_dispatch(**kwargs):
+        captured_sizes.append(kwargs["num_permuted_tokens"])
+        handle = (object(), torch.tensor(1)) if kwargs["num_permuted_tokens"] is not None else object()
+        return kwargs["x"], kwargs["probs"], None, torch.tensor([2, 3]), handle
+
+    with patch(
+        "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+        new=fake_hybrid_ep_dispatch,
+    ):
+        manager = _HybridEPManager(
+            group=None,
+            num_local_experts=2,
+            num_experts=8,
+            router_topk=2,
+            moe_router_expert_pad_multiple=8,
+            moe_expert_rank_capacity_factor=1.25,
+        )
+        manager.setup_metadata(torch.zeros(4, 8, dtype=torch.bool), torch.zeros(4, 8))
+
+        manager.dispatch(torch.randn(4, 8))
+        assert manager.check_over_budget().item()
+
+        manager.set_static_rank_budget(None)
+        manager.dispatch(torch.randn(4, 8))
+
+    assert captured_sizes == [16, None]
+    assert manager.moe_expert_rank_capacity_factor is None
+    assert manager.num_permuted_tokens == 5
+    assert not manager.check_over_budget().item()
+
+
+def test_hybridep_dispatch_trims_only_extra_probability_rows():
+    """Static receive padding cannot leave probability rows misaligned with hidden rows."""
+
+    def fake_hybrid_ep_dispatch(**kwargs):
+        dispatched_hidden = torch.randn(4, kwargs["x"].shape[-1])
+        dispatched_probs = torch.randn(6, kwargs["probs"].shape[-1])
+        return dispatched_hidden, dispatched_probs, None, torch.tensor([2, 2]), object()
+
+    with patch(
+        "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+        new=fake_hybrid_ep_dispatch,
+    ):
+        manager = _HybridEPManager(
+            group=None,
+            num_local_experts=2,
+            num_experts=8,
+            router_topk=2,
+        )
+        manager.setup_metadata(torch.zeros(3, 8, dtype=torch.bool), torch.zeros(3, 8))
+        dispatched_hidden = manager.dispatch(torch.randn(3, 8))
+
+    assert dispatched_hidden.shape[0] == 4
+    assert manager.dispatched_probs.shape[0] == dispatched_hidden.shape[0]
+
+
+def test_hybridep_combine_retains_handle_captured_by_cuda_graph():
+    """Opaque HybridEP resources remain alive for later CUDA graph replay."""
+    handle = object()
+
+    with (
+        patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+            new=lambda *args, **kwargs: None,
+        ),
+        patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_combine",
+            new=lambda **kwargs: kwargs["x"],
+        ),
+        patch("torch.cuda.is_available", return_value=True),
+        patch("torch.cuda.is_current_stream_capturing", return_value=True),
+    ):
+        manager = _HybridEPManager(
+            group=None,
+            num_local_experts=2,
+            num_experts=8,
+            router_topk=2,
+        )
+        manager.handle = handle
+        manager.num_permuted_tokens = torch.tensor(4)
+        result = manager.combine(torch.randn(4, 8))
+
+    assert result.shape == (4, 8)
+    assert manager.handle is None
+    assert manager._cuda_graph_handles == [handle]
+
+
 def test_hybridep_shared_manager_identity_includes_preprocessing_sms_for_ep():
     """EP layers share managers only when their HybridEP preprocessing configuration matches."""
     saved_alias = MoEFlexTokenDispatcher.shared_hybridep_manager

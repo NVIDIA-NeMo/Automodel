@@ -290,11 +290,14 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         return 0.0
 
     def run_benchmark(self):
-        """Run the benchmark and always release partial graphs on exit."""
+        """Run the benchmark and always release graph-owned storage on exit."""
         try:
             return self._run_benchmark()
         finally:
-            self._close_partial_cuda_graphs()
+            try:
+                self._close_full_iteration_cuda_graphs()
+            finally:
+                self._close_partial_cuda_graphs()
 
     def _run_benchmark(self):
         """Run the benchmarking loop.
@@ -353,36 +356,39 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             # Time the iteration
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
             with self.timers(iter_timer, log_level=1):
-                # Gradient accumulation loop
                 num_label_tokens = 0
-                loss_buffer = []
-                prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+                if getattr(self, "full_iteration_cuda_graph_manager", None) is not None:
+                    batches = []
+                    for _ga_step_idx in range(ga_steps):
+                        batch = next(dataloader_iter)
+                        batches.append(batch)
+                        num_label_tokens += (batch["labels"] != -100).sum().item()
+                    loss_buffer = self._run_guarded_forward_backward(batches, num_label_tokens=None)
+                else:
+                    # Keep detailed per-microbatch timers for graph-off and
+                    # partial-graph benchmarks. Full-iteration replay is one
+                    # indivisible launch and uses only the outer timer.
+                    loss_buffer = []
+                    prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+                    for ga_step_idx in range(ga_steps):
+                        if ga_step_idx == ga_steps - 1:
+                            prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
-                for ga_step_idx in range(ga_steps):
-                    if ga_step_idx == ga_steps - 1:
-                        prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
-
-                    # Get batch from dataloader
-                    batch = next(dataloader_iter)
-                    torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
-
-                    # Accumulate label tokens locally
-                    num_label_tokens += (batch["labels"] != -100).sum().item()
-
-                    with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
-                        self._forward_backward_step(
-                            ga_step_idx,
-                            batch,
-                            loss_buffer=loss_buffer,
-                            num_label_tokens=None,
-                            num_batches=ga_steps,
-                            is_train=True,
-                        )
-
-                    torch.cuda.nvtx.range_pop()
-
-                    if ga_step_idx == 0:
-                        prepare_after_first_microbatch()
+                        batch = next(dataloader_iter)
+                        torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
+                        num_label_tokens += (batch["labels"] != -100).sum().item()
+                        with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
+                            self._forward_backward_step(
+                                ga_step_idx,
+                                batch,
+                                loss_buffer=loss_buffer,
+                                num_label_tokens=None,
+                                num_batches=ga_steps,
+                                is_train=True,
+                            )
+                        torch.cuda.nvtx.range_pop()
+                        if ga_step_idx == 0:
+                            prepare_after_first_microbatch()
 
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
@@ -483,6 +489,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
     def _log_benchmark_summary(self, steps, warmup_steps, peak_tflops, rank):
         torch.distributed.barrier()
         weight_cache_diagnostics = self._log_te_ops_mxfp8_weight_cache_diagnostics()
+        full_iteration_graph_diagnostics = self._full_iteration_cuda_graph_diagnostics()
+        if rank == 0 and full_iteration_graph_diagnostics["enabled"]:
+            logger.info("Full-iteration CUDA graph diagnostics: %s", full_iteration_graph_diagnostics)
         if rank == 0:
             logger.info(f"{'=' * 60}")
             logger.info("Benchmarking Summary")
@@ -543,6 +552,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "local_batch_size": self.cfg.get("step_scheduler.local_batch_size"),
                 "seq_len": self._bench_seq_len,
                 "te_ops_mxfp8_weight_cache": weight_cache_diagnostics,
+                "full_iteration_cuda_graph": full_iteration_graph_diagnostics,
             }
 
             # Log to wandb as table
@@ -618,7 +628,10 @@ def main(config_path=None):
         recipe.setup()
         recipe.run_benchmark()
     finally:
-        recipe._close_partial_cuda_graphs()
+        try:
+            recipe._close_full_iteration_cuda_graphs()
+        finally:
+            recipe._close_partial_cuda_graphs()
 
 
 if __name__ == "__main__":
