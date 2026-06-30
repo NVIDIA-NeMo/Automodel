@@ -46,6 +46,10 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 )
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
+from nemo_automodel.components.datasets.llm.formatting_utils import (
+    _has_chat_template,
+    _resolve_chat_template,
+)
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -125,6 +129,48 @@ def _gather_full_weight_module(module):
     return module
 
 
+def _apply_target_chat_template(tokenizer, chat_template):
+    """Attach a chat template to the target tokenizer for messages-format DSpark data.
+
+    DSpark renders ``messages`` rows with the tokenizer's chat template, but some
+    targets (e.g. DeepSeek-V4-Flash) ship none. ``recipe_args.chat_template`` (an
+    inline Jinja string or a path to a template / tokenizer_config json) overrides
+    it; it must match the template the training responses were generated with and
+    should mark the assistant span with ``{% generation %}`` so only those tokens
+    carry loss. If no template is supplied and the tokenizer has none, raise rather
+    than silently producing an empty / wrong loss mask.
+    """
+    if chat_template is not None:
+        tokenizer.chat_template = _resolve_chat_template(str(chat_template))
+        return
+    if not _has_chat_template(tokenizer):
+        raise ValueError(
+            "The target tokenizer has no chat template and recipe_args.chat_template "
+            "was not set. DSpark trains on 'messages'-format data, which needs a chat "
+            "template (e.g. DeepSeek-V4-Flash ships none). Set recipe_args.chat_template "
+            "to an inline Jinja string or a template file that matches how the training "
+            "responses were generated."
+        )
+
+
+def _resolve_reduced_target_layers(checkpoint_num_layers, requested):
+    """Validate the optional ``target_num_hidden_layers`` diagnostic override.
+
+    Returns the reduced layer count (an int in ``[1, checkpoint_num_layers]``) or
+    ``None`` when unset. Loading fewer layers lets the full EP / hidden-capture /
+    draft path run on one node (the full DeepSeek-V4-Flash target OOMs at load on a
+    single 8x80GB box); a draft trained against a reduced target is not usable.
+    """
+    if requested is None:
+        return None
+    n = int(requested)
+    if n < 1 or n > checkpoint_num_layers:
+        raise ValueError(
+            f"target_num_hidden_layers={n} must be in [1, {checkpoint_num_layers}] (the checkpoint's depth)."
+        )
+    return n
+
+
 class TrainDSparkRecipe(BaseRecipe):
     """Recipe for DSpark draft-model training on Qwen3, Gemma4, and DeepSeek V4 targets."""
 
@@ -154,6 +200,10 @@ class TrainDSparkRecipe(BaseRecipe):
         is_deepseek_v4_target = target_model_type == _DEEPSEEK_V4_MODEL_TYPE
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+        # DSpark renders 'messages'-format data with the tokenizer's chat template;
+        # some targets (e.g. DeepSeek-V4-Flash) ship none, so recipe_args.chat_template
+        # supplies / overrides it (see the helper for the matching + loss-span rules).
+        _apply_target_chat_template(self.tokenizer, recipe_cfg.get("chat_template", None))
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
         if is_deepseek_v4_target:
@@ -195,6 +245,9 @@ class TrainDSparkRecipe(BaseRecipe):
             recipe_cfg.get("target_layer_ids", None)
             or build_target_layer_ids(num_target_layers, draft_num_hidden_layers)
         )
+        # HFDSparkTargetModel validates target_layer_ids against the actual (possibly
+        # reduced) layer count via common.validate_target_layer_ids, which also accepts
+        # -1 (the embedding output) and enforces strictly-increasing ids.
         self.target_wrapper = HFDSparkTargetModel(self.target_model, target_layer_ids=target_layer_ids)
 
         self.block_size = int(recipe_cfg.get("block_size", 7))
@@ -429,6 +482,26 @@ class TrainDSparkRecipe(BaseRecipe):
         target_config = DeepseekV4Config.from_pretrained(
             target_path, name_or_path=target_path, num_nextn_predict_layers=0
         )
+        # Diagnostic / CI knob: a full 43-layer V4-Flash target dequantizes to
+        # ~63 GiB of experts per rank at ep_size=8 and does NOT fit on a single
+        # 8x80GB node (it OOMs in the expert dequant before the first forward).
+        # Shrinking the layer count loads only the first N layers, so the entire
+        # EP / hidden-capture / draft-training path can be exercised end to end on
+        # one node. ``target_layer_ids`` must then point at layers that exist in
+        # the reduced stack (e.g. [1, 2, 3] for N=4). This is a validation aid:
+        # a draft trained against a reduced target is not a usable drafter for the
+        # full model. Leave it unset for real training (use multi-node ep_size).
+        n_reduced = _resolve_reduced_target_layers(
+            target_config.num_hidden_layers, recipe_cfg.get("target_num_hidden_layers", None)
+        )
+        if n_reduced is not None:
+            logger.warning(
+                "Reducing the DeepSeek V4 target from %d to %d layers "
+                "(target_num_hidden_layers): diagnostic/CI only, not a usable drafter.",
+                target_config.num_hidden_layers,
+                n_reduced,
+            )
+            target_config.num_hidden_layers = n_reduced
         backend = self._build_deepseek_v4_backend(recipe_cfg)
         target_model = NeMoAutoModelForCausalLM.from_config(
             config=target_config,

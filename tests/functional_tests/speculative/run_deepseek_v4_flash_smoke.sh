@@ -4,12 +4,15 @@
 # Validates: distributed V4 target load (expert-parallel + FSDP2, FP8/FP4 dequant)
 #   -> online hidden-state capture across the EP shards -> draft training
 #   -> finite, decreasing three-term loss. This is the path the full config
-#   (deepseek_v4_flash_dspark.yaml) takes, just shrunk to reach a step in minutes.
+#   (deepseek_v4_flash_dspark.yaml) takes, but with the target shrunk to 4 layers
+#   (target_num_hidden_layers=4) so it fits on ONE 8x80GB node and reaches a step
+#   in minutes. The full 43-layer target needs >=2 nodes (see the full config).
 #
 # PREREQUISITES (the smoke cannot pass without these):
 #   * DeepEP (or HybridEP) installed in the env -- the V4 MoE token dispatcher
 #     requires it; without it setup() raises "HybridEP is not installed".
-#   * 8 GPUs, >=80 GiB each (V4-Flash is ~530 GiB bf16, ~66 GiB/rank at ep_size=8).
+#   * 8 GPUs, >=80 GiB each. The smoke loads only 4 target layers (~a few GiB/rank
+#     of experts at ep_size=8); the full target would OOM here, hence the reduction.
 #   * A local DeepSeek-V4-Flash checkpoint.
 #
 # USAGE:
@@ -73,5 +76,6 @@ echo "  1) FP8/FP4 base weights dequantize to bf16 on load (no 'non-finite' on t
 echo "  2) captured hidden states are full per-rank (no all-gather / not a DTensor)"
 echo "  3) frozen V4 target forward runs with a 2D mask + use_cache=False"
 echo "  4) ep_size=8 divides n_routed_experts=256 (32 experts/rank)"
-echo "  5) per-rank weight memory ~66 GiB (nvidia-smi during the run)"
+echo "  5) per-rank memory is small here (only 4 target layers loaded); the FULL"
+echo "     43-layer target needs >=2 nodes (ep_size>=16); it OOMs on one 8x80GB box"
 echo "DONE. Full log: $LOG"

@@ -1,10 +1,16 @@
 # DeepSeek-V4-Flash DSpark SMOKE config: a fast pipeline-sanity run of the REAL
-# recipe path (full V4-Flash target, expert-parallel ep_size=8, tilelang attention,
-# DeepEP dispatcher), shrunk so it reaches a training step in a few minutes. It is
-# NOT a real training run -- use deepseek_v4_flash_dspark.yaml for that. The point
-# is to confirm, end to end on 8 GPUs, that the distributed V4 target loads, the
-# hidden-state capture works across the EP/FSDP shards, the draft trains, and the
-# three-term loss is finite and trends down.
+# recipe path (expert-parallel ep_size=8, DeepEP dispatcher, FP8/FP4 dequant, online
+# hidden-state capture, draft training), shrunk so it reaches a training step in a few
+# minutes ON A SINGLE 8x80GB NODE. It is NOT a real training run; use
+# deepseek_v4_flash_dspark.yaml (>=2 nodes) for that.
+#
+# Why the target is reduced to 4 layers: the full 43-layer V4-Flash dequantizes to
+# ~63 GiB of experts per rank at ep_size=8 and OOMs on 80 GB cards during the load,
+# before the first forward (resident-weight peak, not fixable by seq_length /
+# activation_checkpointing). target_num_hidden_layers=4 loads only the first 4 layers
+# so the whole EP / hidden-capture / draft-training pipeline runs end to end on one
+# node. target_layer_ids=[1,2,3] is the 4-layer equivalent of the full target's late
+# layers [40,41,42]. A draft trained here is a pipeline check, not a usable drafter.
 #
 # Prereq: DeepEP (or HybridEP) installed, 8x>=80GB GPUs, V4-Flash weights local.
 # Run via: tests/functional_tests/speculative/run_deepseek_v4_flash_smoke.sh
@@ -37,16 +43,26 @@ recipe_args:
   num_workers: 0
   num_epochs: 1
 
+  # The V4-Flash tokenizer ships no chat template; a minimal one that marks only the
+  # assistant span as the loss/generation region is enough for a pipeline smoke.
+  chat_template: |-
+    {{ bos_token }}{% for message in messages %}{% if message['role'] == 'user' %}{{ '<｜User｜>' + message['content'] }}{% elif message['role'] == 'assistant' %}{{ '<｜Assistant｜>' }}{% generation %}{{ message['content'] }}{{ eos_token }}{% endgeneration %}{% endif %}{% endfor %}
+
+  # --- smoke: load only the first 4 target layers so the run fits on one node ---
+  target_num_hidden_layers: 4
+
   # --- draft backbone (same as the full config) ---
   draft_num_hidden_layers: 2
   block_size: 5
   num_anchors: 16                # smoke: few anchors per sequence
   mask_token_id: 128799
-  target_layer_ids: [40, 41, 42] # keep the real late-layer capture path
+  target_layer_ids: [1, 2, 3]    # 4-layer equivalent of the full target's late layers [40,41,42]
   freeze_embeddings: true
 
   # --- frozen V4 target backend (the real EP path) ---
-  target_attn_backend: tilelang
+  # eager: reliable everywhere. TileLang is faster but its JIT can fail on some builds
+  # ("_NestedLoopCheckVisitor has no attribute _inst"); switch to tilelang if yours works.
+  target_attn_backend: eager
   target_dispatcher: hybridep
   target_experts: torch_mm
   target_enable_fsdp_optimizations: true
