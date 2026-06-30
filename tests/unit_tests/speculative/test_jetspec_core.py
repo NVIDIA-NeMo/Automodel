@@ -22,9 +22,9 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.speculative.dflash import jetspec_core
-from nemo_automodel.components.speculative.dflash.core import DFlashStepMetrics, NoValidAnchorsError
+from nemo_automodel.components.speculative.dflash.core import NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
-from nemo_automodel.components.speculative.dflash.jetspec_core import JetSpecTrainerModule
+from nemo_automodel.components.speculative.dflash.jetspec_core import JetSpecStepMetrics, JetSpecTrainerModule
 
 VOCAB = 64
 HIDDEN = 32
@@ -92,10 +92,12 @@ def test_forward_returns_finite_loss_and_grads_flow_to_draft():
     trainer = _build_trainer()
     input_ids, hidden, loss_mask, target_logits = _inputs()
     out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask, target_logits=target_logits)
-    assert isinstance(out, DFlashStepMetrics)
+    assert isinstance(out, JetSpecStepMetrics)
     assert torch.isfinite(out.loss) and out.loss.item() > 0
     assert 0.0 <= out.accuracy.item() <= 1.0
     assert out.valid_tokens.item() > 0
+    # accept_len includes the always-accepted anchor (+1) and is capped at block_size.
+    assert 1.0 <= out.accept_len.item() <= BLOCK_SIZE
     out.loss.backward()
     grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
     assert grad > 0
@@ -121,6 +123,9 @@ def test_accuracy_is_vs_target_argmax_not_ground_truth(monkeypatch):
     target_logits[:, :, 0] = 10.0  # target argmax = token 0 at every position
     out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask, target_logits=target_logits)
     assert out.accuracy.item() == 1.0
+    # Every drafted depth agrees with the target -> whole block accepted: accept_len
+    # == block_size (all block_size-1 drafted depths + the anchor).
+    assert out.accept_len.item() == BLOCK_SIZE
 
 
 def test_kd_chunking_matches_unchunked_loss():

@@ -66,12 +66,21 @@ class TrainJetSpecRecipe(TrainDFlashRecipe):
 
     def _run_trainer_step(self, target_batch):
         """Forward through the JetSpec wrapper, passing the captured teacher logits."""
-        return self.trainer_module(
+        metrics = self.trainer_module(
             input_ids=target_batch.input_ids,
             hidden_states=target_batch.hidden_states,
             loss_mask=target_batch.loss_mask,
             target_logits=target_batch.logits,
         )
+        self._last_jetspec_metrics = metrics
+        return metrics
+
+    def _log_extra_train_metrics(self, epoch_idx: int) -> None:
+        """Log the JetSpec acceptance-length proxy (tau) for the most recent step."""
+        m = getattr(self, "_last_jetspec_metrics", None)
+        if m is None:
+            return
+        logger.info("  jetspec: accept_len(tau~)=%.3f", float(m.accept_len))
 
 
 def main(config_path: str | None = None):
