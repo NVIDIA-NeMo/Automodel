@@ -24,12 +24,19 @@ Q  layout:  ``[ block_0 | block_1 | ... | block_{N-1} ]``
 Each query in block *b* attends to:
 
   1. context positions strictly less than ``anchor[b]`` (causal-style prefix)
-  2. its own block's noise positions (bidirectional in-block)
+  2. its own block's noise positions (bidirectional in-block, or causal in-block
+     when ``causal=True`` — see below)
   3. nothing else — other blocks are invisible
 
 The context is never queried *from* (the target LM is frozen, we only need
 its hidden states), so omitting it from Q halves the attention compute vs.
 including context positions in Q.
+
+``causal=False`` (default) is the DFlash mask: in-block attention is
+bidirectional. ``causal=True`` is the JetSpec mask: a query at within-block
+offset ``i`` attends only to noise positions at offset ``j <= i``, so each
+branch follows the target model's autoregressive order (paper §2.2). Offset 0
+(the anchor) still attends to itself, so no query row is ever fully masked.
 """
 
 from __future__ import annotations
@@ -63,6 +70,7 @@ def create_dflash_sdpa_mask(
     block_size: int,
     device: torch.device,
     dtype: torch.dtype,
+    causal: bool = False,
 ) -> torch.Tensor:
     """Build a dense additive attention mask for the SDPA backend.
 
@@ -73,6 +81,8 @@ def create_dflash_sdpa_mask(
         block_size:       block size.
         device:           torch device.
         dtype:            dtype for the additive mask (typically the model dtype).
+        causal:           When True, make in-block attention causal (JetSpec);
+            otherwise it is bidirectional (DFlash).
 
     Returns:
         ``[B, 1, N*block_size, S + N*block_size]`` float tensor: ``0`` at
@@ -94,6 +104,12 @@ def create_dflash_sdpa_mask(
     is_noise = kv_idx >= ctx_len
     kv_block = (kv_idx - ctx_len) // block_size
     noise_visible = is_noise & (q_block == kv_block)
+    if causal:
+        # Block-causal in-block attention (JetSpec): offset i sees only offsets
+        # j <= i. Offset 0 (anchor) still sees itself, so no row is fully masked.
+        q_in_block = q_idx - q_block * block_size
+        kv_in_block = (kv_idx - ctx_len) - kv_block * block_size
+        noise_visible = noise_visible & (kv_in_block <= q_in_block)
 
     keep = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
     # A padding block (``keep`` False) keeps only its in-block (noise) attention,
@@ -115,6 +131,7 @@ def create_dflash_block_mask(
     block_size: int,
     device: torch.device,
     use_compile: bool = True,
+    causal: bool = False,
 ) -> "BlockMask":
     """Build a sparse FlexAttention :class:`BlockMask` for DFlash training.
 
@@ -132,6 +149,8 @@ def create_dflash_block_mask(
         use_compile:      Cache and reuse a torch.compile'd ``create_block_mask``
             across calls (default True). Set to False when running on PyTorch
             builds that hit Inductor errors during compile.
+        causal:           When True, make in-block attention causal (JetSpec);
+            otherwise it is bidirectional (DFlash).
 
     Returns:
         :class:`torch.nn.attention.flex_attention.BlockMask`.
@@ -153,6 +172,12 @@ def create_dflash_block_mask(
         is_noise = kv_idx >= ctx_len
         kv_block = (kv_idx - ctx_len) // block_size
         noise_visible = is_noise & (q_block == kv_block)
+        if causal:
+            # Block-causal in-block attention (JetSpec): offset i sees only
+            # offsets j <= i. Offset 0 (anchor) still sees itself.
+            q_in_block = q_idx - q_block * block_size
+            kv_in_block = (kv_idx - ctx_len) - kv_block * block_size
+            noise_visible = noise_visible & (kv_in_block <= q_in_block)
 
         keep = block_keep_mask[b, safe_q_block]
         in_bounds = q_block < N
