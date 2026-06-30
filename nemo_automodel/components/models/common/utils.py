@@ -219,10 +219,11 @@ class BackendConfig:
         te_ops_mxfp8_weight_cache: Keep a non-registered MXFP8 compute cache for
             ``GroupedExpertsTeOps`` weights while retaining ordinary stacked
             ``nn.Parameter`` owners for optimization and checkpointing. Graph-off
-            training refreshes each projection with one grouped quantization; partial
-            expert graphs use fixed-address preallocated storage. The optimized path
-            requires EP>1 with complete local experts (``ep_shard=1``); an additional
-            expert FSDP shard transparently uses TE's eager weight quantization instead.
+            training lazily refreshes preallocated GEMM-ready MXFP8 storage; partial
+            expert graphs use canonical-scale fixed-address storage with synchronous
+            post-step refresh. The optimized path requires EP>1 with complete local
+            experts (``ep_shard=1``); an additional expert FSDP shard transparently
+            uses TE's eager weight quantization instead.
         partial_cuda_graph_expert_bucket_tokens: Optional fixed physical token capacity
             for partial expert graphs. HybridEP still receives the exact dynamic token
             count; expert inputs at or below this capacity are padded locally for TE and

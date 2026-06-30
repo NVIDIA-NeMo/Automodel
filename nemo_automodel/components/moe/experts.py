@@ -1414,14 +1414,18 @@ class _TeOpsMXFP8WeightCache:
 
     The high-precision ``nn.Parameter`` remains the sole optimizer and checkpoint
     owner. Transformer Engine's grouped tensor is only a compute cache. Graph-off
-    training replaces it with one fused grouped quantization per owner generation.
-    Partial expert CUDA graphs instead refresh preallocated per-member storage so
-    every wrapper and backing-buffer address remains fixed across graph replay.
+    training defaults to lazily refreshed, preallocated GEMM-ready member storage;
+    fused grouped quantization remains available as an internal A/B mode. Partial
+    expert CUDA graphs use preallocated canonical-scale storage with synchronous
+    post-step refresh so every address remains fixed across graph replay.
     """
 
     GROUP_QUANTIZE_MODE = "group_quantize"
+    GEMM_READY_FIXED_MODE = "gemm_ready_fixed"
     FIXED_ADDRESS_MODE = "fixed_address"
-    MODES = frozenset((GROUP_QUANTIZE_MODE, FIXED_ADDRESS_MODE))
+    LAZY_MODES = frozenset((GROUP_QUANTIZE_MODE, GEMM_READY_FIXED_MODE))
+    PREALLOCATED_MODES = frozenset((GEMM_READY_FIXED_MODE, FIXED_ADDRESS_MODE))
+    MODES = LAZY_MODES | PREALLOCATED_MODES
 
     def __init__(
         self,
@@ -1454,10 +1458,10 @@ class _TeOpsMXFP8WeightCache:
             columnwise=True,
         )
         refresh_quantizer.internal = False
-        # Keep compact scales in the cache. TE creates any GEMM-swizzled views
-        # from a shallow alias, preserving the canonical representation needed
-        # again by dgrad during backward.
-        refresh_quantizer.optimize_for_gemm = False
+        # Graph capture keeps the existing compact-scale representation. The
+        # graph-off GEMM-ready mode asks TE to allocate and update the padded,
+        # swizzled scale layout consumed directly by GEMM.
+        refresh_quantizer.optimize_for_gemm = mode == self.GEMM_READY_FIXED_MODE
         self._tex = tex
         self.refresh_quantizer = refresh_quantizer
         self.tensor = None
@@ -1470,7 +1474,7 @@ class _TeOpsMXFP8WeightCache:
         self.member_update_count = 0
         self.buffer_replacement_count = 0
 
-        if mode == self.FIXED_ADDRESS_MODE:
+        if mode in self.PREALLOCATED_MODES:
             grouped_tensor = GroupedTensorStorage.make_grouped_tensor_with_shapes(
                 num_tensors=num_groups,
                 shapes=[(out_features, in_features)] * num_groups,
@@ -1527,13 +1531,30 @@ class _TeOpsMXFP8WeightCache:
         if grouped is None:
             return ()
         members = getattr(grouped, "quantized_tensors", None)
+
+        def offset_identity(offsets: Any) -> Any:
+            if isinstance(offsets, torch.Tensor):
+                return (offsets.data_ptr(), tuple(offsets.shape), offsets.dtype, offsets.device)
+            if offsets is None:
+                return None
+            return tuple(offsets)
+
         return (
             id(grouped),
             tuple(id(member) for member in members) if members is not None else (),
             grouped.rowwise_data.data_ptr(),
+            tuple(grouped.rowwise_data.shape),
             grouped.columnwise_data.data_ptr(),
+            tuple(grouped.columnwise_data.shape),
             grouped.scale_inv.data_ptr(),
+            tuple(grouped.scale_inv.shape),
             grouped.columnwise_scale_inv.data_ptr(),
+            tuple(grouped.columnwise_scale_inv.shape),
+            offset_identity(getattr(grouped, "tensor_offsets", None)),
+            offset_identity(getattr(grouped, "offsets", None)),
+            offset_identity(getattr(grouped, "scale_inv_offsets", None)),
+            offset_identity(getattr(grouped, "columnwise_scale_inv_offsets", None)),
+            bool(getattr(grouped, "_with_gemm_swizzled_scales", False)),
         )
 
     def has_stable_storage_identity(self) -> bool:
@@ -1795,10 +1816,10 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
             return refreshed
 
         def invalidate_mxfp8_weight_cache(self) -> bool:
-            """Mark a graph-off grouped cache stale at an optimizer boundary."""
+            """Mark a lazy graph-off cache stale at an optimizer boundary."""
             if not self.__dict__.get("_mxfp8_weight_cache_enabled", False):
                 return False
-            if self.__dict__.get("_mxfp8_weight_cache_mode") != _TeOpsMXFP8WeightCache.GROUP_QUANTIZE_MODE:
+            if self.__dict__.get("_mxfp8_weight_cache_mode") not in _TeOpsMXFP8WeightCache.LAZY_MODES:
                 return False
             cache_state = self.__dict__.get("_mxfp8_weight_cache")
             if cache_state is not None:
@@ -1826,13 +1847,22 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
                     "columnwise_data_ptr": grouped.columnwise_data.data_ptr(),
                     "rowwise_scale_ptr": grouped.scale_inv.data_ptr(),
                     "columnwise_scale_ptr": grouped.columnwise_scale_inv.data_ptr(),
+                    "rowwise_data_numel": grouped.rowwise_data.numel(),
+                    "columnwise_data_numel": grouped.columnwise_data.numel(),
+                    "rowwise_scale_numel": grouped.scale_inv.numel(),
+                    "columnwise_scale_numel": grouped.columnwise_scale_inv.numel(),
+                    "offsets": tuple(getattr(grouped, "offsets", ()) or ()),
+                    "rowwise_scale_offsets": tuple(getattr(grouped, "scale_inv_offsets", ()) or ()),
+                    "columnwise_scale_offsets": tuple(getattr(grouped, "columnwise_scale_inv_offsets", ()) or ()),
+                    "with_gemm_swizzled_scales": bool(getattr(grouped, "_with_gemm_swizzled_scales", False)),
                     "identity_stable": cache_state.has_stable_storage_identity(),
                 }
             mode = self.__dict__.get("_mxfp8_weight_cache_mode", _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE)
-            requires_fixed_identity = mode == _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE
+            requires_fixed_identity = mode in _TeOpsMXFP8WeightCache.PREALLOCATED_MODES
             return {
                 "enabled": self.__dict__.get("_mxfp8_weight_cache_enabled", False),
                 "mode": mode,
+                "optimize_for_gemm": False if cache_state is None else cache_state.refresh_quantizer.optimize_for_gemm,
                 "allocations": self.__dict__.get("_mxfp8_weight_cache_allocations", 0),
                 "refreshes": refreshes,
                 "group_quantize_calls": 0 if cache_state is None else cache_state.group_quantize_count,
@@ -2195,10 +2225,11 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             configured_mxfp8 and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) > 0
         )
         self._te_ops_mxfp8_weight_cache_requested = bool(getattr(backend, "te_ops_mxfp8_weight_cache", False))
+        self._te_ops_mxfp8_weight_cache_graph_off_mode = _TeOpsMXFP8WeightCache.GEMM_READY_FIXED_MODE
         self._te_ops_mxfp8_weight_cache_mode = (
             _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE
             if bool(getattr(backend, "partial_cuda_graph_experts", False))
-            else _TeOpsMXFP8WeightCache.GROUP_QUANTIZE_MODE
+            else self._te_ops_mxfp8_weight_cache_graph_off_mode
         )
         # Keep the cache disabled until EP>1 construction reports whether an
         # additional expert FSDP dimension is active. This prevents ep_shard>1
@@ -2365,7 +2396,7 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
 
     def configure_mxfp8_weight_cache_for_partial_graph(self, *, captured: bool) -> None:
         """Use fixed storage only for expert layers selected for graph capture."""
-        mode = _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE if captured else _TeOpsMXFP8WeightCache.GROUP_QUANTIZE_MODE
+        mode = _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE if captured else self._te_ops_mxfp8_weight_cache_graph_off_mode
         if mode == self._te_ops_mxfp8_weight_cache_mode:
             return
         self._te_ops_mxfp8_weight_cache_mode = mode
@@ -2600,7 +2631,7 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
         # This stays outside ``_te_grouped_mlp``, which is the partial CUDA-graph
-        # target. For graph-off grouped quantization, the optimizer hook only
+        # target. For graph-off cache modes, the optimizer hook only
         # marks the cache dirty and this first subsequent expert forward refreshes
         # it. Fixed-address graph caches refresh synchronously in the hook. Owner
         # version checks additionally catch ordinary in-place edits, while GA and
@@ -2788,7 +2819,7 @@ def register_te_ops_mxfp8_weight_cache_optimizer_hooks(
             def advance_after_step(_optimizer, _args, _kwargs, *, linears=owned_linears):
                 for linear in linears:
                     mode = linear.__dict__.get("_mxfp8_weight_cache_mode", _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE)
-                    if mode == _TeOpsMXFP8WeightCache.GROUP_QUANTIZE_MODE:
+                    if mode in _TeOpsMXFP8WeightCache.LAZY_MODES:
                         invalidate = getattr(linear, "invalidate_mxfp8_weight_cache", None)
                         if callable(invalidate) and invalidate():
                             linear.__dict__["_mxfp8_weight_cache_optimizer_invalidations"] = (
@@ -2835,7 +2866,9 @@ def collect_te_ops_mxfp8_weight_cache_diagnostics(model_parts: Any) -> dict[str,
         "current_caches": 0,
         "dirty_caches": 0,
         "group_quantize_caches": 0,
+        "gemm_ready_fixed_caches": 0,
         "fixed_address_caches": 0,
+        "gemm_optimized_caches": 0,
         "storage_identity_stable": True,
         "identity_policy_satisfied": True,
     }
@@ -2876,7 +2909,9 @@ def collect_te_ops_mxfp8_weight_cache_diagnostics(model_parts: Any) -> dict[str,
                 result["projection_caches"] += 1
                 mode = projection["mode"]
                 result["group_quantize_caches"] += int(mode == _TeOpsMXFP8WeightCache.GROUP_QUANTIZE_MODE)
+                result["gemm_ready_fixed_caches"] += int(mode == _TeOpsMXFP8WeightCache.GEMM_READY_FIXED_MODE)
                 result["fixed_address_caches"] += int(mode == _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE)
+                result["gemm_optimized_caches"] += int(projection["optimize_for_gemm"])
                 result["storage_identity_stable"] &= bool(storage["identity_stable"])
                 cache_ids.append(storage["cache_id"])
                 buffer_identities.append(
