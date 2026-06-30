@@ -19,7 +19,6 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
-import os
 from collections.abc import MutableMapping
 from typing import Any, Iterator, Optional, Union
 
@@ -1119,8 +1118,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                     "padding_mask": padding_mask,
                     "_packed_seq_ids": kwargs.get("_packed_seq_ids"),
                     "_gemma4_vision_group_ids": kwargs.get("_gemma4_vision_group_ids"),
-                    "_gemma4_reference_full_attention": kwargs.get("_gemma4_reference_full_attention"),
-                    "_gemma4_reference_sliding_attention": kwargs.get("_gemma4_reference_sliding_attention"),
                 }
                 # Left set (not cleared) so the activation-checkpoint recompute in
                 # backward sees the same metadata; each CP forward overwrites it.
@@ -1546,24 +1543,6 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
         if _packed_seq_ids is not None:
             prepared_inputs["_packed_seq_ids"] = _packed_seq_ids
 
-        if os.environ.get("NEMO_AUTOMODEL_GEMMA4_CP_COMPARE_REFERENCE_MASK", "").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            reference_mask_mapping = self._prepare_packed_attention_mask_mapping(
-                attention_mask,
-                _packed_seq_ids,
-                mm_token_type_ids,
-                input_ids=input_ids,
-                inputs_embeds=prepared_inputs.get("inputs_embeds"),
-            )
-            if isinstance(reference_mask_mapping, dict):
-                for mask_name, mask_value in reference_mask_mapping.items():
-                    if mask_value is not None:
-                        prepared_inputs[f"_gemma4_reference_{mask_name}"] = mask_value
-
         special_image_mask: torch.Tensor | None = None
         if mm_token_type_ids is not None or pixel_values is not None:
             special_image_mask = (
@@ -1674,8 +1653,6 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
                 "padding_mask": kwargs.get("padding_mask"),
                 "_packed_seq_ids": kwargs.get("_packed_seq_ids"),
                 "_gemma4_vision_group_ids": kwargs.get("_gemma4_vision_group_ids"),
-                "_gemma4_reference_full_attention": kwargs.get("_gemma4_reference_full_attention"),
-                "_gemma4_reference_sliding_attention": kwargs.get("_gemma4_reference_sliding_attention"),
             }
             for module in self.modules():
                 if getattr(module, "_cp_uses_attention_hook", False):
