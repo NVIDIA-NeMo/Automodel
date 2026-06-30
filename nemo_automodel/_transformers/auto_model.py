@@ -421,6 +421,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             logger.info("attn_implementation='te' requested: using 'sdpa' for model init and will inject TE post-init.")
             attn_implementation = "sdpa"
 
+        # FFPA backend setup (validate + register) lives in ffpa_attention; run it
+        # before _apply_preload_overrides, which would otherwise rewrite ffpa → sdpa/
+        # flash_attention_2 for HF models.
+        if attn_implementation == "ffpa":
+            from nemo_automodel.components.attention.ffpa_attention import setup_ffpa_backend
+
+            setup_ffpa_backend(mesh.cp_size, has_packed_sequence)
+
         if is_hf_model:
             attn_implementation, use_liger_kernel = _apply_preload_overrides(
                 mesh.tp_size,
@@ -1059,6 +1067,11 @@ class _NeMoAutoModelForRetrievalBase:
                 "and injecting TE attention post-init."
             )
             attn_implementation = "sdpa"
+
+        if attn_implementation == "ffpa":
+            from nemo_automodel.components.attention.ffpa_attention import register_ffpa_attention
+
+            register_ffpa_attention()
 
         logger.info(f"Loading {cls.__name__} from {pretrained_model_name_or_path}")
 

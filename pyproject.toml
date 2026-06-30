@@ -129,6 +129,7 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
+ffpa = ["ffpa-attn>=0.1.19"]
 fla = [
     "flash-linear-attention>=0.4.2",
 ]
@@ -509,6 +510,8 @@ allowed-unresolved-imports = [
     "deep_ep.**",
     "dion",
     "fast_hadamard_transform",
+    "ffpa_attn",
+    "ffpa_attn.**",
     "fla.**",
     "flash_attn",
     "grouped_gemm",

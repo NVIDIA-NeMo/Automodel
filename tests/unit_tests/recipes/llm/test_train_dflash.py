@@ -132,7 +132,7 @@ def _eval_self(trainer, num_batches):
         "attention_mask": torch.ones(1, 4, dtype=torch.long),
         "loss_mask": torch.ones(1, 4, dtype=torch.long),
     }
-    return SimpleNamespace(
+    obj = SimpleNamespace(
         val_dataloader=[dict(batch) for _ in range(num_batches)],
         device=torch.device("cpu"),
         trainer_module=trainer,
@@ -144,6 +144,11 @@ def _eval_self(trainer, num_batches):
             )
         ),
     )
+    # _run_eval routes the trainer call through the same _run_trainer_step seam as
+    # training (so subclasses inject their extra inputs); bind the base seam, which
+    # forwards (input_ids, hidden_states, loss_mask) to the trainer module.
+    obj._run_trainer_step = TrainDFlashRecipe._run_trainer_step.__get__(obj)
+    return obj
 
 
 def test_run_eval_returns_none_without_val_dataloader():
