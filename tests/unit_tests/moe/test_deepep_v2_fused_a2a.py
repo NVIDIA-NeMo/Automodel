@@ -38,12 +38,17 @@ class _FakeEvent:
 
 
 class _FakeHandle:
-    def __init__(self, topk_idx: torch.Tensor, num_max_tokens_per_rank: int | None = None):
+    def __init__(
+        self,
+        topk_idx: torch.Tensor,
+        num_max_tokens_per_rank: int | None = None,
+        num_sms: int = 7,
+    ):
         self.num_max_tokens_per_rank = (
             num_max_tokens_per_rank if num_max_tokens_per_rank is not None else topk_idx.size(0)
         )
         self.num_recv_tokens_per_expert_list = [2, 0]
-        self.num_sms = 7
+        self.num_sms = num_sms
         self.topk_idx = topk_idx
         self.psum_num_recv_tokens_per_scaleup_rank = torch.tensor([topk_idx.size(0)], dtype=torch.int32)
         self.psum_num_recv_tokens_per_expert = torch.tensor([2, 2], dtype=torch.int32)
@@ -69,7 +74,11 @@ class _FakeElasticBuffer:
     def dispatch(self, x, topk_idx=None, topk_weights=None, handle=None, **kwargs):
         self.dispatch_kwargs.append(kwargs)
         if handle is None:
-            handle = _FakeHandle(topk_idx, kwargs["num_max_tokens_per_rank"])
+            handle = _FakeHandle(
+                topk_idx,
+                kwargs["num_max_tokens_per_rank"],
+                kwargs["num_sms"],
+            )
             self.dispatch_handles.append(handle)
             return x + 1, topk_idx, topk_weights, handle, _FakeEvent()
         self.dispatch_handles.append(handle)
@@ -313,8 +322,9 @@ def test_deepep_v2_combine_uses_process_global_buffer(monkeypatch):
     assert buffer.combine_handles == [handle]
 
 
-def test_deepep_v2_uses_tuned_qp_count_in_forward_and_backward(monkeypatch):
+def test_deepep_v2_uses_tuned_resources_in_forward_and_backward(monkeypatch):
     _reset_fake_state(monkeypatch)
+    monkeypatch.setattr(fused_a2a, "_deepep_v2_num_sms", 20)
     monkeypatch.setattr(fused_a2a, "_deepep_v2_num_qps", 65)
     group = _FakeGroup()
     x = torch.zeros(2, 256, requires_grad=True)
@@ -334,6 +344,8 @@ def test_deepep_v2_uses_tuned_qp_count_in_forward_and_backward(monkeypatch):
     combined_x.sum().backward()
 
     buffer = fused_a2a._deepep_v2_buffer
+    assert [kwargs["num_sms"] for kwargs in buffer.dispatch_kwargs] == [20, 20]
+    assert [kwargs["num_sms"] for kwargs in buffer.combine_kwargs] == [20, 20]
     assert [kwargs["num_qps"] for kwargs in buffer.dispatch_kwargs] == [65, 65]
     assert [kwargs["num_qps"] for kwargs in buffer.combine_kwargs] == [65, 65]
 
