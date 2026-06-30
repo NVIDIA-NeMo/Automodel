@@ -99,6 +99,22 @@ class HFDSparkTargetModel:
             raise ValueError("Could not locate the target's final norm for last-hidden capture")
         return norm
 
+    def _collapse_hc_streams(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Collapse a 4D Hyper-Connection stream ``[B, S, hc_mult, H]`` to ``[B, S, H]``.
+
+        DeepSeek V4 decoder layers emit ``hc_mult`` parallel residual copies; only the
+        final-norm output is already collapsed. For intermediate target-feature layers
+        we reduce the streams with the model's learned ``hc_head`` when it is available
+        (matching the model's own final collapse), falling back to the mean over the
+        stream dimension. Non-HC targets emit 3D states and pass through unchanged.
+        """
+        if tensor.ndim != 4:
+            return tensor
+        hc_head = getattr(self._inner_model(), "hc_head", None)
+        if hc_head is not None:
+            return hc_head(tensor)
+        return tensor.mean(dim=2)
+
     def get_input_embeddings(self) -> nn.Embedding:
         """Return the target model input embeddings."""
         return self.model.get_input_embeddings()
@@ -153,10 +169,12 @@ class HFDSparkTargetModel:
 
         def _feature(layer_id: int) -> torch.Tensor:
             if layer_id == -1:
-                return captured["embed"]
-            if layer_id == last:
-                return captured["norm"]
-            return captured[layer_id]
+                feat = captured["embed"]
+            elif layer_id == last:
+                feat = captured["norm"]
+            else:
+                feat = captured[layer_id]
+            return self._collapse_hc_streams(feat)
 
         target_hidden_states = torch.cat([_feature(layer_id) for layer_id in self.target_layer_ids], dim=-1)
         return DSparkTargetBatch(
