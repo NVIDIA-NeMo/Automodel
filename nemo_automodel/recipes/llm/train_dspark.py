@@ -54,6 +54,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
+from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.speculative.dspark.config import (
@@ -429,6 +430,15 @@ class TrainDSparkRecipe(BaseRecipe):
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
+        self.wandb_run = None
+        if self.dist_env.is_main and self.cfg.get("wandb", None) is not None:
+            suppress_wandb_log_messages()
+            self.wandb_run = init_wandb_run(
+                self.cfg.wandb.to_dict(),
+                self.cfg.to_dict(),
+                default_name="dspark_" + str(target_path).rstrip("/").split("/")[-1],
+            )
+
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
         """Resolve and validate the MASK token id filling non-anchor block positions.
@@ -780,6 +790,23 @@ class TrainDSparkRecipe(BaseRecipe):
         self.trainer_module.train()
         return {"val_loss": (total_loss / total_batches.clamp_min(1)).item()}
 
+    def _wandb_log(self, data: dict, step: int) -> None:
+        """Log rank-zero metrics when a W&B run is active."""
+        run = getattr(self, "wandb_run", None)
+        if run is not None:
+            run.log(data, step=step)
+
+    def _finish_wandb(self) -> None:
+        run = getattr(self, "wandb_run", None)
+        if run is None:
+            return
+        try:
+            run.finish()
+        except Exception:
+            logger.warning("Failed to finish W&B run cleanly.", exc_info=True)
+        finally:
+            self.wandb_run = None
+
     def run_train_validation_loop(self):
         """Run the DSpark training loop."""
         self.trainer_module.train()
@@ -787,6 +814,9 @@ class TrainDSparkRecipe(BaseRecipe):
         if start_epoch >= self.num_epochs:
             if self.dist_env.is_main:
                 logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
+            if getattr(self, "metric_logger", None) is not None:
+                self.metric_logger.close()
+            self._finish_wandb()
             return
 
         pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
@@ -878,6 +908,18 @@ class TrainDSparkRecipe(BaseRecipe):
                                         metrics={**avg, "lr": current_lr, "mem": mem},
                                     )
                                 )
+                                self._wandb_log(
+                                    {
+                                        "train/loss": avg["loss"],
+                                        "train/ce_loss": avg["ce_loss"],
+                                        "train/tv_loss": avg["l1_loss"],
+                                        "train/confidence_loss": avg["confidence_loss"],
+                                        "train/lr": current_lr,
+                                        "train/mem_gib": mem,
+                                        "train/epoch": epoch_idx,
+                                    },
+                                    step=self.runtime.global_step,
+                                )
                                 if pbar is not None:
                                     pbar.set_postfix(loss=f"{avg['loss']:.4f}", lr=f"{current_lr:.2e}")
                                 logger.info(
@@ -915,6 +957,10 @@ class TrainDSparkRecipe(BaseRecipe):
                     msg = f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps}"
                     if eval_metrics is not None:
                         msg += f" val_loss={eval_metrics['val_loss']:.4f}"
+                        self._wandb_log(
+                            {"val/loss": eval_metrics["val_loss"], "val/epoch": epoch_idx},
+                            step=self.runtime.global_step,
+                        )
                     logger.info(msg)
 
                 if getattr(self, "save_checkpoint_every_epoch", False) and last_batch_idx >= 0:
@@ -936,6 +982,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 pbar.close()
             if getattr(self, "metric_logger", None) is not None:
                 self.metric_logger.close()
+            self._finish_wandb()
 
 
 def main(config_path: str | None = None):
