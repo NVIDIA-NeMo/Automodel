@@ -70,6 +70,19 @@ def _alias_pattern(tensors: Sequence[torch.Tensor]) -> tuple[int, ...]:
     return tuple(pattern)
 
 
+def _is_transformer_engine_pybind_enum(value: Any) -> bool:
+    """Return whether ``value`` is an immutable enum exported by TE's extension."""
+    value_type = type(value)
+    members = getattr(value_type, "__members__", None)
+    name = getattr(value, "name", None)
+    return (
+        value_type.__module__ == "transformer_engine_torch"
+        and isinstance(members, dict)
+        and isinstance(name, str)
+        and name in members
+    )
+
+
 def _same_control_value(expected: Any, actual: Any) -> bool:
     """Compare non-tensor graph controls without invoking tensor-like equality."""
     if type(expected) is not type(actual):
@@ -84,6 +97,14 @@ def _same_control_value(expected: Any, actual: Any) -> bool:
         return expected.keys() == actual.keys() and all(
             _same_control_value(expected[key], actual[key]) for key in expected
         )
+    if _is_transformer_engine_pybind_enum(expected) and _is_transformer_engine_pybind_enum(actual):
+        # pybind11 materializes a fresh Python wrapper when a C++ function
+        # returns an enum. TE therefore produces a value-equal but non-identical
+        # fused-attention backend object on every DPA invocation.
+        try:
+            return int(expected) == int(actual)
+        except (TypeError, ValueError):
+            return False
     return expected is actual
 
 

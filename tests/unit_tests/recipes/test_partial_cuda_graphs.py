@@ -23,6 +23,28 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoi
 import nemo_automodel.recipes.llm.partial_cuda_graphs as partial_graphs
 
 
+class _FakeTransformerEnginePybindEnum:
+    """Model the fresh wrappers returned for C++ enums by pybind11."""
+
+    __module__ = "transformer_engine_torch"
+    __members__ = {"BACKEND_ZERO": object(), "BACKEND_ONE": object()}
+
+    def __init__(self, name, value):
+        self.name = name
+        self._value = value
+
+    def __int__(self):
+        return self._value
+
+
+class _FakeNonTeEnumLike:
+    __members__ = {"BACKEND_ONE": object()}
+
+    def __init__(self):
+        self.name = "BACKEND_ONE"
+        self.value = 1
+
+
 def _te_mxfp8_grouped_mlp_supported(te_ops) -> bool:
     """Accept TE 2.16 and the post-2.16 grouped-MLP fuser class names."""
     fused = getattr(te_ops, "fused", None)
@@ -1091,6 +1113,23 @@ def test_non_tensor_control_change_falls_back_eagerly(monkeypatch, caplog):
     assert "builtins.str('weighted')" in caplog.text
     assert "builtins.str('uniform')" in caplog.text
     assert manager.stats()["fallback"] == 1
+
+
+def test_te_pybind_enum_controls_compare_by_immutable_value():
+    expected = _FakeTransformerEnginePybindEnum("BACKEND_ONE", 1)
+    same_value = _FakeTransformerEnginePybindEnum("BACKEND_ONE", 1)
+    different_value = _FakeTransformerEnginePybindEnum("BACKEND_ZERO", 0)
+
+    assert expected is not same_value
+    assert partial_graphs._same_control_value(expected, same_value)
+    assert not partial_graphs._same_control_value(expected, different_value)
+
+
+def test_non_te_enum_like_controls_remain_identity_guarded():
+    expected = _FakeNonTeEnumLike()
+    same_value = _FakeNonTeEnumLike()
+
+    assert not partial_graphs._same_control_value(expected, same_value)
 
 
 def test_explicit_capture_error_is_not_silenced(monkeypatch):
