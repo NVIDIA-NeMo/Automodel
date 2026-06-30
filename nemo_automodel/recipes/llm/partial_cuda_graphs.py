@@ -87,6 +87,18 @@ def _same_control_value(expected: Any, actual: Any) -> bool:
     return expected is actual
 
 
+def _describe_control_value(value: Any) -> str:
+    """Return a bounded diagnostic for one non-tensor graph control."""
+    type_name = f"{type(value).__module__}.{type(value).__qualname__}"
+    try:
+        value_repr = repr(value)
+    except Exception:
+        value_repr = "<repr failed>"
+    if len(value_repr) > 160:
+        value_repr = value_repr[:157] + "..."
+    return f"{type_name}({value_repr})"
+
+
 @dataclass
 class _CapturedCall:
     """Detached sample inputs and the invariants required for a safe replay."""
@@ -175,7 +187,12 @@ class _CapturedCall:
             if index in tensor_position_set:
                 continue
             if not _same_control_value(expected, actual):
-                return False, "non-tensor control changed", ()
+                return (
+                    False,
+                    f"non-tensor control changed at leaf {index}: "
+                    f"expected {_describe_control_value(expected)}, got {_describe_control_value(actual)}",
+                    (),
+                )
 
         return True, "", tuple(unique_tensors)
 

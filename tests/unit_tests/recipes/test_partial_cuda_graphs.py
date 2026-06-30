@@ -1068,7 +1068,7 @@ def test_manager_close_after_capture_failure_releases_retained_storage(monkeypat
     assert entry.expert_graph_storage is None
 
 
-def test_non_tensor_control_change_falls_back_eagerly(monkeypatch):
+def test_non_tensor_control_change_falls_back_eagerly(monkeypatch, caplog):
     _install_fake_graph(monkeypatch)
     module = _DynamicSplitModule()
     entry = _make_entry(module)
@@ -1081,11 +1081,15 @@ def test_non_tensor_control_change_falls_back_eagerly(monkeypatch):
     module(x, splits, probs, splits, probs, mode="weighted")
     manager.capture()
 
-    output = module(x, splits, probs, splits, probs, mode="uniform")
+    with caplog.at_level("WARNING"):
+        output = module(x, splits, probs, splits, probs, mode="uniform")
     torch.testing.assert_close(
         output,
         entry.original_forward(x, splits, probs, splits, probs, mode="uniform"),
     )
+    assert "non-tensor control changed at leaf" in caplog.text
+    assert "builtins.str('weighted')" in caplog.text
+    assert "builtins.str('uniform')" in caplog.text
     assert manager.stats()["fallback"] == 1
 
 
