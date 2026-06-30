@@ -153,3 +153,28 @@ def test_trainer_integration_trains_on_cpu():
     out.loss.backward()
     grads = [p.grad for p in draft.parameters() if p.grad is not None]
     assert grads and all(torch.isfinite(g).all() for g in grads)
+
+
+def test_rope_freqs_stays_fp32_after_bf16_cast():
+    """``draft.to(bf16)`` must not round the MLA RoPE frequencies.
+
+    The EAGLE-3 training build casts the draft with a raw ``.to(dtype=compute_dtype)``;
+    a bf16-rounded ``rope_freqs`` dephases with absolute position (a bf16 round-trip
+    cannot be undone by a later fp32 upcast), so the draft's RoPE would drift from
+    the fp32 target and erode draft acceptance. Every ``rope_freqs`` buffer must
+    stay fp32 (and exact) after the cast.
+    """
+    draft = _build_draft()  # fp32
+    freq_names = [n for n, _ in draft.named_buffers() if n.endswith("rope_freqs")]
+    assert freq_names, "expected at least one rope_freqs buffer on the MLA draft"
+    ref = {n: draft.get_buffer(n).detach().clone().float() for n in freq_names}
+
+    draft = draft.to(torch.bfloat16)
+    for n in freq_names:
+        rope_freqs = draft.get_buffer(n)
+        # Without the fp32 pin this buffer would be bf16 (its frequencies rounded).
+        assert rope_freqs.dtype == torch.float32, n
+        # Recomputed fresh in fp32, not a bf16 round-trip (bf16 rel. error ~1e-2).
+        assert torch.allclose(rope_freqs, ref[n], rtol=1e-6, atol=1e-8), n
+    # The pin is rope-only: the rest of the draft still casts to bf16.
+    assert any(p.dtype == torch.bfloat16 for p in draft.parameters())

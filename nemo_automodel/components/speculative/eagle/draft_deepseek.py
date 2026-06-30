@@ -126,6 +126,37 @@ class Eagle3DeepseekMLAAttention(nn.Module):
         )
         self.register_buffer("rope_freqs", freqs, persistent=False)
 
+    def _apply(self, fn, recurse: bool = True):
+        """Keep the RoPE ``rope_freqs`` buffer in fp32 across dtype casts.
+
+        ``precompute_freqs_cis`` returns fp32 base frequencies, but the EAGLE-3
+        training build casts the whole draft with a raw ``.to(dtype=compute_dtype)``
+        (``train_eagle3.py``), and ``nn.Module.to`` rounds floating-point buffers --
+        so ``rope_freqs`` is downcast to bf16. The rounded frequencies dephase with
+        absolute position (worse with longer context, and a bf16 round-trip cannot
+        be undone by a later fp32 upcast), so the draft's RoPE drifts from the fp32
+        target and draft acceptance erodes. Recompute fresh fp32 frequencies after
+        any cast that would round them, keeping the same fp32 guarantee the Llama
+        draft and the DeepSeek target get by recomputing their RoPE cache from
+        config in fp32.
+        """
+        module = super()._apply(fn, recurse=recurse)
+        rope_freqs = getattr(self, "rope_freqs", None)
+        if (
+            rope_freqs is not None
+            and rope_freqs.is_floating_point()
+            and not rope_freqs.is_meta
+            and rope_freqs.dtype != torch.float32
+        ):
+            fresh = precompute_freqs_cis(
+                self.qk_rope_head_dim,
+                getattr(self.config, "max_position_embeddings", 4096),
+                getattr(self.config, "rope_theta", 10000.0),
+                getattr(self.config, "rope_scaling", None),
+            )
+            self.rope_freqs = fresh.to(device=rope_freqs.device, dtype=torch.float32)
+        return module
+
     def _project_qkv(
         self, combined_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
