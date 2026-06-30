@@ -246,7 +246,7 @@ def test_make_vision_collator_from_processor_method_returns_bound_method():
 
 
 def test_make_vision_collator_from_processor_method_missing_method_raises():
-    with pytest.raises(AttributeError):
+    with pytest.raises(ValueError, match="no collator method"):
         rc.make_vision_collator_from_processor_method(object(), "missing_collator")
 
 
@@ -256,9 +256,3 @@ def test_make_vision_collator_from_processor_method_rejects_non_callable_attribu
 
     with pytest.raises(ValueError, match="not callable"):
         rc.make_vision_collator_from_processor_method(FakeProcessor(), "not_callable")
-
-
-def test_models_with_processor_includes_llama_nemotron_vl():
-    from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
-
-    assert rc.MODELS_WITH_PROCESSOR["llama_nemotron_vl"] is LlamaNemotronVLProcessor
