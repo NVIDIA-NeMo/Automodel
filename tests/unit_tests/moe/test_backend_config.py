@@ -196,6 +196,21 @@ class TestBackendConfigHybridEP:
         config = BackendConfig(dispatcher="deepep_v2", dispatcher_num_sms=20)
         assert config.dispatcher_num_sms == 20
 
+    def test_deepep_v2_dispatcher_num_qps_default(self):
+        """DeepEP v2 defaults to the measured EP64 QP count."""
+        config = BackendConfig(dispatcher="deepep_v2")
+        assert config.dispatcher_num_qps == 33
+
+    def test_deepep_v2_dispatcher_num_qps_custom(self):
+        """An explicit DeepEP v2 QP count overrides the tuned default."""
+        config = BackendConfig(dispatcher="deepep_v2", dispatcher_num_qps=65)
+        assert config.dispatcher_num_qps == 65
+
+    def test_legacy_dispatcher_num_qps_default(self):
+        """Other dispatchers retain the API's automatic QP selection."""
+        config = BackendConfig(dispatcher="deepep")
+        assert config.dispatcher_num_qps == 0
+
     def test_dispatcher_share_token_dispatcher_default(self):
         """Test that dispatcher_share_token_dispatcher defaults to enabled."""
         config = BackendConfig(dispatcher="deepep")

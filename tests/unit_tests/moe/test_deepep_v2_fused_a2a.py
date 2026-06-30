@@ -155,6 +155,14 @@ def test_deepep_v2_num_sms_does_not_mutate_legacy_buffer(monkeypatch):
     assert fused_a2a._deepep_v2_num_sms == 20
 
 
+def test_deepep_v2_num_qps_is_configurable(monkeypatch):
+    monkeypatch.setattr(fused_a2a, "_deepep_v2_num_qps", 0)
+
+    fused_a2a.set_deepep_v2_num_qps(65)
+
+    assert fused_a2a._deepep_v2_num_qps == 65
+
+
 def test_deepep_v2_dispatch_uses_legacy_return_contract(monkeypatch):
     _reset_fake_state(monkeypatch)
 
@@ -307,6 +315,7 @@ def test_deepep_v2_combine_uses_process_global_buffer(monkeypatch):
 
 def test_deepep_v2_uses_tuned_qp_count_in_forward_and_backward(monkeypatch):
     _reset_fake_state(monkeypatch)
+    monkeypatch.setattr(fused_a2a, "_deepep_v2_num_qps", 65)
     group = _FakeGroup()
     x = torch.zeros(2, 256, requires_grad=True)
     token_indices = torch.tensor([[0], [1]], dtype=torch.int64)
@@ -325,8 +334,8 @@ def test_deepep_v2_uses_tuned_qp_count_in_forward_and_backward(monkeypatch):
     combined_x.sum().backward()
 
     buffer = fused_a2a._deepep_v2_buffer
-    assert [kwargs["num_qps"] for kwargs in buffer.dispatch_kwargs] == [33, 33]
-    assert [kwargs["num_qps"] for kwargs in buffer.combine_kwargs] == [33, 33]
+    assert [kwargs["num_qps"] for kwargs in buffer.dispatch_kwargs] == [65, 65]
+    assert [kwargs["num_qps"] for kwargs in buffer.combine_kwargs] == [65, 65]
 
 
 def test_destroy_deepep_v2_buffer_clears_process_global_buffer(monkeypatch):
