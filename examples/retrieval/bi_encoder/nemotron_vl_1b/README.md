@@ -70,3 +70,13 @@ Here is an example on how to fine-tune the [nvidia/llama-nemotron-embed-vl-1b-v2
 torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml
 ```
 
+### Optimized DDP configuration
+
+For higher throughput on the VL retriever path, use [nemotron_vl_1b_optimized_ddp_lbs2.yaml](nemotron_vl_1b_optimized_ddp_lbs2.yaml). This config enables the optimized custom VL backend, Transformer Engine fused components, passage-gather overlap, mask precomputation, and tuned DDP bucket settings.
+
+The config is set up for `local_batch_size=2` and `global_batch_size=64`. On 32 GPUs this avoids gradient accumulation. On 80GB GPUs, set the PyTorch allocator option before launch:
+
+```bash
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized_ddp_lbs2.yaml
+```
