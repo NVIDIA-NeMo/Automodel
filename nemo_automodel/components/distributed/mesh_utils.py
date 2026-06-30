@@ -133,12 +133,12 @@ def _init_named_mesh(spec: _MeshSpec, *, timeout_minutes: int | None = None) -> 
         mesh_dim_names=spec.axes,
         backend_override=_nccl_backend_override(spec.axes, device_type=device_type, timeout_minutes=timeout_minutes),
     )
-    _register_flattened_axes(device_mesh, spec.flattened_axes)
+    _register_flattened_axes(device_mesh, spec.flattened_axes, timeout_minutes=timeout_minutes)
     return device_mesh
 
 
 def _nccl_backend_override(
-    axes: tuple[MeshAxisName, ...],
+    axes: tuple[str, ...],
     *,
     device_type: str,
     timeout_minutes: int | None,
@@ -168,14 +168,25 @@ def _validate_mesh_spec(spec: _MeshSpec) -> None:
 
 
 def _register_flattened_axes(
-    device_mesh: DeviceMesh, flattened_axes: dict[MeshAxisName, tuple[MeshAxisName, ...]]
+    device_mesh: DeviceMesh,
+    flattened_axes: dict[MeshAxisName, tuple[MeshAxisName, ...]],
+    *,
+    timeout_minutes: int | None = None,
 ) -> None:
     if not flattened_axes:
         return
     if not hasattr(device_mesh, "_flatten_mapping"):
         device_mesh._flatten_mapping = {}
+    backend_overrides = _nccl_backend_override(
+        tuple(flattened_axes),
+        device_type=device_mesh.device_type,
+        timeout_minutes=timeout_minutes,
+    )
     for flattened_axis, source_axes in flattened_axes.items():
-        flattened_mesh = device_mesh[source_axes]._flatten(mesh_dim_name=flattened_axis)
+        flattened_mesh = device_mesh[source_axes]._flatten(
+            mesh_dim_name=flattened_axis,
+            backend_override=backend_overrides.get(flattened_axis) if backend_overrides else None,
+        )
         device_mesh._flatten_mapping.setdefault(flattened_axis, flattened_mesh)
 
 
@@ -234,7 +245,12 @@ def _create_fsdp2_device_mesh(
 
     moe_mesh = None
     if ep_size > 1:
-        moe_mesh = _create_moe_mesh(device_mesh, ep_shard_size=ep_shard_size, ep_size=ep_size)
+        moe_mesh = _create_moe_mesh(
+            device_mesh,
+            ep_shard_size=ep_shard_size,
+            ep_size=ep_size,
+            timeout_minutes=timeout_minutes,
+        )
 
     return device_mesh, moe_mesh
 
@@ -266,19 +282,44 @@ def _create_megatron_fsdp_device_mesh(
     )
 
 
-def _create_moe_mesh(device_mesh: DeviceMesh, *, ep_shard_size: int, ep_size: int) -> DeviceMesh:
+def _create_moe_mesh(
+    device_mesh: DeviceMesh,
+    *,
+    ep_shard_size: int,
+    ep_size: int,
+    timeout_minutes: int | None = None,
+) -> DeviceMesh:
     non_pp_axes = (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP, MeshAxisName.TP)
     return _unflatten_compat(
         device_mesh[non_pp_axes]._flatten(),
-        0,
-        (ep_shard_size, ep_size),
-        (MeshAxisName.EP_SHARD, MeshAxisName.EP),
+        axis=0,
+        sizes=(ep_shard_size, ep_size),
+        names=(MeshAxisName.EP_SHARD, MeshAxisName.EP),
+        timeout_minutes=timeout_minutes,
     )
 
 
-def _unflatten_compat(flat_mesh: DeviceMesh, axis: int, sizes: tuple, names: tuple) -> DeviceMesh:
-    """Compatibility shim for DeviceMesh._unflatten(), added in PyTorch 2.10."""
+def _unflatten_compat(
+    flat_mesh: DeviceMesh,
+    axis: int,
+    sizes: tuple,
+    names: tuple,
+    *,
+    timeout_minutes: int | None = None,
+) -> DeviceMesh:
+    """Unflatten a mesh with its NCCL timeout, including the PyTorch 2.9 fallback."""
     if hasattr(flat_mesh, "_unflatten"):
+        if timeout_minutes is not None and flat_mesh.device_type == "cuda":
+            return flat_mesh._unflatten(
+                axis,
+                sizes,
+                names,
+                backend_override=_nccl_backend_override(
+                    names,
+                    device_type=flat_mesh.device_type,
+                    timeout_minutes=timeout_minutes,
+                ),
+            )
         return flat_mesh._unflatten(axis, sizes, names)
     new_mesh_tensor = flat_mesh.mesh.reshape(sizes)
     from torch.distributed.device_mesh import DeviceMesh as _DeviceMesh
