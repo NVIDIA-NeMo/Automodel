@@ -16,6 +16,7 @@ from contextlib import contextmanager, nullcontext
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 import nemo_automodel.recipes.llm.full_iteration_cuda_graph as full_graph
 from nemo_automodel.recipes.llm.full_iteration_cuda_graph import (
@@ -281,3 +282,66 @@ def test_capture_rejects_legacy_tensor_rng_state(mocked_cuda_graph_runtime):
 
     with pytest.raises(FullIterationCudaGraphError, match="graph-safe torch.Generator"):
         manager([{"x": torch.ones(1)}])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph capture")
+def test_manager_replays_nonreentrant_checkpoint_with_rng_and_gradient_parity():
+    device = torch.device("cuda", torch.cuda.current_device())
+    cpu_rng_state = torch.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state(device)
+    manager = None
+
+    def checkpointed_loss_and_grad(x):
+        def randomized_forward(value):
+            dropped = torch.nn.functional.dropout(torch.sin(value), p=0.375, training=True)
+            return dropped * torch.linspace(0.5, 1.5, value.numel(), device=value.device).view_as(value)
+
+        output = checkpoint(
+            randomized_forward,
+            x,
+            use_reentrant=False,
+            preserve_rng_state=True,
+        )
+        loss = output.sum()
+        (grad,) = torch.autograd.grad(loss, x)
+        return loss.detach().clone(), grad.detach().clone()
+
+    inputs = [
+        torch.linspace(-1.0 + 0.25 * index, 1.0 + 0.25 * index, 32, device=device).reshape(4, 8) for index in range(4)
+    ]
+
+    def run_eager_sequence():
+        records = []
+        for values in inputs:
+            loss, grad = checkpointed_loss_and_grad(values.detach().clone().requires_grad_())
+            records.append((loss, grad, torch.rand(13, device=device)))
+        return records
+
+    try:
+        seed = 20260630
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        eager_records = run_eager_sequence()
+
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        manager = FullIterationCudaGraphManager(
+            lambda batches: checkpointed_loss_and_grad(batches[0]["x"]),
+            warmup_iterations=1,
+        )
+        graph_records = []
+        for values in inputs:
+            loss, grad = manager([{"x": values.detach().clone().requires_grad_()}])
+            graph_records.append((loss.clone(), grad.clone(), torch.rand(13, device=device)))
+
+        assert manager.completed_warmups == 1
+        assert manager.capture_count == 1
+        assert manager.replay_count == 2
+        for eager_record, graph_record in zip(eager_records, graph_records):
+            for eager_value, graph_value in zip(eager_record, graph_record):
+                torch.testing.assert_close(graph_value, eager_value, rtol=0, atol=0)
+    finally:
+        if manager is not None:
+            manager.close()
+        torch.set_rng_state(cpu_rng_state)
+        torch.cuda.set_rng_state(cuda_rng_state, device)
