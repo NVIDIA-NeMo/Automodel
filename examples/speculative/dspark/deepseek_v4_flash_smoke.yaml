@@ -1,0 +1,76 @@
+# DeepSeek-V4-Flash DSpark SMOKE config: a fast pipeline-sanity run of the REAL
+# recipe path (full V4-Flash target, expert-parallel ep_size=8, tilelang attention,
+# DeepEP dispatcher), shrunk so it reaches a training step in a few minutes. It is
+# NOT a real training run -- use deepseek_v4_flash_dspark.yaml for that. The point
+# is to confirm, end to end on 8 GPUs, that the distributed V4 target loads, the
+# hidden-state capture works across the EP/FSDP shards, the draft trains, and the
+# three-term loss is finite and trends down.
+#
+# Prereq: DeepEP (or HybridEP) installed, 8x>=80GB GPUs, V4-Flash weights local.
+# Run via: tests/functional_tests/speculative/run_deepseek_v4_flash_smoke.sh
+recipe: TrainDSparkRecipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+distributed:
+  strategy: fsdp2
+  defer_fsdp_grad_sync: true
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8                     # must divide n_routed_experts (256)
+  activation_checkpointing: true # smoke: trade compute for memory headroom
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+recipe_args:
+  target_model_name_or_path: /path/to/DeepSeek-V4-Flash   # <-- set to your local V4-Flash checkout
+  train_data_path: ./v4_smoke_data                         # <-- tiny smoke data (the run script builds it)
+  val_data_path: null
+  output_dir: ./outputs/v4_smoke
+  seq_length: 512                # smoke: short sequences
+  micro_batch_size: 1
+  grad_accumulation_steps: 1     # smoke: optimizer step every micro-batch
+  num_workers: 0
+  num_epochs: 1
+
+  # --- draft backbone (same as the full config) ---
+  draft_num_hidden_layers: 2
+  block_size: 5
+  num_anchors: 16                # smoke: few anchors per sequence
+  mask_token_id: 128799
+  target_layer_ids: [40, 41, 42] # keep the real late-layer capture path
+  freeze_embeddings: true
+
+  # --- frozen V4 target backend (the real EP path) ---
+  target_attn_backend: tilelang
+  target_dispatcher: hybridep
+  target_experts: torch_mm
+  target_enable_fsdp_optimizations: true
+
+  # --- heads + objective (same as the full config) ---
+  markov_rank: 256
+  markov_head_type: vanilla
+  confidence_head_alpha: 1.0
+  confidence_head_with_markov: true
+  ce_loss_alpha: 0.1
+  l1_loss_alpha: 0.9
+  loss_decay_gamma: 4.0
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 1             # smoke: log every step
+  max_grad_norm: 1.0
+
+optimizer:
+  lr: 6.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  warmup_ratio: 0.0              # smoke: no warmup, see movement immediately
+  min_lr_ratio: 0.1
+
+checkpoint:
+  enabled: false                 # smoke: don't write checkpoints
