@@ -3,11 +3,11 @@
 
 # GPT-OSS 120B BF16 throughput recipe at the 26.06 Megatron comparison
 # geometry: 16 GB200 nodes x 4 GPUs, EP64, MBS4, GBS1280 (GA5).
-# AutoModel uses HybridEP because its TE GroupedLinear experts require a flex
-# dispatcher. Activation checkpointing is disabled because this operating point
-# fits and avoids recompute. Detailed sub-step timers are disabled because each
-# timer boundary synchronizes CUDA and serializes adjacent accumulation steps;
-# the synchronized outer iteration timer remains enabled.
+# AutoModel uses stacked TE-ops experts with HybridEP. Activation checkpointing
+# is disabled because this operating point fits and avoids recompute. Detailed
+# sub-step timers are disabled because each timer boundary synchronizes CUDA and
+# serializes adjacent accumulation steps; the synchronized outer iteration timer
+# remains enabled.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
@@ -64,7 +64,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: te
+    experts: te_ops
     dispatcher: hybridep
     dispatcher_num_sms: 32
     fake_balanced_gate: true
@@ -89,14 +89,16 @@ dataloader:
   num_workers: 0
 
 optimizer:
-  _target_: torch.optim.Adam
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   betas: [0.9, 0.999]
   eps: 1e-8
   lr: 0.0001
   weight_decay: 0
-  # At EP==world the TE expert parameters are plain tensors while FSDP-managed
-  # dense parameters are DTensors; foreach cannot batch the mixed types.
-  foreach: false
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+  master_weight_dtype: torch.float32
 
 ci:
   time: "00:40:00"

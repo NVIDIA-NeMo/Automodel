@@ -95,12 +95,16 @@ dataloader:
   num_workers: 0
 
 optimizer:
-  _target_: torch.optim.Adam
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   betas: [0.9, 0.999]
   eps: 1e-8
   lr: 0.0001
   weight_decay: 0
-  foreach: false
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+  master_weight_dtype: torch.float32
 
 ci:
   time: "00:20:00"
