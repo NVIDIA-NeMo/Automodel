@@ -217,6 +217,33 @@ def create_noise_embed(
     return embed_tokens(noise_ids)
 
 
+def pin_rope_inv_freq_fp32(rotary_emb: Optional[nn.Module]) -> None:
+    """Keep a RoPE module's ``inv_freq`` buffer in fp32 after a dtype cast.
+
+    ``module.to(bfloat16)`` (the training build path) rounds the rotary
+    ``inv_freq`` buffer to bf16. The rounded frequencies dephase with absolute
+    position, so the train/inference RoPE diverges (worse with longer context)
+    and draft acceptance erodes, while the serving runtime keeps an fp32 RoPE
+    cache. A bf16 round-trip cannot be undone by upcasting, so recompute fresh
+    fp32 frequencies from the rotary config (the same values HF derives on the
+    fp32 paths). No-op when ``inv_freq`` is already fp32 or on a meta device.
+    """
+    if rotary_emb is None:
+        return
+    inv_freq = getattr(rotary_emb, "inv_freq", None)
+    if inv_freq is None or not inv_freq.is_floating_point() or inv_freq.is_meta or inv_freq.dtype == torch.float32:
+        return
+    rope_init_fn = getattr(rotary_emb, "rope_init_fn", None)
+    config = getattr(rotary_emb, "config", None)
+    if rope_init_fn is None or config is None:
+        return
+    rope_kwargs = getattr(rotary_emb, "rope_kwargs", None) or {}
+    fresh, _ = rope_init_fn(config, inv_freq.device, **rope_kwargs)
+    rotary_emb.inv_freq = fresh.to(device=inv_freq.device, dtype=torch.float32)
+    if getattr(rotary_emb, "original_inv_freq", None) is not None:
+        rotary_emb.original_inv_freq = rotary_emb.inv_freq.clone()
+
+
 __all__ = [
     "DSparkForwardOutput",
     "AcceptRatePredictor",
@@ -227,4 +254,5 @@ __all__ = [
     "build_eval_mask",
     "create_position_ids",
     "create_noise_embed",
+    "pin_rope_inv_freq_fp32",
 ]
