@@ -29,7 +29,10 @@ def _reference_dflash_mask(anchor_positions, block_keep_mask, ctx_len, block_siz
     Mirrors the rules from the DFlash paper §4.2:
     - Block b attends to context positions ``< anchor[b]`` (causal prefix).
     - Block b attends to its own noise positions (bidirectional).
-    - Different blocks invisible; padded-anchor slots see nothing.
+    - Different blocks invisible. A padded-anchor block (keep=False) drops its
+      context attention but keeps its in-block noise attention, so its query
+      rows are never fully masked (a fully-masked row NaNs the dense softmax);
+      its output is discarded by the loss block mask.
     """
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
@@ -38,12 +41,11 @@ def _reference_dflash_mask(anchor_positions, block_keep_mask, ctx_len, block_siz
     for b in range(B):
         for q in range(Q_LEN):
             block_id = q // block_size
-            if not bool(block_keep_mask[b, block_id]):
-                continue
+            keep = bool(block_keep_mask[b, block_id])
             anchor = int(anchor_positions[b, block_id])
             for k in range(KV_LEN):
                 is_ctx = k < ctx_len
-                ctx_ok = is_ctx and (k < anchor)
+                ctx_ok = is_ctx and (k < anchor) and keep
                 is_noise = k >= ctx_len
                 kv_block = (k - ctx_len) // block_size if is_noise else -1
                 noise_ok = is_noise and (kv_block == block_id)
@@ -77,8 +79,14 @@ def test_sdpa_mask_matches_reference():
     assert sdpa.shape == (2, 1, 2 * 4, 8 + 2 * 4)
 
 
-def test_sdpa_mask_respects_block_keep():
-    """Padded anchor slots (keep=False) must attend to nothing."""
+def test_sdpa_mask_padding_block_keeps_in_block_attention():
+    """A padded anchor block (keep=False) drops context but keeps in-block noise.
+
+    A fully-masked query row would NaN the dense softmax (sdpa/eager) and, via the
+    next layer's ``0 * NaN`` value aggregation, poison the whole sample. The
+    padded block must therefore stay self-attending (its output is dropped by the
+    loss block mask), never fully masked.
+    """
     block_size = 4
     ctx_len = 6
     anchor_positions = torch.tensor([[2, 4, 0]], dtype=torch.long)
@@ -93,9 +101,15 @@ def test_sdpa_mask_respects_block_keep():
         dtype=torch.float32,
     )
 
-    # Rows for block 2 (q_idx in [8, 12)) must all be -inf — sees nothing.
     pad_rows = sdpa[0, 0, 2 * block_size : 3 * block_size, :]
-    assert torch.all(torch.isinf(pad_rows) & (pad_rows < 0))
+    # No padded-block row is fully masked (every row has at least one 0 entry).
+    assert not torch.any(torch.all(torch.isinf(pad_rows) & (pad_rows < 0), dim=-1))
+    # Padded block sees only its own block's noise (kv in [ctx + 2*bs, ctx + 3*bs)).
+    own_noise = slice(ctx_len + 2 * block_size, ctx_len + 3 * block_size)
+    assert torch.all(pad_rows[:, own_noise] == 0.0)
+    # ...and nothing in the context or the other blocks' noise.
+    assert torch.all(torch.isinf(pad_rows[:, :ctx_len]) & (pad_rows[:, :ctx_len] < 0))
+    assert torch.all(torch.isinf(pad_rows[:, ctx_len : ctx_len + 2 * block_size]))
 
 
 def test_sdpa_mask_overlapping_anchors():
