@@ -251,8 +251,8 @@ def _as_bool(value) -> bool:
     return bool(value)
 
 
-def _get_retrieval_optimization_bool(cfg, key: str, default=False) -> bool:
-    return _as_bool(cfg.get(f"retrieval_optimization.{key}", default))
+def _get_bi_encoder_optimization_bool(cfg, key: str, default=False) -> bool:
+    return _as_bool(cfg.get(f"bi_encoder_optimization.{key}", default))
 
 
 def _patch_flash_attention_is_packed_sequence_for_non_packed_training() -> bool:
@@ -595,7 +595,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
         setup_logging()
 
-        if _get_retrieval_optimization_bool(self.cfg, "patch_flash_attention_is_packed_sequence"):
+        if _get_bi_encoder_optimization_bool(self.cfg, "patch_flash_attention_is_packed_sequence"):
             if _patch_flash_attention_is_packed_sequence_for_non_packed_training():
                 logger.info("Patched transformers._is_packed_sequence for non-packed retrieval training")
             else:
@@ -699,7 +699,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             tokenizer.pad_token = getattr(tokenizer, "eos_token", getattr(self.tokenizer, "eos_token", None))
             tokenizer.padding_side = "left"
 
-        precompute_bidirectional_mask = _get_retrieval_optimization_bool(self.cfg, "precompute_bidirectional_mask")
+        precompute_bidirectional_mask = _get_bi_encoder_optimization_bool(self.cfg, "precompute_bidirectional_mask")
         bidirectional_mask_model_config = (
             _get_bidirectional_mask_model_config(self.model_parts[0]) if precompute_bidirectional_mask else None
         )
@@ -849,11 +849,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
             use_dist_neg = is_train and getattr(attr_model, "do_distributed_inbatch_negative", False)
             replicate_distributed_loss = use_dist_neg and _as_bool(self.cfg.get("replicate_distributed_loss", False))
             gather_stream_priority = (
-                -1 if _get_retrieval_optimization_bool(self.cfg, "overlap_passage_gather_high_priority") else 0
+                -1 if _get_bi_encoder_optimization_bool(self.cfg, "overlap_passage_gather_high_priority") else 0
             )
             unified_forward = _as_bool(self.cfg.get("unified_query_passage_forward", False))
             overlap_passage_gather = (
-                _get_retrieval_optimization_bool(self.cfg, "overlap_passage_gather_with_query_forward")
+                _get_bi_encoder_optimization_bool(self.cfg, "overlap_passage_gather_with_query_forward")
                 and not unified_forward
             )
             bypass_second_ddp_forward = (
@@ -873,7 +873,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             if unified_forward:
                 bidirectional_mask_model_config = None
                 bidirectional_mask_dtype = None
-                if _get_retrieval_optimization_bool(self.cfg, "precompute_bidirectional_mask"):
+                if _get_bi_encoder_optimization_bool(self.cfg, "precompute_bidirectional_mask"):
                     bidirectional_mask_model_config = _get_bidirectional_mask_model_config(model)
                     bidirectional_mask_dtype = _get_first_parameter_dtype(model)
                 combined, local_q_rows, local_p_rows, passage_attention_mask_for_scores = (
@@ -1068,7 +1068,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         """Run one optimization step with gradient accumulation."""
         loss_buffer = []
         use_batch_prefetch = (
-            _get_retrieval_optimization_bool(self.cfg, "overlap_batch_to_device_with_compute")
+            _get_bi_encoder_optimization_bool(self.cfg, "overlap_batch_to_device_with_compute")
             and torch.cuda.is_available()
             and self.dist_env.device.type == "cuda"
         )

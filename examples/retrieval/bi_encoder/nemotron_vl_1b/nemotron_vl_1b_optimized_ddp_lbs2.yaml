@@ -14,14 +14,15 @@
 
 # Optimized DDP config for Llama Nemotron VL 1B retrieval fine-tuning.
 #
-# This config targets 32 GPUs with local_batch_size=2 and global_batch_size=64
-# so that no gradient accumulation is needed. For the benchmarked 4x8 GPU
-# setting, set:
+# For a throughput-efficient 4x8 GPU DDP run, use this config with:
 #
 #   export PYTORCH_ALLOC_CONF=expandable_segments:True
 #
-# If running on fewer GPUs, either lower global_batch_size or expect gradient
-# accumulation to preserve the global batch.
+# The allocator option helps local_batch_size=2 fit on 80GB GPUs by reducing
+# CUDA memory fragmentation. If your data or model variant needs more memory,
+# lower local_batch_size or enable activation checkpointing. When reducing GPU
+# count, use activation checkpointing if you need a larger per-GPU batch to keep
+# the same global batch without too much gradient accumulation.
 
 recipe: TrainBiEncoderRecipe
 
@@ -29,8 +30,8 @@ seed: 0
 
 temperature: 0.02
 
-# Optional retrieval recipe optimizations used by the benchmarked fast path.
-retrieval_optimization:
+# Optional bi-encoder recipe optimizations used by the fast path.
+bi_encoder_optimization:
   patch_flash_attention_is_packed_sequence: true
   precompute_bidirectional_mask: true
   overlap_passage_gather_with_query_forward: true
