@@ -655,6 +655,7 @@ class MoE(nn.Module):
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,
                     dispatcher_num_sms=backend.dispatcher_num_sms,
+                    dispatcher_num_qps=backend.dispatcher_num_qps,
                     dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
                     dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
@@ -665,6 +666,7 @@ class MoE(nn.Module):
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,
                     dispatcher_num_sms=backend.dispatcher_num_sms,
+                    dispatcher_num_qps=backend.dispatcher_num_qps,
                     dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
                     dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
