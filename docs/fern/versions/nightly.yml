@@ -51,6 +51,9 @@ navigation:
       - page: "Release Log"
         path: ../../model-coverage/latest-models.mdx
         slug: release-log
+      - page: "Troubleshooting Models and First Runs"
+        path: ../../model-coverage/troubleshooting.mdx
+        slug: troubleshooting
       - section: "Large Language Models"
         slug: large-language-models
         contents:
@@ -73,6 +76,7 @@ navigation:
             path: ../../model-coverage/llm/qwen/qwen3-next.mdx
           - page: "ERNIE 4.5"
             path: ../../model-coverage/llm/baidu/ernie4-5.mdx
+            slug: ernie-4-5
           - page: "DeepSeek"
             path: ../../model-coverage/llm/deepseek-ai/deepseek.mdx
           - page: "DeepSeek-V3"
@@ -85,28 +89,34 @@ navigation:
             path: ../../model-coverage/llm/mistralai/mixtral.mdx
           - page: "Ministral3 / Devstral"
             path: ../../model-coverage/llm/mistralai/ministral3.mdx
+            slug: ministral3-devstral
           - page: "Phi"
             path: ../../model-coverage/llm/microsoft/phi.mdx
           - page: "Phi-3 / Phi-4"
             path: ../../model-coverage/llm/microsoft/phi3.mdx
+            slug: phi-3-phi-4
           - page: "Phi-3-Small"
             path: ../../model-coverage/llm/microsoft/phi3-small.mdx
           - page: "Nemotron / Minitron"
             path: ../../model-coverage/llm/nvidia/nemotron.mdx
+            slug: nemotron-minitron
           - page: "Nemotron-H"
             path: ../../model-coverage/llm/nvidia/nemotron-h.mdx
           - page: "Nemotron-Flash"
             path: ../../model-coverage/llm/nvidia/nemotron-flash.mdx
           - page: "Nemotron-Super (Llama-3.3-Nemotron-Super-49B)"
             path: ../../model-coverage/llm/nvidia/nemotron-super.mdx
+            slug: nemotron-super-llama-3-3-nemotron-super-49b
           - page: "ChatGLM"
             path: ../../model-coverage/llm/thudm/chatglm.mdx
           - page: "GLM-4"
             path: ../../model-coverage/llm/thudm/glm4.mdx
           - page: "GLM-4 MoE (GLM-4.5 / GLM-4.7)"
             path: ../../model-coverage/llm/thudm/glm4-moe.mdx
-          - page: "GLM-5 MoE (DSA)"
+            slug: glm-4-moe-glm-4-5-glm-4-7
+          - page: "GLM-5 / GLM-5.2 MoE (DSA)"
             path: ../../model-coverage/llm/thudm/glm5-moe-dsa.mdx
+            slug: glm-5-moe-dsa
           - page: "Granite"
             path: ../../model-coverage/llm/ibm/granite.mdx
           - page: "Granite MoE"
@@ -127,14 +137,17 @@ navigation:
             path: ../../model-coverage/llm/eleutherai/gpt-j.mdx
           - page: "GPT-NeoX / Pythia"
             path: ../../model-coverage/llm/eleutherai/gpt-neox.mdx
+            slug: gpt-neox-pythia
           - page: "StarCoder"
             path: ../../model-coverage/llm/bigcode/starcoder.mdx
           - page: "StarCoder2"
             path: ../../model-coverage/llm/bigcode/starcoder2.mdx
           - page: "Aquila / Aquila2"
             path: ../../model-coverage/llm/baai/aquila.mdx
+            slug: aquila-aquila2
           - page: "Baichuan / Baichuan2"
             path: ../../model-coverage/llm/baichuan-inc/baichuan.mdx
+            slug: baichuan-baichuan2
           - page: "Command-R"
             path: ../../model-coverage/llm/cohere/command-r.mdx
           - page: "Falcon"
@@ -146,7 +159,7 @@ navigation:
           - page: "Jais"
             path: ../../model-coverage/llm/inceptionai/jais.mdx
           - page: "MiniMax-M2"
-            path: ../../model-coverage/llm/minimax/minimax-m2.md
+            path: ../../model-coverage/llm/minimax/minimax-m2.mdx
           - page: "MiniCPM"
             path: ../../model-coverage/llm/openbmb/minicpm.mdx
           - page: "Moonlight"
@@ -161,6 +174,7 @@ navigation:
             path: ../../model-coverage/llm/stabilityai/stablelm.mdx
           - page: "Step-3.5"
             path: ../../model-coverage/llm/stepfun-ai/step-3-5.mdx
+            slug: step-3-5
           - page: "GritLM"
             path: ../../model-coverage/llm/parasail-ai/gritlm.mdx
           - page: "Hy3-preview"
@@ -171,6 +185,7 @@ navigation:
             path: ../../model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
           - page: "Ling 2.0"
             path: ../../model-coverage/llm/inclusionai/ling-2.mdx
+            slug: ling-2-0
       - section: "Vision Language Models"
         slug: vision-language-models
         contents:
@@ -181,20 +196,25 @@ navigation:
             path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
           - page: "Gemma 3 VL / Gemma 3n"
             path: ../../model-coverage/vlm/google/gemma3-vl.mdx
+            slug: gemma-3-vl-gemma-3n
           - page: "Gemma 4"
             path: ../../model-coverage/vlm/google/gemma4.mdx
           - page: "Qwen2.5-VL"
             path: ../../model-coverage/vlm/qwen/qwen2-5-vl.mdx
+            slug: qwen2-5-vl
           - page: "Qwen3-VL / Qwen3-VL-MoE"
             path: ../../model-coverage/vlm/qwen/qwen3-vl.mdx
+            slug: qwen3-vl-qwen3-vl-moe
           - page: "Qwen3.5-VL"
             path: ../../model-coverage/vlm/qwen/qwen3-5-vl.mdx
+            slug: qwen3-5-vl
           - page: "Nemotron-Parse"
             path: ../../model-coverage/vlm/nvidia/nemotron-parse.mdx
           - page: "Ministral3 VL"
             path: ../../model-coverage/vlm/mistralai/ministral3-vl.mdx
           - page: "Mistral Medium 3.5"
             path: ../../model-coverage/vlm/mistralai/mistral-medium-3-5.mdx
+            slug: mistral-medium-3-5
           - page: "Mistral-Small-4"
             path: ../../model-coverage/vlm/mistralai/mistral-small-4.mdx
           - page: "InternVL"
@@ -208,7 +228,11 @@ navigation:
           - page: "LLaVA"
             path: ../../model-coverage/vlm/llava-hf/llava.mdx
           - page: "Step-3.7-Flash"
-            path: ../../model-coverage/vlm/stepfun-ai/step-3-7.md
+            path: ../../model-coverage/vlm/stepfun-ai/step-3-7.mdx
+            slug: step-3-7-flash
+          - page: "MiniMax-M3"
+            path: ../../model-coverage/vlm/minimax/minimax-m3.mdx
+            slug: minimax-m3
       - section: "Multimodal"
         slug: multimodal
         contents:
@@ -227,6 +251,7 @@ navigation:
             path: ../../model-coverage/omni/qwen/qwen3-omni.mdx
           - page: "Qwen2.5-Omni"
             path: ../../model-coverage/omni/qwen/qwen2-5-omni.mdx
+            slug: qwen2-5-omni
           - page: "Phi-4-multimodal"
             path: ../../model-coverage/omni/microsoft/phi4-multimodal.mdx
           - page: "Nemotron-Omni"
@@ -247,12 +272,16 @@ navigation:
             slug: overview
           - page: "Wan 2.1 T2V"
             path: ../../model-coverage/diffusion/wan-ai/wan2-1-t2v.mdx
+            slug: wan-2-1-t2v
           - page: "Wan 2.2 T2V-A14B"
             path: ../../model-coverage/diffusion/wan-ai/wan2-2-t2v.mdx
+            slug: wan-2-2-t2v-a14b
           - page: "FLUX.1-dev"
             path: ../../model-coverage/diffusion/black-forest-labs/flux.mdx
+            slug: flux-1-dev
           - page: "HunyuanVideo 1.5"
             path: ../../model-coverage/diffusion/hunyuanvideo-community/hunyuanvideo.mdx
+            slug: hunyuanvideo-1-5
           - page: "Qwen-Image"
             path: ../../model-coverage/diffusion/qwen/qwen-image.mdx
       - section: "Embedding Models"
@@ -286,7 +315,7 @@ navigation:
         path: ../../guides/llm/finetune.mdx
         slug: sft-peft
       - page: "Function Calling with FunctionGemma"
-        path: ../../guides/llm/toolcalling.md
+        path: ../../guides/llm/toolcalling.mdx
         slug: function-calling
       - page: "Multi-Turn Agent (Tool-Calling) SFT"
         path: ../../guides/llm/agent-sft.mdx
@@ -298,13 +327,13 @@ navigation:
         path: ../../guides/llm/large-moe-finetune.mdx
         slug: large-moe-fine-tuning
       - page: "DeepSeek V4 Flash"
-        path: ../../guides/llm/dsv4-flash.md
+        path: ../../guides/llm/dsv4-flash.mdx
         slug: deepseek-v4-flash
       - page: "Hy3-preview"
-        path: ../../guides/llm/hy3.md
+        path: ../../guides/llm/hy3.mdx
         slug: hy3-preview
       - page: "Nemotron-3-Ultra-550B"
-        path: ../../guides/llm/nemotron-3-ultra.md
+        path: ../../guides/llm/nemotron-3-ultra.mdx
         slug: nemotron-3-ultra
       - page: "Pretraining"
         path: ../../guides/llm/pretraining.mdx
@@ -319,35 +348,41 @@ navigation:
         path: ../../guides/llm/retrieval-finetune.mdx
         slug: retrieval-finetune
       - page: "Gemma 3 / 3n"
-        path: ../../guides/omni/gemma3-3n.md
+        path: ../../guides/omni/gemma3-3n.mdx
         slug: gemma-3-3n
       - page: "Gemma 4 31B"
-        path: ../../guides/vlm/gemma4.md
+        path: ../../guides/vlm/gemma4.mdx
         slug: gemma-4
       - page: "Qwen3.5-VL"
-        path: ../../guides/vlm/qwen3-5.md
+        path: ../../guides/vlm/qwen3-5.mdx
         slug: qwen3-5-vl
       - page: "Nemotron-Omni"
-        path: ../../guides/vlm/nemotron-omni.md
+        path: ../../guides/vlm/nemotron-omni.mdx
         slug: nemotron-omni
       - page: "Mistral Medium 3.5 VL"
-        path: ../../guides/vlm/mistral-medium-3-5.md
+        path: ../../guides/vlm/mistral-medium-3-5.mdx
         slug: mistral-medium-3-5
+      - page: "MiniMax-M3"
+        path: ../../guides/vlm/minimax-m3.mdx
+        slug: minimax-m3
       - page: "Fine-Tune Step-3.7-Flash"
-        path: ../../guides/vlm/step-3-7.md
+        path: ../../guides/vlm/step-3-7.mdx
         slug: step-3-7
       - page: "ASR with Qwen3-Omni"
-        path: ../../guides/audio/qwen3-omni-asr.md
+        path: ../../guides/audio/qwen3-omni-asr.mdx
         slug: qwen3-omni-asr
       - page: "Wan2.1-T2V Fine-Tuning"
         path: ../../guides/diffusion/finetune.mdx
         slug: diffusion-fine-tuning
       - page: "Fine-Tuning DiffusionGemma"
-        path: ../../guides/dllm/diffusiongemma.md
+        path: ../../guides/dllm/diffusiongemma.mdx
         slug: diffusiongemma
       - page: "Train an EAGLE Drafter for Speculative Decoding"
         path: ../../guides/speculative/eagle.mdx
         slug: eagle-speculative-decoding
+      - page: "Train a DSpark Drafter for Speculative Decoding"
+        path: ../../guides/speculative/dspark.mdx
+        slug: dspark-speculative-decoding
       - page: "dLLM Fine-Tuning"
         path: ../../guides/dllm/finetune.mdx
         slug: dllm-fine-tuning
@@ -358,6 +393,7 @@ navigation:
         path: ../../guides/llm/databricks.mdx
         slug: databricks
   - section: "Data"
+    slug: datasets
     contents:
       - page: "Overview"
         path: ../../guides/dataset-overview.mdx
@@ -381,6 +417,7 @@ navigation:
         path: ../../guides/diffusion/dataset.mdx
         slug: diffusion-dataset
   - section: "Run Jobs"
+    slug: job-launchers
     contents:
       - page: "Overview"
         path: ../../launcher/overview.mdx
@@ -401,6 +438,7 @@ navigation:
         path: ../../launcher/skypilot-kubernetes.mdx
         slug: skypilot-k8s
   - section: "Advanced Training"
+    slug: development
     contents:
       - page: "Checkpointing"
         path: ../../guides/checkpointing.mdx
@@ -423,6 +461,9 @@ navigation:
       - page: "MLflow Logging"
         path: ../../guides/mlflow-logging.mdx
         slug: mlflow-logging
+      - page: "Breaking Changes"
+        path: ../../breaking-changes.mdx
+        slug: breaking-changes
   - section: "Reference"
     slug: reference
     contents:
