@@ -50,7 +50,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
@@ -75,9 +75,9 @@ CANONICAL_SHAPES = {
 
 OWNER_SHARD_DIMS = {
     "gate_up_linear._stacked_weight": 2,
-    "gate_up_linear._stacked_bias": 1,
+    "gate_up_linear._stacked_bias": 0,
     "down_linear._stacked_weight": 2,
-    "down_linear._stacked_bias": 1,
+    "down_linear._stacked_bias": 0,
 }
 
 
@@ -237,6 +237,30 @@ def _assert_canonical_state(state: dict[str, torch.Tensor]) -> None:
         assert tuple(state[key].shape) == expected_shape, (key, state[key].shape, expected_shape)
 
 
+def _assert_known_canonical_value_load(experts: GroupedExpertsTeOps, device: torch.device) -> None:
+    """Load known canonical tensors and verify the sharded physical layout round-trip."""
+    model_state = ModelState(experts)
+    template = model_state.state_dict()
+    _assert_canonical_state(template)
+    references: dict[str, torch.Tensor] = {}
+    state_to_load: dict[str, torch.Tensor] = {}
+    for key_idx, (key, tensor) in enumerate(template.items()):
+        values = torch.arange(tensor.numel(), device=device, dtype=torch.float32).reshape(tensor.shape)
+        values = (((values + 17 * key_idx) % 251) - 125).div(1024).to(dtype=tensor.dtype)
+        references[key] = values
+        if isinstance(tensor, DTensor):
+            state_to_load[key] = distribute_tensor(values, tensor.device_mesh, tensor.placements)
+        else:
+            state_to_load[key] = values
+
+    model_state.load_state_dict(state_to_load)
+    observed = model_state.state_dict()
+    _assert_canonical_state(observed)
+    for key, tensor in observed.items():
+        value = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+        torch.testing.assert_close(value, references[key], atol=0, rtol=0)
+
+
 def _checkpoint_roundtrip(
     experts: GroupedExpertsTeOps,
     reference_input: torch.Tensor,
@@ -357,6 +381,46 @@ def main() -> None:
     assert sharded_owner_ids == {name: id(owner) for name, owner in experts.named_parameters()}, (
         "post-FSDP initialization replaced stacked DTensor owner Parameters"
     )
+    _assert_known_canonical_value_load(experts, device)
+    # Restore ordinary scratch initialization before the optimizer/convergence
+    # portion of the guard.
+    experts.init_weights(device)
+
+    # The MXFP8 CuTe path uses block-32 gate/up rows. Validate known canonical
+    # values independently because a TeOps-to-TeOps DCP round-trip can hide a
+    # symmetric local permutation bug.
+    old_fusion_env = os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP")
+    os.environ["NVTE_CUTEDSL_FUSED_GROUPED_MLP"] = "1"
+    try:
+        mx_backend = BackendConfig(
+            attn="sdpa",
+            linear="torch",
+            rms_norm="torch_fp32",
+            rope_fusion=False,
+            experts="te_ops",
+            dispatcher="deepep",
+            te_fp8={"recipe": "mxfp8", "fp8_dpa": False},
+        )
+        mx_experts = GroupedExpertsTeOps(_moe_config(), backend=mx_backend, dispatcher_backend="deepep")
+    finally:
+        if old_fusion_env is None:
+            os.environ.pop("NVTE_CUTEDSL_FUSED_GROUPED_MLP", None)
+        else:
+            os.environ["NVTE_CUTEDSL_FUSED_GROUPED_MLP"] = old_fusion_env
+    assert mx_experts._te_glu_interleave_size == 32
+    mx_experts.ep_size = 1
+    mx_experts.set_moe_mesh(moe_mesh)
+    fully_shard(
+        mx_experts,
+        mesh=ep_shard_mesh,
+        shard_placement_fn=_moe_shard_placement,
+        reshard_after_forward=True,
+        mp_policy=mp_policy,
+    )
+    to_empty_parameters_only(mx_experts, device=device)
+    mx_experts.init_weights(device)
+    _assert_known_canonical_value_load(mx_experts, device)
+    del mx_experts
 
     alias_checks = [0]
 

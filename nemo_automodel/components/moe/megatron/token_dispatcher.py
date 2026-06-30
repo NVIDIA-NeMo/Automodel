@@ -562,6 +562,27 @@ class MoEFlexTokenDispatcher:
     shared_deepep_manager: _DeepepManager = None
     shared_hybridep_manager: _HybridEPManager = None
     shared_uccl_manager: _DeepepManager = None
+    _shared_deepep_managers: dict[tuple, _DeepepManager] = {}
+    _shared_hybridep_managers: dict[tuple, _HybridEPManager] = {}
+    _shared_uccl_managers: dict[tuple, _DeepepManager] = {}
+
+    @classmethod
+    def _get_or_create_shared_manager(cls, backend: str, key: tuple, factory):
+        """Share managers only when communication and padding contracts match."""
+        alias_name = f"shared_{backend}_manager"
+        cache_name = f"_shared_{backend}_managers"
+        # Existing tests and callers reset the public alias to clear process-wide
+        # sharing. Treat that as a request to discard the keyed cache as well.
+        if getattr(cls, alias_name) is None:
+            setattr(cls, cache_name, {})
+        cache = getattr(cls, cache_name)
+        manager = cache.get(key)
+        if manager is None:
+            manager = factory()
+            cache[key] = manager
+        if getattr(cls, alias_name) is None:
+            setattr(cls, alias_name, manager)
+        return manager
 
     def __init__(
         self,
@@ -593,6 +614,16 @@ class MoEFlexTokenDispatcher:
         assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
 
         backend = self.config.moe_flex_dispatcher_backend
+        shared_key = (
+            id(ep_group),
+            self.tp_size * self.config.moe_router_topk,
+            self.config.moe_permute_fusion,
+            self.config.moe_expert_capacity_factor,
+            self.tp_size * self.config.num_moe_experts,
+            self.num_local_experts,
+            self.config.moe_router_dtype,
+            self.config.moe_router_expert_pad_multiple,
+        )
 
         if backend == "uccl_ep":
             if set_uccl_num_sms is not None:
@@ -612,17 +643,21 @@ class MoEFlexTokenDispatcher:
                 _combine_fn=combine_fn,
             )
             if self.config.moe_share_token_dispatcher:
-                if MoEFlexTokenDispatcher.shared_uccl_manager is None:
-                    MoEFlexTokenDispatcher.shared_uccl_manager = _DeepepManager(**manager_kwargs)
-                self._comm_manager = MoEFlexTokenDispatcher.shared_uccl_manager
+                self._comm_manager = self._get_or_create_shared_manager(
+                    "uccl",
+                    (*shared_key, self.config.moe_deepep_num_sms),
+                    lambda: _DeepepManager(**manager_kwargs),
+                )
             else:
                 self._comm_manager = _DeepepManager(**manager_kwargs)
         elif backend == "deepep":
             if set_deepep_num_sms is not None:
                 set_deepep_num_sms(self.config.moe_deepep_num_sms)
             if self.config.moe_share_token_dispatcher:
-                if MoEFlexTokenDispatcher.shared_deepep_manager is None:
-                    MoEFlexTokenDispatcher.shared_deepep_manager = _DeepepManager(
+                self._comm_manager = self._get_or_create_shared_manager(
+                    "deepep",
+                    (*shared_key, self.config.moe_deepep_num_sms),
+                    lambda: _DeepepManager(
                         group=ep_group,
                         router_topk=self.tp_size * self.config.moe_router_topk,
                         permute_fusion=self.config.moe_permute_fusion,
@@ -631,8 +666,8 @@ class MoEFlexTokenDispatcher:
                         num_local_experts=self.num_local_experts,
                         router_dtype=self.config.moe_router_dtype,
                         moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
-                    )
-                self._comm_manager = MoEFlexTokenDispatcher.shared_deepep_manager
+                    ),
+                )
             else:
                 self._comm_manager = _DeepepManager(
                     group=ep_group,
@@ -646,8 +681,10 @@ class MoEFlexTokenDispatcher:
                 )
         elif backend == "hybridep":
             if self.config.moe_share_token_dispatcher:
-                if MoEFlexTokenDispatcher.shared_hybridep_manager is None:
-                    MoEFlexTokenDispatcher.shared_hybridep_manager = _HybridEPManager(
+                self._comm_manager = self._get_or_create_shared_manager(
+                    "hybridep",
+                    (*shared_key, self.config.moe_hybridep_num_sms),
+                    lambda: _HybridEPManager(
                         group=ep_group,
                         num_local_experts=self.num_local_experts,
                         num_experts=self.tp_size * self.config.num_moe_experts,
@@ -655,8 +692,8 @@ class MoEFlexTokenDispatcher:
                         permute_fusion=self.config.moe_permute_fusion,
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                         moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
-                    )
-                self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
+                    ),
+                )
             else:
                 self._comm_manager = _HybridEPManager(
                     group=ep_group,

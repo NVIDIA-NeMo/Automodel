@@ -432,7 +432,7 @@ class TestScaleGradsAndClipGradNorm:
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 2.0)
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 1.0)
 
-    @pytest.mark.parametrize("expert_parent_name", ["mlp", "moe"])
+    @pytest.mark.parametrize("expert_parent_name", ["mlp", "moe", "mixer"])
     @pytest.mark.parametrize("activation_checkpointed", [False, True])
     def test_ep_scaling_for_te_ops_stacked_owners(self, expert_parent_name, activation_checkpointed):
         """Stacked TE-ops weights and biases receive the same EP scaling."""

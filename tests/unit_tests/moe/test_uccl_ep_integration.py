@@ -548,6 +548,51 @@ class TestMoEFlexTokenDispatcherUcclEp:
         # shared_deepep_manager should remain None since we used uccl path
         assert MoEFlexTokenDispatcher.shared_deepep_manager is None
 
+    def test_shared_manager_is_keyed_by_expert_padding_contract(self):
+        """Mixed fused/unfused layers must not reuse incompatible receive padding."""
+        from nemo_automodel.components.moe.megatron.token_dispatcher import (
+            MoEFlexTokenDispatcher,
+            TokenDispatcherConfig,
+            _DeepepManager,
+        )
+
+        group = Mock()
+        group.size.return_value = 2
+
+        def mock_init(self, **kwargs):
+            self.moe_router_expert_pad_multiple = kwargs.get("moe_router_expert_pad_multiple")
+
+        base = dict(
+            moe_flex_dispatcher_backend="deepep",
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_share_token_dispatcher=True,
+        )
+        with patch.object(_DeepepManager, "__init__", mock_init):
+            unpadded = MoEFlexTokenDispatcher(
+                num_local_experts=4,
+                local_expert_indices=list(range(4)),
+                config=TokenDispatcherConfig(**base, moe_router_expert_pad_multiple=None),
+                ep_group=group,
+            )
+            padded = MoEFlexTokenDispatcher(
+                num_local_experts=4,
+                local_expert_indices=list(range(4)),
+                config=TokenDispatcherConfig(**base, moe_router_expert_pad_multiple=256),
+                ep_group=group,
+            )
+            padded_again = MoEFlexTokenDispatcher(
+                num_local_experts=4,
+                local_expert_indices=list(range(4)),
+                config=TokenDispatcherConfig(**base, moe_router_expert_pad_multiple=256),
+                ep_group=group,
+            )
+
+        assert unpadded._comm_manager is not padded._comm_manager
+        assert padded._comm_manager is padded_again._comm_manager
+        assert unpadded._comm_manager.moe_router_expert_pad_multiple is None
+        assert padded._comm_manager.moe_router_expert_pad_multiple == 256
+
 
 # ---------------------------------------------------------------------------
 # uccl_ep/__init__.py – module import and exports
@@ -590,9 +635,7 @@ class TestUCCLBufferIntranodeDetection:
         def mock_buffer_init(self, **kwargs):
             captured_kwargs.update(kwargs)
 
-        with patch.object(Buffer, "__init__", mock_buffer_init), patch.dict(
-            "os.environ", {"LOCAL_WORLD_SIZE": "8"}
-        ):
+        with patch.object(Buffer, "__init__", mock_buffer_init), patch.dict("os.environ", {"LOCAL_WORLD_SIZE": "8"}):
             UCCLBuffer(group, num_nvl_bytes=1024, num_rdma_bytes=2048)
 
         assert captured_kwargs["is_intranode"] is True
@@ -611,9 +654,7 @@ class TestUCCLBufferIntranodeDetection:
         def mock_buffer_init(self, **kwargs):
             captured_kwargs.update(kwargs)
 
-        with patch.object(Buffer, "__init__", mock_buffer_init), patch.dict(
-            "os.environ", {"LOCAL_WORLD_SIZE": "8"}
-        ):
+        with patch.object(Buffer, "__init__", mock_buffer_init), patch.dict("os.environ", {"LOCAL_WORLD_SIZE": "8"}):
             UCCLBuffer(group, num_nvl_bytes=1024, num_rdma_bytes=2048)
 
         assert captured_kwargs["is_intranode"] is False
@@ -632,9 +673,11 @@ class TestUCCLBufferIntranodeDetection:
             captured_kwargs.update(kwargs)
 
         env = {k: v for k, v in os.environ.items() if k != "LOCAL_WORLD_SIZE"}
-        with patch.object(Buffer, "__init__", mock_buffer_init), patch.dict(
-            "os.environ", env, clear=True
-        ), patch("torch.cuda.device_count", return_value=4):
+        with (
+            patch.object(Buffer, "__init__", mock_buffer_init),
+            patch.dict("os.environ", env, clear=True),
+            patch("torch.cuda.device_count", return_value=4),
+        ):
             UCCLBuffer(group, num_nvl_bytes=512, num_rdma_bytes=1024)
 
         # group.size() (2) <= device_count (4), so intranode
@@ -653,9 +696,7 @@ class TestUCCLBufferIntranodeDetection:
         def mock_buffer_init(self, **kwargs):
             captured_kwargs.update(kwargs)
 
-        with patch.object(Buffer, "__init__", mock_buffer_init), patch.dict(
-            "os.environ", {"LOCAL_WORLD_SIZE": "8"}
-        ):
+        with patch.object(Buffer, "__init__", mock_buffer_init), patch.dict("os.environ", {"LOCAL_WORLD_SIZE": "8"}):
             UCCLBuffer(
                 group,
                 num_nvl_bytes=1024,

@@ -42,13 +42,13 @@ class MoEConfig:
     norm_topk_prob: bool
     router_bias: bool = False
     expert_bias: bool = False
-    expert_activation: Literal["swiglu", "swigluoai", "quick_geglu", "geglu", "relu2"] = "swiglu"
+    expert_activation: Literal["swiglu", "swiglu_step", "swigluoai", "quick_geglu", "geglu", "relu2"] = "swiglu"
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
-    # When > 0, ``expert_activation="swiglu"`` dispatches to a clamped FP32
-    # variant (gate clamped at max=limit, up clamped at +/-limit) matching
-    # DeepSeek V4's official ``Expert.forward`` with ``swiglu_limit``.
-    # Default 0.0 preserves the existing ``weighted_bias_swiglu_impl`` path.
+    # When > 0, selects the architecture-specific clamp for SwiGLU variants.
+    # ``swiglu`` clamps the gate preactivation in FP32 (DeepSeek V4), while
+    # ``swiglu_step`` clamps the SiLU output (Step3.5/3.7). Both symmetrically
+    # clamp the up projection. Default 0.0 preserves ordinary SwiGLU.
     swiglu_limit: float = 0.0
     softmax_before_topk: bool = False
     dtype: str | torch.dtype = torch.bfloat16

@@ -99,7 +99,7 @@ def is_gated_activation(activation: str) -> bool:
     Non-gated activations (ReLU²) only use up_proj, requiring up_projs tensor
     with shape [n_experts, dim, inter_dim] - 50% memory savings.
     """
-    return activation in ("swiglu", "swigluoai", "quick_geglu", "geglu")
+    return activation in ("swiglu", "swiglu_step", "swigluoai", "quick_geglu", "geglu")
 
 
 def _permute_tokens_for_grouped_mm(
@@ -631,6 +631,22 @@ def swiglu_clamped_deepep(x, permuted_probs, limit: float):
     return (inter * permuted_probs).to(x.dtype)
 
 
+@torch.compile(fullgraph=True, options={"max_autotune": True})
+def swiglu_step_deepep(x, permuted_probs, limit: float):
+    """Clamped SwiGLU with Step3.5/3.7's post-SiLU gate semantics.
+
+    Step first evaluates ``silu(gate)`` in the projection dtype, then clamps
+    that activated value at ``max=limit``. The up projection is clamped to
+    ``(-limit, +limit)`` before the product. This is intentionally distinct
+    from DeepSeek V4's pre-SiLU gate clamp.
+    """
+    gate, up = torch.chunk(x, 2, dim=-1)
+    gate = F.silu(gate).clamp(max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    inter = gate * up
+    return (inter * permuted_probs).to(x.dtype)
+
+
 def get_expert_activation_for_deepep(config: MoEConfig):
     """Return the DeepEP expert activation function selected by the MoE config."""
 
@@ -638,6 +654,10 @@ def get_expert_activation_for_deepep(config: MoEConfig):
         # DeepSeek V4 uses a clamped FP32 variant when swiglu_limit > 0.
         if getattr(config, "swiglu_limit", 0.0) > 0.0:
             return partial(swiglu_clamped_deepep, limit=config.swiglu_limit)
+        return weighted_bias_swiglu_impl
+    elif config.expert_activation == "swiglu_step":
+        if getattr(config, "swiglu_limit", 0.0) > 0.0:
+            return partial(swiglu_step_deepep, limit=config.swiglu_limit)
         return weighted_bias_swiglu_impl
     elif config.expert_activation == "swigluoai":
         return partial(
@@ -1046,10 +1066,21 @@ class GroupedExpertsTE(nn.Module):
                 bias_param = bias_param.to_local()
             bias_param.data.copy_(stacked[i])
 
-    def _to_ep_dtensor(self, tensor: torch.Tensor) -> torch.Tensor:
+    def _to_ep_dtensor(self, tensor: torch.Tensor, *, ep_shard_dim: int = 1) -> torch.Tensor:
         device_mesh = self.moe_mesh or self.ep_mesh
-        dtensor = create_dtensor_from_local(tensor, device_mesh, self.ep_rank if device_mesh is not None else None)
+        dtensor = create_dtensor_from_local(
+            tensor,
+            device_mesh,
+            self.ep_rank if device_mesh is not None else None,
+            ep_shard_dim=ep_shard_dim,
+        )
         return dtensor
+
+    def _canonical_bias_ep_shard_dim(self) -> int:
+        """Return the ep_shard dimension of the stacked canonical bias view."""
+        # Legacy TE owns one bias vector per expert and FSDP shards each vector,
+        # so stacking those local vectors produces an output-dimension shard.
+        return 1
 
     def _normalize_moe_mesh(self, moe_mesh: Optional[DeviceMesh]) -> Optional[DeviceMesh]:
         if moe_mesh is None:
@@ -1103,7 +1134,7 @@ class GroupedExpertsTE(nn.Module):
         bias = self._get_stacked_bias(self.gate_up_linear)
         if bias is None:
             return None
-        return self._to_ep_dtensor(bias)
+        return self._to_ep_dtensor(bias, ep_shard_dim=self._canonical_bias_ep_shard_dim())
 
     @gate_up_proj_bias.setter
     def gate_up_proj_bias(self, value: Optional[torch.Tensor]) -> None:
@@ -1120,7 +1151,7 @@ class GroupedExpertsTE(nn.Module):
         bias = self._get_stacked_bias(self.down_linear)
         if bias is None:
             return None
-        return self._to_ep_dtensor(bias)
+        return self._to_ep_dtensor(bias, ep_shard_dim=self._canonical_bias_ep_shard_dim())
 
     @down_proj_bias.setter
     def down_proj_bias(self, value: Optional[torch.Tensor]) -> None:
@@ -1570,6 +1601,248 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
     return _StackedTeOpsGroupedLinear
 
 
+def _select_te_ops_activation(
+    config: MoEConfig,
+    full_mxfp8_fusion_requested: bool = False,
+) -> tuple[str, dict[str, Any], bool, bool]:
+    """Select the TE activation op without importing the optional TE package.
+
+    Returns the op name, constructor arguments, whether the activation consumes
+    routing probabilities itself, and whether TE's full MXFP8 grouped-MLP fusion
+    is numerically compatible with the selection.
+    """
+    activation = config.expert_activation
+    full_mxfp8_dims_supported = config.expert_dim % 64 == 0 and config.moe_inter_dim % 64 == 0
+    if activation == "swiglu":
+        swiglu_limit = float(getattr(config, "swiglu_limit", 0.0))
+        if swiglu_limit > 0.0:
+            return (
+                "exact_gated",
+                {"alpha": 1.0, "linear_offset": 0.0, "limit": swiglu_limit},
+                False,
+                False,
+            )
+        full_mxfp8_fusion = full_mxfp8_dims_supported
+        kwargs = {"glu_interleave_size": 32} if full_mxfp8_fusion_requested and full_mxfp8_fusion else {}
+        return "scaled_swiglu", kwargs, True, full_mxfp8_fusion
+
+    if activation == "swiglu_step":
+        swiglu_limit = float(getattr(config, "swiglu_limit", 0.0))
+        if swiglu_limit > 0.0:
+            return (
+                "exact_gated",
+                {
+                    "alpha": 1.0,
+                    "linear_offset": 0.0,
+                    "limit": swiglu_limit,
+                    "clamp_after_gate_activation": True,
+                    "use_input_dtype": True,
+                },
+                False,
+                False,
+            )
+        full_mxfp8_fusion = full_mxfp8_dims_supported
+        kwargs = {"glu_interleave_size": 32} if full_mxfp8_fusion_requested and full_mxfp8_fusion else {}
+        return "scaled_swiglu", kwargs, True, full_mxfp8_fusion
+
+    if activation == "swigluoai":
+        limit = float(config.activation_limit)
+        alpha = float(config.activation_alpha)
+        if limit <= 0.0:
+            return (
+                "exact_gated",
+                {"alpha": alpha, "linear_offset": 1.0, "limit": None},
+                False,
+                False,
+            )
+        full_mxfp8_fusion = (
+            full_mxfp8_dims_supported
+            and math.isclose(alpha, 1.702, abs_tol=1e-3)
+            and math.isclose(limit, 7.0, abs_tol=1e-6)
+        )
+        kwargs = {"limit": limit, "alpha": alpha}
+        if full_mxfp8_fusion_requested and full_mxfp8_fusion:
+            kwargs["glu_interleave_size"] = 32
+        return (
+            "scaled_clamped_qgeglu",
+            kwargs,
+            True,
+            full_mxfp8_fusion,
+        )
+
+    if activation == "quick_geglu":
+        # GPT-OSS checkpoints use element-interleaved gate/up rows. Unfused TE
+        # consumes concatenated rows; the CuTe grouped MLP consumes 32-wide blocks.
+        limit = float(config.activation_limit)
+        alpha = float(config.activation_alpha)
+        full_mxfp8_fusion = (
+            full_mxfp8_dims_supported
+            and math.isclose(alpha, 1.702, abs_tol=1e-3)
+            and math.isclose(limit, 7.0, abs_tol=1e-6)
+        )
+        kwargs = {"limit": limit, "alpha": alpha}
+        if full_mxfp8_fusion_requested and full_mxfp8_fusion:
+            kwargs["glu_interleave_size"] = 32
+        return (
+            "scaled_clamped_qgeglu",
+            kwargs,
+            True,
+            full_mxfp8_fusion,
+        )
+
+    if activation == "geglu":
+        return "geglu", {}, False, False
+    if activation == "relu2":
+        return "scaled_srelu", {}, True, full_mxfp8_dims_supported
+    raise ValueError(f"experts='te_ops' does not support expert_activation={activation!r}")
+
+
+@cache
+def _get_te_ops_custom_classes() -> tuple[type[nn.Module], type[nn.Module]]:
+    """Build the small custom fusible ops used by generic TE experts."""
+    try:
+        from transformer_engine.pytorch import ops as te_ops
+    except ImportError as error:
+        raise ImportError("experts='te_ops' requires Transformer Engine 2.16.1 or newer") from error
+
+    class _TeOpsRowScale(te_ops.BasicOperation):
+        """Multiply every token row by its routing probability."""
+
+        num_extra_inputs: int = 1
+
+        def op_forward(self, *args, **kwargs) -> None:
+            raise RuntimeError("_TeOpsRowScale overrides fuser_forward instead of op_forward")
+
+        def op_backward(self, *args, **kwargs) -> None:
+            raise RuntimeError("_TeOpsRowScale overrides fuser_backward instead of op_backward")
+
+        def fuser_forward(
+            self,
+            basic_op_ctxs,
+            input_: torch.Tensor,
+            *,
+            basic_op_extra_inputs,
+            prev_op_grad_output_quantizer,
+            next_op_input_quantizer,
+            basic_op_kwargs,
+        ):
+            del prev_op_grad_output_quantizer, next_op_input_quantizer, basic_op_kwargs
+            scales = basic_op_extra_inputs[0][0]
+            if tuple(scales.shape) != tuple(input_.shape[:-1]):
+                raise ValueError(
+                    f"TE-ops route scales have shape {tuple(scales.shape)}, expected {tuple(input_.shape[:-1])}"
+                )
+            ctx = basic_op_ctxs[0]
+            if ctx.requires_grad:
+                ctx.extra_input_requires_grad = scales.requires_grad
+                ctx.save_for_backward(input_, scales)
+            return input_ * scales.unsqueeze(-1), [()]
+
+        def fuser_backward(self, basic_op_ctxs, grad_output: torch.Tensor, *, basic_op_grad_extra_outputs):
+            del basic_op_grad_extra_outputs
+            ctx = basic_op_ctxs[0]
+            input_, scales = ctx.saved_tensors
+            # Match autograd's promotion for ``input_ * scales``. In the exact
+            # activation path ``input_`` is FP32 while the following TE linear
+            # returns BF16 dgrad; the canonical explicit BF16 cast promotes that
+            # dgrad back to FP32 before differentiating the FP32 route multiply.
+            compute_dtype = torch.promote_types(torch.promote_types(input_.dtype, scales.dtype), grad_output.dtype)
+            grad_output_compute = grad_output.to(compute_dtype)
+            grad_input = (grad_output_compute * scales.to(compute_dtype).unsqueeze(-1)).to(input_.dtype)
+            grad_scales = None
+            if ctx.extra_input_requires_grad:
+                grad_scales = torch.linalg.vecdot(input_.to(compute_dtype), grad_output_compute).to(scales.dtype)
+            return grad_input, [()], [(grad_scales,)]
+
+    class _TeOpsExactGatedActivation(te_ops.BasicOperation):
+        """Exact FP32 gated activation for variants without a native TE op."""
+
+        def __init__(
+            self,
+            *,
+            alpha: float,
+            linear_offset: float,
+            limit: float | None,
+            clamp_after_gate_activation: bool = False,
+            use_input_dtype: bool = False,
+        ) -> None:
+            super().__init__()
+            self.alpha = alpha
+            self.linear_offset = linear_offset
+            self.limit = limit
+            self.clamp_after_gate_activation = clamp_after_gate_activation
+            self.use_input_dtype = use_input_dtype
+
+        def op_forward(
+            self,
+            ctx,
+            input_: torch.Tensor,
+            prev_op_grad_output_quantizer,
+            next_op_input_quantizer,
+        ) -> torch.Tensor:
+            del prev_op_grad_output_quantizer, next_op_input_quantizer
+            if input_.shape[-1] % 2 != 0:
+                raise ValueError(f"Gated TE activation requires an even width, got {input_.shape[-1]}")
+            gate, up = input_.chunk(2, dim=-1)
+            if not self.use_input_dtype:
+                gate = gate.float()
+                up = up.float()
+            if self.limit is not None and not self.clamp_after_gate_activation:
+                gate = gate.clamp(max=self.limit)
+                up = up.clamp(min=-self.limit, max=self.limit)
+            if self.clamp_after_gate_activation or self.alpha == 1.0:
+                # Keep exact fused SiLU semantics for Step and DeepSeek V4;
+                # decomposing sigmoid + multiply adds a rounding point.
+                activated_gate = F.silu(gate)
+            else:
+                activated_gate = gate * torch.sigmoid(self.alpha * gate)
+            if self.limit is not None and self.clamp_after_gate_activation:
+                activated_gate = activated_gate.clamp(max=self.limit)
+                up = up.clamp(min=-self.limit, max=self.limit)
+            output = activated_gate * (up + self.linear_offset)
+            if ctx.requires_grad:
+                ctx.save_for_backward(input_)
+            # The FP32 variants must keep their activation product in FP32 until
+            # the following row-scale op applies routing probabilities. The
+            # canonical expert path rounds only after that multiply; rounding
+            # here would change both outputs and router/parameter gradients.
+            # Step intentionally evaluates the whole activation in the input
+            # dtype, so preserve its existing BF16/FP16 result.
+            return output.to(input_.dtype) if self.use_input_dtype else output
+
+        def op_backward(self, ctx, grad_output: torch.Tensor):
+            (input_,) = ctx.saved_tensors
+            gate, up = input_.chunk(2, dim=-1)
+            if not self.use_input_dtype:
+                gate = gate.float()
+                up = up.float()
+            gate_mask = None
+            up_mask = None
+            if self.limit is not None and not self.clamp_after_gate_activation:
+                gate_mask = gate <= self.limit
+                up_mask = (up >= -self.limit) & (up <= self.limit)
+                gate = gate.clamp(max=self.limit)
+                up = up.clamp(min=-self.limit, max=self.limit)
+
+            sigmoid = torch.sigmoid(self.alpha * gate)
+            quick_gelu = gate * sigmoid
+            if self.limit is not None and self.clamp_after_gate_activation:
+                gate_mask = quick_gelu <= self.limit
+                up_mask = (up >= -self.limit) & (up <= self.limit)
+                quick_gelu = quick_gelu.clamp(max=self.limit)
+                up = up.clamp(min=-self.limit, max=self.limit)
+            grad_output = grad_output.float()
+            grad_gate = grad_output * (up + self.linear_offset) * sigmoid * (1.0 + self.alpha * gate * (1.0 - sigmoid))
+            grad_up = grad_output * quick_gelu
+            if gate_mask is not None:
+                grad_gate = grad_gate * gate_mask
+            if up_mask is not None:
+                grad_up = grad_up * up_mask
+            return torch.cat((grad_gate, grad_up), dim=-1).to(input_.dtype), ()
+
+    return _TeOpsRowScale, _TeOpsExactGatedActivation
+
+
 class GroupedExpertsTeOps(GroupedExpertsTE):
     """MoE experts using TE fusible ops with one stacked owner per projection."""
 
@@ -1588,9 +1861,19 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         configured_mxfp8 = configured_fp8_recipe == "mxfp8" or (
             callable(getattr(configured_fp8_recipe, "mxfp8", None)) and configured_fp8_recipe.mxfp8()
         )
+        self._te_ops_fp8_configured = backend.te_fp8 is not None
+        self._te_ops_configured_mxfp8 = configured_mxfp8
         self._te_ops_mxfp8_fusion_requested = (
             configured_mxfp8 and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) > 0
         )
+        self._te_ops_full_mxfp8_fusion_eligible = False
+        # Graph buckets may overallocate the physical token buffer while
+        # retaining real splits whenever TE selects its graph-safe GroupedTensor
+        # path. This is deliberately separate from dispatcher padding, which is
+        # required only by the full MXFP8 grouped-MLP fusion.
+        self._te_ops_graph_uses_paged_capacity = False
+        self._te_ops_uses_padded_capacity = False
+        self._te_ops_fuser_owner_signature = None
         self._te_ops_fusion_checked = False
         self.use_te_ops = True
         super().__init__(
@@ -1602,23 +1885,61 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             dispatcher_async_dispatch=dispatcher_async_dispatch,
         )
 
+    def _te_ops_dynamic_splits_graph_capability(self) -> tuple[bool, str]:
+        """Return whether TE reads grouped split values from device at replay."""
+        self._te_ops_graph_uses_paged_capacity = False
+        if not torch.cuda.is_available():
+            return False, "CUDA is unavailable"
+        capability = torch.cuda.get_device_capability()
+        if capability < (10, 0):
+            return False, f"TE on-device grouped splits require SM100+, got SM{capability[0]}{capability[1]}"
+        checker = getattr(self.gate_up_linear, "_is_graph_safe_path_supported", None)
+        if not callable(checker):
+            return False, "this Transformer Engine build does not expose the graph-safe GroupedTensor path"
+        if self._te_ops_fp8_configured:
+            if not self._te_ops_configured_mxfp8:
+                return False, "only the MXFP8 TE recipe supports on-device grouped splits"
+            if capability >= (12, 0):
+                return False, (
+                    "TE MXFP8 graph-safe GroupedTensor compute requires SM100/SM110, "
+                    f"got SM{capability[0]}{capability[1]}"
+                )
+            # TE's MXFP8 GroupedLinear path supports the same overallocated
+            # physical buffer contract even when the surrounding activation is
+            # not eligible for the full grouped-MLP fusion.
+            self._te_ops_graph_uses_paged_capacity = True
+            return True, ""
+        if self.config.dtype not in (torch.bfloat16, torch.float16):
+            return False, f"BF16/FP16 grouped compute is required, got {self.config.dtype}"
+        try:
+            supported = checker(
+                with_quantized_compute=False,
+                input_quantizers=[None] * self.gate_up_linear.num_groups,
+                dtype=self.config.dtype,
+            )
+        except Exception as error:
+            return False, f"TE graph-safe GroupedTensor capability check failed: {error}"
+        if not supported:
+            return False, "TE selected its host-split grouped GEMM path"
+        # TE 2.16.1's graph-safe GroupedTensor forward/backward uses device
+        # splits as active-region offsets independently of the physical input
+        # length. Its own CUDA-graph test covers BF16/FP16 with physical rows
+        # greater than sum(split_sizes), including input and parameter grads.
+        self._te_ops_graph_uses_paged_capacity = True
+        return True, ""
+
     def _build_grouped_linears(self, num_experts: int) -> None:
         """Build stacked-owner TE ops projections on the meta device."""
-        if self.config.expert_activation != "quick_geglu":
-            raise ValueError(
-                "experts='te_ops' currently supports expert_activation='quick_geglu', "
-                f"not {self.config.expert_activation!r}"
-            )
-        if self._te_ops_mxfp8_fusion_requested and (
-            not math.isclose(self.config.activation_alpha, 1.702, abs_tol=1e-3)
-            or not math.isclose(self.config.activation_limit, 7.0, abs_tol=1e-6)
-        ):
-            raise ValueError("TE's fused MXFP8 QGeGLU kernel requires activation_alpha=1.702 and activation_limit=7.0")
-
         from transformer_engine.pytorch import ops as te_ops
 
+        activation_name, activation_kwargs, activation_scales_routes, full_mxfp8_fusion = _select_te_ops_activation(
+            self.config,
+            full_mxfp8_fusion_requested=self._te_ops_mxfp8_fusion_requested,
+        )
+        self._te_glu_interleave_size = activation_kwargs.get("glu_interleave_size")
+
         stacked_linear = _get_stacked_te_ops_grouped_linear_class()
-        gate_up_out_features = self.config.moe_inter_dim * 2
+        gate_up_out_features = self.config.moe_inter_dim * 2 if self.is_gated else self.config.moe_inter_dim
         self.gate_up_linear = stacked_linear(
             num_groups=num_experts,
             in_features=self.config.expert_dim,
@@ -1636,20 +1957,49 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             device="meta",
             scale_bias=self.expert_bias,
         )
-        activation = te_ops.ScaledClampedQGeGLU(
-            glu_interleave_size=32,
-            limit=self.config.activation_limit,
-            alpha=self.config.activation_alpha,
-        )
+
+        if activation_name == "scaled_swiglu":
+            activation = te_ops.ScaledSwiGLU(**activation_kwargs)
+        elif activation_name == "scaled_clamped_qgeglu":
+            activation = te_ops.ScaledClampedQGeGLU(**activation_kwargs)
+        elif activation_name == "geglu":
+            activation = te_ops.GEGLU(**activation_kwargs)
+        elif activation_name == "scaled_srelu":
+            scaled_srelu = getattr(te_ops, "ScaledSReLU", None)
+            if scaled_srelu is None:
+                # ScaledSReLU was added after the other scaled activations. Older
+                # TE builds can still run exact BF16 with the generic row scaler.
+                activation = te_ops.SReLU(**activation_kwargs)
+                activation_scales_routes = False
+                full_mxfp8_fusion = False
+            else:
+                activation = scaled_srelu(**activation_kwargs)
+        elif activation_name == "exact_gated":
+            _, exact_gated_activation = _get_te_ops_custom_classes()
+            activation = exact_gated_activation(**activation_kwargs)
+        else:  # pragma: no cover - guarded by _select_te_ops_activation
+            raise AssertionError(f"Unhandled TE activation selection {activation_name!r}")
+
+        activation_ops = [activation]
+        if not activation_scales_routes:
+            row_scale, _ = _get_te_ops_custom_classes()
+            activation_ops.append(row_scale())
+        self._te_ops_full_mxfp8_fusion_eligible = full_mxfp8_fusion
+        self._te_ops_uses_padded_capacity = self._te_ops_mxfp8_fusion_requested and full_mxfp8_fusion
+        self._te_ops_fuser_owner_signature = None
 
         # Sequential is intentionally unregistered because these same linear objects
         # are already registered above. Its OperationFuser is created lazily on the
         # first forward, after FSDP has unsharded the stacked owners.
         self.__dict__["_te_grouped_mlp"] = te_ops.Sequential(
             self.gate_up_linear,
-            activation,
+            *activation_ops,
             self.down_linear,
         )
+
+    def _canonical_bias_ep_shard_dim(self) -> int:
+        """Stacked TE-ops biases shard experts so layout conversion stays local."""
+        return 0
 
     @staticmethod
     def _interleave_glu_blocks(tensor: torch.Tensor, block_size: int = 32) -> torch.Tensor:
@@ -1672,10 +2022,81 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         pairs = blocks.permute(0, 1, 3, 2, *range(4, blocks.ndim))
         return pairs.flatten(1, 3)
 
+    @staticmethod
+    def _pair_interleaved_to_concatenated(tensor: torch.Tensor) -> torch.Tensor:
+        """Convert GPT-OSS ``[gate0, up0, ...]`` rows to ``[gate | up]``."""
+        if tensor.shape[1] % 2 != 0:
+            raise ValueError(f"GLU width {tensor.shape[1]} must be even")
+        tail = tensor.shape[2:]
+        pairs = tensor.reshape(tensor.shape[0], -1, 2, *tail)
+        gate = pairs[:, :, 0]
+        up = pairs[:, :, 1]
+        return torch.cat((gate, up), dim=1)
+
+    @staticmethod
+    def _concatenated_to_pair_interleaved(tensor: torch.Tensor) -> torch.Tensor:
+        """Convert ``[gate | up]`` rows to GPT-OSS ``[gate0, up0, ...]``."""
+        if tensor.shape[1] % 2 != 0:
+            raise ValueError(f"GLU width {tensor.shape[1]} must be even")
+        gate, up = tensor.chunk(2, dim=1)
+        return torch.stack((gate, up), dim=2).flatten(1, 2)
+
+    @staticmethod
+    def _interleave_concatenated_glu_blocks(tensor: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+        """Convert canonical ``[gate | up]`` rows to TE's block-interleaved layout."""
+        if tensor.shape[1] % (2 * block_size) != 0:
+            raise ValueError(f"GLU width {tensor.shape[1]} must be divisible by {2 * block_size}")
+        tail = tensor.shape[2:]
+        gate, up = tensor.chunk(2, dim=1)
+        gate = gate.reshape(tensor.shape[0], -1, block_size, *tail)
+        up = up.reshape(tensor.shape[0], -1, block_size, *tail)
+        return torch.stack((gate, up), dim=2).flatten(1, 3)
+
+    @staticmethod
+    def _deinterleave_concatenated_glu_blocks(tensor: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+        """Convert TE's block-interleaved rows back to canonical ``[gate | up]``."""
+        if tensor.shape[1] % (2 * block_size) != 0:
+            raise ValueError(f"GLU width {tensor.shape[1]} must be divisible by {2 * block_size}")
+        tail = tensor.shape[2:]
+        blocks = tensor.reshape(tensor.shape[0], -1, 2, block_size, *tail)
+        gate = blocks[:, :, 0].flatten(1, 2)
+        up = blocks[:, :, 1].flatten(1, 2)
+        return torch.cat((gate, up), dim=1)
+
+    @staticmethod
+    def _to_te_gate_up_layout(tensor: torch.Tensor, activation: str, block_size: int | None) -> torch.Tensor:
+        """Convert the canonical checkpoint layout to the selected TE layout."""
+        if activation == "quick_geglu":
+            if block_size is None:
+                return GroupedExpertsTeOps._pair_interleaved_to_concatenated(tensor)
+            return GroupedExpertsTeOps._interleave_glu_blocks(tensor, block_size)
+        if block_size is None:
+            return tensor
+        if is_gated_activation(activation):
+            return GroupedExpertsTeOps._interleave_concatenated_glu_blocks(tensor, block_size)
+        return tensor
+
+    @staticmethod
+    def _from_te_gate_up_layout(tensor: torch.Tensor, activation: str, block_size: int | None) -> torch.Tensor:
+        """Convert the selected TE layout back to the canonical checkpoint layout."""
+        if activation == "quick_geglu":
+            if block_size is None:
+                return GroupedExpertsTeOps._concatenated_to_pair_interleaved(tensor)
+            return GroupedExpertsTeOps._deinterleave_glu_blocks(tensor, block_size)
+        if block_size is None:
+            return tensor
+        if is_gated_activation(activation):
+            return GroupedExpertsTeOps._deinterleave_concatenated_glu_blocks(tensor, block_size)
+        return tensor
+
     def _get_stacked_weight(self, linear: nn.Module, transpose: bool = False) -> torch.Tensor:
         stacked = linear.stacked_weight_local()
         if linear is self.gate_up_linear:
-            stacked = self._deinterleave_glu_blocks(stacked)
+            stacked = self._from_te_gate_up_layout(
+                stacked,
+                self.config.expert_activation,
+                self._te_glu_interleave_size,
+            )
         if transpose:
             stacked = stacked.transpose(-1, -2)
         return stacked
@@ -1683,14 +2104,22 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
     def _get_stacked_bias(self, linear: nn.Module) -> torch.Tensor | None:
         stacked = linear.stacked_bias_local()
         if stacked is not None and linear is self.gate_up_linear:
-            stacked = self._deinterleave_glu_blocks(stacked)
+            stacked = self._from_te_gate_up_layout(
+                stacked,
+                self.config.expert_activation,
+                self._te_glu_interleave_size,
+            )
         return stacked
 
     def _set_stacked_weight(self, linear: nn.Module, stacked: torch.Tensor, transpose: bool = False) -> None:
         if transpose:
             stacked = stacked.transpose(-1, -2)
         if linear is self.gate_up_linear:
-            stacked = self._interleave_glu_blocks(stacked)
+            stacked = self._to_te_gate_up_layout(
+                stacked,
+                self.config.expert_activation,
+                self._te_glu_interleave_size,
+            )
         with torch.no_grad():
             linear.stacked_weight_local().copy_(stacked)
         linear.clear_grouped_aliases()
@@ -1699,7 +2128,11 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         if not linear.use_bias or stacked is None:
             return
         if linear is self.gate_up_linear:
-            stacked = self._interleave_glu_blocks(stacked)
+            stacked = self._to_te_gate_up_layout(
+                stacked,
+                self.config.expert_activation,
+                self._te_glu_interleave_size,
+            )
         bias = linear.stacked_bias_local()
         if bias is None:
             raise RuntimeError("TE-ops grouped bias owner is missing")
@@ -1708,7 +2141,43 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         linear.clear_grouped_aliases()
 
     def _router_expert_pad_multiple(self) -> int | None:
-        return 256 if self._te_ops_mxfp8_fusion_requested else None
+        if self._te_ops_uses_padded_capacity:
+            return 256
+        return None
+
+    def _assert_te_fuser_owner_identity(self) -> None:
+        """Ensure TE's lazy fuser captured the current plain stacked owners."""
+        module_groups = getattr(self._te_grouped_mlp, "_module_groups", None)
+        if module_groups is None:
+            # Lightweight test doubles do not construct TE's OperationFuser.
+            return
+        current_signature = tuple(
+            id(parameter) for linear in (self.gate_up_linear, self.down_linear) for parameter in linear.parameters()
+        )
+        if self.__dict__.get("_te_ops_fuser_owner_signature") == current_signature:
+            return
+
+        fuser_groups = [group for group in module_groups if hasattr(group, "_basic_ops")]
+        for linear in (self.gate_up_linear, self.down_linear):
+            matches = []
+            for group in fuser_groups:
+                for op_idx, op in enumerate(group._basic_ops):
+                    if op is linear:
+                        matches.append(tuple(group._basic_op_params[op_idx]))
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "TE-ops fuser did not capture each stacked GroupedLinear exactly once; "
+                    "the expert OperationFuser must be created lazily inside the FSDP unshard window"
+                )
+            current_owners = tuple(linear.parameters())
+            if len(matches[0]) != len(current_owners) or any(
+                captured is not current for captured, current in zip(matches[0], current_owners)
+            ):
+                raise RuntimeError(
+                    "TE-ops fuser captured stale expert parameters. Keep plain stacked owners stable "
+                    "across FSDP unshard and checkpoint recomputation."
+                )
+        self._te_ops_fuser_owner_signature = current_signature
 
     def forward(
         self,
@@ -1764,12 +2233,13 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             permuted_probs,
             *fc2_extra_inputs,
         )
+        self._assert_te_fuser_owner_identity()
         self._check_te_ops_fusion(fp8_active)
         return self.token_dispatcher.token_unpermutation(output)
 
     def _check_te_ops_fusion(self, fp8_active: bool) -> None:
         """Fail loudly if an explicitly requested MXFP8 fusion silently fell back."""
-        if self._te_ops_fusion_checked or not fp8_active:
+        if self._te_ops_fusion_checked or not fp8_active or not self._te_ops_uses_padded_capacity:
             return
 
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
@@ -1786,25 +2256,35 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         forward_ops = getattr(module_groups[0], "_forward_ops", []) if module_groups else []
         backward_ops = getattr(module_groups[0], "_backward_ops", []) if module_groups else []
         forward_fusion_active = any(
-            "ForwardGroupedMLP_CuTeGEMM" in type(op_and_indices[0]).__name__ for op_and_indices in forward_ops
+            "GroupedMLP_CuTeGEMM" in type(op_and_indices[0]).__name__ for op_and_indices in forward_ops
         )
         backward_fusion_active = any(
-            "BackwardGroupedMLP_CuTeGEMM" in type(op_and_indices[0]).__name__ for op_and_indices in backward_ops
+            "GroupedMLP_CuTeGEMM" in type(op_and_indices[0]).__name__ for op_and_indices in backward_ops
         )
         if not forward_fusion_active or not backward_fusion_active:
             raise RuntimeError(
                 "TE CuTe DSL grouped-MLP forward/backward fusion was requested but did not fully activate. "
                 "Check Transformer Engine >=2.16.1, nvidia-cudnn-frontend >=1.23, "
-                "SM100, MXFP8 autocast, and 32-wide GLU interleaving."
+                "SM100, MXFP8 autocast, the selected scaled activation, and 32-wide GLU interleaving where needed."
             )
         if not dist.is_initialized() or dist.get_rank() == 0:
             logger.warning("TE CuTe DSL MXFP8 grouped-MLP forward/backward fusion is active.")
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
-        """Initialize stacked owners in-place, preserving FSDP and optimizer identity."""
-        del buffer_device, init_std
-        self.gate_up_linear.reset_parameters()
-        self.down_linear.reset_parameters()
+        """Initialize canonical expert weights without replacing stacked owners."""
+        del buffer_device
+        with torch.no_grad():
+            for linear in (self.gate_up_linear, self.down_linear):
+                weight = linear._parameters["_stacked_weight"]
+                weight = weight.to_local() if isinstance(weight, DTensor) else weight
+                weight.normal_(mean=0.0, std=init_std)
+                bias = linear._parameters.get("_stacked_bias")
+                if bias is not None:
+                    bias = bias.to_local() if isinstance(bias, DTensor) else bias
+                    bias.zero_()
+                clear_aliases = getattr(linear, "clear_grouped_aliases", None)
+                if callable(clear_aliases):
+                    clear_aliases()
 
 
 def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):

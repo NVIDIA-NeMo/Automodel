@@ -166,3 +166,30 @@ def test_step3p5_model_router_bias_config_uses_sigmoid_with_bias_and_force_flag(
     assert model.moe_config.score_func == "sigmoid_with_bias"
     assert model.moe_config.router_bias is False
     assert model.moe_config.force_e_score_correction_bias is True
+
+
+def test_step3p5_per_layer_swiglu_limit_reaches_generic_routed_experts():
+    config = TinyStepConfig(
+        num_hidden_layers=1,
+        moe_layers_enum=(0,),
+        swiglu_limits=[3.5],
+    )
+    model = Step3p5Model(config, tiny_backend())
+    layer_config = model.layers["0"].moe.experts.config
+
+    assert layer_config.expert_activation == "swiglu_step"
+    assert layer_config.swiglu_limit == 3.5
+    from nemo_automodel.components.moe.experts import _select_te_ops_activation
+
+    op_name, kwargs, route_scaled, full_mxfp8_fusion = _select_te_ops_activation(
+        layer_config,
+        full_mxfp8_fusion_requested=True,
+    )
+    assert (op_name, route_scaled, full_mxfp8_fusion) == ("exact_gated", False, False)
+    assert kwargs == {
+        "alpha": 1.0,
+        "linear_offset": 0.0,
+        "limit": 3.5,
+        "clamp_after_gate_activation": True,
+        "use_input_dtype": True,
+    }

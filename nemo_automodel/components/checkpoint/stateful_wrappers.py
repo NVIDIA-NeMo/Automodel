@@ -65,6 +65,46 @@ from nemo_automodel.components.checkpoint.utils import (
 )
 
 _PREFIX = "model."
+_TE_OPS_OPTIMIZER_LAYOUT_KEY = "te_ops_optimizer_layout"
+_TE_OPS_OPTIMIZER_LAYOUT_SCHEMA = 1
+_TE_OPS_ACTIVATION_IDS = {
+    "swiglu": 1,
+    "swiglu_step": 2,
+    "swigluoai": 3,
+    "quick_geglu": 4,
+    "geglu": 5,
+    "relu2": 6,
+}
+
+
+def _get_te_ops_optimizer_layout(model_parts: list[torch.nn.Module]) -> dict[str, torch.Tensor]:
+    """Describe physical stacked-owner layouts whose optimizer states are raw."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
+
+    layouts = {}
+    for model_idx, model in enumerate(model_parts):
+        for module_fqn, module in model.named_modules():
+            if not isinstance(module, GroupedExpertsTeOps):
+                continue
+            activation = module.config.expert_activation
+            if activation not in _TE_OPS_ACTIVATION_IDS:
+                raise RuntimeError(f"Unknown GroupedExpertsTeOps optimizer layout for activation {activation!r}")
+            normalized_fqn = module_fqn.replace("._checkpoint_wrapped_module", "") or "<root>"
+            key = f"model{model_idx}.{normalized_fqn}"
+            if key in layouts:
+                raise RuntimeError(f"Duplicate GroupedExpertsTeOps optimizer layout key {key!r}")
+            layouts[key] = torch.tensor(
+                [
+                    _TE_OPS_OPTIMIZER_LAYOUT_SCHEMA,
+                    _TE_OPS_ACTIVATION_IDS[activation],
+                    int(getattr(module, "_te_glu_interleave_size", None) or 0),
+                    2,  # stacked weights shard their physical input dimension
+                    0,  # stacked biases shard experts, never gate/up rows
+                ],
+                dtype=torch.int64,
+                device="cpu",
+            )
+    return layouts
 
 
 def _is_quantized_module(module: torch.nn.Module) -> bool:
@@ -424,6 +464,7 @@ class OptimizerState:
         self.optimizer = [optimizer] if isinstance(optimizer, torch.optim.Optimizer) else optimizer
         self.scheduler = [scheduler] if isinstance(scheduler, torch.optim.lr_scheduler.LRScheduler) else scheduler
         self.is_peft = is_peft
+        self._te_ops_optimizer_layout = _get_te_ops_optimizer_layout(self.model)
 
     def state_dict(self) -> dict[str, Any]:
         """
@@ -452,10 +493,49 @@ class OptimizerState:
         state_dict = {
             "optim": optimizer_state_dict,
         }
+        if self._te_ops_optimizer_layout:
+            # Model state is checkpointed canonically, but optimizer moments are
+            # keyed to the physical stacked owners. Carry an independent guard
+            # so changing BF16 concat vs MXFP8 block-32 layout cannot silently
+            # permute Adam/momentum state at resume.
+            state_dict[_TE_OPS_OPTIMIZER_LAYOUT_KEY] = {
+                key: value.clone() for key, value in self._te_ops_optimizer_layout.items()
+            }
         if self.scheduler is not None:
             state_dict["sched"] = self.scheduler[0].state_dict()
 
         return state_dict
+
+    def prepare_state_dict_for_load(self, state_dict: dict[str, Any]) -> None:
+        """Poison layout guards so a missing old-checkpoint key fails closed."""
+        if not self._te_ops_optimizer_layout:
+            return
+        guards = state_dict.get(_TE_OPS_OPTIMIZER_LAYOUT_KEY)
+        if not isinstance(guards, dict):
+            raise RuntimeError("GroupedExpertsTeOps optimizer layout guard is missing from the load template")
+        for value in guards.values():
+            value.fill_(-1)
+
+    def _validate_te_ops_optimizer_layout(self, state_dict: dict[str, Any]) -> None:
+        if not self._te_ops_optimizer_layout:
+            state_dict.pop(_TE_OPS_OPTIMIZER_LAYOUT_KEY, None)
+            return
+        loaded = state_dict.pop(_TE_OPS_OPTIMIZER_LAYOUT_KEY, None)
+        expected = self._te_ops_optimizer_layout
+        mismatch = not isinstance(loaded, dict) or set(loaded) != set(expected)
+        if not mismatch:
+            mismatch = any(
+                not isinstance(loaded[key], torch.Tensor)
+                or loaded[key].shape != value.shape
+                or not torch.equal(loaded[key].cpu(), value)
+                for key, value in expected.items()
+            )
+        if mismatch:
+            raise RuntimeError(
+                "GroupedExpertsTeOps optimizer checkpoint layout does not match this model. "
+                "BF16, MXFP8 block-32, activation, or stacked-owner sharding changed (or this is an "
+                "older checkpoint without a layout guard). Restore model state only and reset the optimizer."
+            )
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """
@@ -464,6 +544,8 @@ class OptimizerState:
         Args:
             state_dict (dict): State dictionary containing optimizer and scheduler states to load.
         """
+        self._validate_te_ops_optimizer_layout(state_dict)
+
         # For PEFT + quantized or expert-parallel models, use native load to match the native save path.
         if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             self.optimizer[0].load_state_dict(state_dict["optim"])

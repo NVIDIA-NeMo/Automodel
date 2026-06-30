@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import importlib.util
-import math
 from unittest.mock import Mock, patch
 
 import pytest
@@ -30,10 +29,12 @@ from nemo_automodel.components.moe.experts import (
     GroupedExpertsDeepEP,
     _apply_bias,
     _permute_tokens_for_grouped_mm,
+    _select_te_ops_activation,
     _torch_mm_experts_fwd,
     get_expert_activation_for_deepep,
     is_gated_activation,
     swiglu_clamped_deepep,
+    swiglu_step_deepep,
 )
 
 
@@ -110,6 +111,19 @@ class TestActivationFunctions:
 
         with patch("nemo_automodel.components.moe.experts.weighted_bias_swiglu_impl") as mock_swiglu:
             assert get_expert_activation_for_deepep(moe_config) is mock_swiglu
+
+    def test_get_expert_activation_for_deepep_step_swiglu_uses_post_silu_clamp(self, moe_config):
+        """Step's routed experts select their distinct post-SiLU clamp."""
+        from functools import partial
+
+        moe_config.expert_activation = "swiglu_step"
+        moe_config.swiglu_limit = 7.0
+
+        activation_fn = get_expert_activation_for_deepep(moe_config)
+
+        assert isinstance(activation_fn, partial)
+        assert activation_fn.func is swiglu_step_deepep
+        assert activation_fn.keywords == {"limit": 7.0}
 
 
 class TestSwigluClampedDeepEP:
@@ -207,6 +221,32 @@ class TestSwigluClampedDeepEP:
 
         assert out.dtype == torch.bfloat16
         assert out.shape == (2, 4)
+
+
+class TestStepSwigluDeepEP:
+    """Tests for Step3.5/3.7's post-SiLU clamped routed activation."""
+
+    @staticmethod
+    def _eager_reference(x, permuted_probs, limit):
+        gate, up = torch.chunk(x, 2, dim=-1)
+        gate = torch.nn.functional.silu(gate).clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+        return (gate * up * permuted_probs).to(x.dtype)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_matches_step_reference_and_differs_from_dsv4(self, dtype):
+        limit = 1.5
+        gate = torch.tensor([[4.0, -2.0]], dtype=dtype)
+        up = torch.tensor([[3.0, -3.0]], dtype=dtype)
+        x = torch.cat((gate, up), dim=-1)
+        probs = torch.tensor([[0.75]], dtype=dtype)
+
+        output = swiglu_step_deepep(x, probs, limit=limit)
+        reference = self._eager_reference(x, probs, limit)
+        dsv4_output = swiglu_clamped_deepep(x, probs, limit=limit)
+
+        torch.testing.assert_close(output, reference, atol=0, rtol=0)
+        assert not torch.equal(output, dsv4_output)
 
 
 class TestGroupedExpertsZeroActiveExperts:
@@ -1054,8 +1094,227 @@ def test_te_ops_glu_block_interleave_roundtrip(tail_shape):
     torch.testing.assert_close(GroupedExpertsTeOps._deinterleave_glu_blocks(interleaved), canonical)
 
 
-def test_te_ops_init_weights_preserves_parameter_objects():
-    """TE-ops initialization must not replace parameters after FSDP has wrapped them."""
+@pytest.mark.parametrize(
+    ("activation", "expected_op", "route_scaled", "full_mxfp8_fusion"),
+    [
+        ("swiglu", "scaled_swiglu", True, True),
+        ("swiglu_step", "scaled_swiglu", True, True),
+        ("swigluoai", "scaled_clamped_qgeglu", True, True),
+        ("quick_geglu", "scaled_clamped_qgeglu", True, True),
+        ("geglu", "geglu", False, False),
+        ("relu2", "scaled_srelu", True, True),
+    ],
+)
+def test_te_ops_activation_selection(
+    moe_config,
+    activation,
+    expected_op,
+    route_scaled,
+    full_mxfp8_fusion,
+):
+    """Every supported MoE activation selects an exact TE-ops pipeline."""
+    moe_config.expert_activation = activation
+
+    op_name, kwargs, selected_route_scaled, selected_full_mxfp8_fusion = _select_te_ops_activation(moe_config)
+
+    assert op_name == expected_op
+    assert selected_route_scaled is route_scaled
+    assert selected_full_mxfp8_fusion is full_mxfp8_fusion
+    assert "glu_interleave_size" not in kwargs
+
+
+def test_te_ops_activation_selection_preserves_exact_unfused_variants(moe_config):
+    """Numerically distinct clamped/unclamped variants stay available in BF16."""
+    moe_config.expert_activation = "swiglu"
+    moe_config.swiglu_limit = 10.0
+    op_name, kwargs, route_scaled, full_mxfp8_fusion = _select_te_ops_activation(moe_config)
+    assert (op_name, route_scaled, full_mxfp8_fusion) == ("exact_gated", False, False)
+    assert kwargs == {"alpha": 1.0, "linear_offset": 0.0, "limit": 10.0}
+
+    moe_config.expert_activation = "swiglu_step"
+    moe_config.swiglu_limit = 10.0
+    op_name, kwargs, route_scaled, full_mxfp8_fusion = _select_te_ops_activation(moe_config)
+    assert (op_name, route_scaled, full_mxfp8_fusion) == ("exact_gated", False, False)
+    assert kwargs == {
+        "alpha": 1.0,
+        "linear_offset": 0.0,
+        "limit": 10.0,
+        "clamp_after_gate_activation": True,
+        "use_input_dtype": True,
+    }
+
+    moe_config.expert_activation = "swigluoai"
+    moe_config.activation_limit = 0.0
+    op_name, kwargs, route_scaled, full_mxfp8_fusion = _select_te_ops_activation(moe_config)
+    assert (op_name, route_scaled, full_mxfp8_fusion) == ("exact_gated", False, False)
+    assert kwargs == {"alpha": 1.702, "linear_offset": 1.0, "limit": None}
+
+    moe_config.expert_activation = "quick_geglu"
+    moe_config.moe_inter_dim = 30
+    op_name, kwargs, route_scaled, full_mxfp8_fusion = _select_te_ops_activation(moe_config)
+    assert (op_name, route_scaled, full_mxfp8_fusion) == ("scaled_clamped_qgeglu", True, False)
+    assert "glu_interleave_size" not in kwargs
+
+
+@pytest.mark.parametrize("activation", ["swiglu", "swiglu_step", "swigluoai", "quick_geglu"])
+def test_te_ops_fused_glu_selection_uses_block32_only_when_effective(moe_config, activation):
+    """Unfused GLUs consume concat layout; effective CuTe GLUs consume blocks."""
+    moe_config.expert_activation = activation
+    _, unfused_kwargs, _, unfused_eligible = _select_te_ops_activation(
+        moe_config,
+        full_mxfp8_fusion_requested=False,
+    )
+    _, fused_kwargs, _, fused_eligible = _select_te_ops_activation(
+        moe_config,
+        full_mxfp8_fusion_requested=True,
+    )
+
+    assert unfused_eligible and fused_eligible
+    assert "glu_interleave_size" not in unfused_kwargs
+    assert fused_kwargs["glu_interleave_size"] == 32
+
+
+@pytest.mark.parametrize("activation", ["swiglu", "swiglu_step", "swigluoai", "quick_geglu", "relu2"])
+def test_te_ops_full_fusion_rejects_unsupported_grouped_mlp_dims(moe_config, activation):
+    """Odd expert dimensions fall back before TE's fused-dimension validator."""
+    moe_config.expert_activation = activation
+    moe_config.dim = 96
+    _, kwargs, _, full_mxfp8_fusion = _select_te_ops_activation(
+        moe_config,
+        full_mxfp8_fusion_requested=True,
+    )
+
+    assert not full_mxfp8_fusion
+    assert "glu_interleave_size" not in kwargs
+
+
+@pytest.mark.parametrize(
+    ("activation", "fusion_eligible"),
+    [
+        ("swiglu", True),
+        ("swiglu_step", True),
+        ("swigluoai", True),
+        ("quick_geglu", True),
+        ("geglu", False),
+        ("relu2", True),
+    ],
+)
+def test_te_ops_padding_and_fusion_expectation_are_activation_aware(moe_config, activation, fusion_eligible):
+    """Only activation patterns supported by the full CuTe MLP request padding."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
+
+    moe_config.expert_activation = activation
+    _, _, _, selected_fusion_eligible = _select_te_ops_activation(
+        moe_config,
+        full_mxfp8_fusion_requested=True,
+    )
+    assert selected_fusion_eligible is fusion_eligible
+
+    experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
+    experts._te_ops_mxfp8_fusion_requested = True
+    experts._te_ops_full_mxfp8_fusion_eligible = selected_fusion_eligible
+    experts._te_ops_uses_padded_capacity = selected_fusion_eligible
+    experts._te_ops_fusion_checked = False
+    assert experts._router_expert_pad_multiple() == (256 if fusion_eligible else None)
+    if not fusion_eligible:
+        experts._check_te_ops_fusion(fp8_active=True)
+
+
+def test_te_ops_bf16_graph_paged_capacity_does_not_enable_dispatcher_padding(monkeypatch):
+    """TE's graph-safe BF16 GroupedTensor path may overallocate only the graph bucket."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
+
+    checker = Mock(return_value=True)
+    experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
+    experts._te_ops_fp8_configured = False
+    experts._te_ops_configured_mxfp8 = False
+    experts._te_ops_graph_uses_paged_capacity = False
+    experts._te_ops_uses_padded_capacity = False
+    experts.config = Mock(dtype=torch.bfloat16)
+    experts.gate_up_linear = Mock(num_groups=4, _is_graph_safe_path_supported=checker)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+
+    supported, reason = experts._te_ops_dynamic_splits_graph_capability()
+
+    assert supported
+    assert reason == ""
+    assert experts._te_ops_graph_uses_paged_capacity
+    assert experts._router_expert_pad_multiple() is None
+    checker.assert_called_once_with(
+        with_quantized_compute=False,
+        input_quantizers=[None] * 4,
+        dtype=torch.bfloat16,
+    )
+
+
+@pytest.mark.parametrize(("capability", "supported"), [((10, 0), True), ((11, 0), True), ((12, 0), False)])
+def test_te_ops_mxfp8_graph_paged_capacity_is_independent_of_full_fusion(monkeypatch, capability, supported):
+    """Unfused MXFP8 GroupedLinear can page graph input without enabling dispatcher padding."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
+
+    experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
+    experts._te_ops_fp8_configured = True
+    experts._te_ops_configured_mxfp8 = True
+    experts._te_ops_graph_uses_paged_capacity = False
+    experts._te_ops_uses_padded_capacity = False
+    experts.gate_up_linear = Mock(_is_graph_safe_path_supported=Mock())
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+
+    graph_safe, reason = experts._te_ops_dynamic_splits_graph_capability()
+
+    assert graph_safe is supported
+    assert experts._te_ops_graph_uses_paged_capacity is supported
+    assert experts._router_expert_pad_multiple() is None
+    assert (reason == "") is supported
+
+
+@pytest.mark.parametrize("full_mxfp8_fusion_requested", [False, True])
+@pytest.mark.parametrize("activation", ["swiglu", "swiglu_step", "swigluoai", "quick_geglu", "geglu", "relu2"])
+def test_te_ops_canonical_layout_roundtrip_by_activation(moe_config, activation, full_mxfp8_fusion_requested):
+    """Canonical and physical layouts round-trip in fused and unfused modes."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
+
+    moe_config.expert_activation = activation
+    _, kwargs, _, full_mxfp8_fusion = _select_te_ops_activation(
+        moe_config,
+        full_mxfp8_fusion_requested=full_mxfp8_fusion_requested,
+    )
+    block_size = kwargs.get("glu_interleave_size")
+    canonical = torch.arange(2 * 128, dtype=torch.float32).reshape(2, 128)
+    physical = GroupedExpertsTeOps._to_te_gate_up_layout(canonical, activation, block_size)
+    restored = GroupedExpertsTeOps._from_te_gate_up_layout(physical, activation, block_size)
+
+    expect_layout_conversion = activation == "quick_geglu" or (
+        full_mxfp8_fusion_requested and full_mxfp8_fusion and is_gated_activation(activation)
+    )
+    if expect_layout_conversion:
+        assert not torch.equal(physical, canonical)
+    else:
+        assert physical.data_ptr() == canonical.data_ptr()
+    if activation == "quick_geglu" and not full_mxfp8_fusion_requested:
+        expected_physical = GroupedExpertsTeOps._pair_interleaved_to_concatenated(canonical)
+        torch.testing.assert_close(physical, expected_physical)
+    torch.testing.assert_close(restored, canonical)
+
+
+@pytest.mark.parametrize("tail_shape", [(), (3,)])
+def test_te_ops_concatenated_glu_block_interleave_roundtrip(tail_shape):
+    """Canonical ``[gate | up]`` rows round-trip through TE's fused layout."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
+
+    canonical = torch.arange(2 * 128 * max(1, int(torch.tensor(tail_shape).prod())), dtype=torch.float32)
+    canonical = canonical.reshape(2, 128, *tail_shape)
+    physical = GroupedExpertsTeOps._interleave_concatenated_glu_blocks(canonical)
+    expected_prefix = torch.cat((canonical[:, :32], canonical[:, 64:96]), dim=1)
+
+    torch.testing.assert_close(physical[:, :64], expected_prefix)
+    torch.testing.assert_close(GroupedExpertsTeOps._deinterleave_concatenated_glu_blocks(physical), canonical)
+
+
+def test_te_ops_init_weights_preserves_parameter_objects_and_honors_std():
+    """TE-ops initialization must preserve owners and use the canonical normal std."""
     from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
 
     class FakeGroupedLinear(torch.nn.Module):
@@ -1067,26 +1326,51 @@ def test_te_ops_init_weights_preserves_parameter_objects():
             self._stacked_weight = torch.nn.Parameter(torch.zeros(2, 8, 8))
             self._stacked_bias = torch.nn.Parameter(torch.ones(2, 8))
 
-        def reset_parameters(self):
-            with torch.no_grad():
-                self._stacked_weight.uniform_(-1 / math.sqrt(self.in_features), 1 / math.sqrt(self.in_features))
-                self._stacked_bias.zero_()
-
     experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
     torch.nn.Module.__init__(experts)
     experts.gate_up_linear = FakeGroupedLinear()
     experts.down_linear = FakeGroupedLinear()
     parameter_ids = {name: id(param) for name, param in experts.named_parameters()}
 
-    experts.init_weights(torch.device("cpu"))
+    experts.init_weights(torch.device("cpu"), init_std=0.0)
 
     assert {name: id(param) for name, param in experts.named_parameters()} == parameter_ids
-    for name, param in experts.named_parameters():
-        if "bias" in name:
-            torch.testing.assert_close(param, torch.zeros_like(param))
-        else:
-            assert torch.count_nonzero(param) > 0
-            assert param.abs().max() <= 1 / math.sqrt(8)
+    for param in experts.parameters():
+        torch.testing.assert_close(param, torch.zeros_like(param))
+
+
+def test_te_ops_fuser_owner_identity_guard_rejects_stale_parameters():
+    """The lazy TE fuser must hold the same plain Parameters as its linears."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
+
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._stacked_weight = torch.nn.Parameter(torch.randn(2, 4, 4))
+            self._stacked_bias = torch.nn.Parameter(torch.randn(2, 4))
+
+    class FakeFuser:
+        def __init__(self, linears):
+            self._basic_ops = list(linears)
+            self._basic_op_params = [list(linear.parameters()) for linear in linears]
+
+    class FakeSequential:
+        def __init__(self, fuser):
+            self._module_groups = [fuser]
+
+    experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
+    torch.nn.Module.__init__(experts)
+    experts.gate_up_linear = FakeGroupedLinear()
+    experts.down_linear = FakeGroupedLinear()
+    fuser = FakeFuser((experts.gate_up_linear, experts.down_linear))
+    experts.__dict__["_te_grouped_mlp"] = FakeSequential(fuser)
+    experts._te_ops_fuser_owner_signature = None
+
+    experts._assert_te_fuser_owner_identity()
+
+    experts.gate_up_linear._stacked_weight = torch.nn.Parameter(experts.gate_up_linear._stacked_weight.detach().clone())
+    with pytest.raises(RuntimeError, match="captured stale expert parameters"):
+        experts._assert_te_fuser_owner_identity()
 
 
 def test_te_ops_empty_rank_preserves_dispatch_backward_and_explicit_zero_grads():
@@ -1198,6 +1482,290 @@ class TestGroupedExpertsTeOps:
             dtype=torch.bfloat16,
         )
 
+    @pytest.mark.parametrize(
+        ("activation", "expected_ops", "expected_gate_up_width"),
+        [
+            ("swiglu", ["_StackedTeOpsGroupedLinear", "ScaledSwiGLU", "_StackedTeOpsGroupedLinear"], 128),
+            (
+                "swiglu_step",
+                ["_StackedTeOpsGroupedLinear", "ScaledSwiGLU", "_StackedTeOpsGroupedLinear"],
+                128,
+            ),
+            (
+                "swigluoai",
+                ["_StackedTeOpsGroupedLinear", "ScaledClampedQGeGLU", "_StackedTeOpsGroupedLinear"],
+                128,
+            ),
+            (
+                "quick_geglu",
+                ["_StackedTeOpsGroupedLinear", "ScaledClampedQGeGLU", "_StackedTeOpsGroupedLinear"],
+                128,
+            ),
+            (
+                "geglu",
+                ["_StackedTeOpsGroupedLinear", "GEGLU", "_TeOpsRowScale", "_StackedTeOpsGroupedLinear"],
+                128,
+            ),
+            (
+                "relu2",
+                ["_StackedTeOpsGroupedLinear", "ScaledSReLU", "_StackedTeOpsGroupedLinear"],
+                64,
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("expert_bias", [False, True])
+    def test_generic_activation_pipeline_and_projection_width(
+        self,
+        te_ops_config,
+        activation,
+        expected_ops,
+        expected_gate_up_width,
+        expert_bias,
+    ):
+        """TE-ops constructs the right native activation and gated/non-gated width."""
+        from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
+
+        te_ops_config.expert_activation = activation
+        te_ops_config.expert_bias = expert_bias
+        backend = BackendConfig(experts="te_ops", dispatcher="hybridep")
+        experts = GroupedExpertsTeOps(te_ops_config, backend=backend, dispatcher_backend="hybridep")
+
+        assert experts.gate_up_linear.out_features == expected_gate_up_width
+        assert experts.gate_up_linear.use_bias is expert_bias
+        assert experts.down_linear.use_bias is expert_bias
+        if activation == "relu2":
+            from transformer_engine.pytorch import ops as te_ops
+
+            if not hasattr(te_ops, "ScaledSReLU"):
+                expected_ops = [
+                    "_StackedTeOpsGroupedLinear",
+                    "SReLU",
+                    "_TeOpsRowScale",
+                    "_StackedTeOpsGroupedLinear",
+                ]
+        assert [type(op).__name__ for op in experts._te_grouped_mlp] == expected_ops
+        assert sum(op.num_extra_inputs for op in experts._te_grouped_mlp) == (4 if expert_bias else 3)
+        expected_parameters = {
+            "gate_up_linear._stacked_weight",
+            "down_linear._stacked_weight",
+        }
+        if expert_bias:
+            expected_parameters.update(("gate_up_linear._stacked_bias", "down_linear._stacked_bias"))
+        assert set(dict(experts.named_parameters())) == expected_parameters
+
+    @pytest.mark.parametrize(
+        ("input_dtype", "scale_dtype", "grad_dtype"),
+        [
+            (torch.float32, torch.float32, torch.float32),
+            (torch.float32, torch.bfloat16, torch.bfloat16),
+        ],
+    )
+    def test_custom_row_scale_forward_backward_parity(self, input_dtype, scale_dtype, grad_dtype):
+        """The fusible fallback scale differentiates both activations and router probs."""
+        from nemo_automodel.components.moe.experts import _get_te_ops_custom_classes
+
+        row_scale, _ = _get_te_ops_custom_classes()
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        x_ref = torch.randn(7, 13, device=device, dtype=input_dtype, requires_grad=True)
+        scales_ref = torch.randn(7, device=device, dtype=scale_dtype, requires_grad=True)
+        x_test = x_ref.detach().clone().requires_grad_()
+        scales_test = scales_ref.detach().clone().requires_grad_()
+        grad = torch.randn(7, 13, device=device, dtype=grad_dtype)
+
+        output_ref = x_ref * scales_ref.unsqueeze(-1)
+        output_test = row_scale()(x_test, scales_test)
+        output_ref.backward(grad)
+        output_test.backward(grad)
+
+        torch.testing.assert_close(output_test, output_ref)
+        torch.testing.assert_close(x_test.grad, x_ref.grad)
+        torch.testing.assert_close(scales_test.grad, scales_ref.grad)
+
+    @pytest.mark.parametrize(
+        ("alpha", "linear_offset", "limit"),
+        [(1.0, 0.0, 1.5), (1.3, 1.0, None)],
+    )
+    def test_custom_exact_gated_activation_forward_backward_parity(self, alpha, linear_offset, limit):
+        """Exact fallbacks preserve FP32 through activation and backward."""
+        from nemo_automodel.components.moe.experts import _get_te_ops_custom_classes
+
+        _, exact_gated_activation = _get_te_ops_custom_classes()
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        x_ref = (torch.randn(7, 26, device=device, dtype=torch.bfloat16) * 2.0).requires_grad_()
+        x_test = x_ref.detach().clone().requires_grad_()
+        grad = torch.randn(7, 13, device=device, dtype=torch.float32)
+
+        gate, up = x_ref.chunk(2, dim=-1)
+        gate = gate.float()
+        up = up.float()
+        if limit is not None:
+            gate = gate.clamp(max=limit)
+            up = up.clamp(min=-limit, max=limit)
+        activated_gate = torch.nn.functional.silu(gate) if alpha == 1.0 else gate * torch.sigmoid(alpha * gate)
+        output_ref = activated_gate * (up + linear_offset)
+        output_test = exact_gated_activation(alpha=alpha, linear_offset=linear_offset, limit=limit)(x_test)
+        output_ref.backward(grad)
+        output_test.backward(grad)
+
+        assert output_test.dtype == torch.float32
+        torch.testing.assert_close(output_test, output_ref)
+        torch.testing.assert_close(x_test.grad, x_ref.grad, atol=2e-2, rtol=2e-2)
+
+    def test_custom_step_gated_activation_bf16_forward_backward_parity(self):
+        """Step's post-SiLU clamp remains exact in the TE-ops fallback."""
+        from nemo_automodel.components.moe.experts import _get_te_ops_custom_classes
+
+        _, exact_gated_activation = _get_te_ops_custom_classes()
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        x_ref = (torch.randn(7, 26, device=device, dtype=torch.bfloat16) * 3).requires_grad_()
+        x_test = x_ref.detach().clone().requires_grad_()
+        grad = torch.randn(7, 13, device=device, dtype=torch.bfloat16)
+        limit = 1.5
+
+        gate, up = x_ref.chunk(2, dim=-1)
+        output_ref = torch.nn.functional.silu(gate).clamp(max=limit) * up.clamp(min=-limit, max=limit)
+        output_test = exact_gated_activation(
+            alpha=1.0,
+            linear_offset=0.0,
+            limit=limit,
+            clamp_after_gate_activation=True,
+            use_input_dtype=True,
+        )(x_test)
+        output_ref.backward(grad)
+        output_test.backward(grad)
+
+        torch.testing.assert_close(output_test, output_ref, atol=0, rtol=0)
+        torch.testing.assert_close(x_test.grad, x_ref.grad, atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.parametrize(
+        ("activation", "swiglu_limit", "activation_limit"),
+        [("swiglu", 1.5, 7.0), ("swigluoai", 0.0, 0.0)],
+    )
+    def test_exact_fp32_full_expert_forward_backward_parity(
+        self,
+        te_ops_config,
+        activation,
+        swiglu_limit,
+        activation_limit,
+    ):
+        """Full TE experts match eager math when routes scale FP32 activations."""
+        from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
+        from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
+
+        class LocalPermutationDispatcher:
+            def token_permutation2(self, hidden_states, num_local_tokens, token_probs, token_indices):
+                self.num_tokens = num_local_tokens
+                flat_indices = token_indices.reshape(-1)
+                flat_probs = token_probs.reshape(-1)
+                token_ids = (
+                    torch.arange(num_local_tokens, device=hidden_states.device)
+                    .unsqueeze(1)
+                    .expand_as(token_indices)
+                    .reshape(-1)
+                )
+                order = torch.argsort(flat_indices, stable=True)
+                self.token_ids = token_ids[order]
+                splits = torch.bincount(flat_indices, minlength=te_ops_config.n_routed_experts)
+                return hidden_states[self.token_ids], splits, flat_probs[order]
+
+            def token_unpermutation(self, hidden_states):
+                output = torch.zeros(
+                    self.num_tokens,
+                    hidden_states.shape[-1],
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+                return output.index_add(0, self.token_ids, hidden_states)
+
+        te_ops_config.n_activated_experts = 2
+        te_ops_config.expert_bias = False
+        te_ops_config.expert_activation = activation
+        te_ops_config.swiglu_limit = swiglu_limit
+        te_ops_config.activation_limit = activation_limit
+        backend = BackendConfig(experts="te_ops", dispatcher="hybridep")
+        experts = GroupedExpertsTeOps(te_ops_config, backend=backend, dispatcher_backend="hybridep")
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        to_empty_parameters_only(experts, device=device)
+        experts.ep_size = 1
+        experts.token_dispatcher = LocalPermutationDispatcher()
+
+        generator = torch.Generator(device="cpu").manual_seed(9817)
+
+        def sample(shape, scale=1.0):
+            return (torch.randn(shape, generator=generator) * scale).to(device=device, dtype=torch.bfloat16)
+
+        num_tokens = 6
+        gate_up = sample((2, 64, 128), scale=0.2)
+        down = sample((2, 64, 64), scale=0.1)
+        experts.gate_and_up_projs = gate_up
+        experts.down_projs = down
+
+        gate_up_ref = gate_up.detach().clone().requires_grad_()
+        down_ref = down.detach().clone().requires_grad_()
+        x_ref = sample((num_tokens, 64)).requires_grad_()
+        x_test = x_ref.detach().clone().requires_grad_()
+        indices = torch.tensor(
+            [[0, 1], [1, 0], [0, 1], [1, 0], [0, 1], [1, 0]],
+            device=device,
+            dtype=torch.int64,
+        )
+        probs_ref = torch.tensor(
+            [[0.13, 0.87], [0.71, 0.29], [0.43, 0.57], [0.19, 0.81], [0.62, 0.38], [0.34, 0.66]],
+            device=device,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        probs_test = probs_ref.detach().clone().requires_grad_()
+
+        flat_experts = indices.reshape(-1)
+        flat_token_ids = torch.arange(num_tokens, device=device).unsqueeze(1).expand_as(indices).reshape(-1)
+        order = torch.argsort(flat_experts, stable=True)
+        sorted_experts = flat_experts[order]
+        sorted_token_ids = flat_token_ids[order]
+        sorted_probs = probs_ref.reshape(-1)[order]
+        splits = torch.bincount(sorted_experts, minlength=te_ops_config.n_routed_experts).tolist()
+        grouped_hidden = x_ref[sorted_token_ids]
+        projected = torch.cat(
+            [chunk @ gate_up_ref[expert_idx] for expert_idx, chunk in enumerate(grouped_hidden.split(splits))]
+        )
+        gate, up = projected.chunk(2, dim=-1)
+        gate = gate.float()
+        up = up.float()
+        if activation == "swiglu":
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+            activated = torch.nn.functional.silu(gate) * up
+        else:
+            activated = gate * torch.sigmoid(te_ops_config.activation_alpha * gate) * (up + 1.0)
+        routed = (activated * sorted_probs.float().unsqueeze(-1)).to(torch.bfloat16)
+        route_outputs = torch.cat(
+            [chunk @ down_ref[expert_idx] for expert_idx, chunk in enumerate(routed.split(splits))]
+        )
+        output_ref = torch.zeros_like(x_ref).index_add(0, sorted_token_ids, route_outputs)
+
+        token_mask = torch.ones(num_tokens, device=device, dtype=torch.bool)
+        output_test = experts(x_test, token_mask, probs_test, indices)
+        grad_output = sample(output_ref.shape)
+        output_ref.backward(grad_output)
+        output_test.backward(grad_output)
+
+        torch.testing.assert_close(output_test, output_ref, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(x_test.grad, x_ref.grad, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(probs_test.grad, probs_ref.grad, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(
+            experts.gate_up_linear._stacked_weight.grad.transpose(-1, -2),
+            gate_up_ref.grad,
+            atol=3e-2,
+            rtol=3e-2,
+        )
+        torch.testing.assert_close(
+            experts.down_linear._stacked_weight.grad.transpose(-1, -2),
+            down_ref.grad,
+            atol=3e-2,
+            rtol=3e-2,
+        )
+        assert torch.count_nonzero(probs_test.grad).item() == probs_test.numel()
+
     def test_stacked_owner_alias_and_materialization_identity(self, te_ops_config):
         from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
         from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
@@ -1232,10 +1800,19 @@ class TestGroupedExpertsTeOps:
             assert weight_alias.requires_grad == linear._stacked_weight.requires_grad
             assert bias_alias.requires_grad == linear._stacked_bias.requires_grad
 
-    def test_virtual_state_dict_roundtrip_preserves_stacked_owners(self, te_ops_config):
+    @pytest.mark.parametrize("activation", ["swiglu", "swiglu_step", "swigluoai", "quick_geglu", "geglu", "relu2"])
+    @pytest.mark.parametrize("expert_bias", [False, True])
+    def test_virtual_state_dict_roundtrip_preserves_stacked_owners(
+        self,
+        te_ops_config,
+        activation,
+        expert_bias,
+    ):
         from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
         from nemo_automodel.components.moe.experts import GroupedExpertsTeOps
 
+        te_ops_config.expert_activation = activation
+        te_ops_config.expert_bias = expert_bias
         backend = BackendConfig(experts="te_ops", dispatcher="hybridep")
         source = GroupedExpertsTeOps(te_ops_config, backend=backend, dispatcher_backend="hybridep")
         destination = GroupedExpertsTeOps(te_ops_config, backend=backend, dispatcher_backend="hybridep")
@@ -1246,7 +1823,16 @@ class TestGroupedExpertsTeOps:
         destination.init_weights(device)
 
         state = source.state_dict()
-        assert set(state) == {"gate_and_up_projs", "down_projs", "gate_up_proj_bias", "down_proj_bias"}
+        expected_keys = {"gate_and_up_projs", "down_projs"}
+        if expert_bias:
+            expected_keys.update(("gate_up_proj_bias", "down_proj_bias"))
+        assert set(state) == expected_keys
+        expected_gate_up_width = te_ops_config.moe_inter_dim * (2 if is_gated_activation(activation) else 1)
+        assert state["gate_and_up_projs"].shape == (
+            te_ops_config.n_routed_experts,
+            te_ops_config.expert_dim,
+            expected_gate_up_width,
+        )
         destination_ids = {name: id(parameter) for name, parameter in destination.named_parameters()}
         destination.load_state_dict(state)
         assert {name: id(parameter) for name, parameter in destination.named_parameters()} == destination_ids

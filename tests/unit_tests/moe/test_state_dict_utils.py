@@ -37,6 +37,7 @@ class TestIsDtensor:
 
     def test_dtensor_mock(self):
         from torch.distributed._tensor import DTensor
+
         with patch("nemo_automodel.components.moe.state_dict_utils.DTensor", DTensor):
             mock_tensor = Mock(spec=DTensor)
             mock_tensor.__class__ = DTensor
@@ -77,6 +78,7 @@ class TestGetExpertSliceForRank:
 
         # Mock placement - sharded on dim 0
         from torch.distributed._tensor.placement_types import Shard
+
         mock_placement = Shard(0)
         mock_dtensor.placements = [Mock(), mock_placement]
 
@@ -104,6 +106,7 @@ class TestGetExpertSliceForRank:
 
         # Mock placement - replicated
         from torch.distributed._tensor.placement_types import Replicate
+
         mock_placement = Replicate()
         mock_dtensor.placements = [mock_placement]
 
@@ -179,6 +182,7 @@ class TestValidateDtensorExpertSharding:
         mock_dtensor.shape = [8, 16, 32]
 
         from torch.distributed._tensor.placement_types import Shard
+
         mock_placement = Shard(0)
         mock_dtensor.placements = [mock_placement]
 
@@ -262,6 +266,23 @@ class TestCreateDtensorFromLocal:
             result = create_dtensor_from_local(local_tensor, mock_device_mesh)
 
             assert result == mock_dtensor_instance
+
+    @patch("nemo_automodel.components.moe.state_dict_utils.get_submesh")
+    def test_custom_ep_shard_dimension(self, mock_get_submesh):
+        local_tensor = torch.randn(2, 16)
+        mock_device_mesh = Mock()
+        mock_device_mesh.mesh_dim_names = ["ep_shard", "ep"]
+
+        mock_submesh = Mock()
+        mock_submesh.size.return_value = 2
+        mock_get_submesh.return_value = mock_submesh
+
+        with patch("nemo_automodel.components.moe.state_dict_utils.DTensor") as mock_dtensor_class:
+            create_dtensor_from_local(local_tensor, mock_device_mesh, ep_shard_dim=0)
+
+        placements = mock_dtensor_class.from_local.call_args.args[2]
+        assert [placement.dim for placement in placements] == [0, 0]
+        assert mock_get_submesh.call_args.args[1] == ("ep", "ep_shard")
 
 
 class TestGetExpertRangeForRankFromMesh:

@@ -617,7 +617,7 @@ def _find_call_by_first_arg(mock_obj, target_first_arg):
 
 
 def test_te_ops_stacked_owner_shard_placements(monkeypatch):
-    """TE-layout stacked weights shard input dim 2; stacked biases shard output dim 1."""
+    """Weights shard input dim 2; biases shard experts so layout conversion commutes."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     shard_dims = []
 
@@ -631,9 +631,9 @@ def test_te_ops_stacked_owner_shard_placements(monkeypatch):
     ordinary = type("Ordinary", (), {"ndim": 3})()
 
     assert P._moe_shard_placement(weight) == 2
-    assert P._moe_shard_placement(bias) == 1
+    assert P._moe_shard_placement(bias) == 0
     assert P._moe_shard_placement(ordinary) == 1
-    assert shard_dims == [2, 1, 1]
+    assert shard_dims == [2, 0, 1]
 
 
 def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch):

@@ -198,7 +198,10 @@ def validate_dtensor_expert_sharding(tensor: torch.Tensor, expected_experts: int
 
 
 def create_dtensor_from_local(
-    local_tensor: torch.Tensor, device_mesh: Optional["DeviceMesh"], rank: Optional[int] = None
+    local_tensor: torch.Tensor,
+    device_mesh: Optional["DeviceMesh"],
+    rank: Optional[int] = None,
+    ep_shard_dim: int = 1,
 ) -> torch.Tensor:
     """
     Create a DTensor from a local tensor for expert parallelism.
@@ -207,6 +210,7 @@ def create_dtensor_from_local(
         local_tensor: Local portion of the tensor on this rank
         device_mesh: Device mesh for DTensor creation
         rank: Current rank (for device placement)
+        ep_shard_dim: Canonical tensor dimension sharded by ``ep_shard``.
 
     Returns:
         DTensor if device_mesh is provided and DTensor is available, otherwise local_tensor
@@ -226,10 +230,17 @@ def create_dtensor_from_local(
         )
     )
     dim_names_for_placements = []
-    mesh_dim_names = device_mesh.mesh_dim_names
+    mesh_dim_names = list(device_mesh.mesh_dim_names)
     assert all(map(lambda x: x in ["ep", "ep_shard", "ep_replicate"], mesh_dim_names)), (
         f"Expected mesh dimension names to contain only 'ep', 'ep_shard', 'ep_replicate', got {mesh_dim_names}"
     )
+    # If both EP and EP-shard partition the expert dimension, their order is
+    # semantic. Experts are first assigned contiguously to EP ranks, then each
+    # EP rank's local experts are FSDP-sharded. Reorder the DTensor mesh axes to
+    # represent that ownership even when the physical mesh was constructed as
+    # (ep_shard, ep).
+    if ep_shard_dim == 0 and "ep" in mesh_dim_names and "ep_shard" in mesh_dim_names:
+        mesh_dim_names = ["ep", "ep_shard", *[name for name in mesh_dim_names if name not in ("ep", "ep_shard")]]
     for _, dim_name in enumerate(mesh_dim_names):
         if dim_name == "ep":
             # Expert parallelism: shard across experts (dim 0)
@@ -237,7 +248,7 @@ def create_dtensor_from_local(
             dim_names_for_placements.append(dim_name)
         elif dim_name == "ep_shard":
             if ep_sharded:
-                placements.append(Shard(1))
+                placements.append(Shard(ep_shard_dim))
                 dim_names_for_placements.append(dim_name)
         elif dim_name == "ep_replicate":
             if ep_sharded:

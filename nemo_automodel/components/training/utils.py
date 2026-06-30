@@ -31,8 +31,12 @@ from nemo_automodel.components.models.common.utils import set_is_first_microbatc
 # - model.layers.X.mlp.experts.down_linear.bias0
 # - model.layers.X.mlp.experts.gate_up_linear._stacked_weight
 # - model.layers.X.mlp.experts.down_linear._stacked_bias
+# - model.layers.X.mixer.experts.gate_up_linear._stacked_weight (Nemotron)
+# The parent module is intentionally unconstrained: architectures expose the
+# same GroupedExpertsTE contract through ``mlp``, ``moe``, ``mixer``, or a
+# checkpoint wrapper, while the exact expert/linear/owner suffix is stable.
 _TE_EXPERT_PARAM_PATTERN = re.compile(
-    r"(^|\.)(mlp|moe)\.experts\.(gate_up_linear|down_linear)\.((weight|bias)\d+|_stacked_(weight|bias))$"
+    r"(^|\.)experts\.(gate_up_linear|down_linear)\.((weight|bias)\d+|_stacked_(weight|bias))$"
 )
 
 

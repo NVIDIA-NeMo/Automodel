@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional, Union
 
 import torch
@@ -119,29 +119,13 @@ class Block(nn.Module):
 
         # MLP or MoE with shared expert
         if self.is_moe_layer:
-            # Create MoE config with per-layer swiglu limit
-            layer_moe_config = MoEConfig(
-                dim=moe_config.dim,
-                inter_dim=moe_config.inter_dim,
-                moe_inter_dim=moe_config.moe_inter_dim,
-                n_routed_experts=moe_config.n_routed_experts,
+            # Preserve every generic MoE capability while applying Step's per-layer
+            # clamp to the field consumed by all routed-expert implementations.
+            layer_moe_config = replace(
+                moe_config,
                 n_shared_experts=0,  # Shared expert handled separately in Step3p5
-                n_activated_experts=moe_config.n_activated_experts,
-                n_expert_groups=moe_config.n_expert_groups,
-                n_limited_groups=moe_config.n_limited_groups,
-                train_gate=moe_config.train_gate,
-                gate_bias_update_factor=moe_config.gate_bias_update_factor,
-                score_func=moe_config.score_func,
-                route_scale=moe_config.route_scale,
-                aux_loss_coeff=moe_config.aux_loss_coeff,
-                norm_topk_prob=moe_config.norm_topk_prob,
-                router_bias=moe_config.router_bias,
-                expert_bias=moe_config.expert_bias,
-                expert_activation=moe_config.expert_activation,
-                activation_limit=swiglu_limit if swiglu_limit else moe_config.activation_limit,
-                dtype=moe_config.dtype,
-                softmax_before_topk=moe_config.softmax_before_topk,
-                force_e_score_correction_bias=moe_config.force_e_score_correction_bias,
+                expert_activation="swiglu_step",
+                swiglu_limit=swiglu_limit if swiglu_limit is not None else moe_config.swiglu_limit,
             )
             self.moe = MoE(layer_moe_config, backend)
 
@@ -267,7 +251,7 @@ class Step3p5Model(nn.Module):
             norm_topk_prob=True,
             router_bias=False,
             expert_bias=False,
-            expert_activation="swiglu",
+            expert_activation="swiglu_step",
             dtype=get_dtype(getattr(config, "torch_dtype", "bfloat16"), torch.bfloat16),
             force_e_score_correction_bias=use_router_bias,
         )
