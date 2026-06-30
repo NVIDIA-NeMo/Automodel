@@ -171,6 +171,8 @@ class BackendConfig:
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP for token dispatch, "deepep_v2" uses DeepEP V2 ElasticBuffer,
             "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
+        dispatcher_num_sms: Communication SM count. Defaults to 6 for DeepEP v2 and 20 for
+            the other dispatchers.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
@@ -207,7 +209,7 @@ class BackendConfig:
         if HAVE_UCCL_EP and torch.cuda.is_available()
         else "torch"
     )
-    dispatcher_num_sms: int = 20
+    dispatcher_num_sms: int | None = None
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
@@ -266,6 +268,9 @@ class BackendConfig:
                 )
             self.dispatcher = "torch"
             self.experts = "torch_mm"
+
+        if self.dispatcher_num_sms is None:
+            self.dispatcher_num_sms = 6 if self.dispatcher == "deepep_v2" else 20
 
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
         if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":

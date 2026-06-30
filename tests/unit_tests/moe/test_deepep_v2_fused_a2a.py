@@ -63,8 +63,11 @@ class _FakeElasticBuffer:
         self.destroyed = False
         self.dispatch_handles = []
         self.combine_handles = []
+        self.dispatch_kwargs = []
+        self.combine_kwargs = []
 
     def dispatch(self, x, topk_idx=None, topk_weights=None, handle=None, **kwargs):
+        self.dispatch_kwargs.append(kwargs)
         if handle is None:
             handle = _FakeHandle(topk_idx, kwargs["num_max_tokens_per_rank"])
             self.dispatch_handles.append(handle)
@@ -73,6 +76,7 @@ class _FakeElasticBuffer:
         return x + 2, None, None, handle, _FakeEvent()
 
     def combine(self, x, handle, topk_weights=None, **kwargs):
+        self.combine_kwargs.append(kwargs)
         self.combine_handles.append(handle)
         return x + 3, topk_weights, _FakeEvent()
 
@@ -299,6 +303,30 @@ def test_deepep_v2_combine_uses_process_global_buffer(monkeypatch):
 
     assert torch.equal(combined_x, torch.full((2, 256), 3.0))
     assert buffer.combine_handles == [handle]
+
+
+def test_deepep_v2_uses_tuned_qp_count_in_forward_and_backward(monkeypatch):
+    _reset_fake_state(monkeypatch)
+    group = _FakeGroup()
+    x = torch.zeros(2, 256, requires_grad=True)
+    token_indices = torch.tensor([[0], [1]], dtype=torch.int64)
+    token_probs = torch.ones(2, 1)
+
+    recv_x, _, _, _, handle = fused_a2a.DeepEPV2FusedDispatch.apply(
+        x,
+        token_indices,
+        token_probs,
+        2,
+        group,
+        False,
+        False,
+    )
+    combined_x, _ = fused_a2a.DeepEPV2FusedCombine.apply(recv_x, group, handle, False, False)
+    combined_x.sum().backward()
+
+    buffer = fused_a2a._deepep_v2_buffer
+    assert [kwargs["num_qps"] for kwargs in buffer.dispatch_kwargs] == [33, 33]
+    assert [kwargs["num_qps"] for kwargs in buffer.combine_kwargs] == [33, 33]
 
 
 def test_destroy_deepep_v2_buffer_clears_process_global_buffer(monkeypatch):
