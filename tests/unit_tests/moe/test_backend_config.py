@@ -186,6 +186,16 @@ class TestBackendConfigHybridEP:
         config = BackendConfig(dispatcher="hybridep", dispatcher_num_sms=24)
         assert config.dispatcher_num_sms == 24
 
+    def test_deepep_v2_dispatcher_num_sms_default(self):
+        """DeepEP v2 defaults to the measured EP64 optimum."""
+        config = BackendConfig(dispatcher="deepep_v2")
+        assert config.dispatcher_num_sms == 6
+
+    def test_deepep_v2_dispatcher_num_sms_custom(self):
+        """An explicit DeepEP v2 SM count overrides the tuned default."""
+        config = BackendConfig(dispatcher="deepep_v2", dispatcher_num_sms=20)
+        assert config.dispatcher_num_sms == 20
+
     def test_dispatcher_share_token_dispatcher_default(self):
         """Test that dispatcher_share_token_dispatcher defaults to enabled."""
         config = BackendConfig(dispatcher="deepep")
