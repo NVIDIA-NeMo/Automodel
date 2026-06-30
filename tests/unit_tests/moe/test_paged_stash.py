@@ -62,7 +62,7 @@ def _record_group(manager, tensor, num_tokens, *, max_num_tokens, name="test"):
     return group.commit(output)
 
 
-def test_recording_profiles_peak_live_rows_and_releases_after_backward():
+def test_recording_profiles_peak_page_charges_and_releases_after_backward():
     manager = paged_stash.PagedStashManager()
     manager.configure(enabled=True, page_size=4, buffer_size_factor=1.2)
 
@@ -73,7 +73,8 @@ def test_recording_profiles_peak_live_rows_and_releases_after_backward():
     second.sum().backward()
 
     diagnostics = manager.diagnostics()
-    assert diagnostics["recorded_peak_tokens"] == {(torch.float32, 4): 8}
+    # The two simultaneously live tensors use ceil(5/4) + ceil(3/4) pages.
+    assert diagnostics["recorded_peak_tokens"] == {(torch.float32, 4): 12}
     assert diagnostics["live_groups"] == 0
     with pytest.raises(RuntimeError, match="CUDA warmup"):
         manager.prepare()
@@ -95,7 +96,8 @@ def test_recording_understands_te_columnwise_scale_inverse_rows():
     output = group.commit(output)
     output.sum().backward()
 
-    assert manager.diagnostics()["recorded_peak_tokens"] == {(torch.float32, 3): 1}
+    # One live scale row still owns one complete page in the active allocator.
+    assert manager.diagnostics()["recorded_peak_tokens"] == {(torch.float32, 3): 64}
     manager.close()
 
 

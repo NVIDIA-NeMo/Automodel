@@ -109,7 +109,7 @@ class _PagedStashBuffer:
 class _RecordedTensor:
     tensor: torch.Tensor
     key: tuple[torch.dtype, int]
-    num_tokens: int
+    charged_tokens: int
     released: bool = False
 
 
@@ -453,10 +453,14 @@ class PagedStashManager:
                 raise RuntimeError(
                     f"Paged stash recording changed device from {self._record_device} to {tensor.device}"
                 )
-            current = self._recorded_current_tokens.get(key, 0) + actual_tokens
+            # The active allocator cannot share a partial page between saved
+            # tensors. Profile the exact page-rounded charge, rather than raw
+            # live rows, or many small scale tensors understate peak capacity.
+            charged_tokens = math.ceil(actual_tokens / self._page_size) * self._page_size
+            current = self._recorded_current_tokens.get(key, 0) + charged_tokens
             self._recorded_current_tokens[key] = current
             self._recorded_peak_tokens[key] = max(self._recorded_peak_tokens.get(key, 0), current)
-            return _RecordedTensor(tensor=tensor, key=key, num_tokens=actual_tokens)
+            return _RecordedTensor(tensor=tensor, key=key, charged_tokens=charged_tokens)
 
         if self._state is not _PagedStashState.ACTIVE:
             return tensor
@@ -478,7 +482,7 @@ class PagedStashManager:
     def _unpack_saved_tensor(self, saved: Any) -> torch.Tensor:
         if isinstance(saved, _RecordedTensor):
             if not saved.released:
-                current = self._recorded_current_tokens[saved.key] - saved.num_tokens
+                current = self._recorded_current_tokens[saved.key] - saved.charged_tokens
                 if current < 0:
                     raise RuntimeError(f"Paged stash recording underflow for layout {saved.key}")
                 self._recorded_current_tokens[saved.key] = current
