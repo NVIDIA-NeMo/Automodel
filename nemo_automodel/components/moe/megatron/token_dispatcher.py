@@ -27,6 +27,7 @@ from .fused_a2a import (
     hybrid_ep_combine,
     hybrid_ep_dispatch,
     set_deepep_num_sms,
+    set_deepep_v2_num_qps,
     set_deepep_v2_num_sms,
     set_uccl_num_sms,
     uccl_fused_combine,
@@ -494,6 +495,9 @@ class TokenDispatcherConfig:
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP backend."""
 
+    moe_deepep_num_qps: int = 0
+    """Number of QPs to use for DeepEP v2."""
+
     moe_hybridep_num_sms: int = 24
     """Number of SMs to use for HybridEP dispatch and combine APIs."""
 
@@ -572,6 +576,7 @@ class MoEFlexTokenDispatcher:
                 set_deepep_num_sms(self.config.moe_deepep_num_sms)
             else:
                 set_deepep_v2_num_sms(self.config.moe_deepep_num_sms)
+                set_deepep_v2_num_qps(self.config.moe_deepep_num_qps)
             if backend == "deepep_v2" and deepep_v2_fused_dispatch is None:
                 raise ImportError("DeepEP V2 is not installed. Install a deep_ep package that exports ElasticBuffer.")
 
