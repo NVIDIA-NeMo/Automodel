@@ -42,6 +42,19 @@ def test_static_batch_buffer_copies_nested_noncontiguous_aliases():
     torch.testing.assert_close(static_input, replacement)
 
 
+def test_static_batch_buffer_materializes_overlapping_expanded_inputs():
+    source = torch.arange(3, dtype=torch.int64).reshape(1, 3).expand(2, 3)
+    buffer = _StaticCudaBatchBuffer(_batch(source), device=torch.device("cpu"))
+
+    replacement = (torch.arange(3, dtype=torch.int64) + 10).reshape(1, 3).expand(2, 3)
+    buffer.copy_from(_batch(replacement))
+
+    static_input = buffer.batches[0]["nested"]["input"]
+    assert static_input.is_contiguous()
+    assert static_input is buffer.batches[0]["alias"]
+    torch.testing.assert_close(static_input, replacement)
+
+
 @pytest.mark.parametrize(
     ("replacement", "message"),
     [

@@ -202,12 +202,24 @@ class _StaticCudaBatchBuffer:
                 raise FullIterationCudaGraphError(
                     f"Full-iteration CUDA graph inputs must use torch.strided layout, got {tensor.layout}"
                 )
-            static_tensor = torch.empty_strided(
-                tuple(tensor.shape),
-                tuple(tensor.stride()),
-                dtype=tensor.dtype,
-                device=device,
+            overlap_checker = getattr(torch, "_debug_has_internal_overlap", None)
+            has_internal_overlap = (
+                int(overlap_checker(tensor)) != 0
+                if callable(overlap_checker)
+                else any(size > 1 and stride == 0 for size, stride in zip(tensor.shape, tensor.stride()))
             )
+            if has_internal_overlap:
+                # Expanded/as_strided inputs may be readable but cannot be used
+                # as copy destinations. The source stride remains part of the
+                # replay signature; only the graph-owned storage is materialized.
+                static_tensor = torch.empty(tuple(tensor.shape), dtype=tensor.dtype, device=device)
+            else:
+                static_tensor = torch.empty_strided(
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    dtype=tensor.dtype,
+                    device=device,
+                )
             with torch.no_grad():
                 static_tensor.copy_(tensor, non_blocking=True)
             static_tensor.requires_grad_(tensor.requires_grad)
