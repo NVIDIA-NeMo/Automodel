@@ -1255,3 +1255,25 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
 
 ModelClass = Qwen3_5ForCausalLM
+
+
+def _get_nemo_parallelization_strategy():
+    """Load the Qwen3.5 FSDP2 strategy only when parallelization is requested."""
+    from .parallelizer import get_parallelization_strategy
+
+    return get_parallelization_strategy()
+
+
+def _get_nemo_tp_plan(model, *, sequence_parallel: bool = False):
+    """Load the Qwen3.5 tensor-parallel plan only when it is requested."""
+    from .parallelizer import get_tp_plan
+
+    return get_tp_plan(model, sequence_parallel=sequence_parallel)
+
+
+Qwen3_5ForCausalLM._nemo_parallelization_strategy_factory = staticmethod(_get_nemo_parallelization_strategy)
+Qwen3_5ForConditionalGeneration._nemo_parallelization_strategy_factory = staticmethod(
+    _get_nemo_parallelization_strategy
+)
+Qwen3_5ForCausalLM._nemo_tp_plan_factory = staticmethod(_get_nemo_tp_plan)
+Qwen3_5ForConditionalGeneration._nemo_tp_plan_factory = staticmethod(_get_nemo_tp_plan)

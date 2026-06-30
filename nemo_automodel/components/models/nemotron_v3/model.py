@@ -1050,3 +1050,13 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
 
 ModelClass = NemotronHForCausalLM
+
+
+def _get_nemo_parallelization_strategy():
+    """Load the Nemotron-H FSDP2 strategy only when parallelization is requested."""
+    from .parallelizer import get_parallelization_strategy
+
+    return get_parallelization_strategy()
+
+
+NemotronHForCausalLM._nemo_parallelization_strategy_factory = staticmethod(_get_nemo_parallelization_strategy)

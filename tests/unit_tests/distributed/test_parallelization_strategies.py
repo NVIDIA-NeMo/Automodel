@@ -24,6 +24,8 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import ColwiseParallel
 
+from nemo_automodel._diffusers.hunyuan_video.parallelizer import HunyuanParallelizationStrategy
+from nemo_automodel._diffusers.wan.parallelizer import WanParallelizationStrategy
 from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
 
 # Import the components under test
@@ -31,14 +33,17 @@ from nemo_automodel.components.distributed.parallelizer import (
     _DEFAULT_STRATEGY,
     PARALLELIZATION_STRATEGIES,
     DefaultParallelizationStrategy,
-    HunyuanParallelizationStrategy,
-    NemotronHParallelizationStrategy,
     ParallelizationStrategy,
-    WanParallelizationStrategy,
     _extract_model_layers,
-    _nemotronh_decoder_blocks,
     fsdp2_strategy_parallelize,
     get_parallelization_strategy,
+)
+from nemo_automodel.components.models.nemotron_v3.parallelizer import (
+    NemotronHParallelizationStrategy,
+    _nemotronh_decoder_blocks,
+)
+from nemo_automodel.components.models.nemotron_v3.parallelizer import (
+    get_parallelization_strategy as get_nemotron_parallelization_strategy,
 )
 
 
@@ -101,6 +106,7 @@ class MockNemotronHModel(nn.Module):
 
         self.backbone = MockBackbone()
         self.__class__.__name__ = "NemotronHForCausalLM"
+        self._nemo_parallelization_strategy_factory = get_nemotron_parallelization_strategy
 
     def forward(self, x):
         return x
@@ -124,6 +130,7 @@ class MockNemotronV3Model(nn.Module):
 
         self.model = MockInner()
         self.__class__.__name__ = "NemotronHForCausalLM"
+        self._nemo_parallelization_strategy_factory = get_nemotron_parallelization_strategy
 
     def forward(self, x):
         return x
@@ -216,11 +223,11 @@ def mock_distributed_env(monkeypatch):
         raising=False,
     )
 
-    # Mock apply_fsdp2_sharding_recursively
-    apply_fsdp_mock = MagicMock()
+    # Default strategy owns its recursive traversal; mock that hook directly.
+    shard_modules_mock = MagicMock()
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively",
-        apply_fsdp_mock,
+        "nemo_automodel.components.distributed.parallelizer.DefaultParallelizationStrategy._shard_modules_recursively",
+        shard_modules_mock,
         raising=False,
     )
 
@@ -230,11 +237,9 @@ def mock_distributed_env(monkeypatch):
         "nemo_automodel.components.distributed.parallelizer._extract_model_layers", extract_layers_mock, raising=False
     )
 
-    # Mock _get_parallel_plan
+    # Mock generic TP plan resolution.
     get_plan_mock = MagicMock(return_value={"test.layer": ColwiseParallel()})
-    monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer._get_parallel_plan", get_plan_mock, raising=False
-    )
+    monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.get_tp_plan", get_plan_mock, raising=False)
 
     # Mock validate_tp_mesh
     validate_tp_mock = MagicMock()
@@ -246,7 +251,7 @@ def mock_distributed_env(monkeypatch):
         "fully_shard": fully_shard_mock,
         "parallelize_module": parallelize_module_mock,
         "checkpoint_wrapper": checkpoint_wrapper_mock,
-        "apply_fsdp": apply_fsdp_mock,
+        "shard_modules": shard_modules_mock,
         "extract_layers": extract_layers_mock,
         "get_plan": get_plan_mock,
         "validate_tp": validate_tp_mock,
@@ -327,7 +332,7 @@ class TestDefaultParallelizationStrategy:
 
         # Verify key functions were called
         mock_distributed_env["extract_layers"].assert_called_once_with(model)
-        mock_distributed_env["apply_fsdp"].assert_called_once()
+        mock_distributed_env["shard_modules"].assert_called_once()
         mock_distributed_env["fully_shard"].assert_called()
 
     def test_parallelize_with_tensor_parallel(self, strategy, mock_device_mesh, mock_distributed_env):
@@ -344,7 +349,7 @@ class TestDefaultParallelizationStrategy:
             activation_checkpointing=False,
         )
 
-        # Should call validate_tp_mesh, _get_parallel_plan, and parallelize_module
+        # Should call validate_tp_mesh, TP plan resolution, and parallelize_module.
         mock_distributed_env["validate_tp"].assert_called_once_with(model, tp_mesh)
         mock_distributed_env["get_plan"].assert_called_once()
         mock_distributed_env["parallelize_module"].assert_called_once()
@@ -601,10 +606,9 @@ class TestNemotronHParallelizationStrategy:
 class TestStrategyRegistry:
     """Test the strategy registry functionality."""
 
-    def test_registry_contains_nemotron_strategy(self):
-        """Test that the registry contains NemotronH strategy."""
-        assert "NemotronHForCausalLM" in PARALLELIZATION_STRATEGIES
-        assert isinstance(PARALLELIZATION_STRATEGIES["NemotronHForCausalLM"], NemotronHParallelizationStrategy)
+    def test_builtin_nemotron_strategy_does_not_mutate_global_registry(self):
+        """Built-in model strategies are resolved through a lazy model factory."""
+        assert "NemotronHForCausalLM" not in PARALLELIZATION_STRATEGIES
 
     def test_default_strategy_exists(self):
         """Test that the default strategy exists."""

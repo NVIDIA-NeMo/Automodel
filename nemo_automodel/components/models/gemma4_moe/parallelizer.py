@@ -1,0 +1,38 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Gemma4 tensor-parallel plan."""
+
+from __future__ import annotations
+
+import warnings
+
+from torch.distributed.tensor.parallel import ParallelStyle
+
+from nemo_automodel.components.models.common.tp_plan import DecoderTPPaths, decoder_tp_plan
+
+_TP_PATHS = DecoderTPPaths(
+    embedding="model.language_model.embed_tokens",
+    layer="model.language_model.layers.*",
+    norm="model.language_model.norm",
+    output_head="lm_head",
+)
+
+
+def get_tp_plan(model, *, sequence_parallel: bool = False) -> dict[str, ParallelStyle]:
+    """Return the Gemma4 language-model tensor-parallel plan."""
+    del model
+    if sequence_parallel:
+        warnings.warn("sequence_parallel=True is not supported for Gemma4 and will be ignored.", stacklevel=2)
+    return decoder_tp_plan(paths=_TP_PATHS)

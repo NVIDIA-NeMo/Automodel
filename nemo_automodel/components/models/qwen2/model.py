@@ -489,3 +489,13 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
 
 
 ModelClass = Qwen2ForCausalLM
+
+
+def _get_nemo_tp_plan(model, *, sequence_parallel: bool = False):
+    """Load the Qwen2 tensor-parallel plan only when it is requested."""
+    from .parallelizer import get_tp_plan
+
+    return get_tp_plan(model, sequence_parallel=sequence_parallel)
+
+
+Qwen2ForCausalLM._nemo_tp_plan_factory = staticmethod(_get_nemo_tp_plan)

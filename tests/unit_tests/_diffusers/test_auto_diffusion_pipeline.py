@@ -79,6 +79,33 @@ class DummyPipeline:
 
 
 # =============================================================================
+# Parallelization strategy registration tests
+# =============================================================================
+
+
+def test_attach_diffusion_parallelization_strategy_is_lazy_and_local():
+    """Diffusion-specific strategy loading attaches to a matching module only."""
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _attach_diffusion_parallelization_strategy
+    from nemo_automodel._diffusers.hunyuan_video.parallelizer import HunyuanParallelizationStrategy
+    from nemo_automodel._diffusers.wan.parallelizer import WanParallelizationStrategy
+    from nemo_automodel.components.distributed.parallelizer import PARALLELIZATION_STRATEGIES
+
+    original_registry = dict(PARALLELIZATION_STRATEGIES)
+    wan_model = type("WanTransformer3DModel", (DummyModule,), {})()
+    hunyuan_model = type("HunyuanVideo15Transformer3DModel", (DummyModule,), {})()
+    unrelated_model = DummyModule()
+
+    _attach_diffusion_parallelization_strategy(wan_model)
+    _attach_diffusion_parallelization_strategy(hunyuan_model)
+    _attach_diffusion_parallelization_strategy(unrelated_model)
+
+    assert isinstance(wan_model._nemo_parallelization_strategy, WanParallelizationStrategy)
+    assert isinstance(hunyuan_model._nemo_parallelization_strategy, HunyuanParallelizationStrategy)
+    assert not hasattr(unrelated_model, "_nemo_parallelization_strategy")
+    assert PARALLELIZATION_STRATEGIES == original_registry
+
+
+# =============================================================================
 # _choose_device tests
 # =============================================================================
 
@@ -560,7 +587,6 @@ def test_apply_parallelization_creates_managers_and_replaces_modules():
     with (
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
         patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mock_manager) as mock_create,
-        patch(f"{MODULE_PATH}._init_parallelizer"),
     ):
         managers = _apply_parallelization(pipe, {"unet": {"_manager_type": "fsdp2"}})
 
@@ -584,7 +610,6 @@ def test_apply_parallelization_skips_components_not_in_scheme():
     with (
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
         patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mock_manager),
-        patch(f"{MODULE_PATH}._init_parallelizer"),
     ):
         managers = _apply_parallelization(pipe, {"unet": {"_manager_type": "fsdp2"}})
 
@@ -672,7 +697,6 @@ def test_from_pretrained_parallel_scheme_applies_managers_and_sets_attrs():
         patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
         patch(f"{MODULE_PATH}._create_parallel_manager", side_effect=manager_sequence),
-        patch(f"{MODULE_PATH}._init_parallelizer"),
     ):
         # parallel_scheme values are now dicts (manager kwargs), not manager objects
         pipe, managers = NeMoAutoDiffusionPipeline.from_pretrained(
@@ -709,7 +733,6 @@ def test_from_pretrained_parallel_scheme_propagates_errors():
         patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
         patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mgr),
-        patch(f"{MODULE_PATH}._init_parallelizer"),
     ):
         with pytest.raises(RuntimeError, match="boom"):
             NeMoAutoDiffusionPipeline.from_pretrained(

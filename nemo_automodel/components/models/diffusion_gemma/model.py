@@ -673,10 +673,12 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
 if _TRANSFORMERS_AVAILABLE:
     ModelClass = DiffusionGemmaForBlockDiffusion
 
-    # Register the pure-FSDP2 (ep_size=1) parallelization strategy so that
-    # get_parallelization_strategy() selects it for this model. Done here (not in
-    # the package __init__) so the parallelizer import — which pulls torch/FSDP —
-    # only runs in a torch-enabled environment, alongside model construction.
-    from .fsdp import register_diffusion_gemma_parallel_strategy
+    def _get_nemo_parallelization_strategy():
+        """Load DiffusionGemma's FSDP2 strategy only when it is requested."""
+        from .parallelizer import get_parallelization_strategy
 
-    register_diffusion_gemma_parallel_strategy()
+        return get_parallelization_strategy()
+
+    DiffusionGemmaForBlockDiffusion._nemo_parallelization_strategy_factory = staticmethod(
+        _get_nemo_parallelization_strategy
+    )

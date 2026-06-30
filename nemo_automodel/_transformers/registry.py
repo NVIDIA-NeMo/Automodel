@@ -381,6 +381,14 @@ class _LazyArchMapping:
     def keys(self):
         return set(self._auto_map.keys()) | set(self._extra.keys())
 
+    def get_module_path(self, key: str) -> str | None:
+        """Return the registered model module path without importing the model."""
+        if key in self._auto_map:
+            return self._auto_map[key][0]
+        if key in self._extra:
+            return self._extra[key].__module__
+        return None
+
     def __len__(self) -> int:
         return len(self.keys())
 
@@ -404,6 +412,10 @@ class _ModelRegistry:
 
     def get_model_cls_from_model_arch(self, model_arch: str) -> Type[nn.Module]:
         return self.model_arch_name_to_cls[model_arch]
+
+    def get_model_module_path(self, model_arch: str) -> str | None:
+        """Return the module that owns a registered model architecture."""
+        return self.model_arch_name_to_cls.get_module_path(model_arch)
 
     def has_custom_model(self, arch_name: str) -> bool:
         """Return ``True`` if *arch_name* has a custom (non-HF) implementation."""
