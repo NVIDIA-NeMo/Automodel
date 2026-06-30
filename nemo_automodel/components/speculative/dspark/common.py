@@ -218,30 +218,44 @@ def create_noise_embed(
 
 
 def pin_rope_inv_freq_fp32(rotary_emb: Optional[nn.Module]) -> None:
-    """Keep a RoPE module's ``inv_freq`` buffer in fp32 after a dtype cast.
+    """Keep a RoPE module's ``inv_freq`` buffers in fp32 after a dtype cast.
 
     ``module.to(bfloat16)`` (the training build path) rounds the rotary
-    ``inv_freq`` buffer to bf16. The rounded frequencies dephase with absolute
+    ``inv_freq`` buffers to bf16. The rounded frequencies dephase with absolute
     position, so the train/inference RoPE diverges (worse with longer context)
     and draft acceptance erodes, while the serving runtime keeps an fp32 RoPE
     cache. A bf16 round-trip cannot be undone by upcasting, so recompute fresh
-    fp32 frequencies from the rotary config (the same values HF derives on the
-    fp32 paths). No-op when ``inv_freq`` is already fp32 or on a meta device.
+    fp32 frequencies from a fresh rotary module built off the same config (the
+    same values HF derives on the fp32 paths) and copy them back in.
+
+    Works for both the single-buffer layout (``inv_freq`` / ``original_inv_freq``,
+    e.g. Qwen3) and the per-layer-type layout where each frequency buffer is named
+    ``<layer_type>_inv_freq`` (e.g. Gemma4). No-op when every frequency buffer is
+    already fp32 or on a meta device.
     """
     if rotary_emb is None:
         return
-    inv_freq = getattr(rotary_emb, "inv_freq", None)
-    if inv_freq is None or not inv_freq.is_floating_point() or inv_freq.is_meta or inv_freq.dtype == torch.float32:
+    # Match both ``inv_freq``/``original_inv_freq`` and ``<layer_type>_inv_freq``.
+    rounded = {
+        name: buf
+        for name, buf in rotary_emb.named_buffers(recurse=False)
+        if name.endswith("inv_freq")
+        and buf is not None
+        and buf.is_floating_point()
+        and not buf.is_meta
+        and buf.dtype != torch.float32
+    }
+    if not rounded:
         return
-    rope_init_fn = getattr(rotary_emb, "rope_init_fn", None)
     config = getattr(rotary_emb, "config", None)
-    if rope_init_fn is None or config is None:
+    if config is None:
         return
-    rope_kwargs = getattr(rotary_emb, "rope_kwargs", None) or {}
-    fresh, _ = rope_init_fn(config, inv_freq.device, **rope_kwargs)
-    rotary_emb.inv_freq = fresh.to(device=inv_freq.device, dtype=torch.float32)
-    if getattr(rotary_emb, "original_inv_freq", None) is not None:
-        rotary_emb.original_inv_freq = rotary_emb.inv_freq.clone()
+    # Rebuild a fresh module of the same type to recompute the frequencies in
+    # fp32; upcasting the rounded buffers in place cannot recover the lost bits.
+    fresh = type(rotary_emb)(config)
+    for name, fresh_buf in fresh.named_buffers(recurse=False):
+        if name in rounded:
+            setattr(rotary_emb, name, fresh_buf.to(device=rounded[name].device, dtype=torch.float32))
 
 
 __all__ = [
