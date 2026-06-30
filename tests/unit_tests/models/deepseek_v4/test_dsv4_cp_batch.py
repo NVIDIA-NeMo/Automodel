@@ -256,8 +256,20 @@ def test_contiguous_shard_packed_sequence_pads_each_doc_before_cp_slice():
         "seq_lens_padded": torch.tensor([[3, 5]]),
     }
 
-    _, rank0 = _shard({k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()}, cp_size=2, local_rank=0, pad_multiple=4, padding_token_id=99)
-    _, rank1 = _shard({k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()}, cp_size=2, local_rank=1, pad_multiple=4, padding_token_id=99)
+    _, rank0 = _shard(
+        {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()},
+        cp_size=2,
+        local_rank=0,
+        pad_multiple=4,
+        padding_token_id=99,
+    )
+    _, rank1 = _shard(
+        {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()},
+        cp_size=2,
+        local_rank=1,
+        pad_multiple=4,
+        padding_token_id=99,
+    )
 
     torch.testing.assert_close(rank0["input_ids"], torch.tensor([[0, 1, 2, 99]]))
     torch.testing.assert_close(rank0["labels"], torch.tensor([[0, 1, 2, -100]]))
@@ -274,6 +286,59 @@ def test_contiguous_shard_packed_sequence_pads_each_doc_before_cp_slice():
     torch.testing.assert_close(rank0["seq_lens"], torch.tensor([[3, 2]]))
     torch.testing.assert_close(rank0["seq_lens_padded"], torch.tensor([[4, 4]]))
     assert rank0["qkv_format"] == "thd"
+
+
+def test_contiguous_shard_syncs_packed_length_for_hybridep(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+
+    def _all_reduce_max(length, op):
+        assert op == torch.distributed.ReduceOp.MAX
+        length.fill_(16)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", _all_reduce_max)
+    batch = {
+        "input_ids": torch.arange(8).view(1, 8),
+        "labels": torch.arange(8).view(1, 8),
+        "qkv_format": "thd",
+        "seq_lens": torch.tensor([[3, 2]]),
+        "seq_lens_padded": torch.tensor([[3, 5]]),
+    }
+
+    _, out = _shard(
+        batch,
+        cp_size=2,
+        local_rank=0,
+        pad_multiple=4,
+        padding_token_id=99,
+        sync_packed_length=True,
+    )
+
+    assert out["input_ids"].shape == (1, 8)
+    torch.testing.assert_close(out["input_ids"], torch.tensor([[0, 1, 2, 99, 3, 4, 99, 99]]))
+    torch.testing.assert_close(out["labels"], torch.tensor([[0, 1, 2, -100, 3, 4, -100, -100]]))
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1)
+    batch = {
+        "input_ids": torch.arange(8).view(1, 8),
+        "labels": torch.arange(8).view(1, 8),
+        "qkv_format": "thd",
+        "seq_lens": torch.tensor([[3, 2]]),
+        "seq_lens_padded": torch.tensor([[3, 5]]),
+    }
+    _, out = _shard(
+        batch,
+        cp_size=2,
+        local_rank=1,
+        pad_multiple=4,
+        padding_token_id=99,
+        sync_packed_length=True,
+    )
+
+    torch.testing.assert_close(out["input_ids"], torch.full((1, 8), 99))
+    torch.testing.assert_close(out["labels"], torch.full((1, 8), -100))
+    torch.testing.assert_close(out["padding_mask"], torch.ones((1, 8), dtype=torch.bool))
+    torch.testing.assert_close(out["packed_seq_ids"], torch.zeros((1, 8), dtype=torch.long))
 
 
 def test_contiguous_shard_requires_exactly_one_primary_key():
@@ -304,13 +369,14 @@ def test_contiguous_shard_requires_labels():
 def test_prepare_model_inputs_for_cp_returns_make_batch_fn_and_flag():
     # The method only reads self.config, so a lightweight stand-in suffices.
     cfg = SimpleNamespace(compress_ratios=[0, 4, 128])
-    fake_self = SimpleNamespace(config=cfg)
+    fake_self = SimpleNamespace(config=cfg, backend=SimpleNamespace(dispatcher="hybridep"))
     prepared = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, input_ids=torch.arange(8).view(1, 8))
 
     assert prepared["_cp_full_logits_grad_touch"] is True
     fn = prepared["_cp_make_batch_fn"]
     # the partial binds the config-derived per-rank multiple (lcm(8,128) == 128)
     assert fn.keywords["pad_multiple"] == 128
+    assert fn.keywords["sync_packed_length"] is True
     assert fn.func is make_dsv4_contiguous_shard_cp_batch_and_ctx
 
     # the bound fn shards a batch end-to-end with a real (fake-mesh) divisor.
@@ -323,13 +389,14 @@ def test_forward_pre_embed_only_branch_delegates_to_prepare():
     # forward()'s first statement short-circuits to prepare_model_inputs_for_cp
     # before any model compute, so a fake self exercises it without a build.
     cfg = SimpleNamespace(compress_ratios=[4])
-    fake_self = SimpleNamespace(config=cfg)
+    fake_self = SimpleNamespace(config=cfg, backend=SimpleNamespace(dispatcher="deepep"))
     fake_self.prepare_model_inputs_for_cp = lambda input_ids: DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(
         fake_self, input_ids=input_ids
     )
     out = DeepseekV4ForCausalLM.forward(fake_self, torch.arange(8).view(1, 8), _pre_embed_only=True)
     assert out["_cp_full_logits_grad_touch"] is True
     assert out["_cp_make_batch_fn"].keywords["pad_multiple"] == 8
+    assert out["_cp_make_batch_fn"].keywords["sync_packed_length"] is False
 
 
 def test_setup_cp_attention_stores_group():
