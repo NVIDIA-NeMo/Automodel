@@ -357,11 +357,11 @@ class TestDefaultParallelizationStrategy:
         mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
 
         # Mock layers with all the attributes that get checkpointed
-        mock_layer = MagicMock()
+        mock_layer = nn.Module()
         mock_layer.mlp = nn.Linear(10, 10)
-        mock_layer.self_attn = MagicMock()
-        mock_layer.input_layernorm = MagicMock()
-        mock_layer.post_attention_layernorm = MagicMock()
+        mock_layer.self_attn = nn.Linear(10, 10)
+        mock_layer.input_layernorm = nn.Linear(10, 10)
+        mock_layer.post_attention_layernorm = nn.Linear(10, 10)
         mock_distributed_env["extract_layer_groups"].return_value = {"language": [mock_layer]}
 
         model = MockModel()
@@ -380,6 +380,8 @@ class TestDefaultParallelizationStrategy:
         expected_calls = [
             call(mock_layer.mlp),
             call(mock_layer.self_attn),
+            call(mock_layer.input_layernorm),
+            call(mock_layer.post_attention_layernorm),
         ]
         checkpoint_wrapper_mock.assert_has_calls(expected_calls, any_order=False)
 

@@ -2037,14 +2037,20 @@ class TestSingleGpuActivationCheckpointing:
             assert isinstance(layer.mlp, CheckpointWrapper)
             assert not isinstance(layer.self_attn, CheckpointWrapper)
 
-    def test_full_uses_hf_gradient_checkpointing_on_single_gpu(self, monkeypatch):
-        """Non-selective AC still uses HF gradient_checkpointing_enable on a single GPU."""
+    def test_full_wraps_layers_on_single_gpu_without_hf_native(self, monkeypatch):
+        """Non-selective AC wraps layers on single GPU when the model is not an HF native GC candidate."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
         manager = self._make_manager(monkeypatch, True)
         model = _make_model_for_ac(num_kv_shared_layers=0)
         model.gradient_checkpointing_enable = MagicMock()
         manager.parallelize(model)
 
-        model.gradient_checkpointing_enable.assert_called_once()
+        model.gradient_checkpointing_enable.assert_not_called()
+        for layer in model.model.layers:
+            assert not isinstance(layer, CheckpointWrapper)
+            assert isinstance(layer.mlp, CheckpointWrapper)
+            assert isinstance(layer.self_attn, CheckpointWrapper)
 
 
 class TestSelectiveCheckpointSaveOps:
