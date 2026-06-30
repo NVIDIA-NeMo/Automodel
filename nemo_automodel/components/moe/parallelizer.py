@@ -391,6 +391,9 @@ def apply_fsdp(
     mp_policy: MixedPrecisionPolicy | None = None,
     offload_policy: OffloadPolicy | None = None,
     reshard_after_forward: bool = False,
+    enable_fsdp2_prefetch: bool = False,
+    fsdp2_backward_prefetch_depth: int = 2,
+    fsdp2_forward_prefetch_depth: int = 1,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
 ):
@@ -440,7 +443,8 @@ def apply_fsdp(
     if mtp_module is not None and hasattr(mtp_module, "layers"):
         mtp_block_ids = {id(b) for b in mtp_module.layers.children()}
 
-    for block in _iter_moe_blocks(model, _model):
+    fsdp_blocks = list(_iter_moe_blocks(model, _model))
+    for block in fsdp_blocks:
         moe_module = _get_moe_module(block)
         experts_reshard_after_forward = False if id(block) in mtp_block_ids else reshard_after_forward
         if isinstance(moe_module, MoE) and ep_shard_enabled:
@@ -473,6 +477,18 @@ def apply_fsdp(
         if fp32_ignored:
             ignored_params = (ignored_params or set()) | fp32_ignored
         fully_shard_default(block, ignored_params=ignored_params)
+
+    if enable_fsdp2_prefetch:
+        if fsdp2_forward_prefetch_depth > 0:
+            for block_idx, block in enumerate(fsdp_blocks[:-1]):
+                targets = fsdp_blocks[
+                    block_idx + 1 : min(block_idx + 1 + fsdp2_forward_prefetch_depth, len(fsdp_blocks))
+                ]
+                block.set_modules_to_forward_prefetch(targets)
+        if fsdp2_backward_prefetch_depth > 0:
+            for block_idx, block in enumerate(fsdp_blocks[1:], start=1):
+                targets = fsdp_blocks[max(0, block_idx - fsdp2_backward_prefetch_depth) : block_idx]
+                block.set_modules_to_backward_prefetch(list(reversed(targets)))
 
     # Re-establish weight tying before detecting it: a device/dtype move during
     # from_pretrained (HF replaces param tensors) can silently break a tie set in
@@ -648,6 +664,9 @@ def parallelize_model(
     activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = True,
     reshard_after_forward: bool = False,
+    enable_fsdp2_prefetch: bool = False,
+    fsdp2_backward_prefetch_depth: int = 2,
+    fsdp2_forward_prefetch_depth: int = 1,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
@@ -697,6 +716,9 @@ def parallelize_model(
             ep_shard_mesh=ep_shard_mesh,
             mp_policy=mp_policy,
             reshard_after_forward=reshard_after_forward,
+            enable_fsdp2_prefetch=enable_fsdp2_prefetch,
+            fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
+            fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,
         )

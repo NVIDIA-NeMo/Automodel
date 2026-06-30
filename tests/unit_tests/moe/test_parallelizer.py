@@ -698,6 +698,39 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     assert model_call is not None and model_call[1]["mesh"] is fsdp_mesh
 
 
+def test_apply_fsdp_configures_moe_block_prefetch_chains(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    blocks = [DummyBlock() for _ in range(4)]
+    for block in blocks:
+        block.set_modules_to_forward_prefetch = MagicMock()
+        block.set_modules_to_backward_prefetch = MagicMock()
+    model = DummyModel(blocks)
+    fsdp_mesh = type("Mesh", (), {"size": lambda self: 2})()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=True,
+        ep_shard_enabled=False,
+        enable_fsdp2_prefetch=True,
+        fsdp2_forward_prefetch_depth=2,
+        fsdp2_backward_prefetch_depth=2,
+    )
+
+    blocks[0].set_modules_to_forward_prefetch.assert_called_once_with([blocks[1], blocks[2]])
+    blocks[1].set_modules_to_forward_prefetch.assert_called_once_with([blocks[2], blocks[3]])
+    blocks[2].set_modules_to_forward_prefetch.assert_called_once_with([blocks[3]])
+    blocks[3].set_modules_to_forward_prefetch.assert_not_called()
+    blocks[0].set_modules_to_backward_prefetch.assert_not_called()
+    blocks[1].set_modules_to_backward_prefetch.assert_called_once_with([blocks[0]])
+    blocks[2].set_modules_to_backward_prefetch.assert_called_once_with([blocks[1], blocks[0]])
+    blocks[3].set_modules_to_backward_prefetch.assert_called_once_with([blocks[2], blocks[1]])
+
+
 def test_shard_fp32_param_holders_shards_each_holder(monkeypatch):
     """``_shard_fp32_param_holders`` fully_shards each model-owned fp32 holder."""
     P = _import_parallelizer_with_stubs(monkeypatch)
