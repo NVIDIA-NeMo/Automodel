@@ -698,6 +698,77 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     assert model_call is not None and model_call[1]["mesh"] is fsdp_mesh
 
 
+def test_apply_fsdp_enables_process_group_allocator_for_all_dense_units_at_ep64(monkeypatch):
+    """EP64 has no expert FSDP shard, but every dense FSDP unit gets the allocator."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    block = DummyBlock(mlp=DummyMoE())
+    embed = type("Embed", (), {})()
+    lm_head = type("LMHead", (), {})()
+    model = DummyModel([block], embed_tokens=embed, lm_head=lm_head)
+    wrapped_dense_units = (block, embed, lm_head, model)
+    for unit in wrapped_dense_units:
+        unit.set_allocate_memory_from_process_group_for_comm = MagicMock()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=object(),
+        ep_enabled=True,
+        ep_shard_enabled=False,
+        enable_fsdp2_process_group_allocator=True,
+    )
+
+    for unit in wrapped_dense_units:
+        unit.set_allocate_memory_from_process_group_for_comm.assert_called_once_with(True)
+    assert not hasattr(block.mlp.experts, "set_allocate_memory_from_process_group_for_comm")
+
+
+def test_apply_fsdp_process_group_allocator_requires_public_fsdp2_api(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    block = DummyBlock(mlp=DummyMoE())
+    model = DummyModel([block])
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"FSDPModule\.set_allocate_memory_from_process_group_for_comm",
+    ):
+        P.apply_fsdp(
+            model=model,
+            fsdp_mesh=object(),
+            ep_enabled=True,
+            ep_shard_enabled=False,
+            enable_fsdp2_process_group_allocator=True,
+        )
+
+
+def test_apply_fsdp_process_group_allocator_wraps_api_errors(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    block = DummyBlock(mlp=DummyMoE())
+    block.set_allocate_memory_from_process_group_for_comm = MagicMock(side_effect=ValueError("unsupported allocator"))
+    model = DummyModel([block])
+
+    with pytest.raises(RuntimeError, match="ProcessGroup-backed FSDP2") as exc_info:
+        P.apply_fsdp(
+            model=model,
+            fsdp_mesh=object(),
+            ep_enabled=True,
+            ep_shard_enabled=False,
+            enable_fsdp2_process_group_allocator=True,
+        )
+    assert isinstance(exc_info.value.__cause__, ValueError)
+
+
 def test_apply_fsdp_configures_moe_block_prefetch_chains(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
@@ -985,6 +1056,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
         ep_axis_name="ep",
         ep_shard_axis_names=("es1", "es2"),
         activation_checkpointing=True,
+        enable_fsdp2_process_group_allocator=True,
     )
     apply_ep_mock.assert_called_once()
     # AC enabled
@@ -1003,6 +1075,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     assert ep_enabled is True
     assert ep_shard_enabled is True
     assert ep_shard_mesh_arg.size() == 2
+    assert kwargs["enable_fsdp2_process_group_allocator"] is True
 
 
 def test_parallelize_model_accepts_top_level_moe_config(monkeypatch):

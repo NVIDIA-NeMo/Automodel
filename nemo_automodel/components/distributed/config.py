@@ -136,6 +136,7 @@ class MoEParallelizerConfig:
     enable_fsdp2_prefetch: bool = False
     fsdp2_backward_prefetch_depth: int = 2
     fsdp2_forward_prefetch_depth: int = 1
+    enable_fsdp2_process_group_allocator: bool = False
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
     wrap_outer_model: bool = True
     mp_policy: Optional[MixedPrecisionPolicy] = None

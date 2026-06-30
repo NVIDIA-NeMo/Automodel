@@ -344,7 +344,37 @@ def apply_ac(
         parent_layers.register_module(layer_id, block)
 
 
-def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):
+def _enable_fsdp2_process_group_allocator(module: torch.nn.Module) -> None:
+    """Use the ProcessGroup allocator for one already-wrapped FSDP2 unit.
+
+    PyTorch 2.10 exposes this as a public ``FSDPModule`` API. Keeping the
+    capability check here gives an actionable startup error on older PyTorch
+    builds instead of silently dropping an explicitly requested optimization.
+    """
+    setter = getattr(module, "set_allocate_memory_from_process_group_for_comm", None)
+    if not callable(setter):
+        raise RuntimeError(
+            "enable_fsdp2_process_group_allocator=True requires "
+            "FSDPModule.set_allocate_memory_from_process_group_for_comm(), "
+            f"but the wrapped {type(module).__name__} unit does not expose it. "
+            "Use PyTorch 2.10 or newer, or disable this option."
+        )
+    try:
+        setter(True)
+    except Exception as error:
+        raise RuntimeError(
+            "Failed to enable ProcessGroup-backed FSDP2 communication buffers "
+            f"for wrapped {type(module).__name__} unit."
+        ) from error
+
+
+def _shard_fp32_param_holders(
+    block,
+    fsdp_mesh,
+    reshard_after_forward,
+    offload_policy,
+    enable_fsdp2_process_group_allocator: bool = False,
+):
     """Shard each ``_fp32_params`` holder in ``block`` as its own fp32 FSDP unit.
 
     Model implementations own the architecture-specific decision to create these
@@ -378,6 +408,8 @@ def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_p
             mp_policy=fp32_mp_policy,
             offload_policy=offload_policy,
         )
+        if enable_fsdp2_process_group_allocator:
+            _enable_fsdp2_process_group_allocator(sub)
         ignored.update(holder_params)
     return ignored
 
@@ -394,6 +426,7 @@ def apply_fsdp(
     enable_fsdp2_prefetch: bool = False,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
+    enable_fsdp2_process_group_allocator: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
 ):
@@ -416,8 +449,13 @@ def apply_fsdp(
 
         fully_shard_impl = fully_shard_deepseek_v4
 
+    def fully_shard_configured(module, *, fully_shard_fn=fully_shard_impl, **kwargs):
+        fully_shard_fn(module, **kwargs)
+        if enable_fsdp2_process_group_allocator:
+            _enable_fsdp2_process_group_allocator(module)
+
     fully_shard_default = functools.partial(
-        fully_shard_impl,
+        fully_shard_configured,
         mesh=fsdp_mesh,
         reshard_after_forward=reshard_after_forward,
         mp_policy=mp_policy,
@@ -454,8 +492,9 @@ def apply_fsdp(
             # kept in fp32 (e.g. for fp32 master weights under FSDP2) the
             # all-gathered expert weights are still cast to param_dtype for
             # forward compute (required by GMM / TE kernels that expect bf16).
-            fully_shard(
+            fully_shard_configured(
                 moe_module.experts,
+                fully_shard_fn=fully_shard,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=_moe_shard_placement,
                 reshard_after_forward=experts_reshard_after_forward,
@@ -473,7 +512,13 @@ def apply_fsdp(
 
         # Shard model-owned fp32 holders on their own and exclude their params from
         # the block's FSDP unit to keep the block dtype-uniform.
-        fp32_ignored = _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy)
+        fp32_ignored = _shard_fp32_param_holders(
+            block,
+            fsdp_mesh,
+            reshard_after_forward,
+            offload_policy,
+            enable_fsdp2_process_group_allocator=enable_fsdp2_process_group_allocator,
+        )
         if fp32_ignored:
             ignored_params = (ignored_params or set()) | fp32_ignored
         fully_shard_default(block, ignored_params=ignored_params)
@@ -526,8 +571,9 @@ def apply_fsdp(
                 reduce_dtype=torch.float32,
                 output_dtype=torch.float32,
             )
-            fully_shard(
+            fully_shard_configured(
                 lm_head,
+                fully_shard_fn=fully_shard,
                 mesh=fsdp_mesh,
                 reshard_after_forward=reshard_after_forward,
                 mp_policy=lm_head_mp_policy,
@@ -667,6 +713,7 @@ def parallelize_model(
     enable_fsdp2_prefetch: bool = False,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
+    enable_fsdp2_process_group_allocator: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
@@ -719,6 +766,7 @@ def parallelize_model(
             enable_fsdp2_prefetch=enable_fsdp2_prefetch,
             fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
+            enable_fsdp2_process_group_allocator=enable_fsdp2_process_group_allocator,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,
         )

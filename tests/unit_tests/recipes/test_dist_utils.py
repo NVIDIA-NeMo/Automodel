@@ -242,6 +242,7 @@ class TestMoE:
                 "enable_fsdp2_prefetch": True,
                 "fsdp2_backward_prefetch_depth": 3,
                 "fsdp2_forward_prefetch_depth": 2,
+                "enable_fsdp2_process_group_allocator": True,
                 "wrap_outer_model": False,
             },
         }
@@ -250,6 +251,7 @@ class TestMoE:
         assert result["moe_parallel_config"].enable_fsdp2_prefetch is True
         assert result["moe_parallel_config"].fsdp2_backward_prefetch_depth == 3
         assert result["moe_parallel_config"].fsdp2_forward_prefetch_depth == 2
+        assert result["moe_parallel_config"].enable_fsdp2_process_group_allocator is True
         assert result["moe_parallel_config"].wrap_outer_model is False
 
     def test_empty_moe_dict_uses_defaults(self):
