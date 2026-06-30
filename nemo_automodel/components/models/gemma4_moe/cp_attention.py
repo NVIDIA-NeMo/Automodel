@@ -27,8 +27,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.utils.memory_profile import log_cuda_memory_profile
-
 logger = logging.getLogger(__name__)
 _GEMMA4_CP_FLEX_RING_OK_LOGGED = False
 _GEMMA4_CP_PROFILE_NEXT_MODULE_ID = 0
@@ -162,42 +160,6 @@ def _cached_block_mask(key, build):
         _BLOCK_MASK_CACHE.pop(next(iter(_BLOCK_MASK_CACHE)))
     _BLOCK_MASK_CACHE[key] = mask
     return mask
-
-
-def _cp_memory_profile_allowed(attention_module: torch.nn.Module) -> bool:
-    layers = os.environ.get("NEMO_AUTOMODEL_MEMORY_PROFILE_CP_LAYERS")
-    if not layers:
-        return True
-
-    layer_idx = getattr(attention_module, "layer_idx", None)
-    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", None)
-    allowed = set()
-    for item in layers.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            allowed.add(int(item))
-        except ValueError:
-            continue
-    return layer_idx in allowed or profile_id in allowed
-
-
-def _log_cp_memory(
-    attention_module: torch.nn.Module,
-    tag: str,
-    *,
-    include_tensors: bool = False,
-) -> None:
-    if not _cp_memory_profile_allowed(attention_module):
-        return
-    layer_idx = getattr(attention_module, "layer_idx", None)
-    profile_id = getattr(attention_module, "_gemma4_cp_profile_id", None)
-    log_cuda_memory_profile(
-        f"gemma4_cp layer={layer_idx} profile_id={profile_id} {tag}",
-        logger=logger,
-        include_tensors=include_tensors,
-    )
 
 
 def _env_flag(name: str) -> bool:
@@ -1700,7 +1662,6 @@ def _run_gemma4_cp_ring_attention_forward(attention_module: torch.nn.Module, ctx
     empty_query_rows = None
     padded_head_dim = ctx.query.shape[-1]
 
-    _log_cp_memory(attention_module, "forward_start")
     for current_owner, current_key, current_value, current_metadata in _collect_ring_kv_chunks(ctx):
         kv_global_start = current_owner * ctx.seq_local
         out_step, lse_step, empty_query_rows, padded_head_dim = _run_gemma4_flex_chunk(
@@ -1712,8 +1673,6 @@ def _run_gemma4_cp_ring_attention_forward(attention_module: torch.nn.Module, ctx
             kv_global_start=kv_global_start,
         )
         out_acc, lse_acc = _merge_flex_chunk(out_acc, lse_acc, out_step, lse_step)
-        if os.environ.get("NEMO_AUTOMODEL_MEMORY_PROFILE_CP_VERBOSE", "").lower() in {"1", "true", "yes", "on"}:
-            _log_cp_memory(attention_module, f"forward_after_owner={current_owner}")
 
     if out_acc is None:
         raise RuntimeError("Gemma4 CP ring attention produced no output chunks.")
@@ -1732,7 +1691,6 @@ def _run_gemma4_cp_ring_attention_forward(attention_module: torch.nn.Module, ctx
             ctx.cp_size,
         )
         _GEMMA4_CP_FLEX_RING_OK_LOGGED = True
-    _log_cp_memory(attention_module, "forward_end")
     return out_acc.to(ctx.query.dtype)
 
 
@@ -1743,7 +1701,6 @@ def _zero_if_none(grad: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor
 class _Gemma4FlexRingAttention(torch.autograd.Function):
     @staticmethod
     def forward(autograd_ctx, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, ring_ctx: Any):
-        _log_cp_memory(ring_ctx.module, "autograd_forward_start")
         runtime_ctx = replace(ring_ctx, query=query, key=key, value=value)
         out = _run_gemma4_cp_ring_attention_forward(ring_ctx.module, runtime_ctx)
         autograd_ctx.save_for_backward(query, key, value)
@@ -1754,14 +1711,12 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
             value=None,
             metadata=_detach_metadata(ring_ctx.metadata),
         )
-        _log_cp_memory(ring_ctx.module, "autograd_forward_end")
         return out
 
     @staticmethod
     def backward(autograd_ctx, grad_output: torch.Tensor):
         query, key, value = autograd_ctx.saved_tensors
         ring_ctx = autograd_ctx.ring_ctx
-        _log_cp_memory(ring_ctx.module, "backward_start")
 
         with torch.enable_grad():
             query_req = query.detach().requires_grad_(True)
@@ -1773,7 +1728,6 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
                 metadata=_detach_metadata(ring_ctx.metadata),
             )
             chunks = _collect_ring_kv_chunks(collect_ctx)
-            _log_cp_memory(ring_ctx.module, "backward_after_collect")
 
             runtime_ctx = replace(collect_ctx, query=query_req)
             key_reqs = []
@@ -1799,20 +1753,12 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
                     kv_global_start=owner * ring_ctx.seq_local,
                 )
                 out_acc, lse_acc = _merge_flex_chunk(out_acc, lse_acc, out_step, lse_step)
-                if os.environ.get("NEMO_AUTOMODEL_MEMORY_PROFILE_CP_VERBOSE", "").lower() in {
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                }:
-                    _log_cp_memory(ring_ctx.module, f"backward_after_recompute_owner={owner}")
 
             if out_acc is None:
                 raise RuntimeError("Gemma4 CP ring attention backward produced no output chunks.")
             if empty_query_rows is not None and empty_query_rows.any():
                 out_acc = out_acc.masked_fill(empty_query_rows[:, None, :, None], 0)
 
-            _log_cp_memory(ring_ctx.module, "backward_before_autograd_grad")
             grad_targets = [query_req, *key_reqs, *value_reqs]
             grads = torch.autograd.grad(out_acc, grad_targets, grad_output, allow_unused=True)
             _debug_compare_ring_dense_backward(
@@ -1822,7 +1768,6 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
                 grad_output=grad_output,
                 split_grads=grads,
             )
-            _log_cp_memory(ring_ctx.module, "backward_after_autograd_grad", include_tensors=True)
 
         grad_query = _zero_if_none(grads[0], query)
         num_chunks = len(chunks)
@@ -1859,7 +1804,6 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
             grad_key=grad_key,
             grad_value=grad_value,
         )
-        _log_cp_memory(ring_ctx.module, "backward_end", include_tensors=True)
 
         return grad_query, grad_key, grad_value, None
 
