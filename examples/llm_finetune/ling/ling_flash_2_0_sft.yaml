@@ -106,3 +106,4 @@ ci:
   # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
   recipe_owner: akoumpa
   nodes: 4
+  time: "00:30:00"
