@@ -1145,6 +1145,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logger.warning("Failed to enable fake-quant: %s", e)
 
     # ------------------ main loop ------------------
+    def _log_te_ops_mxfp8_weight_cache_diagnostics(self) -> dict[str, Any]:
+        """Log one bounded aggregate for the optional TE-ops compute cache."""
+        from nemo_automodel.components.moe.experts import collect_te_ops_mxfp8_weight_cache_diagnostics
+
+        diagnostics = collect_te_ops_mxfp8_weight_cache_diagnostics(self.model_parts)
+        if diagnostics["requested_layers"] and self.dist_env.is_main:
+            logger.info("TE-ops MXFP8 weight cache diagnostics: %s", diagnostics)
+        return diagnostics
+
     def run_train_validation_loop(self):
         """Run the training loop over all epochs and batches.
 
@@ -1202,6 +1211,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             finally:
                 if pbar is not None:
                     pbar.close()
+        self._log_te_ops_mxfp8_weight_cache_diagnostics()
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():

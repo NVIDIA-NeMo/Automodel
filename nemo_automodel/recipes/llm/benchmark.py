@@ -482,6 +482,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
     def _log_benchmark_summary(self, steps, warmup_steps, peak_tflops, rank):
         torch.distributed.barrier()
+        weight_cache_diagnostics = self._log_te_ops_mxfp8_weight_cache_diagnostics()
         if rank == 0:
             logger.info(f"{'=' * 60}")
             logger.info("Benchmarking Summary")
@@ -541,6 +542,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "global_batch_size": self.cfg.step_scheduler.global_batch_size,
                 "local_batch_size": self.cfg.get("step_scheduler.local_batch_size"),
                 "seq_len": self._bench_seq_len,
+                "te_ops_mxfp8_weight_cache": weight_cache_diagnostics,
             }
 
             # Log to wandb as table

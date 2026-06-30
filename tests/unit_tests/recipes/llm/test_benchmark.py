@@ -747,6 +747,7 @@ class TestBenchmarkingRecipeJSONOutput:
         assert summary_data["seq_len"] == 2048
         assert "avg_iter_time_seconds" in summary_data
         assert "avg_mfu_percent" in summary_data
+        assert "te_ops_mxfp8_weight_cache" in summary_data
 
     def test_log_benchmark_summary_skips_json_when_none(self, mock_recipe, tmp_path):
         """Test that JSON output is skipped when path is None."""

@@ -216,6 +216,11 @@ class BackendConfig:
         partial_cuda_graph_experts: Opt-in that captures structurally discovered TE-ops
             expert compute. Real routing can change the received-token shape, so calls
             whose metadata differs from the captured sample fall back to eager execution.
+        te_ops_mxfp8_weight_cache: Keep a non-registered, preallocated MXFP8 compute
+            cache for ``GroupedExpertsTeOps`` weights while retaining ordinary stacked
+            ``nn.Parameter`` owners for optimization and checkpointing. The optimized
+            path requires EP>1 with complete local experts (``ep_shard=1``); an additional
+            expert FSDP shard transparently uses TE's eager weight quantization instead.
         partial_cuda_graph_expert_bucket_tokens: Optional fixed physical token capacity
             for partial expert graphs. HybridEP still receives the exact dynamic token
             count; expert inputs at or below this capacity are padded locally for TE and
@@ -266,6 +271,7 @@ class BackendConfig:
     partial_cuda_graph_experts: bool = False
     partial_cuda_graph_expert_bucket_tokens: int | None = None
     partial_cuda_graph_layer_limit: int = 0
+    te_ops_mxfp8_weight_cache: bool = False
 
     def __post_init__(self):
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
@@ -337,6 +343,13 @@ class BackendConfig:
             raise ValueError("partial_cuda_graph_moe_preprocess requires dispatcher='hybridep'")
         if self.partial_cuda_graph_experts and self.experts != "te_ops":
             raise ValueError("partial_cuda_graph_experts requires experts='te_ops'")
+        if self.te_ops_mxfp8_weight_cache:
+            if self.experts != "te_ops":
+                raise ValueError("te_ops_mxfp8_weight_cache requires experts='te_ops'")
+            recipe = getattr(self.te_fp8, "recipe", None)
+            is_mxfp8 = recipe == "mxfp8" or (callable(getattr(recipe, "mxfp8", None)) and recipe.mxfp8())
+            if not is_mxfp8:
+                raise ValueError("te_ops_mxfp8_weight_cache requires te_fp8.recipe='mxfp8'")
         if self.partial_cuda_graph_expert_bucket_tokens is not None:
             bucket_tokens = self.partial_cuda_graph_expert_bucket_tokens
             if isinstance(bucket_tokens, bool) or not isinstance(bucket_tokens, int) or bucket_tokens <= 0:

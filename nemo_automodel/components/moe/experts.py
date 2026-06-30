@@ -1409,6 +1409,138 @@ class GroupedExpertsTE(nn.Module):
         self.down_linear.reset_parameters()
 
 
+class _TeOpsMXFP8WeightCache:
+    """Stable, non-registered MXFP8 compute storage for one stacked owner.
+
+    The high-precision ``nn.Parameter`` remains the sole optimizer and checkpoint
+    owner. Transformer Engine's grouped tensor is only a compute cache. Its
+    member wrappers and row/column data and scale buffers are allocated once;
+    refreshes quantize into those same buffers after the owner's version changes.
+    """
+
+    def __init__(
+        self,
+        owner: torch.Tensor,
+        *,
+        num_groups: int,
+        out_features: int,
+        in_features: int,
+    ) -> None:
+        self.num_groups = num_groups
+        self.out_features = out_features
+        self.in_features = in_features
+        self._validate_owner(owner)
+
+        try:
+            import transformer_engine_torch as tex
+            from transformer_engine.pytorch.tensor import GroupedTensorStorage, MXFP8Quantizer
+        except ImportError as error:
+            raise ImportError("TE-ops MXFP8 weight caching requires Transformer Engine 2.16.1 or newer") from error
+
+        refresh_quantizer = MXFP8Quantizer(
+            tex.DType.kFloat8E4M3,
+            rowwise=True,
+            columnwise=True,
+        )
+        refresh_quantizer.internal = False
+        # Keep compact scales in the persistent cache. TE creates any GEMM-swizzled
+        # views from a shallow alias, leaving these canonical storage addresses stable.
+        refresh_quantizer.optimize_for_gemm = False
+        grouped_tensor = GroupedTensorStorage.make_grouped_tensor_with_shapes(
+            num_tensors=num_groups,
+            shapes=[(out_features, in_features)] * num_groups,
+            quantizer=refresh_quantizer,
+            device=owner.device,
+            dtype=owner.dtype,
+        )
+        grouped_tensor.requires_grad_(owner.requires_grad)
+
+        members = tuple(grouped_tensor.quantized_tensors)
+        if len(members) != num_groups:
+            raise RuntimeError(f"TE MXFP8 cache created {len(members)} members for {num_groups} expert weights")
+
+        self.tensor = grouped_tensor
+        self.members = members
+        self.refresh_quantizer = refresh_quantizer
+        self.storage_identity = self._storage_identity()
+        self.owner_key: tuple[Any, ...] | None = None
+        self.refresh_count = 0
+        self.refresh(owner, force=True)
+
+    @property
+    def expected_shape(self) -> tuple[int, int, int]:
+        return (self.num_groups, self.out_features, self.in_features)
+
+    def _validate_owner(self, owner: torch.Tensor) -> None:
+        if tuple(owner.shape) != self.expected_shape:
+            raise RuntimeError(
+                f"TE-ops MXFP8 cache expected owner shape {self.expected_shape}, got {tuple(owner.shape)}"
+            )
+        if owner.device.type != "cuda":
+            raise RuntimeError(f"TE-ops MXFP8 cache requires a CUDA owner, got {owner.device}")
+        if owner.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            raise RuntimeError(f"TE-ops MXFP8 cache requires FP32/FP16/BF16 owner storage, got {owner.dtype}")
+        if not owner.is_contiguous():
+            raise RuntimeError("TE-ops MXFP8 cache requires a contiguous stacked owner")
+        if self.out_features % 32 != 0 or self.in_features % 32 != 0:
+            raise RuntimeError(
+                "TE-ops MXFP8 cache requires expert output and input dimensions divisible by 32, "
+                f"got ({self.out_features}, {self.in_features})"
+            )
+
+    @staticmethod
+    def _owner_key(owner: torch.Tensor) -> tuple[Any, ...]:
+        return (
+            owner.data_ptr(),
+            int(owner._version),
+            owner.device.type,
+            getattr(owner.device, "index", None),
+            owner.dtype,
+            tuple(owner.shape),
+            owner.requires_grad,
+        )
+
+    def _storage_identity(self) -> tuple[Any, ...]:
+        grouped = self.tensor
+        return (
+            id(grouped),
+            tuple(id(member) for member in self.members),
+            grouped.rowwise_data.data_ptr(),
+            grouped.columnwise_data.data_ptr(),
+            grouped.scale_inv.data_ptr(),
+            grouped.columnwise_scale_inv.data_ptr(),
+        )
+
+    def has_stable_storage_identity(self) -> bool:
+        """Return whether every persistent wrapper and backing buffer is unchanged."""
+        return self.storage_identity == self._storage_identity()
+
+    def is_current(self, owner: torch.Tensor) -> bool:
+        """Return whether the cache already represents this owner generation."""
+        return self.owner_key == self._owner_key(owner)
+
+    def refresh(self, owner: torch.Tensor, *, force: bool = False) -> bool:
+        """Refresh every MXFP8 member in-place when the owner generation changes."""
+        self._validate_owner(owner)
+        owner_key = self._owner_key(owner)
+        if not force and self.owner_key == owner_key:
+            return False
+
+        if self.tensor.requires_grad != owner.requires_grad:
+            self.tensor.requires_grad_(owner.requires_grad)
+        owner_members = owner.unbind(0)
+        if len(owner_members) != len(self.members):
+            raise RuntimeError(
+                f"TE-ops MXFP8 cache has {len(self.members)} members for {len(owner_members)} owner slices"
+            )
+        with torch.no_grad():
+            for source, destination in zip(owner_members, self.members):
+                self.refresh_quantizer.update_quantized(source, destination)
+        self.owner_key = owner_key
+        self.refresh_count += 1
+        return True
+
+
 @cache
 def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
     """Build the TE-ops GroupedLinear variant with FSDP-safe stacked owners."""
@@ -1500,6 +1632,12 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
             self.__dict__["_stacked_weight_alias_key"] = None
             self.__dict__["_stacked_bias_alias"] = None
             self.__dict__["_stacked_bias_alias_key"] = None
+            self.__dict__["_mxfp8_weight_cache_enabled"] = False
+            self.__dict__["_mxfp8_weight_cache"] = None
+            self.__dict__["_mxfp8_weight_cache_allocations"] = 0
+            self.__dict__["_mxfp8_weight_cache_hits"] = 0
+            self.__dict__["_mxfp8_weight_cache_fallbacks"] = 0
+            self.__dict__["_mxfp8_weight_cache_fallback_reason"] = "disabled by backend config"
 
         def _owner_local_tensor(self, name: str, expected_shape: tuple[int, ...]) -> torch.Tensor:
             owner = self._parameters[name]
@@ -1545,9 +1683,94 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
             self.__dict__[alias_key_name] = cache_key
             return alias
 
+        def set_mxfp8_weight_cache_enabled(self, enabled: bool, *, fallback_reason: str = "") -> None:
+            """Enable the local compute cache or drop it before expert FSDP wrapping."""
+            enabled = bool(enabled)
+            self.__dict__["_mxfp8_weight_cache_enabled"] = enabled
+            if not enabled:
+                self.__dict__["_mxfp8_weight_cache"] = None
+                self.__dict__["_mxfp8_weight_cache_fallback_reason"] = fallback_reason or "disabled"
+                return
+            self.__dict__["_mxfp8_weight_cache_fallback_reason"] = "awaiting owner materialization"
+            self.refresh_mxfp8_weight_cache_if_needed()
+            if self.__dict__.get("_mxfp8_weight_cache") is not None:
+                self.__dict__["_mxfp8_weight_cache_fallback_reason"] = ""
+
+        def refresh_mxfp8_weight_cache_if_needed(self, *, force: bool = False) -> bool:
+            """Refresh the stable cache outside the TE Sequential graph target."""
+            if not self.__dict__.get("_mxfp8_weight_cache_enabled", False):
+                return False
+            expected_shape = (self.num_groups, self.out_features, self.in_features)
+            owner = self._owner_local_tensor("_stacked_weight", expected_shape)
+            if owner.is_meta:
+                self.__dict__["_mxfp8_weight_cache_fallback_reason"] = "awaiting owner materialization"
+                return False
+
+            cache_state = self.__dict__.get("_mxfp8_weight_cache")
+            if cache_state is None:
+                cache_state = _TeOpsMXFP8WeightCache(
+                    owner,
+                    num_groups=self.num_groups,
+                    out_features=self.out_features,
+                    in_features=self.in_features,
+                )
+                self.__dict__["_mxfp8_weight_cache"] = cache_state
+                self.__dict__["_mxfp8_weight_cache_allocations"] += 1
+                self.__dict__["_mxfp8_weight_cache_fallback_reason"] = ""
+                return True
+
+            refreshed = cache_state.refresh(owner, force=force)
+            if refreshed:
+                self.__dict__["_mxfp8_weight_cache_fallback_reason"] = ""
+            return refreshed
+
+        def mxfp8_weight_cache_diagnostics(self) -> dict[str, Any]:
+            """Return bounded counters and stable storage identities for profiling."""
+            cache_state = self.__dict__.get("_mxfp8_weight_cache")
+            storage = None
+            refreshes = 0
+            current = False
+            if cache_state is not None:
+                owner = self._parameters["_stacked_weight"]
+                owner = owner.to_local() if isinstance(owner, DTensor) else owner
+                current = cache_state.is_current(owner)
+                refreshes = cache_state.refresh_count
+                grouped = cache_state.tensor
+                storage = {
+                    "cache_id": id(grouped),
+                    "member_ids": tuple(id(member) for member in cache_state.members),
+                    "rowwise_data_ptr": grouped.rowwise_data.data_ptr(),
+                    "columnwise_data_ptr": grouped.columnwise_data.data_ptr(),
+                    "rowwise_scale_ptr": grouped.scale_inv.data_ptr(),
+                    "columnwise_scale_ptr": grouped.columnwise_scale_inv.data_ptr(),
+                    "identity_stable": cache_state.has_stable_storage_identity(),
+                }
+            return {
+                "enabled": self.__dict__.get("_mxfp8_weight_cache_enabled", False),
+                "allocations": self.__dict__.get("_mxfp8_weight_cache_allocations", 0),
+                "refreshes": refreshes,
+                "hits": self.__dict__.get("_mxfp8_weight_cache_hits", 0),
+                "fallbacks": self.__dict__.get("_mxfp8_weight_cache_fallbacks", 0),
+                "current": current,
+                "fallback_reason": self.__dict__.get("_mxfp8_weight_cache_fallback_reason", ""),
+                "storage": storage,
+            }
+
         def __getattr__(self, name: str):
             parameters = self.__dict__.get("_parameters", {})
             if name == "weight" and parameters.get("_stacked_weight") is not None:
+                if self.__dict__.get("_mxfp8_weight_cache_enabled", False):
+                    cache_state = self.__dict__.get("_mxfp8_weight_cache")
+                    if cache_state is not None:
+                        owner = parameters["_stacked_weight"]
+                        owner = owner.to_local() if isinstance(owner, DTensor) else owner
+                        if cache_state.is_current(owner):
+                            self.__dict__["_mxfp8_weight_cache_hits"] += 1
+                            return cache_state.tensor
+                        self.__dict__["_mxfp8_weight_cache_fallbacks"] += 1
+                        self.__dict__["_mxfp8_weight_cache_fallback_reason"] = (
+                            "owner generation changed before cache refresh"
+                        )
                 return self._grouped_alias(
                     "_stacked_weight",
                     (self.out_features, self.in_features),
@@ -1592,6 +1815,7 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
                 if bias is not None:
                     bias.zero_()
             self.clear_grouped_aliases()
+            self.refresh_mxfp8_weight_cache_if_needed(force=True)
 
         def _load_from_state_dict(
             self,
@@ -1875,6 +2099,14 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         self._te_ops_mxfp8_fusion_requested = (
             configured_mxfp8 and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) > 0
         )
+        self._te_ops_mxfp8_weight_cache_requested = bool(getattr(backend, "te_ops_mxfp8_weight_cache", False))
+        # Keep the cache disabled until EP>1 construction reports whether an
+        # additional expert FSDP dimension is active. This prevents ep_shard>1
+        # jobs from allocating a cache only to discard it before fully_shard.
+        self._te_ops_mxfp8_weight_cache_enabled = False
+        self._te_ops_mxfp8_weight_cache_fallback_reason = (
+            "awaiting EP shard policy" if self._te_ops_mxfp8_weight_cache_requested else "disabled by backend config"
+        )
         self._te_ops_full_mxfp8_fusion_eligible = False
         # Graph buckets may overallocate the physical token buffer while
         # retaining real splits whenever TE selects its graph-safe GroupedTensor
@@ -1967,6 +2199,11 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             device="meta",
             scale_bias=self.expert_bias,
         )
+        for linear in (self.gate_up_linear, self.down_linear):
+            linear.set_mxfp8_weight_cache_enabled(
+                self._te_ops_mxfp8_weight_cache_enabled,
+                fallback_reason=self._te_ops_mxfp8_weight_cache_fallback_reason,
+            )
 
         if activation_name == "scaled_swiglu":
             activation = te_ops.ScaledSwiGLU(**activation_kwargs)
@@ -2006,6 +2243,41 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
             *activation_ops,
             self.down_linear,
         )
+
+    def configure_mxfp8_weight_cache_for_ep_shard(self, *, ep_shard_enabled: bool) -> None:
+        """Enable the cache only when every rank owns complete local expert weights."""
+        enabled = self._te_ops_mxfp8_weight_cache_requested and not ep_shard_enabled
+        if self._te_ops_mxfp8_weight_cache_requested and ep_shard_enabled:
+            fallback_reason = "ep_shard>1 requires FSDP unshard; using eager TE weight quantization"
+        elif not self._te_ops_mxfp8_weight_cache_requested:
+            fallback_reason = "disabled by backend config"
+        else:
+            fallback_reason = ""
+        self._te_ops_mxfp8_weight_cache_enabled = enabled
+        self._te_ops_mxfp8_weight_cache_fallback_reason = fallback_reason
+        for linear in (self.gate_up_linear, self.down_linear):
+            linear.set_mxfp8_weight_cache_enabled(enabled, fallback_reason=fallback_reason)
+
+    def refresh_mxfp8_weight_cache_if_needed(self, *, force: bool = False) -> int:
+        """Refresh both projection caches before entering the TE graph target."""
+        if not getattr(self, "_te_ops_mxfp8_weight_cache_enabled", False):
+            return 0
+        refreshes = 0
+        for linear in (self.gate_up_linear, self.down_linear):
+            refresh = getattr(linear, "refresh_mxfp8_weight_cache_if_needed", None)
+            if callable(refresh):
+                refreshes += int(refresh(force=force))
+        return refreshes
+
+    def mxfp8_weight_cache_diagnostics(self) -> dict[str, Any]:
+        """Expose bounded per-projection counters for GB200 validation."""
+        return {
+            "requested": getattr(self, "_te_ops_mxfp8_weight_cache_requested", False),
+            "enabled": getattr(self, "_te_ops_mxfp8_weight_cache_enabled", False),
+            "fallback_reason": getattr(self, "_te_ops_mxfp8_weight_cache_fallback_reason", ""),
+            "gate_up": self.gate_up_linear.mxfp8_weight_cache_diagnostics(),
+            "down": self.down_linear.mxfp8_weight_cache_diagnostics(),
+        }
 
     def _canonical_bias_ep_shard_dim(self) -> int:
         """Stacked TE-ops biases shard experts so layout conversion stays local."""
@@ -2133,6 +2405,9 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         with torch.no_grad():
             linear.stacked_weight_local().copy_(stacked)
         linear.clear_grouped_aliases()
+        refresh_weight_cache = getattr(linear, "refresh_mxfp8_weight_cache_if_needed", None)
+        if callable(refresh_weight_cache):
+            refresh_weight_cache(force=True)
 
     def _set_stacked_bias(self, linear: nn.Module, stacked: torch.Tensor) -> None:
         if not linear.use_bias or stacked is None:
@@ -2201,6 +2476,11 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         assert self.config.n_routed_experts % self.ep_size == 0, (
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
+        # This stays outside ``_te_grouped_mlp``, which is the partial CUDA-graph
+        # target. Optimizer updates bump the plain owner's version, so each cache
+        # is refreshed exactly once before the next forward. Checkpoint recompute
+        # observes the same version and reuses the same fixed-address cache.
+        self.refresh_mxfp8_weight_cache_if_needed()
 
         weights, indices = _mask_routing_metadata(weights, indices, token_mask)
         permuted_local_hidden_states, tokens_per_expert, permuted_probs = self.token_dispatcher.token_permutation2(
@@ -2295,6 +2575,72 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
                 clear_aliases = getattr(linear, "clear_grouped_aliases", None)
                 if callable(clear_aliases):
                     clear_aliases()
+        self.refresh_mxfp8_weight_cache_if_needed(force=True)
+
+
+def collect_te_ops_mxfp8_weight_cache_diagnostics(model_parts: Any) -> dict[str, Any]:
+    """Aggregate TE-ops weight-cache counters without emitting per-layer logs."""
+    roots = (model_parts,) if isinstance(model_parts, nn.Module) else tuple(model_parts)
+    seen_experts: set[int] = set()
+    fallback_reasons: dict[str, int] = {}
+    cache_ids: list[int] = []
+    buffer_identities: list[tuple[int, ...]] = []
+    result: dict[str, Any] = {
+        "expert_layers": 0,
+        "requested_layers": 0,
+        "enabled_layers": 0,
+        "fallback_layers": 0,
+        "projection_caches": 0,
+        "allocations": 0,
+        "refreshes": 0,
+        "hits": 0,
+        "fallbacks": 0,
+        "current_caches": 0,
+        "storage_identity_stable": True,
+    }
+
+    for root in roots:
+        modules = root.modules() if hasattr(root, "modules") else ()
+        for module in modules:
+            if not isinstance(module, GroupedExpertsTeOps) or id(module) in seen_experts:
+                continue
+            seen_experts.add(id(module))
+            diagnostics = module.mxfp8_weight_cache_diagnostics()
+            result["expert_layers"] += 1
+            requested = bool(diagnostics["requested"])
+            enabled = bool(diagnostics["enabled"])
+            result["requested_layers"] += int(requested)
+            result["enabled_layers"] += int(enabled)
+            fallback_reason = diagnostics["fallback_reason"]
+            if requested and fallback_reason:
+                result["fallback_layers"] += 1
+                fallback_reasons[fallback_reason] = fallback_reasons.get(fallback_reason, 0) + 1
+
+            for projection in (diagnostics["gate_up"], diagnostics["down"]):
+                result["allocations"] += int(projection["allocations"])
+                result["refreshes"] += int(projection["refreshes"])
+                result["hits"] += int(projection["hits"])
+                result["fallbacks"] += int(projection["fallbacks"])
+                result["current_caches"] += int(projection["current"])
+                storage = projection["storage"]
+                if storage is None:
+                    continue
+                result["projection_caches"] += 1
+                result["storage_identity_stable"] &= bool(storage["identity_stable"])
+                cache_ids.append(storage["cache_id"])
+                buffer_identities.append(
+                    (
+                        storage["rowwise_data_ptr"],
+                        storage["columnwise_data_ptr"],
+                        storage["rowwise_scale_ptr"],
+                        storage["columnwise_scale_ptr"],
+                    )
+                )
+
+    result["unique_cache_objects"] = len(set(cache_ids))
+    result["unique_buffer_sets"] = len(set(buffer_identities))
+    result["fallback_reasons"] = dict(sorted(fallback_reasons.items()))
+    return result
 
 
 def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):

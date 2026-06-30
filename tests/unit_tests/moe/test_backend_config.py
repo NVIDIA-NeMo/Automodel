@@ -93,6 +93,33 @@ class TestBackendConfigExpertsDispatcherValidation:
         )
         assert config.te_fp8.recipe == "mxfp8"
 
+    def test_te_ops_mxfp8_weight_cache_is_default_off(self):
+        config = BackendConfig(experts="te_ops", dispatcher="hybridep")
+
+        assert config.te_ops_mxfp8_weight_cache is False
+
+    def test_te_ops_mxfp8_weight_cache_accepts_exact_backend(self):
+        config = BackendConfig(
+            experts="te_ops",
+            dispatcher="hybridep",
+            te_fp8={"recipe": "mxfp8"},
+            te_ops_mxfp8_weight_cache=True,
+        )
+
+        assert config.te_ops_mxfp8_weight_cache is True
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"experts": "torch_mm", "dispatcher": "torch", "te_fp8": {"recipe": "mxfp8"}},
+            {"experts": "te_ops", "dispatcher": "hybridep", "te_fp8": {"recipe": "delayed"}},
+            {"experts": "te_ops", "dispatcher": "hybridep"},
+        ],
+    )
+    def test_te_ops_mxfp8_weight_cache_rejects_other_backends(self, kwargs):
+        with pytest.raises(ValueError, match="te_ops_mxfp8_weight_cache requires"):
+            BackendConfig(**kwargs, te_ops_mxfp8_weight_cache=True)
+
     def test_gmm_experts_with_deepep_valid(self):
         """Test that gmm experts with deepep dispatcher is valid."""
         config = BackendConfig(experts="gmm", dispatcher="deepep")

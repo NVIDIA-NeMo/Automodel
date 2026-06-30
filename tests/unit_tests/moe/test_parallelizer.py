@@ -488,6 +488,39 @@ def test_apply_ep_parallelizes_diffusion_style_block_moe(monkeypatch):
     assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
 
 
+@pytest.mark.parametrize("ep_shard_enabled", [False, True])
+def test_apply_ep_configures_te_ops_cache_for_ep2_policy(monkeypatch, ep_shard_enabled):
+    """EP2 constructs local experts before selecting ep_shard=1 or fallback."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    events = []
+
+    class TeOpsExperts(P.GroupedExpertsTE):
+        def init_token_dispatcher(self, *, ep_mesh, moe_mesh):
+            events.append(("init", ep_mesh, moe_mesh))
+
+        def configure_mxfp8_weight_cache_for_ep_shard(self, *, ep_shard_enabled):
+            events.append(("configure", ep_shard_enabled))
+
+    block = DummyBlock(mlp=DummyMoE())
+    block.mlp.experts = TeOpsExperts()
+    model = DummyModel([block])
+    ep_mesh = type("Mesh", (), {"size": lambda self: 2})()
+    moe_mesh = object()
+
+    P.apply_ep(
+        model,
+        ep_mesh,
+        moe_mesh=moe_mesh,
+        ep_shard_enabled=ep_shard_enabled,
+    )
+
+    assert events == [
+        ("init", ep_mesh, moe_mesh),
+        ("configure", ep_shard_enabled),
+    ]
+
+
 def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     wrapper_returns = [object(), object()]
@@ -696,6 +729,41 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
 
     model_call = _find_call_by_first_arg(fully_shard_mock, model)
     assert model_call is not None and model_call[1]["mesh"] is fsdp_mesh
+
+
+@pytest.mark.parametrize("ep_shard_enabled", [False, True])
+def test_apply_fsdp_reasserts_ep2_cache_policy_before_expert_wrap(monkeypatch, ep_shard_enabled):
+    """EP2/ep_shard=1 keeps the cache; EP2/ep_shard=2 falls back before fully_shard."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    events = []
+
+    block = DummyBlock(mlp=DummyMoE())
+    experts = block.mlp.experts
+    experts.configure_mxfp8_weight_cache_for_ep_shard = MagicMock(
+        side_effect=lambda **kwargs: events.append(("configure", kwargs["ep_shard_enabled"]))
+    )
+    model = DummyModel([block])
+
+    def fully_shard_mock(module, **kwargs):
+        events.append(("fully_shard", module))
+
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+    ep_shard_mesh = type("Mesh", (), {"size": lambda self: 2})()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=object(),
+        ep_enabled=True,
+        ep_shard_enabled=ep_shard_enabled,
+        ep_shard_mesh=ep_shard_mesh if ep_shard_enabled else None,
+    )
+
+    experts.configure_mxfp8_weight_cache_for_ep_shard.assert_called_once_with(ep_shard_enabled=ep_shard_enabled)
+    assert events[0] == ("configure", ep_shard_enabled)
+    expert_wraps = [event for event in events if event == ("fully_shard", experts)]
+    assert len(expert_wraps) == int(ep_shard_enabled)
 
 
 def test_apply_fsdp_enables_process_group_allocator_for_all_dense_units_at_ep64(monkeypatch):
@@ -1059,6 +1127,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
         enable_fsdp2_process_group_allocator=True,
     )
     apply_ep_mock.assert_called_once()
+    assert apply_ep_mock.call_args.kwargs["ep_shard_enabled"] is True
     # AC enabled
     apply_ac_mock.assert_called_once_with(model, ignore_router=True, selective=False)
     # FSDP called with combined flags and derived meshes
@@ -1104,6 +1173,7 @@ def test_parallelize_model_accepts_top_level_moe_config(monkeypatch):
     )
 
     apply_ep_mock.assert_called_once()
+    assert apply_ep_mock.call_args.kwargs["ep_shard_enabled"] is False
     apply_fsdp_mock.assert_not_called()
 
 
