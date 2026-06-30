@@ -269,6 +269,12 @@ class DeepseekV4DSparkModel(nn.Module):
                 input_dim += config.markov_rank
             self.confidence_head = AcceptRatePredictor(input_dim=input_dim)
 
+        # V4's RMSNorm factory builds norms in bf16 while the Linear / Embedding
+        # layers are fp32. Unify to fp32 so the freshly built draft is single-dtype
+        # (matching the Qwen3 draft); FSDP2 fully_shard requires a uniform original
+        # parameter dtype before any later cast to the training compute dtype.
+        self.to(torch.float32)
+
     def _apply(self, fn, recurse=True):
         """Keep the rotary ``inv_freq`` buffer in fp32 across dtype casts.
 
