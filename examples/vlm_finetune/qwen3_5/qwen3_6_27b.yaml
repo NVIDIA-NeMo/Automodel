@@ -68,7 +68,6 @@ distributed:
   ep_size: 1
   sequence_parallel: false
   activation_checkpointing: true
-  activation_checkpointing_scope: language
 
   pipeline:
     pp_schedule: interleaved1f1b
@@ -79,7 +78,7 @@ distributed:
     dtype: bf16
 
 freeze_config:
-  freeze_vision_tower: false
+  freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
 
