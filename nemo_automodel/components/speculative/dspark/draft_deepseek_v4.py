@@ -27,7 +27,7 @@ import torch
 from torch import nn
 from transformers.activations import ACT2FN
 
-from nemo_automodel.components.attention.dflash_mask import create_dflash_block_mask, create_dflash_sdpa_mask
+from nemo_automodel.components.attention.dflash_mask import create_dflash_sdpa_mask
 from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4FP32Parameter,
@@ -124,9 +124,10 @@ class DeepseekV4DSparkAttention(nn.Module):
         q = _rms_norm_last_dim(q, self.config.rms_norm_eps)
 
         # One shared K=V latent over the concatenated context and noise tokens.
-        kv_ctx = self.kv_norm(self.wkv(target_hidden_states))
-        kv_noise = self.kv_norm(self.wkv(hidden_states))
-        kv = torch.cat([kv_ctx, kv_noise], dim=1).view(bsz, ctx_len + q_len, 1, self.head_dim).transpose(1, 2)
+        # wkv and kv_norm are per-token, so projecting the concatenation once is
+        # equivalent to projecting each part separately (one GEMM + one RMSNorm).
+        kv = self.kv_norm(self.wkv(torch.cat([target_hidden_states, hidden_states], dim=1)))
+        kv = kv.view(bsz, ctx_len + q_len, 1, self.head_dim).transpose(1, 2)
 
         # Partial RoPE. cos/sin span the full [context | draft] positions, so the
         # draft queries take the suffix slice while the shared latent takes the
@@ -278,28 +279,25 @@ class DeepseekV4DSparkModel(nn.Module):
     def _apply(self, fn, recurse=True):
         """Keep the rotary ``inv_freq`` buffer in fp32 across dtype casts.
 
-        DeepseekV4RotaryEmbedding builds the rotary angles in fp32 but reads the
-        frequencies from a stored ``inv_freq`` buffer. ``model.to(bfloat16)`` (the
-        training build path) rounds that buffer to bf16, and the resulting
-        train/inference RoPE mismatch grows with absolute position and erodes draft
-        acceptance. A bf16 round-trip cannot be undone by upcasting, so when a cast
-        rounds the buffer we recompute fresh fp32 frequencies from the rotary
-        config (the same closed form the rotary uses at construction). The Qwen
-        helper does not apply here (this rotary has no ``rope_init_fn`` / ``config``),
-        so we recompute directly.
+        ``model.to(bfloat16)`` (the training build path) would otherwise round
+        ``inv_freq`` to bf16 and dephase RoPE with absolute position, eroding draft
+        acceptance (the mismatch grows with position, and a bf16 round-trip cannot
+        be undone by upcasting). Snapshot the fp32 frequencies before the cast and
+        restore them after (the Fp32Safe rotary idiom used elsewhere in the repo),
+        so the buffer never makes a bf16 round-trip.
         """
-        module = super()._apply(fn, recurse=recurse)
         rotary_emb = getattr(self, "rotary_emb", None)
         inv_freq = getattr(rotary_emb, "inv_freq", None) if rotary_emb is not None else None
-        if (
-            inv_freq is not None
-            and inv_freq.is_floating_point()
-            and not inv_freq.is_meta
-            and inv_freq.dtype != torch.float32
-        ):
-            dim = int(self.config.head_dim * self.partial_rotary_factor)
-            fresh = 1.0 / (float(self.config.rope_theta) ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim))
-            rotary_emb.inv_freq = fresh.to(device=inv_freq.device)
+        inv_freq_fp32 = (
+            inv_freq.detach().clone().to(torch.float32)
+            if inv_freq is not None and inv_freq.is_floating_point() and not inv_freq.is_meta
+            else None
+        )
+        module = super()._apply(fn, recurse=recurse)
+        if inv_freq_fp32 is not None:
+            rotary_emb.register_buffer(
+                "inv_freq", inv_freq_fp32.to(device=rotary_emb.inv_freq.device), persistent=False
+            )
         return module
 
     def initialize_embeddings_and_head(
@@ -444,14 +442,12 @@ class DeepseekV4DSparkModel(nn.Module):
         context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         draft_position_ids = create_position_ids(anchor_positions, self.block_size)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-        if self.config._attn_implementation == "flex_attention":
-            dspark_attn_mask = create_dflash_block_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device
-            )
-        else:
-            dspark_attn_mask = create_dflash_sdpa_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device, noise_embedding.dtype
-            )
+        # The draft attention is always dense eager-with-sink, so it always uses the
+        # DFlash dense additive (SDPA) mask; there is no flex/eager kernel axis here
+        # (a flex BlockMask cannot feed eager_attention_with_sink).
+        dspark_attn_mask = create_dflash_sdpa_mask(
+            anchor_positions, block_keep_mask, seq_len, self.block_size, device, noise_embedding.dtype
+        )
         output_hidden = self._forward_backbone(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,

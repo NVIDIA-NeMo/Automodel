@@ -103,16 +103,15 @@ class HFDSparkTargetModel:
         """Collapse a 4D Hyper-Connection stream ``[B, S, hc_mult, H]`` to ``[B, S, H]``.
 
         DeepSeek V4 decoder layers emit ``hc_mult`` parallel residual copies; only the
-        final-norm output is already collapsed. For intermediate target-feature layers
-        we reduce the streams with the model's learned ``hc_head`` when it is available
-        (matching the model's own final collapse), falling back to the mean over the
-        stream dimension. Non-HC targets emit 3D states and pass through unchanged.
+        final-norm output is already collapsed. For an intermediate target-feature
+        layer we reduce the streams with their mean: a simple, in-distribution
+        reduction that the draft's learnable ``fc`` then reprojects. We deliberately
+        avoid the model's final ``hc_head`` here, since it is trained for the
+        last-layer stream distribution, not the intermediate ones. Non-HC targets
+        emit 3D states and pass through unchanged.
         """
         if tensor.ndim != 4:
             return tensor
-        hc_head = getattr(self._inner_model(), "hc_head", None)
-        if hc_head is not None:
-            return hc_head(tensor)
         return tensor.mean(dim=2)
 
     def get_input_embeddings(self) -> nn.Embedding:
