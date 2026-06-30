@@ -38,17 +38,15 @@ eager twin on later steps.
 ``TE_OPS_GRAPH_MODE=mxfp8`` additionally requires
 ``NVTE_CUTEDSL_FUSED_GROUPED_MLP=1``. It enables TE MXFP8 autocast with BF16 DPA
 disabled and requires the full CuTe grouped-MLP block-32 layout. The local
-dispatcher models the fused path's paged post-dispatch contract: non-empty
-in-bucket calls have 256 physical rows, overflow calls use the next multiple of
-256, real split values are retained, and padded output rows are removed before
-unpermutation.
+dispatcher models the fused path's real HybridEP contract: every expert group
+is padded independently to 256 rows, padded split values remain dynamic, and
+only real output positions enter unpermutation.
 """
 
 from __future__ import annotations
 
 import atexit
 import logging
-import math
 import os
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -84,12 +82,13 @@ NUM_EXPERTS = 4
 TOP_K = 2
 HIDDEN_SIZE = 64
 INTERMEDIATE_SIZE = 64
-TOKENS = 130
-EXPERT_BUCKET_TOKENS = 256
-CAPTURE_VALID_TOKENS = 11
-REPLAY_VALID_TOKENS = (7, 19, 31)
+TOKENS = 1100
+EXPERT_PAD_MULTIPLE = 256
+EXPERT_BUCKET_TOKENS = 2048
+CAPTURE_VALID_TOKENS = 300
+REPLAY_VALID_TOKENS = (50, 500, 700)
 OVERFLOW_VALID_TOKENS = TOKENS
-POST_OVERFLOW_VALID_TOKENS = 23
+POST_OVERFLOW_VALID_TOKENS = 500
 
 OWNER_SHARD_DIMS = {
     "gate_up_linear._stacked_weight": 2,
@@ -126,17 +125,20 @@ _MXFP8_TOLERANCES = {
 
 
 class _LocalPermutationDispatcher:
-    """Group real routes locally and optionally expose an MXFP8 physical page."""
+    """Group routes and model HybridEP's per-expert MXFP8 padding."""
 
     def __init__(self, num_experts: int, *, paged_mxfp8: bool) -> None:
         self.num_experts = num_experts
         self.paged_mxfp8 = paged_mxfp8
         self._token_ids: torch.Tensor | None = None
+        self._real_output_positions: torch.Tensor | None = None
         self._num_tokens = 0
         self._real_route_count = 0
         self.last_splits: tuple[int, ...] | None = None
+        self.last_real_splits: tuple[int, ...] | None = None
         self.last_physical_tokens = 0
         self.history: list[tuple[int, ...]] = []
+        self.real_history: list[tuple[int, ...]] = []
         self.physical_history: list[int] = []
         self.runtime_alias_check: Callable[[], None] | None = None
 
@@ -169,44 +171,62 @@ class _LocalPermutationDispatcher:
         self._token_ids = token_ids[order]
         permuted_probs = flat_probs[order]
         permuted_hidden_states = hidden_states[self._token_ids]
-        tokens_per_expert = torch.bincount(expert_ids, minlength=self.num_experts)
+        real_tokens_per_expert = torch.bincount(expert_ids, minlength=self.num_experts)
 
         self._real_route_count = token_ids.numel()
         physical_tokens = self._real_route_count
-        # Keep an actually empty capture sample empty. That is what exercises
-        # synchronized FSDP storage preparation with one locally skipped graph.
+        self._real_output_positions = torch.arange(self._real_route_count, device=hidden_states.device)
+        tokens_per_expert = real_tokens_per_expert
+        # HybridEP pads each expert independently for the full MXFP8 grouped
+        # MLP. Keep an actually empty sample empty so asymmetric capture still
+        # exercises synchronized FSDP storage preparation on the skipped rank.
         if self.paged_mxfp8 and self._real_route_count > 0:
-            physical_tokens = max(
-                EXPERT_BUCKET_TOKENS,
-                math.ceil(self._real_route_count / EXPERT_BUCKET_TOKENS) * EXPERT_BUCKET_TOKENS,
+            tokens_per_expert = (
+                (real_tokens_per_expert + EXPERT_PAD_MULTIPLE - 1) // EXPERT_PAD_MULTIPLE * EXPERT_PAD_MULTIPLE
             )
-            padding = physical_tokens - self._real_route_count
-            if padding:
-                permuted_hidden_states = torch.cat(
-                    (
-                        permuted_hidden_states,
-                        permuted_hidden_states.new_zeros((padding, permuted_hidden_states.shape[-1])),
-                    ),
-                    dim=0,
-                )
-                permuted_probs = torch.cat((permuted_probs, permuted_probs.new_zeros(padding)), dim=0)
+            hidden_chunks = []
+            probability_chunks = []
+            real_output_positions = []
+            real_offset = 0
+            physical_offset = 0
+            for real_count_tensor, padded_count_tensor in zip(real_tokens_per_expert, tokens_per_expert):
+                real_count = int(real_count_tensor.item())
+                padded_count = int(padded_count_tensor.item())
+                if real_count:
+                    hidden_chunks.append(permuted_hidden_states.narrow(0, real_offset, real_count))
+                    probability_chunks.append(permuted_probs.narrow(0, real_offset, real_count))
+                    real_output_positions.append(
+                        torch.arange(physical_offset, physical_offset + real_count, device=hidden_states.device)
+                    )
+                padding = padded_count - real_count
+                if padding:
+                    hidden_chunks.append(permuted_hidden_states.new_zeros((padding, permuted_hidden_states.shape[-1])))
+                    probability_chunks.append(permuted_probs.new_zeros(padding))
+                real_offset += real_count
+                physical_offset += padded_count
+            permuted_hidden_states = torch.cat(hidden_chunks, dim=0)
+            permuted_probs = torch.cat(probability_chunks, dim=0)
+            self._real_output_positions = torch.cat(real_output_positions, dim=0)
+            physical_tokens = int(tokens_per_expert.sum().item())
 
+        self.last_real_splits = tuple(int(value) for value in real_tokens_per_expert.cpu().tolist())
         self.last_splits = tuple(int(value) for value in tokens_per_expert.cpu().tolist())
         self.last_physical_tokens = physical_tokens
+        self.real_history.append(self.last_real_splits)
         self.history.append(self.last_splits)
         self.physical_history.append(physical_tokens)
         return permuted_hidden_states, tokens_per_expert, permuted_probs
 
     def token_unpermutation(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._token_ids is None:
+        if self._token_ids is None or self._real_output_positions is None:
             raise RuntimeError("token_unpermutation called before token_permutation2")
         if hidden_states.shape[0] < self._real_route_count:
             raise RuntimeError(
                 f"expert output has {hidden_states.shape[0]} rows for {self._real_route_count} real routes"
             )
-        # MXFP8 can return a full physical page. Only real routed rows may enter
-        # the combine/unpermutation step.
-        hidden_states = hidden_states.narrow(0, 0, self._real_route_count)
+        # Padding is interspersed after every expert group, exactly as in the
+        # real dispatcher. Select only real rows before reversing permutation.
+        hidden_states = hidden_states.index_select(0, self._real_output_positions)
         output = torch.zeros(
             self._num_tokens,
             hidden_states.shape[-1],
@@ -285,6 +305,7 @@ class _StepResult:
     input_grad: torch.Tensor
     param_grads: dict[str, torch.Tensor]
     splits: tuple[int, ...]
+    real_splits: tuple[int, ...]
     physical_tokens: int
 
 
@@ -533,12 +554,6 @@ def _make_twins(
     return graph, eager
 
 
-def _expected_physical_tokens(mode: str, real_routes: int) -> int:
-    if mode != "mxfp8" or real_routes == 0:
-        return real_routes
-    return max(EXPERT_BUCKET_TOKENS, math.ceil(real_routes / EXPERT_BUCKET_TOKENS) * EXPERT_BUCKET_TOKENS)
-
-
 def _execute_forward_backward(
     *,
     twin: _Twin,
@@ -552,6 +567,7 @@ def _execute_forward_backward(
     hidden_states = _input(rank, step, device).requires_grad_(True)
     token_mask, weights, indices = _routes(rank, step, valid_tokens, device)
     history_start = len(twin.dispatcher.history)
+    real_history_start = len(twin.dispatcher.real_history)
     physical_history_start = len(twin.dispatcher.physical_history)
 
     fp8_context: Any = twin.backend.te_fp8.maybe_te_autocast() if twin.backend.te_fp8 is not None else nullcontext()
@@ -569,20 +585,25 @@ def _execute_forward_backward(
         loss.backward()
 
     assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
-    assert twin.dispatcher.last_splits is not None
+    assert twin.dispatcher.last_splits is not None and twin.dispatcher.last_real_splits is not None
     forward_splits = twin.dispatcher.last_splits
+    forward_real_splits = twin.dispatcher.last_real_splits
     real_routes = valid_tokens * TOP_K
-    assert sum(forward_splits) == real_routes
+    assert sum(forward_real_splits) == real_routes
     if mode == "mxfp8" and real_routes > 0:
+        assert all(split % EXPERT_PAD_MULTIPLE == 0 for split in forward_splits)
         assert twin.experts._te_ops_fusion_checked, (
             f"{twin.name}: MXFP8 autocast did not confirm full CuTe grouped-MLP forward/backward fusion"
         )
-    expected_physical_tokens = _expected_physical_tokens(mode, real_routes)
+    else:
+        assert forward_splits == forward_real_splits
+    expected_physical_tokens = sum(forward_splits)
     assert twin.dispatcher.last_physical_tokens == expected_physical_tokens
 
     # Non-reentrant checkpointing must rerun the same dynamic route and physical
     # layout during backward, including when the nested expert call is replayed.
     assert twin.dispatcher.history[history_start:] == [forward_splits, forward_splits]
+    assert twin.dispatcher.real_history[real_history_start:] == [forward_real_splits, forward_real_splits]
     assert twin.dispatcher.physical_history[physical_history_start:] == [
         expected_physical_tokens,
         expected_physical_tokens,
@@ -602,6 +623,7 @@ def _execute_forward_backward(
         input_grad=hidden_states.grad.detach().clone(),
         param_grads=param_grads,
         splits=forward_splits,
+        real_splits=forward_real_splits,
         physical_tokens=expected_physical_tokens,
     )
 
@@ -616,7 +638,7 @@ def _run_parity_step(
     step: int,
     valid_tokens: int,
     device: torch.device,
-) -> tuple[int, tuple[int, ...]]:
+) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
     graph.optimizer.zero_grad(set_to_none=False)
     eager.optimizer.zero_grad(set_to_none=False)
 
@@ -642,6 +664,7 @@ def _run_parity_step(
     )
 
     assert graph_result.splits == eager_result.splits
+    assert graph_result.real_splits == eager_result.real_splits
     assert graph_result.physical_tokens == eager_result.physical_tokens
     tolerances = _MXFP8_TOLERANCES if mode == "mxfp8" else _BF16_TOLERANCES
     label_prefix = f"{mode}/step={step}/rank={rank}"
@@ -696,18 +719,17 @@ def _run_parity_step(
     )
     _assert_logically_sharded(graph.experts, world_size)
     _assert_logically_sharded(eager.experts, world_size)
-    return valid_tokens * TOP_K, graph_result.splits
+    return valid_tokens * TOP_K, graph_result.splits, graph_result.real_splits
 
 
 def _assert_manager_stats(
     *,
     manager: PartialCudaGraphManager,
-    mode: str,
     capture_on_rank: bool,
-    replay_route_counts: list[int],
+    replay_splits: list[tuple[int, ...]],
     retained_bytes: int,
 ) -> None:
-    expected_replays = 2 * len(replay_route_counts) if capture_on_rank else 0
+    expected_replays = 2 * len(replay_splits) if capture_on_rank else 0
     assert manager.stats() == {
         "captured": int(capture_on_rank),
         "replayed": expected_replays,
@@ -715,8 +737,8 @@ def _assert_manager_stats(
     }
 
     expected_padding = 0
-    if mode == "bf16" and capture_on_rank:
-        expected_padding = 2 * sum(EXPERT_BUCKET_TOKENS - route_count for route_count in replay_route_counts)
+    if capture_on_rank:
+        expected_padding = 2 * sum(EXPERT_BUCKET_TOKENS - sum(splits) for splits in replay_splits)
     assert manager.expert_bucket_stats() == {
         "entries": 1,
         "capacity_tokens": EXPERT_BUCKET_TOKENS,
@@ -775,7 +797,7 @@ def main() -> None:
     # post-dispatch capture sample. It is a complete optimizer step before
     # capture, exactly as in the production training lifecycle.
     capture_valid_tokens = CAPTURE_VALID_TOKENS if capture_on_rank else 0
-    capture_routes, capture_splits = _run_parity_step(
+    capture_routes, capture_splits, capture_real_splits = _run_parity_step(
         graph=graph,
         eager=eager,
         mode=mode,
@@ -786,6 +808,8 @@ def main() -> None:
         device=device,
     )
     assert capture_routes < EXPERT_BUCKET_TOKENS
+    assert sum(capture_real_splits) == capture_routes
+    assert sum(capture_splits) < EXPERT_BUCKET_TOKENS
     graph_entry = graph.manager.entries[0]
     assert graph_entry.expert_bucket_uses_paged_capacity
     if capture_on_rank:
@@ -799,7 +823,7 @@ def main() -> None:
             atol=0,
             rtol=0,
         )
-        assert captured_splits.sum().item() == capture_routes
+        assert captured_splits.sum().item() == sum(capture_splits)
     graph.manager.capture()
     assert graph.manager.stats() == {"captured": int(capture_on_rank), "replayed": 0, "fallback": 0}
     storage_after_capture = graph.manager.expert_storage_stats()
@@ -811,9 +835,11 @@ def main() -> None:
     _assert_logically_sharded(eager.experts, world_size)
 
     replay_route_counts: list[int] = []
+    replay_splits: list[tuple[int, ...]] = []
     observed_splits = [capture_splits]
+    observed_real_splits = [capture_real_splits]
     for step, valid_tokens in enumerate(REPLAY_VALID_TOKENS, start=1):
-        route_count, splits = _run_parity_step(
+        route_count, splits, real_splits = _run_parity_step(
             graph=graph,
             eager=eager,
             mode=mode,
@@ -824,15 +850,18 @@ def main() -> None:
             device=device,
         )
         assert route_count < EXPERT_BUCKET_TOKENS
+        assert sum(splits) <= EXPERT_BUCKET_TOKENS
         replay_route_counts.append(route_count)
+        replay_splits.append(splits)
         observed_splits.append(splits)
+        observed_real_splits.append(real_splits)
         assert graph.manager.expert_storage_stats()["retained_bytes"] == retained_bytes
 
-    # The real route count exceeds 256. BF16 reaches the manager with 260 rows;
-    # MXFP8 reaches it with the dispatcher's next physical page (512 rows). Both
-    # must bypass the graph and remain numerically aligned with eager execution.
+    # The real route count exceeds the graph bucket. MXFP8 additionally pads
+    # every expert to 256 rows. Both modes must bypass the graph and remain
+    # numerically aligned with eager execution.
     overflow_step = len(REPLAY_VALID_TOKENS) + 1
-    overflow_routes, overflow_splits = _run_parity_step(
+    overflow_routes, overflow_splits, overflow_real_splits = _run_parity_step(
         graph=graph,
         eager=eager,
         mode=mode,
@@ -843,13 +872,15 @@ def main() -> None:
         device=device,
     )
     assert overflow_routes > EXPERT_BUCKET_TOKENS
+    assert sum(overflow_splits) > EXPERT_BUCKET_TOKENS
     observed_splits.append(overflow_splits)
+    observed_real_splits.append(overflow_real_splits)
 
     # The TE Sequential used for capture shares BasicOperations and FP8
     # quantizers with the eager fallback target. Replay once more after the
     # overflow to prove that eager execution did not perturb graph state.
     post_overflow_step = overflow_step + 1
-    post_overflow_routes, post_overflow_splits = _run_parity_step(
+    post_overflow_routes, post_overflow_splits, post_overflow_real_splits = _run_parity_step(
         graph=graph,
         eager=eager,
         mode=mode,
@@ -860,16 +891,21 @@ def main() -> None:
         device=device,
     )
     assert post_overflow_routes < EXPERT_BUCKET_TOKENS
+    assert sum(post_overflow_splits) <= EXPERT_BUCKET_TOKENS
     replay_route_counts.append(post_overflow_routes)
+    replay_splits.append(post_overflow_splits)
     observed_splits.append(post_overflow_splits)
+    observed_real_splits.append(post_overflow_real_splits)
 
     assert len(set(replay_route_counts)) == len(REPLAY_VALID_TOKENS) + 1
-    assert len(set(observed_splits)) == len(observed_splits), f"expert splits did not vary: {observed_splits}"
+    assert len(set(observed_real_splits)) == len(observed_real_splits), (
+        f"real expert splits did not vary: {observed_real_splits}"
+    )
+    assert len(set(observed_splits)) >= 2, f"physical expert splits did not vary: {observed_splits}"
     _assert_manager_stats(
         manager=graph.manager,
-        mode=mode,
         capture_on_rank=capture_on_rank,
-        replay_route_counts=replay_route_counts,
+        replay_splits=replay_splits,
         retained_bytes=retained_bytes,
     )
 
@@ -880,10 +916,11 @@ def main() -> None:
     assert graph.alias_checks[0] == 2 * expected_optimizer_steps
     assert eager.alias_checks[0] == 2 * expected_optimizer_steps
     assert graph.dispatcher.history == eager.dispatcher.history
+    assert graph.dispatcher.real_history == eager.dispatcher.real_history
     assert graph.dispatcher.physical_history == eager.dispatcher.physical_history
 
     all_splits: list[list[tuple[int, ...]] | None] = [None for _ in range(world_size)]
-    dist.all_gather_object(all_splits, observed_splits)
+    dist.all_gather_object(all_splits, observed_real_splits)
     assert len({split for rank_splits in all_splits if rank_splits is not None for split in rank_splits}) > len(
         observed_splits
     )
