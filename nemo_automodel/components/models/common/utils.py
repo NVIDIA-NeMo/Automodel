@@ -169,8 +169,12 @@ class BackendConfig:
             scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
             else falls back to torch._grouped_mm at runtime).
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
-            "deepep" uses DeepEP for token dispatch,
+            "deepep" uses DeepEP for token dispatch, "deepep_v2" uses DeepEP V2 ElasticBuffer,
             "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
+        dispatcher_num_sms: Communication SM count. Defaults to 6 for DeepEP v2 and 20 for
+            the other dispatchers.
+        dispatcher_num_qps: Communication QP count. Defaults to 33 for DeepEP v2 and 0 for
+            the other dispatchers.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
@@ -200,14 +204,15 @@ class BackendConfig:
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
-    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep"] = (
+    dispatcher: Literal["torch", "deepep", "deepep_v2", "hybridep", "uccl_ep"] = (
         "deepep"
         if HAVE_DEEP_EP and torch.cuda.is_available()
         else "uccl_ep"
         if HAVE_UCCL_EP and torch.cuda.is_available()
         else "torch"
     )
-    dispatcher_num_sms: int = 20
+    dispatcher_num_sms: int | None = None
+    dispatcher_num_qps: int | None = None
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
@@ -249,17 +254,28 @@ class BackendConfig:
             self.enable_deepep = None
 
         # Backward compatibility
-        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep"):
+        if self.experts in ("te", "gmm") and self.dispatcher not in (
+            "deepep",
+            "deepep_v2",
+            "hybridep",
+            "uccl_ep",
+        ):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():
                 logger.info(
-                    f"experts='{self.experts}' requires dispatcher='deepep' or 'uccl_ep', "
+                    f"experts='{self.experts}' requires dispatcher='deepep', 'deepep_v2', "
+                    "'hybridep', or 'uccl_ep', "
                     f"but got dispatcher='{self.dispatcher}'. "
                     "Setting dispatcher to torch and experts to torch_mm."
                 )
             self.dispatcher = "torch"
             self.experts = "torch_mm"
+
+        if self.dispatcher_num_sms is None:
+            self.dispatcher_num_sms = 6 if self.dispatcher == "deepep_v2" else 20
+        if self.dispatcher_num_qps is None:
+            self.dispatcher_num_qps = 33 if self.dispatcher == "deepep_v2" else 0
 
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
         if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":
