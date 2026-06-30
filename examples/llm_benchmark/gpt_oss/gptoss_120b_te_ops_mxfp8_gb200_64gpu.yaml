@@ -69,6 +69,9 @@ model:
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
     enable_fsdp_optimizations: true
+    # Cache GEMM-ready expert weights once per optimizer generation while the
+    # ordinary stacked BF16 Parameters remain the optimizer/checkpoint owners.
+    te_ops_mxfp8_weight_cache: true
     te_fp8:
       recipe: mxfp8
       # Keep dot-product attention in BF16; MXFP8 is restricted to the MLP path.
