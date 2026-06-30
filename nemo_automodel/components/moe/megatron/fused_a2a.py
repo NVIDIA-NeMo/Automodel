@@ -87,10 +87,9 @@ except ImportError:
 _buffer = None
 _deepep_v2_buffer = None
 _deepep_v2_num_sms = 0
+_deepep_v2_num_qps = 0
 _nvshmem_available = None
 _uccl_buffer = None
-
-_DEEPEP_V2_DEFAULT_NUM_QPS = 33
 
 _DEEPEP_V2_HANDLE_TENSOR_FIELDS = (
     "topk_idx",
@@ -428,7 +427,7 @@ class DeepEPV2FusedDispatch(torch.autograd.Function):
             num_experts=num_experts,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
             num_sms=_deepep_v2_num_sms,
-            num_qps=_DEEPEP_V2_DEFAULT_NUM_QPS,
+            num_qps=_deepep_v2_num_qps,
             async_with_compute_stream=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
@@ -457,7 +456,7 @@ class DeepEPV2FusedDispatch(torch.autograd.Function):
             grad_output.contiguous(),
             handle,
             topk_weights=grad_token_probs.float() if grad_token_probs is not None else None,
-            num_qps=_DEEPEP_V2_DEFAULT_NUM_QPS,
+            num_qps=_deepep_v2_num_qps,
             async_with_compute_stream=ctx.async_finish,
             allocate_on_comm_stream=ctx.allocate_on_comm_stream,
         )
@@ -492,7 +491,7 @@ class DeepEPV2FusedCombine(torch.autograd.Function):
             x.contiguous(),
             handle=handle,
             num_sms=_deepep_v2_num_sms,
-            num_qps=_DEEPEP_V2_DEFAULT_NUM_QPS,
+            num_qps=_deepep_v2_num_qps,
             async_with_compute_stream=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
@@ -512,7 +511,7 @@ class DeepEPV2FusedCombine(torch.autograd.Function):
             grad_output.contiguous(),
             handle=handle,
             num_sms=handle.num_sms,
-            num_qps=_DEEPEP_V2_DEFAULT_NUM_QPS,
+            num_qps=_deepep_v2_num_qps,
             async_with_compute_stream=ctx.async_finish,
             allocate_on_comm_stream=ctx.allocate_on_comm_stream,
         )
@@ -584,6 +583,12 @@ def set_deepep_v2_num_sms(num_sms):
     """Set the number of SMs passed to DeepEP V2 ElasticBuffer operations."""
     global _deepep_v2_num_sms
     _deepep_v2_num_sms = num_sms
+
+
+def set_deepep_v2_num_qps(num_qps):
+    """Set the number of QPs passed to DeepEP V2 ElasticBuffer operations."""
+    global _deepep_v2_num_qps
+    _deepep_v2_num_qps = num_qps
 
 
 atexit.register(destroy_deepep_v2_buffer)

@@ -830,12 +830,14 @@ class TestGroupedExpertsDeepEP:
             moe_config,
             dispatcher_backend="hybridep",
             dispatcher_num_sms=24,
+            dispatcher_num_qps=33,
             dispatcher_share_token_dispatcher=False,
             dispatcher_async_dispatch=True,
         )
 
         assert experts.dispatcher_backend == "hybridep"
         assert experts.dispatcher_num_sms == 24
+        assert experts.dispatcher_num_qps == 33
         assert experts.dispatcher_share_token_dispatcher is False
         assert experts.dispatcher_async_dispatch is True
         assert experts.config == moe_config
@@ -846,6 +848,7 @@ class TestGroupedExpertsDeepEP:
             moe_config,
             dispatcher_backend="hybridep",
             dispatcher_num_sms=24,
+            dispatcher_num_qps=33,
             dispatcher_share_token_dispatcher=False,
             dispatcher_async_dispatch=True,
         )
@@ -868,6 +871,7 @@ class TestGroupedExpertsDeepEP:
             assert config_arg.moe_flex_dispatcher_backend == "hybridep"
             assert config_arg.moe_hybridep_num_sms == 24
             assert config_arg.moe_deepep_num_sms == 24
+            assert config_arg.moe_deepep_num_qps == 33
             assert config_arg.moe_share_token_dispatcher is False
             assert config_arg.moe_deepep_async_dispatch is True
 
