@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DSpark draft-model training recipe (Qwen3-style targets).
+"""DSpark draft-model training recipe (Qwen3, Gemma4, and DeepSeek V4 targets).
 
 DSpark is a semi-autoregressive parallel drafter: a parallel backbone produces a
 block of tokens per anchor in one pass, a serial Markov head injects intra-block
@@ -34,7 +34,7 @@ import torch
 import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
@@ -50,7 +50,12 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
-from nemo_automodel.components.speculative.dspark.config import build_gemma4_draft_config
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.speculative.dspark.config import (
+    build_deepseek_v4_draft_config,
+    build_gemma4_draft_config,
+)
 from nemo_automodel.components.speculative.dspark.core import DSparkTrainerModule
 from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSparkModel
 from nemo_automodel.components.speculative.dspark.registry import (
@@ -59,6 +64,7 @@ from nemo_automodel.components.speculative.dspark.registry import (
 )
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
@@ -73,6 +79,7 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
 logger = logging.getLogger(__name__)
 
 _GEMMA4_MODEL_TYPES = ("gemma4", "gemma4_unified")
+_DEEPSEEK_V4_MODEL_TYPE = "deepseek_v4"
 
 
 class _DraftArgs(dict):
@@ -85,8 +92,41 @@ class _DraftArgs(dict):
             raise AttributeError(key) from exc
 
 
+def _read_target_model_type(target_path: str, trust_remote_code: bool) -> str:
+    """Return the HF ``model_type`` for a target without instantiating the model.
+
+    DeepSeek V4's ``model_type`` ("deepseek_v4") is a custom architecture that stock
+    ``AutoConfig`` may not recognize, so read it straight from the raw config dict
+    (which never requires the type to be registered). Falls back to ``AutoConfig``
+    for any path ``get_config_dict`` cannot resolve.
+    """
+    try:
+        config_dict, _ = PretrainedConfig.get_config_dict(target_path, trust_remote_code=trust_remote_code)
+        model_type = config_dict.get("model_type")
+        if model_type:
+            return str(model_type)
+    except (OSError, ValueError, KeyError):
+        pass
+    config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+    return str(getattr(config, "model_type", "") or "")
+
+
+def _gather_full_weight_module(module):
+    """Return an object exposing a full (non-DTensor) ``.weight`` tensor.
+
+    The expert-parallel / FSDP-sharded DeepSeek V4 target stores ``embed_tokens`` and
+    ``lm_head`` weights as DTensors, while the draft copies them into plain Parameters.
+    Gather the sharded weight to a full tensor first (an all-gather, so every rank must
+    call this in lockstep); non-sharded targets (Qwen3, Gemma4) pass through unchanged.
+    """
+    weight = getattr(module, "weight", None)
+    if weight is not None and hasattr(weight, "full_tensor"):
+        return SimpleNamespace(weight=weight.full_tensor())
+    return module
+
+
 class TrainDSparkRecipe(BaseRecipe):
-    """Recipe for DSpark draft-model training on Qwen3-style dense / MoE targets."""
+    """Recipe for DSpark draft-model training on Qwen3, Gemma4, and DeepSeek V4 targets."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -103,32 +143,45 @@ class TrainDSparkRecipe(BaseRecipe):
         self.device = self.dist_env.device or torch.device("cpu")
         # The draft is sharded directly with fully_shard over the default world
         # mesh (no explicit MeshContext), so _dp_allreduce reduces over the world group.
+        # A DeepSeek V4 target additionally needs its own expert-parallel / FSDP mesh,
+        # kept in self.distributed_setup and used only to load and shard that target.
         self.device_mesh = None
+        self.distributed_setup = None
 
         target_path = recipe_cfg.target_model_name_or_path
-        target_config = AutoConfig.from_pretrained(
-            target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
-        )
-        architectures = getattr(target_config, "architectures", []) or []
-        is_gemma4_target = getattr(target_config, "model_type", "") in _GEMMA4_MODEL_TYPES
+        trust_remote_code = bool(recipe_cfg.get("trust_remote_code", False))
+        target_model_type = _read_target_model_type(target_path, trust_remote_code)
+        is_deepseek_v4_target = target_model_type == _DEEPSEEK_V4_MODEL_TYPE
 
-        self.tokenizer = NeMoAutoTokenizer.from_pretrained(
-            target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
-        )
+        self.tokenizer = NeMoAutoTokenizer.from_pretrained(target_path, trust_remote_code=trust_remote_code)
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
-        target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
-        target_kwargs = {}
-        if target_attn_implementation is not None:
-            target_kwargs["attn_implementation"] = target_attn_implementation
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
-            target_path,
-            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
-            torch_dtype=self.compute_dtype,
-            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
-            **target_kwargs,
-        )
-        self.target_model.to(self.device)
+        if is_deepseek_v4_target:
+            # Full V4-Flash target loaded with the same expert-parallel / FSDP and
+            # FP8-dequant path as the V4 finetune recipe, so the 256 experts shard
+            # across ranks instead of replicating per rank.
+            target_config, self.target_model = self._build_deepseek_v4_target(
+                target_path, recipe_cfg, trust_remote_code
+            )
+            is_gemma4_target = False
+            architectures = list(getattr(target_config, "architectures", None) or ["DeepseekV4ForCausalLM"])
+        else:
+            target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+            architectures = getattr(target_config, "architectures", []) or []
+            is_gemma4_target = getattr(target_config, "model_type", "") in _GEMMA4_MODEL_TYPES
+
+            target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
+            target_kwargs = {}
+            if target_attn_implementation is not None:
+                target_kwargs["attn_implementation"] = target_attn_implementation
+            self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
+                target_path,
+                trust_remote_code=trust_remote_code,
+                torch_dtype=self.compute_dtype,
+                force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+                **target_kwargs,
+            )
+            self.target_model.to(self.device)
         self.target_model.requires_grad_(False)
 
         # Resolve the captured target layers once and share them between the
@@ -175,16 +228,18 @@ class TrainDSparkRecipe(BaseRecipe):
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
             )
 
-        # DSpark's block attention mask is a flex_attention BlockMask; the draft
-        # only supports the flex attention path during training.
+        # The Qwen3 / Gemma4 drafts consume a flex_attention BlockMask during training.
+        # The DeepSeek V4 draft instead consumes a dense additive mask (the DFlash SDPA
+        # path), so it is exempt from the flex_attention requirement.
         attention_backend = recipe_cfg.get("attention_backend", "flex_attention")
-        if attention_backend != "flex_attention":
+        if not is_deepseek_v4_target and attention_backend != "flex_attention":
             raise ValueError(f"DSpark training requires attention_backend='flex_attention', got {attention_backend!r}.")
         confidence_head_alpha = float(recipe_cfg.get("confidence_head_alpha", 1.0))
         markov_rank = int(recipe_cfg.get("markov_rank", 256))
 
-        if is_gemma4_target:
-            # Gemma4 draft is built from the target's text sub-config (text_config).
+        if is_deepseek_v4_target or is_gemma4_target:
+            # Gemma4 and DeepSeek V4 drafts share one typed draft-config builder that
+            # takes the same DSpark model-args bundle.
             margs = _DraftArgs(
                 num_draft_layers=draft_num_hidden_layers,
                 target_layer_ids=target_layer_ids,
@@ -196,8 +251,16 @@ class TrainDSparkRecipe(BaseRecipe):
                 confidence_head_alpha=confidence_head_alpha,
                 confidence_head_with_markov=bool(recipe_cfg.get("confidence_head_with_markov", True)),
             )
-            draft_config_obj = build_gemma4_draft_config(target_config, margs)
-            draft_cls = Gemma4DSparkModel
+            if is_deepseek_v4_target:
+                # The V4 draft is always dense and fixes _attn_implementation to "sdpa"
+                # inside the builder, so it is not overridden by attention_backend.
+                draft_config_obj = build_deepseek_v4_draft_config(target_config, margs)
+                draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
+            else:
+                # Gemma4 draft is built from the target's text sub-config (text_config).
+                draft_config_obj = build_gemma4_draft_config(target_config, margs)
+                draft_config_obj._attn_implementation = attention_backend
+                draft_cls = Gemma4DSparkModel
         else:
             # Qwen3-style draft: a small non-causal stack reusing the target's
             # architecture defaults plus the DSpark-specific fields.
@@ -220,16 +283,23 @@ class TrainDSparkRecipe(BaseRecipe):
             # The draft owns an independent (frozen) lm_head seeded from the target.
             draft_config["tie_word_embeddings"] = False
             draft_config_obj = Qwen3Config.from_dict(draft_config)
+            draft_config_obj._attn_implementation = attention_backend
             draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
 
-        draft_config_obj._attn_implementation = attention_backend
         self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
 
         # DSpark shares the target's embeddings + lm_head and keeps them frozen,
         # training only the backbone, fc, Markov head, and confidence head.
+        embed_src = self.target_wrapper.get_input_embeddings()
+        head_src = self.target_wrapper.get_output_embeddings()
+        if is_deepseek_v4_target:
+            # The V4 target's embed_tokens / lm_head are expert-parallel / FSDP-sharded
+            # DTensors; gather them to full tensors before the draft copies them.
+            embed_src = _gather_full_weight_module(embed_src)
+            head_src = _gather_full_weight_module(head_src)
         self.draft_model.initialize_embeddings_and_head(
-            embed_tokens=self.target_wrapper.get_input_embeddings(),
-            lm_head=self.target_wrapper.get_output_embeddings(),
+            embed_tokens=embed_src,
+            lm_head=head_src,
             freeze=bool(recipe_cfg.get("freeze_embeddings", True)),
         )
 
@@ -329,6 +399,65 @@ class TrainDSparkRecipe(BaseRecipe):
                 "it indexes the draft embed_tokens table."
             )
         return mask_token_id
+
+    def _build_deepseek_v4_target(self, target_path, recipe_cfg, trust_remote_code):
+        """Load the full DeepSeek V4 target as a frozen, expert-parallel / FSDP model.
+
+        Mirrors the V4 finetune recipe's model build: an expert-parallel / FSDP
+        distributed setup (device_mesh + moe_mesh, derived from the recipe's
+        ``distributed`` block) shards the 256 experts across ranks while the
+        ``enable_hf_state_dict_adapter`` path dequantizes the FP8 base weights on load.
+        The target is MTP-free (``num_nextn_predict_layers=0``) because the draft
+        consumes hidden states only, and is returned frozen for inference.
+
+        Returns the resolved ``DeepseekV4Config`` and the sharded target model.
+        """
+        if self.device.type != "cuda":
+            raise RuntimeError(
+                "DeepSeek V4 DSpark target training requires CUDA: the target is loaded "
+                "with the expert-parallel / FSDP distributed path."
+            )
+        # Build the device_mesh + moe_mesh from the recipe's `distributed` block
+        # (strategy, ep_size, moe, ...). DeepseekV4Config.from_pretrained is used
+        # because the custom V4 model_type is not registered with stock AutoConfig.
+        self.distributed_setup = create_distributed_setup_from_config(
+            self.cfg,
+            world_size=self.dist_env.world_size,
+        )
+        # Pass name_or_path explicitly (as the V4 finetune recipe does) so from_config
+        # resolves the base checkpoint to load and dequantize from.
+        target_config = DeepseekV4Config.from_pretrained(
+            target_path, name_or_path=target_path, num_nextn_predict_layers=0
+        )
+        backend = self._build_deepseek_v4_backend(recipe_cfg)
+        target_model = NeMoAutoModelForCausalLM.from_config(
+            config=target_config,
+            backend=backend,
+            distributed_setup=self.distributed_setup,
+            load_base_model=True,
+            torch_dtype=self.compute_dtype,
+            trust_remote_code=trust_remote_code,
+        )
+        return target_config, target_model
+
+    @staticmethod
+    def _build_deepseek_v4_backend(recipe_cfg) -> BackendConfig:
+        """Build the V4 target BackendConfig (TileLang attention, hybrid-EP, FP8 adapter).
+
+        Matches the V4 finetune recipe's backend: dense linears and fp32 RMSNorm on
+        torch, the ``torch_mm`` grouped-expert GEMM, the hybrid-EP token dispatcher, and
+        the HF state-dict adapter that dequantizes the FP8 base checkpoint on load.
+        """
+        return BackendConfig(
+            attn=str(recipe_cfg.get("target_attn_backend", "tilelang")),
+            linear="torch",
+            rms_norm="torch_fp32",
+            rope_fusion=False,
+            dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
+            experts=str(recipe_cfg.get("target_experts", "torch_mm")),
+            enable_hf_state_dict_adapter=True,
+            enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
+        )
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the EAGLE / DFlash recipes."""
