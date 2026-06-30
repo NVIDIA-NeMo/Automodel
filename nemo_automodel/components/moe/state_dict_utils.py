@@ -26,8 +26,31 @@ def is_dtensor(tensor: torch.Tensor) -> bool:
 
 
 def get_submesh(device_mesh: DeviceMesh, dims: tuple[str, ...]) -> DeviceMesh:
-    """Access a submesh by dim names from the given mesh."""
-    return device_mesh[dims]
+    """Access a submesh, preserving the requested logical dimension order.
+
+    PyTorch requires ``DeviceMesh.__getitem__`` dimensions to follow their
+    physical order. Expert state dicts sometimes need the logical hierarchy
+    ``(ep, ep_shard)`` even though the runtime MoE mesh is physically laid out
+    as ``(ep_shard, ep)``. Rebuild that view from the existing process groups
+    and a transposed rank mesh instead of asking ``__getitem__`` to reverse the
+    dimensions.
+    """
+    mesh_dim_names = tuple(device_mesh.mesh_dim_names)
+    dim_indices = tuple(mesh_dim_names.index(dim) for dim in dims)
+    if dim_indices == tuple(sorted(dim_indices)):
+        return device_mesh[dims]
+
+    physical_dims = tuple(dim for dim in mesh_dim_names if dim in dims)
+    physical_submesh = device_mesh[physical_dims]
+    permutation = tuple(physical_dims.index(dim) for dim in dims)
+    logical_rank_mesh = physical_submesh.mesh.permute(permutation).contiguous()
+    groups = [device_mesh[dim].get_group() for dim in dims]
+    return DeviceMesh.from_group(
+        groups,
+        physical_submesh.device_type,
+        mesh=logical_rank_mesh,
+        mesh_dim_names=dims,
+    )
 
 
 def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> tuple[torch.Tensor, int, int]:

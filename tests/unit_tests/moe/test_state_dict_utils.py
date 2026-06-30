@@ -23,11 +23,49 @@ from nemo_automodel.components.moe.state_dict_utils import (
     create_dtensor_from_local,
     get_expert_range_for_rank_from_mesh,
     get_expert_slice_for_rank,
+    get_submesh,
     is_dtensor,
     should_load_expert_for_rank,
     split_experts_weights_dtensor_aware,
     validate_dtensor_expert_sharding,
 )
+
+
+class TestGetSubmesh:
+    @patch("nemo_automodel.components.moe.state_dict_utils.DeviceMesh.from_group")
+    def test_reorders_logical_dimensions_with_existing_groups(self, mock_from_group):
+        ep_group = Mock()
+        ep_shard_group = Mock()
+        ep_mesh = Mock()
+        ep_mesh.get_group.return_value = ep_group
+        ep_shard_mesh = Mock()
+        ep_shard_mesh.get_group.return_value = ep_shard_group
+
+        class PhysicalMesh:
+            mesh_dim_names = ("ep_shard", "ep")
+            mesh = torch.tensor([[0, 1], [2, 3]])
+            device_type = "cuda"
+
+            def __getitem__(self, dims):
+                if dims == ("ep_shard", "ep"):
+                    return self
+                if dims == "ep":
+                    return ep_mesh
+                if dims == "ep_shard":
+                    return ep_shard_mesh
+                raise KeyError(dims)
+
+        physical_mesh = PhysicalMesh()
+        logical_mesh = Mock()
+        mock_from_group.return_value = logical_mesh
+
+        result = get_submesh(physical_mesh, ("ep", "ep_shard"))
+
+        assert result is logical_mesh
+        args, kwargs = mock_from_group.call_args
+        assert args == ([ep_group, ep_shard_group], "cuda")
+        assert torch.equal(kwargs["mesh"], torch.tensor([[0, 2], [1, 3]]))
+        assert kwargs["mesh_dim_names"] == ("ep", "ep_shard")
 
 
 class TestIsDtensor:
