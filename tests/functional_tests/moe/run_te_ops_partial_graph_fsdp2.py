@@ -28,8 +28,9 @@ the always-eager reference at the output, loss, input-gradient, local sharded
 parameter-gradient, and optimizer-updated local-shard boundaries.
 
 Iteration zero is an ordinary eager optimizer step and supplies the graph
-capture sample. Later steps change route counts and per-expert splits before an
-overflow call exercises eager fallback. Setting
+capture sample. Later steps change route counts and per-expert splits; an
+overflow call exercises eager fallback before a final graph replay verifies
+that the fallback did not perturb shared TE operation/quantizer state. Setting
 ``TE_OPS_GRAPH_ASYMMETRIC_CAPTURE=1`` gives rank 1 zero routes on iteration zero;
 it must still join graph-storage collectives, skip local capture, and match its
 eager twin on later steps.
@@ -88,6 +89,7 @@ EXPERT_BUCKET_TOKENS = 128
 CAPTURE_VALID_TOKENS = 11
 REPLAY_VALID_TOKENS = (7, 19, 31)
 OVERFLOW_VALID_TOKENS = TOKENS
+POST_OVERFLOW_VALID_TOKENS = 23
 
 OWNER_SHARD_DIMS = {
     "gate_up_linear._stacked_weight": 2,
@@ -705,7 +707,7 @@ def _assert_manager_stats(
     replay_route_counts: list[int],
     retained_bytes: int,
 ) -> None:
-    expected_replays = 2 * len(REPLAY_VALID_TOKENS) if capture_on_rank else 0
+    expected_replays = 2 * len(replay_route_counts) if capture_on_rank else 0
     assert manager.stats() == {
         "captured": int(capture_on_rank),
         "replayed": expected_replays,
@@ -843,7 +845,25 @@ def main() -> None:
     assert overflow_routes > EXPERT_BUCKET_TOKENS
     observed_splits.append(overflow_splits)
 
-    assert len(set(replay_route_counts)) == len(REPLAY_VALID_TOKENS)
+    # The TE Sequential used for capture shares BasicOperations and FP8
+    # quantizers with the eager fallback target. Replay once more after the
+    # overflow to prove that eager execution did not perturb graph state.
+    post_overflow_step = overflow_step + 1
+    post_overflow_routes, post_overflow_splits = _run_parity_step(
+        graph=graph,
+        eager=eager,
+        mode=mode,
+        rank=rank,
+        world_size=world_size,
+        step=post_overflow_step,
+        valid_tokens=POST_OVERFLOW_VALID_TOKENS,
+        device=device,
+    )
+    assert post_overflow_routes < EXPERT_BUCKET_TOKENS
+    replay_route_counts.append(post_overflow_routes)
+    observed_splits.append(post_overflow_splits)
+
+    assert len(set(replay_route_counts)) == len(REPLAY_VALID_TOKENS) + 1
     assert len(set(observed_splits)) == len(observed_splits), f"expert splits did not vary: {observed_splits}"
     _assert_manager_stats(
         manager=graph.manager,
@@ -856,7 +876,7 @@ def main() -> None:
     # Every real full-experts call runs once in the original forward and once
     # in non-reentrant checkpoint recomputation. Graph capture warmups target
     # the inner TE op directly and therefore do not increment these counters.
-    expected_optimizer_steps = 2 + len(REPLAY_VALID_TOKENS)
+    expected_optimizer_steps = 3 + len(REPLAY_VALID_TOKENS)
     assert graph.alias_checks[0] == 2 * expected_optimizer_steps
     assert eager.alias_checks[0] == 2 * expected_optimizer_steps
     assert graph.dispatcher.history == eager.dispatcher.history

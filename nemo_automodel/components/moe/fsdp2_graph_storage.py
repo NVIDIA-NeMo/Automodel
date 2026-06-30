@@ -37,7 +37,12 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-_SUPPORTED_TORCH_MAJOR_MINOR = (2, 10)
+_SUPPORTED_TORCH_MAJOR_MINORS = frozenset({(2, 10), (2, 12), (2, 13)})
+_DYNAMO_COMPILED_AUTOGRAD_FLAGS = (
+    "compiled_autograd_enabled",
+    "compiled_autograd_enabled_force_eager",
+    "in_compiled_autograd_region",
+)
 
 
 class FSDP2ExpertGraphStorageError(RuntimeError):
@@ -73,42 +78,106 @@ class _MethodInterception:
     replacement_method: Callable[[], None]
 
 
+def _load_dynamo_compiled_autograd_probe(major_minor: tuple[int, int]) -> Callable[[], bool]:
+    """Load the compiled-autograd state that FSDP2 stopped mirroring in 2.12+."""
+    torch_version = ".".join(str(part) for part in major_minor)
+    try:
+        import torch._dynamo.compiled_autograd as compiled_autograd
+    except (ImportError, AttributeError) as error:
+        raise FSDP2ExpertGraphStorageError(
+            f"The audited PyTorch {torch_version} contract changed: compiled-autograd state is unavailable."
+        ) from error
+
+    def compiled_autograd_enabled() -> bool:
+        flag_values: list[bool] = []
+        for flag_name in _DYNAMO_COMPILED_AUTOGRAD_FLAGS:
+            flag_value = getattr(compiled_autograd, flag_name, None)
+            if type(flag_value) is not bool:
+                raise FSDP2ExpertGraphStorageError(
+                    f"The audited PyTorch {torch_version} compiled-autograd contract changed: "
+                    f"{flag_name} is not a boolean."
+                )
+            flag_values.append(flag_value)
+        return any(flag_values)
+
+    # Validate the state shape eagerly instead of deferring a missing/private
+    # API failure until graph capture has already started.
+    compiled_autograd_enabled()
+    return compiled_autograd_enabled
+
+
 def _load_fsdp2_contract() -> _FSDP2Contract:
-    """Load the private eager-FSDP2 types used by the pinned PyTorch build."""
+    """Load the private eager-FSDP2 types used by audited PyTorch builds."""
     version_parts = torch.__version__.split("+", 1)[0].split(".")
     try:
         major_minor = (int(version_parts[0]), int(version_parts[1]))
     except (IndexError, ValueError) as error:
         raise FSDP2ExpertGraphStorageError(f"Cannot parse the PyTorch version {torch.__version__!r}.") from error
-    if major_minor != _SUPPORTED_TORCH_MAJOR_MINOR:
+    if major_minor not in _SUPPORTED_TORCH_MAJOR_MINORS:
         git_version = getattr(torch.version, "git_version", None)
         raise FSDP2ExpertGraphStorageError(
-            "Partial expert CUDA graphs with ep_shard depend on the pinned PyTorch 2.10 eager-FSDP2 contract; "
+            "Partial expert CUDA graphs with ep_shard depend on an audited PyTorch 2.10/2.12/2.13 "
+            "eager-FSDP2 contract; "
             f"got torch {torch.__version__} (git {git_version or 'unknown'})."
         )
 
     try:
         from torch.distributed.fsdp import fully_shard
         from torch.distributed.fsdp._fully_shard import FSDPModule
-        from torch.distributed.fsdp._fully_shard._fsdp_common import compiled_autograd_enabled
         from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam, ShardedState
         from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
     except (ImportError, AttributeError) as error:
         raise FSDP2ExpertGraphStorageError(
-            "Partial expert CUDA graphs with ep_shard require the pinned eager FSDP2 private API "
+            "Partial expert CUDA graphs with ep_shard require the audited eager FSDP2 private API "
             "(FSDPModule, FSDPParamGroup, FSDPParam, and ShardedState)."
         ) from error
+
+    if major_minor == (2, 10):
+        try:
+            from torch.distributed.fsdp._fully_shard._fsdp_common import compiled_autograd_enabled
+        except (ImportError, AttributeError) as error:
+            raise FSDP2ExpertGraphStorageError(
+                "The audited PyTorch 2.10 contract changed: FSDP2 compiled-autograd state is unavailable."
+            ) from error
+        if not callable(compiled_autograd_enabled):
+            raise FSDP2ExpertGraphStorageError(
+                "The audited PyTorch 2.10 contract changed: FSDP2 compiled-autograd state is not callable."
+            )
+    else:
+        # PyTorch 2.12+ removed FSDP2's cached compiled-autograd helper when
+        # FSDP hooks became eager graph breaks. Probe Dynamo's source state
+        # directly so this module can continue to reject that unaudited mode.
+        compiled_autograd_enabled = _load_dynamo_compiled_autograd_probe(major_minor)
 
     state_for_module = getattr(fully_shard, "state", None)
     if not callable(state_for_module):
         raise FSDP2ExpertGraphStorageError(
-            "The pinned FSDP2 contract changed: torch.distributed.fsdp.fully_shard.state is unavailable."
+            "The audited FSDP2 contract changed: torch.distributed.fsdp.fully_shard.state is unavailable."
         )
-    if not callable(getattr(FSDPParam, "free_unsharded_param", None)) or not callable(
-        getattr(FSDPParamGroup, "_to_sharded", None)
-    ):
+    required_methods = (
+        (FSDPModule, "unshard"),
+        (FSDPParam, "init_all_gather_outputs"),
+        (FSDPParam, "init_unsharded_param"),
+        (FSDPParam, "free_unsharded_param"),
+        (FSDPParam, "to_sharded"),
+        (FSDPParamGroup, "_to_unsharded"),
+        (FSDPParamGroup, "_to_sharded"),
+    )
+    missing_methods = [
+        f"{owner.__name__}.{method_name}"
+        for owner, method_name in required_methods
+        if not callable(getattr(owner, method_name, None))
+    ]
+    if missing_methods:
         raise FSDP2ExpertGraphStorageError(
-            "The pinned PyTorch 2.10 FSDP2 contract changed: storage-freeing or logical-reshard methods are missing."
+            "The audited PyTorch FSDP2 contract changed: required methods are missing or non-callable: "
+            + ", ".join(missing_methods)
+            + "."
+        )
+    missing_states = [state_name for state_name in ("SHARDED", "UNSHARDED") if not hasattr(ShardedState, state_name)]
+    if missing_states:
+        raise FSDP2ExpertGraphStorageError(
+            "The audited PyTorch FSDP2 contract changed: ShardedState is missing " + ", ".join(missing_states) + "."
         )
     return _FSDP2Contract(
         fsdp_module_type=FSDPModule,

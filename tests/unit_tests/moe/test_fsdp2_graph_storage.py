@@ -237,8 +237,63 @@ def test_rejects_non_te_ops_module(monkeypatch: pytest.MonkeyPatch) -> None:
         FSDP2ExpertGraphStorage(nn.Linear(2, 2))
 
 
-def test_private_contract_rejects_unpinned_torch_minor(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(torch, "__version__", "2.11.0+cu130")
+@pytest.mark.parametrize("version", ("2.9.1", "2.11.0+cu130", "2.14.0a0+gitdeadbeef"))
+def test_private_contract_rejects_unaudited_torch_minor(monkeypatch: pytest.MonkeyPatch, version: str) -> None:
+    monkeypatch.setattr(torch, "__version__", version)
 
-    with pytest.raises(FSDP2ExpertGraphStorageError, match="pinned PyTorch 2.10"):
+    with pytest.raises(FSDP2ExpertGraphStorageError, match="audited PyTorch 2.10/2.12/2.13"):
+        graph_storage._load_fsdp2_contract()
+
+
+@pytest.mark.parametrize(
+    "version",
+    (
+        "2.10.0+cu130",
+        "2.12.0a0+0291f960b6.nv26.04.48445190",
+        "2.13.0a0+8145d630e8.nv26.06",
+    ),
+)
+def test_private_contract_loads_audited_torch_minor(monkeypatch: pytest.MonkeyPatch, version: str) -> None:
+    monkeypatch.setattr(torch, "__version__", version)
+
+    contract = graph_storage._load_fsdp2_contract()
+
+    assert callable(contract.state_for_module)
+    assert callable(contract.compiled_autograd_enabled)
+    assert callable(contract.fsdp_param_type.free_unsharded_param)
+    assert callable(contract.fsdp_param_group_type._to_sharded)
+
+
+@pytest.mark.parametrize(
+    "version",
+    ("2.12.0a0+0291f960b6.nv26.04.48445190", "2.13.0a0+8145d630e8.nv26.06"),
+)
+def test_torch_212_plus_contract_reads_compiled_autograd_state(monkeypatch: pytest.MonkeyPatch, version: str) -> None:
+    import torch._dynamo.compiled_autograd as compiled_autograd
+
+    monkeypatch.setattr(torch, "__version__", version)
+    monkeypatch.setattr(compiled_autograd, "compiled_autograd_enabled", True)
+
+    contract = graph_storage._load_fsdp2_contract()
+
+    assert contract.compiled_autograd_enabled()
+
+
+def test_torch_213_contract_rejects_changed_compiled_autograd_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    import torch._dynamo.compiled_autograd as compiled_autograd
+
+    monkeypatch.setattr(torch, "__version__", "2.13.0a0+8145d630e8.nv26.06")
+    monkeypatch.delattr(compiled_autograd, "in_compiled_autograd_region")
+
+    with pytest.raises(FSDP2ExpertGraphStorageError, match="compiled-autograd contract changed"):
+        graph_storage._load_fsdp2_contract()
+
+
+def test_torch_213_contract_retains_structural_method_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+    monkeypatch.setattr(torch, "__version__", "2.13.0a0+8145d630e8.nv26.06")
+    monkeypatch.setattr(FSDPParamGroup, "_to_sharded", None)
+
+    with pytest.raises(FSDP2ExpertGraphStorageError, match="required methods are missing or non-callable"):
         graph_storage._load_fsdp2_contract()

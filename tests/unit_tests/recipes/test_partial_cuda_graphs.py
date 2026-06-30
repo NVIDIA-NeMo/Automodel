@@ -271,15 +271,20 @@ class _NestedGenericMoEWrapper(nn.Module):
         )
 
 
-def _install_fake_graph(monkeypatch):
+def _install_fake_graph(monkeypatch, captured_kwargs=None):
     class _FakeGraphedAdapter(nn.Module):
         def __init__(self, adapter):
             super().__init__()
+            self._explicit_adapter_forward = (
+                adapter.forward if isinstance(adapter, partial_graphs._ExplicitParameterCallAdapter) else None
+            )
             self._captured_call = adapter.captured_call
-            self._target_forward = adapter.target.forward
+            self._target_forward = None if self._explicit_adapter_forward is not None else adapter.target.forward
             self.reset_count = 0
 
         def forward(self, *tensor_inputs):
+            if self._explicit_adapter_forward is not None:
+                return self._explicit_adapter_forward(*tensor_inputs)
             args, kwargs = self._captured_call.rebuild(tensor_inputs)
             return self._target_forward(*args, **kwargs)
 
@@ -288,6 +293,8 @@ def _install_fake_graph(monkeypatch):
 
     def fake_make_graphed_callables(modules, _sample_args, **_kwargs):
         assert all(len(args) == len({id(tensor) for tensor in args}) for args in _sample_args)
+        if captured_kwargs is not None:
+            captured_kwargs.append(_kwargs)
         return tuple(_FakeGraphedAdapter(module) for module in modules)
 
     monkeypatch.setattr(partial_graphs, "_get_make_graphed_callables", lambda: fake_make_graphed_callables)
@@ -829,6 +836,117 @@ def test_tensor_metadata_change_falls_back_eagerly(monkeypatch):
 
     torch.testing.assert_close(output, entry.original_forward(larger_x, splits, larger_probs, splits, larger_probs))
     assert manager.stats() == {"captured": 1, "replayed": 0, "fallback": 1}
+
+
+def test_explicit_parameter_adapter_uses_fresh_accumulators_over_live_storage():
+    torch.manual_seed(42)
+    module = _DynamicSplitModule()
+    graph_target = copy.deepcopy(module)
+    x = torch.randn(4, 3, requires_grad=True)
+    splits = torch.tensor([2, 2], dtype=torch.int64)
+    probs = torch.randn(4, 1, requires_grad=True)
+    captured_call = partial_graphs._CapturedCall.from_call(
+        (x, splits, probs, splits, probs),
+        {},
+    )
+
+    adapter = partial_graphs._ExplicitParameterCallAdapter(module, graph_target, captured_call)
+
+    assert tuple(adapter.parameters()) == ()
+    assert graph_target in tuple(adapter.modules())
+    assert len(adapter.capture_parameter_aliases) == 1
+    alias = adapter.capture_parameter_aliases[0]
+    assert alias is not module.scale
+    assert alias.data_ptr() == module.scale.data_ptr()
+    assert (
+        torch.autograd.graph.get_gradient_edge(alias).node
+        is not torch.autograd.graph.get_gradient_edge(module.scale).node
+    )
+
+    output = adapter(*adapter.capture_inputs)
+    output.sum().backward()
+    assert alias.grad is not None
+    assert module.scale.grad is None
+
+
+def test_explicit_parameter_adapter_gives_fresh_fuser_alias_leaves():
+    class _Scale(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(2.0))
+
+    class _CachedParameterSequential(nn.Module):
+        def __init__(self, scale):
+            super().__init__()
+            self.scale = scale
+            self.cached_parameters = None
+
+        def forward(self, x):
+            if self.cached_parameters is None:
+                self.cached_parameters = tuple(self.scale.parameters())
+            return x * self.cached_parameters[0]
+
+    scale = _Scale()
+    target = _CachedParameterSequential(scale)
+    target(torch.ones(1))
+    graph_target = _CachedParameterSequential(scale)
+    captured_call = partial_graphs._CapturedCall.from_call((torch.ones(1, requires_grad=True),), {})
+
+    adapter = partial_graphs._ExplicitParameterCallAdapter(target, graph_target, captured_call)
+    alias = adapter.capture_parameter_aliases[0]
+    adapter(*adapter.capture_inputs).sum().backward()
+
+    assert target.cached_parameters[0] is scale.weight
+    assert graph_target.cached_parameters[0] is alias
+    assert alias.grad is not None
+    assert scale.weight.grad is None
+
+
+def test_explicit_parameter_expert_replay_routes_gradients_to_live_parameters(monkeypatch):
+    torch.manual_seed(42)
+    captured_kwargs = []
+    _install_fake_graph(monkeypatch, captured_kwargs)
+    monkeypatch.setattr(
+        partial_graphs,
+        "_build_te_ops_explicit_parameter_adapter",
+        lambda target, captured_call: partial_graphs._ExplicitParameterCallAdapter(
+            target,
+            copy.deepcopy(target),
+            captured_call,
+        ),
+    )
+    module = _DynamicSplitModule()
+    reference = copy.deepcopy(module)
+    entry = _make_entry(module, canonicalizer=partial_graphs._canonicalize_te_ops_experts)
+    manager = partial_graphs.PartialCudaGraphManager([entry])
+    manager.start_recording()
+
+    first_x = torch.randn(4, 3, requires_grad=True)
+    first_splits = torch.tensor([1, 3], dtype=torch.int64)
+    first_probs = torch.randn(4, 1, requires_grad=True)
+    module(first_x, first_splits, first_probs, first_splits, first_probs)
+    manager.capture()
+
+    assert captured_kwargs[0]["allow_unused_input"] is False
+    assert entry._explicit_parameter_names == ("scale",)
+    assert entry.adapter is not None
+    module.zero_grad(set_to_none=True)
+    graph_x = torch.randn(4, 3, requires_grad=True)
+    graph_splits = torch.tensor([3, 1], dtype=torch.int64)
+    graph_probs = torch.randn(4, 1, requires_grad=True)
+    graph_output = module(graph_x, graph_splits, graph_probs, graph_splits, graph_probs)
+    graph_output.square().mean().backward()
+
+    ref_x = graph_x.detach().clone().requires_grad_(True)
+    ref_probs = graph_probs.detach().clone().requires_grad_(True)
+    ref_output = reference(ref_x, graph_splits, ref_probs, graph_splits, ref_probs)
+    ref_output.square().mean().backward()
+
+    torch.testing.assert_close(graph_output, ref_output)
+    torch.testing.assert_close(graph_x.grad, ref_x.grad)
+    torch.testing.assert_close(graph_probs.grad, ref_probs.grad)
+    torch.testing.assert_close(module.scale.grad, reference.scale.grad)
+    assert manager.stats() == {"captured": 1, "replayed": 1, "fallback": 0}
 
 
 def test_parameter_pointer_change_falls_back_eagerly(monkeypatch):

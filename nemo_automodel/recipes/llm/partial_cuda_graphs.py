@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import enum
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -194,6 +194,121 @@ class _TensorOnlyCallAdapter(nn.Module):
         return self.target(*args, **kwargs)
 
 
+class _ExplicitParameterCallAdapter(nn.Module):
+    """Capture module parameters as fresh leaf inputs instead of module inputs.
+
+    PyTorch associates each persistent ``AccumulateGrad`` node with the stream
+    on which the node was created. FSDP/DDP may keep nodes from an eager step
+    alive, so letting TE discover the real module parameters during a later
+    side-stream capture can make the legacy stream wait on a capturing stream.
+
+    This adapter presents no module parameters to TE. Instead, capture uses
+    detached aliases that share the real parameter storage but own fresh
+    ``AccumulateGrad`` nodes. Replay passes the real parameters as explicit
+    inputs to TE's graphed autograd function, which returns their captured
+    gradients to the normal eager/FSDP autograd graph.
+    """
+
+    def __init__(
+        self,
+        target: nn.Module,
+        graph_target: nn.Module,
+        captured_call: _CapturedCall,
+    ) -> None:
+        super().__init__()
+        # Register the graph-only target so TE can discover its BasicOperations
+        # and FP8 state. ``parameters()`` below intentionally hides its owners
+        # from make_graphed_callables.
+        self.graph_target = graph_target
+        self.__dict__["target"] = target
+        self.captured_call = captured_call
+
+        target_parameters = tuple(target.named_parameters())
+        graph_parameter_names = tuple(name for name, _parameter in graph_target.named_parameters())
+        target_parameter_names = tuple(name for name, _parameter in target_parameters)
+        if graph_parameter_names != target_parameter_names:
+            raise RuntimeError(
+                "Partial expert CUDA graph parameter clone does not match the live TE-ops target; "
+                f"clone={graph_parameter_names}, target={target_parameter_names}"
+            )
+        if not target_parameters:
+            raise RuntimeError("Partial expert CUDA graph explicit-parameter adapter found no parameters")
+
+        self.parameter_names = target_parameter_names
+        self.dynamic_input_count = len(captured_call.sample_tensors)
+        aliases = []
+        for _name, parameter in target_parameters:
+            if not isinstance(parameter, nn.Parameter):
+                raise RuntimeError(
+                    "Partial expert CUDA graph parameters must be plain nn.Parameter objects during capture; "
+                    f"got {type(parameter).__name__}"
+                )
+            alias = parameter.detach()
+            alias.requires_grad_(parameter.requires_grad)
+            if alias.data_ptr() != parameter.data_ptr():
+                raise RuntimeError("Partial expert CUDA graph parameter alias did not preserve storage")
+            aliases.append(alias)
+        self.capture_parameter_aliases = tuple(aliases)
+
+    def parameters(self, recurse: bool = True) -> Iterator[nn.Parameter]:
+        """Hide registered graph-target owners from TE parameter discovery."""
+        del recurse
+        return iter(())
+
+    def named_parameters(
+        self,
+        prefix: str = "",
+        recurse: bool = True,
+        remove_duplicate: bool = True,
+    ) -> Iterator[tuple[str, nn.Parameter]]:
+        """Hide registered graph-target owners from generic module utilities."""
+        del prefix, recurse, remove_duplicate
+        return iter(())
+
+    @property
+    def capture_inputs(self) -> tuple[torch.Tensor, ...]:
+        """Return dynamic samples followed by fresh storage-sharing leaves."""
+        return self.captured_call.sample_tensors + self.capture_parameter_aliases
+
+    def forward(self, *tensor_inputs: torch.Tensor) -> Any:
+        """Run the graph-only target with explicit parameter values."""
+        expected_inputs = self.dynamic_input_count + len(self.parameter_names)
+        if len(tensor_inputs) != expected_inputs:
+            raise RuntimeError(f"Expected {expected_inputs} explicit graph inputs, got {len(tensor_inputs)}")
+        dynamic_inputs = tensor_inputs[: self.dynamic_input_count]
+        parameter_inputs = tensor_inputs[self.dynamic_input_count :]
+        args, kwargs = self.captured_call.rebuild(dynamic_inputs)
+        parameter_mapping = dict(zip(self.parameter_names, parameter_inputs))
+        return torch.func.functional_call(
+            self.graph_target,
+            parameter_mapping,
+            args,
+            kwargs,
+            tie_weights=False,
+            strict=False,
+        )
+
+
+def _build_te_ops_explicit_parameter_adapter(
+    target: nn.Module,
+    captured_call: _CapturedCall,
+) -> _ExplicitParameterCallAdapter | None:
+    """Build a fresh TE Sequential fuser whose leaves are capture aliases."""
+    try:
+        from transformer_engine.pytorch import ops as te_ops
+    except ImportError:
+        return None
+    if not isinstance(target, te_ops.Sequential):
+        return None
+
+    # GroupedExpertsTeOps deliberately owns one lazily-created Sequential.
+    # Reusing its BasicOperations in a fresh Sequential gives capture a fresh
+    # OperationFuser. During the first functional call that fuser caches the
+    # explicit alias leaves instead of the real FSDP/optimizer Parameters.
+    graph_target = te_ops.Sequential(dict(target._modules))
+    return _ExplicitParameterCallAdapter(target, graph_target, captured_call)
+
+
 class _PartialGraphEntry:
     """One graphable module invocation and its replay safety state."""
 
@@ -217,7 +332,7 @@ class _PartialGraphEntry:
         self.expert_graph_storage = expert_graph_storage
         self.original_forward = target.forward
         self.captured_call: _CapturedCall | None = None
-        self.adapter: _TensorOnlyCallAdapter | None = None
+        self.adapter: nn.Module | None = None
         self.capture_count = 0
         self.replay_count = 0
         self.fallback_count = 0
@@ -234,6 +349,7 @@ class _PartialGraphEntry:
         self._logged_replay = False
         self._logged_fallback = False
         self._closed = False
+        self._explicit_parameter_names: tuple[str, ...] = ()
 
     def _canonicalize(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
         if self.canonicalizer is None:
@@ -367,6 +483,7 @@ class _PartialGraphEntry:
         self.adapter = None
         self.captured_call = None
         self._parameter_signature = ()
+        self._explicit_parameter_names = ()
         self._captured_training = None
         del adapter
 
@@ -376,13 +493,42 @@ class _PartialGraphEntry:
             self.expert_graph_storage = None
         self._closed = True
 
-    def build_adapter(self) -> _TensorOnlyCallAdapter:
+    def build_adapter(self) -> nn.Module:
         """Build the tensor-only capture adapter after an eager sample was observed."""
         if self.captured_call is None:
             raise RuntimeError(f"Partial CUDA graph target {self.name!r} was not called during iteration 0")
-        self.adapter = _TensorOnlyCallAdapter(self.target, self.captured_call)
+        explicit_adapter = None
+        if self.canonicalizer is _canonicalize_te_ops_experts:
+            explicit_adapter = _build_te_ops_explicit_parameter_adapter(self.target, self.captured_call)
+        if explicit_adapter is None:
+            self.adapter = _TensorOnlyCallAdapter(self.target, self.captured_call)
+            self._explicit_parameter_names = ()
+        else:
+            self.adapter = explicit_adapter
+            self._explicit_parameter_names = explicit_adapter.parameter_names
         self.adapter.train(self.target.training)
         return self.adapter
+
+    def capture_inputs(self) -> tuple[torch.Tensor, ...]:
+        """Return the sample surface passed to Transformer Engine."""
+        if self.adapter is None or self.captured_call is None:
+            raise RuntimeError(f"Partial CUDA graph adapter for {self.name!r} has not been built")
+        if isinstance(self.adapter, _ExplicitParameterCallAdapter):
+            return self.adapter.capture_inputs
+        return self.captured_call.sample_tensors
+
+    def replay_inputs(self, dynamic_inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+        """Append live parameters when they are explicit graph inputs."""
+        if not self._explicit_parameter_names:
+            return dynamic_inputs
+        named_parameters = tuple(self.target.named_parameters())
+        parameter_names = tuple(name for name, _parameter in named_parameters)
+        if parameter_names != self._explicit_parameter_names:
+            raise RuntimeError(
+                f"Partial CUDA graph parameter names changed for {self.name!r}: "
+                f"expected {self._explicit_parameter_names}, got {parameter_names}"
+            )
+        return dynamic_inputs + tuple(parameter for _name, parameter in named_parameters)
 
     @staticmethod
     def _parameter_state(parameter: nn.Parameter) -> tuple[Any, ...] | None:
@@ -402,7 +548,7 @@ class _PartialGraphEntry:
         current = tuple(self._parameter_state(parameter) for parameter in self.target.parameters())
         return all(state is not None for state in current) and current == self._parameter_signature
 
-    def install(self, graphed_adapter: _TensorOnlyCallAdapter) -> None:
+    def install(self, graphed_adapter: nn.Module) -> None:
         """Install validated graph replay around the original target forward."""
         if self._closed:
             raise RuntimeError(f"Partial CUDA graph entry {self.name!r} is closed")
@@ -445,7 +591,7 @@ class _PartialGraphEntry:
                     logger.info("Partial CUDA graph replay active for %s", self.name)
                     self._logged_replay = True
                 assert self.adapter is not None
-                output = self.adapter(*tensors)
+                output = self.adapter(*self.replay_inputs(tensors))
                 if bucket_token_count is not None:
                     if not isinstance(output, torch.Tensor):
                         raise RuntimeError("Partial expert CUDA graph bucket expects one tensor output")
@@ -960,7 +1106,10 @@ class PartialCudaGraphManager:
                 assert entry.captured_call is not None
                 kwargs = {
                     "num_warmup_iters": 3,
-                    "allow_unused_input": True,
+                    # Every explicit expert parameter must produce a gradient.
+                    # Fail capture instead of allowing TE to silently filter an
+                    # alias and omit the corresponding live-parameter gradient.
+                    "allow_unused_input": not isinstance(adapter, _ExplicitParameterCallAdapter),
                     "sample_kwargs": ({},),
                     "enabled": (entry.fp8_enabled,),
                 }
@@ -969,7 +1118,7 @@ class PartialCudaGraphManager:
                 try:
                     result = _get_make_graphed_callables()(
                         (adapter,),
-                        (entry.captured_call.sample_tensors,),
+                        (entry.capture_inputs(),),
                         **kwargs,
                     )
                 except Exception as error:
