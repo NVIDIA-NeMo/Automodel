@@ -39,8 +39,8 @@ eager twin on later steps.
 ``NVTE_CUTEDSL_FUSED_GROUPED_MLP=1``. It enables TE MXFP8 autocast with BF16 DPA
 disabled and requires the full CuTe grouped-MLP block-32 layout. The local
 dispatcher models the fused path's paged post-dispatch contract: non-empty
-in-bucket calls have 128 physical rows, overflow calls use the next multiple of
-128, real split values are retained, and padded output rows are removed before
+in-bucket calls have 256 physical rows, overflow calls use the next multiple of
+256, real split values are retained, and padded output rows are removed before
 unpermutation.
 """
 
@@ -84,8 +84,8 @@ NUM_EXPERTS = 4
 TOP_K = 2
 HIDDEN_SIZE = 64
 INTERMEDIATE_SIZE = 64
-TOKENS = 66
-EXPERT_BUCKET_TOKENS = 128
+TOKENS = 130
+EXPERT_BUCKET_TOKENS = 256
 CAPTURE_VALID_TOKENS = 11
 REPLAY_VALID_TOKENS = (7, 19, 31)
 OVERFLOW_VALID_TOKENS = TOKENS
@@ -828,8 +828,8 @@ def main() -> None:
         observed_splits.append(splits)
         assert graph.manager.expert_storage_stats()["retained_bytes"] == retained_bytes
 
-    # The real route count exceeds 128. BF16 reaches the manager with 132 rows;
-    # MXFP8 reaches it with the dispatcher's next physical page (256 rows). Both
+    # The real route count exceeds 256. BF16 reaches the manager with 260 rows;
+    # MXFP8 reaches it with the dispatcher's next physical page (512 rows). Both
     # must bypass the graph and remain numerically aligned with eager execution.
     overflow_step = len(REPLAY_VALID_TOKENS) + 1
     overflow_routes, overflow_splits = _run_parity_step(
