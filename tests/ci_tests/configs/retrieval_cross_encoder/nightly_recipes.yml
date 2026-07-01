@@ -14,5 +14,4 @@
 
 examples_dir: retrieval
 
-configs:
-  - cross_encoder/llama3_2_1b.yaml
+configs: []

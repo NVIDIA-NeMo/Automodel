@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Models deprecated for 26.10 removal — skipped in release (auto-discover) scope.
 exempt_models:
+  - gemma3
+  - gemma3n
+  - kimi
+  - mistral
+  - phi4
+  - qwen2_5
 
 exempt_configs:
-  gemma3_vl_4b_cord_v2_megatron_fsdp:
-    reason: "Known issue megatron fsdp support,PIC: @akoumparouli, 3680"
 
 known_issue:
-
