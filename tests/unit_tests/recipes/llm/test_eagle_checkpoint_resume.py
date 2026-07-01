@@ -462,6 +462,8 @@ def test_eagle1_final_checkpoint_saved_before_close(tmp_path):
     recipe.save_checkpoint_every_epoch = False
     recipe.train_dataloader = []
     recipe.runtime.global_step = 1
+    recipe.total_optim_steps = 1
+    recipe._make_progress_bar = lambda **kwargs: None
     events = []
 
     recipe._maybe_save_final_checkpoint = lambda completed_epochs: events.append(("final", completed_epochs)) or True

@@ -16,7 +16,6 @@ import getpass
 import json
 import logging
 import os
-import re
 import shutil
 import socket
 from datetime import datetime
@@ -43,6 +42,15 @@ except ImportError:
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import save_config
+from nemo_automodel.components.checkpoint.utils import (
+    _find_latest_checkpoint,
+    _find_pointer_protected_checkpoints,
+    _format_missing_checkpoint_dir_error,
+    _list_existing_checkpoints,
+    _read_checkpoint_metric,
+    _read_checkpoint_pointer,
+    _resolve_restore_from_to_ckpt_dir,
+)
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
@@ -135,168 +143,6 @@ def is_model(object):
     return isinstance(object, nn.Module) or (
         isinstance(object, list) and len(object) > 0 and all(isinstance(item, nn.Module) for item in object)
     )
-
-
-def _checkpoint_step_num(path: Path) -> int:
-    """Return the trailing checkpoint step number, or -1 when the name is not a checkpoint."""
-    match = re.search(r"step_(\d+)$", path.stem)
-    return int(match.group(1)) if match else -1
-
-
-def _list_existing_checkpoints(ckpt_root: Path) -> list[Path]:
-    """Return existing checkpoint directories under ckpt_root (matching '*step_*')."""
-    if not ckpt_root.exists():
-        return []
-    checkpoints = [path for path in ckpt_root.glob("*step_*") if path.is_dir() and not path.is_symlink()]
-    return sorted((path for path in checkpoints if _checkpoint_step_num(path) >= 0), key=_checkpoint_step_num)
-
-
-def _resolve_checkpoint_pointer_target(ckpt_root: Path, raw_target: str) -> Path | None:
-    """Resolve a checkpoint pointer target relative to ckpt_root."""
-    if not raw_target:
-        return None
-    target = Path(raw_target)
-    if not target.is_absolute():
-        target = ckpt_root / target
-    return Path(os.path.abspath(target))
-
-
-def _read_checkpoint_pointer(ckpt_root: str | Path, link_name: str) -> Path | None:
-    """Resolve a checkpoint pointer symlink or fallback text file."""
-    root = Path(ckpt_root)
-    link_path = root / link_name
-    raw_target = None
-    if os.path.islink(link_path):
-        try:
-            raw_target = os.readlink(link_path)
-        except OSError:
-            pass
-    elif os.path.isfile(f"{link_path}.txt"):
-        try:
-            with open(f"{link_path}.txt", "r") as f:
-                raw_target = f.read().strip()
-        except (OSError, UnicodeError):
-            pass
-
-    return _resolve_checkpoint_pointer_target(root, raw_target) if raw_target else None
-
-
-def _checkpoint_contains_target(checkpoint: Path, target: Path) -> bool:
-    """Return whether target points at or inside checkpoint."""
-    checkpoint_abs = Path(os.path.abspath(checkpoint))
-    target_abs = Path(os.path.abspath(target))
-    return target_abs == checkpoint_abs or checkpoint_abs in target_abs.parents
-
-
-def _read_checkpoint_metric(checkpoint: Path, metric_key: str | None) -> float | None:
-    """Read a validation metric from checkpoint loss metadata."""
-    try:
-        with open(checkpoint / "losses.json", "r") as f:
-            losses = json.load(f)
-    except (OSError, TypeError, json.JSONDecodeError):
-        return None
-
-    candidate_keys = []
-    if metric_key is not None:
-        candidate_keys.append(metric_key)
-    candidate_keys.extend(["val_loss", "default"])
-
-    for key in candidate_keys:
-        if key not in losses:
-            continue
-        try:
-            return float(losses[key])
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path]) -> set[Path]:
-    """Return checkpoints targeted by top-level symlinks or symlink fallback text files."""
-    protected = set()
-    if not ckpt_root.exists():
-        return protected
-
-    try:
-        entries = list(ckpt_root.iterdir())
-    except OSError:
-        logger.warning("Failed to scan checkpoint pointers in %s", ckpt_root, exc_info=True)
-        return protected
-
-    for entry in entries:
-        raw_target = None
-        if os.path.islink(entry):
-            try:
-                raw_target = os.readlink(entry)
-            except OSError:
-                continue
-        elif entry.is_file() and entry.suffix == ".txt":
-            try:
-                raw_target = entry.read_text().strip()
-            except (OSError, UnicodeError):
-                continue
-
-        target = _resolve_checkpoint_pointer_target(ckpt_root, raw_target) if raw_target else None
-        if target is None:
-            continue
-        for checkpoint in checkpoints:
-            if _checkpoint_contains_target(checkpoint, target):
-                protected.add(checkpoint)
-                break
-    return protected
-
-
-def _resolve_restore_from_to_ckpt_dir(checkpoint_dir: str, restore_from: str) -> str | None:
-    """
-    Resolve restore_from to a checkpoint directory.
-
-    Returns:
-        - str: resolved checkpoint directory
-        - None: if restore_from='LATEST' but no checkpoint found (caller should start fresh)
-    """
-    # Handle checkpoint-root pointers such as LATEST and LOWEST_VAL.
-    if os.path.sep not in restore_from and not os.path.isabs(restore_from):
-        pointed_checkpoint = _read_checkpoint_pointer(checkpoint_dir, restore_from)
-        if pointed_checkpoint is not None and pointed_checkpoint.is_dir():
-            return os.fspath(pointed_checkpoint)
-    if restore_from.upper() == "LATEST":
-        return _find_latest_checkpoint(checkpoint_dir)
-
-    # If restore_from is just a directory name (no path separator), treat it as
-    # relative to checkpoint_dir. Otherwise use as-is (absolute or relative path).
-    if os.path.sep not in restore_from and not os.path.isabs(restore_from):
-        return os.path.join(checkpoint_dir, restore_from)
-    return restore_from
-
-
-def _format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str, resolved_ckpt_dir: str) -> str:
-    """Format a helpful error message for a missing checkpoint directory."""
-    error_msg = [
-        f"\n{'=' * 80}",
-        "ERROR: Checkpoint directory does not exist",
-        f"{'=' * 80}",
-        f"Specified: checkpoint.restore_from: '{restore_from}'",
-        f"Resolved to: {resolved_ckpt_dir}",
-        "",
-        "Please check:",
-        "  1. The checkpoint directory exists",
-        f"  2. The path is correct (restore_from: '{restore_from}')",
-        f"  3. Available checkpoints in {checkpoint_dir}:",
-    ]
-
-    ckpt_root = Path(checkpoint_dir)
-    available_ckpts = _list_existing_checkpoints(ckpt_root)
-    if available_ckpts:
-        error_msg += [f"       {', '.join([p.name for p in available_ckpts[:5]])}"]
-        if len(available_ckpts) > 5:
-            error_msg += [f"       ... and {len(available_ckpts) - 5} more"]
-    else:
-        error_msg += (
-            ["       (no checkpoints found)"] if ckpt_root.exists() else ["       (checkpoint_dir does not exist)"]
-        )
-
-    error_msg += [f"{'=' * 80}"]
-    return "\n".join(error_msg)
 
 
 def _is_rank_0() -> bool:
@@ -714,37 +560,6 @@ class BaseRecipe:
                 f"Updated LOWEST_VAL checkpoint symlink to {os.path.basename(target_dir)} (val_loss={val_loss:.4f})"
             )
 
-    def _finalize_pending_checkpoint(self) -> None:
-        """Wait the final async checkpoint write and flush its deferred symlinks.
-
-        The async ``save_checkpoint`` path defers the ``latest`` / ``best`` symlink
-        update to the *next* save's preamble. After the final checkpoint there is
-        no next save, so the training loop must call this once at the end --
-        otherwise the last async write may be left unfinished and ``latest`` /
-        ``best`` still point at the previous checkpoint. A no-op when checkpointing
-        is disabled or no async save is pending.
-        """
-        checkpointer = getattr(self, "checkpointer", None)
-        if checkpointer is None or not getattr(checkpointer.config, "enabled", False):
-            return
-        checkpointer.async_wait()
-        is_dist_initialized = torch.distributed.is_initialized()
-        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
-        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
-        if prev_pending is not None:
-            if is_rank_0:
-                self._update_latest_symlink(prev_pending)
-            setattr(self, "_last_pending_checkpoint_dir", None)
-            if is_dist_initialized:
-                _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
-        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
-        if prev_best_pending is not None:
-            if is_rank_0 and prev_best_pending.get("val") is not None:
-                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
-            setattr(self, "_last_pending_best_checkpoint_info", None)
-            if is_dist_initialized:
-                _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
-
     def _validate_checkpoint_dir_exists(self, ckpt_dir: str, restore_from: str, is_rank_0: bool) -> None:
         """Validate resolved checkpoint directory exists; raise FileNotFoundError with a helpful message."""
         if os.path.exists(ckpt_dir):
@@ -1001,25 +816,38 @@ class BaseRecipe:
             "Validation every steps": step_scheduler.val_every_steps,
             "Max train steps": step_scheduler.max_steps,
         }
-        checkpoint_config = getattr(getattr(self, "checkpointer", None), "config", None)
-        if checkpoint_config is not None:
-            if not getattr(checkpoint_config, "enabled", True):
-                attrs["Checkpoint retention"] = "inactive because checkpointing is disabled"
-            elif hasattr(checkpoint_config, "max_recent_checkpoints"):
-                max_recent_checkpoints = checkpoint_config.max_recent_checkpoints
-                if max_recent_checkpoints is None:
-                    attrs["Checkpoint retention"] = (
-                        "disabled; keeping all checkpoints (checkpoint.max_recent_checkpoints=None)"
-                    )
-                else:
-                    attrs["Checkpoint retention"] = (
-                        f"keeping the most recent {max_recent_checkpoints} checkpoint(s), "
-                        "plus pointer-protected checkpoints "
-                        f"(checkpoint.max_recent_checkpoints={max_recent_checkpoints})"
-                    )
+        retention_policy = self._checkpoint_retention_policy_message()
+        if retention_policy is not None:
+            attrs["Checkpoint retention"] = retention_policy
         logging.info("Step scheduler:")
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")
+
+    def _checkpoint_retention_policy_message(self, checkpoint_config=None) -> str | None:
+        """Return the user-facing checkpoint retention policy message, if available."""
+        if checkpoint_config is None:
+            checkpoint_config = getattr(getattr(self, "checkpointer", None), "config", None)
+        if checkpoint_config is None:
+            return None
+        if not getattr(checkpoint_config, "enabled", True):
+            return "inactive because checkpointing is disabled"
+        if not hasattr(checkpoint_config, "max_recent_checkpoints"):
+            return None
+
+        max_recent_checkpoints = checkpoint_config.max_recent_checkpoints
+        if max_recent_checkpoints is None:
+            return "disabled; keeping all checkpoints (checkpoint.max_recent_checkpoints=None)"
+        return (
+            f"keeping the most recent {max_recent_checkpoints} checkpoint(s), "
+            "plus pointer-protected checkpoints "
+            f"(checkpoint.max_recent_checkpoints={max_recent_checkpoints})"
+        )
+
+    def _log_checkpoint_retention_policy(self, checkpoint_config=None) -> None:
+        """Log the checkpoint retention policy without requiring a StepScheduler."""
+        retention_policy = self._checkpoint_retention_policy_message(checkpoint_config)
+        if retention_policy is not None:
+            logging.info("Checkpoint retention: %s", retention_policy)
 
     def _setup_garbage_collection(self, step_scheduler: StepScheduler | None = None) -> None:
         """Initialize manual garbage collection based on step scheduler config."""
@@ -1158,54 +986,6 @@ class BaseRecipe:
                 break
         pbar.set_postfix(**postfix)
         pbar.update(1)
-
-
-def _find_latest_checkpoint(checkpoint_dir):
-    """
-    Resolve the most recent checkpoint directory.
-
-    Preference order:
-      1) Valid LATEST symlink or txt file under checkpoint_dir
-      2) Highest step directory under checkpoint_dir matching *step_*
-
-    Returns:
-        Path (or str) of the latest checkpoint directory, or None.
-    """
-    root = Path(checkpoint_dir)
-    if not root.exists():
-        return
-
-    # Try LATEST symlink or txt pointer first
-    latest_link = os.path.join(os.fspath(root), "LATEST")
-    resolved = None
-    if os.path.islink(latest_link):
-        try:
-            resolved = os.readlink(latest_link)
-        except OSError:
-            pass
-    elif os.path.isfile(latest_link + ".txt"):
-        try:
-            with open(latest_link + ".txt", "r") as f:
-                resolved = f.read().strip()
-        except OSError:
-            pass
-
-    if resolved:
-        if not os.path.isabs(resolved):
-            resolved = os.path.abspath(os.path.join(os.fspath(root), resolved))
-        if os.path.isdir(resolved):
-            return resolved
-
-    # Fallback to scanning
-    checkpoint_files = _list_existing_checkpoints(root)
-    if not checkpoint_files:
-        return
-
-    latest = max(checkpoint_files, key=_checkpoint_step_num)
-    if _checkpoint_step_num(latest) == -1:
-        return
-
-    return latest
 
 
 def _extract_model_signature(cfg: dict) -> dict:

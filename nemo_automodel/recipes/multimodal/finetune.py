@@ -968,6 +968,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
         if self.checkpointer is not None:
+            self._finalize_pending_checkpoint()
             self.checkpointer.close()
 
     # ------------------------------------------------------------------

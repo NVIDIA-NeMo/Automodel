@@ -35,6 +35,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     save_config,
 )
+from nemo_automodel.components.checkpoint.utils import _find_latest_checkpoint, _resolve_restore_from_to_ckpt_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -47,12 +48,7 @@ from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTarget
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
-from nemo_automodel.recipes.base_recipe import (
-    BaseRecipe,
-    _find_latest_checkpoint,
-    _is_checkpoint_model_config_compatible,
-    _resolve_restore_from_to_ckpt_dir,
-)
+from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_compile,
     apply_draft_fp8,
@@ -406,6 +402,7 @@ class TrainEagle1Recipe(BaseRecipe):
             pp_rank=0,
             moe_mesh=None,
         )
+        self._log_checkpoint_retention_policy(self.checkpoint_config)
 
     def _module(self):
         return (
