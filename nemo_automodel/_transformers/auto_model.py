@@ -448,11 +448,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 )
                 inject_te_attention = False
 
-        # Keep the explicit kwarg forwarded to Transformers aligned with the
-        # resolved implementation. The NeMo ``te`` extension is initialized as
-        # SDPA and injected after model construction; leaving ``te`` in kwargs
-        # makes Transformers reject it before the injection path runs.
-        kwargs["attn_implementation"] = attn_implementation
         device = torch.cuda.current_device()
 
         # When PEFT is requested, force dequantization of FP8-quantized models.

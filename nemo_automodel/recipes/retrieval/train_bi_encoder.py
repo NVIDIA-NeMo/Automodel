@@ -783,9 +783,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 # The step scheduler yields a list of batches for gradient accumulation
                 for batches in self.step_scheduler:
                     train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    log_every_steps = getattr(self, "log_every_steps", 1)
                     should_log_step = (
-                        self.log_every_steps == 1
-                        or self.step_scheduler.step % self.log_every_steps == 0
+                        log_every_steps == 1
+                        or self.step_scheduler.step % log_every_steps == 0
                         or self.step_scheduler.is_last_step
                     )
                     if should_log_step:
@@ -837,6 +838,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
 
         with train_ctx, sync_ctx:
+            cfg = getattr(self, "cfg", {})
             if is_train:
                 if query is not None:
                     query["run_dummy_vision"] = False
@@ -847,13 +849,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
             n_passages = self.train_n_passages
             use_multi_vector_scoring = _uses_multi_vector_scoring(model)
             use_dist_neg = is_train and getattr(attr_model, "do_distributed_inbatch_negative", False)
-            replicate_distributed_loss = use_dist_neg and _as_bool(self.cfg.get("replicate_distributed_loss", False))
+            replicate_distributed_loss = use_dist_neg and _as_bool(cfg.get("replicate_distributed_loss", False))
             gather_stream_priority = (
-                -1 if _get_bi_encoder_optimization_bool(self.cfg, "overlap_passage_gather_high_priority") else 0
+                -1 if _get_bi_encoder_optimization_bool(cfg, "overlap_passage_gather_high_priority") else 0
             )
-            unified_forward = _as_bool(self.cfg.get("unified_query_passage_forward", False))
+            unified_forward = _as_bool(cfg.get("unified_query_passage_forward", False))
             overlap_passage_gather = (
-                _get_bi_encoder_optimization_bool(self.cfg, "overlap_passage_gather_with_query_forward")
+                _get_bi_encoder_optimization_bool(cfg, "overlap_passage_gather_with_query_forward")
                 and not unified_forward
             )
             bypass_second_ddp_forward = (
@@ -873,7 +875,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             if unified_forward:
                 bidirectional_mask_model_config = None
                 bidirectional_mask_dtype = None
-                if _get_bi_encoder_optimization_bool(self.cfg, "precompute_bidirectional_mask"):
+                if _get_bi_encoder_optimization_bool(cfg, "precompute_bidirectional_mask"):
                     bidirectional_mask_model_config = _get_bidirectional_mask_model_config(model)
                     bidirectional_mask_dtype = _get_first_parameter_dtype(model)
                 combined, local_q_rows, local_p_rows, passage_attention_mask_for_scores = (
@@ -1067,8 +1069,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
     def _run_train_optim_step(self, batches, max_grad_norm=None):
         """Run one optimization step with gradient accumulation."""
         loss_buffer = []
+        cfg = getattr(self, "cfg", {})
         use_batch_prefetch = (
-            _get_bi_encoder_optimization_bool(self.cfg, "overlap_batch_to_device_with_compute")
+            _get_bi_encoder_optimization_bool(cfg, "overlap_batch_to_device_with_compute")
             and torch.cuda.is_available()
             and self.dist_env.device.type == "cuda"
         )

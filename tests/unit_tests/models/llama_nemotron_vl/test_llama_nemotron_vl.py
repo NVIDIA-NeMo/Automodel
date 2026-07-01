@@ -63,6 +63,11 @@ class FakeTokenizer:
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
         }
 
+    def convert_tokens_to_ids(self, token):
+        if token == "<IMG_CONTEXT>":
+            return IMG_CONTEXT_TOKEN_ID
+        return 0
+
 
 class FakeVisionModel(nn.Module):
     def __init__(self):
@@ -92,16 +97,21 @@ class FakeLanguageModel(nn.Module):
         inputs_embeds,
         attention_mask=None,
         position_ids=None,
+        bidirectional_mask=None,
+        bidirectional_mask_precomputed=False,
         past_key_values=None,
         use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
+        **kwargs,
     ):
         self.forward_calls.append(
             {
                 "inputs_embeds": inputs_embeds.detach().clone(),
                 "attention_mask": attention_mask.detach().clone() if attention_mask is not None else None,
                 "position_ids": position_ids,
+                "bidirectional_mask": bidirectional_mask,
+                "bidirectional_mask_precomputed": bidirectional_mask_precomputed,
                 "past_key_values": past_key_values,
                 "use_cache": use_cache,
                 "output_attentions": output_attentions,
@@ -241,9 +251,10 @@ def test_processor_process_documents_supports_pil_images_and_text(processor):
 
     output = processor.process_documents({"images": images, "texts": ["text 1", "text 2"]})
 
-    assert set(output) == {"input_ids", "attention_mask", "pixel_values"}
+    assert set(output) == {"input_ids", "attention_mask", "pixel_values", "image_token_indices"}
     assert output["pixel_values"].shape == (4, 3, 4, 4)
     assert output["pixel_values"].dtype == torch.bfloat16
+    assert output["image_token_indices"].numel() == 8
 
     call = processor.tokenizer.calls[-1]
     assert call["texts"][0].startswith("passage: <img>")
