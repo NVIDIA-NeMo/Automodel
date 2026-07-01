@@ -1,5 +1,5 @@
 ---
-title: "Checkpointing"
+title: "Checkpointing in NeMo Automodel"
 description: ""
 position: 1
 ---
@@ -97,7 +97,7 @@ automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 ```
 
 <Note>
-In the above command, we used the [`llama3_2_1b_squad.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/492add84a2b9d495946fe211c28973cd00051f3e/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) config as a running example; adjust as necessary to your case.
+In the above command we used the [`llama3_2_1b_squad.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/492add84a2b9d495946fe211c28973cd00051f3e/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) config as a running example, adjust as necessary to your case.
 More config examples can be found in our [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
 
 </Note>
@@ -143,7 +143,7 @@ bash checkpoints/epoch_0_step_20/model/consolidate.sh
 
 Run the helper from the AutoModel repo root so it can find `tools/offline_hf_consolidation.py`, or set `CONSOLIDATION_TOOL=/path/to/tools/offline_hf_consolidation.py`.
 
-The helper defaults to one CPU worker process with five writer threads, so it is safe on small machines. For large checkpoints, run it on a CPU compute node and increase parallelism:
+The helper defaults to one CPU worker process with five writer threads so it is safe on small machines. For large checkpoints, run it on a CPU compute node and increase parallelism:
 
 ```bash
 NPROC_PER_NODE=16 NUM_THREADS=5 bash checkpoints/epoch_0_step_20/model/consolidate.sh
@@ -165,7 +165,7 @@ CAST_DTYPE=bf16 bash checkpoints/epoch_0_step_20/model/consolidate.sh
 
 Use `CAST_DTYPE` when the consolidated Hugging Face bundle should override the default per-tensor dtype behavior, such as `CAST_DTYPE=bf16` to export ordinary floating-point tensors as BF16 for serving. Supported values include `bf16`, `fp16`, `fp32`, and `fp64`. Only ordinary floating-point tensors with a different source dtype are cast; tensors already in the cast dtype, FP8 tensors, and non-floating tensors are left unchanged.
 
-The helper writes `checkpoints/epoch_0_step_20/model/consolidated/`. You can load and run that consolidated checkpoint using the Hugging Face Transformers API directly:
+The helper writes `checkpoints/epoch_0_step_20/model/consolidated/`. We can load and run that consolidated checkpoint using the Hugging Face Transformers API directly:
 ```python
 import torch
 from transformers import pipeline
@@ -186,7 +186,7 @@ print(pipe("The key to life is"))
 Although this example uses the Hugging Face Transformers API, the `consolidated/` checkpoint is compatible with any Hugging Face-compatible tool, such as vLLM, SGLang, and others.
 
 ## PEFT
-When training with Parameter-Efficient Fine-Tuning (PEFT) techniques, only a small subset of model weights are updated; the rest of the model remains frozen. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
+When training with Parameter-Efficient Fine-Tuning (PEFT) techniques, only a small subset of model weights are updated — the rest of the model remains frozen. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
 
 PEFT checkpoints save adapter files directly under `model/` and do not generate or need `model/consolidate.sh`.
 
@@ -256,7 +256,7 @@ print(tokenizer.batch_decode(outputs.detach().cpu().numpy(), skip_special_tokens
 ## PyTorch DCP
 NeMo AutoModel also offers native PyTorch DCP checkpointing support (`.distcp` extension). Similar to Safetensors, it also provides the same features of load-time resharding and parallel saving.
 
-As a simple example, run the following command to launch the training recipe on two GPUs.
+As a simple example, we can run the following command to launch the training recipe on two GPUs.
 ```bash
 automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --step_scheduler.ckpt_every_steps 20 \
@@ -309,7 +309,7 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/nemo-automodel:26.06.00
 ```
 
-You can also set a custom checkpoint directory using the YAML config or CLI override:
+You can also set a custom checkpoint directory through the YAML config or CLI override:
 ```yaml
 checkpoint:
   checkpoint_dir: /mnt/shared/my_checkpoints
@@ -338,7 +338,7 @@ NeMo AutoModel can write checkpoints asynchronously to reduce training stalls ca
   ```
 - **Enable** (CLI): add `--checkpoint.is_async True` to your run command.
 - **Requirements**: PyTorch ≥ 2.9.0. If an older version is detected, async mode is automatically disabled.
-- **Behavior**: At most one checkpoint uploads at a time; the next save waits for the previous upload to finish. The `LATEST` symlink is updated after the async save completes (might be deferred until the next save call). During PEFT, adapter model files are written synchronously on rank 0; optimizer states can still use async.
+- **Behavior**: At most one checkpoint uploads at a time; the next save waits for the previous upload to finish. The `LATEST` symlink is updated after the async save completes (may be deferred until the next save call). During PEFT, adapter model files are written synchronously on rank 0; optimizer states can still use async.
 
 ## Advanced Usage: Save Additional States
 You can also save additional states in NeMo AutoModel. By default, we also automatically checkpoint the `dataloader`, `rng`, and `step_scheduler` states which are necessary to resume training accurately. In full, a Safetensors consolidated checkpoint will look like this:
