@@ -87,33 +87,49 @@ class OptimizerParamScheduler:
         self.init_lr = init_lr
         self.max_lr = float(max_lr)
         self.min_lr = min_lr
-        assert self.min_lr >= 0.0
-        assert self.max_lr >= self.min_lr
-        assert self.init_lr <= self.max_lr
+        if self.min_lr < 0.0:
+            raise ValueError(f"min_lr must be >= 0.0, got {self.min_lr}")
+        if self.max_lr < self.min_lr:
+            raise ValueError(f"max_lr must be >= min_lr, got max_lr={self.max_lr}, min_lr={self.min_lr}")
+        if self.init_lr > self.max_lr:
+            raise ValueError(f"init_lr must be <= max_lr, got init_lr={self.init_lr}, max_lr={self.max_lr}")
 
         self.lr_warmup_steps = lr_warmup_steps
         self.num_steps = 0
         self.lr_decay_steps = lr_decay_steps
         self.wsd_decay_steps = wsd_decay_steps
         self.lr_wsd_decay_style = lr_wsd_decay_style
-        assert self.lr_decay_steps > 0
-        assert self.lr_warmup_steps < self.lr_decay_steps
+        if self.lr_decay_steps <= 0:
+            raise ValueError(f"lr_decay_steps must be > 0, got {self.lr_decay_steps}")
+        if self.lr_warmup_steps >= self.lr_decay_steps:
+            raise ValueError(
+                f"lr_warmup_steps must be < lr_decay_steps, got warmup={self.lr_warmup_steps}, decay={self.lr_decay_steps}"
+            )
 
         self.lr_decay_style = lr_decay_style
         if self.lr_decay_style == "WSD":
-            assert self.wsd_decay_steps is not None
+            if self.wsd_decay_steps is None:
+                raise ValueError("wsd_decay_steps must be set when lr_decay_style='WSD'")
 
         self.start_wd = start_wd
         self.end_wd = end_wd
-        assert self.start_wd >= 0.0
-        assert self.end_wd >= self.start_wd
+        if self.start_wd < 0.0:
+            raise ValueError(f"start_wd must be >= 0.0, got {self.start_wd}")
+        if self.end_wd < self.start_wd:
+            raise ValueError(f"end_wd must be >= start_wd, got start_wd={self.start_wd}, end_wd={self.end_wd}")
         self.wd_incr_steps = wd_incr_steps
         self.wd_incr_style = wd_incr_style
+        if self.wd_incr_style == "constant" and self.start_wd != self.end_wd:
+            raise ValueError(
+                "start_wd must equal end_wd when wd_incr_style='constant', "
+                f"got start_wd={self.start_wd}, end_wd={self.end_wd}"
+            )
 
         self.override_opt_param_scheduler = override_opt_param_scheduler
         self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
         if self.override_opt_param_scheduler:
-            assert not self.use_checkpoint_opt_param_scheduler, "both override and use-checkpoint are set."
+            if self.use_checkpoint_opt_param_scheduler:
+                raise ValueError("both override and use-checkpoint are set.")
 
         # Set the learning rate
         self.step(0)
@@ -292,10 +308,11 @@ class OptimizerParamScheduler:
             return cls_value
 
         if not self.use_checkpoint_opt_param_scheduler:
-            assert cls_value == sd_value, (
-                f"OptimizerParamScheduler: class input value {cls_value} and checkpoint"
-                f"value {sd_value} for {name} do not match"
-            )
+            if cls_value != sd_value:
+                raise ValueError(
+                    f"OptimizerParamScheduler: class input value {cls_value} and checkpoint "
+                    f"value {sd_value} for {name} do not match"
+                )
 
         logger.info("using checkpoint value {} for {}".format(sd_value, name))
         return sd_value

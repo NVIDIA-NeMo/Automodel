@@ -131,9 +131,8 @@ class CheckpointingConfig:
 
         # Convert a raw string such as "safetensors" into the right Enum.
         formats = [v.value for v in SerializationFormat]
-        assert self.model_save_format in formats, (
-            f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}"
-        )
+        if self.model_save_format not in formats:
+            raise ValueError(f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}")
         self.model_save_format = SerializationFormat[self.model_save_format.upper()]
 
         # Normalize legacy bools and string aliases to a consolidated export mode.
