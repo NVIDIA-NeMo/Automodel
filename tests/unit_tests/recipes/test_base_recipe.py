@@ -692,8 +692,8 @@ def test_load_checkpoint_multiple_checkpoints_with_latest(tmp_path):
     assert torch.allclose(recipe_inst.model.weight, weight_at_step_200)
 
 
-def test_checkpoint_retention_default_keeps_last_two_checkpoints(tmp_path):
-    """Without checkpoint.max_recent_checkpoints, checkpoint retention defaults to a bounded safety window."""
+def test_checkpoint_retention_default_keeps_all_checkpoints(tmp_path):
+    """Without checkpoint.max_recent_checkpoints, checkpoint retention preserves existing keep-all behavior."""
     recipe_inst = _ToyRecipe(tmp_path)
 
     for step in [50, 100, 75, 200]:
@@ -703,11 +703,16 @@ def test_checkpoint_retention_default_keeps_last_two_checkpoints(tmp_path):
         recipe_inst.optimizer.step()
         recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
 
-    assert recipe_inst.checkpointer.config.max_recent_checkpoints == 2
-    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_200"]
+    assert recipe_inst.checkpointer.config.max_recent_checkpoints is None
+    assert _checkpoint_dir_names(tmp_path) == [
+        "epoch_0_step_50",
+        "epoch_0_step_75",
+        "epoch_0_step_100",
+        "epoch_0_step_200",
+    ]
 
 
-def test_checkpoint_retention_can_be_disabled(tmp_path):
+def test_checkpoint_retention_explicit_none_keeps_all_checkpoints(tmp_path):
     """checkpoint.max_recent_checkpoints=None keeps all checkpoints for users who need the full history."""
     recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=None)
 

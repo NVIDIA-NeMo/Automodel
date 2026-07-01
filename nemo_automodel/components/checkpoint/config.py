@@ -112,8 +112,8 @@ class CheckpointingConfig:
     # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
     best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
     # Retain this many recent checkpoint directories. Checkpoints targeted by checkpoint-root pointers
-    # such as LATEST and LOWEST_VAL are preserved in addition. Set None to disable pruning.
-    max_recent_checkpoints: int | None = 2
+    # such as LATEST and LOWEST_VAL are preserved in addition. None keeps all checkpoints.
+    max_recent_checkpoints: int | None = None
 
     def __post_init__(self):
         """Resolve the cache dir, enforce PEFT constraints, and coerce the save format/mode."""

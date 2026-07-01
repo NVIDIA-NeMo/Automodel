@@ -55,7 +55,7 @@ These symbolic links eliminate the need to manually track checkpoint names or se
 
 ## Checkpoint Retention
 
-By default, NeMo AutoModel retains a bounded recent checkpoint window to reduce accidental disk growth from frequent checkpoint saves:
+By default, NeMo AutoModel keeps all intermediate checkpoints. To reduce disk growth from frequent checkpoint saves, set a bounded recent checkpoint window:
 
 ```yaml
 checkpoint:
@@ -66,7 +66,7 @@ checkpoint:
 
 For example, if `max_recent_checkpoints: 2` and `LOWEST_VAL` points to an older checkpoint outside the most recent two saves, NeMo AutoModel keeps the two most recent checkpoints plus the `LOWEST_VAL` target.
 
-Set the value to `null` to disable pruning and keep all intermediate checkpoints:
+Leave the value unset, or set it to `null`, to keep all intermediate checkpoints:
 
 ```yaml
 checkpoint:

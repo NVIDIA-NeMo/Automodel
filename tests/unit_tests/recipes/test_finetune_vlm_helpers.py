@@ -1277,7 +1277,7 @@ class TestBuildCheckpointConfig:
         assert config.model_cache_dir == "/tmp/cache"
         assert config.save_consolidated.value == "final"
         assert config.is_peft is False
-        assert config.max_recent_checkpoints == 2
+        assert config.max_recent_checkpoints is None
 
     def test_build_checkpoint_config_with_custom_config(self):
         """Test checkpoint config with custom settings."""
