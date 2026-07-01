@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -80,7 +81,18 @@ class _WithKwargs(nn.Module):
         return input_ids
 
 
+@dataclass(frozen=True)
+class _THDCapabilities:
+    supports_tp: bool = False
+    supports_cp: bool = True
+    supports_pp: bool = True
+    supports_ep: bool = True
+    supports_thd: bool = True
+
+
 class _DeepseekV4Like(nn.Module):
+    ModelCapabilities = _THDCapabilities
+
     def __init__(self, backend_attn="tilelang"):
         super().__init__()
         self.config = SimpleNamespace(model_type="deepseek_v4")
@@ -91,6 +103,8 @@ class _DeepseekV4Like(nn.Module):
 
 
 class _GlmMoeDsaLike(nn.Module):
+    ModelCapabilities = _THDCapabilities
+
     def __init__(self, backend_attn="tilelang"):
         super().__init__()
         self.config = SimpleNamespace(model_type="glm_moe_dsa")

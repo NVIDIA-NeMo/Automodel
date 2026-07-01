@@ -72,6 +72,12 @@ def _supports_seq_lens(model: "nn.Module") -> bool:
         return False
 
 
+def _supports_thd(model: "nn.Module") -> bool:
+    """True when the model capability declaration opts into native THD inputs."""
+    capabilities = getattr(model, "ModelCapabilities", None)
+    return bool(getattr(capabilities, "supports_thd", False))
+
+
 def _has_backend(model: "nn.Module") -> bool:
     """True for custom models that carry a ``BackendConfig``."""
     backend = getattr(model, "backend", None)
@@ -279,8 +285,7 @@ class ModelSupports:
             getattr(model, "_supports_sdpa", False) is True
             or _uses_te_attention(model)
             or _uses_magi_attention(model)
-            or (_is_deepseek_v4(model) and backend_attn == "tilelang")
-            or (_is_glm_moe_dsa(model) and backend_attn == "tilelang")
+            or (_supports_thd(model) and backend_attn == "tilelang")
         )
         return _supports_seq_lens(model) and sp_attn_backend
 
@@ -326,14 +331,14 @@ class ModelSupports:
 
         MagiAttention dispatches the packed sequence across the CP group with its
         own load-balancing solver and a per-document varlen mask, so it supports
-        CP + packing (see ``magi_attn_utils.magi_prepare_packed_cp``). DSV4 owns
-        its packed CP path in the TileLang attention implementation."""
+        CP + packing (see ``magi_attn_utils.magi_prepare_packed_cp``). Models
+        with native THD support own their packed CP path in TileLang attention."""
         model = self._model
         if not self.supports_sequence_packing:
             return False
         if self.cp_size <= 1:
             return True
-        if _is_deepseek_v4(model) or _is_glm_moe_dsa(model):
+        if _supports_thd(model):
             backend_attn = getattr(getattr(model, "backend", None), "attn", None)
             return backend_attn == "tilelang"
         return _uses_te_attention(model) or _uses_magi_attention(model)
