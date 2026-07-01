@@ -85,7 +85,7 @@ optimizer:
   min_lr_ratio: 1.0
 
 wandb:
-  enable: true
+  enable: false
   project: minimax-m3-dspark
   group: perfectblend-direct-full
   name: minimax-m3-dspark-perfectblend-full
