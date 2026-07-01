@@ -20,14 +20,17 @@ Covers the recipe-level glue added for the DeepSeek-V4-Flash target:
   fast, and an explicit template overrides whatever the tokenizer carries.
 - ``_resolve_reduced_target_layers``: the ``target_num_hidden_layers``
   diagnostic override is range-checked.
-- ``_resolve_dspark_optimizer_spec``: the ``optimizer:`` config is normalized
-  into a ``build_optimizer`` spec, honoring an explicit ``_target_`` (e.g. TE
-  FusedAdam with ``master_weights``/``exp_avg_dtype``/...) instead of always
-  hardcoding plain ``torch.optim.AdamW``.
+- ``_resolve_dspark_optimizer_spec`` / ``_build_dspark_optimizer``: the
+  ``optimizer:`` config is normalized into a ``build_optimizer`` spec and built,
+  honoring an explicit ``_target_`` (e.g. TE FusedAdam with
+  ``master_weights``/``exp_avg_dtype``/...) instead of always hardcoding plain
+  ``torch.optim.AdamW``.
 - ``_resolve_warmup_steps``: the ratio-derived warmup length is floored for
   short / small-dataset runs, unless the caller opts out with ``warmup_ratio<=0``.
-- ``_resolve_wandb_kwargs``: the examples' documentation-only ``enable`` flag is
-  stripped before forwarding to ``wandb.init`` and gates whether to log at all.
+- ``_resolve_wandb_kwargs`` / ``_init_dspark_wandb``: the examples'
+  documentation-only ``enable`` flag is stripped before forwarding to
+  ``wandb.init`` and gates whether to log at all; ``_init_dspark_wandb`` also
+  gates on rank (``is_main``) and block presence.
 
 (target_layer_ids range/-1/ordering validation is covered by the shared
 ``common.validate_target_layer_ids``, which HFDSparkTargetModel already calls.)
@@ -38,9 +41,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from nemo_automodel.recipes.llm.train_dspark import (
     _apply_target_chat_template,
+    _build_dspark_optimizer,
+    _init_dspark_wandb,
     _resolve_dspark_optimizer_spec,
     _resolve_reduced_target_layers,
     _resolve_wandb_kwargs,
@@ -177,6 +183,45 @@ def test_optimizer_spec_coerces_lr_to_float():
     assert isinstance(kwargs["lr"], float)
 
 
+def test_optimizer_spec_does_not_force_betas_onto_explicit_target():
+    # An explicit _target_ for an optimizer with no `betas` kwarg (e.g. SGD)
+    # must not have AdamW's betas/weight_decay defaults forced onto it.
+    target, kwargs = _resolve_dspark_optimizer_spec(_opt_cfg(_target_="torch.optim.SGD", lr=0.1, momentum=0.9))
+    assert target == "torch.optim.SGD"
+    assert "betas" not in kwargs
+    assert "weight_decay" not in kwargs
+    assert kwargs["momentum"] == 0.9
+
+
+# ---------------------------------------------------------------------------
+# _build_dspark_optimizer
+# ---------------------------------------------------------------------------
+
+
+def test_build_optimizer_defaults_to_adamw():
+    model = torch.nn.Linear(4, 4)
+    optimizer = _build_dspark_optimizer(model, _opt_cfg(lr=6e-4))
+    assert isinstance(optimizer, torch.optim.AdamW)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(6e-4)
+    assert optimizer.param_groups[0]["betas"] == (0.9, 0.95)
+
+
+def test_build_optimizer_respects_explicit_target():
+    model = torch.nn.Linear(4, 4)
+    optimizer = _build_dspark_optimizer(model, _opt_cfg(_target_="torch.optim.SGD", lr=0.1, momentum=0.9))
+    assert isinstance(optimizer, torch.optim.SGD)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+    assert optimizer.param_groups[0]["momentum"] == 0.9
+
+
+def test_build_optimizer_only_covers_trainable_params():
+    model = torch.nn.Linear(4, 4)
+    model.bias.requires_grad_(False)
+    optimizer = _build_dspark_optimizer(model, _opt_cfg(lr=6e-4))
+    (params,) = (group["params"] for group in optimizer.param_groups)
+    assert params == [model.weight]
+
+
 # ---------------------------------------------------------------------------
 # _resolve_warmup_steps
 # ---------------------------------------------------------------------------
@@ -225,3 +270,67 @@ def test_wandb_kwargs_enabled_strips_enable_key():
 def test_wandb_kwargs_defaults_enabled_when_flag_absent():
     kwargs = _resolve_wandb_kwargs({"project": "p"})
     assert kwargs == {"project": "p"}
+
+
+# ---------------------------------------------------------------------------
+# _init_dspark_wandb
+# ---------------------------------------------------------------------------
+
+
+def _patch_wandb_run(monkeypatch, run=object()):
+    """Patch the module-level wandb hooks ``_init_dspark_wandb`` calls, returning a spy call log."""
+    import nemo_automodel.recipes.llm.train_dspark as train_dspark_module
+
+    calls = {}
+
+    def _fake_init_wandb_run(wandb_kwargs, cfg_dict, default_name):
+        calls["wandb_kwargs"] = wandb_kwargs
+        calls["cfg_dict"] = cfg_dict
+        calls["default_name"] = default_name
+        return run
+
+    def _fake_suppress():
+        calls["suppressed"] = True
+
+    monkeypatch.setattr(train_dspark_module, "init_wandb_run", _fake_init_wandb_run)
+    monkeypatch.setattr(train_dspark_module, "suppress_wandb_log_messages", _fake_suppress)
+    return calls
+
+
+def test_init_wandb_skipped_on_non_main_rank(monkeypatch):
+    calls = _patch_wandb_run(monkeypatch)
+    result = _init_dspark_wandb(is_main=False, wandb_cfg=_opt_cfg(project="p"), cfg_dict={}, default_name="run")
+    assert result is None
+    assert calls == {}
+
+
+def test_init_wandb_skipped_when_block_absent(monkeypatch):
+    calls = _patch_wandb_run(monkeypatch)
+    result = _init_dspark_wandb(is_main=True, wandb_cfg=None, cfg_dict={}, default_name="run")
+    assert result is None
+    assert calls == {}
+
+
+def test_init_wandb_skipped_when_disabled(monkeypatch):
+    calls = _patch_wandb_run(monkeypatch)
+    result = _init_dspark_wandb(
+        is_main=True, wandb_cfg=_opt_cfg(enable=False, project="p"), cfg_dict={}, default_name="run"
+    )
+    assert result is None
+    assert calls == {}
+
+
+def test_init_wandb_runs_on_main_when_enabled(monkeypatch):
+    sentinel_run = object()
+    calls = _patch_wandb_run(monkeypatch, run=sentinel_run)
+    result = _init_dspark_wandb(
+        is_main=True,
+        wandb_cfg=_opt_cfg(project="p", group="g"),
+        cfg_dict={"lr": 1e-4},
+        default_name="dspark_run",
+    )
+    assert result is sentinel_run
+    assert calls["suppressed"] is True
+    assert calls["wandb_kwargs"] == {"project": "p", "group": "g"}
+    assert calls["cfg_dict"] == {"lr": 1e-4}
+    assert calls["default_name"] == "dspark_run"

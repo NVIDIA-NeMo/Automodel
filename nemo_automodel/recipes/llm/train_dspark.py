@@ -171,6 +171,22 @@ def _resolve_wandb_kwargs(wandb_cfg: dict) -> dict | None:
     return kwargs
 
 
+def _init_dspark_wandb(*, is_main: bool, wandb_cfg, cfg_dict: dict, default_name: str):
+    """Initialize the rank-zero W&B run for a DSpark training job, or return ``None``.
+
+    Centralizes the ``is_main`` / block-presence / ``enable`` gating that
+    ``TrainDSparkRecipe.setup`` previously inlined, so it is unit-testable
+    without a distributed environment.
+    """
+    if not is_main or wandb_cfg is None:
+        return None
+    wandb_kwargs = _resolve_wandb_kwargs(wandb_cfg.to_dict())
+    if wandb_kwargs is None:
+        return None
+    suppress_wandb_log_messages()
+    return init_wandb_run(wandb_kwargs, cfg_dict, default_name=default_name)
+
+
 def _resolve_dspark_optimizer_spec(opt_cfg) -> tuple[str, dict]:
     """Normalize the recipe's ``optimizer:`` config into a ``build_optimizer`` spec.
 
@@ -181,17 +197,35 @@ def _resolve_dspark_optimizer_spec(opt_cfg) -> tuple[str, dict]:
     ``exp_avg_dtype``, ``exp_avg_sq_dtype``, ``store_param_remainders``, ...) -- and
     returns the ``(target, kwargs)`` tuple that ``build_optimizer`` resolves via its
     registry / dotted-import-path / ``OptimizerFromFactoryConfig`` escape hatch.
+
     Absent an explicit ``_target_``, this defaults to plain ``torch.optim.AdamW``
-    (the prior hardcoded behavior), so existing DSpark configs are unaffected.
+    with its prior ``betas``/``weight_decay`` defaults (matching the previous
+    hardcoded behavior, so existing DSpark configs are unaffected). Those two
+    AdamW-shaped defaults are only injected in that no-``_target_`` case: forcing
+    them onto an arbitrary explicit ``_target_`` would break optimizers that do
+    not accept a ``betas`` kwarg (e.g. plain SGD).
     """
     kwargs = dict(opt_cfg.to_dict())
-    target = kwargs.pop("_target_", "torch.optim.AdamW")
+    target = kwargs.pop("_target_", None)
     kwargs.pop("warmup_ratio", None)
     kwargs.pop("min_lr_ratio", None)
     kwargs["lr"] = float(kwargs["lr"])
-    kwargs.setdefault("betas", (0.9, 0.95))
-    kwargs.setdefault("weight_decay", 0.0)
+    if target is None:
+        target = "torch.optim.AdamW"
+        kwargs.setdefault("betas", (0.9, 0.95))
+        kwargs.setdefault("weight_decay", 0.0)
     return target, kwargs
+
+
+def _build_dspark_optimizer(trainer_module, opt_cfg, device_mesh=None) -> torch.optim.Optimizer:
+    """Build the DSpark trainer's optimizer from its ``optimizer:`` config.
+
+    Thin wrapper around ``build_optimizer`` so ``TrainDSparkRecipe.setup`` has a
+    single, unit-testable call site (``build_optimizer`` itself needs no
+    distributed environment for a non-pipelined single-part model like the
+    DSpark draft, so this is testable with a plain CPU module).
+    """
+    return build_optimizer(trainer_module, _resolve_dspark_optimizer_spec(opt_cfg), device_mesh=device_mesh)[0]
 
 
 def _resolve_warmup_steps(warmup_ratio: float, total_optim_steps: int, min_warmup_steps: int = 20) -> int:
@@ -446,9 +480,7 @@ class TrainDSparkRecipe(BaseRecipe):
 
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
-        self.optimizer = build_optimizer(
-            self.trainer_module, _resolve_dspark_optimizer_spec(opt_cfg), device_mesh=None
-        )[0]
+        self.optimizer = _build_dspark_optimizer(self.trainer_module, opt_cfg, device_mesh=None)
         self.grad_accumulation_steps = recipe_cfg.get("grad_accumulation_steps", 1)
         self.max_grad_norm = recipe_cfg.get("max_grad_norm", 1.0)
         self.num_epochs = recipe_cfg.num_epochs
@@ -482,17 +514,12 @@ class TrainDSparkRecipe(BaseRecipe):
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
-        self.wandb_run = None
-        wandb_cfg = self.cfg.get("wandb", None)
-        if self.dist_env.is_main and wandb_cfg is not None:
-            wandb_kwargs = _resolve_wandb_kwargs(wandb_cfg.to_dict())
-            if wandb_kwargs is not None:
-                suppress_wandb_log_messages()
-                self.wandb_run = init_wandb_run(
-                    wandb_kwargs,
-                    self.cfg.to_dict(),
-                    default_name="dspark_" + str(target_path).rstrip("/").split("/")[-1],
-                )
+        self.wandb_run = _init_dspark_wandb(
+            is_main=self.dist_env.is_main,
+            wandb_cfg=self.cfg.get("wandb", None),
+            cfg_dict=self.cfg.to_dict(),
+            default_name="dspark_" + str(target_path).rstrip("/").split("/")[-1],
+        )
 
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
