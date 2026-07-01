@@ -129,6 +129,7 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
+ffpa = ["ffpa-attn>=0.1.19"]
 fla = [
     "flash-linear-attention>=0.4.2",
 ]
@@ -439,6 +440,12 @@ convention = "google"
 "nemo_automodel/components/models/qwen3_vl_moe/model.py" = ["D101"]
 "nemo_automodel/recipes/retrieval/train_bi_encoder.py" = ["D103"]
 "nemo_automodel/recipes/retrieval/train_cross_encoder.py" = ["D101", "D103"]
+"nemo_automodel/components/speculative/dspark/common.py" = ["D101", "D103"]
+"nemo_automodel/components/speculative/dspark/config.py" = ["D103"]
+"nemo_automodel/components/speculative/dspark/loss.py" = ["D103"]
+"nemo_automodel/components/speculative/dspark/markov_head.py" = ["D101", "D103"]
+"nemo_automodel/components/speculative/dspark/draft_qwen3.py" = ["D101"]
+"nemo_automodel/components/speculative/dspark/draft_gemma4.py" = ["D101"]
 
 
 [tool.ruff.lint.isort]
@@ -465,6 +472,8 @@ modules = [
     "nemo_automodel.components.utils",
 ]
 ignore_imports = [
+    # Dion needs the FSDP DP mesh resolver so its optimizer mesh matches parameter sharding.
+    "nemo_automodel.components.optim.dion -> nemo_automodel.components.distributed.mesh_utils",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.llama.model",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.gemma4_moe.model",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.mistral3_vlm.model",
@@ -501,6 +510,8 @@ allowed-unresolved-imports = [
     "deep_ep.**",
     "dion",
     "fast_hadamard_transform",
+    "ffpa_attn",
+    "ffpa_attn.**",
     "fla.**",
     "flash_attn",
     "grouped_gemm",

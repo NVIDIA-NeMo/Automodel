@@ -75,10 +75,7 @@ fi
 echo "[config] Recipe=$RECIPE_NAME  MediaType=$MEDIA_TYPE  Processor=$PROCESSOR  Model=$MODEL_NAME  LoRA=$IS_LORA"
 
 # Video decodes via imageio-ffmpeg (opt-in diffusion-media extra, kept out of the image).
-DIFFUSION_EXTRAS="--extra diffusion"
-if [ "$MEDIA_TYPE" = "video" ]; then
-    DIFFUSION_EXTRAS="$DIFFUSION_EXTRAS --extra diffusion-media"
-fi
+DIFFUSION_EXTRAS="--extra diffusion --extra diffusion-media"
 
 # ============================================
 # Stage 1: Download dataset

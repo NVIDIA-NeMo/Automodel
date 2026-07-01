@@ -132,7 +132,7 @@ def _eval_self(trainer, num_batches):
         "attention_mask": torch.ones(1, 4, dtype=torch.long),
         "loss_mask": torch.ones(1, 4, dtype=torch.long),
     }
-    return SimpleNamespace(
+    obj = SimpleNamespace(
         val_dataloader=[dict(batch) for _ in range(num_batches)],
         device=torch.device("cpu"),
         trainer_module=trainer,
@@ -144,6 +144,11 @@ def _eval_self(trainer, num_batches):
             )
         ),
     )
+    # _run_eval routes the trainer call through the same _run_trainer_step seam as
+    # training (so subclasses inject their extra inputs); bind the base seam, which
+    # forwards (input_ids, hidden_states, loss_mask) to the trainer module.
+    obj._run_trainer_step = TrainDFlashRecipe._run_trainer_step.__get__(obj)
+    return obj
 
 
 def test_run_eval_returns_none_without_val_dataloader():
@@ -196,3 +201,51 @@ def test_all_ranks_have_valid_ddp_min_reduces_across_ranks(monkeypatch):
     # Every rank valid -> MIN leaves the 1 in place -> all run the backward.
     monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda t, op=None: None)
     assert train_dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is True
+
+
+def _load_extra_state_self(mask_token_id=7):
+    return SimpleNamespace(
+        runtime=SimpleNamespace(global_step=0),
+        _resume_epoch=0,
+        mask_token_id=mask_token_id,
+    )
+
+
+def _write_meta(tmp_path, **fields):
+    meta = {"global_step": 5, "epoch": 2, "block_size": 16, "target_layer_ids": [1, 2]}
+    meta.update(fields)
+    torch.save(meta, tmp_path / "dflash_meta.pt")
+    return str(tmp_path)
+
+
+def test_load_extra_state_restores_step_and_epoch(tmp_path):
+    ckpt_dir = _write_meta(tmp_path, mask_token_id=7)
+    obj = _load_extra_state_self(mask_token_id=7)
+    TrainDFlashRecipe._load_extra_state(obj, ckpt_dir)
+    assert obj.runtime.global_step == 5
+    assert obj._resume_epoch == 2
+
+
+def test_load_extra_state_raises_on_mask_token_id_mismatch(tmp_path):
+    """A resume YAML whose mask_token_id disagrees with the checkpoint must fail loudly."""
+    ckpt_dir = _write_meta(tmp_path, mask_token_id=7)
+    obj = _load_extra_state_self(mask_token_id=99)
+    with pytest.raises(ValueError, match="mask_token_id mismatch on resume"):
+        TrainDFlashRecipe._load_extra_state(obj, ckpt_dir)
+
+
+def test_load_extra_state_accepts_legacy_meta_without_mask_token_id(tmp_path):
+    """Checkpoints saved before mask_token_id was persisted skip the check."""
+    meta = {"global_step": 3, "epoch": 1}
+    torch.save(meta, tmp_path / "dflash_meta.pt")
+    obj = _load_extra_state_self(mask_token_id=99)
+    TrainDFlashRecipe._load_extra_state(obj, str(tmp_path))
+    assert obj.runtime.global_step == 3
+    assert obj._resume_epoch == 1
+
+
+def test_load_extra_state_noop_when_meta_missing(tmp_path):
+    obj = _load_extra_state_self(mask_token_id=7)
+    TrainDFlashRecipe._load_extra_state(obj, str(tmp_path))
+    assert obj.runtime.global_step == 0
+    assert obj._resume_epoch == 0

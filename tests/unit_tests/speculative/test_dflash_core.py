@@ -31,7 +31,9 @@ BLOCK_SIZE = 4
 MASK_ID = VOCAB - 1
 
 
-def _build_trainer(num_anchors=8, loss_decay_gamma=None, loss_type="dflash", dpace_alpha=0.5):
+def _build_trainer(
+    num_anchors=8, loss_decay_gamma=None, loss_type="dflash", dpace_alpha=0.5, attention_backend="sdpa"
+):
     cfg = Qwen3Config(
         vocab_size=VOCAB,
         hidden_size=HIDDEN,
@@ -48,7 +50,7 @@ def _build_trainer(num_anchors=8, loss_decay_gamma=None, loss_type="dflash", dpa
     cfg.num_target_layers = NUM_TARGET_LAYERS
     cfg.block_size = BLOCK_SIZE
     cfg.dflash_config = {"mask_token_id": MASK_ID, "target_layer_ids": TARGET_LAYER_IDS}
-    cfg._attn_implementation = "sdpa"
+    cfg._attn_implementation = attention_backend
     draft = Qwen3DFlashDraftModel(cfg)
     lm_head = torch.nn.Linear(HIDDEN, VOCAB, bias=False)
     embed = torch.nn.Embedding(VOCAB, HIDDEN)
@@ -58,7 +60,7 @@ def _build_trainer(num_anchors=8, loss_decay_gamma=None, loss_type="dflash", dpa
         target_embed_tokens=embed,
         mask_token_id=MASK_ID,
         block_size=BLOCK_SIZE,
-        attention_backend="sdpa",
+        attention_backend=attention_backend,
         num_anchors=num_anchors,
         loss_decay_gamma=loss_decay_gamma,
         loss_type=loss_type,
@@ -94,6 +96,28 @@ def test_forward_supports_dpace_loss_and_grads_flow_to_draft():
     assert isinstance(out, DFlashStepMetrics)
     assert torch.isfinite(out.loss) and out.loss.item() > 0
     out.loss.backward()
+    grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
+    assert grad > 0
+
+
+@pytest.mark.parametrize("attention_backend", ["eager", "sdpa"])
+def test_padding_blocks_do_not_nan_loss_or_grads(attention_backend):
+    """A batch mixing sequence lengths produces padding blocks (block_keep_mask
+    has False entries). Those blocks must not NaN the loss or gradients on the
+    dense (eager/sdpa) backends: a fully-masked attention row NaNs the softmax,
+    and that NaN spreads across the whole sample via the next layer's
+    ``0 * NaN`` value aggregation. Regression for that contamination."""
+    trainer = _build_trainer(loss_decay_gamma=7.0, attention_backend=attention_backend)
+    input_ids, hidden, loss_mask = _inputs(bsz=2, seq_len=24)
+    # Sample 0 keeps only the first 5 positions valid -> fewer anchors than
+    # sample 1 -> trailing padding blocks for sample 0.
+    loss_mask[0, 5:] = 0.0
+
+    out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+    assert torch.isfinite(out.loss) and out.loss.item() > 0
+
+    out.loss.backward()
+    assert all(torch.isfinite(p.grad).all() for p in trainer.draft_model.parameters() if p.grad is not None)
     grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
     assert grad > 0
 

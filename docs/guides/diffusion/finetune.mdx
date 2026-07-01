@@ -44,8 +44,11 @@ All models use FSDP2 for distributed training and flow matching for loss computa
 
 ## Install NeMo AutoModel
 
+Diffusion fine-tuning needs the `diffusion` extra plus `diffusion-media` (OpenCV
+for image/video preprocessing and imageio-ffmpeg for T2V export):
+
 ```bash
-pip3 install nemo-automodel
+pip3 install "nemo-automodel[diffusion,diffusion-media]"
 ```
 
 Alternatively, if you run into dependency or driver issues, use the pre-built Docker container:
@@ -54,6 +57,14 @@ Alternatively, if you run into dependency or driver issues, use the pre-built Do
 docker pull nvcr.io/nvidia/nemo-automodel:26.06.00
 docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:26.06.00
 ```
+
+<Note>
+Media dependencies are not installed in the Docker container by default. Add them from the AutoModel directory before preprocessing or training:
+
+```bash
+cd /opt/Automodel && uv pip install ".[diffusion-media]"
+```
+</Note>
 
 <Info>
 **Docker users:** Checkpoints are lost when the container exits unless you bind-mount the checkpoint directory to the host. See [Install with NeMo Docker Container](/get-started/installation#install-with-nemo-docker-container) and [Save Checkpoints When Using Docker](/development/checkpointing#save-checkpoints-when-using-docker).

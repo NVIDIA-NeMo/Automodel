@@ -49,8 +49,7 @@ def _normalize_activation_checkpointing(value: Any) -> bool | str:
     """Normalize YAML activation checkpointing values.
 
     ``True`` keeps the existing full checkpointing behavior. ``"selective"``
-    enables PyTorch selective activation checkpointing for supported FSDP2
-    paths.
+    enables PyTorch selective activation checkpointing for supported paths.
     """
     if value is None:
         return False
@@ -157,8 +156,8 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
             strategy_kwargs["autocast_dtype"] = dtype_from_str(val)
 
     ep_size: int = parallelism.get("ep_size") or 1
-    if activation_checkpointing == "selective" and strategy_name != "fsdp2":
-        raise ValueError("selective activation checkpointing is supported only for FSDP2 configs.")
+    if activation_checkpointing == "selective" and strategy_name not in {"fsdp2", "ddp"}:
+        raise ValueError("selective activation checkpointing is supported only for FSDP2 and DDP configs.")
 
     # `distributed.pipeline` and `pp_size` are validated asymmetrically:
     #   * pipeline block with pp_size<=1 -> WARN (inert; block ignored). This is
