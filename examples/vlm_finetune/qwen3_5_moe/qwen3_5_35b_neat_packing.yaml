@@ -132,7 +132,7 @@ optimizer:
 ci:
   recipe_owner: HuiyingLi
   max_steps: 10
-  time: "00:30:00"
+  time: "00:20:00"
 
 # wandb:
 #   project: <your_wandb_project>
