@@ -150,6 +150,47 @@ def test_clip_grad_norm_uses_torch_fast_path_when_requested(monkeypatch):
     clip_grads_with_norm_mock.assert_not_called()
 
 
+def test_clip_grad_norm_uses_precomputed_norm_without_recomputation(monkeypatch):
+    model = torch.nn.Linear(10, 10)
+    model.weight.grad = torch.randn_like(model.weight)
+
+    clip_grad_norm_mock = Mock(side_effect=AssertionError("gradient norm should be precomputed"))
+    clip_grads_with_norm_mock = Mock()
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", clip_grad_norm_mock)
+    monkeypatch.setattr(torch.nn.utils, "clip_grads_with_norm_", clip_grads_with_norm_mock)
+
+    precomputed_norm = torch.tensor(3.0)
+    grad_norm = clip_grad_norm(
+        max_grad_norm=1.0,
+        model_parts=[model],
+        precomputed_grad_norm=precomputed_norm,
+    )
+
+    assert grad_norm == 3.0
+    clip_grad_norm_mock.assert_not_called()
+    clip_grads_with_norm_mock.assert_called_once()
+    assert clip_grads_with_norm_mock.call_args.args[1] == 1.0
+    assert clip_grads_with_norm_mock.call_args.args[2] is precomputed_norm
+
+
+def test_clip_grad_norm_caches_parameter_walk(monkeypatch):
+    model = torch.nn.Linear(10, 10)
+    model.weight.grad = torch.randn_like(model.weight)
+    original_parameters = model.parameters
+    parameter_walks = 0
+
+    def counted_parameters():
+        nonlocal parameter_walks
+        parameter_walks += 1
+        return original_parameters()
+
+    monkeypatch.setattr(model, "parameters", counted_parameters)
+    clip_grad_norm(max_grad_norm=1.0, model_parts=[model])
+    clip_grad_norm(max_grad_norm=1.0, model_parts=[model])
+
+    assert parameter_walks == 1
+
+
 def test_clip_grad_norm_returns_zero_when_max_grad_norm_is_none():
     model = torch.nn.Linear(10, 10)
     model.weight.grad = torch.randn_like(model.weight)
