@@ -215,6 +215,13 @@ dataloader:
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_multilingual_random5_native_english_ultra_more6_20260619_doc_tha_thai_query_eng_latn_qwen3_8B_0_95_perc_unrolled.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_multilingual_random5_native_english_ultra_more6_20260619_doc_urd_arab_query_urd_arab_qwen3_8B_0_95_perc_unrolled.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_multilingual_random5_native_english_ultra_more6_20260619_doc_urd_arab_query_eng_latn_qwen3_8B_0_95_perc_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/retrieval_from_scratch_133k_english_fuzzy94_5model_more2_partial_20260627_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/spartqa_train_retrieval_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/winogrande_train_retrieval_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/tempreason_l1_train_retrieval_qwen3_8B_0_95_perc_positives_unrolled_40k.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/english_healthcare1_autoresearch_20260625_iter_008_englishhealthcare1retrieval_prompt_improved_sdg_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/japanese_legal1_private_local_autoresearch_20260625_iter_003_more_synthetic_qnext_6400_sdg_1gpu_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/germanlegal1_eval_like_nemotron_super_sentencepairs_2400_v2_20260625_qwen3_8B_0_95_perc.json
     data_type: train
     n_passages: 5
     seed: 42
