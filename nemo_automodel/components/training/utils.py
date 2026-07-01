@@ -36,6 +36,13 @@ _TE_EXPERT_PARAM_PATTERN = re.compile(r"(^|\.)mlp\.experts\.(gate_up_linear|down
 # expensive module parameter walks while keeping entries lifetime-bound to the module.
 _TRAINABLE_PARAMETER_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _NAMED_PARAMETER_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_SHARDING_GROUP_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _parameter_sharding_key(parameter: torch.Tensor):
+    if isinstance(parameter, DTensor):
+        return id(parameter.device_mesh), tuple(str(placement) for placement in parameter.placements)
+    return "regular"
 
 
 def _get_cached_trainable_parameters(model_parts: list[torch.nn.Module]) -> list[torch.Tensor]:
@@ -61,15 +68,32 @@ def _get_cached_named_parameters(model_parts: list[torch.nn.Module]) -> list[tup
     return named_parameters
 
 
+def _get_cached_sharding_groups(model_parts: list[torch.nn.Module]) -> list[tuple[torch.Tensor, ...]]:
+    groups = []
+    for model_part in model_parts:
+        cached = _SHARDING_GROUP_CACHE.get(model_part)
+        if cached is None:
+            grouped_parameters = {}
+            for parameter in model_part.parameters():
+                if parameter.requires_grad:
+                    grouped_parameters.setdefault(_parameter_sharding_key(parameter), []).append(parameter)
+            cached = tuple(tuple(parameters) for parameters in grouped_parameters.values())
+            _SHARDING_GROUP_CACHE[model_part] = cached
+        groups.extend(cached)
+    return groups
+
+
 def clear_grad_clip_parameter_cache(model_parts: list[torch.nn.Module] | None = None) -> None:
     """Clear cached clipping parameters after changing a model's trainable set."""
     if model_parts is None:
         _TRAINABLE_PARAMETER_CACHE.clear()
         _NAMED_PARAMETER_CACHE.clear()
+        _SHARDING_GROUP_CACHE.clear()
         return
     for model_part in model_parts:
         _TRAINABLE_PARAMETER_CACHE.pop(model_part, None)
         _NAMED_PARAMETER_CACHE.pop(model_part, None)
+        _SHARDING_GROUP_CACHE.pop(model_part, None)
 
 
 @torch.no_grad()
@@ -110,6 +134,7 @@ def _clip_grad_norm_impl(
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
     precomputed_grad_norm: torch.Tensor | None = None,
+    sharding_groups: Iterable[Iterable[torch.Tensor]] | None = None,
 ) -> torch.Tensor:
     # Determine target device for all tensor operations
     # Use current CUDA device if available, otherwise use CPU
@@ -123,26 +148,20 @@ def _clip_grad_norm_impl(
     else:
         parameters = list(parameters)
 
-    # Group parameters by their sharding pattern
-    # Key: (device_mesh_id, tuple of placements)
-    sharding_groups = {}
-
-    for p in parameters:
-        if p.grad is None:
-            continue
-
-        if isinstance(p, DTensor):
-            # Create a hashable key from device_mesh and placements
-            mesh_id = id(p.device_mesh)
-            placements_tuple = tuple(str(placement) for placement in p.placements)
-            key = (mesh_id, placements_tuple)
-        else:
-            # Regular tensor - group separately
-            key = ("regular", "regular")
-
-        if key not in sharding_groups:
-            sharding_groups[key] = []
-        sharding_groups[key].append(p)
+    if sharding_groups is None:
+        # Group parameters by their sharding pattern when called directly. The main
+        # clip_grad_norm path supplies cached groups to avoid this walk every step.
+        grouped_parameters = {}
+        for parameter in parameters:
+            if parameter.grad is not None:
+                grouped_parameters.setdefault(_parameter_sharding_key(parameter), []).append(parameter)
+        sharding_groups = tuple(grouped_parameters.values())
+    else:
+        sharding_groups = tuple(sharding_groups)
+    sharding_groups = tuple(
+        tuple(parameter for parameter in group if parameter.grad is not None) for group in sharding_groups
+    )
+    sharding_groups = tuple(group for group in sharding_groups if group)
 
     if precomputed_grad_norm is not None:
         total_norm = precomputed_grad_norm.float().to(target_device)
@@ -156,29 +175,46 @@ def _clip_grad_norm_impl(
         # Replicate) then allreduces with mismatched numel and hangs.
         is_inf = math.isinf(norm_type)
         group_norms = []
-        for group_params in sharding_groups.values():
+        for group_params in sharding_groups:
             first = group_params[0]
             is_dtensor = isinstance(first, DTensor)
-            # Partial placements can't be reduced via sum-of-local-norms; materialize
-            # those per-grad (each full_tensor() is a same-shape collective, safe).
+            # Partial placements can't be reduced via sum-of-local-norms; reduce
+            # the flattened local values before calculating the norm.
             has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in first.placements)
 
-            local_val = torch.zeros((), dtype=torch.float32, device=target_device)
-            for p in group_params:
-                g = p.grad
-                if isinstance(g, DTensor):
-                    g = g.full_tensor() if has_partial else g.to_local()
-                g = g.detach().float()
+            if has_partial:
+                # A Partial DTensor needs its values reduced before its norm is
+                # known. Flatten the whole placement group so this is one
+                # collective per mesh dimension instead of one full_tensor()
+                # collective per parameter.
+                local_values = [p.grad.to_local().detach().float().reshape(-1) for p in group_params]
+                flat_values = torch.cat(local_values)
+                for dim_idx, placement in enumerate(first.placements):
+                    if isinstance(placement, Partial):
+                        torch.distributed.all_reduce(
+                            flat_values,
+                            op=torch.distributed.ReduceOp.SUM,
+                            group=first.device_mesh.get_group(mesh_dim=dim_idx),
+                        )
                 if is_inf:
-                    local_val = torch.maximum(local_val, g.abs().max())
+                    local_val = flat_values.abs().max()
                 else:
-                    local_val = local_val + g.abs().pow(norm_type).sum()
+                    local_val = flat_values.abs().pow(norm_type).sum()
+            else:
+                local_val = torch.zeros((), dtype=torch.float32, device=target_device)
+                for p in group_params:
+                    g = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
+                    g = g.detach().float()
+                    if is_inf:
+                        local_val = torch.maximum(local_val, g.abs().max())
+                    else:
+                        local_val = local_val + g.abs().pow(norm_type).sum()
 
-            if is_dtensor and not has_partial:
+            if is_dtensor:
                 mesh = first.device_mesh
                 op = torch.distributed.ReduceOp.MAX if is_inf else torch.distributed.ReduceOp.SUM
                 for dim_idx, pl in enumerate(first.placements):
-                    if isinstance(pl, Replicate):
+                    if isinstance(pl, (Replicate, Partial)):
                         continue
                     torch.distributed.all_reduce(local_val, op=op, group=mesh.get_group(mesh_dim=dim_idx))
 
@@ -207,10 +243,32 @@ def _clip_grad_norm_impl(
                 torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=pp_mesh.get_group())
                 total_norm = total_norm ** (1.0 / norm_type)
 
-    # Clip gradients for each sharding group separately
-    # This is necessary because clip_grads_with_norm_ doesn't support mixing tensors from different device meshes
-    for group_params in sharding_groups.values():
-        torch.nn.utils.clip_grads_with_norm_(group_params, max_norm, total_norm, foreach)
+    clip_coef = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
+    # Scale DTensor gradients through their local tensors. The clip coefficient
+    # is rank-identical, so this preserves Partial/Shard semantics without
+    # triggering one redistribution collective per gradient.
+    for group_params in sharding_groups:
+        dtensor_grads = [parameter.grad.to_local() for parameter in group_params if isinstance(parameter.grad, DTensor)]
+        if not dtensor_grads:
+            torch.nn.utils.clip_grads_with_norm_(group_params, max_norm, total_norm, foreach)
+            continue
+
+        regular_params = [
+            parameter
+            for parameter in group_params
+            if parameter.grad is not None and not isinstance(parameter.grad, DTensor)
+        ]
+        if regular_params:
+            torch.nn.utils.clip_grads_with_norm_(regular_params, max_norm, total_norm, foreach)
+        if foreach:
+            grouped_grads = {}
+            for grad in dtensor_grads:
+                grouped_grads.setdefault((grad.device, grad.dtype), []).append(grad)
+            for grads in grouped_grads.values():
+                torch._foreach_mul_(grads, clip_coef.to(grads[0].device))
+        else:
+            for grad in dtensor_grads:
+                grad.mul_(clip_coef.to(grad.device))
 
     return total_norm
 
@@ -311,6 +369,7 @@ def clip_grad_norm(
                 foreach=foreach,
                 pp_mesh=pp_mesh,
                 precomputed_grad_norm=precomputed_grad_norm,
+                sharding_groups=_get_cached_sharding_groups(model_parts),
             )
 
         # Convert to float for API compatibility
