@@ -105,11 +105,15 @@ def get_controlling_tie_word_embeddings(config: object, model_class_name: str) -
     """Resolve the ``tie_word_embeddings`` flag that actually controls lm_head tying.
 
     HF ties ``lm_head`` based on the *top-level* config flag, not a nested
-    ``text_config`` (verified by construction for Gemma4, Mistral3, and
-    Qwen2.5-Omni under transformers 5.8.1: the top-level flag decides tying
-    regardless of the nested value). So prefer the top-level flag, and only fall
-    back to ``text_config`` for configs that don't expose a top-level
-    ``tie_word_embeddings``.
+    ``text_config`` (verified by construction for Gemma4 and Mistral3 under
+    transformers 5.8.1: the top-level flag decides tying regardless of the nested
+    value). So prefer the top-level flag, and only fall back to ``text_config``
+    for configs that don't expose a top-level ``tie_word_embeddings``.
+
+    Omni "thinker" models are the exception: the full wrapper config
+    (``Qwen2_5OmniConfig`` / ``Qwen3OmniMoeConfig``) does not expose
+    ``tie_word_embeddings`` at the top level at all -- the controlling flag lives
+    on ``config.thinker_config`` -- so unwrap to it for those classes.
 
     Args:
         config: The model's config (or anything exposing ``tie_word_embeddings``
@@ -119,17 +123,29 @@ def get_controlling_tie_word_embeddings(config: object, model_class_name: str) -
     Returns:
         bool: The controlling ``tie_word_embeddings`` value.
     """
-    # Composite models whose top-level / thinker config owns the lm_head tying
+    # Omni "thinker" models: the controlling flag lives on the thinker config.
+    # A full wrapper config (e.g. ``Qwen2_5OmniConfig`` / ``Qwen3OmniMoeConfig``)
+    # does not expose ``tie_word_embeddings`` at the top level at all -- it nests
+    # under ``config.thinker_config`` -- so unwrap to it when present. When the
+    # thinker config itself is passed, ``thinker_config`` is absent and we read
+    # its own top-level flag.
+    omni_thinker_models = (
+        "Qwen2_5OmniThinkerForConditionalGeneration",
+        "Qwen3OmniMoeThinkerForConditionalGeneration",
+    )
+    if any(name in model_class_name for name in omni_thinker_models):
+        thinker_config = getattr(config, "thinker_config", config)
+        return bool(getattr(thinker_config, "tie_word_embeddings", False))
+
+    # Other composite models whose top-level config owns the lm_head tying
     # decision; their nested ``text_config`` flag can disagree and must be ignored.
     # Return the top-level flag (not a forced ``False``) so a constructor guard can
     # still see and reject an unsupported ``top-level=True``. The checkpoint save
     # path stays safe through the storage-based ``has_local_tied_lm_head()`` check,
     # which only drops ``lm_head.weight`` when the tensors actually share storage.
     composite_top_level_models = (
-        "Qwen2_5OmniThinkerForConditionalGeneration",
         "Mistral3FP8VLMForConditionalGeneration",
         "Qwen3VLMoeForConditionalGeneration",
-        "Qwen3OmniMoeThinkerForConditionalGeneration",
     )
     if any(name in model_class_name for name in composite_top_level_models):
         return bool(getattr(config, "tie_word_embeddings", False))
@@ -161,6 +177,34 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
     if config is None:
         return False
     return get_controlling_tie_word_embeddings(config, type(model).__name__)
+
+
+def reject_unsupported_tied_word_embeddings(config: object, model_class_name: str) -> None:
+    """Reject ``tie_word_embeddings=True`` for models whose HF default is untied.
+
+    Separate-head architectures (HF default: distinct input/output embeddings)
+    don't build a shared ``lm_head``, so honoring ``tie_word_embeddings=True``
+    would silently leave a randomly-initialized head or require materializing a
+    tied weight NeMo does not support. Reject it explicitly with a clear message
+    instead of pretending to support it.
+
+    Uses :func:`get_controlling_tie_word_embeddings`, so composite VLM/omni configs
+    are read from the controlling top-level flag rather than a nested
+    ``text_config``.
+
+    Args:
+        config: The model's config.
+        model_class_name: ``type(self).__name__`` of the constructing model.
+
+    Raises:
+        NotImplementedError: if the controlling ``tie_word_embeddings`` flag is set.
+    """
+    if get_controlling_tie_word_embeddings(config, model_class_name):
+        raise NotImplementedError(
+            f"{model_class_name} has separate input and output embeddings and does not "
+            f"support tie_word_embeddings=True. The Hugging Face default for this "
+            f"architecture is untied; set tie_word_embeddings=False."
+        )
 
 
 def _normalize_param_name(name: str) -> str:

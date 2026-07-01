@@ -14,6 +14,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch.nn as nn
 
 import nemo_automodel.components.checkpoint.utils as checkpoint_utils
@@ -123,6 +124,67 @@ def test_get_controlling_tie_word_embeddings_falls_back_to_text_config():
             return SimpleNamespace(tie_word_embeddings=True)
 
     assert checkpoint_utils.get_controlling_tie_word_embeddings(_NoTopFlag(), "SomeForCausalLM") is True
+
+
+def test_reject_unsupported_tied_word_embeddings_raises_when_tied():
+    """A separate-head model with tie_word_embeddings=True is rejected."""
+    config = SimpleNamespace(tie_word_embeddings=True)
+    with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=True"):
+        checkpoint_utils.reject_unsupported_tied_word_embeddings(config, "Qwen3MoeForCausalLM")
+
+
+def test_reject_unsupported_tied_word_embeddings_noop_when_untied():
+    """The default (untied) config passes the guard without raising."""
+    config = SimpleNamespace(tie_word_embeddings=False)
+    checkpoint_utils.reject_unsupported_tied_word_embeddings(config, "Qwen3MoeForCausalLM")  # no raise
+
+
+def test_reject_unsupported_tied_word_embeddings_uses_top_level_for_composite():
+    """Composite VLM/omni configs read the controlling top-level flag, not nested text_config."""
+    # top-level False (even with nested text True) -> not tied -> no raise
+    untied = SimpleNamespace(
+        tie_word_embeddings=False, get_text_config=lambda: SimpleNamespace(tie_word_embeddings=True)
+    )
+    checkpoint_utils.reject_unsupported_tied_word_embeddings(untied, "Qwen3VLMoeForConditionalGeneration")
+    # top-level True -> tied -> raise
+    tied = SimpleNamespace(tie_word_embeddings=True, get_text_config=lambda: SimpleNamespace(tie_word_embeddings=False))
+    with pytest.raises(NotImplementedError):
+        checkpoint_utils.reject_unsupported_tied_word_embeddings(tied, "Qwen3VLMoeForConditionalGeneration")
+
+
+def test_get_controlling_tie_word_embeddings_omni_wrapper_reads_thinker_config():
+    """Full Omni wrapper config nests the controlling flag under thinker_config.
+
+    Qwen2_5OmniConfig / Qwen3OmniMoeConfig do not expose tie_word_embeddings at the
+    top level; the controlling flag lives on config.thinker_config.
+    """
+    wrapper_tied = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=True))
+    wrapper_untied = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=False))
+    for cls in (
+        "Qwen2_5OmniThinkerForConditionalGeneration",
+        "Qwen3OmniMoeThinkerForConditionalGeneration",
+    ):
+        assert checkpoint_utils.get_controlling_tie_word_embeddings(wrapper_tied, cls) is True
+        assert checkpoint_utils.get_controlling_tie_word_embeddings(wrapper_untied, cls) is False
+    # When the thinker config itself is passed (no nested thinker_config), read its own flag.
+    direct = SimpleNamespace(tie_word_embeddings=True)
+    assert (
+        checkpoint_utils.get_controlling_tie_word_embeddings(direct, "Qwen2_5OmniThinkerForConditionalGeneration")
+        is True
+    )
+
+
+def test_reject_unsupported_tied_word_embeddings_omni_wrapper_path():
+    """The guard raises for a full Omni wrapper whose thinker_config requests tying."""
+    wrapper = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=True))
+    with pytest.raises(NotImplementedError):
+        checkpoint_utils.reject_unsupported_tied_word_embeddings(
+            wrapper, "Qwen2_5OmniThinkerForConditionalGeneration"
+        )
+    wrapper_untied = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=False))
+    checkpoint_utils.reject_unsupported_tied_word_embeddings(
+        wrapper_untied, "Qwen3OmniMoeThinkerForConditionalGeneration"
+    )  # no raise
 
 
 class _DraftLikeModel(nn.Module):
