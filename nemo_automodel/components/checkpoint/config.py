@@ -122,8 +122,8 @@ class CheckpointingConfig:
     best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
     consolidation_timeout_minutes: int = 30  # Timeout for inline consolidated-export synchronization.
     # Retain this many recent checkpoint directories. Checkpoints targeted by checkpoint-root pointers
-    # such as LATEST and LOWEST_VAL are preserved in addition. Set None to disable pruning.
-    max_recent_checkpoints: int | None = 2
+    # such as LATEST and LOWEST_VAL are preserved in addition. None keeps all checkpoints.
+    max_recent_checkpoints: int | None = None
 
     def __post_init__(self):
         """Resolve the cache dir, enforce PEFT constraints, and coerce the save format/mode."""

@@ -989,7 +989,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             is_peft=self.peft_cfg is not None,
             model_state_dict_keys=model_state_dict_keys,
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
-            max_recent_checkpoints=checkpoint_cfg.get("max_recent_checkpoints", 2),
+            max_recent_checkpoints=checkpoint_cfg.get("max_recent_checkpoints", None),
         )
         self.restore_from = checkpoint_cfg.get("restore_from", None)
         self.checkpointer = self.checkpoint_config.build(
