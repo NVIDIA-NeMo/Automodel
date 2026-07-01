@@ -294,6 +294,13 @@ class MiniMaxM3DSparkModel(nn.Module):
                 input_dim += config.markov_rank
             self.confidence_head = AcceptRatePredictor(input_dim=input_dim)
 
+        # FSDP2 requires every parameter under one flat-param group to share a
+        # dtype; force uniform fp32 storage here rather than relying on every
+        # submodule's factory defaulting to fp32 (the same defensive pin the
+        # DeepSeek V4 draft uses, there guarding against its "torch" RMSNorm
+        # factory producing bf16 params next to fp32 Linear layers).
+        self.to(torch.float32)
+
     def _apply(self, fn, recurse: bool = True):
         """Keep the rotary module's device in sync across ``.to()`` calls.
 

@@ -41,6 +41,11 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
     _ensure_rgb,
     build_labels_from_template,
 )
+from nemo_automodel.components.datasets.vlm.fake_image import (
+    _conversation_has_media,
+    inject_fake_image_into_conversation,
+    mask_fake_vision_tokens_batch,
+)
 
 
 def dspark_vlm_collate_fn(
@@ -61,11 +66,29 @@ def dspark_vlm_collate_fn(
     ``max_length`` is required (unlike ``default_collate_fn``'s optional one):
     DSpark needs a fixed shape across every batch/rank/step for its DFlash
     attention mask and the FSDP-sharded target's forward to stay consistent.
+
+    Every conversation without an image/video gets the same fake-image
+    injection ``default_collate_fn`` uses (:func:`~.fake_image
+    .inject_fake_image_into_conversation`): MiniMax M3's vision_tower is its
+    own FSDP2-sharded unit, so a batch mixing text-only and image-containing
+    samples across data-parallel ranks would have some ranks skip the
+    vision_tower's all-gather collective while others don't, hanging
+    training. The fake image's vision tokens get ``attention_mask = 0``
+    (:func:`~.fake_image.mask_fake_vision_tokens_batch`) so they never
+    influence the captured hidden states.
     """
     if not HAVE_QWEN_VL_UTILS:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
 
-    conversations = _ensure_rgb([example["conversation"] for example in examples])
+    conversations = []
+    fake_indices = []
+    for i, example in enumerate(examples):
+        conversation = example["conversation"]
+        if not _conversation_has_media(conversation):
+            conversation = inject_fake_image_into_conversation(conversation)
+            fake_indices.append(i)
+        conversations.append(conversation)
+    conversations = _ensure_rgb(conversations)
 
     batch = processor.apply_chat_template(
         conversations,
@@ -83,6 +106,9 @@ def dspark_vlm_collate_fn(
     labels = build_labels_from_template(batch["input_ids"], conversations, processor)
     batch["loss_mask"] = (labels != -100).to(torch.long)
     batch.pop("labels", None)
+
+    if fake_indices:
+        mask_fake_vision_tokens_batch(batch, processor, fake_indices)
 
     return batch
 

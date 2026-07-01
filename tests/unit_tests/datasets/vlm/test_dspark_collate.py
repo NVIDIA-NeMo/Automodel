@@ -23,6 +23,11 @@ CONVERSATION = [
     {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
 ]
 
+TEXT_ONLY_CONVERSATION = [
+    {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+]
+
 
 class _DummyTokenizer:
     pad_token_id = 0
@@ -31,18 +36,29 @@ class _DummyTokenizer:
 class _DummyProcessor:
     """Mirrors ``DummyDefaultProcessor`` in test_collate_fns.py: returns fixed
     ``input_ids``/``pixel_values``, recording the ``apply_chat_template`` kwargs
-    it was called with."""
+    and conversation list it was called with. ``input_ids`` places the vision
+    token id at position 1 so fake-image masking has something to act on."""
+
+    # A recognizable vision-token id (see fake_image._VISION_TOKEN_ID_ATTRS),
+    # read directly off the processor by _get_vision_token_ids.
+    image_token_id = 99
 
     def __init__(self):
         self.tokenizer = _DummyTokenizer()
         self.captured_kwargs = {}
+        self.captured_conv_list = None
 
     def apply_chat_template(self, conv_list, **kwargs):
         self.captured_kwargs.update(kwargs)
+        self.captured_conv_list = conv_list
         batch_size = len(conv_list)
-        input_ids = torch.arange(1, 5).unsqueeze(0).repeat(batch_size, 1)  # length 4
+        input_ids = torch.tensor([[1, 99, 3, 4]], dtype=torch.long).repeat(batch_size, 1)  # length 4
         pixel_values = torch.ones(batch_size, 3, 64, 64, dtype=torch.float32)
-        return {"input_ids": input_ids, "pixel_values": pixel_values}
+        return {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "pixel_values": pixel_values,
+        }
 
 
 @pytest.fixture()
@@ -123,3 +139,54 @@ def test_dspark_vlm_collate_fn_raises_without_qwen_vl_utils(collate_mod, monkeyp
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", False, raising=True)
     with pytest.raises(ImportError):
         collate_mod.dspark_vlm_collate_fn([], None, max_length=4)
+
+
+def test_dspark_vlm_collate_fn_injects_fake_image_into_text_only_conversation(
+    collate_mod, fake_qwen_utils, monkeypatch
+):
+    """Mixed text/image corpora must stay FSDP-safe: a text-only example gets a
+    fake placeholder image injected before tokenization, mirroring
+    default_collate_fn's own fake-image handling for the VLM SFT recipe."""
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+    monkeypatch.setattr(
+        collate_mod, "build_labels_from_template", lambda *a, **k: torch.zeros(1, 4, dtype=torch.long), raising=True
+    )
+
+    processor = _DummyProcessor()
+    collate_mod.dspark_vlm_collate_fn([{"conversation": TEXT_ONLY_CONVERSATION}], processor, max_length=4)
+
+    # The conversation actually sent to the processor now carries an image,
+    # even though the original TEXT_ONLY_CONVERSATION had none.
+    sent_conversation = processor.captured_conv_list[0]
+    user_content = sent_conversation[0]["content"]
+    assert any(item.get("type") == "image" for item in user_content)
+
+
+def test_dspark_vlm_collate_fn_does_not_double_inject_when_image_present(collate_mod, fake_qwen_utils, monkeypatch):
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+    monkeypatch.setattr(
+        collate_mod, "build_labels_from_template", lambda *a, **k: torch.zeros(1, 4, dtype=torch.long), raising=True
+    )
+
+    processor = _DummyProcessor()
+    collate_mod.dspark_vlm_collate_fn([{"conversation": CONVERSATION}], processor, max_length=4)
+
+    sent_conversation = processor.captured_conv_list[0]
+    user_content = sent_conversation[0]["content"]
+    assert sum(1 for item in user_content if item.get("type") == "image") == 1
+
+
+def test_dspark_vlm_collate_fn_masks_fake_vision_tokens(collate_mod, fake_qwen_utils, monkeypatch):
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+    monkeypatch.setattr(
+        collate_mod, "build_labels_from_template", lambda *a, **k: torch.zeros(1, 4, dtype=torch.long), raising=True
+    )
+
+    processor = _DummyProcessor()
+    batch = collate_mod.dspark_vlm_collate_fn([{"conversation": TEXT_ONLY_CONVERSATION}], processor, max_length=4)
+
+    # _DummyProcessor's fixed input_ids place the vision token (id 99) at
+    # position 1; the fake-injected sample's attention_mask must be zeroed
+    # there so it never influences the captured hidden states.
+    assert batch["attention_mask"][0, 1].item() == 0
+    assert batch["attention_mask"][0, 0].item() == 1

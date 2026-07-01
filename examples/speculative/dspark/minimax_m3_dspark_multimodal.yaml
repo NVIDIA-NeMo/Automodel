@@ -6,17 +6,18 @@
 # conversations through the target instead of plain text.
 #
 # ---------------------------------------------------------------------------
-# DATA REQUIREMENT: every example must contain at least one image (or video).
+# MIXED CORPORA (some examples with images, some without) ARE SAFE.
 # ---------------------------------------------------------------------------
-# MiniMax M3's vision_tower is its own FSDP2-sharded unit. If a batch mixes
-# text-only samples (which never call vision_tower) with image-containing
-# samples (which do) across data-parallel ranks, some ranks skip the
+# MiniMax M3's vision_tower is its own FSDP2-sharded unit. If a batch mixed
+# text-only samples (which would never call vision_tower) with image-containing
+# samples (which do) across data-parallel ranks, some ranks would skip the
 # vision_tower's all-gather collective while others don't in the same step --
-# an NCCL collective mismatch that hangs training. This is NOT enforced in
-# code (would require inspecting every example up front); for v1, curate the
-# dataset so every example has >= 1 image/video, or split mixed corpora into
-# a text-only run (the plain `minimax_m3_dspark.yaml`) and a separate
-# multimodal run.
+# an NCCL collective mismatch that hangs training. `dspark_vlm_collate_fn`
+# avoids this the same way `default_collate_fn` does for the VLM SFT recipe:
+# every text-only example gets a tiny fake placeholder image injected
+# (`fake_image.inject_fake_image_into_conversation`), with its vision tokens
+# masked out of attention (`attention_mask = 0`) so it never influences the
+# captured hidden states. No dataset curation needed.
 #
 # `trust_remote_code: true` is REQUIRED here (unlike the text-only yaml's
 # default `false`): MiniMax M3's processor needs the model's remote code to

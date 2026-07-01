@@ -234,13 +234,12 @@ class TrainDSparkRecipe(BaseRecipe):
         self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_text_config.vocab_size)
 
         if is_multimodal:
-            # Every example in the multimodal dataset must contain at least one
-            # image/video: MiniMax M3's vision_tower is its own FSDP2-sharded
-            # unit, so a batch mixing text-only and image-containing samples
-            # across DP ranks would have some ranks skip the vision_tower call
-            # entirely, desyncing the FSDP2 all-gather collective and hanging
-            # training. Not enforced in code (would require inspecting every
-            # example up front); document it here and in the example yaml.
+            # MiniMax M3's vision_tower is its own FSDP2-sharded unit, so a batch
+            # mixing text-only and image-containing samples across DP ranks would
+            # desync the FSDP2 all-gather collective and hang training.
+            # dspark_vlm_collate_fn injects a masked fake image into any text-only
+            # example (mirroring default_collate_fn's own fake-image handling),
+            # so mixed corpora are safe here without any dataset curation.
             self.processor = build_minimax_m3_vl_processor(target_path, trust_remote_code=trust_remote_code)
             self.train_dataloader = build_dspark_vlm_dataloader(
                 dataset_cfg=self.cfg.dataset,
