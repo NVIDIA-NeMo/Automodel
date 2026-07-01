@@ -108,6 +108,42 @@ def test_local_seq_multiple(ratios, expected):
     assert dsv4_cp_local_seq_multiple(SimpleNamespace(config=cfg)) == expected
 
 
+def test_build_packed_seq_ids_handles_1d_padding_zero_and_truncation():
+    seq_ids = cpmod.build_packed_seq_ids(
+        torch.tensor([2, cpmod._SEQ_LENS_PADDING_VALUE, 0, 3]),
+        seq_len=4,
+        device=torch.device("cpu"),
+    )
+
+    torch.testing.assert_close(seq_ids, torch.tensor([[1, 1, 3, 3]]))
+
+
+def test_packed_cp_mask_gathers_metadata_and_applies_padding(monkeypatch):
+    gathered = iter(
+        (
+            torch.tensor([[0, 1, 0, 1]]),
+            torch.tensor([[1, 1, 2, 2]]),
+            torch.tensor([[False, False, False, True]]),
+        )
+    )
+    monkeypatch.setattr(cpmod, "dsv4_cp_all_gather_metadata", lambda *args, **kwargs: next(gathered))
+
+    mask = cpmod.build_dsv4_cp_packed_causal_padding_mask(
+        position_ids=torch.tensor([0, 1]),
+        packed_seq_ids=torch.tensor([2, 2]),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        cp_group=object(),
+        padding_mask=torch.tensor([[False, False]]),
+        sliding_window=2,
+    )
+
+    min_value = torch.finfo(torch.float32).min
+    expected = torch.full((1, 1, 2, 4), min_value)
+    expected[:, :, :, 2] = 0
+    torch.testing.assert_close(mask, expected)
+
+
 # --------------------------------------------------------------------------- #
 # make_dsv4_contiguous_shard_cp_batch_and_ctx                                   #
 # --------------------------------------------------------------------------- #
@@ -286,6 +322,58 @@ def test_contiguous_shard_packed_sequence_pads_each_doc_before_cp_slice():
     torch.testing.assert_close(rank0["seq_lens"], torch.tensor([[3, 2]]))
     torch.testing.assert_close(rank0["seq_lens_padded"], torch.tensor([[4, 4]]))
     assert rank0["qkv_format"] == "thd"
+
+
+def test_repad_packed_inputs_embeds_and_loss_mask_with_1d_lengths():
+    inputs_embeds = torch.arange(6, dtype=torch.float32).view(1, 3, 2)
+    batch = {
+        "inputs_embeds": inputs_embeds,
+        "labels": torch.tensor([[10, 11, 12]]),
+        "seq_lens": torch.tensor([2, 1]),
+        "seq_lens_padded": torch.tensor([2]),
+    }
+
+    out, loss_mask = cpmod._repad_dsv4_packed_batch(
+        batch,
+        cp_size=2,
+        pad_multiple=2,
+        padding_token_id=99,
+        loss_mask=torch.ones(1, 3),
+    )
+
+    assert out["inputs_embeds"].shape == (1, 4, 2)
+    torch.testing.assert_close(out["inputs_embeds"][0, :3], inputs_embeds[0])
+    torch.testing.assert_close(out["inputs_embeds"][0, 3], torch.zeros(2))
+    torch.testing.assert_close(out["labels"], torch.tensor([[10, 11, 12, -100]]))
+    torch.testing.assert_close(out["seq_lens"], torch.tensor([[2, 1]]))
+    torch.testing.assert_close(out["seq_lens_padded"], torch.tensor([[2, 2]]))
+    torch.testing.assert_close(loss_mask, torch.tensor([[1.0, 1.0, 1.0, 0.0]]))
+    torch.testing.assert_close(
+        cpmod._pad_1d([7], 3),
+        torch.tensor([7, cpmod._SEQ_LENS_PADDING_VALUE, cpmod._SEQ_LENS_PADDING_VALUE]),
+    )
+
+
+def test_repad_packed_batch_validates_labels_and_metadata_extent():
+    with pytest.raises(KeyError, match="labels"):
+        cpmod._repad_dsv4_packed_batch(
+            {"input_ids": torch.arange(2).view(1, 2), "seq_lens": torch.tensor([[2]])},
+            cp_size=1,
+            pad_multiple=2,
+            padding_token_id=0,
+        )
+
+    with pytest.raises(ValueError, match="metadata exceeds token row length"):
+        cpmod._repad_dsv4_packed_batch(
+            {
+                "input_ids": torch.arange(2).view(1, 2),
+                "labels": torch.arange(2).view(1, 2),
+                "seq_lens": torch.tensor([[3]]),
+            },
+            cp_size=1,
+            pad_multiple=2,
+            padding_token_id=0,
+        )
 
 
 def test_contiguous_shard_syncs_packed_length_for_hybridep(monkeypatch):

@@ -291,6 +291,12 @@ class TestDeepseekV4ModelSmoke:
         assert ignored_expert_params.issubset(parent_ignored)
         assert len(parent_ignored) == len(ignored_expert_params)
 
+    def test_dsv4_fp32_holder_preserves_explicit_no_reshard(self):
+        holder_type = type("DeepseekV4FP32Parameter", (torch.nn.Module,), {})
+        kwargs = {"reshard_after_forward": False, "mesh": object()}
+
+        assert dsv4_fsdp._fp32_module_fsdp_kwargs(holder_type(), kwargs) is kwargs
+
     def test_reference_fp32_parameters_constructed_before_cast(self):
         cfg = _tiny_config(
             num_hidden_layers=2,
@@ -540,6 +546,39 @@ class TestDeepseekV4ModelSmoke:
             )
 
         assert out.logits.shape == (1, 8, cfg.vocab_size)
+
+    def test_thd_cp_normalizes_packed_ids_and_derives_padding_mask(self, monkeypatch):
+        cfg = _tiny_config(num_hidden_layers=0, compress_ratios=[])
+        model = _make_model(cfg)
+        cp_group = object()
+        captured = {}
+
+        monkeypatch.setattr(dsv4_model_module, "dsv4_cp_enabled", lambda group: group is cp_group)
+
+        def fake_packed_cp_mask(**kwargs):
+            captured.update(kwargs)
+            seq_len = kwargs["position_ids"].shape[-1]
+            return torch.zeros(1, 1, seq_len, seq_len, dtype=kwargs["dtype"], device=kwargs["device"])
+
+        monkeypatch.setattr(dsv4_model_module, "build_dsv4_cp_packed_causal_padding_mask", fake_packed_cp_mask)
+
+        input_ids = torch.ones(1, 4, dtype=torch.long)
+        attention_mask = torch.tensor([[1, 1, 1, 0]])
+        with torch.no_grad():
+            out = model(
+                input_ids,
+                attention_mask=attention_mask,
+                qkv_format="thd",
+                seq_lens_padded=torch.tensor([[4]]),
+                packed_seq_ids=torch.ones(4, dtype=torch.int32),
+                _dsv4_cp_group=cp_group,
+            )
+
+        assert out.logits.shape == (1, 4, cfg.vocab_size)
+        assert captured["packed_seq_ids"].dtype == torch.long
+        assert captured["packed_seq_ids"].shape == (1, 4)
+        torch.testing.assert_close(captured["padding_mask"], torch.tensor([[False, False, False, True]]))
+        assert captured["cp_group"] is cp_group
 
     @_REQUIRES_CUDA
     def test_forward_shape(self):

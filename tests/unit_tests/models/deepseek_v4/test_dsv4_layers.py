@@ -303,6 +303,26 @@ class TestDeepseekV4AttentionMask:
 
         torch.testing.assert_close(actual, expected)
 
+    def test_compressed_window_metadata_handles_1d_mixed_and_short_windows(self):
+        seq_ids, positions = dsv4_layers._compressed_window_metadata(
+            seq_ids=torch.tensor([1, 1, 1, 1, 2, 2, 0, 0]),
+            position_ids=torch.tensor([0, 1, 2, 3, 0, 1, 0, 1]),
+            ready_len=8,
+            ratio=2,
+        )
+
+        torch.testing.assert_close(seq_ids, torch.tensor([[1, 1, 2, 0]]))
+        torch.testing.assert_close(positions, torch.tensor([[0, 1, 0, 0]]))
+
+        empty_seq_ids, empty_positions = dsv4_layers._compressed_window_metadata(
+            seq_ids=torch.tensor([1]),
+            position_ids=torch.tensor([0]),
+            ready_len=1,
+            ratio=2,
+        )
+        assert empty_seq_ids.shape == (1, 0)
+        assert empty_positions.shape == (1, 0)
+
     def test_overlap_pool_all_masked_padding_window_is_finite_zero(self):
         torch.manual_seed(1234)
         batch, n_windows, ratio, head_dim = 1, 2, 4, 3
@@ -364,6 +384,103 @@ class TestDeepseekV4AttentionMask:
 
         assert (real_topk[0, 5:] >= 0).sum(dim=-1).eq(0).all()
         assert (padded_topk[0, 5:] >= 0).sum(dim=-1).gt(0).all()
+
+    def test_packed_hca_uses_document_metadata_for_compressed_mask(self):
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        seq_len = cfg.compress_ratios[0]
+        hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, attention_mask = (
+            self._hca_inputs(cfg, seq_len)
+        )
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.eval()
+
+        with torch.no_grad():
+            _, attention_weights = attention(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_embeddings_compress=position_embeddings_compress,
+                rotary_compress=rotary_compress,
+                position_ids=torch.arange(seq_len),
+                packed_seq_ids=torch.ones(seq_len, dtype=torch.long),
+            )
+
+        assert attention_weights.shape[-1] == seq_len + 1
+        torch.testing.assert_close(
+            attention_weights[..., :-1, -1],
+            torch.zeros_like(attention_weights[..., :-1, -1]),
+            atol=0.0,
+            rtol=0.0,
+        )
+        assert (attention_weights[..., -1, -1] > 0).all()
+
+    def test_packed_csa_indexer_filters_compressed_keys_by_document(self):
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        cfg.compress_ratios = [4]
+        cfg.sliding_window = 8
+        seq_len = 8
+        hidden_states = torch.randn(1, seq_len, cfg.hidden_size)
+        position_ids = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
+        packed_seq_ids = torch.tensor([1, 1, 1, 1, 2, 2, 2, 2])
+        partial_rotary_factor = float(cfg.qk_rope_head_dim) / float(cfg.head_dim)
+        rotary = DeepseekV4RotaryEmbedding(
+            rope_theta=float(cfg.rope_theta),
+            head_dim=int(cfg.head_dim),
+            partial_rotary_factor=partial_rotary_factor,
+        )
+        rotary_compress = DeepseekV4RotaryEmbedding(
+            rope_theta=float(cfg.compress_rope_theta),
+            head_dim=int(cfg.head_dim),
+            partial_rotary_factor=partial_rotary_factor,
+        )
+        position_embeddings = rotary(hidden_states, position_ids.unsqueeze(0))
+        position_embeddings_compress = rotary_compress(hidden_states, position_ids.unsqueeze(0))
+        attention_mask = build_packed_causal_padding_mask(
+            torch.tensor([[4, 4]]),
+            seq_len=seq_len,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+            sliding_window=cfg.sliding_window,
+        )
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.eval()
+
+        with torch.no_grad():
+            _, attention_weights = attention(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_embeddings_compress=position_embeddings_compress,
+                rotary_compress=rotary_compress,
+                position_ids=position_ids,
+                packed_seq_ids=packed_seq_ids,
+            )
+
+        compressed_weights = attention_weights[..., -2:]
+        torch.testing.assert_close(
+            compressed_weights[..., [0, 1, 2, 4, 5, 6], :],
+            torch.zeros_like(compressed_weights[..., [0, 1, 2, 4, 5, 6], :]),
+            atol=0.0,
+            rtol=0.0,
+        )
+        assert (compressed_weights[..., 3, 0] > 0).all()
+        torch.testing.assert_close(
+            compressed_weights[..., 3, 1],
+            torch.zeros_like(compressed_weights[..., 3, 1]),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            compressed_weights[..., 7, 0],
+            torch.zeros_like(compressed_weights[..., 7, 0]),
+            atol=0.0,
+            rtol=0.0,
+        )
+        assert (compressed_weights[..., 7, 1] > 0).all()
 
     def test_short_hca_training_window_stays_disabled_without_group_hca(self):
         """All-short groups should keep the original no-HCA path and grad=None semantics."""

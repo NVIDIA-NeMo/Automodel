@@ -400,8 +400,14 @@ class TestModelSupportsCPWithSequencePacking:
         model._mesh = _mesh(cp=2)
         assert model.supports.supports_cp_with_sequence_packing is False
 
-    def test_deepseek_v4_cp_gt1_sequence_packing_unsupported(self):
+    def test_deepseek_v4_cp_gt1_sequence_packing_supported_with_tilelang(self):
         model = _DeepseekV4Like()
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is True
+
+    def test_deepseek_v4_cp_gt1_sequence_packing_rejects_sdpa(self):
+        model = _DeepseekV4Like(backend_attn="sdpa")
         _attach(model)
         model._mesh = _mesh(cp=2)
         assert model.supports.supports_cp_with_sequence_packing is False

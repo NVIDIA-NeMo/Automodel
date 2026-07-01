@@ -970,7 +970,9 @@ class DeepseekV4Compressor(nn.Module):
         if window_positions is not None:
             positions = (window_positions[:, : new_pooled.shape[1]] * self.compress_ratio).to(new_pooled.device)
         else:
-            positions = _rope_pool_positions(new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, batch)
+            positions = _rope_pool_positions(
+                new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, batch
+            )
         cos, sin = rotary(new_pooled, positions)
         new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
         pooled = cache.update_pool(new_pooled, layer_idx, "compressor_state").unsqueeze(1)
@@ -1014,7 +1016,9 @@ class DeepseekV4Compressor(nn.Module):
                 if q_seq.dim() == 1:
                     q_seq = q_seq.unsqueeze(0)
                 safe_topk = raw_topk.clamp(min=0, max=max(window_seq_ids.shape[-1] - 1, 0))
-                selected_seq = torch.gather(window_seq_ids.to(raw_topk.device).unsqueeze(1).expand(-1, seq_len, -1), -1, safe_topk)
+                selected_seq = torch.gather(
+                    window_seq_ids.to(raw_topk.device).unsqueeze(1).expand(-1, seq_len, -1), -1, safe_topk
+                )
                 selected_pos = torch.gather(
                     window_positions.to(raw_topk.device).unsqueeze(1).expand(-1, seq_len, -1),
                     -1,
