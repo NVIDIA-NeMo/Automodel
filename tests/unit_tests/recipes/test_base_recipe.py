@@ -20,9 +20,10 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.checkpoint.utils import _find_latest_checkpoint
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.recipes.base_recipe import BaseRecipe, _find_latest_checkpoint, is_distributed_stateful
+from nemo_automodel.recipes.base_recipe import BaseRecipe, is_distributed_stateful
 
 try:
     import expecttest
