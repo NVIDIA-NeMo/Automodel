@@ -396,6 +396,7 @@ class _HybridEPManager(_DispatchManager):
         permute_fusion: bool = False,
         moe_hybridep_num_sms: int = 24,
         moe_hybridep_num_sms_preprocessing: Optional[int] = None,
+        moe_hybridep_enable_custom_allgather: bool = True,
         moe_router_expert_pad_multiple: Optional[int] = None,
         moe_expert_rank_capacity_factor: Optional[float] = None,
     ):
@@ -406,6 +407,7 @@ class _HybridEPManager(_DispatchManager):
         self.permute_fusion = permute_fusion
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
         self.moe_hybridep_num_sms_preprocessing = moe_hybridep_num_sms_preprocessing
+        self.moe_hybridep_enable_custom_allgather = moe_hybridep_enable_custom_allgather
         self.num_permuted_tokens = None
         self.moe_expert_rank_capacity_factor: Optional[float] = None
         self.over_budget: Optional[torch.Tensor] = None
@@ -519,6 +521,7 @@ class _HybridEPManager(_DispatchManager):
             num_sms_dispatch_api=self.moe_hybridep_num_sms,
             num_sms_combine_api=self.moe_hybridep_num_sms,
             num_sms_preprocessing_api=self.moe_hybridep_num_sms_preprocessing,
+            enable_custom_allgather=self.moe_hybridep_enable_custom_allgather,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
         )
@@ -615,6 +618,9 @@ class TokenDispatcherConfig:
 
     moe_hybridep_num_sms_preprocessing: Optional[int] = None
     """Optional number of SMs to use for HybridEP routing-metadata preprocessing."""
+
+    moe_hybridep_enable_custom_allgather: bool = True
+    """Use HybridEP's custom intra-NVLink routing-map all-gather."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
     """Static HybridEP receive budget relative to balanced per-rank routing.
@@ -763,6 +769,7 @@ class MoEFlexTokenDispatcher:
                         *shared_key,
                         self.config.moe_hybridep_num_sms,
                         self.config.moe_hybridep_num_sms_preprocessing,
+                        self.config.moe_hybridep_enable_custom_allgather,
                     ),
                     lambda: _HybridEPManager(
                         group=ep_group,
@@ -772,6 +779,7 @@ class MoEFlexTokenDispatcher:
                         permute_fusion=self.config.moe_permute_fusion,
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                         moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
+                        moe_hybridep_enable_custom_allgather=self.config.moe_hybridep_enable_custom_allgather,
                         moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
                         moe_expert_rank_capacity_factor=self.config.moe_expert_rank_capacity_factor,
                     ),
@@ -785,6 +793,7 @@ class MoEFlexTokenDispatcher:
                     permute_fusion=self.config.moe_permute_fusion,
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                     moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
+                    moe_hybridep_enable_custom_allgather=self.config.moe_hybridep_enable_custom_allgather,
                     moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
                     moe_expert_rank_capacity_factor=self.config.moe_expert_rank_capacity_factor,
                 )

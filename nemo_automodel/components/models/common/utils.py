@@ -181,6 +181,9 @@ class BackendConfig:
             "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
         dispatcher_num_sms_preprocessing: Optional number of SMs for HybridEP's routing-metadata
             preprocessing kernel. None preserves the HybridEP library default.
+        dispatcher_hybridep_enable_custom_allgather: Whether HybridEP uses its custom
+            intra-NVLink routing-map all-gather. Disable this to use the process group's
+            ``all_gather_into_tensor`` implementation instead.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
@@ -269,6 +272,7 @@ class BackendConfig:
     )
     dispatcher_num_sms: int = 20
     dispatcher_num_sms_preprocessing: int | None = None
+    dispatcher_hybridep_enable_custom_allgather: bool = True
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
@@ -336,6 +340,11 @@ class BackendConfig:
                 raise ValueError("dispatcher_num_sms_preprocessing must be a positive integer or None")
             if self.dispatcher != "hybridep":
                 raise ValueError("dispatcher_num_sms_preprocessing requires dispatcher='hybridep'")
+
+        if not isinstance(self.dispatcher_hybridep_enable_custom_allgather, bool):
+            raise ValueError("dispatcher_hybridep_enable_custom_allgather must be a boolean")
+        if not self.dispatcher_hybridep_enable_custom_allgather and self.dispatcher != "hybridep":
+            raise ValueError("dispatcher_hybridep_enable_custom_allgather=False requires dispatcher='hybridep'")
 
         # Backward compatibility
         if self.experts in ("te", "te_ops", "gmm") and self.dispatcher not in (

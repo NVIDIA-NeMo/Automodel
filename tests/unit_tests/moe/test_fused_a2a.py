@@ -68,7 +68,8 @@ def test_free_buffer_swallows_destroy_errors():
 
 
 @pytest.mark.parametrize("preprocessing_sms", [None, 32])
-def test_init_hybrid_ep_buffer_preserves_default_or_forwards_preprocessing_sms(preprocessing_sms):
+@pytest.mark.parametrize("enable_custom_allgather", [True, False])
+def test_init_hybrid_ep_buffer_forwards_optional_tuning(preprocessing_sms, enable_custom_allgather):
     """The opt-in knob maps exactly to HybridEPBuffer without overriding its default."""
     group = object()
     with mock.patch.object(fused_a2a, "HybridEPBuffer", create=True) as buffer_cls:
@@ -81,6 +82,7 @@ def test_init_hybrid_ep_buffer_preserves_default_or_forwards_preprocessing_sms(p
             num_sms_combine_api=24,
             fp8_dispatch=False,
             num_sms_preprocessing_api=preprocessing_sms,
+            enable_custom_allgather=enable_custom_allgather,
         )
 
     buffer_kwargs = buffer_cls.call_args.kwargs
@@ -88,7 +90,8 @@ def test_init_hybrid_ep_buffer_preserves_default_or_forwards_preprocessing_sms(p
         assert "num_sms_preprocessing_api" not in buffer_kwargs
     else:
         assert buffer_kwargs["num_sms_preprocessing_api"] == preprocessing_sms
-    assert fused_a2a._hybrid_ep_buffer_identity[-1] == preprocessing_sms
+    assert buffer_kwargs["enable_custom_allgather"] is enable_custom_allgather
+    assert fused_a2a._hybrid_ep_buffer_identity[-2:] == (preprocessing_sms, enable_custom_allgather)
 
 
 def test_hybrid_ep_buffer_identity_rejects_preprocessing_sms_changes():
@@ -118,6 +121,38 @@ def test_hybrid_ep_buffer_identity_rejects_preprocessing_sms_changes():
             None,
             None,
             32,
+        )
+
+
+def test_hybrid_ep_buffer_identity_rejects_custom_allgather_changes():
+    """A process-global buffer cannot silently change the all-gather implementation."""
+    group = object()
+    fused_a2a._hybrid_ep_buffer = mock.MagicMock()
+    fused_a2a._hybrid_ep_buffer_identity = fused_a2a._get_hybrid_ep_buffer_identity(
+        group,
+        hidden_dim=128,
+        num_local_experts=2,
+        num_sms_dispatch_api=24,
+        num_sms_combine_api=24,
+        fp8_dispatch=False,
+        num_sms_preprocessing_api=None,
+        enable_custom_allgather=True,
+    )
+
+    with pytest.raises(RuntimeError, match="different communication or geometry settings"):
+        fused_a2a.HybridEPDispatch.forward(
+            mock.Mock(),
+            mock.Mock(shape=(64, 128)),
+            mock.Mock(),
+            mock.Mock(),
+            group,
+            2,
+            24,
+            24,
+            None,
+            None,
+            None,
+            False,
         )
 
 

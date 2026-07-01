@@ -377,6 +377,7 @@ def _get_hybrid_ep_buffer_identity(
     num_sms_combine_api: int,
     fp8_dispatch: bool,
     num_sms_preprocessing_api: int | None,
+    enable_custom_allgather: bool = True,
 ) -> tuple:
     """Return immutable settings that determine a HybridEP buffer instance."""
     return (
@@ -387,6 +388,7 @@ def _get_hybrid_ep_buffer_identity(
         num_sms_combine_api,
         fp8_dispatch,
         num_sms_preprocessing_api,
+        enable_custom_allgather,
     )
 
 
@@ -399,6 +401,7 @@ def init_hybrid_ep_buffer(
     num_sms_combine_api: int,
     fp8_dispatch: bool,
     num_sms_preprocessing_api: int | None = None,
+    enable_custom_allgather: bool = True,
 ) -> None:
     """Initialize the HybridEP buffer, including buffer allocation and metadata initialization.
 
@@ -415,6 +418,7 @@ def init_hybrid_ep_buffer(
         num_sms_combine_api: Number of SMs used by the combine API.
         fp8_dispatch: Whether to use FP8 communication during the dispatch phase.
         num_sms_preprocessing_api: Optional number of SMs used by the routing-metadata preprocessing API.
+        enable_custom_allgather: Whether to use HybridEP's custom intra-NVLink routing-map all-gather.
     """
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer, _hybrid_ep_buffer_identity
@@ -430,6 +434,7 @@ def init_hybrid_ep_buffer(
         max_num_of_tokens_per_rank=seq_len,
         num_local_experts=num_local_experts,
         use_fp8=fp8_dispatch,
+        enable_custom_allgather=enable_custom_allgather,
         **buffer_kwargs,
     )
     _hybrid_ep_buffer_identity = _get_hybrid_ep_buffer_identity(
@@ -440,6 +445,7 @@ def init_hybrid_ep_buffer(
         num_sms_combine_api,
         fp8_dispatch,
         num_sms_preprocessing_api,
+        enable_custom_allgather,
     )
 
 
@@ -466,6 +472,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=None,
+        enable_custom_allgather=True,
     ):
         """Forward pass of fused dispatch of the HybridEP backend."""
         fp8_dispatch = False
@@ -478,6 +485,7 @@ class HybridEPDispatch(torch.autograd.Function):
             num_sms_combine_api,
             fp8_dispatch,
             num_sms_preprocessing_api,
+            enable_custom_allgather,
         )
         if _hybrid_ep_buffer is None:
             init_hybrid_ep_buffer(
@@ -489,6 +497,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_sms_combine_api,
                 fp8_dispatch,
                 num_sms_preprocessing_api,
+                enable_custom_allgather,
             )
         elif _hybrid_ep_buffer_identity != buffer_identity:
             raise RuntimeError(
@@ -530,7 +539,7 @@ class HybridEPDispatch(torch.autograd.Function):
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
             hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
         )
-        return combined_hidden, None, combined_probs, None, None, None, None, None, None, None
+        return combined_hidden, None, combined_probs, None, None, None, None, None, None, None, None
 
 
 class HybridEPCombine(torch.autograd.Function):
@@ -581,6 +590,7 @@ if HAVE_HYBRIDEP:
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=None,
+        enable_custom_allgather=True,
     ):
         """Perform fused dispatch for permute + dispatch a2a + permute using the HybridEP backend."""
         return HybridEPDispatch.apply(
@@ -594,6 +604,7 @@ if HAVE_HYBRIDEP:
             num_permuted_tokens,
             pad_multiple,
             num_sms_preprocessing_api,
+            enable_custom_allgather,
         )
 
     def hybrid_ep_combine(x, handle, num_permuted_tokens=None, pad_multiple=None):

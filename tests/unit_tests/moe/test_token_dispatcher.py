@@ -141,6 +141,7 @@ def test_hybridep_manager_forwards_preprocessing_sms_with_dynamic_receive_sizing
             num_experts=8,
             router_topk=2,
             moe_hybridep_num_sms_preprocessing=32,
+            moe_hybridep_enable_custom_allgather=False,
         )
         manager.setup_metadata(
             torch.tensor([[True, False, True, False, False, False, False, False]]),
@@ -149,6 +150,7 @@ def test_hybridep_manager_forwards_preprocessing_sms_with_dynamic_receive_sizing
         manager.dispatch(torch.randn(1, 8))
 
     assert captured_kwargs["num_sms_preprocessing_api"] == 32
+    assert captured_kwargs["enable_custom_allgather"] is False
     assert captured_kwargs["num_permuted_tokens"] is None
     assert manager.num_permuted_tokens == 4
 
@@ -382,12 +384,23 @@ def test_hybridep_shared_manager_identity_includes_preprocessing_sms_for_ep():
                 config=TokenDispatcherConfig(**config_kwargs, moe_hybridep_num_sms_preprocessing=32),
                 ep_group=group,
             )
+            nccl_dispatcher = MoEFlexTokenDispatcher(
+                num_local_experts=4,
+                local_expert_indices=list(range(4)),
+                config=TokenDispatcherConfig(
+                    **config_kwargs,
+                    moe_hybridep_num_sms_preprocessing=32,
+                    moe_hybridep_enable_custom_allgather=False,
+                ),
+                ep_group=group,
+            )
     finally:
         MoEFlexTokenDispatcher.shared_hybridep_manager = saved_alias
         MoEFlexTokenDispatcher._shared_hybridep_managers = saved_cache
 
     assert default_dispatcher._comm_manager is not tuned_dispatcher._comm_manager
     assert tuned_dispatcher._comm_manager is tuned_dispatcher_again._comm_manager
+    assert nccl_dispatcher._comm_manager is not tuned_dispatcher._comm_manager
 
 
 def test_hybridep_metadata_processor_matches_manager_and_preserves_prob_grads():

@@ -626,6 +626,25 @@ class TestBackendConfigHybridEP:
         with pytest.raises(ValueError, match="requires dispatcher='hybridep'"):
             BackendConfig(dispatcher="deepep", dispatcher_num_sms_preprocessing=32)
 
+    def test_hybridep_custom_allgather_is_enabled_by_default(self):
+        config = BackendConfig(dispatcher="hybridep")
+
+        assert config.dispatcher_hybridep_enable_custom_allgather is True
+
+    def test_hybridep_custom_allgather_can_be_disabled(self):
+        config = BackendConfig(dispatcher="hybridep", dispatcher_hybridep_enable_custom_allgather=False)
+
+        assert config.dispatcher_hybridep_enable_custom_allgather is False
+
+    @pytest.mark.parametrize("value", [None, 0, 1, "false"])
+    def test_hybridep_custom_allgather_requires_boolean(self, value):
+        with pytest.raises(ValueError, match="must be a boolean"):
+            BackendConfig(dispatcher="hybridep", dispatcher_hybridep_enable_custom_allgather=value)
+
+    def test_disabling_hybridep_custom_allgather_requires_hybridep(self):
+        with pytest.raises(ValueError, match="requires dispatcher='hybridep'"):
+            BackendConfig(dispatcher="deepep", dispatcher_hybridep_enable_custom_allgather=False)
+
     def test_dispatcher_share_token_dispatcher_default(self):
         """Test that dispatcher_share_token_dispatcher defaults to enabled."""
         config = BackendConfig(dispatcher="deepep")

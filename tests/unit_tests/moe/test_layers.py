@@ -1302,6 +1302,7 @@ class TestMoE:
             experts="te_ops",
             dispatcher="hybridep",
             dispatcher_num_sms_preprocessing=32,
+            dispatcher_hybridep_enable_custom_allgather=False,
         )
         with (
             patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2),
@@ -1311,6 +1312,7 @@ class TestMoE:
 
         te_ops_experts.assert_called_once()
         assert te_ops_experts.call_args.kwargs["dispatcher_num_sms_preprocessing"] == 32
+        assert te_ops_experts.call_args.kwargs["dispatcher_hybridep_enable_custom_allgather"] is False
         assert moe.experts is te_ops_experts.return_value
 
     def test_moe_init_with_gmm_experts_with_deepep(self, moe_config, backend_config):
@@ -1352,6 +1354,7 @@ class TestMoE:
             dispatcher="hybridep",
             dispatcher_num_sms=12,
             dispatcher_num_sms_preprocessing=32,
+            dispatcher_hybridep_enable_custom_allgather=False,
             dispatcher_share_token_dispatcher=False,
             dispatcher_async_dispatch=True,
         )
@@ -1362,6 +1365,7 @@ class TestMoE:
         assert moe.experts.dispatcher_backend == "hybridep"
         assert moe.experts.dispatcher_num_sms == 12
         assert moe.experts.dispatcher_num_sms_preprocessing == 32
+        assert moe.experts.dispatcher_hybridep_enable_custom_allgather is False
         assert moe.experts.dispatcher_share_token_dispatcher is False
         assert moe.experts.dispatcher_async_dispatch is True
 
