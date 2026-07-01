@@ -73,3 +73,58 @@ def test_negative_one_layer_id_is_accepted():
     input_ids = torch.randint(0, VOCAB, (1, 8))
     batch = wrapper.generate_batch(input_ids, torch.ones_like(input_ids), torch.ones_like(input_ids, dtype=torch.uint8))
     assert batch.target_hidden_states.shape == (1, 8, HIDDEN)
+
+
+def _spy_on_forward(target):
+    """Wrap ``target``'s bound ``forward`` to record the kwargs it was called
+    with, while still delegating to the real forward (Qwen3's forward accepts
+    arbitrary ``**kwargs``, so passing e.g. ``pixel_values`` does not error)."""
+    received = {}
+    original_forward = target.forward
+
+    def _recording_forward(**kwargs):
+        received.update(kwargs)
+        return original_forward(**kwargs)
+
+    target.forward = _recording_forward
+    return received
+
+
+def test_generate_batch_forwards_multimodal_kwargs_when_present():
+    target = _tiny_target()
+    received = _spy_on_forward(target)
+    wrapper = HFDSparkTargetModel(target, target_layer_ids=[-1])
+
+    input_ids = torch.randint(0, VOCAB, (1, 8))
+    attention_mask = torch.ones_like(input_ids)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.uint8)
+    pixel_values = torch.randn(2, 3, 4, 4)
+    image_grid_thw = torch.tensor([[1, 2, 2]])
+
+    wrapper.generate_batch(
+        input_ids,
+        attention_mask,
+        loss_mask,
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+    )
+
+    assert received["pixel_values"] is pixel_values
+    assert received["image_grid_thw"] is image_grid_thw
+    assert "pixel_values_videos" not in received
+    assert "video_grid_thw" not in received
+
+
+def test_generate_batch_backward_compatible_without_multimodal_kwargs():
+    target = _tiny_target()
+    received = _spy_on_forward(target)
+    wrapper = HFDSparkTargetModel(target, target_layer_ids=[-1])
+
+    input_ids = torch.randint(0, VOCAB, (1, 8))
+    wrapper.generate_batch(input_ids, torch.ones_like(input_ids), torch.ones_like(input_ids, dtype=torch.uint8))
+
+    # None of the multimodal keys are ever added -- not even as `None` -- so a
+    # plain text-only target's forward call is byte-for-byte what it was before.
+    for key in ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"):
+        assert key not in received
+    assert set(received) == {"input_ids", "attention_mask", "use_cache"}

@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
+from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 
 
 @dataclass
@@ -113,6 +114,7 @@ class HFDSparkTargetModel:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        **mm_kwargs: torch.Tensor,
     ) -> DSparkTargetBatch:
         """Run the target model once and capture the DSpark context + last hidden state.
 
@@ -121,6 +123,15 @@ class HFDSparkTargetModel:
         ``output_hidden_states[num_layers]``), and any other id is that decoder
         layer's output. The final-norm output is also returned as the last hidden
         state for the TV / confidence losses.
+
+        ``mm_kwargs`` carries any multimodal inputs present in the training batch
+        (``pixel_values``, ``image_grid_thw``, ...); :func:`filter_forward_kwargs`
+        drops whatever the target's own forward signature does not accept, so a
+        text-only target (Qwen3, Gemma4, or MiniMax M3 without multimodal training
+        data) is never passed inputs it cannot handle -- this is a no-behavior-change
+        extension for every existing (``mm_kwargs``-empty) caller. A VLM target
+        (e.g. MiniMax M3) splices the vision features into its embedding sequence
+        internally when they are provided.
         """
         layers = self._get_transformer_layers()
         last = self._num_layers - 1
@@ -142,8 +153,13 @@ class HFDSparkTargetModel:
         # last-layer feature (post-norm), matching the HF offset-1 convention.
         handles.append(self._get_final_norm().register_forward_hook(_make_hook("norm")))
 
+        forward_kwargs = filter_forward_kwargs(
+            self.model,
+            dict(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, **mm_kwargs),
+        )
+
         try:
-            self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+            self.model(**forward_kwargs)
         finally:
             for handle in handles:
                 handle.remove()
