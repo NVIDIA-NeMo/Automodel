@@ -229,9 +229,7 @@ def _resolve_dspark_optimizer_spec(opt_cfg) -> tuple[str, dict]:
     """
     kwargs = dict(opt_cfg.to_dict())
     target = (
-        opt_cfg.get_as_string("_target_", None)
-        if hasattr(opt_cfg, "get_as_string")
-        else kwargs.get("_target_", None)
+        opt_cfg.get_as_string("_target_", None) if hasattr(opt_cfg, "get_as_string") else kwargs.get("_target_", None)
     )
     kwargs.pop("_target_", None)
     kwargs.pop("warmup_ratio", None)
