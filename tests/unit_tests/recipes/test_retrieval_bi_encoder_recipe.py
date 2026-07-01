@@ -27,6 +27,7 @@ from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     _unwrap_model_for_attrs,
     _uses_multi_vector_scoring,
 )
+from nemo_automodel.recipes.retrieval.train_cross_encoder import TrainCrossEncoderRecipe
 
 
 class _RetrieverAttrs(torch.nn.Module):
@@ -179,3 +180,38 @@ def test_retrieval_optim_step_keeps_sharded_clip_path_for_fsdp2(monkeypatch):
     recipe._run_train_optim_step([{}], max_grad_norm=1.0)
 
     assert captured["use_torch_clip_grad_norm"] is False
+
+
+class _FakeCrossEncoder(torch.nn.Module):
+    def forward(self, **kwargs):
+        return SimpleNamespace(
+            logits=torch.tensor([[2.0], [1.0], [1.0], [2.0]], requires_grad=True),
+        )
+
+
+def test_cross_encoder_forward_backward_accepts_prefetched_batch():
+    recipe = TrainCrossEncoderRecipe.__new__(TrainCrossEncoderRecipe)
+    recipe.dist_env = SimpleNamespace(device=torch.device("meta"))
+    recipe.distributed_config = SimpleNamespace(autocast_dtype=None)
+    recipe.model_parts = [_FakeCrossEncoder()]
+    recipe.train_n_passages = 2
+    recipe._acc_buffer = []
+
+    batch = {
+        "input_ids": torch.ones(4, 3),
+        "attention_mask": torch.ones(4, 3),
+        "labels": torch.tensor([0, 1]),
+    }
+    loss_buffer = []
+
+    recipe._forward_backward_step(
+        0,
+        batch,
+        loss_buffer=loss_buffer,
+        num_batches=1,
+        is_train=False,
+        batch_is_on_device=True,
+    )
+
+    assert len(loss_buffer) == 1
+    assert len(recipe._acc_buffer) == 1

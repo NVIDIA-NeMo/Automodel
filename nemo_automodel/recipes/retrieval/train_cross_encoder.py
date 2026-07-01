@@ -87,12 +87,15 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
 
         torch.cuda.reset_peak_memory_stats()
 
-    def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
+    def _forward_backward_step(
+        self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True, batch_is_on_device: bool = False
+    ):
         """Forward and backward pass for a single micro-batch."""
-        batch = {
-            k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-            for k, v in batch.items()
-        }
+        if not batch_is_on_device:
+            batch = {
+                k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
         labels = batch.pop("labels")
 
         model = self.model_parts[0]
