@@ -2837,7 +2837,7 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
 
         fp8_active = FP8GlobalStateManager.is_fp8_enabled()
         fc2_extra_inputs = (tokens_per_expert, permuted_probs) if self.expert_bias else (tokens_per_expert,)
-        if self._te_ops_paged_stash_requested:
+        if getattr(self, "_te_ops_paged_stash_requested", False):
             from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
 
             stash_group = get_paged_stash_manager().group(
@@ -2846,6 +2846,7 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
                 num_tokens_tensor=tokens_per_expert.sum(),
                 tokens_per_expert=tokens_per_expert,
             )
+            permuted_local_hidden_states = stash_group.start(permuted_local_hidden_states)
             with stash_group:
                 output = self._te_grouped_mlp(
                     permuted_local_hidden_states,

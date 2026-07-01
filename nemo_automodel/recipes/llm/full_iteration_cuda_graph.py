@@ -349,12 +349,15 @@ class FullIterationCudaGraphManager:
 
     def _destroy_graph(self) -> None:
         graph = self._graph
-        self._result = None
-        self._graph = None
         if graph is not None:
             reset = getattr(graph, "reset", None)
             if callable(reset):
                 reset()
+        # Keep the graph and every object it may reference alive when reset()
+        # fails. Callers use the non-None graph as proof that graph-owned
+        # storage must not be released during exceptional teardown.
+        self._result = None
+        self._graph = None
 
     def _poison(self, reason: str) -> None:
         if self._graph is not None and torch.cuda.is_available():

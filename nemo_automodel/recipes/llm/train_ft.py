@@ -30,7 +30,7 @@ import inspect
 import logging
 import pathlib
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from typing import TYPE_CHECKING, Any, Optional
 
 import mlflow
@@ -665,6 +665,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.partial_cuda_graph_manager = None
         self._partial_cuda_graph_capture_pending = False
         self.full_iteration_cuda_graph_manager = None
+        self._full_iteration_abandoned_graph_manager = None
         self._full_iteration_num_label_tokens: int | None = None
         self._full_iteration_num_label_tokens_tensor: torch.Tensor | None = None
         self._full_iteration_label_normalizer_mode: bool | None = None
@@ -1070,6 +1071,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 "Full-iteration CUDA graphs are enabled with PyTorch activation checkpointing; "
                 "paged expert stashing is disabled because nested saved_tensors_hooks are not yet supported"
             )
+        elif paged_stash_enabled:
+            # This mode is intentionally armed only after the PP1/CP1 checks
+            # above. It uses a persistent side stream captured as part of the
+            # full-iteration graph; other schedules retain same-stream stashing.
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            get_paged_stash_manager().configure_full_iteration_stream_overlap(enabled=True)
 
         self._full_iteration_backend = backend
         self._full_iteration_dispatchers = tuple(dispatchers)
@@ -1683,6 +1691,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     f"{dtype}:{hidden_size}": tokens for (dtype, hidden_size), tokens in stash["buffer_tokens"].items()
                 },
                 "live_groups": stash["live_groups"],
+                "stream_overlap": stash["full_iteration_stream_overlap"],
+                "transfer_stream_status": stash["transfer_stream_status"],
+                "backward_schedule_depth": stash["backward_schedule_depth"],
             }
         return diagnostics
 
@@ -1718,8 +1729,40 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         self._maybe_prepare_full_iteration_paged_stash()
         self._reset_full_iteration_dispatch_overflow()
-        loss_buffer = manager.run(batches)
-        over_budget_ranks, stash_overflow_ranks = self._collect_full_iteration_overflow()
+        try:
+            loss_buffer = manager.run(batches)
+            over_budget_ranks, stash_overflow_ranks = self._collect_full_iteration_overflow()
+        except Exception:
+            # Exceptional cleanup must not replace the original execution
+            # failure. Destroy the graph before releasing any page buffers it
+            # may reference; normal teardown remains strict and diagnostic.
+            graph_destroyed = False
+            try:
+                manager.reset()
+            except Exception:
+                pass
+            else:
+                graph_destroyed = True
+            if graph_destroyed:
+                with suppress(Exception):
+                    self._release_full_iteration_backend_handles()
+                if self._full_iteration_paged_stash_enabled:
+                    with suppress(Exception):
+                        from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+                        get_paged_stash_manager().force_abort_after_error()
+            else:
+                # Retain the manager (and therefore the live CUDAGraph) until
+                # process teardown. The process-global stash manager retains
+                # its page buffers, so their destruction cannot race the graph.
+                self._full_iteration_abandoned_graph_manager = manager
+            # Do not let the outer recipe finally block retry strict teardown
+            # and replace this error. If graph destruction itself failed, its
+            # storage is intentionally leaked until process teardown rather
+            # than freeing buffers still referenced by a live graph.
+            self.full_iteration_cuda_graph_manager = None
+            self._full_iteration_paged_stash_enabled = False
+            raise
         if over_budget_ranks == 0 and stash_overflow_ranks == 0:
             return loss_buffer
 

@@ -19,6 +19,17 @@ scalar directly, pack only live rows into fixed page buffers, and restore those
 rows immediately before expert backward. This avoids a device-to-host sync and
 does not freeze expert splits.
 
+The PP1 full-iteration runner may opt into a dedicated transfer stream. Packing
+then overlaps the token-unpermutation and intervening transformer work, and is
+joined before the next expert starts. Reload uses the same stream (the circular
+page allocator is not safe across independent pack/unpack streams). After each
+expert backward, the next LIFO expert group is prefetched while the main stream
+continues through intervening backward work; its post-expert boundary rejoins
+before saved tensors are exposed to autograd. The current PP1 immediate-F/B
+recipe validates that LIFO order. General PP/VP or interleaved schedules require
+recorded schedule metadata like Megatron's and are deliberately not inferred
+from group IDs.
+
 This module deliberately owns only activation storage. A full-iteration CUDA
 graph still needs a separately fixed HybridEP dispatch shape and a global
 overflow rerun policy. The first eager forward/backward records peak page usage;
@@ -188,11 +199,16 @@ class _PagedTensor:
         """Drop the source after its same-stream stash kernel has been enqueued."""
         self._original_tensor = None
 
-    def reload(self, buffer: _PagedStashBuffer) -> None:
-        """Allocate the original fixed shape and restore its live rows."""
+    def allocate_for_reload(self) -> None:
+        """Allocate the fixed destination on the main graph stream."""
         if self._tensor is not None:
             raise RuntimeError("Paged tensor was restored more than once")
         self._tensor = torch.empty(self.original_shape, dtype=self.dtype, device=self.device)
+
+    def reload(self, buffer: _PagedStashBuffer) -> None:
+        """Restore live rows into a destination allocated by the caller."""
+        if self._tensor is None:
+            raise RuntimeError("Paged tensor reload requires a preallocated destination")
         storage_dtype = _storage_dtype(self.dtype)
         destination = self._tensor.view(storage_dtype).reshape(self.effective_max_num_tokens, self.hidden_size)
         grid = (max(1, min(self.effective_max_num_tokens, 2048)),)
@@ -245,8 +261,33 @@ class _PagedStashBoundary(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:
-        ctx.manager._reload_group(ctx.group_id)
+        ctx.manager._begin_group_backward(ctx.group_id)
         return grad_output, None, None
+
+
+class _PagedStashPreBoundary(torch.autograd.Function):
+    """Start the next PP1 LIFO reload after this expert backward completes."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        input_: torch.Tensor,
+        backward_anchor: torch.Tensor,
+        manager: PagedStashManager,
+        group_id: int,
+    ) -> torch.Tensor:
+        del backward_anchor
+        ctx.manager = manager
+        ctx.group_id = group_id
+        ctx.input_requires_grad = input_.requires_grad
+        ctx.active = manager._state is _PagedStashState.ACTIVE
+        return input_
+
+    @staticmethod
+    def backward(ctx: Any, grad_input: torch.Tensor) -> tuple[torch.Tensor | None, None, None, None]:
+        if ctx.active:
+            ctx.manager._finish_group_backward(ctx.group_id)
+        return grad_input if ctx.input_requires_grad else None, None, None, None
 
 
 class _PagedStashGroup:
@@ -257,6 +298,24 @@ class _PagedStashGroup:
         self.state = state
         self._hooks: Any = None
         self._exited = False
+        self._started = False
+
+    def start(self, input_: torch.Tensor) -> torch.Tensor:
+        """Attach the post-expert-backward prefetch boundary when requested."""
+        if self.state is None:
+            return input_
+        if (
+            self.manager._state in (_PagedStashState.RECORDING, _PagedStashState.ACTIVE)
+            and self.manager._full_iteration_stream_overlap
+        ):
+            self._started = True
+            return _PagedStashPreBoundary.apply(
+                input_,
+                self.manager._get_backward_anchor(input_),
+                self.manager,
+                self.state.group_id,
+            )
+        return input_
 
     def __enter__(self) -> _PagedStashGroup:
         if self.state is not None:
@@ -283,6 +342,12 @@ class _PagedStashGroup:
             raise RuntimeError("Paged stash group must exit its context before commit()")
         if self.state is None:
             return output
+        if (
+            self.manager._state is _PagedStashState.ACTIVE
+            and self.manager._full_iteration_stream_overlap
+            and not self._started
+        ):
+            raise RuntimeError("Full-iteration paged stash requires start() before expert compute")
         return self.manager._commit_group(self.state.group_id, output)
 
 
@@ -303,6 +368,15 @@ class PagedStashManager:
         self._recording_invalid_reason: str | None = None
         self._buffers: dict[tuple[torch.dtype, int], _PagedStashBuffer] = {}
         self._overflow: torch.Tensor | None = None
+        self._full_iteration_stream_overlap = False
+        self._transfer_stream: Any = None
+        self._transfer_stream_status = "idle"
+        self._pending_original_releases: list[_PagedTensor] = []
+        self._backward_group_stack: list[int] = []
+        self._prefetched_group_id: int | None = None
+        self._backward_in_progress_group_id: int | None = None
+        self._groups_without_stash: set[int] = set()
+        self._backward_anchor: torch.Tensor | None = None
 
     @property
     def is_enabled(self) -> bool:
@@ -345,6 +419,78 @@ class PagedStashManager:
         self._buffer_size_factor = buffer_size_factor
         self._state = _PagedStashState.RECORDING
 
+    def configure_full_iteration_stream_overlap(self, *, enabled: bool) -> None:
+        """Opt into the PP1 full-iteration transfer-stream contract.
+
+        This is intentionally configured by the recipe only after its PP1/CP1
+        immediate-forward/backward eligibility checks. The stream itself is
+        created by :meth:`prepare`, before active warmup and graph capture.
+        """
+        if self._current_group is not None or self._group_tensors:
+            raise RuntimeError("Cannot change paged-stash stream overlap while groups are live")
+        if self._transfer_stream_status != "idle" or self._pending_original_releases:
+            raise RuntimeError("Cannot change paged-stash stream overlap while a transfer is pending")
+        if (
+            self._backward_group_stack
+            or self._prefetched_group_id is not None
+            or self._backward_in_progress_group_id is not None
+        ):
+            raise RuntimeError("Cannot change paged-stash stream overlap while a backward schedule is live")
+        if self._groups_without_stash:
+            raise RuntimeError("Cannot change paged-stash stream overlap while expert boundaries are live")
+        if enabled and self._state is _PagedStashState.DISABLED:
+            raise RuntimeError("Paged-stash stream overlap requires an enabled manager")
+        self._full_iteration_stream_overlap = bool(enabled)
+        if not enabled:
+            self._transfer_stream = None
+
+    def _require_transfer_stream(self) -> Any:
+        if self._transfer_stream is None:
+            raise RuntimeError(
+                "Paged-stash transfer stream was not created before active execution; "
+                "prepare the stash before CUDA graph capture"
+            )
+        return self._transfer_stream
+
+    def _get_backward_anchor(self, input_: torch.Tensor) -> torch.Tensor:
+        """Return a persistent grad edge even when an expert input is frozen.
+
+        The pre-expert boundary must run after expert backward to clear the
+        current group and prefetch the next one. A custom Function whose only
+        tensor input does not require gradients has no backward node, even
+        though trainable expert weights can make the expert output require
+        gradients. This scalar supplies that edge without accumulating a grad.
+        """
+        anchor = self._backward_anchor
+        if anchor is None:
+            anchor = torch.empty((), dtype=torch.float32, device=input_.device, requires_grad=True)
+            self._backward_anchor = anchor
+        elif anchor.device != input_.device:
+            raise RuntimeError(
+                f"Paged-stash backward anchor is on {anchor.device}, but the expert input is on {input_.device}"
+            )
+        return anchor
+
+    def _release_pending_originals(self) -> None:
+        while self._pending_original_releases:
+            self._pending_original_releases.pop(0).release_original()
+
+    def _wait_for_stash_to_complete(self) -> None:
+        """Join an asynchronous pack before another expert can reuse storage."""
+        if not self._full_iteration_stream_overlap:
+            return
+        if self._transfer_stream_status == "packing":
+            torch.cuda.current_stream().wait_stream(self._require_transfer_stream())
+            self._transfer_stream_status = "idle"
+            self._release_pending_originals()
+        elif self._transfer_stream_status == "reloading":
+            raise RuntimeError(
+                "PP1 paged-stash reload prefetch reached a new forward expert; "
+                "this schedule requires explicit PP/VP metadata"
+            )
+        elif self._pending_original_releases:
+            raise RuntimeError("Paged stash has pending source tensors without an active pack")
+
     @contextlib.contextmanager
     def disabled(self) -> Iterator[None]:
         """Temporarily bypass hooks, including around unvalidated checkpoint scopes."""
@@ -365,6 +511,10 @@ class PagedStashManager:
         """Create one saved-tensor scope around a grouped expert invocation."""
         if not self.is_enabled or self._disable_depth or not torch.is_grad_enabled():
             return _PagedStashGroup(self, None)
+        # A previous expert's pack may overlap token unpermutation, attention,
+        # routing, and dispatch, but its source storage must be retired before
+        # the next expert starts producing saved activations.
+        self._wait_for_stash_to_complete()
         if self._current_group is not None:
             raise RuntimeError("Paged stash groups cannot nest; disable paged stash around outer saved_tensors_hooks")
         if max_num_tokens <= 0:
@@ -501,6 +651,10 @@ class PagedStashManager:
             return output
         if not self._group_tensors[group_id]:
             self._group_tensors.pop(group_id)
+            if self._full_iteration_stream_overlap:
+                # start() already attached a pre-boundary. Remember that no
+                # matching post-boundary exists so its backward is a no-op.
+                self._groups_without_stash.add(group_id)
             return output
         return _PagedStashBoundary.apply(output, self, group_id)
 
@@ -515,19 +669,107 @@ class PagedStashManager:
         tensors = self._group_tensors.get(group_id)
         if tensors is None:
             raise RuntimeError(f"Unknown paged stash group {group_id}")
-        for paged_tensor in tensors:
-            key = (paged_tensor.dtype, paged_tensor.hidden_size)
-            paged_tensor.offload(self._buffers[key])
-        for paged_tensor in tensors:
-            paged_tensor.release_original()
+        if not self._full_iteration_stream_overlap:
+            for paged_tensor in tensors:
+                key = (paged_tensor.dtype, paged_tensor.hidden_size)
+                paged_tensor.offload(self._buffers[key])
+            for paged_tensor in tensors:
+                paged_tensor.release_original()
+            return
 
-    def _reload_group(self, group_id: int) -> None:
+        if self._transfer_stream_status != "idle" or self._pending_original_releases:
+            raise RuntimeError("Paged stash started a pack before the previous transfer was joined")
+        current_stream = torch.cuda.current_stream()
+        transfer_stream = self._require_transfer_stream()
+        transfer_stream.wait_stream(current_stream)
+        with torch.cuda.stream(transfer_stream):
+            for paged_tensor in tensors:
+                key = (paged_tensor.dtype, paged_tensor.hidden_size)
+                paged_tensor.offload(self._buffers[key])
+        self._pending_original_releases.extend(tensors)
+        self._transfer_stream_status = "packing"
+        self._backward_group_stack.append(group_id)
+
+    def _start_group_reload(self, group_id: int) -> None:
+        """Start one reload on the transfer stream without joining it."""
+        if self._prefetched_group_id is not None:
+            raise RuntimeError(
+                f"Paged stash already prefetched group {self._prefetched_group_id}, cannot start {group_id}"
+            )
         tensors = self._group_tensors.pop(group_id, None)
         if tensors is None:
             raise RuntimeError(f"Unknown paged stash group {group_id} during backward")
+        current_stream = torch.cuda.current_stream()
+        transfer_stream = self._require_transfer_stream()
         for paged_tensor in reversed(tensors):
-            key = (paged_tensor.dtype, paged_tensor.hidden_size)
-            paged_tensor.reload(self._buffers[key])
+            paged_tensor.allocate_for_reload()
+        transfer_stream.wait_stream(current_stream)
+        self._transfer_stream_status = "reloading"
+        with torch.cuda.stream(transfer_stream):
+            for paged_tensor in reversed(tensors):
+                key = (paged_tensor.dtype, paged_tensor.hidden_size)
+                paged_tensor.reload(self._buffers[key])
+        self._prefetched_group_id = group_id
+
+    def _wait_for_group_reload(self, group_id: int) -> None:
+        """Join the matching prefetched reload before saved-tensor unpack."""
+        if self._prefetched_group_id != group_id:
+            raise RuntimeError(f"Paged stash expected prefetched group {group_id}, got {self._prefetched_group_id}")
+        current_stream = torch.cuda.current_stream()
+        transfer_stream = self._require_transfer_stream()
+        current_stream.wait_stream(transfer_stream)
+        self._transfer_stream_status = "idle"
+        self._prefetched_group_id = None
+        self._release_pending_originals()
+
+    def _reload_group(self, group_id: int) -> None:
+        """Restore one group, synchronously unless full-iteration overlap is armed."""
+        if not self._full_iteration_stream_overlap:
+            tensors = self._group_tensors.pop(group_id, None)
+            if tensors is None:
+                raise RuntimeError(f"Unknown paged stash group {group_id} during backward")
+            for paged_tensor in reversed(tensors):
+                paged_tensor.allocate_for_reload()
+                key = (paged_tensor.dtype, paged_tensor.hidden_size)
+                paged_tensor.reload(self._buffers[key])
+            return
+        self._start_group_reload(group_id)
+        self._wait_for_group_reload(group_id)
+
+    def _begin_group_backward(self, group_id: int) -> None:
+        """Validate PP1 LIFO order and expose this group's restored tensors."""
+        if not self._full_iteration_stream_overlap:
+            self._reload_group(group_id)
+            return
+        if not self._backward_group_stack or self._backward_group_stack[-1] != group_id:
+            expected = self._backward_group_stack[-1] if self._backward_group_stack else None
+            raise RuntimeError(
+                f"PP1 paged-stash backward order is not LIFO: expected group {expected}, got {group_id}; "
+                "this schedule requires explicit PP/VP metadata"
+            )
+        if self._backward_in_progress_group_id is not None:
+            raise RuntimeError(
+                f"Paged stash began group {group_id} backward while group "
+                f"{self._backward_in_progress_group_id} is still active"
+            )
+        if self._prefetched_group_id is None:
+            self._start_group_reload(group_id)
+        self._wait_for_group_reload(group_id)
+        self._backward_group_stack.pop()
+        self._backward_in_progress_group_id = group_id
+
+    def _finish_group_backward(self, group_id: int) -> None:
+        """Prefetch the next LIFO group after the current expert backward."""
+        if not self._full_iteration_stream_overlap:
+            return
+        if group_id in self._groups_without_stash:
+            self._groups_without_stash.remove(group_id)
+            return
+        if self._backward_in_progress_group_id != group_id:
+            raise RuntimeError(f"Paged stash finished group {group_id}, expected {self._backward_in_progress_group_id}")
+        self._backward_in_progress_group_id = None
+        if self._backward_group_stack:
+            self._start_group_reload(self._backward_group_stack[-1])
 
     def prepare(self) -> None:
         """Allocate fixed CUDA page buffers from one completed eager warmup."""
@@ -559,6 +801,12 @@ class PagedStashManager:
                 dtype=storage_dtype,
                 overflow=self._overflow,
             )
+        if self._full_iteration_stream_overlap:
+            self._transfer_stream = torch.cuda.Stream(device=self._record_device)
+            if self._backward_anchor is None:
+                self._backward_anchor = torch.empty(
+                    (), dtype=torch.float32, device=self._record_device, requires_grad=True
+                )
         self._state = _PagedStashState.ACTIVE
 
     def finish_iteration(self) -> None:
@@ -571,6 +819,15 @@ class PagedStashManager:
         """
         if self._current_group is not None or self._group_tensors:
             raise RuntimeError("Paged stash iteration finished with live expert groups")
+        if (
+            self._transfer_stream_status != "idle"
+            or self._pending_original_releases
+            or self._backward_group_stack
+            or self._prefetched_group_id is not None
+            or self._backward_in_progress_group_id is not None
+            or self._groups_without_stash
+        ):
+            raise RuntimeError("Paged stash iteration finished with live transfer or backward schedule state")
         if self._overflow is not None and bool(self._overflow.item()):
             raise PagedStashOverflowError(
                 "MoE paged stash capacity overflowed; discard this attempt and rerun without paged stash"
@@ -584,6 +841,15 @@ class PagedStashManager:
         """Clear overflow metadata after the graph using these buffers is destroyed."""
         if self._current_group is not None or self._group_tensors:
             raise RuntimeError("Cannot reset paged stash while groups are live")
+        if self._transfer_stream_status != "idle" or self._pending_original_releases:
+            raise RuntimeError("Cannot reset paged stash while a transfer is pending")
+        if (
+            self._backward_group_stack
+            or self._prefetched_group_id is not None
+            or self._backward_in_progress_group_id is not None
+            or self._groups_without_stash
+        ):
+            raise RuntimeError("Cannot reset paged stash while a backward schedule is live")
         if self._overflow is not None:
             self._overflow.zero_()
         for buffer in self._buffers.values():
@@ -593,12 +859,14 @@ class PagedStashManager:
         """Drop fixed pages and start a fresh eager profile after graph teardown."""
         page_size = self._page_size
         buffer_size_factor = self._buffer_size_factor
+        stream_overlap = self._full_iteration_stream_overlap
         self.close()
         self.configure(
             enabled=True,
             page_size=page_size,
             buffer_size_factor=buffer_size_factor,
         )
+        self.configure_full_iteration_stream_overlap(enabled=stream_overlap)
 
     def diagnostics(self) -> dict[str, Any]:
         """Return bounded lifecycle and allocation diagnostics."""
@@ -609,12 +877,16 @@ class PagedStashManager:
             "recorded_peak_tokens": dict(self._recorded_peak_tokens),
             "buffer_tokens": {key: buffer.total_tokens for key, buffer in self._buffers.items()},
             "live_groups": len(self._group_tensors),
+            "full_iteration_stream_overlap": self._full_iteration_stream_overlap,
+            "transfer_stream_status": self._transfer_stream_status,
+            "backward_schedule_depth": len(self._backward_group_stack),
+            "prefetched_group_id": self._prefetched_group_id,
         }
 
-    def close(self) -> None:
-        """Release page buffers after every CUDA graph that references them is gone."""
-        if self._current_group is not None or self._group_tensors:
-            raise RuntimeError("Cannot close paged stash while groups are live")
+    def _clear_state(self) -> None:
+        """Release all manager-owned references after synchronization/validation."""
+        self._current_group = None
+        self._group_tensors.clear()
         self._buffers.clear()
         self._overflow = None
         self._recorded_peak_tokens.clear()
@@ -623,7 +895,47 @@ class PagedStashManager:
         self._recording_invalid_reason = None
         self._next_group_id = 0
         self._disable_depth = 0
+        self._full_iteration_stream_overlap = False
+        self._transfer_stream = None
+        self._transfer_stream_status = "idle"
+        self._pending_original_releases.clear()
+        self._backward_group_stack.clear()
+        self._prefetched_group_id = None
+        self._backward_in_progress_group_id = None
+        self._groups_without_stash.clear()
+        self._backward_anchor = None
         self._state = _PagedStashState.DISABLED
+
+    def force_abort_after_error(self) -> None:
+        """Best-effort no-throw cleanup after exceptional graph teardown.
+
+        The caller must destroy any CUDA graph that references the page buffers
+        first. Normal teardown uses :meth:`close` so lifecycle bugs still fail
+        loudly; this path exists only to keep cleanup from masking the original
+        execution error.
+        """
+        device = self._record_device
+        with contextlib.suppress(Exception):
+            if torch.cuda.is_available() and device is not None and device.type == "cuda":
+                torch.cuda.synchronize(device)
+        with contextlib.suppress(Exception):
+            self._release_pending_originals()
+        self._clear_state()
+
+    def close(self) -> None:
+        """Release page buffers after every CUDA graph that references them is gone."""
+        if self._current_group is not None or self._group_tensors:
+            raise RuntimeError("Cannot close paged stash while groups are live")
+        if self._transfer_stream_status != "idle" or self._pending_original_releases:
+            raise RuntimeError("Cannot close paged stash while a transfer is pending")
+        if (
+            self._backward_group_stack
+            or self._prefetched_group_id is not None
+            or self._backward_in_progress_group_id is not None
+            or self._groups_without_stash
+        ):
+            raise RuntimeError("Cannot close paged stash while a backward schedule is live")
+        self._clear_state()
 
 
 _PAGED_STASH_MANAGER = PagedStashManager()

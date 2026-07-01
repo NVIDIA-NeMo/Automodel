@@ -104,6 +104,23 @@ class _FakeGraph:
         self.registered_rng_states.append(state)
 
 
+def test_destroy_graph_retains_live_graph_when_cuda_reset_fails():
+    class BrokenGraph(_FakeGraph):
+        def reset(self):
+            raise RuntimeError("reset failed")
+
+    manager = FullIterationCudaGraphManager(lambda batches: batches)
+    graph = BrokenGraph()
+    manager._graph = graph
+    manager._result = object()
+
+    with pytest.raises(RuntimeError, match="reset failed"):
+        manager._destroy_graph()
+
+    assert manager._graph is graph
+    assert manager._result is not None
+
+
 @contextmanager
 def _fake_graph_context(_graph, **kwargs):
     assert kwargs["capture_error_mode"] == "thread_local"

@@ -82,6 +82,38 @@ def test_full_iteration_setup_allows_checkpointing_but_disables_paged_stash(monk
     assert stash_manager.configured == {"enabled": False}
 
 
+def test_full_iteration_setup_arms_paged_stash_overlap_only_after_pp1_checks(monkeypatch):
+    overlap_calls = []
+    stash_manager = SimpleNamespace(
+        configure_full_iteration_stream_overlap=lambda **kwargs: overlap_calls.append(kwargs)
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.moe.paged_stash.get_paged_stash_manager",
+        lambda: stash_manager,
+    )
+    recipe = object.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    model_part = torch.nn.Module()
+    model_part.backend = SimpleNamespace(
+        full_iteration_cuda_graph=True,
+        full_iteration_cuda_graph_warmup_steps=2,
+        full_iteration_cuda_graph_single_mempool=True,
+        moe_expert_rank_capacity_factor=1.125,
+        moe_paged_stash=True,
+    )
+    recipe.model_parts = [model_part]
+    recipe.pp_enabled = False
+    recipe._get_cp_group_size = lambda: 1
+    recipe.activation_checkpointing = False
+    recipe.moe_parallel_config = SimpleNamespace(enable_fsdp2_prefetch=False)
+    recipe.cfg = {}
+    recipe.optimizer = []
+
+    recipe._setup_full_iteration_cuda_graphs()
+
+    assert overlap_calls == [{"enabled": True}]
+    assert recipe._full_iteration_paged_stash_enabled is True
+
+
 def _recipe(manager, events):
     recipe = object.__new__(TrainFinetuneRecipeForNextTokenPrediction)
     recipe.full_iteration_cuda_graph_manager = manager
@@ -116,6 +148,42 @@ def test_guarded_full_iteration_returns_graph_result_without_eager_rerun():
     assert result is graph_loss
     assert recipe._full_iteration_num_label_tokens == 2
     assert events == ["stash-prepare", "overflow-reset-all", ("graph", batches)]
+
+
+def test_full_iteration_execution_error_is_not_masked_by_exceptional_cleanup(monkeypatch):
+    events = []
+
+    class BrokenGraphManager(_GraphManager):
+        def run(self, batches):
+            del batches
+            raise ValueError("original graph failure")
+
+        def reset(self):
+            events.append("graph-reset-attempt")
+            raise RuntimeError("secondary graph reset failure")
+
+    broken_manager = BrokenGraphManager([], events)
+    recipe = _recipe(broken_manager, events)
+    recipe._full_iteration_paged_stash_enabled = True
+    recipe._release_full_iteration_backend_handles = lambda: (_ for _ in ()).throw(
+        RuntimeError("secondary handle cleanup failure")
+    )
+    stash_manager = SimpleNamespace(force_abort_after_error=lambda: events.append("unsafe-stash-release"))
+    monkeypatch.setattr(
+        "nemo_automodel.components.moe.paged_stash.get_paged_stash_manager",
+        lambda: stash_manager,
+    )
+
+    with pytest.raises(ValueError, match="original graph failure"):
+        recipe._run_guarded_forward_backward(
+            [{"labels": torch.ones(1, 2, dtype=torch.long)}],
+            num_label_tokens=2,
+        )
+
+    assert "graph-reset-attempt" in events
+    assert "unsafe-stash-release" not in events
+    assert recipe._full_iteration_abandoned_graph_manager is broken_manager
+    assert recipe.full_iteration_cuda_graph_manager is None
 
 
 def test_hybridep_overflow_discards_graph_gradients_and_reruns_same_batches_dropless():
@@ -247,4 +315,39 @@ def test_full_iteration_diagnostics_are_disabled_for_an_unconfigured_recipe():
         "replays": 0,
         "overflow_reruns": 0,
         "paged_stash_enabled": False,
+    }
+
+
+def test_full_iteration_diagnostics_report_paged_stash_stream_state(monkeypatch):
+    events = []
+    recipe = _recipe(_GraphManager([torch.tensor(1.0)], events), events)
+    recipe._full_iteration_paged_stash_enabled = True
+    stash_manager = SimpleNamespace(
+        diagnostics=lambda: {
+            "state": "active",
+            "page_size": 64,
+            "buffer_size_factor": 1.1,
+            "buffer_tokens": {(torch.uint8, 16): 128},
+            "live_groups": 0,
+            "full_iteration_stream_overlap": True,
+            "transfer_stream_status": "idle",
+            "backward_schedule_depth": 0,
+        }
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.moe.paged_stash.get_paged_stash_manager",
+        lambda: stash_manager,
+    )
+
+    diagnostics = recipe._full_iteration_cuda_graph_diagnostics()
+
+    assert diagnostics["paged_stash"] == {
+        "state": "active",
+        "page_size": 64,
+        "buffer_size_factor": 1.1,
+        "buffer_tokens": {"torch.uint8:16": 128},
+        "live_groups": 0,
+        "stream_overlap": True,
+        "transfer_stream_status": "idle",
+        "backward_schedule_depth": 0,
     }
