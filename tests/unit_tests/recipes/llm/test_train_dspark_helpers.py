@@ -26,6 +26,8 @@ Covers the recipe-level glue added for the DeepSeek-V4-Flash target:
   hardcoding plain ``torch.optim.AdamW``.
 - ``_resolve_warmup_steps``: the ratio-derived warmup length is floored for
   short / small-dataset runs, unless the caller opts out with ``warmup_ratio<=0``.
+- ``_resolve_wandb_kwargs``: the examples' documentation-only ``enable`` flag is
+  stripped before forwarding to ``wandb.init`` and gates whether to log at all.
 
 (target_layer_ids range/-1/ordering validation is covered by the shared
 ``common.validate_target_layer_ids``, which HFDSparkTargetModel already calls.)
@@ -41,6 +43,7 @@ from nemo_automodel.recipes.llm.train_dspark import (
     _apply_target_chat_template,
     _resolve_dspark_optimizer_spec,
     _resolve_reduced_target_layers,
+    _resolve_wandb_kwargs,
     _resolve_warmup_steps,
 )
 
@@ -203,3 +206,22 @@ def test_warmup_steps_negative_ratio_treated_as_opt_out():
 def test_warmup_steps_custom_floor():
     assert _resolve_warmup_steps(0.01, 100, min_warmup_steps=5) == 5
     assert _resolve_warmup_steps(0.5, 100, min_warmup_steps=5) == 50
+
+
+# ---------------------------------------------------------------------------
+# _resolve_wandb_kwargs
+# ---------------------------------------------------------------------------
+
+
+def test_wandb_kwargs_disabled_when_enable_false():
+    assert _resolve_wandb_kwargs({"enable": False, "project": "p"}) is None
+
+
+def test_wandb_kwargs_enabled_strips_enable_key():
+    kwargs = _resolve_wandb_kwargs({"enable": True, "project": "p", "group": "g"})
+    assert kwargs == {"project": "p", "group": "g"}
+
+
+def test_wandb_kwargs_defaults_enabled_when_flag_absent():
+    kwargs = _resolve_wandb_kwargs({"project": "p"})
+    assert kwargs == {"project": "p"}

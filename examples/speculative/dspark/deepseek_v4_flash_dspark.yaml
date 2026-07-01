@@ -51,6 +51,7 @@ dist_env:
   timeout_minutes: 30
 
 wandb:
+  enable: false            # opt-in: flip to true to log this run (needs W&B credentials)
   project: deepseek-v4-dspark
   group: perfectblend-direct
   tags: [dspark, deepseek-v4-flash, perfectblend, hybridep]

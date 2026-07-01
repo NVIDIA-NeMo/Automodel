@@ -155,6 +155,22 @@ def _apply_target_chat_template(tokenizer, chat_template):
         )
 
 
+def _resolve_wandb_kwargs(wandb_cfg: dict) -> dict | None:
+    """Convert a ``wandb:`` config block into ``wandb.init`` kwargs, or ``None``.
+
+    ``enable`` is the examples' documentation-only opt-in flag (W&B logging is
+    opt-in: example configs ship the block with ``enable: false`` so users start
+    logging by flipping it to ``true`` instead of commenting the block in/out);
+    it is not a real ``wandb.init`` kwarg, so strip it before forwarding the rest
+    -- passing it through raises ``TypeError: init() got an unexpected keyword
+    argument 'enable'``. Returns ``None`` when ``enable`` is explicitly ``False``.
+    """
+    kwargs = dict(wandb_cfg)
+    if kwargs.pop("enable", True) is False:
+        return None
+    return kwargs
+
+
 def _resolve_dspark_optimizer_spec(opt_cfg) -> tuple[str, dict]:
     """Normalize the recipe's ``optimizer:`` config into a ``build_optimizer`` spec.
 
@@ -467,13 +483,16 @@ class TrainDSparkRecipe(BaseRecipe):
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
         self.wandb_run = None
-        if self.dist_env.is_main and self.cfg.get("wandb", None) is not None:
-            suppress_wandb_log_messages()
-            self.wandb_run = init_wandb_run(
-                self.cfg.wandb.to_dict(),
-                self.cfg.to_dict(),
-                default_name="dspark_" + str(target_path).rstrip("/").split("/")[-1],
-            )
+        wandb_cfg = self.cfg.get("wandb", None)
+        if self.dist_env.is_main and wandb_cfg is not None:
+            wandb_kwargs = _resolve_wandb_kwargs(wandb_cfg.to_dict())
+            if wandb_kwargs is not None:
+                suppress_wandb_log_messages()
+                self.wandb_run = init_wandb_run(
+                    wandb_kwargs,
+                    self.cfg.to_dict(),
+                    default_name="dspark_" + str(target_path).rstrip("/").split("/")[-1],
+                )
 
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
