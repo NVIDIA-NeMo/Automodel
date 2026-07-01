@@ -136,4 +136,4 @@ ci:
   nodes: 64
   max_steps: 20
   # Cold multi-node start + TileLang JIT runs past the 00:10:00 default.
-  time: "00:30:00"
+  time: "00:35:00"
