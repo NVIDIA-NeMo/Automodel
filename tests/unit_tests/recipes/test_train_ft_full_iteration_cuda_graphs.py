@@ -132,6 +132,21 @@ def _recipe(manager, events):
     return recipe
 
 
+def test_release_optimizer_gradient_storage_uses_set_to_none_after_graph_teardown():
+    calls = []
+
+    class Optimizer:
+        def zero_grad(self, *, set_to_none):
+            calls.append(set_to_none)
+
+    recipe = object.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.optimizer = [Optimizer()]
+
+    recipe._release_optimizer_gradient_storage()
+
+    assert calls == [True]
+
+
 def test_guarded_full_iteration_returns_graph_result_without_eager_rerun():
     events = []
     graph_loss = [torch.tensor(1.25)]
@@ -193,7 +208,7 @@ def test_hybridep_overflow_discards_graph_gradients_and_reruns_same_batches_drop
     dispatcher = _Dispatcher(events)
     recipe._full_iteration_dispatchers = (dispatcher,)
     recipe._collect_full_iteration_overflow = lambda: (4, 0)
-    recipe._zero_optimizer_gradients = lambda: events.append("zero-grad")
+    recipe._release_optimizer_gradient_storage = lambda: events.append("release-grad-storage")
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.gc.collect", lambda: events.append("gc-collect"))
     monkeypatch.setattr("torch.cuda.empty_cache", lambda: events.append("empty-cache"))
     eager_loss = [torch.tensor(0.75)]
@@ -217,7 +232,7 @@ def test_hybridep_overflow_discards_graph_gradients_and_reruns_same_batches_drop
         ("graph", batches),
         "graph-reset",
         "release-handles",
-        "zero-grad",
+        "release-grad-storage",
         "gc-collect",
         "empty-cache",
         ("rank-budget", None),

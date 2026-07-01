@@ -1141,6 +1141,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         "Partial CUDA graphs require optimizer.zero_grad(set_to_none=False) support"
                     ) from error
 
+    def _release_optimizer_gradient_storage(self) -> None:
+        """Drop discarded grad buffers after the owning full graph is destroyed."""
+        for optimizer in self.optimizer:
+            try:
+                optimizer.zero_grad(set_to_none=True)
+            except TypeError:
+                # This is an exceptional rerun path after graph teardown, so a
+                # legacy optimizer may use its ordinary storage-releasing form.
+                optimizer.zero_grad()
+
     def _capture_partial_cuda_graphs_after_eager_step(self) -> None:
         """Capture once, after a complete eager forward/backward/optimizer step."""
         # Some recipe subclasses and focused tests construct an instance via
@@ -1782,7 +1792,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         del loss_buffer
         manager.reset()
         self._release_full_iteration_backend_handles()
-        self._zero_optimizer_gradients()
+        self._release_optimizer_gradient_storage()
         gc.collect()
         torch.cuda.empty_cache()
 
