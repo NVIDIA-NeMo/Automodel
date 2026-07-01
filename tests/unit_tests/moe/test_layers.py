@@ -1007,6 +1007,44 @@ class TestGate:
         # Cumulative load should be reset
         assert gate._cumulative_expert_load is None
 
+    def test_gate_bias_load_accumulates_once_under_reentrant_checkpoint(self, moe_config, device):
+        """The no-grad original forward does not double-count the reentrant recompute."""
+        import warnings
+
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            checkpoint_wrapper,
+        )
+
+        moe_config.aux_loss_coeff = 0.0
+        moe_config.dtype = torch.float32
+        gate = Gate(moe_config).to(device).train()
+        gate._track_load_balance = True
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            wrapped = checkpoint_wrapper(
+                gate,
+                checkpoint_impl=CheckpointImpl.REENTRANT,
+                preserve_rng_state=True,
+            )
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, device=device, requires_grad=True)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights, indices, _ = wrapped(x, token_mask=token_mask, cp_mesh=None)
+        expected_load = gate._compute_expert_load(indices, token_mask)
+
+        assert gate._cumulative_expert_load is None
+        torch.testing.assert_close(gate._last_expert_load, expected_load)
+
+        weights.sum().backward()
+
+        torch.testing.assert_close(gate._cumulative_expert_load, expected_load)
+        torch.testing.assert_close(gate._last_expert_load, expected_load)
+
     def test_gate_init_weights(self, moe_config, device):
         """Test Gate weight initialization."""
         gate = Gate(moe_config)

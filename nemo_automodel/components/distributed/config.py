@@ -127,10 +127,9 @@ class DistributedSetup:
 class MoEParallelizerConfig:
     """Configuration for MoE model parallelization (EP + FSDP settings)."""
 
-    # Default True: under activation checkpointing the MoE router output must be saved
-    # rather than recomputed. Recomputing the router can route a different number of tokens
-    # per expert than the forward pass, which makes torch.utils.checkpoint raise a
-    # CheckpointError on the backward recompute.
+    # Deprecated compatibility knob. Full MoE activation checkpointing now uses
+    # one native reentrant checkpoint per block and always recomputes the router
+    # with preserved RNG state so HybridEP collectives stay rank-symmetric.
     ignore_router_for_ac: bool = True
     reshard_after_forward: bool = False
     enable_fsdp2_prefetch: bool = False

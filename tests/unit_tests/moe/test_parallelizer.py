@@ -14,7 +14,7 @@
 
 import sys
 import types
-from contextlib import contextmanager
+from enum import Enum, auto
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -75,33 +75,6 @@ class DummyModel:
         self.lm_head = lm_head
         self.audio_tower = audio_tower
         self.visual = visual
-
-
-def test_checkpoint_without_early_stop_preserves_nonreentrant_checkpoint_kwargs(monkeypatch):
-    P = _import_parallelizer_with_stubs(monkeypatch)
-    events = []
-
-    @contextmanager
-    def fake_early_stop(enable):
-        events.append(("early-stop", enable))
-        yield
-        events.append("early-stop-exit")
-
-    def fake_checkpoint(function, *args, **kwargs):
-        events.append(("checkpoint", kwargs))
-        return function(*args)
-
-    monkeypatch.setattr(P, "set_checkpoint_early_stop", fake_early_stop)
-    monkeypatch.setattr(P, "checkpoint", fake_checkpoint)
-
-    result = P._checkpoint_without_early_stop(lambda value: value + 1, 2, preserve_rng_state=True)
-
-    assert result == 3
-    assert events == [
-        ("early-stop", False),
-        ("checkpoint", {"use_reentrant": False, "preserve_rng_state": True}),
-        "early-stop-exit",
-    ]
 
 
 def _install_torch_and_layers_stubs(monkeypatch):
@@ -202,6 +175,11 @@ def _install_torch_and_layers_stubs(monkeypatch):
     def checkpoint_wrapper(*args, **kwargs):
         return args[0]
 
+    class CheckpointImpl(Enum):
+        REENTRANT = auto()
+        NO_REENTRANT = auto()
+
+    cpw_stub.CheckpointImpl = CheckpointImpl
     cpw_stub.checkpoint_wrapper = checkpoint_wrapper
 
     # utils module hierarchy
@@ -234,18 +212,8 @@ def _install_torch_and_layers_stubs(monkeypatch):
     def create_selective_checkpoint_contexts(policy_factory):
         return "CTX"
 
-    def checkpoint(function, *args, **kwargs):
-        return function(*args)
-
-    @contextmanager
-    def set_checkpoint_early_stop(enable):
-        del enable
-        yield
-
     utils_checkpoint_stub.CheckpointPolicy = CheckpointPolicy
-    utils_checkpoint_stub.checkpoint = checkpoint
     utils_checkpoint_stub.create_selective_checkpoint_contexts = create_selective_checkpoint_contexts
-    utils_checkpoint_stub.set_checkpoint_early_stop = set_checkpoint_early_stop
 
     # ops.aten.mm.default sentinel
     aten = types.SimpleNamespace(mm=types.SimpleNamespace(default=object()))
@@ -559,59 +527,25 @@ def test_apply_ep_configures_te_ops_cache_for_ep2_policy(monkeypatch, ep_shard_e
     ]
 
 
-def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
+@pytest.mark.parametrize("ignore_router", [False, True])
+def test_apply_ac_wraps_full_blocks_with_native_reentrant_checkpoint(monkeypatch, ignore_router):
     P = _import_parallelizer_with_stubs(monkeypatch)
     wrapper_returns = [object(), object()]
-
-    def fake_wrapper(block, preserve_rng_state, context_fn=None, checkpoint_fn=None):
-        assert preserve_rng_state is True
-        assert checkpoint_fn is P._checkpoint_without_early_stop
-        # if ignore_router=True, context_fn should be provided
-        return wrapper_returns.pop(0)
-
-    wrapper_mock = MagicMock(side_effect=fake_wrapper)
-    ctx_mock = MagicMock(return_value="CTX")
+    wrapper_mock = MagicMock(side_effect=lambda block, **kwargs: wrapper_returns.pop(0))
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", ctx_mock)
 
     blocks = [DummyBlock(), DummyBlock()]
     model = DummyModel(blocks)
 
-    # ignore_router=True path - provide explicit hidden_size and num_experts
-    P.apply_ac(model, ignore_router=True, hidden_size=7168, num_experts=256)
+    P.apply_ac(model, ignore_router=ignore_router, hidden_size=7168, num_experts=256)
+
     assert wrapper_mock.call_count == 2
-    # registration should replace both blocks
     assert len(model.layers.registered) == 2
-
-    # reset for ignore_router=False path
-    wrapper_returns.extend([object(), object()])
-    model = DummyModel([DummyBlock(), DummyBlock()])
-    wrapper_mock.reset_mock()
-    model.layers.registered.clear()
-
-    P.apply_ac(model, ignore_router=False, hidden_size=7168, num_experts=256)
-    # context_fn should not be passed (3rd arg remains default None)
     for _, kwargs in wrapper_mock.call_args_list:
-        assert "context_fn" not in kwargs or kwargs["context_fn"] is None
-    assert len(model.layers.registered) == 2
-
-
-def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
-    P = _import_parallelizer_with_stubs(monkeypatch)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kw: block))
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", MagicMock(return_value="CTX"))
-    logger_mock = MagicMock()
-    monkeypatch.setattr(P, "logger", logger_mock)
-
-    # ignore_router=False under (non-selective) AC recomputes the router -> warn.
-    P.apply_ac(DummyModel([DummyBlock()]), ignore_router=False, hidden_size=7168, num_experts=256)
-    assert logger_mock.warning.call_count == 1
-    assert "ignore_router_for_ac" in logger_mock.warning.call_args[0][0]
-
-    # ignore_router=True (the default) saves the router output -> no warning.
-    logger_mock.reset_mock()
-    P.apply_ac(DummyModel([DummyBlock()]), ignore_router=True, hidden_size=7168, num_experts=256)
-    logger_mock.warning.assert_not_called()
+        assert kwargs == {
+            "checkpoint_impl": P.CheckpointImpl.REENTRANT,
+            "preserve_rng_state": True,
+        }
 
 
 def test_apply_ac_uses_generic_wrapper_even_when_block_local_checkpointing_is_available(monkeypatch):
@@ -634,52 +568,23 @@ def test_apply_ac_uses_generic_wrapper_even_when_block_local_checkpointing_is_av
     P.apply_ac(model, ignore_router=True, hidden_size=7168, num_experts=256)
 
     wrapper_mock.assert_called_once()
-    assert wrapper_mock.call_args.kwargs["preserve_rng_state"] is True
-    assert callable(wrapper_mock.call_args.kwargs["context_fn"])
+    assert wrapper_mock.call_args.kwargs == {
+        "checkpoint_impl": P.CheckpointImpl.REENTRANT,
+        "preserve_rng_state": True,
+    }
     assert block.activation_checkpointing is False
     assert model.layers.registered["0"] is wrapped
 
 
-def test_apply_ac_custom_policy_respects_hidden_and_expert_dims(monkeypatch):
+def test_apply_ac_full_mode_does_not_require_router_dimensions(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
+    wrapper_mock = MagicMock(side_effect=lambda block, **kwargs: block)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
 
-    captured_policy = None
+    model = DummyModel([DummyBlock()])
+    P.apply_ac(model)
 
-    def fake_create_selective_checkpoint_contexts(policy_cb):
-        nonlocal captured_policy
-        captured_policy = policy_cb
-        return "CTX"
-
-    def fake_wrapper(block, preserve_rng_state, context_fn=None, checkpoint_fn=None):
-        assert preserve_rng_state is True
-        assert checkpoint_fn is P._checkpoint_without_early_stop
-        assert callable(context_fn)
-        assert context_fn() == "CTX"
-        return block
-
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
-
-    hidden_size = 17
-    num_experts = 31
-    model = DummyModel([DummyBlock(), DummyBlock()])
-
-    P.apply_ac(model, ignore_router=True, hidden_size=hidden_size, num_experts=num_experts)
-
-    assert captured_policy is not None
-
-    torch_stub = sys.modules["torch"]
-    rhs_match = type("Mat", (), {"shape": (hidden_size, num_experts)})()
-    rhs_mismatch = type("Mat", (), {"shape": (hidden_size, num_experts + 1)})()
-
-    policy = captured_policy
-    must_save = policy(None, torch_stub.ops.aten.mm.default, object(), rhs_match)
-    prefer_recompute_shape = policy(None, torch_stub.ops.aten.mm.default, object(), rhs_mismatch)
-    prefer_recompute_func = policy(None, object(), object(), rhs_match)
-
-    assert must_save == P.CheckpointPolicy.MUST_SAVE
-    assert prefer_recompute_shape == P.CheckpointPolicy.PREFER_RECOMPUTE
-    assert prefer_recompute_func == P.CheckpointPolicy.PREFER_RECOMPUTE
+    wrapper_mock.assert_called_once()
 
 
 def _find_call_by_first_arg(mock_obj, target_first_arg):
@@ -1662,318 +1567,6 @@ def test_parallelize_model_wrap_outer_model_defaults_to_true(monkeypatch):
     assert kwargs.get("wrap_outer_model") is True
 
 
-def test_apply_ac_derives_hidden_size_and_num_experts_from_config(monkeypatch):
-    """Test that apply_ac derives hidden_size and num_experts from model.config."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    captured_hidden_size = None
-    captured_num_experts = None
-
-    def fake_create_selective_checkpoint_contexts(policy_cb):
-        nonlocal captured_hidden_size, captured_num_experts
-        # Extract hidden_size and num_experts by testing the policy
-        torch_stub = sys.modules["torch"]
-        # Test with various shapes to determine what was captured
-        for hs in [128, 256, 512, 1024]:
-            for ne in [8, 16, 32, 64]:
-                rhs = type("Mat", (), {"shape": (hs, ne)})()
-                result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
-                if result == P.CheckpointPolicy.MUST_SAVE:
-                    captured_hidden_size = hs
-                    captured_num_experts = ne
-                    break
-            if captured_hidden_size is not None:
-                break
-        return "CTX"
-
-    def fake_wrapper(block, preserve_rng_state, context_fn=None, checkpoint_fn=None):
-        assert checkpoint_fn is P._checkpoint_without_early_stop
-        if context_fn is not None:
-            context_fn()  # Trigger the context function to capture values
-        return block
-
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
-
-    # Create model with config containing hidden_size and num_experts
-    class Config:
-        hidden_size = 256
-        num_experts = 16
-
-    class ModelWithConfig:
-        def __init__(self):
-            self.config = Config()
-            self.layers = LayerContainer([DummyBlock()])
-
-    model = ModelWithConfig()
-
-    P.apply_ac(model, ignore_router=True)
-
-    assert captured_hidden_size == 256
-    assert captured_num_experts == 16
-
-
-def test_apply_ac_raises_when_hidden_size_not_available(monkeypatch):
-    """Test that apply_ac raises ValueError when hidden_size is not in config and not provided."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    # Model without config
-    class ModelWithoutConfig:
-        def __init__(self):
-            self.layers = LayerContainer([DummyBlock()])
-
-    model = ModelWithoutConfig()
-
-    with pytest.raises(ValueError, match="hidden_size must be provided"):
-        P.apply_ac(model)
-
-
-def test_apply_ac_raises_when_num_experts_not_available(monkeypatch):
-    """Test that apply_ac raises ValueError when num_experts is not in config and not provided."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    # Model with config containing only hidden_size
-    class ConfigPartial:
-        hidden_size = 256
-
-    class ModelPartialConfig:
-        def __init__(self):
-            self.config = ConfigPartial()
-            self.layers = LayerContainer([DummyBlock()])
-
-    model = ModelPartialConfig()
-
-    with pytest.raises(ValueError, match="num_experts must be provided"):
-        P.apply_ac(model)
-
-
-def test_apply_ac_derives_num_experts_from_num_local_experts(monkeypatch):
-    """Test that apply_ac derives num_experts from config.num_local_experts (Mixtral/GPT-OSS style)."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    captured_num_experts = None
-
-    def fake_create_selective_checkpoint_contexts(policy_cb):
-        nonlocal captured_num_experts
-        torch_stub = sys.modules["torch"]
-        for ne in [32, 64, 128]:
-            rhs = type("Mat", (), {"shape": (256, ne)})()
-            result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
-            if result == P.CheckpointPolicy.MUST_SAVE:
-                captured_num_experts = ne
-        return "CTX"
-
-    def fake_wrapper(block, preserve_rng_state, context_fn=None, checkpoint_fn=None):
-        assert checkpoint_fn is P._checkpoint_without_early_stop
-        if context_fn is not None:
-            context_fn()
-        return block
-
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
-
-    class ConfigWithNumLocalExperts:
-        hidden_size = 256
-        num_local_experts = 32
-
-    class ModelWithNumLocalExperts:
-        def __init__(self):
-            self.config = ConfigWithNumLocalExperts()
-            self.layers = LayerContainer([DummyBlock()])
-
-    model = ModelWithNumLocalExperts()
-
-    P.apply_ac(model, ignore_router=True)
-
-    assert captured_num_experts == 32
-
-
-def test_apply_ac_accepts_explicit_hidden_size_and_num_experts(monkeypatch):
-    """Test that apply_ac accepts explicit hidden_size and num_experts parameters."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    captured_hidden_size = None
-    captured_num_experts = None
-
-    def fake_create_selective_checkpoint_contexts(policy_cb):
-        nonlocal captured_hidden_size, captured_num_experts
-        torch_stub = sys.modules["torch"]
-        # Test with the expected explicit values
-        rhs_match = type("Mat", (), {"shape": (512, 32)})()
-        result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs_match)
-        if result == P.CheckpointPolicy.MUST_SAVE:
-            captured_hidden_size = 512
-            captured_num_experts = 32
-        return "CTX"
-
-    def fake_wrapper(block, preserve_rng_state, context_fn=None, checkpoint_fn=None):
-        assert checkpoint_fn is P._checkpoint_without_early_stop
-        if context_fn is not None:
-            context_fn()
-        return block
-
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
-
-    # Model without config - should work with explicit params
-    class ModelWithoutConfig:
-        def __init__(self):
-            self.layers = LayerContainer([DummyBlock()])
-
-    model = ModelWithoutConfig()
-
-    P.apply_ac(model, ignore_router=True, hidden_size=512, num_experts=32)
-
-    assert captured_hidden_size == 512
-    assert captured_num_experts == 32
-
-
-def test_apply_ac_explicit_params_override_config(monkeypatch):
-    """Test that explicit hidden_size and num_experts override model.config values."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    captured_hidden_size = None
-    captured_num_experts = None
-
-    def fake_create_selective_checkpoint_contexts(policy_cb):
-        nonlocal captured_hidden_size, captured_num_experts
-        torch_stub = sys.modules["torch"]
-        # Test with explicit override values
-        rhs_match = type("Mat", (), {"shape": (1024, 64)})()
-        result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs_match)
-        if result == P.CheckpointPolicy.MUST_SAVE:
-            captured_hidden_size = 1024
-            captured_num_experts = 64
-        return "CTX"
-
-    def fake_wrapper(block, preserve_rng_state, context_fn=None, checkpoint_fn=None):
-        assert checkpoint_fn is P._checkpoint_without_early_stop
-        if context_fn is not None:
-            context_fn()
-        return block
-
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
-
-    # Model with config
-    class Config:
-        hidden_size = 256
-        num_experts = 16
-
-    class ModelWithConfig:
-        def __init__(self):
-            self.config = Config()
-            self.layers = LayerContainer([DummyBlock()])
-
-    model = ModelWithConfig()
-
-    # Explicit params should override config
-    P.apply_ac(model, ignore_router=True, hidden_size=1024, num_experts=64)
-
-    assert captured_hidden_size == 1024
-    assert captured_num_experts == 64
-
-
-def test_apply_ac_derives_from_llm_config(monkeypatch):
-    """VLM nests LM config under llm_config (not text_config) — apply_ac must fall back to it."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    captured_hidden_size = None
-    captured_num_experts = None
-
-    def fake_create_selective_checkpoint_contexts(policy_cb):
-        nonlocal captured_hidden_size, captured_num_experts
-        torch_stub = sys.modules["torch"]
-        for hs in [128, 256, 512, 1024]:
-            for ne in [8, 16, 32, 64]:
-                rhs = type("Mat", (), {"shape": (hs, ne)})()
-                if policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs) == P.CheckpointPolicy.MUST_SAVE:
-                    captured_hidden_size = hs
-                    captured_num_experts = ne
-                    break
-            if captured_hidden_size is not None:
-                break
-        return "CTX"
-
-    def fake_wrapper(block, preserve_rng_state, context_fn=None, checkpoint_fn=None):
-        assert checkpoint_fn is P._checkpoint_without_early_stop
-        if context_fn is not None:
-            context_fn()
-        return block
-
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
-
-    class LLMConfig:
-        hidden_size = 512
-        num_experts = 32
-
-    # No text_config and no top-level hidden_size/num_experts — must come from llm_config.
-    class Config:
-        llm_config = LLMConfig()
-
-    class ModelWithLLMConfig:
-        def __init__(self):
-            self.config = Config()
-            self.layers = LayerContainer([DummyBlock()])
-
-    P.apply_ac(ModelWithLLMConfig(), ignore_router=True)
-
-    assert captured_hidden_size == 512
-    assert captured_num_experts == 32
-
-
-def test_apply_ac_text_config_takes_priority_over_llm_config(monkeypatch):
-    """When both text_config and llm_config define hidden_size/num_experts, text_config wins."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    captured_hidden_size = None
-    captured_num_experts = None
-
-    def fake_create_selective_checkpoint_contexts(policy_cb):
-        nonlocal captured_hidden_size, captured_num_experts
-        torch_stub = sys.modules["torch"]
-        for hs in [128, 256, 512, 1024]:
-            for ne in [8, 16, 32, 64]:
-                rhs = type("Mat", (), {"shape": (hs, ne)})()
-                if policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs) == P.CheckpointPolicy.MUST_SAVE:
-                    captured_hidden_size = hs
-                    captured_num_experts = ne
-                    break
-            if captured_hidden_size is not None:
-                break
-        return "CTX"
-
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(
-        P,
-        "ptd_checkpoint_wrapper",
-        MagicMock(side_effect=lambda b, **kw: (kw.get("context_fn") and kw["context_fn"](), b)[1]),
-    )
-
-    class TextConfig:
-        hidden_size = 256
-        num_experts = 16
-
-    class LLMConfig:
-        hidden_size = 1024
-        num_experts = 64
-
-    class Config:
-        text_config = TextConfig()
-        llm_config = LLMConfig()
-
-    class ModelBoth:
-        def __init__(self):
-            self.config = Config()
-            self.layers = LayerContainer([DummyBlock()])
-
-    P.apply_ac(ModelBoth(), ignore_router=True)
-
-    assert captured_hidden_size == 256
-    assert captured_num_experts == 16
-
-
 def test_apply_ac_routes_through_get_text_module(monkeypatch):
     """For VLMs, apply_ac must wrap layers under the text sub-module (LM), not the outer wrapper."""
     P = _import_parallelizer_with_stubs(monkeypatch)
@@ -2001,7 +1594,6 @@ def test_apply_ac_routes_through_get_text_module(monkeypatch):
         return m.language_model if hasattr(m, "language_model") else m
 
     monkeypatch.setattr(P, "get_text_module", vlm_get_text_module)
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", MagicMock(return_value="CTX"))
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda b, **kw: b))
 
     lm_blocks = [DummyBlock(), DummyBlock()]
@@ -2167,6 +1759,30 @@ def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
         assert getattr(w, sentinel_flag, False) is True
 
 
+def test_apply_ac_selective_rejects_hybridep_before_wrapping_any_block(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    dense_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+    dense_stub.make_selective_checkpoint_context_fn = MagicMock(return_value=object())
+    dense_stub.SELECTIVE_AC_WRAPPER_FLAG = "_nemo_selective_ac"
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.activation_checkpointing", dense_stub)
+
+    class HybridMoE(P.MoE):
+        def __init__(self):
+            self.experts = types.SimpleNamespace(dispatcher_backend="hybridep")
+
+    wrapper_mock = MagicMock(side_effect=lambda block, **kwargs: block)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
+    model = DummyModel([DummyBlock(), DummyBlock(mlp=HybridMoE())])
+
+    with pytest.raises(ValueError, match="Selective activation checkpointing with HybridEP"):
+        P.apply_ac(model, selective=True)
+
+    wrapper_mock.assert_not_called()
+    dense_stub.make_selective_checkpoint_context_fn.assert_not_called()
+    assert model.layers.registered == {}
+
+
 # ============================================================================
 # Tests for block.moe attribute handling (Step3p5 style models)
 # ============================================================================
@@ -2243,196 +1859,6 @@ def test_apply_ep_falls_back_to_mlp(monkeypatch):
     assert parallelize_module_mock.call_count == 1
     args, kwargs = parallelize_module_mock.call_args
     assert kwargs["module"] is mlp.experts
-
-
-def test_apply_ac_derives_num_experts_from_moe_num_experts(monkeypatch):
-    """Test that apply_ac derives num_experts from config.moe_num_experts when num_experts is absent."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    captured_num_experts = None
-
-    def fake_create_selective_checkpoint_contexts(policy_cb):
-        nonlocal captured_num_experts
-        torch_stub = sys.modules["torch"]
-        # Test with various shapes to determine what was captured
-        for ne in [8, 16, 32, 64]:
-            rhs = type("Mat", (), {"shape": (256, ne)})()
-            result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
-            if result == P.CheckpointPolicy.MUST_SAVE:
-                captured_num_experts = ne
-                break
-        return "CTX"
-
-    def fake_wrapper(block, preserve_rng_state, context_fn=None, checkpoint_fn=None):
-        assert checkpoint_fn is P._checkpoint_without_early_stop
-        if context_fn is not None:
-            context_fn()
-        return block
-
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
-
-    # Create model with config containing only moe_num_experts (not num_experts)
-    class Config:
-        hidden_size = 256
-        moe_num_experts = 32  # Only moe_num_experts, not num_experts
-
-    class ModelWithMoeNumExperts:
-        def __init__(self):
-            self.config = Config()
-            self.layers = LayerContainer([DummyBlock()])
-
-    model = ModelWithMoeNumExperts()
-
-    P.apply_ac(model, ignore_router=True)
-
-    # Should find moe_num_experts
-    assert captured_num_experts == 32
-
-
-def test_apply_ac_prefers_num_experts_over_moe_num_experts(monkeypatch):
-    """Test that apply_ac prefers config.num_experts over config.moe_num_experts."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    captured_num_experts = None
-
-    def fake_create_selective_checkpoint_contexts(policy_cb):
-        nonlocal captured_num_experts
-        torch_stub = sys.modules["torch"]
-        for ne in [8, 16, 32, 64]:
-            rhs = type("Mat", (), {"shape": (256, ne)})()
-            result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
-            if result == P.CheckpointPolicy.MUST_SAVE:
-                captured_num_experts = ne
-                break
-        return "CTX"
-
-    def fake_wrapper(block, preserve_rng_state, context_fn=None, checkpoint_fn=None):
-        assert checkpoint_fn is P._checkpoint_without_early_stop
-        if context_fn is not None:
-            context_fn()
-        return block
-
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
-
-    # Create model with both num_experts and moe_num_experts
-    class Config:
-        hidden_size = 256
-        num_experts = 16  # Should be preferred
-        moe_num_experts = 64  # Should be ignored
-
-    class ModelWithBothExperts:
-        def __init__(self):
-            self.config = Config()
-            self.layers = LayerContainer([DummyBlock()])
-
-    model = ModelWithBothExperts()
-
-    P.apply_ac(model, ignore_router=True)
-
-    # Should find num_experts first
-    assert captured_num_experts == 16
-
-
-def test_apply_ac_derives_num_experts_from_moe_config(monkeypatch):
-    """Test that apply_ac derives num_experts from model.model.moe_config.n_routed_experts."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    captured_num_experts = None
-
-    def fake_create_selective_checkpoint_contexts(policy_cb):
-        nonlocal captured_num_experts
-        torch_stub = sys.modules["torch"]
-        for ne in [8, 16, 32, 64]:
-            rhs = type("Mat", (), {"shape": (256, ne)})()
-            result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
-            if result == P.CheckpointPolicy.MUST_SAVE:
-                captured_num_experts = ne
-                break
-        return "CTX"
-
-    def fake_wrapper(block, preserve_rng_state, context_fn=None, checkpoint_fn=None):
-        assert checkpoint_fn is P._checkpoint_without_early_stop
-        if context_fn is not None:
-            context_fn()
-        return block
-
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
-
-    class Config:
-        hidden_size = 256
-
-    class MoeConfig:
-        n_routed_experts = 32
-
-    class Inner:
-        def __init__(self):
-            self.moe_config = MoeConfig()
-            self.layers = LayerContainer([DummyBlock()])
-
-    class Outer:
-        def __init__(self):
-            self.config = Config()
-            self.model = Inner()
-
-    model = Outer()
-
-    P.apply_ac(model, ignore_router=True)
-
-    assert captured_num_experts == 32
-
-
-def test_apply_ac_prefers_moe_config_over_config_attrs(monkeypatch):
-    """Test that apply_ac prefers moe_config.n_routed_experts over model.config attributes."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    captured_num_experts = None
-
-    def fake_create_selective_checkpoint_contexts(policy_cb):
-        nonlocal captured_num_experts
-        torch_stub = sys.modules["torch"]
-        for ne in [8, 16, 32, 64]:
-            rhs = type("Mat", (), {"shape": (256, ne)})()
-            result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
-            if result == P.CheckpointPolicy.MUST_SAVE:
-                captured_num_experts = ne
-                break
-        return "CTX"
-
-    def fake_wrapper(block, preserve_rng_state, context_fn=None, checkpoint_fn=None):
-        assert checkpoint_fn is P._checkpoint_without_early_stop
-        if context_fn is not None:
-            context_fn()
-        return block
-
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
-
-    class Config:
-        hidden_size = 256
-        num_experts = 64  # Should be ignored in favor of moe_config
-
-    class MoeConfig:
-        n_routed_experts = 32
-
-    class Inner:
-        def __init__(self):
-            self.moe_config = MoeConfig()
-            self.layers = LayerContainer([DummyBlock()])
-
-    class Outer:
-        def __init__(self):
-            self.config = Config()
-            self.model = Inner()
-
-    model = Outer()
-
-    P.apply_ac(model, ignore_router=True)
-
-    # moe_config should take priority over config.num_experts
-    assert captured_num_experts == 32
 
 
 def test_apply_fsdp_handles_block_with_moe_attribute(monkeypatch):
@@ -2579,57 +2005,6 @@ def test_parallelize_model_mp_policy_defaults_to_none(monkeypatch):
     apply_fsdp_mock.assert_called_once()
     _, kwargs = apply_fsdp_mock.call_args
     assert kwargs.get("mp_policy") is None
-
-
-def test_apply_ac_derives_hidden_size_and_num_experts_from_text_config(monkeypatch):
-    """Test that apply_ac resolves hidden_size/num_experts from model.config.text_config (VLM models)."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    captured_hidden_size = None
-    captured_num_experts = None
-
-    def fake_create_selective_checkpoint_contexts(policy_cb):
-        nonlocal captured_hidden_size, captured_num_experts
-        torch_stub = sys.modules["torch"]
-        for hs in [256, 512, 2048]:
-            for ne in [8, 16, 128]:
-                rhs = type("Mat", (), {"shape": (hs, ne)})()
-                result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
-                if result == P.CheckpointPolicy.MUST_SAVE:
-                    captured_hidden_size = hs
-                    captured_num_experts = ne
-                    break
-            if captured_hidden_size is not None:
-                break
-        return "CTX"
-
-    def fake_wrapper(block, preserve_rng_state, context_fn=None, checkpoint_fn=None):
-        assert checkpoint_fn is P._checkpoint_without_early_stop
-        if context_fn is not None:
-            context_fn()
-        return block
-
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
-
-    # VLM pattern: attrs nested under text_config, NOT at top level
-    class TextConfig:
-        hidden_size = 2048
-        num_experts = 128
-
-    class VLMConfig:
-        text_config = TextConfig()
-
-    class VLMModel:
-        def __init__(self):
-            self.config = VLMConfig()
-            self.layers = LayerContainer([DummyBlock()])
-
-    model = VLMModel()
-    P.apply_ac(model, ignore_router=True)
-
-    assert captured_hidden_size == 2048
-    assert captured_num_experts == 128
 
 
 # ============================================================================

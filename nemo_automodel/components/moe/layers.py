@@ -520,7 +520,11 @@ class Gate(nn.Module):
         if self._track_load_balance:
             self._last_expert_load = expert_load.detach()
 
-        if self.bias_update_factor > 0 and self.training:
+        # Native reentrant activation checkpointing runs the original forward
+        # under no_grad and the full recompute with gradients enabled. Accumulate
+        # exactly once from the recompute; ordinary (non-checkpointed) training
+        # forwards remain grad-enabled and keep their existing behavior.
+        if self.bias_update_factor > 0 and self.training and torch.is_grad_enabled():
             if self._cumulative_expert_load is None:
                 self._cumulative_expert_load = expert_load.detach()
             else:
