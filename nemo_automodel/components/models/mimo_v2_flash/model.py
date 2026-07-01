@@ -489,7 +489,6 @@ class MiMoV2FlashModel(nn.Module):
             "config": self.config,
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
-            "cache_position": cache_position,
             "past_key_values": None,
             "position_ids": position_ids,
         }
