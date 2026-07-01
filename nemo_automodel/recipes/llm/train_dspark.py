@@ -57,6 +57,7 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample, build
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.optim.optimizer import build_optimizer
 from nemo_automodel.components.speculative.dspark.config import (
     build_deepseek_v4_draft_config,
     build_gemma4_draft_config,
@@ -152,6 +153,44 @@ def _apply_target_chat_template(tokenizer, chat_template):
             "to an inline Jinja string or a template file that matches how the training "
             "responses were generated."
         )
+
+
+def _resolve_dspark_optimizer_spec(opt_cfg) -> tuple[str, dict]:
+    """Normalize the recipe's ``optimizer:`` config into a ``build_optimizer`` spec.
+
+    Reads an optional ``_target_`` (a registry short name such as ``"fused_adam"``
+    or a dotted import path, e.g. ``transformer_engine.pytorch.optimizers.FusedAdam``)
+    plus whatever other fields the config carries -- ``lr``/``betas``/``weight_decay``
+    and any optimizer-specific kwargs (``master_weights``, ``master_weight_dtype``,
+    ``exp_avg_dtype``, ``exp_avg_sq_dtype``, ``store_param_remainders``, ...) -- and
+    returns the ``(target, kwargs)`` tuple that ``build_optimizer`` resolves via its
+    registry / dotted-import-path / ``OptimizerFromFactoryConfig`` escape hatch.
+    Absent an explicit ``_target_``, this defaults to plain ``torch.optim.AdamW``
+    (the prior hardcoded behavior), so existing DSpark configs are unaffected.
+    """
+    kwargs = dict(opt_cfg.to_dict())
+    target = kwargs.pop("_target_", "torch.optim.AdamW")
+    kwargs.pop("warmup_ratio", None)
+    kwargs.pop("min_lr_ratio", None)
+    kwargs["lr"] = float(kwargs["lr"])
+    kwargs.setdefault("betas", (0.9, 0.95))
+    kwargs.setdefault("weight_decay", 0.0)
+    return target, kwargs
+
+
+def _resolve_warmup_steps(warmup_ratio: float, total_optim_steps: int, min_warmup_steps: int = 20) -> int:
+    """Return the LR warmup length in optimizer steps.
+
+    ``warmup_ratio * total_optim_steps`` collapses to a handful of steps (or fewer)
+    on short / small-dataset runs, dropping a freshly-initialized draft (random
+    attention layers, Markov head, confidence head) to near-peak LR within the
+    first few optimizer steps -- a reliable way to trigger an early loss spike.
+    Floor the ratio-derived step count at ``min_warmup_steps`` unless the caller
+    explicitly opts out of warmup with ``warmup_ratio<=0`` (e.g. the smoke config).
+    """
+    if warmup_ratio <= 0:
+        return 1
+    return max(min_warmup_steps, int(warmup_ratio * total_optim_steps))
 
 
 def _resolve_reduced_target_layers(checkpoint_num_layers, requested):
@@ -391,12 +430,9 @@ class TrainDSparkRecipe(BaseRecipe):
 
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
-        self.optimizer = torch.optim.AdamW(
-            [p for p in self.trainer_module.parameters() if p.requires_grad],
-            lr=self.peak_lr,
-            betas=tuple(opt_cfg.get("betas", (0.9, 0.95))),
-            weight_decay=opt_cfg.get("weight_decay", 0.0),
-        )
+        self.optimizer = build_optimizer(
+            self.trainer_module, _resolve_dspark_optimizer_spec(opt_cfg), device_mesh=None
+        )[0]
         self.grad_accumulation_steps = recipe_cfg.get("grad_accumulation_steps", 1)
         self.max_grad_norm = recipe_cfg.get("max_grad_norm", 1.0)
         self.num_epochs = recipe_cfg.num_epochs
@@ -418,7 +454,7 @@ class TrainDSparkRecipe(BaseRecipe):
         )
         warmup_ratio = float(opt_cfg.get("warmup_ratio", 0.05))
         min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
-        warmup_steps = max(1, int(warmup_ratio * total_optim_steps))
+        warmup_steps = _resolve_warmup_steps(warmup_ratio, total_optim_steps)
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer, make_warmup_cosine_schedule(warmup_steps, total_optim_steps, min_lr_ratio)
         )

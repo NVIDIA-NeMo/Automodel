@@ -20,6 +20,12 @@ Covers the recipe-level glue added for the DeepSeek-V4-Flash target:
   fast, and an explicit template overrides whatever the tokenizer carries.
 - ``_resolve_reduced_target_layers``: the ``target_num_hidden_layers``
   diagnostic override is range-checked.
+- ``_resolve_dspark_optimizer_spec``: the ``optimizer:`` config is normalized
+  into a ``build_optimizer`` spec, honoring an explicit ``_target_`` (e.g. TE
+  FusedAdam with ``master_weights``/``exp_avg_dtype``/...) instead of always
+  hardcoding plain ``torch.optim.AdamW``.
+- ``_resolve_warmup_steps``: the ratio-derived warmup length is floored for
+  short / small-dataset runs, unless the caller opts out with ``warmup_ratio<=0``.
 
 (target_layer_ids range/-1/ordering validation is covered by the shared
 ``common.validate_target_layer_ids``, which HFDSparkTargetModel already calls.)
@@ -33,7 +39,9 @@ import pytest
 
 from nemo_automodel.recipes.llm.train_dspark import (
     _apply_target_chat_template,
+    _resolve_dspark_optimizer_spec,
     _resolve_reduced_target_layers,
+    _resolve_warmup_steps,
 )
 
 JINJA = (
@@ -111,3 +119,87 @@ def test_reduced_layers_full_depth_allowed():
 def test_reduced_layers_out_of_range_raises(bad):
     with pytest.raises(ValueError, match="target_num_hidden_layers"):
         _resolve_reduced_target_layers(43, bad)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_dspark_optimizer_spec
+# ---------------------------------------------------------------------------
+
+
+def _opt_cfg(**fields):
+    """A minimal ``optimizer:`` config-node stub: dict-like ``to_dict``/``get``."""
+    return SimpleNamespace(to_dict=lambda: dict(fields), get=lambda k, default=None: fields.get(k, default))
+
+
+def test_optimizer_spec_defaults_to_adamw_when_no_target():
+    target, kwargs = _resolve_dspark_optimizer_spec(_opt_cfg(lr=6e-4, warmup_ratio=0.04, min_lr_ratio=0.1))
+    assert target == "torch.optim.AdamW"
+    assert kwargs["lr"] == 6e-4
+    assert kwargs["betas"] == (0.9, 0.95)
+    assert kwargs["weight_decay"] == 0.0
+    assert "warmup_ratio" not in kwargs
+    assert "min_lr_ratio" not in kwargs
+
+
+def test_optimizer_spec_respects_explicit_target_and_extra_kwargs():
+    target, kwargs = _resolve_dspark_optimizer_spec(
+        _opt_cfg(
+            _target_="transformer_engine.pytorch.optimizers.FusedAdam",
+            lr=1e-5,
+            master_weights=True,
+            master_weight_dtype="float32",
+            exp_avg_dtype="float32",
+            exp_avg_sq_dtype="float32",
+            store_param_remainders=True,
+        )
+    )
+    assert target == "transformer_engine.pytorch.optimizers.FusedAdam"
+    assert kwargs["lr"] == 1e-5
+    assert kwargs["master_weights"] is True
+    assert kwargs["master_weight_dtype"] == "float32"
+    assert kwargs["exp_avg_dtype"] == "float32"
+    assert kwargs["exp_avg_sq_dtype"] == "float32"
+    assert kwargs["store_param_remainders"] is True
+
+
+def test_optimizer_spec_preserves_explicit_betas_and_weight_decay():
+    _target, kwargs = _resolve_dspark_optimizer_spec(_opt_cfg(lr=6e-4, betas=(0.9, 0.999), weight_decay=0.01))
+    assert kwargs["betas"] == (0.9, 0.999)
+    assert kwargs["weight_decay"] == 0.01
+
+
+def test_optimizer_spec_coerces_lr_to_float():
+    _target, kwargs = _resolve_dspark_optimizer_spec(_opt_cfg(lr="6e-4"))
+    assert kwargs["lr"] == pytest.approx(6e-4)
+    assert isinstance(kwargs["lr"], float)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_warmup_steps
+# ---------------------------------------------------------------------------
+
+
+def test_warmup_steps_floors_short_runs():
+    # 4% of 100 steps is 4 -- far too little warmup for a freshly-initialized
+    # draft; the floor should kick in.
+    assert _resolve_warmup_steps(0.04, 100) == 20
+
+
+def test_warmup_steps_ratio_dominates_for_long_runs():
+    # 4% of 10,000 steps is 400, well above the floor -- the ratio wins.
+    assert _resolve_warmup_steps(0.04, 10_000) == 400
+
+
+def test_warmup_steps_zero_ratio_is_explicit_opt_out():
+    # The smoke config sets warmup_ratio=0.0 on purpose ("see movement
+    # immediately"); the floor must not override that opt-out.
+    assert _resolve_warmup_steps(0.0, 100) == 1
+
+
+def test_warmup_steps_negative_ratio_treated_as_opt_out():
+    assert _resolve_warmup_steps(-1.0, 100) == 1
+
+
+def test_warmup_steps_custom_floor():
+    assert _resolve_warmup_steps(0.01, 100, min_warmup_steps=5) == 5
+    assert _resolve_warmup_steps(0.5, 100, min_warmup_steps=5) == 50
