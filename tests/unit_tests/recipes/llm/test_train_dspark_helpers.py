@@ -15,6 +15,8 @@
 """CPU unit tests for the DSpark recipe's V4-Flash helper knobs.
 
 Covers the recipe-level glue added for the DeepSeek-V4-Flash target:
+- ``_apply_draft_activation_checkpointing``: the distributed AC setting wraps
+  the trainable draft's attention, MLP, and norm modules before FSDP.
 - ``_apply_target_chat_template``: a target whose tokenizer ships no chat
   template (V4-Flash) must take one from ``recipe_args.chat_template`` or fail
   fast, and an explicit template overrides whatever the tokenizer carries.
@@ -43,9 +45,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm.train_dspark import (
+    _apply_draft_activation_checkpointing,
     _apply_target_chat_template,
     _build_dspark_optimizer,
+    _extract_mm_kwargs,
     _init_dspark_wandb,
     _resolve_dspark_optimizer_spec,
     _resolve_reduced_target_layers,
@@ -63,6 +68,38 @@ def _tok(chat_template=None):
     """A minimal tokenizer stub: ``_has_chat_template`` needs a ``chat_template``
     attribute plus a callable ``apply_chat_template``."""
     return SimpleNamespace(chat_template=chat_template, apply_chat_template=lambda *a, **k: None)
+
+
+class _DraftLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = torch.nn.Linear(4, 4)
+        self.mlp = torch.nn.Linear(4, 4)
+        self.input_layernorm = torch.nn.LayerNorm(4)
+        self.post_attention_layernorm = torch.nn.LayerNorm(4)
+
+
+class _Draft(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_DraftLayer(), _DraftLayer()])
+
+
+def test_draft_activation_checkpointing_wraps_trainable_submodules():
+    draft = _Draft()
+    _apply_draft_activation_checkpointing(draft, True)
+    for layer in draft.layers:
+        assert hasattr(layer.self_attn, "_checkpoint_wrapped_module")
+        assert hasattr(layer.mlp, "_checkpoint_wrapped_module")
+        assert hasattr(layer.input_layernorm, "_checkpoint_wrapped_module")
+        assert hasattr(layer.post_attention_layernorm, "_checkpoint_wrapped_module")
+
+
+def test_draft_activation_checkpointing_false_is_noop():
+    draft = _Draft()
+    original_attention = draft.layers[0].self_attn
+    _apply_draft_activation_checkpointing(draft, False)
+    assert draft.layers[0].self_attn is original_attention
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +218,12 @@ def test_optimizer_spec_coerces_lr_to_float():
     _target, kwargs = _resolve_dspark_optimizer_spec(_opt_cfg(lr="6e-4"))
     assert kwargs["lr"] == pytest.approx(6e-4)
     assert isinstance(kwargs["lr"], float)
+
+
+def test_optimizer_spec_keeps_real_config_node_target_as_string():
+    cfg = ConfigNode({"_target_": "torch.optim.AdamW", "lr": 1e-5})
+    target, _kwargs = _resolve_dspark_optimizer_spec(cfg)
+    assert target == "torch.optim.AdamW"
 
 
 def test_optimizer_spec_does_not_force_betas_onto_explicit_target():
@@ -334,3 +377,31 @@ def test_init_wandb_runs_on_main_when_enabled(monkeypatch):
     assert calls["wandb_kwargs"] == {"project": "p", "group": "g"}
     assert calls["cfg_dict"] == {"lr": 1e-4}
     assert calls["default_name"] == "dspark_run"
+
+
+# ---------------------------------------------------------------------------
+# _extract_mm_kwargs (multimodal MiniMax M3 DSpark)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_mm_kwargs_empty_for_text_only_batch():
+    batch = {"input_ids": torch.zeros(1), "attention_mask": torch.ones(1), "loss_mask": torch.ones(1)}
+    assert _extract_mm_kwargs(batch) == {}
+
+
+def test_extract_mm_kwargs_passes_through_present_media_keys():
+    pixel_values = torch.randn(2, 3, 4, 4)
+    image_grid_thw = torch.tensor([[1, 2, 2]])
+    batch = {
+        "input_ids": torch.zeros(1),
+        "loss_mask": torch.ones(1),
+        "pixel_values": pixel_values,
+        "image_grid_thw": image_grid_thw,
+    }
+    mm_kwargs = _extract_mm_kwargs(batch)
+    assert mm_kwargs == {"pixel_values": pixel_values, "image_grid_thw": image_grid_thw}
+
+
+def test_extract_mm_kwargs_ignores_unrelated_keys():
+    batch = {"input_ids": torch.zeros(1), "seq_lens": torch.tensor([1, 2]), "doc_remaining": torch.tensor([0])}
+    assert _extract_mm_kwargs(batch) == {}
