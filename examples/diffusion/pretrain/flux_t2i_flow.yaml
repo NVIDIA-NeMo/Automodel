@@ -84,6 +84,7 @@ checkpoint:
   restore_from:
 
 wandb:
+  enable: false
   project: flux-pretraining
   mode: online
   name: flux_pretrain_ddp_test_run_1

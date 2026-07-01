@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
@@ -20,6 +21,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -47,9 +49,12 @@ class Block(nn.Module):
             config, backend, use_sliding_attention=config.layer_types[layer_idx] == "sliding_attention"
         )
         self.mlp = MoE(moe_config, backend)
-        self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
+        )
         self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
 
     def forward(
@@ -103,6 +108,12 @@ class GptOssModel(nn.Module):
         self.config = config
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
+
+        # Resolve model dtype once; thread it explicitly to every sub-module
+        # so fp32 master weights work even when construction is not wrapped
+        # in local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         # GPT-OSS is MoE everywhere; set shared experts to 0 to disable shared path in our MoE wrapper.
         moe_defaults = dict(
             dim=config.hidden_size,
@@ -124,18 +135,19 @@ class GptOssModel(nn.Module):
             expert_activation="quick_geglu",
             activation_alpha=1.702,
             activation_limit=getattr(config, "swiglu_limit", 7.0),
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
-        self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        )
 
         # Rotary embedding cached at model-level (inv_freq + concentration via YaRN/NTK-by-parts)
         self.max_seq_len = config.max_position_embeddings
@@ -211,6 +223,15 @@ class GptOssModel(nn.Module):
 
 
 class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = True
+
     @classmethod
     def from_config(
         cls,
@@ -240,13 +261,17 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig(attn="flex")
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
+        )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = GPTOSSStateDictAdapter(
-                self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
+                self.config, self.model.moe_config, self.backend, dtype=model_dtype
             )
 
     def get_input_embeddings(self):

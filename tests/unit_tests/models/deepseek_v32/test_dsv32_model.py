@@ -177,6 +177,7 @@ class TestDeepseekV32Block:
         block = DeepseekV32Block(layer_idx=0, config=cfg, moe_config=moe_config, backend=backend)
 
         assert block.layer_idx == 0
+        assert block.is_moe_layer is False
         assert hasattr(block, "self_attn")
         assert hasattr(block, "mlp")
         assert hasattr(block, "input_layernorm")
@@ -221,6 +222,7 @@ class TestDeepseekV32Block:
         block = DeepseekV32Block(layer_idx=3, config=cfg, moe_config=moe_config, backend=backend)
 
         assert block.layer_idx == 3
+        assert block.is_moe_layer is True
 
         # Check that MLP is MoE (not dense)
         from nemo_automodel.components.moe.layers import MoE

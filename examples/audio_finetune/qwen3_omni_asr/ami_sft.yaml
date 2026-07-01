@@ -66,8 +66,8 @@ model:
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: te
-    enable_deepep: true
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -128,6 +128,7 @@ optimizer:
   weight_decay: 0.0
 
 wandb:
+  enable: false
   project: ${oc.env:WANDB_PROJECT,qwen3-omni-asr-ami}
   name: ${oc.env:WANDB_NAME,qwen3_omni_asr_ami_fullft}
   dir: ${oc.env:WANDB_DIR,result/wandb}

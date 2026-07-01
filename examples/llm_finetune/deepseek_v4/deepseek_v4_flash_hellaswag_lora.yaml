@@ -63,7 +63,7 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    dispatcher: deepep
+    dispatcher: hybridep
     experts: torch_mm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -126,3 +126,9 @@ optimizer:
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0.1
+
+ci:
+  # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
+  recipe_owner: hemildesai
+  time: "00:20:00"
+  nodes: 4

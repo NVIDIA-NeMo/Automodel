@@ -47,9 +47,9 @@ from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
@@ -62,12 +62,19 @@ from nemo_automodel.components.models.common.utils import (
     compute_lm_head_logits,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v4.cp import (
+    build_dsv4_cp_causal_padding_mask,
+    dsv4_cp_enabled,
+    dsv4_cp_local_seq_multiple,
+    dsv4_cp_size,
+    make_dsv4_contiguous_shard_cp_batch_and_ctx,
+)
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
     DeepseekV4HyperConnection,
     DeepseekV4HyperHead,
     DeepseekV4RotaryEmbedding,
-    _dsv4_kernel_backend,
+    _dsv4_sinkhorn_backend,
     build_causal_padding_mask,
     build_packed_causal_padding_mask,
 )
@@ -153,20 +160,16 @@ class DeepseekV4Block(nn.Module):
             hc_sinkhorn_iters=int(getattr(config, "hc_sinkhorn_iters", 20) or 20),
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(config.rms_norm_eps),
-            sinkhorn_backend=_dsv4_kernel_backend(backend),
+            sinkhorn_backend=_dsv4_sinkhorn_backend(backend),
         )
         self.attn_hc = DeepseekV4HyperConnection(**hc_kwargs)
         self.ffn_hc = DeepseekV4HyperConnection(**hc_kwargs)
-        self.activation_checkpointing = False
-
-    def set_activation_checkpointing(self, enabled: bool = True) -> None:
-        """Enable block-local checkpointing that avoids replaying MoE dispatch."""
-        self.activation_checkpointing = enabled
 
     def forward(
         self,
         x: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.Tensor | None = None,
         position_embeddings_compress: tuple[torch.Tensor, torch.Tensor] | None = None,
         rotary_compress: nn.Module | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -191,6 +194,8 @@ class DeepseekV4Block(nn.Module):
                 attention_mask=attention_mask,
                 position_embeddings_compress=position_embeddings_compress,
                 rotary_compress=rotary_compress,
+                position_ids=position_ids,
+                **attn_kwargs,
             )
             dtype = hidden_streams.dtype
             # Expand: native DSV4 uses comb[j, h] * residual[j], i.e. comb.T @ residual.
@@ -203,12 +208,8 @@ class DeepseekV4Block(nn.Module):
             collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
             return collapsed, post, comb
 
-        if self.activation_checkpointing and torch.is_grad_enabled():
-            x = checkpoint(attention_site, x, use_reentrant=False)
-            collapsed, post, comb = checkpoint(ffn_prepare, x, use_reentrant=False)
-        else:
-            x = attention_site(x)
-            collapsed, post, comb = ffn_prepare(x)
+        x = attention_site(x)
+        collapsed, post, comb = ffn_prepare(x)
 
         # Hash-routing layers need the current batch's input_ids to do the
         # tid2eid lookup; stash it on the gate just before the MoE call.
@@ -436,6 +437,13 @@ class DeepseekV4Model(nn.Module):
                 raise ValueError("First PP stage requires input_ids or inputs_embeds")
             if inputs_embeds is None:
                 inputs_embeds = self.embed_tokens(input_ids)
+            # Packed-sequence (THD) inputs arrive with the batch axis collapsed
+            # (``process_input_for_thd`` flattens ids to ``[T]`` -> embeds ``[T, dim]``).
+            # Restore the leading batch dim so the hc_mult expand below sees the
+            # expected ``[B, S, dim]`` rank, mirroring the output-side THD
+            # ``unsqueeze(0)`` in ``compute_lm_head_logits(is_thd=True)``.
+            if inputs_embeds.dim() == 2:
+                inputs_embeds = inputs_embeds.unsqueeze(0)
             # Expand embeddings to hc_mult copies: [B,S,dim] -> [B,S,hc_mult,dim]
             h = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
             shape_ref = inputs_embeds  # 3D ref for rotary / mask sizing
@@ -454,6 +462,8 @@ class DeepseekV4Model(nn.Module):
         if position_ids is None:
             seq_len = shape_ref.shape[1]
             position_ids = torch.arange(seq_len, device=shape_ref.device).unsqueeze(0).expand(shape_ref.shape[0], -1)
+        elif position_ids.shape[0] == 1 and shape_ref.shape[0] > 1:
+            position_ids = position_ids.expand(shape_ref.shape[0], -1).contiguous()
 
         # (cos, sin) pairs for the main attention path and the compressor path.
         # Rotary modules live on every stage (PP keep-list ensures it).
@@ -472,7 +482,25 @@ class DeepseekV4Model(nn.Module):
             packed_seq_lens = attn_kwargs.get("seq_lens_padded")
             if packed_seq_lens is None:
                 packed_seq_lens = attn_kwargs.get("seq_lens")
-        if packed_seq_lens is not None:
+        cp_group = attn_kwargs.get("_dsv4_cp_group")
+        cp_active = dsv4_cp_enabled(cp_group)
+        if cp_active and packed_seq_lens is not None:
+            raise NotImplementedError("DeepSeek V4 context parallelism with packed sequences is not implemented yet.")
+
+        if cp_active:
+            cp_padding_mask = padding_mask
+            if cp_padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
+                cp_padding_mask = attention_mask.bool().logical_not()
+            attention_mask_4d = build_dsv4_cp_causal_padding_mask(
+                position_ids=position_ids,
+                key_len=shape_ref.shape[1] * dsv4_cp_size(cp_group),
+                dtype=shape_ref.dtype,
+                device=shape_ref.device,
+                cp_group=cp_group,
+                padding_mask=cp_padding_mask,
+                sliding_window=sliding_window,
+            )
+        elif packed_seq_lens is not None:
             attention_mask_4d = build_packed_causal_padding_mask(
                 packed_seq_lens,
                 seq_len=shape_ref.shape[1],
@@ -501,6 +529,7 @@ class DeepseekV4Model(nn.Module):
             h = layer(
                 x=h,
                 position_embeddings=position_embeddings,
+                position_ids=position_ids,
                 position_embeddings_compress=position_embeddings_compress,
                 rotary_compress=self.rotary_emb_compress,
                 attention_mask=attention_mask_4d,
@@ -574,7 +603,22 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         "self_attn.compressor.indexer.ape",
         "e_score_correction_bias",
         "lm_head",
+        # RoPE inv_freq (matches rotary_emb + rotary_emb_compress) must stay fp32: the
+        # bf16 cast in initialize_weights would otherwise round it and degrade rotary
+        # precision vs HF (see llama/rope_utils.py).
+        "rotary_emb",
     ]
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        # CP is supported with the Miles-style TileLang attention path; the runtime
+        # gate in ``_transformers/capabilities.py`` restricts it to ``attn='tilelang'``.
+        supports_cp: bool = True
+        supports_pp: bool = True
+        supports_ep: bool = True
 
     @classmethod
     def from_config(
@@ -605,6 +649,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)
@@ -747,6 +792,27 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             embeds.append(self.model.embed_tokens(cur_input_ids))
         return tuple(embeds)
 
+    def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
+        """Model-owned context-parallel batch prep (Miles-style contiguous shard).
+
+        Returns the keys ``cp_utils.make_cp_batch_and_ctx`` needs to delegate CP
+        sharding back to this model: a ``_cp_make_batch_fn`` callable (with the
+        config-derived per-rank shard multiple bound) plus a flag asking the recipe
+        to keep the full logits in the autograd graph so every CP rank's backward
+        reaches all parameters even when its local loss is fully masked. DSV4 embeds
+        internally, so (unlike VLM models) this does not pre-embed -- it leaves
+        ``input_ids`` for the sharding callable.
+        """
+        from functools import partial  # noqa: PLC0415
+
+        return {
+            "_cp_make_batch_fn": partial(
+                make_dsv4_contiguous_shard_cp_batch_and_ctx,
+                pad_multiple=dsv4_cp_local_seq_multiple(self.config),
+            ),
+            "_cp_full_logits_grad_touch": True,
+        }
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -758,6 +824,12 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
     ) -> "DeepseekV4CausalLMOutput" | tuple[torch.Tensor, ...] | torch.Tensor:
+        # Model-owned context-parallel input prep. The recipe routes the batch
+        # through ``__call__(_pre_embed_only=True)`` before CP sharding so the model
+        # can attach its own ``_cp_make_batch_fn`` (see ``prepare_model_inputs_for_cp``).
+        if attn_kwargs.pop("_pre_embed_only", False):
+            return self.prepare_model_inputs_for_cp(input_ids=input_ids)
+
         if output_hidden_states is None:
             output_hidden_states = getattr(getattr(self, "config", None), "output_hidden_states", False)
 
@@ -808,20 +880,37 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             if position_ids is None:
                 position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
             sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
-            mtp_attn_mask = build_causal_padding_mask(
-                attention_mask,
-                seq_len=seq_len,
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-                batch_size=batch_size,
-                sliding_window=sliding_window,
-            )
+            cp_group = attn_kwargs.get("_dsv4_cp_group")
+            if dsv4_cp_enabled(cp_group):
+                cp_padding_mask = padding_mask
+                if cp_padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
+                    cp_padding_mask = attention_mask.bool().logical_not()
+                mtp_attn_mask = build_dsv4_cp_causal_padding_mask(
+                    position_ids=position_ids,
+                    key_len=seq_len * dsv4_cp_size(cp_group),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                    cp_group=cp_group,
+                    padding_mask=cp_padding_mask,
+                    sliding_window=sliding_window,
+                )
+            else:
+                mtp_attn_mask = build_causal_padding_mask(
+                    attention_mask,
+                    seq_len=seq_len,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                    batch_size=batch_size,
+                    sliding_window=sliding_window,
+                )
             mtp_kwargs = {
                 "hidden_states": mtp_hc_hidden,
                 "position_ids": position_ids,
                 "attention_mask": mtp_attn_mask,
                 "padding_mask": padding_mask,
             }
+            if cp_group is not None:
+                mtp_kwargs["_dsv4_cp_group"] = cp_group
             if mtp_embed_inputs:
                 mtp_kwargs["embed_inputs"] = tuple(mtp_embed_inputs)
             else:

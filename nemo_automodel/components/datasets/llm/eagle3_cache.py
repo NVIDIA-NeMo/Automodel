@@ -35,11 +35,18 @@ agree on one schema):
 * ``<cache_dir>/shard-000000.safetensors`` -- one shard holds a contiguous block
   of samples, each field stacked along dim 0:
   ``input_ids[n,S]``, ``attention_mask[n,S]``, ``loss_mask[n,S]`` (int64),
-  ``aux_hidden_states[n,S,3H]``, ``target_probs[n,S,draft_vocab]`` (float),
-  ``position_mask[n,S,1]`` (bool).
+  ``aux_hidden_states[n,S,3H]`` (float), ``position_mask[n,S,1]`` (bool), and the
+  draft-vocab target distribution. The distribution is stored in full as
+  ``target_probs[n,S,draft_vocab]`` (float) by default, or -- when the manifest's
+  ``target_probs_topk`` enables it -- as the top-k factorization
+  ``target_probs_values[n,S,k]`` (float) + ``target_probs_indices[n,S,k]`` (int32),
+  which the reader scatters back to full width. Top-k bounds the dominant field's
+  footprint at the cost of the dropped tail mass (a disk/fidelity trade-off, off by
+  default; see ``precompute_eagle3``).
 
 Each ``CachedEagle3Dataset`` item is exactly the keyword arguments
-``Eagle3TrainerModule.forward`` consumes on its precomputed-distribution path.
+``Eagle3TrainerModule.forward`` consumes on its precomputed-distribution path
+(``target_probs`` always yielded at full width).
 """
 
 from __future__ import annotations
@@ -58,17 +65,53 @@ from nemo_automodel.shared.import_utils import safe_import_from
 _MANIFEST_NAME = "manifest.json"
 _EMBEDDINGS_NAME = "target_embeddings.safetensors"
 _SHARD_RE = re.compile(r"^shard-(\d{6})\.safetensors$")
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
 
-# Fields stored per sample. The float fields are cast to the cache dtype; the id /
-# mask fields stay int64 / bool. This key set is exactly what the trainer's
-# precomputed-distribution path consumes.
-_FLOAT_KEYS = ("aux_hidden_states", "target_probs")
-_INT_KEYS = ("input_ids", "attention_mask", "loss_mask")
-_BOOL_KEYS = ("position_mask",)
-CACHE_KEYS = _FLOAT_KEYS + _INT_KEYS + _BOOL_KEYS
+# Fields the trainer's precomputed-distribution path consumes (what each
+# ``CachedEagle3Dataset`` item yields). ``target_probs`` is the full draft-vocab
+# distribution; under top-k compression the reader reconstructs it from the
+# stored factorization, otherwise it is read back as-is.
+_COMMON_KEYS = ("input_ids", "attention_mask", "loss_mask", "aux_hidden_states", "position_mask")
+_LOSSLESS_PROBS_KEYS = ("target_probs",)
+CACHE_KEYS = _COMMON_KEYS + _LOSSLESS_PROBS_KEYS
+
+# A shard stores the draft-vocab ``target_probs`` either in full (lossless, the
+# default) or, to bound the dominant field's footprint, as the top-k
+# ``(values, indices)`` factorization the reader scatters back to full width.
+# Which layout is in use is recorded by ``target_probs_topk`` in the manifest.
+_TARGET_PROBS_VALUES = "target_probs_values"
+_TARGET_PROBS_INDICES = "target_probs_indices"
+_TOPK_PROBS_KEYS = (_TARGET_PROBS_VALUES, _TARGET_PROBS_INDICES)
 
 DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+
+
+def is_compressed(target_probs_topk: int | None, draft_vocab_size: int) -> bool:
+    """True when ``target_probs_topk`` actually compresses (a positive k below the vocab width)."""
+    return target_probs_topk is not None and 0 < int(target_probs_topk) < draft_vocab_size
+
+
+def compress_target_probs(target_probs: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Factor a draft-vocab distribution into its top-``topk`` ``(values, indices)``.
+
+    ``target_probs`` is ``[..., draft_vocab]``. The kept values are renormalized to
+    sum to 1 so the reconstructed distribution stays a proper distribution for soft
+    cross-entropy. The dropped tail mass is a disk/fidelity trade-off that grows with
+    how diffuse the target is (it is *not* negligible for a real LLM: top-64 of a
+    Qwen3-8B next-token distribution keeps only ~0.92 of the mass), so callers choose
+    ``topk`` deliberately; see ``precompute_eagle3``. ``topk`` is clamped to the vocab
+    width.
+    """
+    k = min(topk, target_probs.shape[-1])
+    values, indices = torch.topk(target_probs, k, dim=-1)
+    values = values / values.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(target_probs.dtype).tiny)
+    return values, indices.to(torch.int32)
+
+
+def reconstruct_target_probs(values: torch.Tensor, indices: torch.Tensor, draft_vocab_size: int) -> torch.Tensor:
+    """Scatter stored top-k ``(values, indices)`` back into a full ``[..., draft_vocab]`` distribution."""
+    full = torch.zeros((*values.shape[:-1], draft_vocab_size), dtype=values.dtype, device=values.device)
+    return full.scatter_(-1, indices.to(torch.long), values)
 
 
 def _load_safetensors():
@@ -170,12 +213,25 @@ def read_target_embeddings(cache_dir: str) -> torch.Tensor:
 
 
 def write_shard(cache_dir: str, shard_index: int, samples: dict[str, torch.Tensor]) -> str:
-    """Write one shard atomically. ``samples`` maps each ``CACHE_KEYS`` field to a stacked tensor."""
+    """Write one shard atomically.
+
+    ``samples`` carries the ``_COMMON_KEYS`` plus exactly one ``target_probs``
+    representation: the full ``target_probs`` (lossless) or the top-k pair
+    ``target_probs_values`` + ``target_probs_indices``.
+    """
     save_file, _ = _load_safetensors()
-    missing = [k for k in CACHE_KEYS if k not in samples]
+    has_full = "target_probs" in samples
+    has_topk = all(k in samples for k in _TOPK_PROBS_KEYS)
+    if int(has_full) + int(has_topk) != 1:
+        raise ValueError(
+            "write_shard needs exactly one target_probs representation: the full 'target_probs', "
+            "or the top-k 'target_probs_values' + 'target_probs_indices'."
+        )
+    keys = _COMMON_KEYS + (_LOSSLESS_PROBS_KEYS if has_full else _TOPK_PROBS_KEYS)
+    missing = [k for k in keys if k not in samples]
     if missing:
         raise ValueError(f"write_shard is missing required cache fields: {missing}")
-    tensors = {k: samples[k].contiguous() for k in CACHE_KEYS}
+    tensors = {k: samples[k].contiguous() for k in keys}
     return _atomic_write(shard_path(cache_dir, shard_index), lambda tmp: save_file(tensors, tmp))
 
 
@@ -192,6 +248,11 @@ class CachedEagle3Dataset(Dataset):
         self.manifest = read_manifest(cache_dir)
         self.shard_size = int(self.manifest["shard_size"])
         self.num_samples = int(self.manifest["num_samples"])
+        # A cache stores target_probs either in full or as its top-k factorization;
+        # the reader yields the full distribution either way.
+        self.draft_vocab_size = int(self.manifest["draft_vocab_size"])
+        self._compressed = is_compressed(self.manifest.get("target_probs_topk"), self.draft_vocab_size)
+        self._disk_keys = _COMMON_KEYS + (_TOPK_PROBS_KEYS if self._compressed else _LOSSLESS_PROBS_KEYS)
         indices = sorted(existing_shard_indices(cache_dir))
         expected = (self.num_samples + self.shard_size - 1) // self.shard_size
         if len(indices) != expected:
@@ -221,7 +282,14 @@ class CachedEagle3Dataset(Dataset):
         shard_index = index // self.shard_size
         offset = index % self.shard_size
         handle = self._handle(shard_index)
-        return {key: handle.get_slice(key)[offset] for key in CACHE_KEYS}
+        sample = {key: handle.get_slice(key)[offset] for key in self._disk_keys}
+        if self._compressed:
+            sample["target_probs"] = reconstruct_target_probs(
+                sample.pop(_TARGET_PROBS_VALUES),
+                sample.pop(_TARGET_PROBS_INDICES),
+                self.draft_vocab_size,
+            )
+        return sample
 
 
 def _collate_cached(features: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:

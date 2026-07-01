@@ -19,12 +19,14 @@ These classes subclass from DeepSeek V3, with the main difference being
 the use of DeepseekV32MLA (with Indexer) instead of the standard MLA.
 """
 
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -68,14 +70,22 @@ class DeepseekV32Block(Block):
         from nemo_automodel.components.models.common import initialize_rms_norm_module
         from nemo_automodel.components.moe.layers import MLP, MoE
 
-        if layer_idx < config.first_k_dense_replace:
-            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
+        self.is_moe_layer = layer_idx >= config.first_k_dense_replace
+
+        # Thread dtype from config.torch_dtype so the block's own params stay
+        # aligned with the rest of the model (fp32 under fp32 master weights).
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
+        if not self.is_moe_layer:
+            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
         else:
             self.mlp = MoE(moe_config, backend)
 
-        self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
+        )
         self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
         self.layer_idx = layer_idx
 
@@ -101,6 +111,12 @@ class DeepseekV32Model(DeepseekV3Model):
         self.config = config
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
+
+        # Resolve model dtype once; thread it explicitly to every sub-module
+        # so fp32 master weights work even when construction is not wrapped in
+        # local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
@@ -116,19 +132,20 @@ class DeepseekV32Model(DeepseekV3Model):
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             # Use V3.2 Block instead of V3 Block
             self.layers[str(layer_id)] = DeepseekV32Block(layer_id, config, self.moe_config, backend)
-        self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        )
 
         self.max_seq_len = config.max_position_embeddings
         rope_theta, rope_scaling, _ = get_rope_config(config)
@@ -149,6 +166,15 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
 
     Subclasses V3 ForCausalLM, using DeepseekV32Model and DeepSeekV32StateDictAdapter.
     """
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = True
 
     @classmethod
     def from_config(
@@ -183,6 +209,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         from nemo_automodel.components.models.common import initialize_linear_module
 
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig()
         # Use V3.2 Model instead of V3 Model
         moe_overrides = kwargs.pop("moe_overrides", None)
@@ -192,11 +219,14 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
+        )
         if self.backend.enable_hf_state_dict_adapter:
             # Use V3.2 adapter instead of V3 adapter
             self.state_dict_adapter = DeepSeekV32StateDictAdapter(
-                self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
+                self.config, self.model.moe_config, self.backend, dtype=model_dtype
             )
 
     def get_input_embeddings(self):

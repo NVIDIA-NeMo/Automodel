@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
@@ -19,6 +20,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -42,6 +44,10 @@ class Block(nn.Module):
         super().__init__()
         self.self_attn = Qwen3MoeAttention(config, backend)
 
+        # Thread dtype from config.torch_dtype so the block's own params stay
+        # aligned with the rest of the model (fp32 under fp32 master weights).
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         # Qwen3-MoE sparsifies every decoder_sparse_step layer, unless in mlp_only_layers
         is_moe_layer = (
             (layer_idx not in getattr(config, "mlp_only_layers", []))
@@ -51,11 +57,13 @@ class Block(nn.Module):
         if is_moe_layer:
             self.mlp = MoE(moe_config, backend)
         else:
-            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
+            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
 
-        self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
+        )
         self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
         self.layer_idx = layer_idx
 
@@ -112,6 +120,11 @@ class Qwen3MoeModel(nn.Module):
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
+        # Resolve model dtype once from config.torch_dtype and thread it
+        # explicitly into every sub-module so fp32 master weights work even
+        # when construction is not wrapped in local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         # Map HF Qwen3 MoE config -> our MoE wrapper
         # Qwen config fields from example config:
         # - hidden_size, intermediate_size, moe_intermediate_size, num_experts, num_experts_per_tok, norm_topk_prob
@@ -134,18 +147,19 @@ class Qwen3MoeModel(nn.Module):
             router_bias=False,
             expert_activation="swiglu",
             softmax_before_topk=True,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
-        self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        )
 
         # Rotary embedding cache compatible with our rope_utils functions
         self.max_seq_len = config.max_position_embeddings
@@ -219,6 +233,25 @@ class Qwen3MoeModel(nn.Module):
 
 
 class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    # Skip patch_hf_model_for_pp: this model's own forward already handles
+    # pipeline-parallel stage routing (embed_tokens/norm/lm_head are None off the
+    # owning stage; hidden states arrive in the input_ids slot) AND context
+    # parallelism + THD via the native freqs_cis path
+    # (position_ids_to_freqs_cis + apply_rotary_emb_qk with cu_seqlens/cp_*).
+    # The generic HF pipeline forward assumes the HF rotary API
+    # (rotary_emb(x, position_ids) -> cos/sin) and crashes on the freqs_cis /
+    # THD / CP path, so it must not clobber our forward.
+    _pp_keep_self_forward: bool = True
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = True
+        supports_pp: bool = True
+        supports_ep: bool = True
+
     @classmethod
     def from_config(
         cls,
@@ -248,13 +281,17 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3MoeModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
+        )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3MoeStateDictAdapter(
-                self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
+                self.config, self.model.moe_config, self.backend, dtype=model_dtype
             )
 
     def get_input_embeddings(self):

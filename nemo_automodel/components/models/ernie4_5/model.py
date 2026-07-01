@@ -22,6 +22,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.ernie4_5.configuration_ernie4_5 import Ernie4_5Config
 from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import Ernie4_5_MoeConfig
 
+from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
     postprocess_output_for_attn,
@@ -519,6 +520,25 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     _nemo_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+
+    @classmethod
+    def get_capabilities(cls, config) -> ModelCapabilities:
+        """Return parallelism capabilities for a specific ERNIE-4.5 config.
+
+        ERNIE-4.5 ships in two flavors that share this class file but exercise
+        different code paths:
+
+        1. ``baidu/ERNIE-4.5-21B-A3B-PT`` -- MoE variant (this NeMo custom
+           class). ``moe_num_experts > 0`` in the HF config.
+           Demonstrated by examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml
+           (ep_size=8).
+        2. ``baidu/ERNIE-4.5-0.3B-PT`` -- dense variant. No expert config.
+           Demonstrated by examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml
+           (tp/cp/pp/ep all 1).
+        """
+        if getattr(config, "moe_num_experts", 0) > 0:
+            return ModelCapabilities(supports_ep=True)
+        return ModelCapabilities()
 
     @classmethod
     def from_config(

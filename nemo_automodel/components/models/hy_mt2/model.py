@@ -36,12 +36,14 @@ Notes vs. ``components/models/hy_v3`` (Hy3-preview 295B):
     of being hard-coded.
 """
 
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -278,6 +280,17 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ``from_pretrained`` / ``save_pretrained`` over the HF safetensors layout.
     """
 
+    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = True
+
     @classmethod
     def from_config(
         cls,
@@ -313,6 +326,7 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = HyMT2Model(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)

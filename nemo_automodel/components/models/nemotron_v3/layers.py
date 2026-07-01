@@ -29,6 +29,13 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
+    if isinstance(tensor, DTensor):
+        tensor = tensor.full_tensor()
+    return tensor.clone()
 
 
 class NemotronV3Attention(nn.Module):
@@ -47,17 +54,34 @@ class NemotronV3Attention(nn.Module):
         # Cached for debug-print role disambiguation (backbone vs mtp sublayer).
         self.num_hidden_layers = int(getattr(config, "num_hidden_layers", 0))
 
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.q_proj = initialize_linear_module(
-            self.backend.linear, self.hidden_size, self.num_attention_heads * self.head_dim, self.attention_bias
+            self.backend.linear,
+            self.hidden_size,
+            self.num_attention_heads * self.head_dim,
+            self.attention_bias,
+            dtype=dtype,
         )
         self.k_proj = initialize_linear_module(
-            self.backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, self.attention_bias
+            self.backend.linear,
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            self.attention_bias,
+            dtype=dtype,
         )
         self.v_proj = initialize_linear_module(
-            self.backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, self.attention_bias
+            self.backend.linear,
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            self.attention_bias,
+            dtype=dtype,
         )
         self.o_proj = initialize_linear_module(
-            self.backend.linear, self.num_attention_heads * self.head_dim, self.hidden_size, self.attention_bias
+            self.backend.linear,
+            self.num_attention_heads * self.head_dim,
+            self.hidden_size,
+            self.attention_bias,
+            dtype=dtype,
         )
 
         softmax_scale = self.head_dim**-0.5
@@ -169,6 +193,28 @@ class NemotronV3MambaRMSNormGated(nn.Module):
         )
 
 
+class NemotronV3MambaFP32Params(nn.Module):
+    """Owns Nemotron V3 Mamba parameters that need fp32 storage and compute."""
+
+    def __init__(self, num_heads: int):
+        super().__init__()
+        self.dt_bias = nn.Parameter(torch.ones(num_heads, dtype=torch.float32))
+        A = torch.arange(1, num_heads + 1, dtype=torch.float32)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
+        self.D = nn.Parameter(torch.ones(num_heads, dtype=torch.float32))
+        self.D._no_weight_decay = True
+
+    def forward(self, reference: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return SSM params through the holder's FSDP hooks."""
+        del reference
+        return (
+            _full_tensor_if_dtensor(self.A_log),
+            _full_tensor_if_dtensor(self.dt_bias),
+            _full_tensor_if_dtensor(self.D),
+        )
+
+
 class NemotronV3Mamba2Mixer(nn.Module):
     """Mamba2 mixer for NemotronV3 (training-only, uses CUDA kernels).
 
@@ -221,12 +267,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
         )
 
         # SSM parameters
-        self.dt_bias = nn.Parameter(torch.ones(self.num_heads))
-        A = torch.arange(1, self.num_heads + 1)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.A_log._no_weight_decay = True
-        self.D = nn.Parameter(torch.ones(self.num_heads))
-        self.D._no_weight_decay = True
+        self._fp32_params = NemotronV3MambaFP32Params(self.num_heads)
 
         # Gated RMSNorm
         self.norm = NemotronV3MambaRMSNormGated(
@@ -240,6 +281,23 @@ class NemotronV3Mamba2Mixer(nn.Module):
 
         # Context parallelism — set post-construction by the parallelizer
         self.cp = None
+
+    @property
+    def dt_bias(self) -> torch.Tensor:
+        return self._fp32_params.dt_bias
+
+    @property
+    def A_log(self) -> torch.Tensor:
+        return self._fp32_params.A_log
+
+    @property
+    def D(self) -> torch.Tensor:
+        return self._fp32_params.D
+
+    def _get_fp32_ssm_params(
+        self, reference: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._fp32_params(reference)
 
     def forward(
         self,
@@ -336,15 +394,16 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 projected_states = self.cp.pre_conv_ssm(projected_states, cu_seqlens=cu_seqlens_cp)
                 if squeezed and cu_seqlens_cp is not None:
                     projected_states = projected_states.unsqueeze(0).contiguous()
-                A = -torch.exp(self.cp.get_A_log().float())
+                A_log, dt_bias, D = self._get_fp32_ssm_params(projected_states)
+                A = -torch.exp(self.cp.get_A_log(A_log).float())
 
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.cp.get_conv1d_weight(),
                     self.cp.get_conv1d_bias(),
-                    self.cp.get_dt_bias(),
+                    self.cp.get_dt_bias(dt_bias),
                     A,
-                    D=self.cp.get_D(),
+                    D=self.cp.get_D(D),
                     chunk_size=self.chunk_size,
                     seq_idx=seq_idx,
                     activation=self.activation,
@@ -371,15 +430,16 @@ class NemotronV3Mamba2Mixer(nn.Module):
                     out = out.squeeze(0)
                 return out
             else:
-                A = -torch.exp(self.A_log.float())
+                A_log, dt_bias, D = self._get_fp32_ssm_params(projected_states)
+                A = -torch.exp(A_log.float())
 
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.conv1d.weight.squeeze(1),
                     self.conv1d.bias,
-                    self.dt_bias,
+                    dt_bias,
                     A,
-                    D=self.D,
+                    D=D,
                     chunk_size=self.chunk_size,
                     seq_idx=seq_idx,
                     activation=self.activation,
@@ -428,11 +488,12 @@ class NemotronV3Mamba2Mixer(nn.Module):
             )
 
             # Reshape for selective_state_update
-            A = -torch.exp(self.A_log.float())
+            A_log, dt_bias, D = self._get_fp32_ssm_params(hidden_states)
+            A = -torch.exp(A_log.float())
             A = A[:, None, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
             dt = dt[:, :, None].expand(-1, -1, self.head_dim)
-            dt_bias = self.dt_bias[:, None].expand(-1, self.head_dim)
-            D = self.D[:, None].expand(-1, self.head_dim)
+            dt_bias = dt_bias[:, None].expand(-1, self.head_dim)
+            D = D[:, None].expand(-1, self.head_dim)
             B = B.view(batch_size, self.n_groups, self.ssm_state_size)
             C = C.view(batch_size, self.n_groups, self.ssm_state_size)
             hidden_states_reshaped = hidden_states_inner.view(batch_size, self.num_heads, self.head_dim)
@@ -491,18 +552,19 @@ class NemotronV3Mamba2Mixer(nn.Module):
             dim=-1,
         )
 
-        A = -torch.exp(self.A_log.float())
+        A_log, dt_bias, D = self._get_fp32_ssm_params(hidden_states_inner)
+        A = -torch.exp(A_log.float())
         dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
         # Chunk SSM scan
         scan_output, ssm_state = mamba_chunk_scan_combined(
             hidden_states_inner.view(batch_size, seq_len, -1, self.head_dim),
-            nn.functional.softplus(dt + self.dt_bias),
+            nn.functional.softplus(dt + dt_bias),
             A,
             B.view(batch_size, seq_len, self.n_groups, -1),
             C.view(batch_size, seq_len, self.n_groups, -1),
             chunk_size=self.chunk_size,
-            D=self.D,
+            D=D,
             z=None,
             seq_idx=None,
             return_final_states=True,
@@ -597,6 +659,7 @@ class NemotronV3Block(nn.Module):
             backend.rms_norm,
             config.hidden_size,
             eps=config.layer_norm_epsilon,
+            dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
         )
 
         # Determine layer type from config

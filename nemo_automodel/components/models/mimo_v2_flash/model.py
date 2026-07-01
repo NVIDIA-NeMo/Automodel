@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
@@ -22,6 +23,7 @@ import torch.nn.functional as F
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
@@ -584,9 +586,21 @@ class MiMoV2FlashModel(nn.Module):
 class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Causal LM wrapper for MiMo-V2-Flash with Automodel checkpoint adapters."""
 
-    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "attention_sink_bias"]
+    # "rotary_emb" (matches self.rotary_emb + self.swa_rotary_emb) pins their inv_freq
+    # buffers in fp32: cast_model_to_dtype's bf16 cast would otherwise round inv_freq and
+    # degrade RoPE precision vs HF (see llama/rope_utils.py).
+    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "attention_sink_bias", "rotary_emb"]
     _pp_keep_self_forward = True
     _skip_init_weights_on_load = True
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = True
 
     @classmethod
     def from_config(
@@ -617,6 +631,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = MiMoV2FlashModel(

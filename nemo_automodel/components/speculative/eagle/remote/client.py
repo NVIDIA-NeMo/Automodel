@@ -41,7 +41,7 @@ import torch
 
 from nemo_automodel.components.speculative.eagle.backend import Eagle3TargetBackend
 from nemo_automodel.components.speculative.eagle.remote import protocol, wire
-from nemo_automodel.components.speculative.eagle.remote.transport import NCCLTransport
+from nemo_automodel.components.speculative.eagle.remote.transport import NCCLTransport, nccl_transport_available
 from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
 
 logger = logging.getLogger(__name__)
@@ -66,6 +66,10 @@ class _ServerClient:
         self._nccl: Optional[NCCLTransport] = None
         self._nccl_attempted = False
         self._nccl_lock = threading.Lock()
+        # Serializes generate() per server; see its docstring. The executor in
+        # RemoteEagle3TargetModel has more workers than servers, so this lock,
+        # not the pool size, enforces the one-in-flight invariant.
+        self._generate_lock = threading.Lock()
 
     def _host(self) -> str:
         return self.url.split("://", 1)[-1].split(":", 1)[0].split("/", 1)[0]
@@ -103,6 +107,17 @@ class _ServerClient:
             if self._nccl_attempted:
                 return False
             self._nccl_attempted = True
+
+            # Only ask the server to bring up NCCL if this process can actually
+            # join the group. A client without sglang (the common disaggregated
+            # case: sglang target server + sglang-free training client) cannot,
+            # and contacting the server anyway leaves it blocked on a rendezvous
+            # that never completes until it times out. Fall back to wire instead.
+            if not nccl_transport_available():
+                logger.info("NCCL unavailable in this process (sglang not importable); using wire format")
+                self._nccl = None
+                return False
+
             port = self._nccl_port()
             self._nccl = NCCLTransport(nccl_port=port, host=self._host(), is_server=False)
 
@@ -129,20 +144,42 @@ class _ServerClient:
             return True
 
     def generate(self, payload: bytes) -> dict[str, Optional[torch.Tensor]]:
-        """POST /generate and return the supervision tensors (NCCL or wire)."""
-        if self._nccl_enabled and not self._nccl_attempted:
-            self._init_nccl()
-        headers = {"Content-Type": "application/octet-stream"}
-        use_nccl = self._nccl is not None and self._nccl.is_initialized
-        if use_nccl:
-            headers[protocol.NCCL_HEADER] = "1"
-        url = f"{self.url}/{protocol.EP_GENERATE}"
-        resp = self._session.post(url, data=payload, timeout=self.timeout, headers=headers)
-        resp.raise_for_status()
-        if resp.headers.get(protocol.NCCL_HEADER) == "1" and use_nccl:
-            keys_order, metadata = protocol.decode_nccl_metadata(resp.content)
-            return self._nccl.recv_tensors(metadata, keys_order)
-        return wire.decode(resp.content, map_location="cpu")
+        """POST /generate and return the supervision tensors (NCCL or wire).
+
+        ``/generate`` is the per-step hot path, so a transient timeout / connection
+        reset here would otherwise abort a long remote-training run. The wire path
+        is an idempotent HTTP round-trip, so it reuses :meth:`request`'s
+        exponential-backoff retry. The NCCL path is deliberately a single attempt:
+        the POST triggers a server-side NCCL send paired with the ``recv_tensors``
+        below, so a blind retry would issue a second send and desync the 2-process
+        data-plane group (the client's one recv vs the server's two sends would
+        hang). Recovering the NCCL path needs a transport resync (tear down +
+        re-init, or fall back to wire) and is tracked separately.
+
+        Serialized on ``_generate_lock`` so this process never has two
+        /generate requests in flight against the same server: the NCCL recv
+        posted here must pair with this request's send, and the server's
+        hook-based aux capture is not reentrant.
+        """
+        with self._generate_lock:
+            if self._nccl_enabled and not self._nccl_attempted:
+                self._init_nccl()
+            use_nccl = self._nccl is not None and self._nccl.is_initialized
+            if not use_nccl:
+                # Wire path: an idempotent HTTP round-trip, so reuse request()'s
+                # exponential-backoff retry.
+                return wire.decode(self.request(protocol.EP_GENERATE, payload), map_location="cpu")
+            # NCCL path: a single attempt (a blind retry would desync the 2-process
+            # data-plane group), held under the same lock as the wire path.
+            headers = {"Content-Type": "application/octet-stream", protocol.NCCL_HEADER: "1"}
+            url = f"{self.url}/{protocol.EP_GENERATE}"
+            resp = self._session.post(url, data=payload, timeout=self.timeout, headers=headers)
+            resp.raise_for_status()
+            if resp.headers.get(protocol.NCCL_HEADER) == "1":
+                keys_order, metadata = protocol.decode_nccl_metadata(resp.content)
+                return self._nccl.recv_tensors(metadata, keys_order)
+            # Server fell back to wire despite the client offering NCCL.
+            return wire.decode(resp.content, map_location="cpu")
 
     def close(self) -> None:
         try:

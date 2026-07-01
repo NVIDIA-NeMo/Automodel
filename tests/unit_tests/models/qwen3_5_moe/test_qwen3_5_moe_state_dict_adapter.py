@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import Mock
+import re
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+import nemo_automodel.components.models.qwen3_5_moe.model as qwen3_5_moe_model
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import Qwen3_5MoeStateDictAdapter
 from nemo_automodel.components.moe.layers import MoEConfig
@@ -34,6 +37,8 @@ def config():
     cfg.num_key_value_heads = 2
     cfg.num_experts = 4
     cfg.num_experts_per_tok = 2
+    cfg._name_or_path = "Qwen/Qwen3.6-35B-A3B"
+    cfg.name_or_path = "Qwen/Qwen3.6-35B-A3B"
     return cfg
 
 
@@ -69,7 +74,7 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -101,6 +106,33 @@ class TestInitialization:
         # reverse mapping should be the inverse
         assert ".mlp.shared_experts." in adapter.internal_to_hf_map
         assert adapter.internal_to_hf_map[".mlp.shared_experts."] == ".mlp.shared_expert."
+
+    def test_mtp_layout_explicit_override(self, config, moe_config, backend_config):
+        adapter = Qwen3_5MoeStateDictAdapter(
+            config=config,
+            moe_config=moe_config,
+            backend=backend_config,
+            mtp_expert_hf_layout="per_expert_safetensors",
+        )
+
+        assert adapter._get_mtp_expert_hf_layout() == "split"
+
+    def test_mtp_layout_config_override(self, config, moe_config, backend_config):
+        config.mtp_expert_hf_layout = "group"
+        adapter = Qwen3_5MoeStateDictAdapter(config=config, moe_config=moe_config, backend=backend_config)
+
+        assert adapter._get_mtp_expert_hf_layout() == "grouped"
+
+    def test_mtp_layout_rejects_unknown_override(self, config, moe_config, backend_config):
+        adapter = Qwen3_5MoeStateDictAdapter(
+            config=config,
+            moe_config=moe_config,
+            backend=backend_config,
+            mtp_expert_hf_layout="packed",
+        )
+
+        with pytest.raises(ValueError, match="Unsupported MTP expert HF layout"):
+            adapter._get_mtp_expert_hf_layout()
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +496,91 @@ class TestFromHF:
 
         assert "model.language_model.layers.0.self_attn.q_proj.weight" in out
 
+    def test_maps_vlm_lm_head_to_outer_model(self, adapter):
+        lm_head = torch.randn(128, 64)
+        hf_state = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 64, 128),
+            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(4, 128, 64),
+            "model.lm_head.weight": lm_head,
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        assert "lm_head.weight" in out
+        assert "model.lm_head.weight" not in out
+        assert out["lm_head.weight"] is lm_head
+
+    def test_keeps_native_lm_head_outer_when_model_prefix_is_detected(self, adapter):
+        native_lm_head = torch.zeros(128, 64)
+        checkpoint_lm_head = torch.ones(128, 64)
+        hf_state = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 64, 128),
+            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(4, 128, 64),
+            "lm_head.weight": native_lm_head,
+            "model.lm_head.weight": checkpoint_lm_head,
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        assert "lm_head.weight" in out
+        assert "model.lm_head.weight" not in out
+        assert out["lm_head.weight"] is checkpoint_lm_head
+
+    def test_maps_mtp_fusion_keys_without_model_prefix(self, adapter):
+        tensor = torch.randn(64, 128)
+        hf_state = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 64, 128),
+            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(4, 128, 64),
+            "mtp.fc.weight": tensor,
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        assert "mtp.layers.0.eh_proj.weight" in out
+        assert "model.mtp.layers.0.eh_proj.weight" not in out
+        assert out["mtp.layers.0.eh_proj.weight"] is tensor
+
+    def test_converts_mtp_aggregated_experts(self, adapter):
+        gate_up = torch.randn(4, 32, 64)
+        down = torch.randn(4, 64, 32)
+
+        out = adapter.from_hf(
+            {
+                "mtp.layers.0.mlp.experts.gate_up_proj": gate_up,
+                "mtp.layers.0.mlp.experts.down_proj": down,
+            }
+        )
+
+        torch.testing.assert_close(
+            out["mtp.layers.0.mlp.experts.gate_and_up_projs"], gate_up.transpose(1, 2).to(adapter.dtype)
+        )
+        torch.testing.assert_close(out["mtp.layers.0.mlp.experts.down_projs"], down.transpose(1, 2).to(adapter.dtype))
+
+    def test_converts_mtp_split_experts(self, adapter):
+        hf_state = {}
+        expected_gate_up = []
+        expected_down = []
+        for expert_id in range(adapter.moe_config.n_routed_experts):
+            gate = torch.randn(32, 64)
+            up = torch.randn(32, 64)
+            down = torch.randn(64, 32)
+            hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.gate_proj.weight"] = gate
+            hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.up_proj.weight"] = up
+            hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.down_proj.weight"] = down
+            expected_gate_up.append(torch.cat((gate.transpose(0, 1), up.transpose(0, 1)), dim=1))
+            expected_down.append(down.transpose(0, 1))
+
+        out = adapter.from_hf(hf_state)
+
+        torch.testing.assert_close(
+            out["mtp.layers.0.mlp.experts.gate_and_up_projs"],
+            torch.stack(expected_gate_up, dim=0).to(adapter.dtype),
+        )
+        torch.testing.assert_close(
+            out["mtp.layers.0.mlp.experts.down_projs"],
+            torch.stack(expected_down, dim=0).to(adapter.dtype),
+        )
+
     def test_expert_parallel_sharding(self, adapter, monkeypatch):
         """When device_mesh is provided, from_hf should slice experts by rank."""
         gate_up = torch.randn(4, 32, 64)
@@ -541,6 +658,17 @@ class TestConvertSingleTensorToHf:
         assert result[0][0] == "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"
         assert torch.equal(result[0][1], tensor)
 
+    def test_strips_fp32_holder_segment_on_save(self, adapter):
+        # The fp32 SSM-gating holder is stripped back to the bare HF key on save.
+        tensor = torch.randn(8)
+        fqn = "model.language_model.layers.0.linear_attn._fp32_params.A_log"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+        assert len(result) == 1
+        assert result[0][0] == "model.language_model.layers.0.linear_attn.A_log"
+        assert torch.equal(result[0][1], tensor)
+
     def test_non_expert_tensor_passthrough(self, adapter):
         tensor = torch.randn(64, 64)
         fqn = "model.language_model.layers.0.self_attn.q_proj.weight"
@@ -569,6 +697,157 @@ class TestConvertSingleTensorToHf:
         assert len(result) == 1
         key, _ = result[0]
         assert key == "language_model.layers.0.mlp.experts.gate_up_proj"
+
+    def test_mtp_fusion_key_conversion(self, adapter):
+        tensor = torch.randn(64, 128)
+        result = adapter.convert_single_tensor_to_hf("mtp.layers.0.eh_proj.weight", tensor)
+
+        assert result == [("mtp.fc.weight", tensor)]
+
+    def test_mtp_expert_key_conversion_grouped_layout(self, adapter):
+        # Qwen3.6 MTP experts use the grouped HF layout, identical to the main
+        # decoder layers, not per-expert keys (AM-442).
+        tensor = torch.randn(4, 64, 128)
+        result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.gate_and_up_projs", tensor)
+
+        assert len(result) == 1
+        key, value = result[0]
+        assert key == "mtp.layers.0.mlp.experts.gate_up_proj"
+        torch.testing.assert_close(value, tensor.transpose(1, 2))
+        # No per-expert keys are emitted.
+        assert not any(".experts.0." in k for k, _ in result)
+
+    def test_mtp_down_expert_key_conversion_grouped_layout(self, adapter):
+        tensor = torch.randn(4, 64, 32)
+        result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.down_projs", tensor)
+
+        assert len(result) == 1
+        key, value = result[0]
+        assert key == "mtp.layers.0.mlp.experts.down_proj"
+        torch.testing.assert_close(value, tensor.transpose(1, 2))
+
+    def test_mtp_experts_emit_no_per_expert_keys_for_grouped_layout(self, adapter):
+        """AM-442 regression: to_hf must not fabricate per-expert MTP keys that are
+        absent from the grouped checkpoint (e.g. ``...experts.224.down_proj.weight``)."""
+        for native in ("mtp.layers.0.mlp.experts.gate_and_up_projs", "mtp.layers.0.mlp.experts.down_projs"):
+            result = adapter.convert_single_tensor_to_hf(native, torch.randn(4, 64, 32))
+            assert len(result) == 1
+            key = result[0][0]
+            assert key in ("mtp.layers.0.mlp.experts.gate_up_proj", "mtp.layers.0.mlp.experts.down_proj")
+            assert not re.search(r"\.experts\.\d+\.", key)
+
+    def test_mtp_expert_key_conversion_split_layout_for_qwen35(self, adapter):
+        adapter.pretrained_model_name_or_path = "Qwen/Qwen3.5-35B-A3B"
+        tensor = torch.randn(4, 64, 128)
+
+        result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.gate_and_up_projs", tensor)
+
+        assert len(result) == 8
+        result_by_key = dict(result)
+        expected_keys = set()
+        for expert_id in range(4):
+            expected_keys.add(f"mtp.layers.0.mlp.experts.{expert_id}.gate_proj.weight")
+            expected_keys.add(f"mtp.layers.0.mlp.experts.{expert_id}.up_proj.weight")
+        assert set(result_by_key) == expected_keys
+        for expert_id in range(4):
+            torch.testing.assert_close(
+                result_by_key[f"mtp.layers.0.mlp.experts.{expert_id}.gate_proj.weight"],
+                tensor[expert_id, :, :64].transpose(0, 1),
+            )
+            torch.testing.assert_close(
+                result_by_key[f"mtp.layers.0.mlp.experts.{expert_id}.up_proj.weight"],
+                tensor[expert_id, :, 64:].transpose(0, 1),
+            )
+
+    def test_mtp_down_expert_key_conversion_split_layout_for_qwen35(self, adapter):
+        adapter.pretrained_model_name_or_path = "Qwen/Qwen3.5-35B-A3B"
+        tensor = torch.randn(4, 64, 32)
+
+        result = adapter.convert_single_tensor_to_hf("mtp.layers.0.mlp.experts.down_projs", tensor)
+
+        assert len(result) == 4
+        result_by_key = dict(result)
+        expected_keys = {f"mtp.layers.0.mlp.experts.{expert_id}.down_proj.weight" for expert_id in range(4)}
+        assert set(result_by_key) == expected_keys
+        for expert_id in range(4):
+            torch.testing.assert_close(
+                result_by_key[f"mtp.layers.0.mlp.experts.{expert_id}.down_proj.weight"],
+                tensor[expert_id].transpose(0, 1),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Qwen3_5MoeForConditionalGeneration state dict adapter wiring
+# ---------------------------------------------------------------------------
+class TestConditionalGenerationStateDictAdapterWiring:
+    def test_passes_top_level_model_name_to_state_dict_adapter(self):
+        class DummyRotary:
+            inv_freq = torch.ones(4)
+
+        class DummyVisual:
+            def __init__(self):
+                self.rotary_pos_emb = DummyRotary()
+
+        class DummyParentModel:
+            def __init__(self):
+                self.visual = DummyVisual()
+                self.language_model = SimpleNamespace()
+
+        class DummyTextBackend:
+            def __init__(self, *args, **kwargs):
+                self.moe_config = Mock(name="moe_config")
+
+        class DummyMTPConfig:
+            enabled = False
+
+        class DummyFp32SafeRotary:
+            def __init__(self, dim):
+                self.dim = dim
+
+            def register_buffer(self, *args, **kwargs):
+                pass
+
+            def to(self, *args, **kwargs):
+                return self
+
+        adapter_calls = []
+
+        class DummyAdapter:
+            def __init__(self, *args, **kwargs):
+                adapter_calls.append((args, kwargs))
+
+        def fake_hf_init(self, config):
+            self.model = DummyParentModel()
+            self.lm_head = None
+
+        text_config = SimpleNamespace(torch_dtype=None, hidden_size=8, vocab_size=16, pad_token_id=None)
+        config = SimpleNamespace(
+            text_config=text_config,
+            torch_dtype=None,
+            _name_or_path="model-under-test",
+            name_or_path=None,
+        )
+        backend = BackendConfig(enable_hf_state_dict_adapter=True)
+
+        with (
+            patch.object(qwen3_5_moe_model.HFQwen3_5MoeForConditionalGeneration, "__init__", fake_hf_init),
+            patch.object(qwen3_5_moe_model, "Qwen3_5MoeModel", DummyParentModel),
+            patch.object(qwen3_5_moe_model, "Qwen3_5MoeTextModelBackend", DummyTextBackend),
+            patch.object(qwen3_5_moe_model, "initialize_linear_module", Mock(return_value=Mock())),
+            patch.object(qwen3_5_moe_model, "build_mtp_config_from_hf", Mock(return_value=DummyMTPConfig())),
+            patch.object(qwen3_5_moe_model, "Qwen3_5MoeStateDictAdapter", DummyAdapter),
+            patch.object(
+                qwen3_5_moe_model,
+                "Fp32SafeQwen3_5MoeVisionRotaryEmbedding",  # pragma: allowlist secret
+                DummyFp32SafeRotary,
+            ),
+        ):
+            qwen3_5_moe_model.Qwen3_5MoeForConditionalGeneration(config, backend=backend)
+
+        assert len(adapter_calls) == 1
+        args, kwargs = adapter_calls[0]
+        assert args[0] is text_config
+        assert kwargs["pretrained_model_name_or_path"] == "model-under-test"
 
 
 # ---------------------------------------------------------------------------
@@ -669,3 +948,148 @@ class TestFromHFEpShard:
         # No ep_shard slicing — full transposed tensor
         assert local_gate.shape == (n_experts, hidden, inter)
         torch.testing.assert_close(local_gate, gate_up_hf.transpose(1, 2).to(adapter.dtype))
+
+
+class TestFp32ParamRouting:
+    """Routing/stripping of SSM-gating params into/out of the fp32 holder."""
+
+    def test_strip_fp32_params_removes_holder_segment(self):
+        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _strip_fp32_params
+
+        assert (
+            _strip_fp32_params("model.language_model.layers.0.linear_attn._fp32_params.A_log")
+            == "model.language_model.layers.0.linear_attn.A_log"
+        )
+        assert (
+            _strip_fp32_params("model.language_model.layers.0.linear_attn._fp32_params.dt_bias")
+            == "model.language_model.layers.0.linear_attn.dt_bias"
+        )
+
+    def test_strip_fp32_params_passthrough(self):
+        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _strip_fp32_params
+
+        for key in (
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.linear_attn.norm.weight",
+        ):
+            assert _strip_fp32_params(key) == key
+
+    def test_route_fp32_params_routes_gating_keys(self):
+        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _route_fp32_params
+
+        assert (
+            _route_fp32_params("model.language_model.layers.0.linear_attn.A_log")
+            == "model.language_model.layers.0.linear_attn._fp32_params.A_log"
+        )
+        assert (
+            _route_fp32_params("model.language_model.layers.0.linear_attn.dt_bias")
+            == "model.language_model.layers.0.linear_attn._fp32_params.dt_bias"
+        )
+
+    def test_route_fp32_params_passthrough(self):
+        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _route_fp32_params
+
+        # Already routed, non-gating param, and a non-linear_attn A_log all pass through.
+        for key in (
+            "model.language_model.layers.0.linear_attn._fp32_params.A_log",
+            "model.language_model.layers.0.linear_attn.norm.weight",
+            "model.some.other.path.A_log",
+        ):
+            assert _route_fp32_params(key) == key
+
+    def test_route_strip_round_trip(self):
+        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import (
+            _route_fp32_params,
+            _strip_fp32_params,
+        )
+
+        bare = "model.language_model.layers.3.linear_attn.A_log"
+        assert _strip_fp32_params(_route_fp32_params(bare)) == bare
+
+    def test_from_hf_routes_gating_keys_into_holder(self, adapter):
+        # On load, bare HF SSM-gating keys are routed into the fp32 holder.
+        hf_state = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.randn(8),
+            "model.language_model.layers.0.linear_attn.dt_bias": torch.randn(8),
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        assert "model.language_model.layers.0.linear_attn._fp32_params.A_log" in out
+        assert "model.language_model.layers.0.linear_attn._fp32_params.dt_bias" in out
+        assert "model.language_model.layers.0.linear_attn.A_log" not in out
+
+    def test_to_hf_strips_a_log_holder(self, adapter):
+        sd = {"model.language_model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4)}
+        out = adapter.to_hf(sd)
+        assert "model.language_model.layers.0.linear_attn.A_log" in out
+        assert all("_fp32_params" not in k for k in out)
+
+    def test_to_hf_strips_dt_bias_holder(self, adapter):
+        sd = {"model.language_model.layers.2.linear_attn._fp32_params.dt_bias": torch.ones(4)}
+        out = adapter.to_hf(sd)
+        assert "model.language_model.layers.2.linear_attn.dt_bias" in out
+        assert all("_fp32_params" not in k for k in out)
+
+    def test_to_hf_upcasts_gdn_fp32_params_saved_as_bf16(self, adapter):
+        sd = {
+            "model.language_model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.linear_attn._fp32_params.dt_bias": torch.ones(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+        }
+
+        out = adapter.to_hf(sd)
+
+        assert out["model.language_model.layers.0.linear_attn.A_log"].dtype == torch.float32
+        assert out["model.language_model.layers.0.linear_attn.dt_bias"].dtype == torch.float32
+        q_proj_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        assert out[q_proj_key] is sd[q_proj_key]
+        assert out[q_proj_key].dtype == torch.bfloat16
+
+    def test_forced_hf_dtype_mapping_marks_gdn_fp32_params(self, adapter):
+        state_dict = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.float32),
+            "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.float32),
+            "model.language_model.layers.0.linear_attn.conv1d.weight": torch.zeros(4, dtype=torch.float32),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.float32),
+        }
+
+        assert adapter.forced_hf_dtype_mapping(state_dict) == {
+            "model.language_model.layers.0.linear_attn.A_log": "F32",
+            "model.language_model.layers.0.linear_attn.dt_bias": "F32",
+        }
+
+    def test_convert_single_tensor_strips_holder(self, adapter):
+        result = adapter.convert_single_tensor_to_hf(
+            "model.language_model.layers.1.linear_attn._fp32_params.A_log", torch.zeros(4)
+        )
+        assert [k for k, _ in result] == ["model.language_model.layers.1.linear_attn.A_log"]
+
+    def test_convert_single_tensor_upcasts_gdn_fp32_params(self, adapter):
+        result = adapter.convert_single_tensor_to_hf(
+            "model.language_model.layers.1.linear_attn._fp32_params.dt_bias",
+            torch.zeros(4, dtype=torch.bfloat16),
+        )
+        assert result[0][0] == "model.language_model.layers.1.linear_attn.dt_bias"
+        assert result[0][1].dtype == torch.float32
+
+    def test_bare_key_unchanged(self, adapter):
+        result = adapter.convert_single_tensor_to_hf("model.language_model.layers.0.linear_attn.A_log", torch.zeros(4))
+        assert [k for k, _ in result] == ["model.language_model.layers.0.linear_attn.A_log"]
+
+    def test_from_hf_routes_and_upcasts_gdn_fp32_params_loaded_as_bf16(self, adapter):
+        hf_state = {
+            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        a_log_key = "model.language_model.layers.0.linear_attn._fp32_params.A_log"
+        dt_bias_key = "model.language_model.layers.0.linear_attn._fp32_params.dt_bias"
+        q_proj_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        assert out[a_log_key].dtype == torch.float32
+        assert out[dt_bias_key].dtype == torch.float32
+        assert out[q_proj_key] is hf_state[q_proj_key]
+        assert out[q_proj_key].dtype == torch.bfloat16

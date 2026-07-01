@@ -49,6 +49,7 @@ ci:
   time: "00:25:00"                # Required. SLURM wall time (HH:MM:SS)
   nodes: 2                        # Optional. SLURM node count (default: 1)
   node_multiplier: true           # Optional. Dynamic node scaling
+  max_steps: 50                   # Optional. Override max training steps for CI
   local_batch_size: 2             # Optional. Override batch size for CI
   nproc_per_node: 1               # Optional. GPUs per node, overrides cluster default (CI var: CONFIG_NPROC_PER_NODE)
   vllm_deploy: true               # Optional. Enable vLLM deployment test

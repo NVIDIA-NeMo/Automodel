@@ -2,14 +2,16 @@
 
 [MiniMax-M2](https://huggingface.co/MiniMaxAI) is MiniMax's large Mixture-of-Experts language model with linear attention for efficient long-context inference.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text Generation (MoE) |
 | **Architecture** | `MiniMaxM2ForCausalLM` |
 | **Parameters** | varies |
 | **HF Org** | [MiniMaxAI](https://huggingface.co/MiniMaxAI) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -32,14 +34,14 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`minimax_m2.1_hellaswag_pp.yaml <../../../../examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml>` | SFT — MiniMax-M2.1 on HellaSwag with pipeline parallelism |
-| {download}`minimax_m2.5_hellaswag_pp.yaml <../../../../examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml>` | SFT — MiniMax-M2.5 on HellaSwag with pipeline parallelism |
-| {download}`minimax_m2.7_hellaswag_pp.yaml <../../../../examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml>` | SFT — MiniMax-M2.7 on HellaSwag with pipeline parallelism |
+| [minimax_m2.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml) | SFT — MiniMax-M2.1 on HellaSwag with pipeline parallelism |
+| [minimax_m2.5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) | SFT — MiniMax-M2.5 on HellaSwag with pipeline parallelism |
+| [minimax_m2.7_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml) | SFT — MiniMax-M2.7 on HellaSwag with pipeline parallelism |
 
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -52,9 +54,10 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
 ```
 
-:::{note}
-This recipe was validated on **8 nodes × 8 GPUs (64 H100s)**. See the [Launcher Guide](../../../launcher/slurm.md) for multi-node setup.
-:::
+<Note>
+This recipe was validated on **8 nodes × 8 GPUs (64 H100s)**. See the [Launcher Guide](../../../launcher/slurm.mdx) for multi-node setup.
+
+</Note>
 
 **3. Run the recipe** from inside the repo:
 
@@ -62,14 +65,14 @@ This recipe was validated on **8 nodes × 8 GPUs (64 H100s)**. See the [Launcher
 automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
 docker run --gpus all -it --rm \
   --shm-size=8g \
   -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
-  nvcr.io/nvidia/nemo-automodel:26.02.00
+  nvcr.io/nvidia/nemo-automodel:26.06.00
 ```
 
 **2.** Navigate to the AutoModel directory (where the recipes are):
@@ -83,13 +86,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Fine-Tuning
 
-See the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.md).
+See the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.mdx).
 
 ## Hugging Face Model Cards
 

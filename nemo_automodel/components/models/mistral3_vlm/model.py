@@ -31,6 +31,7 @@ Custom wrapper around HF's ``Mistral3ForConditionalGeneration`` that:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
@@ -119,6 +120,15 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
     # smoke never reaches the adapter load stage within 300s).
     _skip_init_weights_on_load = True
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
+
     def __init__(self, config: PretrainedConfig):
         # HF's Mistral3ForConditionalGeneration.__init__ consults
         # ``config.quantization_config`` and swaps nn.Linear → FP8Linear for
@@ -142,7 +152,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
                 except AttributeError:
                     pass
         super().__init__(config)
-        self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_vlm_full()
+        self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_vlm_full(config)
 
         # Lazy non-persistent buffer reinit. HF's Ministral3RotaryEmbedding /
         # PixtralRotaryEmbedding compute `inv_freq` in their __init__. Under

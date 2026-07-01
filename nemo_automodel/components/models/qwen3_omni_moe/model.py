@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
@@ -25,9 +26,10 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration as HFQwen3OmniMoeThinkerForConditionalGeneration,
 )
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeThinkerTextRotaryEmbedding,
+    Qwen3OmniMoeThinkerTextRotaryEmbedding as HFQwen3OmniMoeThinkerTextRotaryEmbedding,
 )
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
@@ -37,6 +39,22 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+class Qwen3OmniMoeThinkerTextRotaryEmbedding(HFQwen3OmniMoeThinkerTextRotaryEmbedding):
+    """Ensure HF rotary frequency buffers stay fp32 across module-wide casts."""
+
+    def _apply(self, fn: Any, recurse: bool = True):
+        fp32_buffers = {
+            name: buf.detach().clone().to(torch.float32)
+            for name, buf in self.named_buffers(recurse=False)
+            if name in ("inv_freq", "original_inv_freq")
+        }
+        result = super()._apply(fn, recurse=recurse)
+        for name, fp32_buffer in fp32_buffers.items():
+            current = getattr(self, name)
+            self.register_buffer(name, fp32_buffer.to(device=current.device), persistent=False)
+        return result
 
 
 class Qwen3OmniMoeThinkerTextModel(
@@ -61,6 +79,12 @@ class Qwen3OmniMoeThinkerTextModel(
         # Map HF Qwen3OmniMoe config -> our MoE wrapper
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
+
+        # Resolve model dtype once; thread it explicitly to every sub-module
+        # so fp32 master weights work even when construction is not wrapped in
+        # local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
@@ -80,16 +104,19 @@ class Qwen3OmniMoeThinkerTextModel(
             router_bias=False,
             expert_activation="swiglu",
             softmax_before_topk=True,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, dtype=model_dtype)
         self.layers = nn.ModuleList(
             [Block(layer_id, config, self.moe_config, backend) for layer_id in range(config.num_hidden_layers)]
         )
-        self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        )
         self.rotary_emb = Qwen3OmniMoeThinkerTextRotaryEmbedding(config)
 
     def forward(
@@ -193,6 +220,15 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 ):
     """Qwen3OmniMoe Thinker for Conditional Generation with multimodal support."""
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = True
+
     @classmethod
     def from_config(
         cls,
@@ -222,6 +258,23 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     ):
         base_config = config.thinker_config if hasattr(config, "thinker_config") else config
         backend = backend or BackendConfig()
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+
+        # _init_model() only overrides the top-level hf_config.torch_dtype; for
+        # Omni configs the real params live under thinker_config.text_config /
+        # thinker_config.vision_config, whose torch_dtype still holds the
+        # checkpoint's original value. Propagate the user-requested dtype to
+        # every nested sub-config that exposes a torch_dtype attribute (both
+        # the top-level and the thinker sub-config) so the HF parent, our
+        # text backend, and any HF vision / multimodal code agree.
+        top_dtype = getattr(config, "torch_dtype", None)
+        if top_dtype is not None:
+            for parent in (config, base_config):
+                for sub_cfg in vars(parent).values():
+                    if sub_cfg is not parent and hasattr(sub_cfg, "torch_dtype"):
+                        sub_cfg.torch_dtype = top_dtype
+            if base_config is not config and getattr(base_config, "torch_dtype", None) != top_dtype:
+                base_config.torch_dtype = top_dtype
 
         super().__init__(base_config)
 
@@ -232,8 +285,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.model = Qwen3OmniMoeThinkerTextModel(
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )
+        model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
-            self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
+            self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype
         )
 
         self.vocab_size = text_config.vocab_size
@@ -251,7 +305,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 text_config,
                 self.model.moe_config,
                 self.backend,
-                dtype=get_dtype(text_config.torch_dtype, torch.bfloat16),
+                dtype=model_dtype,
             )
 
     def get_input_embeddings(self):

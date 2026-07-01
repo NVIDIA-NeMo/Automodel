@@ -23,6 +23,7 @@ This is a self-contained implementation that includes all necessary components:
 
 import logging
 import math
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -36,6 +37,7 @@ from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 
 LOGGER = logging.getLogger(__name__)
 
@@ -143,6 +145,7 @@ class KimiK25VLConfig(PretrainedConfig):
         return output
 
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
 from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids
@@ -880,6 +883,11 @@ class KimiK25VLModel(nn.Module):
 class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """KimiK25VL model with backend-aware DeepseekV3 language model."""
 
+    # RoPE freqs/inv_freq must stay fp32: from_pretrained casts the model to bf16 and
+    # nn.Module.to rounds floating buffers; routing through cast_model_to_dtype restores
+    # these keep-fp32 buffers afterwards (see llama/rope_utils.py).
+    _keep_in_fp32_modules = ["freqs_cis", "rotary_emb"]
+
     config_class = KimiK25VLConfig
     base_model_prefix = "model"
     main_input_name = "pixel_values"
@@ -889,6 +897,15 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = True
 
     @classmethod
     def from_config(cls, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):
@@ -927,7 +944,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         config.torch_dtype = torch_dtype
         model = cls.from_config(config, torch_dtype=torch_dtype, *model_args, **kwargs)
         model.name_or_path = pretrained_model_name_or_path
-        model = model.to(dtype=torch_dtype)
+        cast_model_to_dtype(model, torch_dtype)
 
         LOGGER.info(f"Model created with dtype={torch_dtype}. Weights loaded by DCP via adapter.")
         return model
@@ -935,6 +952,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
     def __init__(self, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig()
 
         self.model = KimiK25VLModel(config, moe_config=moe_config, backend=self.backend)

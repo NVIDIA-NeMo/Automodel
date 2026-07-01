@@ -28,9 +28,8 @@ from torch.distributed.tensor.parallel import (
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
+import nemo_automodel.components.distributed.parallelizer as parallelizer
 from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
-
-# Import the function under test
 from nemo_automodel.components.distributed.parallelizer import (
     _attention_is_head_sharded,
     _extract_model_layers,
@@ -41,6 +40,45 @@ from nemo_automodel.components.distributed.parallelizer import (
     import_class_from_path,
     megatron_fsdp_strategy_parallelize,
 )
+
+
+def test_fsdp_accumulated_grad_guard_only_handles_missing_unsharded_param(monkeypatch):
+    """The FSDP2 guard only handles the exact missing lazy unsharded tensor case."""
+    calls = {"count": 0}
+
+    class FakeFSDPParam:
+        def __init__(self, mode="ok"):
+            self.mode = mode
+
+        def to_accumulated_grad_if_needed(self):
+            calls["count"] += 1
+            if self.mode == "missing":
+                return self._unsharded_param.grad
+            if self.mode == "other":
+                raise AttributeError("different attribute")
+            return "called"
+
+    fake_module = SimpleNamespace(FSDPParam=FakeFSDPParam)
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp._fully_shard._fsdp_param", fake_module)
+
+    parallelizer._patch_fsdp_accumulated_grad_guard()
+
+    param = FakeFSDPParam()
+    assert param.to_accumulated_grad_if_needed() == "called"
+    assert calls["count"] == 1
+
+    param.mode = "missing"
+    assert param.to_accumulated_grad_if_needed() is None
+    assert calls["count"] == 2
+
+    param.mode = "other"
+    with pytest.raises(AttributeError, match="different attribute"):
+        param.to_accumulated_grad_if_needed()
+    assert calls["count"] == 3
+
+    wrapped = FakeFSDPParam.to_accumulated_grad_if_needed
+    parallelizer._patch_fsdp_accumulated_grad_guard()
+    assert FakeFSDPParam.to_accumulated_grad_if_needed is wrapped
 
 
 class MockModel(nn.Module):
@@ -147,6 +185,40 @@ def create_gemma3_mock():
     # Create an instance of the hybrid class
     mock = MockGemma3ModelWithTypeCheck()
     return mock
+
+
+class _CheckpointWrapped(nn.Module):
+    """Minimal checkpoint wrapper used by BAGEL activation-checkpointing tests."""
+
+    def __init__(self, inner, **kwargs):
+        super().__init__()
+        self._checkpoint_wrapped_module = inner
+        self.kwargs = kwargs
+
+    def forward(self, x):
+        return self._checkpoint_wrapped_module(x)
+
+
+def _make_bagel_model(num_language_layers: int = 2, num_vision_layers: int = 3):
+    """Build the nested layer containers used by BAGEL without importing BAGEL."""
+
+    class BagelForUnifiedMultimodal(nn.Module):
+        """Stand-in with the exact class name used by the production mapper."""
+
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.language_model = nn.Module()
+            self.model.language_model.model = nn.Module()
+            self.model.language_model.model.layers = nn.ModuleList([_FakeLayer() for _ in range(num_language_layers)])
+            self.model.vit_model = nn.Module()
+            self.model.vit_model.vision_model = nn.Module()
+            self.model.vit_model.vision_model.encoder = nn.Module()
+            self.model.vit_model.vision_model.encoder.layers = nn.ModuleList(
+                [_FakeLayer() for _ in range(num_vision_layers)]
+            )
+
+    return BagelForUnifiedMultimodal()
 
 
 @pytest.fixture
@@ -275,6 +347,13 @@ def mock_distributed_env(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
+        checkpoint_wrapper_mock.checkpoint_wrapper,
+        raising=False,
+    )
+    # Whole-block/sub-module wrapping now lives in activation_checkpointing.py and
+    # uses that module's checkpoint_wrapper, so patch it there too.
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
         checkpoint_wrapper_mock.checkpoint_wrapper,
         raising=False,
     )
@@ -782,6 +861,32 @@ class TestApplyFsdpShardingRecursively:
             assert kwargs["offload_policy"] is None
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    def test_apply_fsdp_sharding_module_list_respects_explicit_reshard_override(
+        self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy, mock_offload_policy
+    ):
+        """Test apply_fsdp2_sharding_recursively with an explicit reshard override."""
+        mock_mesh.mesh_dim_names = ("dp", "tp")
+
+        def mock_shard(x, **kwargs):
+            x.set_modules_to_forward_prefetch = MagicMock()
+            x.set_modules_to_backward_prefetch = MagicMock()
+            return x
+
+        mock_fully_shard.side_effect = mock_shard
+
+        apply_fsdp2_sharding_recursively(
+            module=mock_module_list,
+            mesh=mock_mesh,
+            mp_policy=mock_mp_policy,
+            offload_policy=mock_offload_policy,
+            reshard_after_forward=False,
+        )
+
+        assert mock_fully_shard.call_count == 3
+        for call in mock_fully_shard.call_args_list:
+            assert call.kwargs["reshard_after_forward"] is False
+
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_regular_module(
         self, mock_fully_shard, mock_single_module, mock_mesh, mock_mp_policy, mock_offload_policy
     ):
@@ -1265,6 +1370,10 @@ class TestActivationCheckpointingKVSharing:
                 super().__init__()
                 self._inner = inner
 
+            @property
+            def _checkpoint_wrapped_module(self):
+                return self._inner
+
             def forward(self, x):
                 return self._inner(x)
 
@@ -1272,6 +1381,10 @@ class TestActivationCheckpointingKVSharing:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
+            lambda module, **kwargs: _Wrapped(module),
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
             _Wrapped,
         )
         monkeypatch.setattr(
@@ -1397,6 +1510,59 @@ class TestActivationCheckpointingKVSharing:
             assert not isinstance(layer.self_attn, self._Wrapped)
         assert model.config.use_cache is True  # untouched
 
+    def test_selective_checkpointing_wraps_whole_layers(self, monkeypatch):
+        """Selective activation checkpointing wraps full transformer blocks."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
+
+        calls = []
+
+        def fake_checkpoint_wrapper(module, **kwargs):
+            calls.append((module, kwargs))
+            return self._Wrapped(module)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
+            fake_checkpoint_wrapper,
+        )
+
+        from nemo_automodel.components.distributed.activation_checkpointing import SELECTIVE_AC_WRAPPER_FLAG
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        self._run_parallelize(model, activation_checkpointing="selective")
+
+        assert len(calls) == len(model.model.layers)
+        for layer in model.model.layers:
+            assert isinstance(layer, self._Wrapped)
+            # Wrapper is tagged so the per-layer compile step compiles it OUTER.
+            assert getattr(layer, SELECTIVE_AC_WRAPPER_FLAG, False) is True
+        for _, kwargs in calls:
+            assert kwargs["checkpoint_impl"] == CheckpointImpl.NO_REENTRANT
+            assert kwargs["preserve_rng_state"] is True
+            assert callable(kwargs["context_fn"])
+
+    def test_selective_checkpointing_kv_sharing_falls_back_to_submodule_wrapping(self):
+        """KV-shared models cannot checkpoint the whole block because attention mutates cache."""
+        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=20)
+        self._run_parallelize(model, activation_checkpointing="selective")
+
+        for layer in model.model.layers:
+            assert not isinstance(layer, self._Wrapped)
+            assert isinstance(layer.mlp, self._Wrapped)
+            assert not isinstance(layer.self_attn, self._Wrapped)
+            assert isinstance(layer.input_layernorm, self._Wrapped)
+            assert isinstance(layer.post_attention_layernorm, self._Wrapped)
+
+    def test_bagel_parallelize_uses_full_layer_checkpointing(self):
+        """BAGEL wraps whole Qwen/SigLIP layers through the special AC path."""
+        model = _make_bagel_model(num_language_layers=2, num_vision_layers=2)
+
+        self._run_parallelize(model, activation_checkpointing=True)
+
+        language_layers = model.model.language_model.model.layers
+        vision_layers = model.model.vit_model.vision_model.encoder.layers
+        assert all(isinstance(layer, self._Wrapped) for layer in language_layers)
+        assert all(isinstance(layer, self._Wrapped) for layer in vision_layers)
+
     # ------------------------------------------------------------------ #
     # HF native gradient-checkpointing path
     # ------------------------------------------------------------------ #
@@ -1518,6 +1684,294 @@ class TestActivationCheckpointingKVSharing:
         model.gradient_checkpointing_enable.assert_called_once_with(
             gradient_checkpointing_kwargs={"use_reentrant": True}
         )
+
+
+class TestSelectiveCheckpointNumerics:
+    """Real forward/backward parity for the selective-AC op policy.
+
+    These tests use the *real* torch checkpoint primitives (no mocked
+    ``checkpoint_wrapper``) so they exercise the policy returned by
+    ``make_selective_checkpoint_context_fn``. The policy saves every other
+    matmul, so the per-pass matmul counter must be keyed on
+    ``ctx.is_recompute``. A single shared counter continues from the forward
+    count into recompute and flips the save/recompute parity whenever a region
+    has an odd number of matmuls, silently corrupting gradients.
+    """
+
+    class _MatmulBlock(nn.Module):
+        def __init__(self, dim: int, num_linears: int):
+            super().__init__()
+            self.linears = nn.ModuleList([nn.Linear(dim, dim) for _ in range(num_linears)])
+
+        def forward(self, x):
+            for linear in self.linears:
+                x = torch.relu(linear(x))
+            return x
+
+    def _assert_grads_match_baseline(self, num_linears: int):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            checkpoint_wrapper,
+        )
+
+        from nemo_automodel.components.distributed.activation_checkpointing import (
+            make_selective_checkpoint_context_fn,
+        )
+
+        torch.manual_seed(0)
+        dim = 8
+        baseline = self._MatmulBlock(dim, num_linears)
+
+        wrapped_inner = self._MatmulBlock(dim, num_linears)
+        wrapped_inner.load_state_dict(baseline.state_dict())
+        wrapped = checkpoint_wrapper(
+            wrapped_inner,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            context_fn=make_selective_checkpoint_context_fn(),
+            preserve_rng_state=True,
+        )
+
+        x = torch.randn(4, dim)
+
+        out_base = baseline(x.clone())
+        out_base.sum().backward()
+
+        out_wrapped = wrapped(x.clone())
+        out_wrapped.sum().backward()
+
+        torch.testing.assert_close(out_wrapped, out_base)
+        for (name, p_base), (_, p_wrap) in zip(baseline.named_parameters(), wrapped_inner.named_parameters()):
+            torch.testing.assert_close(p_wrap.grad, p_base.grad, msg=f"grad mismatch for {name}")
+
+    def test_gradients_match_with_odd_matmul_count(self):
+        """Regression: an odd number of matmuls must not flip recompute parity."""
+        self._assert_grads_match_baseline(num_linears=3)
+
+    def test_gradients_match_with_even_matmul_count(self):
+        """Even matmul count is the easy case and must also stay correct."""
+        self._assert_grads_match_baseline(num_linears=4)
+
+
+class TestSelectiveCheckpointCompile:
+    """``_apply_per_layer_compile`` must compile selective-AC wrappers OUTER.
+
+    Selective AC wraps the whole block, so torch.compile must compile the
+    wrapper (not the unwrapped inner layer) for the partitioner to honor the
+    SAC recompute tags. Non-selective layer-level wrappers (PP path) are still
+    unwrapped and the decoder layer is compiled directly.
+    """
+
+    class _Block(nn.Module):
+        def __init__(self, dim: int = 8):
+            super().__init__()
+            self.fc = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.fc(x)
+
+    def _build_model(self, *, tag: bool):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            checkpoint_wrapper,
+        )
+
+        from nemo_automodel.components.distributed.activation_checkpointing import SELECTIVE_AC_WRAPPER_FLAG
+
+        layers = nn.ModuleList()
+        for _ in range(2):
+            wrapper = checkpoint_wrapper(self._Block(), checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+            if tag:
+                setattr(wrapper, SELECTIVE_AC_WRAPPER_FLAG, True)
+            layers.append(wrapper)
+        inner = nn.Module()
+        inner.layers = layers
+        model = nn.Module()
+        model.model = inner
+        return model
+
+    def _run_compile(self, model, monkeypatch):
+        import nemo_automodel.components.distributed.parallelizer as parallelizer
+
+        monkeypatch.setattr(parallelizer, "_patch_dtensor_spec_hash_for_symint", lambda: None)
+        compiled = []
+        monkeypatch.setattr(torch.nn.Module, "compile", lambda self, *a, **k: compiled.append(self))
+        parallelizer._apply_per_layer_compile(model)
+        return compiled
+
+    def test_tagged_selective_wrapper_compiled_outer(self, monkeypatch):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        model = self._build_model(tag=True)
+        compiled = self._run_compile(model, monkeypatch)
+
+        assert len(compiled) == 2
+        for m in compiled:
+            assert isinstance(m, CheckpointWrapper), "selective wrapper must be compiled, not unwrapped"
+
+    def test_untagged_wrapper_compiled_inner(self, monkeypatch):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        model = self._build_model(tag=False)
+        compiled = self._run_compile(model, monkeypatch)
+
+        assert len(compiled) == 2
+        for m in compiled:
+            assert not isinstance(m, CheckpointWrapper)
+            assert isinstance(m, self._Block), "non-selective wrapper must be unwrapped before compile"
+
+    def test_disable_dynamo_lru_cache_is_best_effort(self, monkeypatch):
+        """Missing private dynamo API must not raise."""
+        import nemo_automodel.components.distributed.activation_checkpointing as ac
+
+        monkeypatch.delattr(torch._C._dynamo.eval_frame, "_set_lru_cache", raising=False)
+        ac._disable_dynamo_lru_cache()  # should not raise
+
+
+class TestSingleGpuActivationCheckpointing:
+    """FSDP2Manager single-GPU (world_size==1) activation-checkpointing behavior."""
+
+    def _make_manager(self, monkeypatch, activation_checkpointing):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+        from nemo_automodel.components.distributed.config import FSDP2Config
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 1)
+        config = FSDP2Config(activation_checkpointing=activation_checkpointing)
+        return fsdp2_mod.FSDP2Manager(config, device_mesh=MagicMock())
+
+    def test_selective_wraps_layers_on_single_gpu(self, monkeypatch):
+        """Selective AC is honored on a single GPU (not silently full-checkpointed)."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        from nemo_automodel.components.distributed.activation_checkpointing import SELECTIVE_AC_WRAPPER_FLAG
+
+        manager = self._make_manager(monkeypatch, "selective")
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        manager.parallelize(model)
+
+        for layer in model.model.layers:
+            assert isinstance(layer, CheckpointWrapper)
+            assert getattr(layer, SELECTIVE_AC_WRAPPER_FLAG, False) is True
+        assert model.config.use_cache is False
+
+    def test_selective_kv_sharing_falls_back_on_single_gpu(self, monkeypatch):
+        """KV-shared models fall back to sub-module checkpointing, not whole-block."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        manager = self._make_manager(monkeypatch, "selective")
+        model = _make_model_for_ac(num_kv_shared_layers=20)
+        manager.parallelize(model)
+
+        for layer in model.model.layers:
+            assert not isinstance(layer, CheckpointWrapper)
+            assert isinstance(layer.mlp, CheckpointWrapper)
+            assert not isinstance(layer.self_attn, CheckpointWrapper)
+
+    def test_full_uses_hf_gradient_checkpointing_on_single_gpu(self, monkeypatch):
+        """Non-selective AC still uses HF gradient_checkpointing_enable on a single GPU."""
+        manager = self._make_manager(monkeypatch, True)
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.gradient_checkpointing_enable = MagicMock()
+        manager.parallelize(model)
+
+        model.gradient_checkpointing_enable.assert_called_once()
+
+
+class TestSelectiveCheckpointSaveOps:
+    """Tests for the TorchTitan-style save-op set used by selective AC."""
+
+    def test_matmul_ops_alternate_mm_linear_and_grouped_mm(self):
+        """mm/linear and the MoE grouped-GEMM variants alternate; addmm/bmm are always saved."""
+        from nemo_automodel.components.distributed.activation_checkpointing import _SELECTIVE_AC_MATMUL_OPS
+
+        # mm and linear always exist; grouped-GEMM variants are version-dependent.
+        assert torch.ops.aten.mm.default in _SELECTIVE_AC_MATMUL_OPS
+        assert torch.ops.aten.linear.default in _SELECTIVE_AC_MATMUL_OPS
+        # addmm/bmm must NOT alternate (they are always-saved).
+        assert torch.ops.aten.addmm.default not in _SELECTIVE_AC_MATMUL_OPS
+        assert torch.ops.aten.bmm.default not in _SELECTIVE_AC_MATMUL_OPS
+        # When available, the grouped-GEMM op (expert compute) alternates so it is
+        # not unconditionally recomputed under EP.
+        grouped_mm = getattr(torch.ops.aten, "_grouped_mm", None)
+        if grouped_mm is not None:
+            assert grouped_mm.default in _SELECTIVE_AC_MATMUL_OPS
+
+    def test_save_ops_include_compute_and_comm_ops(self):
+        """The save-set covers matmuls, attention, and communication collectives."""
+        from nemo_automodel.components.distributed.activation_checkpointing import _SELECTIVE_AC_MUST_SAVE_OPS
+
+        expected = [
+            torch.ops.aten.mm.default,
+            torch.ops.aten.addmm.default,
+            torch.ops.aten.bmm.default,
+            torch.ops.aten.linear.default,
+            torch.ops.aten._scaled_dot_product_flash_attention.default,
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            torch.ops._c10d_functional.all_to_all_single.default,
+        ]
+        for op in expected:
+            assert op in _SELECTIVE_AC_MUST_SAVE_OPS, f"{op} missing from save-op set"
+
+    def test_save_ops_seeded_from_partitioner(self):
+        """The set is seeded from PyTorch's compute-intensive op list, not hardcoded."""
+        from nemo_automodel.components.distributed.activation_checkpointing import _default_compute_intensive_ops
+
+        seeded = _default_compute_intensive_ops()
+        assert isinstance(seeded, tuple)
+        # mm is compute-intensive in every supported torch version.
+        assert torch.ops.aten.mm.default in seeded
+
+    def test_build_save_ops_falls_back_without_partitioner(self, monkeypatch):
+        """If the private partitioner API is unavailable, the curated supplement still applies."""
+        import nemo_automodel.components.distributed.activation_checkpointing as ac
+
+        monkeypatch.setattr(ac, "_default_compute_intensive_ops", lambda: ())
+        save_ops = ac._build_selective_ac_save_ops()
+        # Curated supplement still provides the core matmul + attention ops.
+        assert torch.ops.aten.mm.default in save_ops
+        assert torch.ops.aten.addmm.default in save_ops
+        assert torch.ops.aten.bmm.default in save_ops
+        assert torch.ops.aten._scaled_dot_product_flash_attention.default in save_ops
+
+    def test_resolve_op_attr_returns_none_for_missing(self):
+        """Optional/absent ops resolve to None instead of raising."""
+        from nemo_automodel.components.distributed.activation_checkpointing import _resolve_op_attr
+
+        assert _resolve_op_attr(torch.ops, "definitely_not_a_namespace.foo.default") is None
+        assert _resolve_op_attr(torch, "_higher_order_ops.flex_attention") is not None
+
+    def test_trace_logs_each_op_once_with_verdict(self, caplog):
+        """The opt-in policy trace logs each unique op a single time with its verdict."""
+        import logging as _logging
+
+        from torch.utils.checkpoint import CheckpointPolicy
+
+        import nemo_automodel.components.distributed.activation_checkpointing as ac
+
+        ac._SELECTIVE_AC_TRACE_SEEN.clear()
+        with patch.object(ac, "_SELECTIVE_AC_TRACE", True):
+            with caplog.at_level(_logging.INFO, logger=ac.__name__):
+                ac._maybe_trace_selective_ac_decision(
+                    torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE, True, is_recompute=False
+                )
+                # Duplicate of the same op must not log a second time.
+                ac._maybe_trace_selective_ac_decision(
+                    torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE, True, is_recompute=False
+                )
+                ac._maybe_trace_selective_ac_decision(
+                    torch.ops._c10d_functional.all_to_all_single.default,
+                    CheckpointPolicy.MUST_SAVE,
+                    False,
+                    is_recompute=False,
+                )
+                ac._maybe_trace_selective_ac_decision(
+                    torch.ops.aten.add.Tensor, CheckpointPolicy.PREFER_RECOMPUTE, False, is_recompute=False
+                )
+
+        lines = [r.getMessage() for r in caplog.records if "[selective-ac]" in r.getMessage()]
+        assert len(lines) == 3  # mm logged once (dedup), all_to_all, add
+        assert any("ALTERNATE" in ln and "mm" in ln for ln in lines)
+        assert any("SAVE" in ln and "all_to_all_single" in ln for ln in lines)
+        assert any("RECOMPUTE" in ln and "add" in ln for ln in lines)
 
 
 class TestExtractModelLayers:
@@ -1718,3 +2172,55 @@ class TestExtractModelLayers:
         # 3 text-decoder + 2 vision tower layers, all flattened.
         assert len(result) == 5
         assert not any(isinstance(r, nn.ModuleList) for r in result)
+
+    def test_string_keyed_bagel_extracts_language_and_vision_layers(self):
+        """BAGEL exposes Qwen decoder layers and SigLIP encoder layers."""
+        model = _make_bagel_model(num_language_layers=2, num_vision_layers=3)
+
+        result = _extract_model_layers(model)
+
+        language_layers = model.model.language_model.model.layers
+        vision_layers = model.model.vit_model.vision_model.encoder.layers
+        assert len(result) == 5
+        assert [id(r) for r in result[:2]] == [id(layer) for layer in language_layers]
+        assert [id(r) for r in result[2:]] == [id(layer) for layer in vision_layers]
+
+
+class TestBagelFullLayerActivationCheckpointing:
+    """Tests for native BAGEL-style whole-layer activation checkpointing."""
+
+    def test_get_module_by_fqn_resolves_nested_module_and_missing_path(self):
+        """Nested FQN lookup returns the module or None for missing paths."""
+        model = _make_bagel_model()
+
+        result = parallelizer._get_module_by_fqn(model, "model.vit_model.vision_model.encoder.layers")
+
+        assert result is model.model.vit_model.vision_model.encoder.layers
+        assert parallelizer._get_module_by_fqn(model, "model.missing.layers") is None
+
+    def test_apply_bagel_full_layer_activation_checkpointing_wraps_each_layer(self, monkeypatch):
+        """BAGEL wraps Qwen and SigLIP layers once and skips already wrapped layers."""
+        model = _make_bagel_model(num_language_layers=2, num_vision_layers=3)
+        wrap_calls = []
+
+        def _fake_checkpoint_wrapper(module, **kwargs):
+            wrap_calls.append((module, kwargs))
+            return _CheckpointWrapped(module, **kwargs)
+
+        monkeypatch.setattr(parallelizer, "checkpoint_wrapper", _fake_checkpoint_wrapper)
+
+        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(model) is True
+
+        language_layers = model.model.language_model.model.layers
+        vision_layers = model.model.vit_model.vision_model.encoder.layers
+        wrapped_layers = list(language_layers) + list(vision_layers)
+        assert len(wrap_calls) == 5
+        assert all(isinstance(layer, _CheckpointWrapped) for layer in wrapped_layers)
+        assert all(call_kwargs["checkpoint_impl"].name == "NO_REENTRANT" for _, call_kwargs in wrap_calls)
+
+        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(model) is False
+        assert len(wrap_calls) == 5
+
+    def test_apply_bagel_full_layer_activation_checkpointing_ignores_other_models(self):
+        """Non-BAGEL models continue through the generic checkpointing path."""
+        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(nn.Module()) is False

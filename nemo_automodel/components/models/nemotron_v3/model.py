@@ -22,6 +22,7 @@ from transformers import AutoConfig
 from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     HFCheckpointingMixin,
@@ -61,6 +62,8 @@ class NemotronV3Model(nn.Module):
 
     This is a hybrid architecture with Mamba2, Attention, MLP, and MoE layers.
     """
+
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "_fp32_params"]
 
     def __init__(
         self,
@@ -128,6 +131,7 @@ class NemotronV3Model(nn.Module):
             self.backend.rms_norm,
             config.hidden_size,
             eps=config.layer_norm_epsilon,
+            dtype=dtype,
         )
 
     def forward(
@@ -282,9 +286,19 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     # Hybrid Mamba2/Attention uses NemotronHybridCache, not DynamicCache.
     _is_stateful: bool = True
     main_input_name: str = "input_ids"
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "_fp32_params"]
 
     # Skip patch_hf_model_for_pp; our forward already handles PP routing.
     _pp_keep_self_forward: bool = True
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = True
+        supports_pp: bool = True
+        supports_ep: bool = True
 
     @classmethod
     def from_config(
@@ -357,6 +371,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         """
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig()
 
         # Base model
@@ -431,6 +446,56 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Enable activation checkpointing on each transformer (and MTP) block.
+
+        Wraps every decoder block (and MTP block, when present) with a
+        non-reentrant checkpoint wrapper so that block activations are recomputed
+        during the backward pass instead of being stored. This is the single-GPU
+        entry point: ``FSDP2Manager.parallelize`` calls it when ``world_size == 1``
+        (the expert-parallel path performs the equivalent wrapping inside the MoE
+        parallelizer's ``apply_ac``). Without it, the hybrid Mamba2/Attention MoE
+        keeps every block's activations live, which is what pushes single-GPU LoRA
+        SFT over a single 80GB device. Idempotent.
+
+        Args:
+            gradient_checkpointing_kwargs: Accepted for HF API compatibility;
+                currently unused (NO_REENTRANT wrapping is always used).
+        """
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            checkpoint_wrapper,
+        )
+
+        if getattr(self, "_gradient_checkpointing", False):
+            return
+
+        def _wrap(block):
+            return checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT, preserve_rng_state=True)
+
+        containers = [self.model.layers]
+        if self.mtp is not None and getattr(self.mtp, "layers", None) is not None:
+            containers.append(self.mtp.layers)
+        for layers in containers:
+            for layer_id, block in list(layers.named_children()):
+                layers.register_module(layer_id, _wrap(block))
+        self._gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        """Unwrap any checkpoint-wrapped blocks (inverse of ``gradient_checkpointing_enable``)."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        if not getattr(self, "_gradient_checkpointing", False):
+            return
+        containers = [self.model.layers]
+        if self.mtp is not None and getattr(self.mtp, "layers", None) is not None:
+            containers.append(self.mtp.layers)
+        for layers in containers:
+            for layer_id, block in list(layers.named_children()):
+                if isinstance(block, CheckpointWrapper):
+                    layers.register_module(layer_id, block._checkpoint_wrapped_module)
+        self._gradient_checkpointing = False
 
     def _is_pipeline_parallel_stage(self) -> bool:
         """True when this module instance has been trimmed to a PP stage subset.
@@ -760,6 +825,18 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             # tensors for the same reason.
             mtp_hidden = hidden_states
             mtp_embeds_for_call = tuple(mtp_embed_inputs) if mtp_embed_inputs else ()
+            # SALM / multimodal: when inputs_embeds (pre-fused audio+text) are present
+            # and no PP embeddings were provided, pre-roll them per depth so audio
+            # positions carry the correct audio embedding rather than embed_fn(padding_id).
+            if not mtp_embeds_for_call and inputs_embeds is not None:
+                from nemo_automodel.components.models.common.mtp import roll_tensor  # noqa: PLC0415
+
+                cur_emb = inputs_embeds
+                salm_embed_inputs: list[torch.Tensor] = []
+                for _ in range(self.mtp_config.num_layers):
+                    cur_emb = roll_tensor(cur_emb, shifts=-1, dim=-2)
+                    salm_embed_inputs.append(cur_emb)
+                mtp_embeds_for_call = tuple(salm_embed_inputs)
             if is_thd:
                 if mtp_hidden.dim() == 3 and mtp_hidden.shape[0] == 1:
                     mtp_hidden = mtp_hidden.squeeze(0)
@@ -971,7 +1048,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 for sublayer in self.mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)
 
-        cast_model_to_dtype(self, dtype)
+        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
 
 ModelClass = NemotronHForCausalLM

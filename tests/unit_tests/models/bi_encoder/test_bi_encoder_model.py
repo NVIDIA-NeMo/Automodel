@@ -45,9 +45,50 @@ class _ToyMultiVectorBiEncoder(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.scale = torch.nn.Parameter(torch.tensor(1.0))
+        self.run_dummy_vision_flags = []
 
     def forward(self, batch):
+        self.run_dummy_vision_flags.append(batch.get("run_dummy_vision"))
         return batch["input_ids"].float() * self.scale
+
+
+class _ToyBackboneOutput:
+    def __init__(self, hidden_state):
+        self.last_hidden_state = hidden_state
+
+
+class _ToyBackboneWithDummyFlag(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(name_or_path="")
+        self.run_dummy_vision = None
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        return_dict=True,
+        output_hidden_states=True,
+        run_dummy_vision=None,
+    ):
+        self.run_dummy_vision = run_dummy_vision
+        hidden_state = input_ids.float().unsqueeze(-1).expand(*input_ids.shape, 2)
+        return _ToyBackboneOutput(hidden_state)
+
+
+class _ToyBackboneWithoutDummyFlag(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(name_or_path="")
+        self.received_kwargs = None
+
+    def forward(self, input_ids, attention_mask, return_dict=True, output_hidden_states=True):
+        self.received_kwargs = {
+            "return_dict": return_dict,
+            "output_hidden_states": output_hidden_states,
+        }
+        hidden_state = input_ids.float().unsqueeze(-1).expand(*input_ids.shape, 2)
+        return _ToyBackboneOutput(hidden_state)
 
 
 def _apply_common_mocks(monkeypatch):
@@ -103,7 +144,7 @@ def test_from_pretrained_happy_path(monkeypatch):
     # Patches applied
     assert "liger" in model.marker and "sdpa" in model.marker
     # Ensure HF kwargs injected + passthrough of parameters to build
-    assert last_kwargs["attn_implementation"] == "flash_attention_2"
+    assert last_kwargs["attn_implementation"] == am.DEFAULT_ATTN_IMPLEMENTATION
     assert last_kwargs["do_distributed_inbatch_negative"] is True
     assert last_kwargs["detach_distributed_inbatch_negatives"] is False
     assert last_kwargs["some_other_kwarg"] == "x"
@@ -209,6 +250,38 @@ def test_cross_encoder_retries_without_liger(monkeypatch):
 
 def test_cross_encoder_retries_without_sdpa(monkeypatch):
     _assert_retries_without_sdpa(monkeypatch, CrossEncoderModel, am.NeMoAutoModelCrossEncoder)
+
+
+def test_bi_encoder_forwards_run_dummy_vision_when_backbone_supports_it():
+    backbone = _ToyBackboneWithDummyFlag()
+    model = BiEncoderModel(backbone, pooling="avg", l2_normalize=False)
+
+    embeddings = model(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "attention_mask": torch.tensor([[1, 1]]),
+            "run_dummy_vision": False,
+        }
+    )
+
+    assert backbone.run_dummy_vision is False
+    assert embeddings.shape == (1, 2)
+
+
+def test_bi_encoder_drops_run_dummy_vision_when_backbone_does_not_support_it():
+    backbone = _ToyBackboneWithoutDummyFlag()
+    model = BiEncoderModel(backbone, pooling="avg", l2_normalize=False)
+
+    embeddings = model(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "attention_mask": torch.tensor([[1, 1]]),
+            "run_dummy_vision": True,
+        }
+    )
+
+    assert backbone.received_kwargs == {"return_dict": True, "output_hidden_states": True}
+    assert embeddings.shape == (1, 2)
 
 
 def test_maxsim_scores_and_labels_masks_padding_before_maxsim():
@@ -320,6 +393,32 @@ def test_forward_backward_step_supports_local_multi_vector_pooling():
     assert len(loss_buffer) == 1
     assert torch.isfinite(loss_buffer[0])
     assert recipe.model_parts[0].scale.grad is not None
+
+
+def test_forward_backward_step_disables_query_dummy_vision_but_keeps_passage_dummy_vision():
+    recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    model = _ToyMultiVectorBiEncoder()
+    recipe.model_parts = [model]
+    recipe.temperature = 1.0
+    recipe.train_n_passages = 2
+
+    batch = {
+        "q_input_ids": torch.tensor([[[1.0, 0.0], [0.0, 1.0]]]),
+        "q_attention_mask": torch.tensor([[1, 1]]),
+        "d_input_ids": torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[0.0, 1.0], [0.0, 0.0]],
+            ]
+        ),
+        "d_attention_mask": torch.tensor([[1, 1], [1, 0]]),
+    }
+
+    recipe._forward_backward_step(0, batch, loss_buffer=[], num_batches=1, is_train=True)
+
+    assert model.run_dummy_vision_flags == [False, True]
 
 
 def test_validation_epoch_supports_multi_vector_pooling():

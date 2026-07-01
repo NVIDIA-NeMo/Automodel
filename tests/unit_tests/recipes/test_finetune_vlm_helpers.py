@@ -215,10 +215,11 @@ def test_build_model_passes_freeze_config():
     assert captured_kwargs["freeze_config"] == {"freeze_language_model": False, "freeze_vision_tower": True}
 
 
-def test_build_model_passes_moe_config_from_parallelizer_config():
-    """Test that cfg_moe as MoEParallelizerConfig is forwarded directly."""
+def test_build_model_passes_distributed_setup():
+    """Distributed policy is passed through the single setup object."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-    from nemo_automodel.components.moe.config import MoEParallelizerConfig
+    from nemo_automodel.components.distributed.config import DistributedSetup
+    from nemo_automodel.components.distributed.mesh import MeshContext
 
     captured_kwargs = {}
 
@@ -234,7 +235,7 @@ def test_build_model_passes_moe_config_from_parallelizer_config():
             return getattr(self, key, default)
 
     cfg_model = CapturingModelConfig()
-    moe_cfg = MoEParallelizerConfig()
+    distributed_setup = DistributedSetup(mesh_context=MeshContext())
 
     with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         build_model(
@@ -242,55 +243,12 @@ def test_build_model_passes_moe_config_from_parallelizer_config():
             cfg_freeze=None,
             cfg_peft=None,
             seed=123,
-            cfg_moe=moe_cfg,
-            activation_checkpointing=True,
+            distributed_setup=distributed_setup,
         )
 
-    assert "moe_config" in captured_kwargs
-    assert captured_kwargs["moe_config"] is moe_cfg
-    assert captured_kwargs["activation_checkpointing"] is True
-
-
-def test_build_model_passes_moe_config_from_dict_like():
-    """Test that cfg_moe with to_dict() is converted to MoEParallelizerConfig."""
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-    from nemo_automodel.components.moe.config import MoEParallelizerConfig
-
-    captured_kwargs = {}
-
-    class CapturingModelConfig:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            captured_kwargs.update(kwargs)
-            return DummyModel()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    class DictLikeMoeConfig:
-        def to_dict(self):
-            return {
-                "activation_checkpointing": True,  # should be stripped
-                "_target_": "some.target",  # should be stripped
-            }
-
-    cfg_model = CapturingModelConfig()
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=123,
-            cfg_moe=DictLikeMoeConfig(),
-            activation_checkpointing=False,
-        )
-
-    assert "moe_config" in captured_kwargs
-    assert isinstance(captured_kwargs["moe_config"], MoEParallelizerConfig)
-    assert captured_kwargs["activation_checkpointing"] is False
+    assert captured_kwargs["distributed_setup"] is distributed_setup
+    assert "moe_config" not in captured_kwargs
+    assert "activation_checkpointing" not in captured_kwargs
 
 
 def test_build_model_no_moe_config_when_cfg_moe_is_none():
@@ -318,7 +276,6 @@ def test_build_model_no_moe_config_when_cfg_moe_is_none():
             cfg_freeze=None,
             cfg_peft=None,
             seed=123,
-            cfg_moe=None,
         )
 
     assert "moe_config" not in captured_kwargs
@@ -2208,8 +2165,127 @@ def _create_non_pp_recipe(model, device="cpu"):
     return recipe
 
 
+class _DummyCPSubMesh:
+    def __init__(self, size: int):
+        self._size = size
+
+    def size(self) -> int:
+        return self._size
+
+
+class _DummyCPDeviceMesh(dict):
+    def __init__(self, cp_size: int):
+        super().__init__()
+        self["cp"] = _DummyCPSubMesh(cp_size)
+        self.mesh_dim_names = ["cp"]
+
+
+class _CPPreEmbedModel(torch.nn.Module):
+    def __init__(self, *, return_mm_token_type_ids: bool = True):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+        self.return_mm_token_type_ids = return_mm_token_type_ids
+
+    def prepare_model_inputs_for_cp(self, *args, **kwargs):
+        raise AssertionError("prepare_model_inputs_for_cp should be invoked through model.__call__")
+
+    def forward(self, *, input_ids=None, mm_token_type_ids=None, _pre_embed_only=False, **kwargs):
+        assert _pre_embed_only is True
+        batch, seq = input_ids.shape
+        inputs_embeds = self.scale * torch.ones(batch, seq, 4)
+        per_layer_inputs = self.scale * torch.ones(batch, seq, 2, 3)
+        prepared = {
+            "inputs_embeds": inputs_embeds,
+            "per_layer_inputs": per_layer_inputs,
+        }
+        if self.return_mm_token_type_ids and mm_token_type_ids is not None:
+            prepared["mm_token_type_ids"] = mm_token_type_ids
+        return prepared
+
+
+class _CPPreEmbedStop(RuntimeError):
+    pass
+
+
 class TestForwardBackwardStepNonPP:
     """Tests for _forward_backward_step without pipeline parallelism."""
+
+    def test_non_pp_cp_pre_embed_uses_model_returned_mm_token_type_ids_and_grad(self, monkeypatch):
+        model = _CPPreEmbedModel()
+        non_pp_recipe = _create_non_pp_recipe(model)
+        non_pp_recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=2)
+
+        mm_token_type_ids = torch.tensor([[1, 1, 0, 0]])
+
+        def _capture_cp_batch(device_mesh, batch, loss_mask=None):
+            assert "input_ids" not in batch
+            assert "pixel_values" not in batch
+            assert "image_position_ids" not in batch
+            assert "mm_token_type_ids" in batch
+            assert "per_layer_inputs" in batch
+            torch.testing.assert_close(batch["mm_token_type_ids"], mm_token_type_ids)
+            assert batch["inputs_embeds"].requires_grad
+            raise _CPPreEmbedStop
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            _capture_cp_batch,
+        )
+
+        batch = {
+            "labels": torch.randint(0, 50, (1, 4)),
+            "input_ids": torch.randint(0, 100, (1, 4)),
+            "pixel_values": torch.randn(1, 3, 8, 8),
+            "image_position_ids": torch.zeros(1, 1, 2, dtype=torch.long),
+            "mm_token_type_ids": mm_token_type_ids,
+        }
+
+        with pytest.raises(_CPPreEmbedStop):
+            non_pp_recipe._forward_backward_step(
+                idx=0,
+                batch=batch,
+                loss_buffer=[],
+                num_label_tokens=4,
+                num_batches=1,
+                is_train=False,
+            )
+
+    def test_non_pp_cp_pre_embed_drops_mm_token_type_ids_when_model_does_not_return_it(self, monkeypatch):
+        model = _CPPreEmbedModel(return_mm_token_type_ids=False)
+        non_pp_recipe = _create_non_pp_recipe(model)
+        non_pp_recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=2)
+
+        def _capture_cp_batch(device_mesh, batch, loss_mask=None):
+            assert "input_ids" not in batch
+            assert "pixel_values" not in batch
+            assert "image_position_ids" not in batch
+            assert "mm_token_type_ids" not in batch
+            assert "per_layer_inputs" in batch
+            assert batch["inputs_embeds"].requires_grad
+            raise _CPPreEmbedStop
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            _capture_cp_batch,
+        )
+
+        batch = {
+            "labels": torch.randint(0, 50, (1, 4)),
+            "input_ids": torch.randint(0, 100, (1, 4)),
+            "pixel_values": torch.randn(1, 3, 8, 8),
+            "image_position_ids": torch.zeros(1, 1, 2, dtype=torch.long),
+            "mm_token_type_ids": torch.tensor([[1, 1, 0, 0]]),
+        }
+
+        with pytest.raises(_CPPreEmbedStop):
+            non_pp_recipe._forward_backward_step(
+                idx=0,
+                batch=batch,
+                loss_buffer=[],
+                num_label_tokens=4,
+                num_batches=1,
+                is_train=False,
+            )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="FusedLinearCE requires CUDA")
     def test_non_pp_with_fused_linear_ce(self, monkeypatch):
@@ -2575,16 +2651,19 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
         property(lambda self: _stub_build_checkpoint_config()),
     )
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.setup_distributed",
+        "nemo_automodel.recipes.vlm.finetune.create_distributed_setup_from_config",
         lambda cfg, world_size: SimpleNamespace(
+            mesh_context=SimpleNamespace(
+                pp_enabled=False,
+                device_mesh=None,
+                moe_mesh=None,
+                cp_size=cp_size,
+                pp_size=1,
+            ),
             strategy_config=None,
             pipeline_config=None,
-            moe_config=None,
+            moe_parallel_config=None,
             activation_checkpointing=False,
-            pp_enabled=False,
-            device_mesh=None,
-            moe_mesh=None,
-            cp_size=cp_size,
         ),
     )
     dummy_model = DummyModel()
@@ -3061,3 +3140,56 @@ def test_build_dataloader_default_get_rope_index_is_none():
 
     assert "get_rope_index" in captured, "neat_pack_dataset_vlm must receive get_rope_index kwarg even when None"
     assert captured["get_rope_index"] is None
+
+
+def _run_build_dataloader_capturing_wrapper(dataset_cfg):
+    """Run build_dataloader (pretokenize path) and return the PreTokenizedDatasetWrapper mock."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    wrapper_mock = MagicMock(return_value=MagicMock())
+    _, ctx_managers = _patches_for_packing(lambda *a, **k: MagicMock())
+
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        # Override the wrapper patch from _patches_for_packing so we can inspect call kwargs.
+        stack.enter_context(
+            patch(
+                "nemo_automodel.components.datasets.vlm.datasets.PreTokenizedDatasetWrapper",
+                wrapper_mock,
+            )
+        )
+        build_dataloader(
+            dataset_cfg,
+            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            "test/model",
+            None,
+            None,
+            42,
+            1,
+            cfg_ps=_make_packing_cfg(pack_size=64),
+        )
+    return wrapper_mock
+
+
+def test_build_dataloader_inject_fake_images_defaults_true():
+    """When dataset cfg omits inject_fake_images, the wrapper defaults to True."""
+    wrapper_mock = _run_build_dataloader_capturing_wrapper(_make_dataset_cfg())
+    assert wrapper_mock.call_args.kwargs["inject_fake_images"] is True
+
+
+def test_build_dataloader_forwards_inject_fake_images_false():
+    """inject_fake_images=False in dataset cfg must reach PreTokenizedDatasetWrapper."""
+    cfg = MagicMock(spec=["get", "instantiate", "path_or_dataset"])
+    cfg.get.side_effect = lambda key, default=None: {
+        "path_or_dataset": None,
+        "truncate": True,
+        "inject_fake_images": False,
+    }.get(key, default)
+    cfg.path_or_dataset = None
+    cfg.instantiate.return_value = []
+
+    wrapper_mock = _run_build_dataloader_capturing_wrapper(cfg)
+    assert wrapper_mock.call_args.kwargs["inject_fake_images"] is False
