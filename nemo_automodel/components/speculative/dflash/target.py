@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -38,6 +38,10 @@ class DFlashTargetBatch:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     loss_mask: torch.Tensor
+    # Full-vocab target logits ``[B, S, V]``, captured only when the wrapper is
+    # built with ``capture_logits=True`` (JetSpec's forward-KL distillation needs
+    # the teacher distribution; DFlash's hard-label CE does not). ``None`` otherwise.
+    logits: Optional[torch.Tensor] = None
 
 
 class HFDFlashTargetModel:
@@ -48,9 +52,13 @@ class HFDFlashTargetModel:
     -- matching SpecForge's ``extract_context_feature`` (offset 1).
     """
 
-    def __init__(self, model: nn.Module, target_layer_ids: Sequence[int]):
+    def __init__(self, model: nn.Module, target_layer_ids: Sequence[int], capture_logits: bool = False):
         self.model = model.eval()
         self.target_layer_ids = self._validate_layer_ids(target_layer_ids)
+        # JetSpec's forward-KL distillation needs the teacher's full-vocab logits.
+        # The target forward already computes them (HF returns ``.logits``); keep a
+        # reference rather than recomputing. DFlash leaves this off (hard-label CE).
+        self.capture_logits = bool(capture_logits)
 
     def _validate_layer_ids(self, target_layer_ids: Sequence[int]) -> list[int]:
         num_layers = self.model.config.num_hidden_layers
@@ -106,7 +114,7 @@ class HFDFlashTargetModel:
             name: False for name in ("output_hidden_states", "output_attentions", "use_cache") if name in forward_params
         }
         try:
-            self.model(input_ids=input_ids, attention_mask=attention_mask, **extra_kwargs)
+            output = self.model(input_ids=input_ids, attention_mask=attention_mask, **extra_kwargs)
         finally:
             for handle in handles:
                 handle.remove()
@@ -116,10 +124,16 @@ class HFDFlashTargetModel:
                 f"Expected {len(self.target_layer_ids)} captured layers but got {len(captured)}: {sorted(captured)}"
             )
 
+        # The target forward already computed the LM-head logits; keep them only
+        # when a distillation trainer (JetSpec) asked for the teacher distribution.
+        # ``getattr`` handles both HF outputs (``.logits``) and bare-tensor returns.
+        logits = getattr(output, "logits", output) if self.capture_logits else None
+
         hidden_states = torch.cat([captured[layer_id] for layer_id in self.target_layer_ids], dim=-1)
         return DFlashTargetBatch(
             hidden_states=hidden_states,
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            logits=logits,
         )
