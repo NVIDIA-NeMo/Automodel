@@ -223,7 +223,12 @@ def _resolve_dspark_optimizer_spec(opt_cfg) -> tuple[str, dict]:
     not accept a ``betas`` kwarg (e.g. plain SGD).
     """
     kwargs = dict(opt_cfg.to_dict())
-    target = kwargs.pop("_target_", None)
+    target = (
+        opt_cfg.get_as_string("_target_", None)
+        if hasattr(opt_cfg, "get_as_string")
+        else kwargs.get("_target_", None)
+    )
+    kwargs.pop("_target_", None)
     kwargs.pop("warmup_ratio", None)
     kwargs.pop("min_lr_ratio", None)
     kwargs["lr"] = float(kwargs["lr"])
@@ -266,7 +271,7 @@ def _resolve_reduced_target_layers(checkpoint_num_layers, requested):
     Returns the reduced layer count (an int in ``[1, checkpoint_num_layers]``) or
     ``None`` when unset. Loading fewer layers lets the full EP / hidden-capture /
     draft path run on one node (the full DeepSeek-V4-Flash target OOMs at load on a
-    single 8x80GB box); a draft trained against a reduced target is not usable.
+    single 8x80GB box); a draft trained against any reduced target is not usable.
     """
     if requested is None:
         return None
@@ -338,6 +343,20 @@ class TrainDSparkRecipe(BaseRecipe):
             # recipe's `distributed:` block; use a larger ep_size instead of PP to
             # shard the parameter memory (see the example yaml for the tradeoff).
             target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+            target_text_overrides = {"num_mtp_modules": 0}
+            n_reduced = _resolve_reduced_target_layers(
+                target_config.text_config.num_hidden_layers,
+                recipe_cfg.get("target_num_hidden_layers", None),
+            )
+            if n_reduced is not None:
+                logger.warning(
+                    "Reducing the MiniMax M3 target from %d to %d text layers "
+                    "(target_num_hidden_layers): diagnostic/CI only, not a usable drafter.",
+                    target_config.text_config.num_hidden_layers,
+                    n_reduced,
+                )
+                target_config.text_config.num_hidden_layers = n_reduced
+                target_text_overrides["num_hidden_layers"] = n_reduced
             architectures = getattr(target_config, "architectures", []) or []
             self.distributed_setup = create_distributed_setup_from_config(
                 self.cfg,
@@ -355,7 +374,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 linear="torch",
                 rms_norm="torch_fp32",
                 rope_fusion=False,
-                experts="gmm",
+                experts=str(recipe_cfg.get("target_experts", "gmm")),
                 dispatcher="hybridep",
                 enable_hf_state_dict_adapter=True,
                 enable_fsdp_optimizations=True,
@@ -369,7 +388,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 # The released bf16 checkpoint ships no real MTP weights despite the
                 # config declaring some, and DSpark trains its own separate draft
                 # regardless, so disable the target's native MTP modules.
-                text_config={"num_mtp_modules": 0},
+                text_config=target_text_overrides,
             )
             # A distributed-setup-loaded model already lands correctly placed
             # (sharded as DTensors); a blanket .to(device) afterward is redundant.
@@ -581,6 +600,17 @@ class TrainDSparkRecipe(BaseRecipe):
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
         self.optimizer = _build_dspark_optimizer(self.trainer_module, opt_cfg, device_mesh=None)
+        logger.info(
+            "Optimizer=%s lr=%.3e master_weights=%s master_weight_dtype=%s "
+            "store_param_remainders=%s exp_avg_dtype=%s exp_avg_sq_dtype=%s",
+            type(self.optimizer).__name__,
+            self.peak_lr,
+            getattr(self.optimizer, "master_weights", False),
+            getattr(self.optimizer, "master_weight_dtype", None),
+            getattr(self.optimizer, "store_param_remainders", False),
+            getattr(self.optimizer, "exp_avg_dtype", None),
+            getattr(self.optimizer, "exp_avg_sq_dtype", None),
+        )
         self.grad_accumulation_steps = recipe_cfg.get("grad_accumulation_steps", 1)
         self.max_grad_norm = recipe_cfg.get("max_grad_norm", 1.0)
         self.num_epochs = recipe_cfg.num_epochs

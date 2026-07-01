@@ -43,6 +43,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm.train_dspark import (
     _apply_target_chat_template,
     _build_dspark_optimizer,
@@ -182,6 +183,12 @@ def test_optimizer_spec_coerces_lr_to_float():
     _target, kwargs = _resolve_dspark_optimizer_spec(_opt_cfg(lr="6e-4"))
     assert kwargs["lr"] == pytest.approx(6e-4)
     assert isinstance(kwargs["lr"], float)
+
+
+def test_optimizer_spec_keeps_real_config_node_target_as_string():
+    cfg = ConfigNode({"_target_": "torch.optim.AdamW", "lr": 1e-5})
+    target, _kwargs = _resolve_dspark_optimizer_spec(cfg)
+    assert target == "torch.optim.AdamW"
 
 
 def test_optimizer_spec_does_not_force_betas_onto_explicit_target():

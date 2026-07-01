@@ -120,3 +120,25 @@ def test_minimax_m3_draft_reuses_dense_intermediate_size_field():
     ``dense_intermediate_size``."""
     model = _build_minimax_m3_draft()
     assert model.layers[0].mlp.gate_proj.out_features == 2 * HIDDEN
+
+
+def test_minimax_m3_flex_attention_compiles_with_dynamic_shapes(monkeypatch):
+    import importlib
+
+    import nemo_automodel.components.speculative.dspark.draft_minimax_m3 as draft_minimax_m3
+
+    captured = {}
+
+    def compile_fn(fn, **kwargs):
+        captured["fn"] = fn
+        captured["kwargs"] = kwargs
+        return fn
+
+    monkeypatch.setattr(torch, "compile", compile_fn)
+    try:
+        importlib.reload(draft_minimax_m3)
+        assert captured["fn"] is draft_minimax_m3.flex_attention
+        assert captured["kwargs"] == {"mode": "max-autotune-no-cudagraphs", "dynamic": True}
+    finally:
+        monkeypatch.undo()
+        importlib.reload(draft_minimax_m3)

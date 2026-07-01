@@ -53,6 +53,19 @@ from nemo_automodel.components.speculative.dspark.common import (
 )
 from nemo_automodel.components.speculative.dspark.markov_head import build_markov_head
 
+_minimax_m3_flex_attention_compiled = torch.compile(
+    flex_attention,
+    mode="max-autotune-no-cudagraphs",
+    dynamic=True,
+)
+
+
+def _minimax_m3_flex_attention(q, k, v, *, block_mask, scale):
+    """Use fused FlexAttention on CUDA while retaining the eager CPU test path."""
+    compile_supported = q.is_cuda and q.shape[-1] >= 16 and k.shape[-1] >= 16 and v.shape[-1] >= 16
+    flex = _minimax_m3_flex_attention_compiled if compile_supported else flex_attention
+    return flex(q, k, v, block_mask=block_mask, scale=scale)
+
 
 class MiniMaxM3DSparkMLP(nn.Module):
     """Dense SwiGLU-OAI MLP for the DSpark draft (plain ``nn.Linear``, no MoE)."""
@@ -151,7 +164,13 @@ class MiniMaxM3DSparkAttention(nn.Module):
         v = self._repeat_kv(v)
 
         if self.config._attn_implementation == "flex_attention" and attention_mask is not None:
-            attn_output = flex_attention(q, k, v, block_mask=attention_mask, scale=self.scaling)
+            attn_output = _minimax_m3_flex_attention(
+                q,
+                k,
+                v,
+                block_mask=attention_mask,
+                scale=self.scaling,
+            )
         else:
             attn_output = F.scaled_dot_product_attention(
                 q,

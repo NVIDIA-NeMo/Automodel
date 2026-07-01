@@ -23,6 +23,7 @@ CPU: the objective and the sampler are plain tensor math (no FlexAttention).
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel.components.speculative.dspark import loss as loss_module
 from nemo_automodel.components.speculative.dspark.common import (
     DSparkForwardOutput,
     build_anchor_candidate_mask,
@@ -161,6 +162,26 @@ def test_total_variation_term_zero_when_draft_matches_target():
     # Draft == target -> TV distance 0 -> the l1 term and the total loss are 0.
     assert terms["l1_loss"].item() == 0.0
     assert loss.item() == 0.0
+
+
+def test_chunked_probability_distance_matches_reference_and_gradient():
+    torch.manual_seed(4)
+    draft = torch.randn(2, 2, 3, 7, requires_grad=True)
+    target = torch.randn_like(draft)
+    chunked = loss_module._compute_l1_dist_per_token(
+        draft_logits=draft,
+        aligned_target_logits=target,
+        chunk_size=2,
+    )
+    expected = (draft.softmax(dim=-1) - target.softmax(dim=-1)).abs().sum(dim=-1)
+
+    torch.testing.assert_close(chunked, expected)
+    chunked.sum().backward()
+    chunked_grad = draft.grad.detach().clone()
+
+    draft.grad = None
+    expected.sum().backward()
+    torch.testing.assert_close(draft.grad, chunked_grad)
 
 
 def test_anchor_candidates_require_two_consecutive_supervised_tokens():
