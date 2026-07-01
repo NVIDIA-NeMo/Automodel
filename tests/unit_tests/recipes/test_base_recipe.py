@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 from types import SimpleNamespace
 
@@ -19,9 +20,10 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.checkpoint.utils import _find_latest_checkpoint
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.recipes.base_recipe import BaseRecipe, _find_latest_checkpoint, is_distributed_stateful
+from nemo_automodel.recipes.base_recipe import BaseRecipe, is_distributed_stateful
 
 try:
     import expecttest
@@ -172,17 +174,23 @@ class _ToyModel(HFCheckpointingMixin, nn.Linear):
         nn.Linear.__init__(self, in_features, out_features, bias=bias)
 
 
+def _checkpoint_dir_names(path):
+    """Return checkpoint directory names under path sorted by step."""
+    names = [p.name for p in path.glob("*step_*") if p.is_dir()]
+    return sorted(names, key=lambda name: int(name.rsplit("_", maxsplit=1)[1]))
+
+
 class _ToyRecipe(BaseRecipe):
     """
     Minimal concrete implementation of BaseRecipe for testing.
     """
 
-    def __init__(self, checkpoint_dir, cfg_dict=None):
+    def __init__(self, checkpoint_dir, cfg_dict=None, max_recent_checkpoints="default"):
         super().__init__()
 
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
-        checkpoint_config = CheckpointingConfig(
+        checkpoint_config_kwargs = dict(
             enabled=True,
             checkpoint_dir=str(checkpoint_dir),
             model_save_format="safetensors",
@@ -192,6 +200,9 @@ class _ToyRecipe(BaseRecipe):
             is_peft=False,
             model_state_dict_keys=[],
         )
+        if max_recent_checkpoints != "default":
+            checkpoint_config_kwargs["max_recent_checkpoints"] = max_recent_checkpoints
+        checkpoint_config = CheckpointingConfig(**checkpoint_config_kwargs)
 
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
@@ -679,6 +690,299 @@ def test_load_checkpoint_multiple_checkpoints_with_latest(tmp_path):
 
     # Should restore to step 200 state
     assert torch.allclose(recipe_inst.model.weight, weight_at_step_200)
+
+
+def test_checkpoint_retention_default_keeps_all_checkpoints(tmp_path):
+    """Without checkpoint.max_recent_checkpoints, checkpoint retention preserves existing keep-all behavior."""
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    for step in [50, 100, 75, 200]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
+
+    assert recipe_inst.checkpointer.config.max_recent_checkpoints is None
+    assert _checkpoint_dir_names(tmp_path) == [
+        "epoch_0_step_50",
+        "epoch_0_step_75",
+        "epoch_0_step_100",
+        "epoch_0_step_200",
+    ]
+
+
+def test_checkpoint_retention_explicit_none_keeps_all_checkpoints(tmp_path):
+    """checkpoint.max_recent_checkpoints=None keeps all checkpoints for users who need the full history."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=None)
+
+    for step in [50, 100, 75, 200]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
+
+    assert _checkpoint_dir_names(tmp_path) == [
+        "epoch_0_step_50",
+        "epoch_0_step_75",
+        "epoch_0_step_100",
+        "epoch_0_step_200",
+    ]
+
+
+def test_step_scheduler_log_includes_checkpoint_retention_policy(tmp_path, caplog):
+    """Startup logs should tell users whether checkpoint retention is bounded or disabled."""
+    step_scheduler = SimpleNamespace(
+        grad_acc_steps=1,
+        ckpt_every_steps=5,
+        gc_every_steps=None,
+        epoch=0,
+        num_epochs=1,
+        val_every_steps=10,
+        max_steps=20,
+    )
+
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=2)
+    with caplog.at_level(logging.INFO):
+        recipe_inst._log_step_scheduler_details(step_scheduler)
+
+    assert "Checkpoint retention" in caplog.text
+    assert "keeping the most recent 2 checkpoint(s)" in caplog.text
+    assert "plus pointer-protected checkpoints" in caplog.text
+    assert "checkpoint.max_recent_checkpoints=2" in caplog.text
+
+    caplog.clear()
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=None)
+    with caplog.at_level(logging.INFO):
+        recipe_inst._log_step_scheduler_details(step_scheduler)
+
+    assert "disabled; keeping all checkpoints" in caplog.text
+    assert "checkpoint.max_recent_checkpoints=None" in caplog.text
+
+    caplog.clear()
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=2)
+    recipe_inst.checkpointer.config.enabled = False
+    with caplog.at_level(logging.INFO):
+        recipe_inst._log_step_scheduler_details(step_scheduler)
+
+    assert "inactive because checkpointing is disabled" in caplog.text
+    assert "keeping the most recent" not in caplog.text
+
+
+def test_checkpoint_retention_max_recent_one_preserves_latest_resume(tmp_path):
+    """checkpoint.max_recent_checkpoints=1 prunes older checkpoints and keeps LATEST resumable."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+
+    for step in [50, 100, 200]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        if step == 200:
+            weight_at_step_200 = recipe_inst.model.weight.clone()
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_200"]
+
+    recipe_inst.model.weight.data.add_(42.0)
+    recipe_inst.load_checkpoint(restore_from="LATEST")
+    assert torch.allclose(recipe_inst.model.weight, weight_at_step_200)
+
+
+def test_checkpoint_retention_max_recent_two_sliding_window(tmp_path):
+    """checkpoint.max_recent_checkpoints=2 keeps the two highest-step checkpoint directories, plus pointer targets."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=2)
+
+    for step in [50, 200, 100, 300]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_200", "epoch_0_step_300"]
+
+
+def test_checkpoint_retention_preserves_lowest_val_pointer_target(tmp_path):
+    """Retention preserves checkpoints targeted by LOWEST_VAL even outside the latest window."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+
+    for step, val_loss in [(100, 0.1), (200, 0.9)]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(
+            epoch=0,
+            step=step,
+            train_loss=float(loss.item()),
+            val_loss={"val_loss": val_loss},
+        )
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_200"]
+    assert (tmp_path / "LOWEST_VAL").exists(follow_symlinks=False) or (tmp_path / "LOWEST_VAL.txt").exists()
+    assert recipe_inst.load_checkpoint(restore_from="epoch_0_step_100") is None
+
+
+def test_checkpoint_restore_from_lowest_val_text_fallback(tmp_path):
+    """restore_from=LOWEST_VAL resolves text fallback pointers, not only symlinks."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+    recipe_inst.save_checkpoint(
+        epoch=0,
+        step=100,
+        train_loss=float(loss.item()),
+        val_loss={"val_loss": 0.1},
+    )
+    (tmp_path / "LOWEST_VAL").unlink(missing_ok=True)
+    (tmp_path / "LOWEST_VAL.txt").write_text("epoch_0_step_100")
+
+    assert recipe_inst.load_checkpoint(restore_from="LOWEST_VAL") is None
+
+
+def test_checkpoint_retention_preserves_arbitrary_checkpoint_pointer_target(tmp_path):
+    """Retention preserves checkpoints targeted by any top-level checkpoint pointer."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+
+    for step in [100, 200, 300]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
+        if step == 100:
+            recipe_inst._update_checkpoint_symlink("PINNED", str(tmp_path / "epoch_0_step_100"))
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_300"]
+    assert (tmp_path / "PINNED").exists(follow_symlinks=False) or (tmp_path / "PINNED.txt").exists()
+
+
+def test_checkpoint_retention_preserves_pointer_to_file_inside_checkpoint(tmp_path):
+    """Retention preserves a checkpoint when a top-level pointer targets a file inside it."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+
+    for step in [100, 200, 300]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
+        if step == 100:
+            recipe_inst._update_checkpoint_symlink("PINNED_FILE", str(tmp_path / "epoch_0_step_100" / "losses.json"))
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_300"]
+
+
+def test_checkpoint_retention_preserves_text_fallback_pointer_target(tmp_path):
+    """Retention preserves checkpoints targeted by symlink fallback text files."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+
+    for step in [100, 200, 300]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
+        if step == 100:
+            (tmp_path / "PINNED.txt").write_text("epoch_0_step_100/losses.json")
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_300"]
+
+
+def test_checkpoint_retention_preserves_lowest_val_after_resume(tmp_path):
+    """After resume, a worse validation checkpoint must not replace the previous LOWEST_VAL target."""
+    recipe_a = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+
+    for step, val_loss in [(100, 0.1), (200, 0.9)]:
+        x = torch.randn(4, 2)
+        loss = recipe_a.model(x).sum()
+        loss.backward()
+        recipe_a.optimizer.step()
+        recipe_a.save_checkpoint(
+            epoch=0,
+            step=step,
+            train_loss=float(loss.item()),
+            val_loss={"val_loss": val_loss},
+        )
+
+    recipe_b = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+    recipe_b.load_checkpoint(restore_from="LATEST")
+    x = torch.randn(4, 2)
+    loss = recipe_b.model(x).sum()
+    loss.backward()
+    recipe_b.optimizer.step()
+    recipe_b.save_checkpoint(
+        epoch=0,
+        step=300,
+        train_loss=float(loss.item()),
+        val_loss={"val_loss": 0.8},
+    )
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_300"]
+
+
+def test_checkpoint_retention_prune_failure_is_nonfatal(tmp_path, monkeypatch):
+    """A failed retention delete leaves extra checkpoints instead of failing the save."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    def fail_rmtree(_path):
+        raise OSError("checkpoint is busy")
+
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.shutil.rmtree", fail_rmtree)
+
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+    recipe_inst.save_checkpoint(epoch=0, step=200, train_loss=float(loss.item()))
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_200"]
+
+
+def test_checkpoint_retention_ignores_unreadable_top_level_text_files(tmp_path):
+    """Retention ignores unrelated text files that are not valid checkpoint pointers."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+    (tmp_path / "NOT_A_POINTER.txt").write_bytes(bytes([0xFF, 0xFE]))
+
+    for step in [100, 200]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_200"]
+
+
+def test_checkpoint_retention_async_finalization_prunes_pending_checkpoint(tmp_path):
+    """Async saves prune only after the pending checkpoint has completed and is published."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+    recipe_inst.checkpointer.config.is_async = True
+
+    for step in [100, 200]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_200"]
+
+    recipe_inst._finalize_pending_checkpoint()
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_200"]
+    assert (tmp_path / "LATEST").exists(follow_symlinks=False) or (tmp_path / "LATEST.txt").exists()
 
 
 def test_load_checkpoint_path_with_separator_treated_as_full_path(tmp_path):

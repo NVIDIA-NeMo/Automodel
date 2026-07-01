@@ -36,8 +36,10 @@ def _recipe(enabled=True, pending=None, best_pending=None):
     r._last_pending_best_checkpoint_info = best_pending
     r._latest = []
     r._best = []
+    r._pruned = []
     r._update_latest_symlink = lambda d: r._latest.append(d)
-    r._update_best_symlink = lambda d, v: r._best.append((d, v))
+    r._update_best_symlink = lambda d, v, metric_key=None: r._best.append((d, v, metric_key))
+    r._prune_old_checkpoints = lambda: r._pruned.append(1)
     return r
 
 
@@ -46,7 +48,8 @@ def test_finalize_waits_and_flushes_pending_latest_and_best():
     r._finalize_pending_checkpoint()
     assert r._waited == [1]
     assert r._latest == ["/ckpt/epoch_1_step_10"]
-    assert r._best == [("/ckpt/epoch_1_step_10", 0.5)]
+    assert r._best == [("/ckpt/epoch_1_step_10", 0.5, None)]
+    assert r._pruned == [1]
     # pending cleared so a second finalize is a no-op
     assert r._last_pending_checkpoint_dir is None
     assert r._last_pending_best_checkpoint_info is None

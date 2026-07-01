@@ -16,7 +16,7 @@ import getpass
 import json
 import logging
 import os
-import re
+import shutil
 import socket
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +42,15 @@ except ImportError:
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import save_config
+from nemo_automodel.components.checkpoint.utils import (
+    _find_latest_checkpoint,
+    _find_pointer_protected_checkpoints,
+    _format_missing_checkpoint_dir_error,
+    _list_existing_checkpoints,
+    _read_checkpoint_metric,
+    _read_checkpoint_pointer,
+    _resolve_restore_from_to_ckpt_dir,
+)
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
@@ -134,62 +143,6 @@ def is_model(object):
     return isinstance(object, nn.Module) or (
         isinstance(object, list) and len(object) > 0 and all(isinstance(item, nn.Module) for item in object)
     )
-
-
-def _list_existing_checkpoints(ckpt_root: Path) -> list[Path]:
-    """Return existing checkpoint directories under ckpt_root (matching '*step_*')."""
-    if not ckpt_root.exists():
-        return []
-    return list(ckpt_root.glob("*step_*"))
-
-
-def _resolve_restore_from_to_ckpt_dir(checkpoint_dir: str, restore_from: str) -> str | None:
-    """
-    Resolve restore_from to a checkpoint directory.
-
-    Returns:
-        - str: resolved checkpoint directory
-        - None: if restore_from='LATEST' but no checkpoint found (caller should start fresh)
-    """
-    # Handle "LATEST" keyword for convenience
-    if restore_from.upper() == "LATEST":
-        return _find_latest_checkpoint(checkpoint_dir)
-
-    # If restore_from is just a directory name (no path separator), treat it as
-    # relative to checkpoint_dir. Otherwise use as-is (absolute or relative path).
-    if os.path.sep not in restore_from and not os.path.isabs(restore_from):
-        return os.path.join(checkpoint_dir, restore_from)
-    return restore_from
-
-
-def _format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str, resolved_ckpt_dir: str) -> str:
-    """Format a helpful error message for a missing checkpoint directory."""
-    error_msg = [
-        f"\n{'=' * 80}",
-        "ERROR: Checkpoint directory does not exist",
-        f"{'=' * 80}",
-        f"Specified: checkpoint.restore_from: '{restore_from}'",
-        f"Resolved to: {resolved_ckpt_dir}",
-        "",
-        "Please check:",
-        "  1. The checkpoint directory exists",
-        f"  2. The path is correct (restore_from: '{restore_from}')",
-        f"  3. Available checkpoints in {checkpoint_dir}:",
-    ]
-
-    ckpt_root = Path(checkpoint_dir)
-    available_ckpts = _list_existing_checkpoints(ckpt_root)
-    if available_ckpts:
-        error_msg += [f"       {', '.join([p.name for p in available_ckpts[:5]])}"]
-        if len(available_ckpts) > 5:
-            error_msg += [f"       ... and {len(available_ckpts) - 5} more"]
-    else:
-        error_msg += (
-            ["       (no checkpoints found)"] if ckpt_root.exists() else ["       (checkpoint_dir does not exist)"]
-        )
-
-    error_msg += [f"{'=' * 80}"]
-    return "\n".join(error_msg)
 
 
 def _is_rank_0() -> bool:
@@ -300,6 +253,7 @@ class BaseRecipe:
 
         # Wait for any in-flight checkpoint (async case) to complete
         self.checkpointer.async_wait()
+        self._complete_pending_checkpoint()
 
         # Free GPU caches before DCP's gather-and-write. DCP allocates NCCL
         # workspace and materializes DTensor shards on GPU; with CPU-offloaded
@@ -309,33 +263,14 @@ class BaseRecipe:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        # If a previous async checkpoint just finished, update the "latest" symlink now
-        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
-        if prev_pending is not None:
-            if is_rank_0:
-                self._update_latest_symlink(prev_pending)
-            # clear and remember the last completed path
-            setattr(self, "_last_pending_checkpoint_dir", None)
-            if is_dist_initialized:
-                torch.distributed.barrier()
-
-        # If a previous async checkpoint just finished, also update the "best" symlink now (if pending)
-        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
-        if prev_best_pending is not None:
-            if is_rank_0 and prev_best_pending.get("val") is not None:
-                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
-            setattr(self, "_last_pending_best_checkpoint_info", None)
-            if is_dist_initialized:
-                torch.distributed.barrier()
 
         path = self.checkpointer.config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
 
-        best_val_metric = (
-            val_loss[next(iter(val_loss.keys())) if len(val_loss) == 1 else best_metric_key] if val_loss else None
-        )
+        best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
+        best_val_metric = val_loss[best_metric_name] if val_loss else None
 
         if is_rank_0:
             if os.path.exists(path):
@@ -452,17 +387,26 @@ class BaseRecipe:
 
         # Update latest symlink according to sync/async behavior
         if getattr(self.checkpointer.config, "is_async", False):
-            # Async: defer symlink until the next call (after async_wait completes)
+            # Async: defer symlink publication until the next call (after async_wait completes).
+            # Store a best-publish record on every rank so _complete_pending_checkpoint has a uniform
+            # barrier sequence even when validation metrics are only present on rank 0.
             setattr(self, "_last_pending_checkpoint_dir", path)
-            # Defer best symlink update similarly, capturing the metric used for comparison
-            if best_val_metric is not None:
-                setattr(self, "_last_pending_best_checkpoint_info", {"path": path, "val": float(best_val_metric)})
+            setattr(
+                self,
+                "_last_pending_best_checkpoint_info",
+                {
+                    "path": path,
+                    "val": float(best_val_metric) if best_val_metric is not None else None,
+                    "metric_key": best_metric_name,
+                },
+            )
         else:
             # Sync: update immediately
             if is_rank_0:
                 self._update_latest_symlink(path)
                 if best_val_metric is not None:
-                    self._update_best_symlink(path, float(best_val_metric))
+                    self._update_best_symlink(path, float(best_val_metric), best_metric_name)
+                self._prune_old_checkpoints()
             if is_dist_initialized:
                 torch.distributed.barrier()
 
@@ -472,6 +416,52 @@ class BaseRecipe:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+
+    def _complete_pending_checkpoint(self) -> None:
+        """Publish a completed async checkpoint and apply retention."""
+        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
+        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
+        if prev_pending is None and prev_best_pending is None:
+            return
+
+        is_dist_initialized = torch.distributed.is_initialized()
+        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+        if prev_pending is not None:
+            if is_rank_0:
+                self._update_latest_symlink(prev_pending)
+            setattr(self, "_last_pending_checkpoint_dir", None)
+            if is_dist_initialized:
+                torch.distributed.barrier()
+
+        if prev_best_pending is not None:
+            if is_rank_0 and prev_best_pending.get("val") is not None:
+                self._update_best_symlink(
+                    prev_best_pending["path"],
+                    float(prev_best_pending["val"]),
+                    prev_best_pending.get("metric_key"),
+                )
+            setattr(self, "_last_pending_best_checkpoint_info", None)
+            if is_dist_initialized:
+                torch.distributed.barrier()
+
+        if is_rank_0:
+            self._prune_old_checkpoints()
+        if is_dist_initialized:
+            torch.distributed.barrier()
+
+    def _finalize_pending_checkpoint(self) -> None:
+        """Wait for the final async checkpoint, publish it, and apply retention."""
+        checkpointer = getattr(self, "checkpointer", None)
+        if checkpointer is None:
+            return
+        config = getattr(checkpointer, "config", None)
+        if config is not None and not getattr(config, "enabled", True):
+            return
+        async_wait = getattr(checkpointer, "async_wait", None)
+        if async_wait is None:
+            return
+        async_wait()
+        self._complete_pending_checkpoint()
 
     def _update_checkpoint_symlink(self, link_name: str, target_dir: str) -> None:
         """
@@ -483,6 +473,9 @@ class BaseRecipe:
         link_path = os.path.join(ckpt_root, link_name)
         if os.path.lexists(link_path):
             os.remove(link_path)
+        txt_path = f"{link_path}.txt"
+        if os.path.exists(txt_path):
+            os.remove(txt_path)
 
         ckpt_root_abs = os.path.abspath(ckpt_root)
         target_abs = os.path.abspath(target_dir)
@@ -494,6 +487,57 @@ class BaseRecipe:
             with open(f"{link_path}.txt", "w") as f:
                 f.write(relative_target)
 
+    def _remove_checkpoint_pointer(self, link_name: str) -> None:
+        """Remove a checkpoint pointer symlink and fallback text file."""
+        ckpt_root = self.checkpointer.config.checkpoint_dir
+        link_path = os.path.join(ckpt_root, link_name)
+        if os.path.lexists(link_path):
+            os.remove(link_path)
+        txt_path = f"{link_path}.txt"
+        if os.path.exists(txt_path):
+            os.remove(txt_path)
+
+    def _remove_stale_checkpoint_pointer(self, link_name: str) -> None:
+        """Remove a checkpoint pointer when its target no longer exists."""
+        target = _read_checkpoint_pointer(self.checkpointer.config.checkpoint_dir, link_name)
+        if target is not None and not target.is_dir():
+            self._remove_checkpoint_pointer(link_name)
+
+    def _prune_old_checkpoints(self) -> None:
+        """Prune old checkpoint directories according to checkpoint.max_recent_checkpoints."""
+        max_recent_checkpoints = getattr(self.checkpointer.config, "max_recent_checkpoints", None)
+        if max_recent_checkpoints is None:
+            return
+
+        ckpt_root = Path(self.checkpointer.config.checkpoint_dir)
+        checkpoints = _list_existing_checkpoints(ckpt_root)
+        protected_checkpoints = _find_pointer_protected_checkpoints(ckpt_root, checkpoints)
+        retained_window = set(checkpoints[-max_recent_checkpoints:])
+        checkpoints_to_delete = [
+            checkpoint for checkpoint in checkpoints if checkpoint not in retained_window | protected_checkpoints
+        ]
+        for checkpoint in checkpoints_to_delete:
+            try:
+                shutil.rmtree(checkpoint)
+            except OSError:
+                logger.warning("Failed to prune old checkpoint directory %s", checkpoint, exc_info=True)
+            else:
+                logger.info("Pruned old checkpoint directory %s", checkpoint)
+
+        self._remove_stale_checkpoint_pointer("LATEST")
+        self._remove_stale_checkpoint_pointer("LOWEST_VAL")
+
+    def _initialize_best_val_loss_from_pointer(self, metric_key: str | None) -> None:
+        """Initialize best validation loss from the existing LOWEST_VAL pointer after resume."""
+        if self._best_val_loss != float("inf"):
+            return
+        target = _read_checkpoint_pointer(self.checkpointer.config.checkpoint_dir, "LOWEST_VAL")
+        if target is None or not target.is_dir():
+            return
+        existing_best = _read_checkpoint_metric(target, metric_key)
+        if existing_best is not None:
+            self._best_val_loss = existing_best
+
     def _update_latest_symlink(self, target_dir: str) -> None:
         """
         Create or update a symlink named "latest" under the checkpoint root
@@ -502,12 +546,13 @@ class BaseRecipe:
         """
         self._update_checkpoint_symlink("LATEST", target_dir)
 
-    def _update_best_symlink(self, target_dir: str, val_loss: float) -> None:
+    def _update_best_symlink(self, target_dir: str, val_loss: float, metric_key: str | None = None) -> None:
         """
         Create or update a symlink named "LOWEST_VAL" under the checkpoint root
         that points to the checkpoint with the lowest validation loss.
         Only called on rank 0.
         """
+        self._initialize_best_val_loss_from_pointer(metric_key)
         # Update best checkpoint if this one is better
         if val_loss < self._best_val_loss:
             self._best_val_loss = val_loss
@@ -515,37 +560,6 @@ class BaseRecipe:
             logging.info(
                 f"Updated LOWEST_VAL checkpoint symlink to {os.path.basename(target_dir)} (val_loss={val_loss:.4f})"
             )
-
-    def _finalize_pending_checkpoint(self) -> None:
-        """Wait the final async checkpoint write and flush its deferred symlinks.
-
-        The async ``save_checkpoint`` path defers the ``latest`` / ``best`` symlink
-        update to the *next* save's preamble. After the final checkpoint there is
-        no next save, so the training loop must call this once at the end --
-        otherwise the last async write may be left unfinished and ``latest`` /
-        ``best`` still point at the previous checkpoint. A no-op when checkpointing
-        is disabled or no async save is pending.
-        """
-        checkpointer = getattr(self, "checkpointer", None)
-        if checkpointer is None or not getattr(checkpointer.config, "enabled", False):
-            return
-        checkpointer.async_wait()
-        is_dist_initialized = torch.distributed.is_initialized()
-        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
-        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
-        if prev_pending is not None:
-            if is_rank_0:
-                self._update_latest_symlink(prev_pending)
-            setattr(self, "_last_pending_checkpoint_dir", None)
-            if is_dist_initialized:
-                torch.distributed.barrier()
-        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
-        if prev_best_pending is not None:
-            if is_rank_0 and prev_best_pending.get("val") is not None:
-                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
-            setattr(self, "_last_pending_best_checkpoint_info", None)
-            if is_dist_initialized:
-                torch.distributed.barrier()
 
     def _validate_checkpoint_dir_exists(self, ckpt_dir: str, restore_from: str, is_rank_0: bool) -> None:
         """Validate resolved checkpoint directory exists; raise FileNotFoundError with a helpful message."""
@@ -803,9 +817,38 @@ class BaseRecipe:
             "Validation every steps": step_scheduler.val_every_steps,
             "Max train steps": step_scheduler.max_steps,
         }
+        retention_policy = self._checkpoint_retention_policy_message()
+        if retention_policy is not None:
+            attrs["Checkpoint retention"] = retention_policy
         logging.info("Step scheduler:")
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")
+
+    def _checkpoint_retention_policy_message(self, checkpoint_config=None) -> str | None:
+        """Return the user-facing checkpoint retention policy message, if available."""
+        if checkpoint_config is None:
+            checkpoint_config = getattr(getattr(self, "checkpointer", None), "config", None)
+        if checkpoint_config is None:
+            return None
+        if not getattr(checkpoint_config, "enabled", True):
+            return "inactive because checkpointing is disabled"
+        if not hasattr(checkpoint_config, "max_recent_checkpoints"):
+            return None
+
+        max_recent_checkpoints = checkpoint_config.max_recent_checkpoints
+        if max_recent_checkpoints is None:
+            return "disabled; keeping all checkpoints (checkpoint.max_recent_checkpoints=None)"
+        return (
+            f"keeping the most recent {max_recent_checkpoints} checkpoint(s), "
+            "plus pointer-protected checkpoints "
+            f"(checkpoint.max_recent_checkpoints={max_recent_checkpoints})"
+        )
+
+    def _log_checkpoint_retention_policy(self, checkpoint_config=None) -> None:
+        """Log the checkpoint retention policy without requiring a StepScheduler."""
+        retention_policy = self._checkpoint_retention_policy_message(checkpoint_config)
+        if retention_policy is not None:
+            logging.info("Checkpoint retention: %s", retention_policy)
 
     def _setup_garbage_collection(self, step_scheduler: StepScheduler | None = None) -> None:
         """Initialize manual garbage collection based on step scheduler config."""
@@ -932,58 +975,6 @@ class BaseRecipe:
                 break
         pbar.set_postfix(**postfix)
         pbar.update(1)
-
-
-def _find_latest_checkpoint(checkpoint_dir):
-    """
-    Resolve the most recent checkpoint directory.
-
-    Preference order:
-      1) Valid LATEST symlink or txt file under checkpoint_dir
-      2) Highest step directory under checkpoint_dir matching *step_*
-
-    Returns:
-        Path (or str) of the latest checkpoint directory, or None.
-    """
-    root = Path(checkpoint_dir)
-    if not root.exists():
-        return
-
-    # Try LATEST symlink or txt pointer first
-    latest_link = os.path.join(os.fspath(root), "LATEST")
-    resolved = None
-    if os.path.islink(latest_link):
-        try:
-            resolved = os.readlink(latest_link)
-        except OSError:
-            pass
-    elif os.path.isfile(latest_link + ".txt"):
-        try:
-            with open(latest_link + ".txt", "r") as f:
-                resolved = f.read().strip()
-        except OSError:
-            pass
-
-    if resolved:
-        if not os.path.isabs(resolved):
-            resolved = os.path.abspath(os.path.join(os.fspath(root), resolved))
-        if os.path.isdir(resolved):
-            return resolved
-
-    # Fallback to scanning
-    checkpoint_files = list(root.glob("*step_*"))
-    if not checkpoint_files:
-        return
-
-    def _step_num(path: Path):
-        m = re.search(r"step_(\d+)$", path.stem)
-        return int(m.group(1)) if m else -1
-
-    latest = max(checkpoint_files, key=_step_num)
-    if _step_num(latest) == -1:
-        return
-
-    return latest
 
 
 def _extract_model_signature(cfg: dict) -> dict:

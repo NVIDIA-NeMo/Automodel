@@ -100,6 +100,7 @@ class TestCheckpointingConfig:
         assert cfg.v4_compatible is False
         assert cfg.diffusers_compatible is False
         assert cfg.best_metric_key == "default"
+        assert cfg.max_recent_checkpoints is None
 
     def test_importable_from_checkpointing(self):
         """Verify backward compat: import from checkpointing.py still works."""
@@ -121,6 +122,7 @@ class TestCheckpointingConfig:
         assert cfg.model_repo_id is None
         # model_cache_dir falls back to the HF hub cache when None.
         assert str(cfg.model_cache_dir) == str(hf_constants.HF_HUB_CACHE)
+        assert cfg.max_recent_checkpoints is None
 
     def test_explicit_cache_dir_is_kept(self):
         cfg = CheckpointingConfig(model_cache_dir="/tmp/cache")

@@ -20,6 +20,7 @@ attributes each helper reads are populated -- mirroring the EAGLE recipe tests.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -81,6 +82,126 @@ def test_maybe_save_final_checkpoint(every, save_epoch, gs, should_fire):
     assert len(calls) == (1 if should_fire else 0)
     if should_fire:
         assert calls[0]["is_final_checkpoint"] is True
+
+
+def test_save_checkpoint_applies_retention_after_sync_save(tmp_path):
+    events = []
+    obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    obj.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    obj.checkpointer = SimpleNamespace(
+        config=SimpleNamespace(enabled=True, is_async=False),
+        async_wait=lambda: events.append("wait"),
+        save_model=lambda *args, **kwargs: events.append("save_model"),
+        save_optimizer=lambda *args, **kwargs: events.append("save_optimizer"),
+        save_on_dp_ranks=lambda *args, **kwargs: events.append("save_rng"),
+    )
+    obj._module = lambda: SimpleNamespace(draft_model=SimpleNamespace())
+    obj.tokenizer = None
+    obj.optimizer = SimpleNamespace()
+    obj.lr_scheduler = SimpleNamespace()
+    obj.rng = SimpleNamespace()
+    obj.runtime = SimpleNamespace(global_step=1)
+    obj.cfg = SimpleNamespace(raw_config={})
+    obj.block_size = 4
+    obj.mask_token_id = 99
+    obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
+    obj._complete_pending_checkpoint = lambda: events.append("complete_pending")
+    obj._update_latest_symlink = lambda path: events.append(("latest", path))
+    obj._update_best_symlink = lambda path, val, metric_key=None: events.append(("best", path, val, metric_key))
+    obj._prune_old_checkpoints = lambda: events.append("prune")
+
+    TrainDFlashRecipe.save_checkpoint(obj, epoch=0, step=1, val_loss={"val_loss": 0.25})
+
+    assert events[0:2] == ["wait", "complete_pending"]
+    assert any(event[0] == "best" and event[3] == "val_loss" for event in events if isinstance(event, tuple))
+    assert "prune" in events
+
+
+def test_save_checkpoint_records_async_best_pending_info_without_metric(tmp_path):
+    events = []
+    obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    obj.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    obj.checkpointer = SimpleNamespace(
+        config=SimpleNamespace(enabled=True, is_async=True),
+        async_wait=lambda: events.append("wait"),
+        save_model=lambda *args, **kwargs: events.append("save_model"),
+        save_optimizer=lambda *args, **kwargs: events.append("save_optimizer"),
+        save_on_dp_ranks=lambda *args, **kwargs: events.append("save_rng"),
+    )
+    obj._module = lambda: SimpleNamespace(draft_model=SimpleNamespace())
+    obj.tokenizer = None
+    obj.optimizer = SimpleNamespace()
+    obj.lr_scheduler = SimpleNamespace()
+    obj.rng = SimpleNamespace()
+    obj.runtime = SimpleNamespace(global_step=1)
+    obj.cfg = SimpleNamespace(raw_config={})
+    obj.block_size = 4
+    obj.mask_token_id = 99
+    obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
+    obj._complete_pending_checkpoint = lambda: events.append("complete_pending")
+
+    TrainDFlashRecipe.save_checkpoint(obj, epoch=0, step=1, best_metric_key="val_loss")
+
+    expected_path = str(tmp_path / "epoch_0_step_1")
+    assert events[0:2] == ["wait", "complete_pending"]
+    assert obj._last_pending_checkpoint_dir == expected_path
+    assert obj._last_pending_best_checkpoint_info == {
+        "path": expected_path,
+        "val": None,
+        "metric_key": "val_loss",
+    }
+
+
+def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog):
+    built = []
+
+    class FakeCheckpointer:
+        def __init__(self, config, **kwargs):
+            self.config = config
+            built.append((config, kwargs))
+
+    monkeypatch.setattr(train_dflash, "Checkpointer", FakeCheckpointer)
+    obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    obj.cfg = SimpleNamespace(
+        get=lambda key, default=None: {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1}
+        if key == "checkpoint"
+        else default
+    )
+    obj.output_dir = tmp_path
+    obj.draft_model = SimpleNamespace(state_dict=lambda: {"weight": torch.zeros(1)})
+    obj.dp_mesh = None
+
+    with caplog.at_level(logging.INFO):
+        TrainDFlashRecipe._build_checkpointer(obj, "target/repo")
+
+    assert built
+    assert "Checkpoint retention: keeping the most recent 1 checkpoint(s)" in caplog.text
+
+
+def test_run_train_validation_loop_finalizes_before_close():
+    events = []
+
+    class FakePbar:
+        def close(self):
+            events.append("pbar_close")
+
+    obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    obj.trainer_module = SimpleNamespace(train=lambda: None)
+    obj.num_epochs = 1
+    obj._resume_epoch = 0
+    obj.dist_env = SimpleNamespace(is_main=False)
+    obj.total_optim_steps = 1
+    obj.runtime = SimpleNamespace(global_step=1)
+    obj.train_dataloader = []
+    obj._make_progress_bar = lambda **kwargs: FakePbar()
+    obj._run_eval = lambda: None
+    obj._maybe_save_final_checkpoint = lambda completed_epochs: events.append(("final", completed_epochs)) or True
+    obj._finalize_pending_checkpoint = lambda: events.append("finalize")
+    obj.checkpointer = SimpleNamespace(close=lambda: events.append("close"))
+
+    TrainDFlashRecipe.run_train_validation_loop(obj)
+
+    assert events == [("final", 1), "finalize", "close", "pbar_close"]
 
 
 def test_resolve_mask_token_id_prefers_explicit():
