@@ -12,10 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# LoRA fine-tuning recipe for deepseek-ai/DeepSeek-V4-Flash on HellaSwag.
-# LoRA target: 4 nodes x 8 H100-80GB = 32 GPUs, PP=1 EP=32 DP=32.
-# Estimate: routed-expert bf16 weights are ~550 GB; EP=32 gives 8 routed
-# experts/rank and avoids full base optimizer state.
+# LoRA fine-tuning of deepseek-ai/DeepSeek-V4-Flash on HellaSwag with the frozen
+# routed experts kept resident in mxfp4 (fp4-e2m1 + e8m0 block scales) and
+# dequantized on the fly in the grouped-GEMM forward/backward.
+#
+# Only the experts are quantized; every other weight (MLA attention, dense MLP,
+# embeddings, MTP, lm_head) stays bf16. The routed experts are ~90%+ of the
+# parameters, so packing them to ~4 bits cuts steady-state base-weight memory by
+# roughly 4x relative to the bf16 LoRA recipe.
+#
+# v1 constraint: mxfp4 experts require the torch_mm GroupedExperts backend, so
+# this recipe uses dispatcher=torch (NOT deepep). DeepEP + mxfp4 is a follow-up.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -35,10 +42,13 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 32
+  # Single node, 8x H200: ep_size must divide dp_size*cp_size (= world_size here).
+  ep_size: 8
 
   sequence_parallel: false
-  activation_checkpointing: false
+  # Recommended on: the 43-layer activation footprint, not the (now-packed) expert
+  # weights, is the steady-state pressure once experts are mxfp4.
+  activation_checkpointing: true
 
   moe:
     reshard_after_forward: false
@@ -55,6 +65,11 @@ model:
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
     name_or_path: deepseek-ai/DeepSeek-V4-Flash
     num_nextn_predict_layers: 0
+    # Required by FusedLinearCrossEntropy: the trainer calls the model with
+    # logits_to_keep=1 and reads out.hidden_states to apply the fused lm_head + CE
+    # without materializing full [seq, vocab] logits. The forward only populates
+    # hidden_states when config.output_hidden_states is set.
+    output_hidden_states: true
   trust_remote_code: false
   load_base_model: true
   backend:
@@ -63,7 +78,8 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    dispatcher: hybridep
+    # mxfp4 experts run on the torch_mm grouped-GEMM path (DeepEP not yet supported).
+    dispatcher: torch
     experts: torch_mm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -71,20 +87,43 @@ model:
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules:
+    # attention
     - "*wq_a"
     - "*wq_b"
     - "*wkv"
     - "*wo_b"
+    # routed experts: GroupedExperts -> GroupedExpertsLoRAMXFP4
+    # (frozen base stays mxfp4-packed; only the LoRA adapters train)
+    - "*mlp.experts"
+    # shared experts: dense MLP nn.Linear (base stays bf16, LoRA adapters bf16)
+    - "*shared_experts.gate_proj"
+    - "*shared_experts.up_proj"
+    - "*shared_experts.down_proj"
   dim: 8
   alpha: 32
   use_triton: True
+  # fp32 LoRA adapters: fp32 master weights + fp32 AdamW state for stability (small-update
+  # swamping), while FSDP2's param_dtype=bf16 still runs the adapter matmuls in bf16. Adapters
+  # are tiny so the fp32 optimizer-state cost is negligible. Matches HF PEFT's default.
+  lora_dtype: float32
+  # Keep the frozen routed experts packed as mxfp4 and dequantize on the fly.
+  expert_weight_format: mxfp4
 
 checkpoint:
   enabled: false
+  # The DSV4-Flash checkpoint is quantized: fp4 routed experts + fp8 non-expert
+  # projections. This enables quant-aware loading -- the fp8 non-expert weights are
+  # dequantized to bf16, while the fp4 experts are passed through packed (mxfp4,
+  # never materialized in bf16). Required to load this checkpoint.
   dequantize_base_checkpoint: true
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  # Fused linear cross-entropy (Apple cut_cross_entropy): applies the lm_head + CE without
+  # materializing the [seq, vocab=129280] logits, removing the ~16 GiB fp32 logits spike and
+  # raising the single-node context ceiling. Uses the DSV4 forward's logits_to_keep /
+  # hidden_states path; loss stays fp32-quality (cut_cross_entropy accumulates the logsumexp in
+  # fp32 internally). Swap back to masked_ce.MaskedCrossEntropy if cut_cross_entropy is unavailable.
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -127,9 +166,3 @@ optimizer:
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0.1
-
-ci:
-  # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
-  recipe_owner: hemildesai
-  time: "00:20:00"
-  nodes: 4

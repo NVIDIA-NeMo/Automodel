@@ -143,8 +143,13 @@ class ExpertParallel(ParallelStyle):
         assert device_mesh.ndim == 1
 
         for name, param in module.named_parameters(recurse=False):
-            dist_param = nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]))
-            dist_param.requires_grad = param.requires_grad
+            # Pass requires_grad at construction: nn.Parameter defaults to
+            # requires_grad=True, which raises for non-floating dtypes (e.g. the
+            # int8 / e8m0 packed tensors of mxfp4-resident experts) before a
+            # later assignment could fix it.
+            dist_param = nn.Parameter(
+                distribute_tensor(param, device_mesh, [Shard(0)]), requires_grad=param.requires_grad
+            )
             module.register_parameter(name, dist_param)
 
         if isinstance(module, GroupedExpertsDeepEP):

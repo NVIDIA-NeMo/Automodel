@@ -742,8 +742,15 @@ class GroupedExpertsDeepEP(nn.Module):
             config=config,
             ep_group=ep_group,
         )
-        if self.dispatcher_backend == "deepep":
-            self._init_deepep_buffer(ep_group)
+        # NOTE: previously called `self._init_deepep_buffer(ep_group)` here to
+        # eagerly allocate the DeepEP NVSHMEM buffer at model construction
+        # (introduced in #2076, e42584e3). On single-node EP=8 ep_shard=1
+        # DSv4-Flash, the eager allocation collides with the ~135 GB load-time
+        # peak and OOMs at `_aggregate_experts` torch.stack. Revert to the
+        # original lazy allocation in FusedDispatch.forward (fused_a2a.py:136
+        # via the global `_buffer` cache). Both code paths produce the same
+        # buffer; only the *timing* differs.
+        # _init_deepep_buffer remains defined below for explicit callers.
 
     def _init_deepep_buffer(self, ep_group: dist.ProcessGroup) -> None:
         """Initialize DeepEP communication buffers before activation checkpointing."""
@@ -1364,6 +1371,11 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
             return tensor.to_local()
         else:
             return tensor
+
+    # mxfp4-resident experts hold packed base weights (no gate_and_up_projs /
+    # down_projs); those are filled from the checkpoint, nothing to init here.
+    if getattr(module, "_mxfp4_resident", False):
+        return
 
     with torch.device(buffer_device):
         if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP)):

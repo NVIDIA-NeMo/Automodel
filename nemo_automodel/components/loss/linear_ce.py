@@ -156,6 +156,13 @@ class FusedLinearCrossEntropy(nn.Module):
         if self.logit_softcapping == 0:
             self.logit_softcapping = None
 
+        # cut_cross_entropy fuses e @ c.T in the input precision (with fp32 logsumexp
+        # accumulation internally), so e (hidden_states) and c (lm_weight) must share a
+        # dtype. Cast the classifier weight to the activation dtype to support models whose
+        # lm_head is kept in fp32 while activations are bf16 (e.g. DeepSeek V4).
+        if lm_weight.dtype != hidden_states.dtype:
+            lm_weight = lm_weight.to(hidden_states.dtype)
+
         # Compute loss with shift=False to match PyTorch behavior
         # Set filter_eps=None to avoid any token filtering
         loss = linear_cross_entropy(
