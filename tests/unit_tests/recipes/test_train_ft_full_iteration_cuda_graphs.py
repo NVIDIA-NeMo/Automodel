@@ -39,6 +39,10 @@ class _GraphManager:
         self.is_captured = False
         self.completed_warmups = 0
 
+    def close(self):
+        self.events.append("graph-close")
+        self.is_captured = False
+
 
 class _Dispatcher:
     def __init__(self, events):
@@ -53,6 +57,28 @@ class _Dispatcher:
 
     def reset_runtime_state(self):
         self.events.append("runtime-state-reset")
+
+
+class _CacheGraphManager:
+    def __init__(self, events):
+        self.events = events
+        self.is_captured = True
+        self.managed_owner_ids = frozenset({1, 2})
+        self.capture_count = 1
+        self.replay_count = 4
+        self.eager_refresh_count = 2
+
+    def run(self, *, capture_allowed):
+        self.events.append(("cache-refresh", capture_allowed))
+        return 2
+
+    def reset(self):
+        self.events.append("cache-graph-reset")
+        self.is_captured = False
+
+    def close(self):
+        self.events.append("cache-graph-close")
+        self.is_captured = False
 
 
 def test_full_iteration_setup_allows_checkpointing_but_disables_paged_stash(monkeypatch):
@@ -182,6 +208,14 @@ def test_full_iteration_execution_error_is_not_masked_by_exceptional_cleanup(mon
 
     broken_manager = BrokenGraphManager([], events)
     recipe = _recipe(broken_manager, events)
+
+    class BrokenCacheGraphManager(_CacheGraphManager):
+        def reset(self):
+            events.append("cache-graph-reset-attempt")
+            raise RuntimeError("secondary cache graph reset failure")
+
+    broken_cache_manager = BrokenCacheGraphManager(events)
+    recipe.te_ops_mxfp8_cache_refresh_cuda_graph_manager = broken_cache_manager
     recipe._full_iteration_paged_stash_enabled = True
     recipe._release_full_iteration_backend_handles = lambda: (_ for _ in ()).throw(
         RuntimeError("secondary handle cleanup failure")
@@ -199,7 +233,10 @@ def test_full_iteration_execution_error_is_not_masked_by_exceptional_cleanup(mon
         )
 
     assert "graph-reset-attempt" in events
+    assert "cache-graph-reset-attempt" in events
     assert "unsafe-stash-release" not in events
+    assert recipe._abandoned_te_ops_mxfp8_cache_refresh_cuda_graph_manager is broken_cache_manager
+    assert recipe.te_ops_mxfp8_cache_refresh_cuda_graph_manager is None
     assert recipe._full_iteration_abandoned_graph_manager is broken_manager
     assert recipe.full_iteration_cuda_graph_manager is None
 
@@ -208,6 +245,7 @@ def test_hybridep_overflow_discards_graph_gradients_and_reruns_same_batches_drop
     events = []
     manager = _GraphManager([torch.tensor(-1.0)], events)
     recipe = _recipe(manager, events)
+    recipe.te_ops_mxfp8_cache_refresh_cuda_graph_manager = _CacheGraphManager(events)
     dispatcher = _Dispatcher(events)
     recipe._full_iteration_dispatchers = (dispatcher,)
     recipe._collect_full_iteration_overflow = lambda: (4, 0)
@@ -238,6 +276,7 @@ def test_hybridep_overflow_discards_graph_gradients_and_reruns_same_batches_drop
         "overflow-reset-all",
         ("graph", batches),
         "cuda-synchronize",
+        "cache-graph-reset",
         "graph-reset",
         "release-handles",
         "runtime-state-reset",
@@ -318,6 +357,7 @@ def test_delayed_qat_toggle_resets_full_iteration_graph_before_the_next_step():
     recipe._qat_enable_after = 3
     recipe._qat_enable_fn = lambda model: events.append(("enable-qat", model))
     recipe.full_iteration_cuda_graph_manager = manager
+    recipe.te_ops_mxfp8_cache_refresh_cuda_graph_manager = _CacheGraphManager(events)
     recipe._release_full_iteration_backend_handles = lambda: events.append("release-handles")
 
     recipe._enable_qat_if_delayed(2)
@@ -326,11 +366,35 @@ def test_delayed_qat_toggle_resets_full_iteration_graph_before_the_next_step():
     recipe._enable_qat_if_delayed(3)
 
     assert events == [
+        "cache-graph-reset",
         ("enable-qat", recipe.model_parts[0]),
         "graph-reset",
         "release-handles",
     ]
     assert recipe._qat_enable_after is None
+
+
+@pytest.mark.parametrize("full_captured", [False, True])
+def test_cache_refresh_graph_is_allowed_only_after_full_iteration_capture(full_captured):
+    events = []
+    recipe = object.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.full_iteration_cuda_graph_manager = SimpleNamespace(is_captured=full_captured)
+    recipe.te_ops_mxfp8_cache_refresh_cuda_graph_manager = _CacheGraphManager(events)
+
+    assert recipe._advance_te_ops_mxfp8_cache_refresh() == 2
+    assert events == [("cache-refresh", full_captured)]
+
+
+def test_full_iteration_teardown_closes_cache_graph_before_forward_backward_graph():
+    events = []
+    recipe = _recipe(_GraphManager([], events), events)
+    recipe.te_ops_mxfp8_cache_refresh_cuda_graph_manager = _CacheGraphManager(events)
+
+    recipe._close_full_iteration_cuda_graphs()
+
+    assert events[:3] == ["cache-graph-close", "graph-close", "release-handles"]
+    assert recipe.te_ops_mxfp8_cache_refresh_cuda_graph_manager is None
+    assert recipe.full_iteration_cuda_graph_manager is None
 
 
 def test_full_iteration_diagnostics_are_disabled_for_an_unconfigured_recipe():
@@ -379,4 +443,20 @@ def test_full_iteration_diagnostics_report_paged_stash_stream_state(monkeypatch)
         "stream_overlap": True,
         "transfer_stream_status": "idle",
         "backward_schedule_depth": 0,
+    }
+
+
+def test_full_iteration_diagnostics_report_cache_refresh_graph():
+    events = []
+    recipe = _recipe(_GraphManager([torch.tensor(1.0)], events), events)
+    recipe.te_ops_mxfp8_cache_refresh_cuda_graph_manager = _CacheGraphManager(events)
+
+    diagnostics = recipe._full_iteration_cuda_graph_diagnostics()
+
+    assert diagnostics["mxfp8_cache_refresh_graph"] == {
+        "captured": True,
+        "managed_owners": 2,
+        "captures": 1,
+        "replays": 4,
+        "eager_refreshes": 2,
     }

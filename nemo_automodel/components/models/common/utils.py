@@ -224,6 +224,9 @@ class BackendConfig:
             post-step refresh. The optimized path requires EP>1 with complete local
             experts (``ep_shard=1``); an additional expert FSDP shard transparently
             uses TE's eager weight quantization instead.
+        te_ops_mxfp8_weight_cache_cuda_graph: Capture only the fixed-address
+            post-optimizer MXFP8 cache refresh kernels. This requires the full-iteration
+            graph and leaves FusedAdam, gradient clipping, and optimizer state eager.
         te_ops_unstacked_parameters: Store each TE-ops expert projection in native
             ``weight0`` ... ``weightN`` parameters instead of one stacked owner.
             This is an experimental performance A/B for TE's discrete-weight CuTe
@@ -300,6 +303,7 @@ class BackendConfig:
     moe_paged_stash_buffer_size_factor_cuda: float = 1.10
     moe_paged_stash_buffer_size_factor_cpu: float = 0.0
     te_ops_mxfp8_weight_cache: bool = False
+    te_ops_mxfp8_weight_cache_cuda_graph: bool = False
     te_ops_unstacked_parameters: bool = False
 
     def __post_init__(self):
@@ -426,6 +430,11 @@ class BackendConfig:
             is_mxfp8 = recipe == "mxfp8" or (callable(getattr(recipe, "mxfp8", None)) and recipe.mxfp8())
             if not is_mxfp8:
                 raise ValueError("te_ops_mxfp8_weight_cache requires te_fp8.recipe='mxfp8'")
+        if self.te_ops_mxfp8_weight_cache_cuda_graph:
+            if not self.te_ops_mxfp8_weight_cache:
+                raise ValueError("te_ops_mxfp8_weight_cache_cuda_graph requires te_ops_mxfp8_weight_cache=True")
+            if not self.full_iteration_cuda_graph:
+                raise ValueError("te_ops_mxfp8_weight_cache_cuda_graph requires full_iteration_cuda_graph=True")
         if self.te_ops_unstacked_parameters:
             if self.experts != "te_ops":
                 raise ValueError("te_ops_unstacked_parameters requires experts='te_ops'")

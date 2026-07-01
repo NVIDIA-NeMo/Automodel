@@ -1570,6 +1570,39 @@ class _TeOpsMXFP8WeightCache:
         """Mark cached compute weights stale without launching quantization."""
         self.invalidated = True
 
+    def _update_preallocated_members(self, owner: torch.Tensor) -> None:
+        """Launch in-place quantization into existing member storage."""
+        assert self.tensor is not None
+        owner_members = owner.unbind(0)
+        if len(owner_members) != len(self.members):
+            raise RuntimeError(
+                f"TE-ops MXFP8 cache has {len(self.members)} members for {len(owner_members)} owner slices"
+            )
+        with torch.no_grad():
+            for source, destination in zip(owner_members, self.members):
+                self.refresh_quantizer.update_quantized(source, destination)
+
+    def capture_fixed_address_refresh(self, owner: torch.Tensor) -> None:
+        """Launch only fixed-address refresh kernels for CUDA graph capture."""
+        self._validate_owner(owner)
+        if self.mode != self.FIXED_ADDRESS_MODE:
+            raise RuntimeError(f"TE-ops MXFP8 cache-refresh CUDA graphs require fixed_address mode, got {self.mode!r}")
+        if self.tensor is None or not self.has_stable_storage_identity():
+            raise RuntimeError("TE-ops MXFP8 cache-refresh CUDA graphs require stable preallocated storage")
+        if self.tensor.requires_grad != owner.requires_grad:
+            raise RuntimeError("TE-ops MXFP8 cache owner and destination requires_grad state changed")
+        self._update_preallocated_members(owner)
+
+    def mark_fixed_address_graph_replayed(self, owner: torch.Tensor) -> None:
+        """Advance generation and diagnostics after one actual graph launch."""
+        self._validate_owner(owner)
+        if self.mode != self.FIXED_ADDRESS_MODE or not self.has_stable_storage_identity():
+            raise RuntimeError("TE-ops MXFP8 cache changed while its refresh CUDA graph was live")
+        self.owner_key = self._owner_key(owner)
+        self.invalidated = False
+        self.refresh_count += 1
+        self.member_update_count += len(self.members)
+
     def refresh(self, owner: torch.Tensor, *, force: bool = False) -> bool:
         """Refresh the selected MXFP8 representation for a new owner generation."""
         self._validate_owner(owner)
@@ -1600,14 +1633,7 @@ class _TeOpsMXFP8WeightCache:
             assert self.tensor is not None
             if self.tensor.requires_grad != owner.requires_grad:
                 self.tensor.requires_grad_(owner.requires_grad)
-            owner_members = owner.unbind(0)
-            if len(owner_members) != len(self.members):
-                raise RuntimeError(
-                    f"TE-ops MXFP8 cache has {len(self.members)} members for {len(owner_members)} owner slices"
-                )
-            with torch.no_grad():
-                for source, destination in zip(owner_members, self.members):
-                    self.refresh_quantizer.update_quantized(source, destination)
+            self._update_preallocated_members(owner)
             self.member_update_count += len(self.members)
         self.owner_key = owner_key
         self.invalidated = False
@@ -1872,6 +1898,56 @@ def _get_stacked_te_ops_grouped_linear_class() -> type[nn.Module]:
             if refreshed:
                 self.__dict__["_mxfp8_weight_cache_fallback_reason"] = ""
             return refreshed
+
+        def mxfp8_weight_cache_graph_signature(self) -> tuple[Any, ...]:
+            """Return immutable owner and destination identities for graph replay."""
+            if not self.__dict__.get("_mxfp8_weight_cache_enabled", False):
+                raise RuntimeError("TE-ops MXFP8 weight cache is disabled")
+            mode = self.__dict__.get("_mxfp8_weight_cache_mode")
+            if mode != _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE:
+                raise RuntimeError(f"TE-ops MXFP8 cache-refresh CUDA graphs require fixed_address mode, got {mode!r}")
+            registered_owner = self._parameters["_stacked_weight"]
+            owner = self._owner_local_tensor(
+                "_stacked_weight",
+                (self.num_groups, self.out_features, self.in_features),
+            )
+            cache_state = self.__dict__.get("_mxfp8_weight_cache")
+            if cache_state is None or cache_state.mode != _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE:
+                raise RuntimeError("TE-ops MXFP8 fixed-address cache has not been materialized")
+            if not cache_state.has_stable_storage_identity():
+                raise RuntimeError("TE-ops MXFP8 fixed-address cache storage identity changed")
+            return (
+                id(self),
+                id(cache_state),
+                id(registered_owner),
+                owner.data_ptr(),
+                tuple(owner.shape),
+                tuple(owner.stride()),
+                owner.dtype,
+                owner.device,
+                owner.requires_grad,
+                cache_state._storage_identity(),
+            )
+
+        def capture_mxfp8_weight_cache_refresh(self) -> None:
+            """Launch the fixed-address refresh kernels without Python bookkeeping."""
+            self.mxfp8_weight_cache_graph_signature()
+            owner = self._owner_local_tensor(
+                "_stacked_weight",
+                (self.num_groups, self.out_features, self.in_features),
+            )
+            self.__dict__["_mxfp8_weight_cache"].capture_fixed_address_refresh(owner)
+
+        def mark_mxfp8_weight_cache_refresh_graph_replayed(self) -> bool:
+            """Mark one graph refresh current for eager forwards and diagnostics."""
+            self.mxfp8_weight_cache_graph_signature()
+            owner = self._owner_local_tensor(
+                "_stacked_weight",
+                (self.num_groups, self.out_features, self.in_features),
+            )
+            self.__dict__["_mxfp8_weight_cache"].mark_fixed_address_graph_replayed(owner)
+            self.__dict__["_mxfp8_weight_cache_optimizer_refreshes"] += 1
+            return True
 
         def invalidate_mxfp8_weight_cache(self) -> bool:
             """Mark a lazy graph-off cache stale at an optimizer boundary."""
@@ -2926,20 +3002,10 @@ class GroupedExpertsTeOps(GroupedExpertsTE):
         self.refresh_mxfp8_weight_cache_if_needed(force=True)
 
 
-def register_te_ops_mxfp8_weight_cache_optimizer_hooks(
+def _collect_te_ops_mxfp8_weight_cache_linears(
     model_parts: Any,
-    optimizers: Any,
-) -> tuple[Any, ...]:
-    """Advance enabled compute caches after each owning optimizer step.
-
-    Native fused optimizers may update ``parameter.data`` without incrementing
-    the registered owner's PyTorch version counter. A post-step hook is therefore
-    the generation boundary for cache correctness. Graph-off grouped caches are
-    invalidated without launching quantization and refresh lazily on the first
-    subsequent expert forward. Fixed-address partial-graph caches refresh in the
-    hook on the current CUDA stream so replay always observes current contents.
-    """
-
+) -> dict[int, tuple[nn.Module, nn.Parameter]]:
+    """Collect each enabled cached projection and its registered owner once."""
     roots = (model_parts,) if isinstance(model_parts, nn.Module) else tuple(model_parts)
     cache_linears: dict[int, tuple[nn.Module, nn.Parameter]] = {}
     seen_experts: set[int] = set()
@@ -2955,6 +3021,124 @@ def register_te_ops_mxfp8_weight_cache_optimizer_hooks(
                 owner = linear._parameters.get("_stacked_weight")
                 if owner is not None:
                     cache_linears[id(linear)] = (linear, owner)
+    return cache_linears
+
+
+class TeOpsMXFP8WeightCacheRefreshTarget:
+    """Fixed-address cached projections refreshed after their owning optimizer."""
+
+    def __init__(
+        self,
+        linears: tuple[nn.Module, ...],
+        owners: tuple[nn.Parameter, ...],
+        optimizer: torch.optim.Optimizer,
+    ) -> None:
+        if not linears or len(linears) != len(owners):
+            raise ValueError("MXFP8 cache-refresh target requires matching non-empty linears and owners")
+        self._linears = linears
+        self._owners = owners
+        self.optimizer = optimizer
+        self._managed_owner_ids = frozenset(id(owner) for owner in owners)
+
+    @property
+    def managed_owner_ids(self) -> frozenset[int]:
+        """Return owner identities excluded from ordinary optimizer hooks."""
+        return self._managed_owner_ids
+
+    def graph_signature(self) -> tuple[Any, ...]:
+        """Return every fixed owner and cache destination identity."""
+        return tuple(linear.mxfp8_weight_cache_graph_signature() for linear in self._linears)
+
+    def eager_refresh(self) -> int:
+        """Refresh synchronously while the forward/backward graph is not ready."""
+        refreshed = 0
+        for linear in self._linears:
+            if linear.refresh_mxfp8_weight_cache_if_needed(force=True):
+                linear.__dict__["_mxfp8_weight_cache_optimizer_refreshes"] += 1
+                refreshed += 1
+        return refreshed
+
+    def capture_refresh(self) -> None:
+        """Launch only fixed-address quantization kernels."""
+        for linear in self._linears:
+            linear.capture_mxfp8_weight_cache_refresh()
+
+    def mark_replayed(self) -> int:
+        """Make every replayed cache generation visible to eager forwards."""
+        for linear in self._linears:
+            linear.mark_mxfp8_weight_cache_refresh_graph_replayed()
+        return len(self._linears)
+
+
+def build_te_ops_mxfp8_weight_cache_refresh_target(
+    model_parts: Any,
+    optimizers: Any,
+) -> TeOpsMXFP8WeightCacheRefreshTarget | None:
+    """Build an optimizer-owned target for fixed-address caches only.
+
+    EP-sharded caches are disabled before this point and therefore produce no
+    target. Lazy cache modes remain on their ordinary post-step hooks.
+    """
+    cache_linears = _collect_te_ops_mxfp8_weight_cache_linears(model_parts)
+    fixed_linears = []
+    fixed_owners = []
+    for linear, owner in cache_linears.values():
+        mode = linear.__dict__.get("_mxfp8_weight_cache_mode")
+        if mode != _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE or not owner.requires_grad:
+            continue
+        fixed_linears.append(linear)
+        fixed_owners.append(owner)
+    if not fixed_linears:
+        return None
+
+    optimizer_list = (optimizers,) if isinstance(optimizers, torch.optim.Optimizer) else tuple(optimizers)
+    optimizer_param_ids = [
+        {id(parameter) for group in optimizer.param_groups for parameter in group.get("params", ())}
+        for optimizer in optimizer_list
+    ]
+    owner_optimizer_indices = []
+    for owner in fixed_owners:
+        owner_indices = [
+            optimizer_index
+            for optimizer_index, parameter_ids in enumerate(optimizer_param_ids)
+            if id(owner) in parameter_ids
+        ]
+        if len(owner_indices) != 1:
+            raise RuntimeError(
+                "Fixed-address TE-ops MXFP8 cache owner must belong to exactly one optimizer, "
+                f"got {len(owner_indices)} owners for shape {tuple(owner.shape)}"
+            )
+        owner_optimizer_indices.extend(owner_indices)
+    if len(set(owner_optimizer_indices)) != 1:
+        raise RuntimeError("One MXFP8 cache-refresh CUDA graph cannot span multiple optimizers")
+
+    optimizer = optimizer_list[owner_optimizer_indices[0]]
+    return TeOpsMXFP8WeightCacheRefreshTarget(tuple(fixed_linears), tuple(fixed_owners), optimizer)
+
+
+def register_te_ops_mxfp8_weight_cache_optimizer_hooks(
+    model_parts: Any,
+    optimizers: Any,
+    *,
+    excluded_owner_ids: frozenset[int] = frozenset(),
+) -> tuple[Any, ...]:
+    """Advance enabled compute caches after each owning optimizer step.
+
+    Native fused optimizers may update ``parameter.data`` without incrementing
+    the registered owner's PyTorch version counter. A post-step hook is therefore
+    the generation boundary for cache correctness. Graph-off grouped caches are
+    invalidated without launching quantization and refresh lazily on the first
+    subsequent expert forward. Fixed-address partial-graph caches refresh in the
+    hook on the current CUDA stream so replay always observes current contents.
+    """
+
+    if not isinstance(excluded_owner_ids, frozenset):
+        raise TypeError("excluded_owner_ids must be a frozenset")
+    cache_linears = {
+        linear_id: (linear, owner)
+        for linear_id, (linear, owner) in _collect_te_ops_mxfp8_weight_cache_linears(model_parts).items()
+        if id(owner) not in excluded_owner_ids
+    }
 
     if isinstance(optimizers, torch.optim.Optimizer):
         optimizer_list = (optimizers,)

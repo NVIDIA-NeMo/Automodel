@@ -1724,6 +1724,113 @@ def test_te_ops_mxfp8_cache_ep2_refreshes_once_ac_recompute_and_keeps_storage(mo
     assert cache._storage_identity() == initial_identity
 
 
+def test_te_ops_mxfp8_fixed_cache_graph_refresh_tracks_changed_weights_and_python_generation(monkeypatch):
+    """Captured kernels and replay bookkeeping match repeated eager force refreshes."""
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.moe.experts import _TeOpsMXFP8WeightCache
+
+    _install_te_216_mxfp8_cache_stubs(monkeypatch)
+
+    class FakeOwner:
+        def __init__(self):
+            self.shape = (2, 32, 32)
+            self.device = SimpleNamespace(type="cuda")
+            self.dtype = torch.bfloat16
+            self.requires_grad = True
+            self._version = 1
+            self.values = (2, 4)
+
+        def data_ptr(self):
+            return 9100
+
+        def is_contiguous(self):
+            return True
+
+        def unbind(self, dim):
+            assert dim == 0
+            return tuple(SimpleNamespace(value=value) for value in self.values)
+
+    graph_owner = FakeOwner()
+    eager_owner = FakeOwner()
+    graph_cache = _TeOpsMXFP8WeightCache(
+        graph_owner,
+        num_groups=2,
+        out_features=32,
+        in_features=32,
+    )
+    eager_cache = _TeOpsMXFP8WeightCache(
+        eager_owner,
+        num_groups=2,
+        out_features=32,
+        in_features=32,
+    )
+    graph_identity = graph_cache._storage_identity()
+
+    for generation, values in enumerate(((7, 9), (11, 13), (17, 19)), start=2):
+        graph_owner.values = values
+        graph_owner._version = generation
+        eager_owner.values = values
+        eager_owner._version = generation
+
+        refreshes_before = graph_cache.refresh_count
+        member_updates_before = graph_cache.member_update_count
+        graph_cache.capture_fixed_address_refresh(graph_owner)
+        # Stream capture launches kernels but must not pretend they executed.
+        assert graph_cache.refresh_count == refreshes_before
+        assert graph_cache.member_update_count == member_updates_before
+        graph_cache.mark_fixed_address_graph_replayed(graph_owner)
+        assert eager_cache.refresh(eager_owner, force=True)
+
+        assert [member.value for member in graph_cache.members] == [member.value for member in eager_cache.members]
+        assert graph_cache.is_current(graph_owner)
+        assert graph_cache.refresh_count == eager_cache.refresh_count
+        assert graph_cache.member_update_count == eager_cache.member_update_count
+        assert graph_cache._storage_identity() == graph_identity
+
+
+@pytest.mark.parametrize("mode", ["group_quantize", "gemm_ready_fixed"])
+def test_te_ops_mxfp8_cache_refresh_graph_rejects_lazy_modes(monkeypatch, mode):
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.moe.experts import _TeOpsMXFP8WeightCache
+
+    _install_te_216_mxfp8_cache_stubs(monkeypatch)
+
+    class FakeOwner:
+        shape = (2, 32, 32)
+        device = SimpleNamespace(type="cuda")
+        dtype = torch.bfloat16
+        requires_grad = True
+        _version = 1
+        values = (2, 4)
+
+        def data_ptr(self):
+            return 9200
+
+        def is_contiguous(self):
+            return True
+
+        def unbind(self, dim):
+            assert dim == 0
+            return tuple(SimpleNamespace(value=value) for value in self.values)
+
+        def view(self, *_shape):
+            return self
+
+    owner = FakeOwner()
+    cache = _TeOpsMXFP8WeightCache(
+        owner,
+        num_groups=2,
+        out_features=32,
+        in_features=32,
+        mode=mode,
+    )
+
+    with pytest.raises(RuntimeError, match="require fixed_address mode"):
+        cache.capture_fixed_address_refresh(owner)
+
+
 def test_te_ops_mxfp8_gemm_ready_fixed_cache_is_lazy_stable_and_padded(monkeypatch):
     """Graph-off default keeps GEMM-ready buffers stable across lazy refreshes."""
     from types import SimpleNamespace
@@ -2225,6 +2332,65 @@ def test_te_ops_mxfp8_weight_cache_optimizer_hook_lazily_invalidates_graph_off_c
         assert linear.invalidate_calls == 2
 
 
+def test_te_ops_mxfp8_fixed_cache_graph_target_excludes_only_owned_fixed_hooks():
+    from nemo_automodel.components.moe.experts import (
+        GroupedExpertsTeOps,
+        _TeOpsMXFP8WeightCache,
+        build_te_ops_mxfp8_weight_cache_refresh_target,
+        register_te_ops_mxfp8_weight_cache_optimizer_hooks,
+    )
+
+    class FakeFixedLinear(torch.nn.Module):
+        def __init__(self, pointer):
+            super().__init__()
+            self.register_parameter("_stacked_weight", torch.nn.Parameter(torch.ones(2, 2)))
+            self.__dict__["_mxfp8_weight_cache_mode"] = _TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE
+            self.__dict__["_mxfp8_weight_cache_optimizer_refreshes"] = 0
+            self.pointer = pointer
+            self.events = []
+
+        def mxfp8_weight_cache_graph_signature(self):
+            return (self.pointer,)
+
+        def refresh_mxfp8_weight_cache_if_needed(self, *, force=False):
+            self.events.append(("eager", force))
+            return True
+
+        def capture_mxfp8_weight_cache_refresh(self):
+            self.events.append("capture")
+
+        def mark_mxfp8_weight_cache_refresh_graph_replayed(self):
+            self.events.append("mark")
+            self.__dict__["_mxfp8_weight_cache_optimizer_refreshes"] += 1
+
+    experts = GroupedExpertsTeOps.__new__(GroupedExpertsTeOps)
+    torch.nn.Module.__init__(experts)
+    experts._te_ops_mxfp8_weight_cache_enabled = True
+    experts.gate_up_linear = FakeFixedLinear(101)
+    experts.down_linear = FakeFixedLinear(103)
+    optimizer = torch.optim.SGD(experts.parameters(), lr=0.1)
+
+    target = build_te_ops_mxfp8_weight_cache_refresh_target(experts, optimizer)
+    assert target is not None
+    assert target.managed_owner_ids == frozenset(id(parameter) for parameter in experts.parameters())
+    assert target.graph_signature() == ((101,), (103,))
+    assert target.eager_refresh() == 2
+    target.capture_refresh()
+    assert target.mark_replayed() == 2
+    assert experts.gate_up_linear.events == [("eager", True), "capture", "mark"]
+    assert experts.down_linear.events == [("eager", True), "capture", "mark"]
+
+    handles = register_te_ops_mxfp8_weight_cache_optimizer_hooks(
+        experts,
+        optimizer,
+        excluded_owner_ids=target.managed_owner_ids,
+    )
+    assert handles == ()
+    optimizer.step()
+    assert experts.gate_up_linear.events == [("eager", True), "capture", "mark"]
+    assert experts.down_linear.events == [("eager", True), "capture", "mark"]
+
+
 def test_te_ops_mxfp8_weight_cache_optimizer_hook_synchronously_refreshes_fixed_address_cache():
     from nemo_automodel.components.moe.experts import (
         GroupedExpertsTeOps,
@@ -2264,6 +2430,88 @@ def test_te_ops_mxfp8_weight_cache_optimizer_hook_synchronously_refreshes_fixed_
 
     for handle in handles:
         handle.remove()
+
+
+@pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
+def test_te_ops_mxfp8_cache_refresh_graph_matches_eager_after_remainder_fused_adam_steps():
+    """Real SM100 quantization replay follows changing BF16 owners over multiple steps."""
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("MXFP8 grouped quantization requires SM100+")
+
+    from transformer_engine.pytorch.optimizers import FusedAdam
+
+    from nemo_automodel.components.moe.experts import (
+        TeOpsMXFP8WeightCacheRefreshTarget,
+        _get_stacked_te_ops_grouped_linear_class,
+        _TeOpsMXFP8WeightCache,
+    )
+    from nemo_automodel.recipes.llm.mxfp8_cache_refresh_cuda_graph import (
+        MXFP8CacheRefreshCudaGraphManager,
+    )
+
+    linear_cls = _get_stacked_te_ops_grouped_linear_class()
+    eager_linear = linear_cls(2, 32, 32, bias=False, dtype=torch.bfloat16, device="cuda")
+    graph_linear = linear_cls(2, 32, 32, bias=False, dtype=torch.bfloat16, device="cuda")
+    with torch.no_grad():
+        graph_linear._parameters["_stacked_weight"].copy_(eager_linear._parameters["_stacked_weight"])
+    for linear in (eager_linear, graph_linear):
+        linear.set_mxfp8_weight_cache_enabled(
+            True,
+            fallback_reason="",
+            mode=_TeOpsMXFP8WeightCache.FIXED_ADDRESS_MODE,
+        )
+
+    eager_optimizer = FusedAdam(
+        eager_linear.parameters(),
+        lr=0.01,
+        master_weights=True,
+        store_param_remainders=True,
+        exp_avg_dtype=torch.bfloat16,
+        exp_avg_sq_dtype=torch.bfloat16,
+    )
+    graph_optimizer = FusedAdam(
+        graph_linear.parameters(),
+        lr=0.01,
+        master_weights=True,
+        store_param_remainders=True,
+        exp_avg_dtype=torch.bfloat16,
+        exp_avg_sq_dtype=torch.bfloat16,
+    )
+    graph_owner = graph_linear._parameters["_stacked_weight"]
+    target = TeOpsMXFP8WeightCacheRefreshTarget((graph_linear,), (graph_owner,), graph_optimizer)
+    manager = MXFP8CacheRefreshCudaGraphManager(target)
+
+    try:
+        for step, capture_allowed in enumerate((False, True, True, True), start=1):
+            eager_owner = eager_linear._parameters["_stacked_weight"]
+            gradient = torch.linspace(-1.0, 1.0, eager_owner.numel(), device="cuda", dtype=torch.bfloat16)
+            gradient = gradient.reshape_as(eager_owner).mul_(step)
+            eager_owner.grad = gradient.clone()
+            graph_owner.grad = gradient.clone()
+
+            eager_optimizer.step()
+            graph_optimizer.step()
+            assert eager_linear.refresh_mxfp8_weight_cache_if_needed(force=True)
+            manager.run(capture_allowed=capture_allowed)
+            torch.cuda.synchronize()
+
+            torch.testing.assert_close(graph_owner, eager_owner, rtol=0, atol=0)
+            eager_cache = eager_linear.__dict__["_mxfp8_weight_cache"].tensor
+            graph_cache = graph_linear.__dict__["_mxfp8_weight_cache"].tensor
+            for graph_buffer, eager_buffer in (
+                (graph_cache.rowwise_data, eager_cache.rowwise_data),
+                (graph_cache.columnwise_data, eager_cache.columnwise_data),
+                (graph_cache.scale_inv, eager_cache.scale_inv),
+                (graph_cache.columnwise_scale_inv, eager_cache.columnwise_scale_inv),
+            ):
+                torch.testing.assert_close(graph_buffer, eager_buffer, rtol=0, atol=0)
+            assert graph_linear.__dict__["_mxfp8_weight_cache"].is_current(graph_owner)
+
+        assert graph_optimizer.store_param_remainders is True
+        assert manager.capture_count == 1
+        assert manager.replay_count == 2
+    finally:
+        manager.close()
 
 
 def test_te_ops_mxfp8_weight_cache_optimizer_hook_rejects_unowned_trainable_params():

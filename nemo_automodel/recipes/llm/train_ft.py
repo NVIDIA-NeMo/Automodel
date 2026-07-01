@@ -666,6 +666,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._partial_cuda_graph_capture_pending = False
         self.full_iteration_cuda_graph_manager = None
         self._full_iteration_abandoned_graph_manager = None
+        self.te_ops_mxfp8_cache_refresh_cuda_graph_manager = None
+        self._abandoned_te_ops_mxfp8_cache_refresh_cuda_graph_manager = None
         self._full_iteration_num_label_tokens: int | None = None
         self._full_iteration_num_label_tokens_tensor: torch.Tensor | None = None
         self._full_iteration_label_normalizer_mode: bool | None = None
@@ -970,12 +972,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Optionally resume
         self.load_checkpoint(restore_from)
-        self._setup_te_ops_mxfp8_weight_cache_optimizer_hooks()
 
         # Full-iteration graphs own the complete gradient-accumulation
         # forward/backward region. Partial graphs remain a separate, mutually
         # exclusive backend mode.
         self._setup_full_iteration_cuda_graphs()
+        self._setup_te_ops_mxfp8_weight_cache_optimizer_hooks()
         # Install lightweight call recorders only after model/optimizer state is
         # final. The manager owns all feature eligibility checks (including PP
         # and activation-checkpointing restrictions).
@@ -1106,13 +1108,100 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
     def _setup_te_ops_mxfp8_weight_cache_optimizer_hooks(self) -> None:
         """Invalidate or refresh compute caches at the optimizer generation boundary."""
-        from nemo_automodel.components.moe.experts import register_te_ops_mxfp8_weight_cache_optimizer_hooks
+        from nemo_automodel.components.moe.experts import (
+            build_te_ops_mxfp8_weight_cache_refresh_target,
+            register_te_ops_mxfp8_weight_cache_optimizer_hooks,
+        )
+        from nemo_automodel.recipes.llm.mxfp8_cache_refresh_cuda_graph import (
+            MXFP8CacheRefreshCudaGraphManager,
+        )
 
         for handle in getattr(self, "_te_ops_mxfp8_weight_cache_optimizer_hook_handles", ()):
             handle.remove()
-        self._te_ops_mxfp8_weight_cache_optimizer_hook_handles = register_te_ops_mxfp8_weight_cache_optimizer_hooks(
-            self.model_parts, self.optimizer
+        old_manager = getattr(self, "te_ops_mxfp8_cache_refresh_cuda_graph_manager", None)
+        if old_manager is not None:
+            old_manager.close()
+        self.te_ops_mxfp8_cache_refresh_cuda_graph_manager = None
+
+        backend = getattr(self, "_full_iteration_backend", None)
+        cache_graph_requested = bool(
+            backend is not None and getattr(backend, "te_ops_mxfp8_weight_cache_cuda_graph", False)
         )
+        excluded_owner_ids = frozenset()
+        if cache_graph_requested:
+            target = build_te_ops_mxfp8_weight_cache_refresh_target(self.model_parts, self.optimizer)
+            if target is None:
+                logger.warning(
+                    "TE-ops MXFP8 cache-refresh CUDA graph requested, but no trainable fixed-address cache "
+                    "is available; retaining ordinary eager cache behavior"
+                )
+            else:
+                cache_manager = MXFP8CacheRefreshCudaGraphManager(
+                    target,
+                    use_single_mempool=backend.full_iteration_cuda_graph_single_mempool,
+                )
+                self.te_ops_mxfp8_cache_refresh_cuda_graph_manager = cache_manager
+                excluded_owner_ids = cache_manager.managed_owner_ids
+                logger.info(
+                    "TE-ops MXFP8 fixed-address cache-refresh CUDA graph armed for %d parameter owners",
+                    len(excluded_owner_ids),
+                )
+
+        if excluded_owner_ids:
+            handles = register_te_ops_mxfp8_weight_cache_optimizer_hooks(
+                self.model_parts,
+                self.optimizer,
+                excluded_owner_ids=excluded_owner_ids,
+            )
+        else:
+            handles = register_te_ops_mxfp8_weight_cache_optimizer_hooks(self.model_parts, self.optimizer)
+        cache_manager = self.te_ops_mxfp8_cache_refresh_cuda_graph_manager
+        if cache_manager is not None:
+            register_hook = getattr(cache_manager.target.optimizer, "register_step_post_hook", None)
+            if not callable(register_hook):
+                cache_manager.close()
+                self.te_ops_mxfp8_cache_refresh_cuda_graph_manager = None
+                for handle in handles:
+                    handle.remove()
+                raise RuntimeError(
+                    f"{type(cache_manager.target.optimizer).__name__} owns fixed-address MXFP8 caches "
+                    "but does not support register_step_post_hook"
+                )
+
+            def advance_fixed_cache_after_step(_optimizer, _args, _kwargs):
+                self._advance_te_ops_mxfp8_cache_refresh()
+
+            try:
+                handles = (*handles, register_hook(advance_fixed_cache_after_step))
+            except Exception:
+                cache_manager.close()
+                self.te_ops_mxfp8_cache_refresh_cuda_graph_manager = None
+                for handle in handles:
+                    handle.remove()
+                raise
+        self._te_ops_mxfp8_weight_cache_optimizer_hook_handles = handles
+
+    def _advance_te_ops_mxfp8_cache_refresh(self) -> int:
+        """Refresh fixed caches eagerly or by graph after one optimizer step."""
+        manager = getattr(self, "te_ops_mxfp8_cache_refresh_cuda_graph_manager", None)
+        if manager is None:
+            return 0
+        full_manager = getattr(self, "full_iteration_cuda_graph_manager", None)
+        return manager.run(capture_allowed=bool(full_manager is not None and full_manager.is_captured))
+
+    def _reset_te_ops_mxfp8_cache_refresh_cuda_graph(self) -> None:
+        """Destroy the cache graph before any full-iteration lifecycle reset."""
+        manager = getattr(self, "te_ops_mxfp8_cache_refresh_cuda_graph_manager", None)
+        if manager is not None:
+            manager.reset()
+
+    def _close_te_ops_mxfp8_cache_refresh_cuda_graph(self) -> None:
+        """Destroy the cache graph while fixed owner/cache storage is still live."""
+        manager = getattr(self, "te_ops_mxfp8_cache_refresh_cuda_graph_manager", None)
+        if manager is None:
+            return
+        manager.close()
+        self.te_ops_mxfp8_cache_refresh_cuda_graph_manager = None
 
     def _validate_partial_graph_optimizers(self) -> None:
         """Require zeroing that preserves persistent graph gradient buffers."""
@@ -1182,6 +1271,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
     def _close_full_iteration_cuda_graphs(self) -> None:
         """Destroy the full graph before releasing any referenced page buffers."""
+        self._close_te_ops_mxfp8_cache_refresh_cuda_graph()
         manager = getattr(self, "full_iteration_cuda_graph_manager", None)
         if manager is not None:
             manager.close()
@@ -1294,6 +1384,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             return
         if step < self._qat_enable_after or self._qat_enable_fn is None:
             return
+        # QAT implementations may replace module buffers while enabling fake
+        # quantization. Destroy the cache graph before invoking that mutation.
+        self._reset_te_ops_mxfp8_cache_refresh_cuda_graph()
         try:
             for mp in self.model_parts:
                 self._qat_enable_fn(mp)
@@ -1356,6 +1449,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     val_losses = {}
                     if self.step_scheduler.is_val_step:
                         if self.full_iteration_cuda_graph_manager is not None:
+                            self._reset_te_ops_mxfp8_cache_refresh_cuda_graph()
                             self.full_iteration_cuda_graph_manager.reset()
                             self._release_full_iteration_backend_handles()
                         for val_name, val_dataloader in self.val_dataloaders.items():
@@ -1368,6 +1462,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     # Save the checkpoint every ckpt_every_steps
                     if self.step_scheduler.is_ckpt_step:
                         if self.full_iteration_cuda_graph_manager is not None:
+                            self._reset_te_ops_mxfp8_cache_refresh_cuda_graph()
                             self.full_iteration_cuda_graph_manager.reset()
                             self._release_full_iteration_backend_handles()
                         self.save_checkpoint(
@@ -1692,6 +1787,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "overflow_reruns": int(getattr(self, "_full_iteration_overflow_reruns", 0)),
             "paged_stash_enabled": bool(getattr(self, "_full_iteration_paged_stash_enabled", False)),
         }
+        cache_manager = getattr(self, "te_ops_mxfp8_cache_refresh_cuda_graph_manager", None)
+        if cache_manager is not None:
+            diagnostics["mxfp8_cache_refresh_graph"] = {
+                "captured": bool(cache_manager.is_captured),
+                "managed_owners": len(cache_manager.managed_owner_ids),
+                "captures": int(cache_manager.capture_count),
+                "replays": int(cache_manager.replay_count),
+                "eager_refreshes": int(cache_manager.eager_refresh_count),
+            }
         if diagnostics["paged_stash_enabled"]:
             from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
 
@@ -1723,6 +1827,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # Benchmarking intentionally normalizes its summed losses outside
             # the graph, while training normalizes inside. Changing that Python
             # branch requires a new graph, but changing the scalar value does not.
+            self._reset_te_ops_mxfp8_cache_refresh_cuda_graph()
             manager.reset()
             self._release_full_iteration_backend_handles()
             self._full_iteration_num_label_tokens_tensor = None
@@ -1749,6 +1854,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # Exceptional cleanup must not replace the original execution
             # failure. Destroy the graph before releasing any page buffers it
             # may reference; normal teardown remains strict and diagnostic.
+            cache_manager = getattr(self, "te_ops_mxfp8_cache_refresh_cuda_graph_manager", None)
+            if cache_manager is not None:
+                try:
+                    cache_manager.reset()
+                except Exception:
+                    self._abandoned_te_ops_mxfp8_cache_refresh_cuda_graph_manager = cache_manager
+                    self.te_ops_mxfp8_cache_refresh_cuda_graph_manager = None
             graph_destroyed = False
             try:
                 manager.reset()
@@ -1797,6 +1909,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # overflow collective only synchronizes its flag, so quiesce all device
         # work before releasing opaque call handles or allocator storage.
         torch.cuda.synchronize(self.dist_env.device)
+        self._reset_te_ops_mxfp8_cache_refresh_cuda_graph()
         manager.reset()
         self._release_full_iteration_backend_handles()
         self._release_optimizer_gradient_storage()

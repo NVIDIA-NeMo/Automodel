@@ -104,6 +104,43 @@ def test_setup_weight_cache_optimizer_hooks_replaces_old_handles(monkeypatch):
     assert recipe._te_ops_mxfp8_weight_cache_optimizer_hook_handles == (new_handle,)
 
 
+def test_setup_weight_cache_refresh_graph_excludes_managed_owners_from_hooks(monkeypatch):
+    import nemo_automodel.components.moe.experts as experts_module
+    import nemo_automodel.recipes.llm.mxfp8_cache_refresh_cuda_graph as cache_graph_module
+
+    recipe = _bare_recipe()
+    recipe.model_parts = [nn.Linear(2, 2)]
+    recipe.optimizer = [_RecordingOptimizer()]
+    recipe._full_iteration_backend = SimpleNamespace(
+        te_ops_mxfp8_weight_cache_cuda_graph=True,
+        full_iteration_cuda_graph_single_mempool=True,
+    )
+    managed_ids = frozenset({17, 19})
+    graph_hook_handle = object()
+    owning_optimizer = SimpleNamespace(register_step_post_hook=MagicMock(return_value=graph_hook_handle))
+    target = SimpleNamespace(
+        managed_owner_ids=managed_ids,
+        graph_signature=lambda: ((1,),),
+        optimizer=owning_optimizer,
+    )
+    build_target = MagicMock(return_value=target)
+    manager = SimpleNamespace(managed_owner_ids=managed_ids, target=target, close=MagicMock())
+    manager_ctor = MagicMock(return_value=manager)
+    register = MagicMock(return_value=())
+    monkeypatch.setattr(experts_module, "build_te_ops_mxfp8_weight_cache_refresh_target", build_target)
+    monkeypatch.setattr(experts_module, "register_te_ops_mxfp8_weight_cache_optimizer_hooks", register)
+    monkeypatch.setattr(cache_graph_module, "MXFP8CacheRefreshCudaGraphManager", manager_ctor)
+
+    recipe._setup_te_ops_mxfp8_weight_cache_optimizer_hooks()
+
+    build_target.assert_called_once_with(recipe.model_parts, recipe.optimizer)
+    manager_ctor.assert_called_once_with(target, use_single_mempool=True)
+    register.assert_called_once_with(recipe.model_parts, recipe.optimizer, excluded_owner_ids=managed_ids)
+    owning_optimizer.register_step_post_hook.assert_called_once()
+    assert recipe.te_ops_mxfp8_cache_refresh_cuda_graph_manager is manager
+    assert recipe._te_ops_mxfp8_weight_cache_optimizer_hook_handles == (graph_hook_handle,)
+
+
 def test_partial_graphs_reject_optimizer_without_preserving_zero_grad():
     recipe = _bare_recipe()
     recipe.partial_cuda_graph_manager = object()

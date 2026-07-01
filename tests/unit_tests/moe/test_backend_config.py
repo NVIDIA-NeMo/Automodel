@@ -239,6 +239,7 @@ class TestBackendConfigFullIterationCudaGraphs:
         assert config.full_iteration_cuda_graph_warmup_steps == 2
         assert config.moe_expert_rank_capacity_factor is None
         assert config.moe_paged_stash is False
+        assert config.te_ops_mxfp8_weight_cache_cuda_graph is False
 
     def test_accepts_stacked_te_ops_paged_stash(self):
         config = BackendConfig(
@@ -358,6 +359,39 @@ class TestBackendConfigFullIterationCudaGraphs:
                 full_iteration_cuda_graph=True,
                 te_fp8={"recipe": "mxfp8", "fp8_dpa": True},
             )
+
+    def test_cache_refresh_graph_requires_weight_cache(self):
+        with pytest.raises(ValueError, match="requires te_ops_mxfp8_weight_cache=True"):
+            BackendConfig(
+                experts="te_ops",
+                dispatcher="hybridep",
+                full_iteration_cuda_graph=True,
+                te_ops_mxfp8_weight_cache_cuda_graph=True,
+                te_fp8={"recipe": "mxfp8"},
+            )
+
+    def test_cache_refresh_graph_requires_full_iteration_graph(self):
+        with pytest.raises(ValueError, match="requires full_iteration_cuda_graph=True"):
+            BackendConfig(
+                experts="te_ops",
+                dispatcher="hybridep",
+                te_ops_mxfp8_weight_cache=True,
+                te_ops_mxfp8_weight_cache_cuda_graph=True,
+                te_fp8={"recipe": "mxfp8"},
+            )
+
+    def test_accepts_opt_in_fixed_cache_refresh_graph_with_bf16_dpa(self):
+        config = BackendConfig(
+            experts="te_ops",
+            dispatcher="hybridep",
+            full_iteration_cuda_graph=True,
+            te_ops_mxfp8_weight_cache=True,
+            te_ops_mxfp8_weight_cache_cuda_graph=True,
+            te_fp8={"recipe": "mxfp8", "fp8_dpa": False},
+        )
+
+        assert config.te_ops_mxfp8_weight_cache_cuda_graph is True
+        assert config.te_fp8.fp8_dpa is False
 
 
 class TestBackendConfigPartialCudaGraphExpertScopes:
