@@ -76,7 +76,6 @@ class TestCompileConfig:
         result = config.to_dict()
         expected = {
             "enabled": True,
-            "scope": "model",
             "mode": "max-autotune",
             "fullgraph": False,
             "dynamic": False,
