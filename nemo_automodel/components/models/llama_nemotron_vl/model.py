@@ -1043,215 +1043,6 @@ def replace_llama_qkv_with_te_fused(model: nn.Module) -> int:
     return fused_count
 
 
-def replace_llama_layers_with_te_fused(model: nn.Module) -> int:
-    """Replace custom bidirectional LLaMA layers with TE transformer layers."""
-    language_model = getattr(model, "language_model", None)
-    layers = getattr(language_model, "layers", None)
-    if layers is None:
-        return 0
-
-    fused_count = 0
-    for index, layer in enumerate(layers):
-        if getattr(layer, "self_attn", None) is None and isinstance(
-            getattr(layer, "mlp", None), FusedTELlamaTransformerLayer
-        ):
-            continue
-        required = ("input_layernorm", "self_attn", "post_attention_layernorm", "mlp")
-        if not all(getattr(layer, name, None) is not None for name in required):
-            continue
-        fused = FusedTELlamaTransformerLayer(layer, layer_number=index + 1)
-        _delete_module_attr(layer, "input_layernorm")
-        _delete_module_attr(layer, "self_attn")
-        _delete_module_attr(layer, "post_attention_layernorm")
-        layer.mlp = fused
-        fused_count += 1
-
-    logger.info("Replaced custom LLaMA layers with TE TransformerLayer: %d", fused_count)
-    return fused_count
-
-
-class FusedTESiglipQKV(nn.Module):
-    """Transformer Engine LayerNorm + fused QKV projection for SigLIP."""
-
-    def __init__(self, source_norm: nn.Module, source_attn: nn.Module):
-        super().__init__()
-        from transformer_engine.pytorch import LayerNormLinear
-
-        norm_weight = source_norm.weight
-        self.fused = LayerNormLinear(
-            in_features=source_attn.embed_dim,
-            out_features=3 * source_attn.embed_dim,
-            eps=source_norm.eps,
-            normalization="LayerNorm",
-            bias=True,
-            params_dtype=norm_weight.dtype,
-            device=norm_weight.device,
-        )
-        with torch.no_grad():
-            self.fused.layer_norm_weight.copy_(norm_weight)
-            self.fused.layer_norm_bias.copy_(source_norm.bias)
-            self.fused.weight.copy_(
-                torch.cat([source_attn.q_proj.weight, source_attn.k_proj.weight, source_attn.v_proj.weight], dim=0)
-            )
-            self.fused.bias.copy_(
-                torch.cat([source_attn.q_proj.bias, source_attn.k_proj.bias, source_attn.v_proj.bias], dim=0)
-            )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.fused(hidden_states)
-
-
-class FusedQKVSiglipAttention(nn.Module):
-    """SigLIP attention with one fused QKV projection and optional TE paths."""
-
-    def __init__(
-        self,
-        source_attn: nn.Module,
-        source_norm: nn.Module | None = None,
-        use_te: bool = False,
-        use_te_qkv: bool = False,
-    ):
-        super().__init__()
-        self.config = source_attn.config
-        self.embed_dim = source_attn.embed_dim
-        self.num_heads = source_attn.num_heads
-        self.head_dim = source_attn.head_dim
-        self.dropout = source_attn.dropout
-        device = source_attn.q_proj.weight.device
-        dtype = source_attn.q_proj.weight.dtype
-        if use_te_qkv:
-            if source_norm is None:
-                raise ValueError("use_te_qkv requires the SigLIP input LayerNorm")
-            self.te_qkv = FusedTESiglipQKV(source_norm, source_attn)
-            self.qkv_proj = None
-        else:
-            self.te_qkv = None
-            self.qkv_proj = nn.Linear(self.embed_dim, 3 * self.embed_dim, device=device, dtype=dtype)
-            self._load_qkv_from_source(source_attn)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, device=device, dtype=dtype)
-        with torch.no_grad():
-            self.out_proj.weight.copy_(source_attn.out_proj.weight)
-            self.out_proj.bias.copy_(source_attn.out_proj.bias)
-        self._use_te = use_te
-        if use_te:
-            from transformer_engine.pytorch.attention import DotProductAttention
-
-            object.__setattr__(
-                self,
-                "_te_attention",
-                DotProductAttention(
-                    num_attention_heads=self.num_heads,
-                    kv_channels=(self.head_dim, self.head_dim),
-                    attn_mask_type="no_mask",
-                    qkv_format="bshd",
-                    softmax_scale=self.head_dim**-0.5,
-                ),
-            )
-
-    def _load_qkv_from_source(self, source_attn: nn.Module) -> None:
-        with torch.no_grad():
-            self.qkv_proj.weight.copy_(
-                torch.cat(
-                    [
-                        source_attn.q_proj.weight,
-                        source_attn.k_proj.weight,
-                        source_attn.v_proj.weight,
-                    ],
-                    dim=0,
-                )
-            )
-            self.qkv_proj.bias.copy_(
-                torch.cat(
-                    [
-                        source_attn.q_proj.bias,
-                        source_attn.k_proj.bias,
-                        source_attn.v_proj.bias,
-                    ],
-                    dim=0,
-                )
-            )
-
-    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
-        batch_size, seq_len, _ = hidden_states.shape
-        qkv_projection = self.te_qkv(hidden_states) if self.te_qkv is not None else self.qkv_proj(hidden_states)
-        qkv = qkv_projection.view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        query_states, key_states, value_states = qkv.unbind(dim=2)
-        if self._use_te:
-            with torch.cuda.device(hidden_states.device):
-                attn_output = self._te_attention(
-                    query_states,
-                    key_states,
-                    value_states,
-                    attn_mask_type="no_mask",
-                    window_size=(-1, -1),
-                )
-            attn_output = attn_output.reshape(batch_size, seq_len, self.embed_dim)
-        else:
-            attn_output = F.scaled_dot_product_attention(
-                query_states.transpose(1, 2),
-                key_states.transpose(1, 2),
-                value_states.transpose(1, 2),
-                attn_mask=None,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=False,
-            )
-            attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
-        return self.out_proj(attn_output)
-
-
-class FusedQKVSiglipMLP(nn.Module):
-    """SigLIP MLP mirror for local class-name consistency in fused-QKV layers."""
-
-    def __init__(self, source_mlp: nn.Module):
-        super().__init__()
-        self.config = source_mlp.config
-        self.activation_fn = ACT2FN[self.config.hidden_act]
-        self.fc1 = source_mlp.fc1
-        self.fc2 = source_mlp.fc2
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.activation_fn(self.fc1(hidden_states)))
-
-
-class FusedTESiglipMLP(nn.Module):
-    """Transformer Engine LayerNorm + GELU MLP replacement for SigLIP."""
-
-    def __init__(self, source_norm: nn.Module, source_mlp: nn.Module):
-        super().__init__()
-        from transformer_engine.pytorch import LayerNormMLP
-
-        norm_weight = source_norm.weight
-        norm_bias = getattr(source_norm, "bias", None)
-        fc1 = source_mlp.fc1
-        fc2 = source_mlp.fc2
-        fc1_bias = getattr(fc1, "bias", None)
-        fc2_bias = getattr(fc2, "bias", None)
-        use_bias = fc1_bias is not None and fc2_bias is not None
-        self.fused = LayerNormMLP(
-            hidden_size=fc1.in_features,
-            ffn_hidden_size=fc1.out_features,
-            eps=source_norm.eps,
-            normalization="LayerNorm",
-            activation="gelu",
-            bias=use_bias,
-            params_dtype=norm_weight.dtype,
-            device=norm_weight.device,
-        )
-
-        with torch.no_grad():
-            self.fused.layer_norm_weight.copy_(norm_weight)
-            if norm_bias is not None and hasattr(self.fused, "layer_norm_bias"):
-                self.fused.layer_norm_bias.copy_(norm_bias)
-            self.fused.fc1_weight.copy_(fc1.weight)
-            self.fused.fc2_weight.copy_(fc2.weight)
-            if use_bias:
-                self.fused.fc1_bias.copy_(fc1_bias)
-                self.fused.fc2_bias.copy_(fc2_bias)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.fused(hidden_states)
-
-
 class FusedTEVisionProjection(nn.Module):
     """Fuse the vision-to-language projection's LayerNorm and first Linear."""
 
@@ -1280,89 +1071,6 @@ class FusedTEVisionProjection(nn.Module):
         hidden_states = self.norm_fc1(hidden_states)
         hidden_states = F.gelu(hidden_states, approximate="none")
         return self.fc2(hidden_states)
-
-
-class FusedTELlamaTransformerLayer(nn.Module):
-    """Transformer Engine replacement for one custom bidirectional LLaMA layer."""
-
-    def __init__(self, source_layer: nn.Module, layer_number: int):
-        super().__init__()
-        from transformer_engine.pytorch import TransformerLayer
-
-        source_attn = source_layer.self_attn
-        source_mlp = source_layer.mlp
-        source_norm = source_layer.input_layernorm
-        source_post_norm = source_layer.post_attention_layernorm
-        config = source_attn.config
-        q_proj = source_attn.q_proj
-        k_proj = source_attn.k_proj
-        v_proj = source_attn.v_proj
-        dtype = source_norm.weight.dtype
-        device = source_norm.weight.device
-
-        self.fused = TransformerLayer(
-            hidden_size=config.hidden_size,
-            ffn_hidden_size=config.intermediate_size,
-            num_attention_heads=config.num_attention_heads,
-            num_gqa_groups=config.num_key_value_heads,
-            kv_channels=source_attn.head_dim,
-            layernorm_epsilon=config.rms_norm_eps,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
-            layer_number=layer_number,
-            self_attn_mask_type="arbitrary",
-            normalization="RMSNorm",
-            activation="swiglu",
-            bias=False,
-            fuse_qkv_params=True,
-            qkv_weight_interleaved=False,
-            attn_input_format="bshd",
-            params_dtype=dtype,
-            device=device,
-        )
-
-        with torch.no_grad():
-            self.fused.self_attention.layernorm_qkv.layer_norm_weight.copy_(source_norm.weight)
-            self.fused.self_attention.layernorm_qkv.weight.copy_(
-                torch.cat([q_proj.weight, k_proj.weight, v_proj.weight], dim=0)
-            )
-            self.fused.self_attention.proj.weight.copy_(source_attn.o_proj.weight)
-            self.fused.layernorm_mlp.layer_norm_weight.copy_(source_post_norm.weight)
-            self.fused.layernorm_mlp.fc1_weight.copy_(
-                torch.cat([source_mlp.gate_proj.weight, source_mlp.up_proj.weight], dim=0)
-            )
-            self.fused.layernorm_mlp.fc2_weight.copy_(source_mlp.down_proj.weight)
-
-    @staticmethod
-    def _normalize_attention_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
-        if attention_mask is None:
-            return None
-        if attention_mask.dtype == torch.bool:
-            if attention_mask.ndim == 2:
-                return ~attention_mask[:, None, None, :]
-            return ~attention_mask
-        if attention_mask.ndim == 2:
-            return attention_mask == 0
-        return attention_mask < 0
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        position_embeddings=None,
-        **kwargs,
-    ) -> torch.Tensor:
-        if kwargs.get("past_key_values") is not None or kwargs.get("past_key_value") is not None:
-            raise RuntimeError("FusedTELlamaTransformerLayer does not support KV cache updates")
-        if position_embeddings is None or len(position_embeddings) != 3:
-            raise RuntimeError("FusedTELlamaTransformerLayer requires fused raw RoPE frequencies")
-        mask = self._normalize_attention_mask(attention_mask)
-        return self.fused(
-            hidden_states,
-            attention_mask=mask,
-            self_attn_mask_type="arbitrary" if mask is not None else "no_mask",
-            rotary_pos_emb=position_embeddings[2],
-        )
 
 
 class FusedTESiglipTransformerLayer(nn.Module):
@@ -1430,64 +1138,22 @@ class FusedTESiglipTransformerLayer(nn.Module):
         )
 
 
-class FusedQKVSiglipEncoderLayer(nn.Module):
-    """Stock-compatible SigLIP encoder layer with fused QKV projection."""
+class FusedTESiglipEncoderLayer(nn.Module):
+    """Stock-compatible wrapper for a full TE SigLIP encoder layer."""
 
-    def __init__(
-        self,
-        source_layer: nn.Module,
-        use_te: bool = False,
-        use_te_mlp: bool = False,
-        use_te_qkv: bool = False,
-        use_te_layer: bool = False,
-    ):
+    def __init__(self, source_layer: nn.Module):
         super().__init__()
         self.embed_dim = source_layer.embed_dim
-        if use_te_layer:
-            # Keep the active fused block under a standard child name so the
-            # generic DDP/FSDP activation-checkpointing path can wrap it.
-            self.mlp = FusedTESiglipTransformerLayer(source_layer)
-            return
-
-        self.self_attn = FusedQKVSiglipAttention(
-            source_layer.self_attn,
-            source_norm=source_layer.layer_norm1,
-            use_te=use_te,
-            use_te_qkv=use_te_qkv,
-        )
-        if not use_te_qkv:
-            self.layer_norm1 = source_layer.layer_norm1
-        if use_te_mlp:
-            self.mlp = FusedTESiglipMLP(source_layer.layer_norm2, source_layer.mlp)
-        else:
-            self.mlp = FusedQKVSiglipMLP(source_layer.mlp)
-            self.layer_norm2 = source_layer.layer_norm2
+        # Keep the active fused block under a standard child name so the
+        # generic DDP/FSDP activation-checkpointing path can wrap it.
+        self.mlp = FusedTESiglipTransformerLayer(source_layer)
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        if getattr(self, "self_attn", None) is None:
-            return self.mlp(hidden_states, *args, **kwargs)
-
-        residual = hidden_states
-        if getattr(self, "layer_norm1", None) is not None:
-            hidden_states = self.layer_norm1(hidden_states)
-        hidden_states = self.self_attn(hidden_states)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        if getattr(self, "layer_norm2", None) is not None:
-            hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        return residual + hidden_states
+        return self.mlp(hidden_states, *args, **kwargs)
 
 
-def replace_siglip_attention_with_fused_qkv(
-    model: nn.Module,
-    use_te: bool = False,
-    use_te_mlp: bool = False,
-    use_te_qkv: bool = False,
-    use_te_layer: bool = False,
-) -> int:
-    """Replace loaded HF SigLIP encoder layers with trainability-preserving fused-QKV equivalents."""
+def replace_siglip_encoder_layers_with_te_fused(model: nn.Module) -> int:
+    """Replace loaded HF SigLIP encoder layers with full TE TransformerLayer equivalents."""
     vision_model = getattr(model, "vision_model", None)
     vision_transformer = getattr(vision_model, "vision_model", None)
     encoder = getattr(vision_transformer, "encoder", None)
@@ -1499,16 +1165,10 @@ def replace_siglip_attention_with_fused_qkv(
     for idx, layer in enumerate(layers):
         if not all(hasattr(layer.self_attn, name) for name in ("q_proj", "k_proj", "v_proj", "out_proj")):
             continue
-        layers[idx] = FusedQKVSiglipEncoderLayer(
-            layer,
-            use_te=use_te,
-            use_te_mlp=use_te_mlp,
-            use_te_qkv=use_te_qkv,
-            use_te_layer=use_te_layer,
-        )
+        layers[idx] = FusedTESiglipEncoderLayer(layer)
         replaced += 1
 
-    logger.info("Replaced SigLIP encoder layers with fused-QKV attention: layers=%d", replaced)
+    logger.info("Replaced SigLIP encoder layers with TE TransformerLayer: layers=%d", replaced)
     return replaced
 
 
@@ -1520,113 +1180,6 @@ def replace_vision_projection_with_te(model: nn.Module) -> bool:
     model.mlp1 = FusedTEVisionProjection(projection)
     logger.info("Fused vision projection LayerNorm + first Linear")
     return True
-
-
-class _FusedLinearProjection(nn.Module):
-    """One projection whose output is exposed through several Linear views.
-
-    Llama attention and SwiGLU call their projections sequentially with the
-    same hidden-state tensor. Computing the concatenated projection once keeps
-    the original module interfaces while removing redundant small GEMM launches.
-    """
-
-    def __init__(self, sources: tuple[nn.Linear, ...]):
-        super().__init__()
-        if not sources or not all(isinstance(source, nn.Linear) for source in sources):
-            raise TypeError("fused projections require nn.Linear sources")
-        first = sources[0]
-        if any(source.in_features != first.in_features for source in sources):
-            raise ValueError("fused projections require matching input dimensions")
-
-        self.sizes = tuple(source.out_features for source in sources)
-        self.offsets = (0, *torch.tensor(self.sizes, dtype=torch.int64).cumsum(0).tolist())
-        self.linear = nn.Linear(
-            first.in_features,
-            sum(self.sizes),
-            bias=first.bias is not None,
-            device=first.weight.device,
-            dtype=first.weight.dtype,
-        )
-        with torch.no_grad():
-            self.linear.weight.copy_(torch.cat([source.weight for source in sources], dim=0))
-            if self.linear.bias is not None:
-                self.linear.bias.copy_(torch.cat([source.bias for source in sources], dim=0))
-
-        self._cached_input = None
-        self._cached_output = None
-        self._remaining_views = 0
-
-    def _view(self, hidden_states: torch.Tensor, index: int) -> torch.Tensor:
-        if self._cached_input is not hidden_states:
-            self._cached_input = hidden_states
-            self._cached_output = self.linear(hidden_states)
-            self._remaining_views = len(self.sizes)
-
-        start, end = self.offsets[index], self.offsets[index + 1]
-        output = self._cached_output[..., start:end]
-        self._remaining_views -= 1
-        if self._remaining_views == 0:
-            self._cached_input = None
-            self._cached_output = None
-        return output
-
-
-class _FusedLinearView(nn.Module):
-    """A parameter-free view retaining the source module's call contract."""
-
-    def __init__(self, projection: _FusedLinearProjection, index: int):
-        super().__init__()
-        object.__setattr__(self, "_projection", projection)
-        self._index = index
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self._projection._view(hidden_states, self._index)
-
-
-def replace_llama_language_projections(model: nn.Module) -> tuple[int, int]:
-    """Fuse trainable Llama QKV and SwiGLU gate/up projections.
-
-    The replacement is shape-preserving and copies the original weights. The
-    fused parameters remain trainable; only the number of projection launches
-    changes. This is applied before distributed wrapping and optimizer creation.
-    """
-
-    language_model = getattr(model, "language_model", None)
-    layers = getattr(language_model, "layers", None)
-    if layers is None:
-        logger.warning("Llama projection fusion requested but no language-model layers were found")
-        return 0, 0
-
-    fused_qkv = 0
-    fused_gate_up = 0
-    for layer in layers:
-        attention = getattr(layer, "self_attn", None)
-        if attention is not None and all(hasattr(attention, name) for name in ("q_proj", "k_proj", "v_proj")):
-            sources = (attention.q_proj, attention.k_proj, attention.v_proj)
-            if all(isinstance(source, nn.Linear) for source in sources):
-                projection = _FusedLinearProjection(sources)
-                attention.qkv_proj = projection
-                attention.q_proj = _FusedLinearView(projection, 0)
-                attention.k_proj = _FusedLinearView(projection, 1)
-                attention.v_proj = _FusedLinearView(projection, 2)
-                fused_qkv += 1
-
-        mlp = getattr(layer, "mlp", None)
-        if mlp is not None and all(hasattr(mlp, name) for name in ("gate_proj", "up_proj")):
-            sources = (mlp.gate_proj, mlp.up_proj)
-            if all(isinstance(source, nn.Linear) for source in sources):
-                projection = _FusedLinearProjection(sources)
-                mlp.gate_up_proj = projection
-                mlp.gate_proj = _FusedLinearView(projection, 0)
-                mlp.up_proj = _FusedLinearView(projection, 1)
-                fused_gate_up += 1
-
-    logger.info(
-        "Fused Llama language projections: qkv_layers=%d gate_up_layers=%d",
-        fused_qkv,
-        fused_gate_up,
-    )
-    return fused_qkv, fused_gate_up
 
 
 def disable_unused_siglip_pooling_head_grad(model: nn.Module) -> int:

@@ -393,16 +393,10 @@ class BiEncoderModel(nn.Module):
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
         trust_remote_code: bool = False,
-        fuse_siglip_qkv: bool = False,
         disable_unused_siglip_pooling_head: bool = False,
-        siglip_te_attention: bool = False,
-        use_te_fused_siglip_mlp: bool = False,
-        use_te_fused_siglip_qkv: bool = False,
         use_te_fused_siglip_layer: bool = False,
         use_te_fused_vision_projection: bool = False,
-        fuse_llama_projections: bool = False,
         use_custom_llama_backend: bool = False,
-        use_te_fused_llama_layer: bool = False,
         use_te_fused_mlp: bool = False,
         use_te_fused_qkv: bool = False,
         **hf_kwargs,
@@ -422,7 +416,6 @@ class BiEncoderModel(nn.Module):
             try:
                 from nemo_automodel.components.models.llama_nemotron_vl.model import (
                     replace_language_model_with_custom_llama,
-                    replace_llama_layers_with_te_fused,
                     replace_llama_mlp_with_te_fused,
                     replace_llama_qkv_with_te_fused,
                 )
@@ -431,44 +424,28 @@ class BiEncoderModel(nn.Module):
             replaced = replace_language_model_with_custom_llama(backbone)
             if not replaced:
                 logger.warning("use_custom_llama_backend requested but the loaded backbone was not replaced")
-            if use_te_fused_llama_layer:
-                fused = replace_llama_layers_with_te_fused(backbone)
-                if fused == 0:
-                    logger.warning("use_te_fused_llama_layer requested but no custom LLaMA layers were fused")
-            if use_te_fused_mlp and not use_te_fused_llama_layer:
+            if use_te_fused_mlp:
                 fused = replace_llama_mlp_with_te_fused(backbone)
                 if fused == 0:
                     logger.warning("use_te_fused_mlp requested but no custom LLaMA MLP layers were fused")
-            if use_te_fused_qkv and not use_te_fused_llama_layer:
+            if use_te_fused_qkv:
                 fused = replace_llama_qkv_with_te_fused(backbone)
                 if fused == 0:
                     logger.warning("use_te_fused_qkv requested but no custom LLaMA QKV layers were fused")
-        if (
-            fuse_siglip_qkv
-            or use_te_fused_siglip_mlp
-            or use_te_fused_siglip_qkv
-            or use_te_fused_siglip_layer
-            or disable_unused_siglip_pooling_head
-        ):
+        if use_te_fused_siglip_layer or disable_unused_siglip_pooling_head:
             try:
                 from nemo_automodel.components.models.llama_nemotron_vl.model import (
                     disable_unused_siglip_pooling_head_grad,
-                    replace_siglip_attention_with_fused_qkv,
+                    replace_siglip_encoder_layers_with_te_fused,
                 )
             except Exception as exc:
                 raise RuntimeError(
                     "SigLIP helper requested but the LlamaNemotronVL helpers could not be imported"
                 ) from exc
-        if fuse_siglip_qkv or use_te_fused_siglip_mlp or use_te_fused_siglip_qkv or use_te_fused_siglip_layer:
-            replaced = replace_siglip_attention_with_fused_qkv(
-                backbone,
-                use_te=siglip_te_attention,
-                use_te_mlp=use_te_fused_siglip_mlp,
-                use_te_qkv=use_te_fused_siglip_qkv,
-                use_te_layer=use_te_fused_siglip_layer,
-            )
+        if use_te_fused_siglip_layer:
+            replaced = replace_siglip_encoder_layers_with_te_fused(backbone)
             if replaced == 0:
-                logger.warning("fuse_siglip_qkv requested but no SigLIP encoder layers were replaced")
+                logger.warning("use_te_fused_siglip_layer requested but no SigLIP encoder layers were replaced")
         if disable_unused_siglip_pooling_head:
             disabled = disable_unused_siglip_pooling_head_grad(backbone)
             if disabled == 0:
@@ -486,16 +463,6 @@ class BiEncoderModel(nn.Module):
                 ) from exc
             if not replace_vision_projection_with_te(backbone):
                 logger.warning("use_te_fused_vision_projection requested but no compatible mlp1 was found")
-        if fuse_llama_projections:
-            try:
-                from nemo_automodel.components.models.llama_nemotron_vl.model import (
-                    replace_llama_language_projections,
-                )
-            except Exception as exc:
-                raise RuntimeError("Llama projection fusion requested but the VL helper could not be imported") from exc
-            fused_qkv, fused_gate_up = replace_llama_language_projections(backbone)
-            if fused_qkv == 0 and fused_gate_up == 0:
-                logger.warning("fuse_llama_projections requested but no Llama projections were replaced")
         if freeze_config is not None:
             apply_parameter_freezing(backbone, freeze_config)
 

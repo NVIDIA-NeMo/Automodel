@@ -28,10 +28,7 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.utils import (
-    add_bidirectional_masks_to_retrieval_batch,
-    create_bidirectional_mask_for_batch,
-)
+from nemo_automodel.components.datasets.utils import add_bidirectional_masks_to_retrieval_batch
 from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
@@ -90,30 +87,6 @@ def _get_autocast_ctx(distributed_config):
 
 def _move_batch_to_device(batch, device):
     return {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
-
-class _CudaBatchPrefetcher:
-    """Stage the next pinned batch while the current batch runs on the default stream."""
-
-    def __init__(self, device):
-        self.device = device
-        self.stream = torch.cuda.Stream(device=device)
-
-    def stage(self, batch):
-        with torch.cuda.stream(self.stream):
-            moved = _move_batch_to_device(batch, self.device)
-            ready = torch.cuda.Event()
-            ready.record(self.stream)
-        return moved, ready
-
-    def consume(self, staged):
-        moved, ready = staged
-        current = torch.cuda.current_stream(self.device)
-        current.wait_event(ready)
-        for value in moved.values():
-            if isinstance(value, torch.Tensor) and value.is_cuda:
-                value.record_stream(current)
-        return moved
 
 
 def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
@@ -280,110 +253,6 @@ def _query_forward_after_passage_forward(model, query, *, use_bypassed_ddp: bool
     if use_bypassed_ddp and hasattr(model, "module"):
         return model.module(query)
     return model(query)
-
-
-def _pad_sequence_dim(tensor: torch.Tensor, target_len: int, padding_value: int | float | bool = 0) -> torch.Tensor:
-    """Pad dim 1 on the right, preserving existing token positions."""
-    if tensor.shape[1] == target_len:
-        return tensor
-    if tensor.shape[1] > target_len:
-        raise ValueError(f"Cannot pad tensor with dim1={tensor.shape[1]} to shorter target_len={target_len}")
-    pad_shape = list(tensor.shape)
-    pad_shape[1] = target_len - tensor.shape[1]
-    padding = tensor.new_full(pad_shape, padding_value)
-    return torch.cat([tensor, padding], dim=1)
-
-
-def _remap_passage_image_token_indices(
-    image_token_indices: torch.Tensor,
-    *,
-    q_rows: int,
-    p_seq_len: int,
-    combined_seq_len: int,
-) -> torch.Tensor:
-    """Move passage-only flattened image token indices into a [query; passage] combined layout."""
-    if image_token_indices.numel() == 0:
-        return image_token_indices
-    old_indices = image_token_indices.reshape(-1).to(dtype=torch.long)
-    rows = torch.div(old_indices, p_seq_len, rounding_mode="floor")
-    cols = old_indices.remainder(p_seq_len)
-    return (rows + q_rows) * combined_seq_len + cols
-
-
-def _build_unified_query_passage_batch(
-    query: dict[str, torch.Tensor],
-    passage: dict[str, torch.Tensor],
-    *,
-    bidirectional_mask_model_config=None,
-    bidirectional_mask_dtype=None,
-) -> tuple[dict[str, torch.Tensor], int, int, torch.Tensor]:
-    """Build a single model input whose rows are [queries; passages]."""
-    if query is None or passage is None:
-        raise ValueError("unified_query_passage_forward requires both query and passage inputs")
-    if "input_ids" not in query or "input_ids" not in passage:
-        raise ValueError("unified_query_passage_forward requires input_ids for both query and passage")
-    if "attention_mask" not in query or "attention_mask" not in passage:
-        raise ValueError("unified_query_passage_forward requires attention_mask for both query and passage")
-
-    q_input_ids = query["input_ids"]
-    p_input_ids = passage["input_ids"]
-    q_rows = q_input_ids.shape[0]
-    p_rows = p_input_ids.shape[0]
-    q_seq_len = q_input_ids.shape[1]
-    p_seq_len = p_input_ids.shape[1]
-    combined_seq_len = max(q_seq_len, p_seq_len)
-
-    combined_attention_mask = torch.cat(
-        [
-            _pad_sequence_dim(query["attention_mask"], combined_seq_len, padding_value=0),
-            _pad_sequence_dim(passage["attention_mask"], combined_seq_len, padding_value=0),
-        ],
-        dim=0,
-    )
-    combined = {
-        "input_ids": torch.cat(
-            [
-                _pad_sequence_dim(q_input_ids, combined_seq_len, padding_value=0),
-                _pad_sequence_dim(p_input_ids, combined_seq_len, padding_value=0),
-            ],
-            dim=0,
-        ),
-        "attention_mask": combined_attention_mask,
-    }
-
-    if "position_ids" in query and "position_ids" in passage:
-        combined["position_ids"] = torch.cat(
-            [
-                _pad_sequence_dim(query["position_ids"], combined_seq_len, padding_value=0),
-                _pad_sequence_dim(passage["position_ids"], combined_seq_len, padding_value=0),
-            ],
-            dim=0,
-        )
-
-    for key in ("pixel_values", "image_flags", "num_patches_list"):
-        if key in passage:
-            combined[key] = passage[key]
-
-    if "image_token_indices" in passage:
-        combined["image_token_indices"] = _remap_passage_image_token_indices(
-            passage["image_token_indices"],
-            q_rows=q_rows,
-            p_seq_len=p_seq_len,
-            combined_seq_len=combined_seq_len,
-        )
-
-    if bidirectional_mask_model_config is not None:
-        combined["bidirectional_mask"] = create_bidirectional_mask_for_batch(
-            bidirectional_mask_model_config,
-            combined_attention_mask,
-            device=combined_attention_mask.device,
-            dtype=bidirectional_mask_dtype,
-        )
-        combined["bidirectional_mask_precomputed"] = True
-
-    combined["run_dummy_vision"] = True
-    passage_attention_mask_for_scores = combined_attention_mask[q_rows:]
-    return combined, q_rows, p_rows, passage_attention_mask_for_scores
 
 
 class _AllGatherWithGrad(torch.autograd.Function):
@@ -817,12 +686,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.metric_logger_valid.close()
         self.checkpointer.close()
 
-    def _forward_backward_step(
-        self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True, batch_is_on_device: bool = False
-    ):
+    def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
         """Forward and backward pass for a single micro-batch."""
-        if not batch_is_on_device:
-            batch = _move_batch_to_device(batch, self.dist_env.device)
+        batch = _move_batch_to_device(batch, self.dist_env.device)
         query, passage = _unpack_qp(batch)
 
         model = self.model_parts[0]
@@ -849,15 +715,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
             n_passages = self.train_n_passages
             use_multi_vector_scoring = _uses_multi_vector_scoring(model)
             use_dist_neg = is_train and getattr(attr_model, "do_distributed_inbatch_negative", False)
-            replicate_distributed_loss = use_dist_neg and _as_bool(cfg.get("replicate_distributed_loss", False))
             gather_stream_priority = (
                 -1 if _get_bi_encoder_optimization_bool(cfg, "overlap_passage_gather_high_priority") else 0
             )
-            unified_forward = _as_bool(cfg.get("unified_query_passage_forward", False))
-            overlap_passage_gather = (
-                _get_bi_encoder_optimization_bool(cfg, "overlap_passage_gather_with_query_forward")
-                and not unified_forward
-            )
+            overlap_passage_gather = _get_bi_encoder_optimization_bool(cfg, "overlap_passage_gather_with_query_forward")
             bypass_second_ddp_forward = (
                 overlap_passage_gather
                 and use_dist_neg
@@ -866,73 +727,44 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 and hasattr(model, "module")
             )
             pending_all_p = None
-            pending_all_q = None
             pending_all_p_mask = None
             pending_all_doc_ids = None
-            loss_gradient_scale = 1
             passage_attention_mask_for_scores = passage["attention_mask"]
 
-            if unified_forward:
-                bidirectional_mask_model_config = None
-                bidirectional_mask_dtype = None
-                if _get_bi_encoder_optimization_bool(cfg, "precompute_bidirectional_mask"):
-                    bidirectional_mask_model_config = _get_bidirectional_mask_model_config(model)
-                    bidirectional_mask_dtype = _get_first_parameter_dtype(model)
-                combined, local_q_rows, local_p_rows, passage_attention_mask_for_scores = (
-                    _build_unified_query_passage_batch(
-                        query,
-                        passage,
-                        bidirectional_mask_model_config=bidirectional_mask_model_config,
-                        bidirectional_mask_dtype=bidirectional_mask_dtype,
-                    )
-                )
-                reps = model(combined)
-                q_reps = reps[:local_q_rows]
-                p_reps = reps[local_q_rows : local_q_rows + local_p_rows]
-            else:
-                p_reps = model(passage)
+            p_reps = model(passage)
 
-                if overlap_passage_gather and use_dist_neg:
-                    preserve_gather_grad = (
-                        not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
-                        and not replicate_distributed_loss
+            if overlap_passage_gather and use_dist_neg:
+                preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
+                gather_stream = _new_gather_stream(p_reps, priority=gather_stream_priority)
+                if use_multi_vector_scoring:
+                    pending_all_p = _start_async_dist_gather_tensor_with_dim1_padding(
+                        p_reps,
+                        preserve_grad=preserve_gather_grad,
+                        stream=gather_stream,
                     )
-                    gather_stream = _new_gather_stream(p_reps, priority=gather_stream_priority)
-                    if use_multi_vector_scoring:
-                        pending_all_p = _start_async_dist_gather_tensor_with_dim1_padding(
-                            p_reps,
-                            preserve_grad=preserve_gather_grad,
-                            stream=gather_stream,
-                        )
-                        pending_all_p_mask = _start_async_dist_gather_tensor_with_dim1_padding(
-                            passage_attention_mask_for_scores,
-                            padding_value=False,
-                            stream=gather_stream,
-                        )
-                    else:
-                        pending_all_p = _start_async_dist_gather_tensor(
-                            p_reps,
-                            preserve_grad=preserve_gather_grad,
-                            stream=gather_stream,
-                        )
-                    passage_doc_ids = batch.get("passage_doc_ids")
-                    if passage_doc_ids is not None:
-                        pending_all_doc_ids = _start_async_dist_gather_tensor(
-                            passage_doc_ids.contiguous(),
-                            stream=gather_stream,
-                        )
+                    pending_all_p_mask = _start_async_dist_gather_tensor_with_dim1_padding(
+                        passage_attention_mask_for_scores,
+                        padding_value=False,
+                        stream=gather_stream,
+                    )
+                else:
+                    pending_all_p = _start_async_dist_gather_tensor(
+                        p_reps,
+                        preserve_grad=preserve_gather_grad,
+                        stream=gather_stream,
+                    )
+                passage_doc_ids = batch.get("passage_doc_ids")
+                if passage_doc_ids is not None:
+                    pending_all_doc_ids = _start_async_dist_gather_tensor(
+                        passage_doc_ids.contiguous(),
+                        stream=gather_stream,
+                    )
 
-                q_reps = _query_forward_after_passage_forward(
-                    model,
-                    query,
-                    use_bypassed_ddp=bypass_second_ddp_forward,
-                )
-                if replicate_distributed_loss:
-                    pending_all_q = _start_async_dist_gather_tensor(
-                        q_reps,
-                        preserve_grad=False,
-                        stream=_new_gather_stream(q_reps, priority=gather_stream_priority),
-                    )
+            q_reps = _query_forward_after_passage_forward(
+                model,
+                query,
+                use_bypassed_ddp=bypass_second_ddp_forward,
+            )
 
             if use_dist_neg:
                 from nemo_automodel.components.models.common.inbatch_neg_utils import (
@@ -945,54 +777,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
                 rank = torch.distributed.get_rank() if dist_initialized else 0
                 world_size = torch.distributed.get_world_size() if dist_initialized else 1
-                preserve_gather_grad = (
-                    not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
-                    and not replicate_distributed_loss
-                )
+                preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
 
-                if replicate_distributed_loss:
-                    all_q = (
-                        pending_all_q.wait()
-                        if pending_all_q is not None
-                        else dist_gather_tensor(q_reps, preserve_grad=False)
-                    )
-                    all_p = (
-                        pending_all_p.wait()
-                        if pending_all_p is not None
-                        else (
-                            dist_gather_tensor_with_dim1_padding(p_reps, padding_value=0, preserve_grad=False)
-                            if use_multi_vector_scoring
-                            else dist_gather_tensor(p_reps, preserve_grad=False)
-                        )
-                    )
-                    expected_global_bs = world_size * local_bs
-                    assert all_q.shape[0] == expected_global_bs, (
-                        f"Gathered query count {all_q.shape[0]} != expected {expected_global_bs}"
-                    )
-                    expected_p = expected_global_bs * n_passages
-                    assert all_p.shape[0] == expected_p, (
-                        f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
-                    )
-                    if use_multi_vector_scoring:
-                        all_p_mask = (
-                            pending_all_p_mask.wait()
-                            if pending_all_p_mask is not None
-                            else dist_gather_tensor_with_dim1_padding(
-                                passage_attention_mask_for_scores, padding_value=False
-                            )
-                        )
-                        scores, labels = distributed_maxsim_scores_and_labels(
-                            all_q,
-                            all_p,
-                            n_passages,
-                            all_p_mask,
-                            rank=0,
-                        )
-                    else:
-                        scores = torch.mm(all_q, all_p.t())
-                        labels = torch.arange(expected_global_bs, device=q_reps.device) * n_passages
-                    loss_gradient_scale = world_size
-                elif use_multi_vector_scoring:
+                if use_multi_vector_scoring:
                     all_p = (
                         pending_all_p.wait()
                         if pending_all_p is not None
@@ -1041,8 +828,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         scores,
                         all_doc_ids,
                         train_n_passages=n_passages,
-                        rank=0 if replicate_distributed_loss else rank,
-                        local_batch_size=(world_size * local_bs if replicate_distributed_loss else local_bs),
+                        rank=rank,
+                        local_batch_size=local_bs,
                     )
             else:
                 if use_multi_vector_scoring:
@@ -1063,35 +850,20 @@ class TrainBiEncoderRecipe(BaseRecipe):
             if is_train:
                 # Scale loss by number of gradient accumulation steps to get correct average gradients
                 # FSDP/DDP will handle averaging across DP ranks automatically
-                scaled_loss = loss * loss_gradient_scale / num_batches
+                scaled_loss = loss / num_batches
                 scaled_loss.backward()
 
     def _run_train_optim_step(self, batches, max_grad_norm=None):
         """Run one optimization step with gradient accumulation."""
         loss_buffer = []
-        cfg = getattr(self, "cfg", {})
-        use_batch_prefetch = (
-            _get_bi_encoder_optimization_bool(cfg, "overlap_batch_to_device_with_compute")
-            and torch.cuda.is_available()
-            and self.dist_env.device.type == "cuda"
-        )
-        prefetcher = _CudaBatchPrefetcher(self.dist_env.device) if use_batch_prefetch else None
-        pending = prefetcher.stage(batches[0]) if prefetcher and batches else None
         for idx, batch in enumerate(batches):
-            next_pending = None
-            if prefetcher is not None:
-                batch = prefetcher.consume(pending)
-                if idx + 1 < len(batches):
-                    next_pending = prefetcher.stage(batches[idx + 1])
             self._forward_backward_step(
                 idx,
                 batch,
                 loss_buffer=loss_buffer,
                 num_batches=len(batches),
                 is_train=True,
-                batch_is_on_device=prefetcher is not None,
             )
-            pending = next_pending
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
