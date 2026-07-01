@@ -693,18 +693,28 @@ class Gemma4MoETextModelBackend(nn.Module):
                 flex_block_size=(32, 32) if getattr(self.config, "head_dim", 0) > 256 else 128,
             )
         elif use_vision_bidirectional_mask:
-            from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
+            from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+            from transformers.models.gemma4.modeling_gemma4 import get_block_sequence_ids_for_mask
 
-            causal_mask_mapping = create_causal_mask_mapping(
-                config=self.config,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-                mm_token_type_ids=mm_token_type_ids,
-                pixel_values=pixel_values,
-                is_training=self.training,
-            )
+            # transformers 5.12 removed gemma4's create_causal_mask_mapping. The
+            # vision-aware behaviour (tokens in the same vision group attend
+            # bidirectionally; text tokens stay causal) is now expressed via
+            # block_sequence_ids passed to the standard mask builders.
+            block_sequence_ids = torch.full(inputs_embeds.shape[:2], -1, device=inputs_embeds.device)
+            if mm_token_type_ids is not None:
+                block_sequence_ids = get_block_sequence_ids_for_mask(mm_token_type_ids, device=inputs_embeds.device)
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+                "block_sequence_ids": block_sequence_ids,
+            }
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
         else:
             from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
@@ -712,7 +722,6 @@ class Gemma4MoETextModelBackend(nn.Module):
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
-                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }

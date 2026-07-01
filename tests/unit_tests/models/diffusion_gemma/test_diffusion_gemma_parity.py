@@ -41,11 +41,6 @@ import torch
 
 _FORK_AVAILABLE = importlib.util.find_spec("transformers.models.diffusion_gemma") is not None
 
-pytestmark = pytest.mark.skipif(
-    not _FORK_AVAILABLE,
-    reason="transformers.models.diffusion_gemma (5.8-dev fork) not available",
-)
-
 
 def _tiny_text_config_dict() -> dict:
     """Tiny text-config shared by the fork and native configs.
@@ -90,6 +85,35 @@ def _build_fork_model(text_cfg: dict):
     config._attn_implementation = "eager"
     model = DiffusionGemmaForBlockDiffusion(config).to(torch.float32).eval()
     return model, config
+
+
+def _text_only_fork_available() -> bool:
+    """Whether the text-only ``diffusion_gemma`` reference this test needs is usable.
+
+    The parity reference is the text-only 5.8-dev ``diffusion_gemma`` fork.
+    transformers >= 5.12 upstreamed ``diffusion_gemma`` as a *multimodal* model
+    whose ``DiffusionGemmaEncoderModel`` unconditionally builds a ``vision_tower``
+    and cannot be constructed with ``vision_config=None`` (how this test builds
+    both models). Probe by building the tiny fork model text-only; if that fails
+    the upstream is the incompatible multimodal variant and the module is skipped.
+    See AM-588 for the DiffusionGemma parity follow-up.
+    """
+    if not _FORK_AVAILABLE:
+        return False
+    try:
+        _build_fork_model(_tiny_text_config_dict())
+    except Exception:
+        return False
+    return True
+
+
+pytestmark = pytest.mark.skipif(
+    not _text_only_fork_available(),
+    reason=(
+        "text-only diffusion_gemma fork unavailable "
+        "(transformers>=5.12 upstreamed it as a multimodal model; see AM-588)"
+    ),
+)
 
 
 def _build_native_model(text_cfg: dict):
