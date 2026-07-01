@@ -51,6 +51,11 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
     _resolve_chat_template,
 )
 from nemo_automodel.components.datasets.vlm.dspark_collate import build_dspark_vlm_dataloader
+from nemo_automodel.components.distributed.activation_checkpointing import (
+    apply_selective_checkpointing_to_layers,
+    apply_submodule_checkpointing,
+    is_selective_activation_checkpointing,
+)
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -281,6 +286,24 @@ def _resolve_reduced_target_layers(checkpoint_num_layers, requested):
             f"target_num_hidden_layers={n} must be in [1, {checkpoint_num_layers}] (the checkpoint's depth)."
         )
     return n
+
+
+def _apply_draft_activation_checkpointing(draft_model: torch.nn.Module, mode: bool | str) -> None:
+    """Apply the recipe's AC mode to the trainable DSpark draft before FSDP."""
+    if not mode or (isinstance(mode, str) and mode.lower() == "false"):
+        return
+    layers = list(getattr(draft_model, "layers", ()))
+    if not layers:
+        logger.warning("Draft activation checkpointing requested, but the draft exposes no layers.")
+        return
+    if is_selective_activation_checkpointing(mode):
+        apply_selective_checkpointing_to_layers(draft_model, layers, has_kv_sharing=False)
+        logger.info("Enabled selective activation checkpointing on %d draft layers", len(layers))
+    else:
+        # DSpark's native layers are not HF GradientCheckpointingLayer subclasses.
+        # Checkpoint their attention/MLP/norm submodules before FSDP indexes params.
+        apply_submodule_checkpointing(layers, has_kv_sharing=False)
+        logger.info("Enabled full activation checkpointing on %d draft layers", len(layers))
 
 
 class TrainDSparkRecipe(BaseRecipe):
@@ -565,6 +588,12 @@ class TrainDSparkRecipe(BaseRecipe):
             freeze=bool(recipe_cfg.get("freeze_embeddings", True)),
         )
 
+        dist_cfg = self.cfg.get("distributed", None)
+        activation_checkpointing = dist_cfg.get("activation_checkpointing", False) if dist_cfg is not None else False
+        # The target consumes this setting through its distributed setup, while
+        # the separately constructed trainable draft must be wrapped explicitly.
+        _apply_draft_activation_checkpointing(self.draft_model, activation_checkpointing)
+
         trainer_module = DSparkTrainerModule(
             self.draft_model,
             loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
@@ -575,7 +604,6 @@ class TrainDSparkRecipe(BaseRecipe):
         # Multi-GPU strategy: FSDP2 (default) shards the draft per block, or DDP.
         self.parallel_strategy = "ddp"
         if self.dist_env.world_size > 1:
-            dist_cfg = self.cfg.get("distributed", None)
             strategy = dist_cfg.get("strategy", "fsdp2") if dist_cfg is not None else "fsdp2"
             self.parallel_strategy = strategy
             if strategy == "fsdp2":

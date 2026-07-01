@@ -1,13 +1,14 @@
 # Experimental full-target MiniMax M3 DSpark training setup validated on
-# 16 nodes with 8x H100 80GB per node (128 GPUs total).
+# 8 nodes with 8x H100 80GB per node (64 GPUs total).
 #
 # This setup trains directly on Open-PerfectBlend without response regeneration.
 # It keeps pp_size=1 because DSpark captures hidden states from one complete target
-# forward, and uses ep_size=128 so each rank owns one of MiniMax M3's 128 routed
-# experts. The target remains frozen; only the five-layer dense draft is trained.
+# forward, and uses ep_size=64 so each rank owns two of MiniMax M3's 128 routed
+# experts. FSDP reshards the target's dense weights after each forward, and AC
+# limits activation memory in the five-layer trainable draft.
 #
 # Run the same command on every node, changing only --node-rank:
-#   torchrun --nnodes=16 --node-rank=0 --nproc-per-node=8 \
+#   torchrun --nnodes=8 --node-rank=0 --nproc-per-node=8 \
 #     --master-addr=<NODE0_IP> --master-port=29500 \
 #     -m nemo_automodel.recipes.llm.train_dspark \
 #     -c examples/speculative/dspark/minimax_m3_dspark_perfectblend_exp.yaml
@@ -24,10 +25,10 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 128
-  activation_checkpointing: false
+  ep_size: 64
+  activation_checkpointing: true
   moe:
-    reshard_after_forward: false
+    reshard_after_forward: true
     wrap_outer_model: true
 
 recipe_args:
@@ -39,7 +40,7 @@ recipe_args:
   output_dir: ./outputs/dspark_minimax_m3_perfectblend
   seq_length: 4096
   micro_batch_size: 1
-  grad_accumulation_steps: 4
+  grad_accumulation_steps: 8
   num_workers: 2
   num_epochs: 10
 

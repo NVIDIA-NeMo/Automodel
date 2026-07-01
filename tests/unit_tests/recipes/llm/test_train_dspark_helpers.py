@@ -15,6 +15,8 @@
 """CPU unit tests for the DSpark recipe's V4-Flash helper knobs.
 
 Covers the recipe-level glue added for the DeepSeek-V4-Flash target:
+- ``_apply_draft_activation_checkpointing``: the distributed AC setting wraps
+  the trainable draft's attention, MLP, and norm modules before FSDP.
 - ``_apply_target_chat_template``: a target whose tokenizer ships no chat
   template (V4-Flash) must take one from ``recipe_args.chat_template`` or fail
   fast, and an explicit template overrides whatever the tokenizer carries.
@@ -45,6 +47,7 @@ import torch
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm.train_dspark import (
+    _apply_draft_activation_checkpointing,
     _apply_target_chat_template,
     _build_dspark_optimizer,
     _extract_mm_kwargs,
@@ -65,6 +68,38 @@ def _tok(chat_template=None):
     """A minimal tokenizer stub: ``_has_chat_template`` needs a ``chat_template``
     attribute plus a callable ``apply_chat_template``."""
     return SimpleNamespace(chat_template=chat_template, apply_chat_template=lambda *a, **k: None)
+
+
+class _DraftLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = torch.nn.Linear(4, 4)
+        self.mlp = torch.nn.Linear(4, 4)
+        self.input_layernorm = torch.nn.LayerNorm(4)
+        self.post_attention_layernorm = torch.nn.LayerNorm(4)
+
+
+class _Draft(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_DraftLayer(), _DraftLayer()])
+
+
+def test_draft_activation_checkpointing_wraps_trainable_submodules():
+    draft = _Draft()
+    _apply_draft_activation_checkpointing(draft, True)
+    for layer in draft.layers:
+        assert hasattr(layer.self_attn, "_checkpoint_wrapped_module")
+        assert hasattr(layer.mlp, "_checkpoint_wrapped_module")
+        assert hasattr(layer.input_layernorm, "_checkpoint_wrapped_module")
+        assert hasattr(layer.post_attention_layernorm, "_checkpoint_wrapped_module")
+
+
+def test_draft_activation_checkpointing_false_is_noop():
+    draft = _Draft()
+    original_attention = draft.layers[0].self_attn
+    _apply_draft_activation_checkpointing(draft, False)
+    assert draft.layers[0].self_attn is original_attention
 
 
 # ---------------------------------------------------------------------------
