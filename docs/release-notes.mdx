@@ -2,6 +2,220 @@
 title: "Release Notes"
 description: ""
 ---
+## 0.5.0 · 26.06 · [PyPI](https://pypi.org/project/nemo-automodel/0.5.0/) · [GH](https://github.com/NVIDIA-NeMo/Automodel/releases/tag/v0.5.0) · [NGC Docker](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.06.00)
+
+### Highlights
+
+- **Agent SFT.** Train Qwen2.5-3B on multi-turn, function-calling ChatML or
+  ShareGPT data with full-SFT and LoRA recipes. The data adapter preserves tool
+  calls, tool responses, and optional `reasoning_content`.
+- **Speculative decoding.** Train EAGLE-1/2/3/3.1, P-EAGLE, and DFlash drafts
+  for Llama, Phi, Qwen3, Qwen3-MoE, GPT-OSS, and Nemotron Nano targets.
+- **Discrete-diffusion LLMs (dLLMs).** Train DFlash drafts and fine-tune
+  LLaDA2 or Nemotron-Labs-Diffusion with the new discrete-diffusion workflows.
+- **Diffusion.** Fine-tune and generate with FLUX.2-dev, Qwen-Image, and Wan
+  2.2 T2V-A14B; updated FLUX, Hunyuan, and Wan 2.1 recipes add LoRA and
+  throughput improvements.
+- **Large-scale MoE.** Run DeepSeek V4 with TileLang kernels, train MoE models
+  with MXFP8 on GB200, and use context parallelism for Qwen3.5/3.6 MoE VLMs.
+
+### New and Expanded Model Support
+
+#### LLM and MoE
+
+- **DeepSeek V4 Flash:** A native model and checkpoint adapter; HellaSwag
+  full-SFT, LoRA, and packed-sequence recipes; and large-scale TileLang PP/EP
+  recipes. The implementation covers hash routing, hyper-connections,
+  sparse/compressed attention, FP4/FP8 checkpoint loading, and multi-token
+  prediction.
+- **ERNIE 4.5:** HellaSwag recipes for the 0.3B dense and 21B-A3B MoE
+  checkpoints.
+- **MiMo-V2-Flash:** A HellaSwag fine-tuning recipe and native model
+  implementation with checkpoint conversion.
+- **Ling 2.0:** Mini, Flash, and 1T model paths with SFT, LoRA, HellaSwag,
+  SQuAD, and pipeline-parallel recipes.
+- **Hy3-preview:** DeepEP full-SFT and LoRA recipes for the 295B MoE model,
+  with model-specific expert-bias handling.
+- **HY-MT2-30B-A3B:** Native model support and a supervised fine-tuning
+  recipe.
+- **MiniMax-M2.7:** Pipeline-parallel full-SFT and LoRA recipes.
+- **Falcon H1:** Full-SFT recipes for 0.5B, 1.5B, and 7B checkpoints, plus 7B
+  and 34B PEFT recipes.
+- **MiniCPM5-1B:** Full-SFT and PEFT recipes.
+- **Nemotron-3-Ultra-550B-A55B:** A 16-node/128-GPU throughput benchmark and
+  a 32-node/256-GPU full-SFT recipe using a real router, THD sequence packing,
+  and a repeated MTP head.
+- **Qwen3.5/3.6 dense and MoE:** MTP support and a native dense Qwen3.5
+  backbone that keeps its SSM-gate parameters in fp32.
+
+#### Vision-Language Models
+
+- **Qwen3.6 VLM:** 27B dense and 35B-A3B SFT/LoRA recipes, including a 4K
+  MedPix EP8/CP2 recipe for the MoE model.
+- **Mistral Medium 3.5:** A 128B MedPix full fine-tuning recipe and matching
+  LoRA recipe.
+- **LLaVA-OneVision 1.5:** A 4B full fine-tuning recipe and an 8B LoRA recipe.
+- **VLM QLoRA:** The existing `quantization:` configuration block now works
+  with VLM fine-tuning, including BitsAndBytes 4-bit NF4 base weights with
+  LoRA adapters.
+- **VLM knowledge distillation:** A Qwen3.5-VL 9B-to-4B KD recipe with a
+  chunked KD loss, frozen vision/audio towers, and separate CE/KD metrics.
+- **Step-3.7-Flash:** Native support and MedPix SFT/LoRA recipes using EP and
+  PP. The full-SFT recipe targets 16 nodes/128 GPUs; the LoRA recipe targets
+  8 nodes/64 GPUs.
+
+#### Retrieval and Embeddings
+
+- **Late-interaction retrieval:** Multi-vector/MaxSim training for
+  ColBERT-style encoders, including distributed in-batch negatives.
+- **Bi-encoder positives:** Cycling over every positive passage instead of
+  choosing only one positive document per query.
+- **Embedding and reranker recipes:** A Ministral3 3B bi-encoder recipe and
+  model-coverage pages for bidirectional Ministral and Llama models.
+
+### Agent SFT and Speculative Decoding
+
+#### Agent SFT
+
+- The agent-chat data adapter accepts ChatML messages and ShareGPT
+  conversations, merges consecutive tool calls, pairs tool responses to call
+  IDs, and supervises assistant content and tool-call arguments.
+- `train_on_last_turn_only` masks every earlier assistant response and trains
+  only on the final assistant turn.
+- `reasoning_content` is preserved during data conversion;
+  `mask_reasoning_content` can include the trace in the prompt while excluding
+  it from loss.
+- Generation-based tool-call evaluation reports call presence, tool-name
+  accuracy, JSON validity, argument precision/recall, and exact argument match.
+
+#### Speculative Decoding
+
+- EAGLE-1/2 recipes support Llama, Phi, Qwen3, and Qwen3-MoE targets. EAGLE-3
+  adds GPT-OSS, and EAGLE-3.1 recipes cover Llama targets.
+- A remote target server/client path can train a draft model while target
+  supervision runs on a separate GPU.
+- P-EAGLE `sequence_partitions` splits a long-context draft step into
+  loss-equivalent segments to reduce activation memory.
+- Packed variable-length training uses block-causal attention and controls to
+  keep, save, or mask target-model reasoning traces.
+- Performance tools include SGLang acceptance/speedup benchmarking, offline
+  target-output caching, and a fused Triton soft-target cross-entropy kernel
+  that avoids allocating a full fp32 log-probability tensor.
+
+### Discrete-Diffusion LLMs
+
+- **DFlash:** A draft-training strategy that distills frozen target hidden
+  states with a position-decay loss, with Nemotron Nano 30B and Qwen3-4B
+  example recipes.
+- **LLaDA2:** A discrete-diffusion SFT recipe alongside the existing LLaDA
+  workflow.
+- **Nemotron-Labs-Diffusion:** A hybrid diffusion-LLM SFT recipe.
+
+### Diffusion
+
+- **FLUX.2-dev:** A model adapter, dataset processor, full fine-tuning recipe,
+  LoRA recipe, and generation configuration for its 4D positional-ID and
+  Mistral3 text-embedding architecture.
+- **Qwen-Image:** Model and processor support plus full fine-tuning,
+  pretraining, generation, and LoRA recipes. The LoRA recipe targets attention
+  and image/text MLP layers; the data collator pads variable-length cached
+  prompt embeddings.
+- **Wan 2.2 T2V-A14B:** Preprocessing, high-noise and low-noise stage
+  fine-tuning, and generation that loads independently trained checkpoints
+  into the matching denoisers.
+- **FLUX, Hunyuan, and Wan 2.1:** LoRA recipes for each workflow, a multi-node
+  Wan 2.1 recipe, and tuned full-SFT/LoRA settings including compile and FSDP
+  reduction-dtype controls.
+
+### Omni and Multimodal
+
+- **Bagel:** Model, dataset, pretraining and fine-tuning recipes, EMA support,
+  checkpoint adapter, and distributed initialization. The one-node examples
+  use token budgets validated for parity runs.
+- **Qwen2.5-Omni ASR:** AMI and multi-language SFT recipes for the 3B and 7B
+  checkpoints.
+- **Qwen3-Omni ASR:** AMI and multi-language audio SFT recipes.
+- **Nemotron-Omni vision:** A dynamic-resolution image path aligned with
+  vLLM image preprocessing, preventing training/rollout vision-embedding
+  divergence.
+- **Nemotron-Omni parallelism:** Activation checkpointing for the nested
+  language model and an EP8/CP2 VLM recipe that prepares and shards multimodal
+  embeddings across the context mesh.
+
+### Gemma 4
+
+- **TP/PP VLM support:** TP4/PP2 and TP4/PP4 recipes for Gemma 4 31B,
+  including pipeline-stage handling for image position IDs.
+- **LoRA coverage:** PEFT recipes for the 2B, 4B, 31B, and 26B-A4B MoE Gemma 4
+  VLM models.
+- **Joint drafter:** A Gemma 4 joint-drafter model, MedPix recipe, and MTP
+  inference benchmark.
+
+### Training, Parallelism, and Performance
+
+- **Selective FSDP2 activation checkpointing:**
+  `distributed.activation_checkpointing: selective` saves attention and
+  communication operations while alternating save/recompute for matrix
+  multiplies and grouped MoE GEMMs. It supports dense models, expert-parallel
+  MoE, single-GPU runs, and `torch.compile`.
+- **Memory-efficient LoRA:** `use_memory_efficient_lora` reduces adapter
+  training memory requirements.
+- **Qwen3.5/3.6 VLM context parallelism:** Image/video embeddings and mRoPE
+  positions are prepared before sequence sharding; the dense sequence index is
+  passed to linear attention, with a CP-aware validation denominator.
+- **Nemotron 3 parallelism:** Context and pipeline parallelism plus
+  MTP-related train-loop support.
+- **GB200 MXFP8 MoE:** Transformer Engine MXFP8 grouped-expert training for
+  Qwen3-MoE-30B, GPT-OSS-120B, and Qwen3-MoE-235B; the bf16 expert backend now
+  uses Transformer Engine grouped linear layers.
+- **Cross-entropy kernels:** Fused linear cross-entropy for custom models and
+  a CUDA Triton implementation of EAGLE soft-target cross-entropy.
+- **DeepSeek V4 kernels:** TileLang implementations for sparse MLA, the
+  lightning indexer, and MHC Sinkhorn. The CUDA environment installs TileLang
+  and TileKernels for the DeepSeek V4 recipes.
+- **Large-checkpoint loading:** Memory-mapped local HF DCP reads let each rank
+  map only its requested tensor slice instead of copying full tensors into host
+  RAM.
+
+### Data, Recipes, and Operations
+
+- Added S3 and multi-storage-client object sources to the Megatron pretraining
+  dataset path.
+- `data_dir_list` accepts `[num_samples, path]` entries for deterministic
+  per-source sampling before concatenation while retaining plain-path entries.
+- Added flat-list blend JSON files and lazy dataset preprocessing.
+- Retrieval runtime tuning exposes DDP bucket size, static graph, buffer
+  broadcast, unused-parameter, and gradient-bucket-view controls; FSDP2
+  `reshard_after_forward`; and averaged retrieval-loss logging.
+- Added runnable examples for agent SFT, EAGLE/DFlash, dLLM, diffusion, ASR,
+  retrieval, DeepSeek V4, Gemma 4, Qwen3.6, Nemotron Ultra, and Bagel.
+- Added NeMo-Run as a managed job launcher alongside local, Slurm, SkyPilot,
+  and Kubernetes workflows.
+
+### Packaging and Media Dependencies
+
+- The package is classified as Production/Stable, pins Transformers 5.8.1,
+  requires Transformer Engine 2.14.1 or newer, and resolves Linux PyTorch
+  packages from the CUDA 13.0 index.
+- Video and media packages are no longer installed by default through the
+  base, VLM, diffusion, or `all` extras. Install the media union when a workflow
+  needs OpenCV, decord, Qwen media utilities, or FFmpeg:
+
+  ```bash
+  uv pip install "nemo-automodel[media]"
+  ```
+
+  Use `nemo-automodel[vlm-media]` or
+  `nemo-automodel[diffusion-media]` when only one media stack is required.
+
+### Breaking Changes
+
+FSDP2 now defaults gradient reduction to `float32` while forward and backward
+compute remain in `bfloat16`. See [Breaking Changes](/development/breaking-changes)
+for the compatibility override and migration guidance.
+
+---
+
 ## 0.4.0 · 26.04 (2026-04-28) · [PyPI](https://pypi.org/project/nemo-automodel/0.4.0/) · [GH](https://github.com/NVIDIA-NeMo/Automodel/releases/tag/v0.4.0) · [NGC Docker](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.04.00)
 
 ### Highlights
