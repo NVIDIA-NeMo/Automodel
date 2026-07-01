@@ -1775,10 +1775,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._full_iteration_overflow_reruns = getattr(self, "_full_iteration_overflow_reruns", 0) + 1
         # No optimizer action has occurred. Destroy the graph before changing
         # dispatcher shape contracts or releasing/reprofiling page storage,
-        # then erase every gradient produced by the discarded attempt.
+        # then erase every gradient produced by the discarded attempt. Drop the
+        # returned loss graph and cached blocks before the exact rerun: dropless
+        # receive tensors can be larger than the guarded attempt and must not
+        # compete with dead graph/static allocations for the last few GiB.
+        del loss_buffer
         manager.reset()
         self._release_full_iteration_backend_handles()
         self._zero_optimizer_gradients()
+        gc.collect()
+        torch.cuda.empty_cache()
 
         backend = self._full_iteration_backend
         rank_capacity = backend.moe_expert_rank_capacity_factor

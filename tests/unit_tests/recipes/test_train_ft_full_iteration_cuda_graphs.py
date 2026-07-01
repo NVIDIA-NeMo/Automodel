@@ -186,7 +186,7 @@ def test_full_iteration_execution_error_is_not_masked_by_exceptional_cleanup(mon
     assert recipe.full_iteration_cuda_graph_manager is None
 
 
-def test_hybridep_overflow_discards_graph_gradients_and_reruns_same_batches_dropless():
+def test_hybridep_overflow_discards_graph_gradients_and_reruns_same_batches_dropless(monkeypatch):
     events = []
     manager = _GraphManager([torch.tensor(-1.0)], events)
     recipe = _recipe(manager, events)
@@ -194,6 +194,8 @@ def test_hybridep_overflow_discards_graph_gradients_and_reruns_same_batches_drop
     recipe._full_iteration_dispatchers = (dispatcher,)
     recipe._collect_full_iteration_overflow = lambda: (4, 0)
     recipe._zero_optimizer_gradients = lambda: events.append("zero-grad")
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.gc.collect", lambda: events.append("gc-collect"))
+    monkeypatch.setattr("torch.cuda.empty_cache", lambda: events.append("empty-cache"))
     eager_loss = [torch.tensor(0.75)]
     batches = [{"labels": torch.ones(1, 2, dtype=torch.long)}]
 
@@ -216,6 +218,8 @@ def test_hybridep_overflow_discards_graph_gradients_and_reruns_same_batches_drop
         "graph-reset",
         "release-handles",
         "zero-grad",
+        "gc-collect",
+        "empty-cache",
         ("rank-budget", None),
         "eager-rerun",
         ("rank-budget", 1.125),
