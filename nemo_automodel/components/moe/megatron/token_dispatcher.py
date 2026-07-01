@@ -444,6 +444,15 @@ class _HybridEPManager(_DispatchManager):
         if self.over_budget is not None:
             self.over_budget.zero_()
 
+    def reset_runtime_state(self) -> None:
+        """Release per-call HybridEP state after all device work has quiesced."""
+        self.handle = None
+        self.num_permuted_tokens = None
+        self.token_probs = None
+        self.routing_map = None
+        self.dispatched_probs = None
+        self.tokens_per_expert = None
+
     def _get_static_num_permuted_tokens(self) -> Optional[int]:
         """Return the aligned static rank budget for the current routing metadata."""
         if self.moe_expert_rank_capacity_factor is None:
@@ -804,6 +813,11 @@ class MoEFlexTokenDispatcher:
         """Reset HybridEP's static-budget overflow flag."""
         if isinstance(self._comm_manager, _HybridEPManager):
             self._comm_manager.reset_over_budget()
+
+    def reset_runtime_state(self) -> None:
+        """Release completed HybridEP call state before changing receive shape mode."""
+        if isinstance(self._comm_manager, _HybridEPManager):
+            self._comm_manager.reset_runtime_state()
 
     def _initialize_metadata(self, num_local_tokens: int, probs: torch.Tensor) -> torch.Tensor:
         """

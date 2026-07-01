@@ -51,6 +51,9 @@ class _Dispatcher:
     def reset_over_budget(self):
         self.events.append("overflow-reset")
 
+    def reset_runtime_state(self):
+        self.events.append("runtime-state-reset")
+
 
 def test_full_iteration_setup_allows_checkpointing_but_disables_paged_stash(monkeypatch):
     stash_manager = SimpleNamespace(configure=lambda **kwargs: setattr(stash_manager, "configured", kwargs))
@@ -208,9 +211,13 @@ def test_hybridep_overflow_discards_graph_gradients_and_reruns_same_batches_drop
     dispatcher = _Dispatcher(events)
     recipe._full_iteration_dispatchers = (dispatcher,)
     recipe._collect_full_iteration_overflow = lambda: (4, 0)
+    recipe._release_full_iteration_backend_handles = lambda: events.extend(["release-handles", "runtime-state-reset"])
     recipe._release_optimizer_gradient_storage = lambda: events.append("release-grad-storage")
+    monkeypatch.setattr("torch.cuda.synchronize", lambda _device: events.append("cuda-synchronize"))
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.gc.collect", lambda: events.append("gc-collect"))
     monkeypatch.setattr("torch.cuda.empty_cache", lambda: events.append("empty-cache"))
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+    monkeypatch.setattr("torch.distributed.barrier", lambda: events.append("rank-barrier"))
     eager_loss = [torch.tensor(0.75)]
     batches = [{"labels": torch.ones(1, 2, dtype=torch.long)}]
 
@@ -230,12 +237,15 @@ def test_hybridep_overflow_discards_graph_gradients_and_reruns_same_batches_drop
         "stash-prepare",
         "overflow-reset-all",
         ("graph", batches),
+        "cuda-synchronize",
         "graph-reset",
         "release-handles",
+        "runtime-state-reset",
         "release-grad-storage",
         "gc-collect",
         "empty-cache",
         ("rank-budget", None),
+        "rank-barrier",
         "eager-rerun",
         ("rank-budget", 1.125),
         "overflow-reset-all",

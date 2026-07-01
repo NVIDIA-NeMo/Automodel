@@ -315,6 +315,35 @@ def test_hybridep_combine_retains_handle_captured_by_cuda_graph():
     assert manager._cuda_graph_handles == [handle]
 
 
+def test_hybridep_reset_runtime_state_releases_completed_call_state():
+    """Shape-mode transitions must not retain checkpoint-recompute handles or metadata."""
+    with patch(
+        "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+        new=lambda *args, **kwargs: None,
+    ):
+        manager = _HybridEPManager(
+            group=None,
+            num_local_experts=2,
+            num_experts=8,
+            router_topk=2,
+        )
+    manager.handle = object()
+    manager.num_permuted_tokens = torch.tensor(4)
+    manager.token_probs = torch.ones(2, 8)
+    manager.routing_map = torch.ones(2, 8, dtype=torch.bool)
+    manager.dispatched_probs = torch.ones(4, 8)
+    manager.tokens_per_expert = torch.ones(2, dtype=torch.int32)
+
+    manager.reset_runtime_state()
+
+    assert manager.handle is None
+    assert manager.num_permuted_tokens is None
+    assert manager.token_probs is None
+    assert manager.routing_map is None
+    assert manager.dispatched_probs is None
+    assert manager.tokens_per_expert is None
+
+
 def test_hybridep_shared_manager_identity_includes_preprocessing_sms_for_ep():
     """EP layers share managers only when their HybridEP preprocessing configuration matches."""
     saved_alias = MoEFlexTokenDispatcher.shared_hybridep_manager

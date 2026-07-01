@@ -19,11 +19,41 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 import nemo_automodel.recipes.llm.full_iteration_cuda_graph as full_graph
+from nemo_automodel.components.moe.parallelizer import _checkpoint_without_early_stop
 from nemo_automodel.recipes.llm.full_iteration_cuda_graph import (
     FullIterationCudaGraphError,
     FullIterationCudaGraphManager,
     _StaticCudaBatchBuffer,
 )
+
+
+def test_moe_checkpoint_recomputes_the_full_tail_instead_of_stopping_early():
+    ordinary_tail_calls = []
+
+    def ordinary_block(value):
+        hidden = torch.sin(value)
+        output = torch.cos(hidden)
+        ordinary_tail_calls.append("collective-tail")
+        return output
+
+    ordinary_value = torch.randn(8, requires_grad=True)
+    ordinary_output = checkpoint(ordinary_block, ordinary_value, use_reentrant=False)
+    ordinary_output.sum().backward()
+
+    tail_calls = []
+
+    def checkpointed_block(value):
+        hidden = torch.sin(value)
+        output = torch.cos(hidden)
+        tail_calls.append("collective-tail")
+        return output
+
+    value = torch.randn(8, requires_grad=True)
+    output = _checkpoint_without_early_stop(checkpointed_block, value, preserve_rng_state=True)
+    output.sum().backward()
+
+    assert ordinary_tail_calls == ["collective-tail"]
+    assert tail_calls == ["collective-tail", "collective-tail"]
 
 
 def _batch(tensor: torch.Tensor, *, alias: bool = True):

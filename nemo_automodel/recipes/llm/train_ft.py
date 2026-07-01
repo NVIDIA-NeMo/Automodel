@@ -1670,12 +1670,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             stash_manager.prepare()
 
     def _release_full_iteration_backend_handles(self) -> None:
-        """Release opaque HybridEP handles after destroying the graph that owns them."""
+        """Release completed HybridEP handles and call metadata after graph teardown."""
         for dispatcher in getattr(self, "_full_iteration_dispatchers", ()):
             comm_manager = getattr(dispatcher, "_comm_manager", None)
             handles = getattr(comm_manager, "_cuda_graph_handles", None)
             if handles is not None:
                 handles.clear()
+            reset_runtime_state = getattr(dispatcher, "reset_runtime_state", None)
+            if callable(reset_runtime_state):
+                reset_runtime_state()
 
     def _full_iteration_cuda_graph_diagnostics(self) -> dict[str, Any]:
         """Return JSON-safe full-iteration graph and paged-stash counters."""
@@ -1790,6 +1793,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # receive tensors can be larger than the guarded attempt and must not
         # compete with dead graph/static allocations for the last few GiB.
         del loss_buffer
+        # The static HybridEP path avoids its host-side receive-size sync. The
+        # overflow collective only synchronizes its flag, so quiesce all device
+        # work before releasing opaque call handles or allocator storage.
+        torch.cuda.synchronize(self.dist_env.device)
         manager.reset()
         self._release_full_iteration_backend_handles()
         self._release_optimizer_gradient_storage()
@@ -1800,6 +1807,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         rank_capacity = backend.moe_expert_rank_capacity_factor
         for dispatcher in self._full_iteration_dispatchers:
             dispatcher.set_static_rank_budget(None)
+        # GC and empty_cache can take very different amounts of time on ranks
+        # that received different expert loads. HybridEP's internal all-gather
+        # has a short rendezvous timeout, so align all ranks before switching
+        # from static nonblocking dispatch to exact dynamic dispatch.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
         if self._full_iteration_paged_stash_enabled:
             from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager

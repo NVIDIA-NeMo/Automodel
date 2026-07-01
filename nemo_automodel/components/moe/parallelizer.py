@@ -27,7 +27,12 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy, OffloadPolicy
 from torch.distributed.tensor import Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
-from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+from torch.utils.checkpoint import (
+    CheckpointPolicy,
+    checkpoint,
+    create_selective_checkpoint_contexts,
+    set_checkpoint_early_stop,
+)
 
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
@@ -38,6 +43,12 @@ from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
 _CP_STREAM = None
+
+
+def _checkpoint_without_early_stop(function, *args, **kwargs):
+    """Run non-reentrant checkpoint while keeping rank-symmetric MoE collectives."""
+    with set_checkpoint_early_stop(False):
+        return checkpoint(function, *args, use_reentrant=False, **kwargs)
 
 
 def _moe_shard_placement(param):
@@ -345,14 +356,25 @@ def apply_ac(
     for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
         if mtp_repeated and id(block) in mtp_block_ids:
             continue
+        # Non-reentrant checkpoint normally stops recomputation as soon as its
+        # last needed tensor is rebuilt. With skewed MoE routes, ranks can reach
+        # that point on opposite sides of a HybridEP collective and permanently
+        # desynchronize its rendezvous epoch. Megatron's reentrant checkpoint
+        # always reruns the whole block; retain graph-capable non-reentrant AC
+        # while requiring the same rank-symmetric full-block recomputation.
         if ignore_router:
             block = ptd_checkpoint_wrapper(
                 block,
+                checkpoint_fn=_checkpoint_without_early_stop,
                 preserve_rng_state=True,
                 context_fn=selective_checkpointing_context_fn,
             )
         else:
-            block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
+            block = ptd_checkpoint_wrapper(
+                block,
+                checkpoint_fn=_checkpoint_without_early_stop,
+                preserve_rng_state=True,
+            )
 
         parent_layers.register_module(layer_id, block)
 
