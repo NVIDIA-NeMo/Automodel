@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from nemo_automodel.components.config import loader as loader_module
 from nemo_automodel.components.config.loader import (
     ConfigNode,
     _resolve_target,
@@ -163,6 +164,7 @@ def test_instantiate_simple(tmp_module):
     obj = cfg.instantiate()
     assert isinstance(obj, mod.Point)
     assert (obj.x, obj.y) == (1, 2)
+
 
 @pytest.mark.parametrize(
     "path, exists",
@@ -330,6 +332,7 @@ def test_load_yaml_config_resolves_oc_env(monkeypatch, tmp_path: Path):
     cfg = load_yaml_config(str(yml))
     assert cfg.dataset.delta_storage_options.DATABRICKS_HOST == "https://example.databricks.local"
 
+
 def test_load_yaml_config_oc_env_default(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("NOT_SET", raising=False)
     yml = tmp_path / "cfg.yaml"
@@ -430,8 +433,15 @@ def test_resolve_target_non_string_passthrough():
     assert _resolve_target(42) == 42
 
 
-def test_resolve_target_file_colon(tmp_path):
+def test_safe_base_dir_defaults_to_repo_root():
+    """File-based target resolution should default to the repository root boundary."""
+    assert loader_module.SAFE_BASE_DIR == Path(__file__).resolve().parents[3]
+
+
+def test_resolve_target_file_colon(tmp_path, monkeypatch):
     """`path/to/file.py:object_name` is resolved correctly."""
+    monkeypatch.setattr(loader_module, "ENABLE_USER_MODULES", False)
+    monkeypatch.setattr(loader_module, "SAFE_BASE_DIR", tmp_path)
     script = tmp_path / "tools.py"
     script.write_text(
         textwrap.dedent(
@@ -446,6 +456,27 @@ def test_resolve_target_file_colon(tmp_path):
     # We get back the function object itself
     assert callable(target)
     assert target() == 42
+
+
+def test_resolve_target_file_colon_blocks_out_of_tree_file(tmp_path, monkeypatch):
+    """Out-of-tree file targets should be rejected unless user modules are enabled."""
+    monkeypatch.setattr(loader_module, "ENABLE_USER_MODULES", False)
+    monkeypatch.setattr(loader_module, "SAFE_BASE_DIR", tmp_path)
+    script = tmp_path.parent / "outside_tools.py"
+    script.write_text("meaning = 42\n")
+
+    with pytest.raises(ImportError, match="out-of-tree code"):
+        _resolve_target(f"{script}:meaning")
+
+
+def test_resolve_target_file_colon_allows_out_of_tree_file_when_opted_in(tmp_path, monkeypatch):
+    """Out-of-tree file targets should still work when the opt-in is enabled."""
+    monkeypatch.setattr(loader_module, "ENABLE_USER_MODULES", True)
+    monkeypatch.setattr(loader_module, "SAFE_BASE_DIR", tmp_path)
+    script = tmp_path.parent / "outside_tools.py"
+    script.write_text("meaning = 42\n")
+
+    assert _resolve_target(f"{script}:meaning") == 42
 
 
 def test_instantiate_skips_kwargs_overridden_nested(tmp_module):
