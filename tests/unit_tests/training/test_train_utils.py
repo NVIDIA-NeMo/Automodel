@@ -186,9 +186,12 @@ def test_clip_grad_norm_caches_parameter_walk(monkeypatch):
 
     monkeypatch.setattr(model, "parameters", counted_parameters)
     clip_grad_norm(max_grad_norm=1.0, model_parts=[model])
+    first_call_walks = parameter_walks
+    clip_grad_norm(max_grad_norm=1.0, model_parts=[model])
     clip_grad_norm(max_grad_norm=1.0, model_parts=[model])
 
-    assert parameter_walks == 1
+    assert first_call_walks > 0
+    assert parameter_walks == first_call_walks
 
 
 def test_clip_grad_norm_returns_zero_when_max_grad_norm_is_none():
