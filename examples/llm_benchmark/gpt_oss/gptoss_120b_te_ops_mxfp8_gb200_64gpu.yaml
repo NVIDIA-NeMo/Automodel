@@ -7,9 +7,11 @@
 # forward/backward fusion. The five-microbatch forward/backward schedule is
 # captured as one CUDA graph after two eager warmups. HybridEP uses a guarded
 # 1.125x receive budget; any over-budget route discards the attempt and reruns
-# the same batches through exact dynamic dispatch before the optimizer. TE
-# expert saves are packed by live token count into GPU pages. No activation
-# recompute is used. Detailed sub-step timers remain disabled.
+# the same batches through exact dynamic dispatch before the optimizer. Paged
+# expert stashing remains available for memory-constrained shapes, but is
+# disabled here because ordinary graph-saved tensors are faster at this
+# operating point. No activation recompute is used. Detailed sub-step timers
+# remain disabled.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
@@ -76,9 +78,7 @@ model:
     full_iteration_cuda_graph_warmup_steps: 2
     full_iteration_cuda_graph_single_mempool: true
     moe_expert_rank_capacity_factor: 1.125
-    moe_paged_stash: true
-    moe_paged_stash_page_size: 64
-    moe_paged_stash_buffer_size_factor_cuda: 1.10
+    moe_paged_stash: false
     # Cache GEMM-ready expert weights once per optimizer generation while the
     # ordinary stacked BF16 Parameters remain the optimizer/checkpoint owners.
     te_ops_mxfp8_weight_cache: true
