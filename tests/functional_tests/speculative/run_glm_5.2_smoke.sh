@@ -25,7 +25,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO"
 TARGET="${TARGET:?set TARGET=/path/to/GLM-5.2 (local path or hub id)}"
 WORK="${WORK:-$REPO/.glm_smoke_work}"
-SMOKE_YAML="examples/speculative/dspark/glm_5.2_smoke.yaml"
+BASE_YAML="examples/speculative/dspark/glm_5.2_dspark.yaml"
 mkdir -p "$WORK"
 
 echo "### 1/4  CPU unit tests (draft / config / registry / freqs pin)"
@@ -45,13 +45,35 @@ PY
 
 echo "### 3/4  materialize run config (point it at your target + smoke data)"
 RUN_YAML="$WORK/smoke.yaml"
-python - "$SMOKE_YAML" "$RUN_YAML" "$TARGET" "$WORK/train.jsonl" "$WORK/out" <<'PY'
+python - "$BASE_YAML" "$RUN_YAML" "$TARGET" "$WORK/train.jsonl" "$WORK/out" <<'PY'
 import sys, yaml
 src, dst, target, data, out = sys.argv[1:6]
 c = yaml.safe_load(open(src))
-c["recipe_args"]["target_model_name_or_path"] = target
-c["recipe_args"]["train_data_path"] = data
-c["recipe_args"]["output_dir"] = out
+dist = c["distributed"]
+dist["ep_size"] = 8
+dist["activation_checkpointing"] = True
+
+args = c["recipe_args"]
+args["target_model_name_or_path"] = target
+args["train_data_path"] = data
+args.pop("train_split", None)
+args["val_data_path"] = None
+args.pop("val_split", None)
+args["output_dir"] = out
+args["seq_length"] = 512
+args["micro_batch_size"] = 1
+args["grad_accumulation_steps"] = 1
+args["num_workers"] = 0
+args["num_epochs"] = 1
+args["target_num_hidden_layers"] = 6
+args["draft_num_hidden_layers"] = 2
+args["num_anchors"] = 16
+args["target_layer_ids"] = [3, 4, 5]
+args["log_every_steps"] = 1
+
+c["optimizer"]["warmup_ratio"] = 0.0
+c["checkpoint"]["enabled"] = False
+c["wandb"]["enable"] = False
 yaml.safe_dump(c, open(dst, "w"), sort_keys=False)
 print("wrote", dst)
 PY

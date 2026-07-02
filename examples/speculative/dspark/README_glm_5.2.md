@@ -31,7 +31,7 @@ The full 78-layer target does **not** fit on a single 8x80GB node; use `ep_size>
 (4+ nodes), or `ep_size=64` (8 nodes, the default in `glm_5.2_dspark.yaml`). This is a
 resident-weight peak in the expert dequant, **not** fixable by lowering `seq_length` or
 enabling `activation_checkpointing`. To sanity-check the whole path on **one** node first,
-use the smoke config (it reduces the target to 4 layers).
+use the smoke runner (it derives a temporary config with only 6 target layers).
 
 ## Prerequisites
 
@@ -76,9 +76,10 @@ finite and trends down:
 TARGET=/path/to/GLM-5.2 bash tests/functional_tests/speculative/run_glm_5.2_smoke.sh
 ```
 
-It runs the CPU unit tests, builds 64 tiny smoke rows, runs an 8-GPU training smoke with
-`glm_5.2_smoke.yaml`, and asserts a finite, non-increasing loss. A draft trained by the
-smoke is a pipeline check, not a usable drafter.
+It runs the CPU unit tests, builds 64 tiny smoke rows, derives a temporary reduced config
+from `glm_5.2_dspark.yaml`, runs an 8-GPU training smoke, and asserts a finite,
+non-increasing loss. A draft trained by the smoke is a pipeline check, not a usable
+drafter.
 
 ## 3. Full training (multi-node)
 

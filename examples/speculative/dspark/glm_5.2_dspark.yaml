@@ -29,8 +29,9 @@
 #     --master-addr=<NODE0_IP> --master-port=29500 \
 #     -m nemo_automodel.recipes.llm.train_dspark -c examples/speculative/dspark/glm_5.2_dspark.yaml
 #
-# To first sanity-check the whole path on ONE node in minutes, use the smoke config
-# (glm_5.2_smoke.yaml), which shrinks the target to 4 layers so it fits.
+# To first sanity-check the whole path on ONE node in minutes, run
+# tests/functional_tests/speculative/run_glm_5.2_smoke.sh. It derives a temporary
+# config from this recipe and shrinks the target to 6 layers so it fits.
 
 recipe: TrainDSparkRecipe
 
