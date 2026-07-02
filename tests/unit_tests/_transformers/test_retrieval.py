@@ -77,7 +77,44 @@ def test_biencoder_build_applies_optimized_vl_flags(monkeypatch):
     assert calls == ["custom", "mlp", "qkv", "siglip", "pooling_head"]
 
 
-def test_biencoder_build_warns_when_optimized_vl_flags_do_not_apply(monkeypatch, caplog):
+@pytest.mark.parametrize(
+    ("flag_kwargs", "failing_helper", "bad_return", "error_match"),
+    [
+        (
+            {"use_custom_llama_backend": True},
+            "replace_language_model_with_custom_llama",
+            False,
+            "use_custom_llama_backend requested but the loaded backbone was not replaced",
+        ),
+        (
+            {"use_custom_llama_backend": True, "use_te_fused_mlp": True},
+            "replace_llama_mlp_with_te_fused",
+            0,
+            "use_te_fused_mlp requested but no custom LLaMA MLP layers were fused",
+        ),
+        (
+            {"use_custom_llama_backend": True, "use_te_fused_qkv": True},
+            "replace_llama_qkv_with_te_fused",
+            0,
+            "use_te_fused_qkv requested but no custom LLaMA QKV layers were fused",
+        ),
+        (
+            {"use_te_fused_siglip_layer": True},
+            "replace_siglip_encoder_layers_with_te_fused",
+            0,
+            "use_te_fused_siglip_layer requested but no SigLIP encoder layers were replaced",
+        ),
+        (
+            {"disable_unused_siglip_pooling_head": True},
+            "disable_unused_siglip_pooling_head_grad",
+            0,
+            "disable_unused_siglip_pooling_head requested but no SigLIP pooling-head parameters were disabled",
+        ),
+    ],
+)
+def test_biencoder_build_raises_when_optimized_vl_flags_do_not_apply(
+    monkeypatch, flag_kwargs, failing_helper, bad_return, error_match
+):
     import nemo_automodel.components.models.llama_nemotron_vl.model as vl_model
     from nemo_automodel._transformers import retrieval
 
@@ -87,30 +124,15 @@ def test_biencoder_build_warns_when_optimized_vl_flags_do_not_apply(monkeypatch,
             self.config = SimpleNamespace()
 
     monkeypatch.setattr(retrieval, "build_encoder_backbone", lambda *args, **kwargs: FakeBackbone())
-    monkeypatch.setattr(vl_model, "replace_language_model_with_custom_llama", lambda model: False)
-    monkeypatch.setattr(vl_model, "replace_llama_mlp_with_te_fused", lambda model: 0)
-    monkeypatch.setattr(vl_model, "replace_llama_qkv_with_te_fused", lambda model: 0)
-    monkeypatch.setattr(vl_model, "replace_siglip_encoder_layers_with_te_fused", lambda model: 0)
-    monkeypatch.setattr(vl_model, "disable_unused_siglip_pooling_head_grad", lambda model: 0)
+    monkeypatch.setattr(vl_model, "replace_language_model_with_custom_llama", lambda model: True)
+    monkeypatch.setattr(vl_model, "replace_llama_mlp_with_te_fused", lambda model: 1)
+    monkeypatch.setattr(vl_model, "replace_llama_qkv_with_te_fused", lambda model: 1)
+    monkeypatch.setattr(vl_model, "replace_siglip_encoder_layers_with_te_fused", lambda model: 1)
+    monkeypatch.setattr(vl_model, "disable_unused_siglip_pooling_head_grad", lambda model: 1)
+    monkeypatch.setattr(vl_model, failing_helper, lambda model: bad_return)
 
-    retrieval.BiEncoderModel.build(
-        "local-vl-model",
-        task="embedding",
-        use_custom_llama_backend=True,
-        use_te_fused_mlp=True,
-        use_te_fused_qkv=True,
-        use_te_fused_siglip_layer=True,
-        disable_unused_siglip_pooling_head=True,
-    )
-
-    assert "use_custom_llama_backend requested but the loaded backbone was not replaced" in caplog.text
-    assert "use_te_fused_mlp requested but no custom LLaMA MLP layers were fused" in caplog.text
-    assert "use_te_fused_qkv requested but no custom LLaMA QKV layers were fused" in caplog.text
-    assert "use_te_fused_siglip_layer requested but no SigLIP encoder layers were replaced" in caplog.text
-    assert (
-        "disable_unused_siglip_pooling_head requested but no SigLIP pooling-head parameters were disabled"
-        in caplog.text
-    )
+    with pytest.raises(RuntimeError, match=error_match):
+        retrieval.BiEncoderModel.build("local-vl-model", task="embedding", **flag_kwargs)
 
 
 def _tiny_mistral3_vlm_config(text_model_type: str) -> Mistral3Config:

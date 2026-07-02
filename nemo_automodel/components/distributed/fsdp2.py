@@ -48,6 +48,8 @@ def _patch_is_packed_sequence_for_training() -> bool:
 
         if getattr(_fa_utils, "_is_packed_sequence_patched", False):
             return True  # already patched
+        if not hasattr(_fa_utils, "_is_packed_sequence"):
+            return False
 
         def _is_packed_sequence_no_sync(position_ids, batch_size):
             # Non-packed training: position_ids is always a simple arange -- never packed.

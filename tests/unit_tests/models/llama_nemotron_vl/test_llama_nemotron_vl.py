@@ -23,6 +23,7 @@ from PIL import Image
 from transformers.image_utils import PILImageResampling
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
+from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 from transformers.processing_utils import ProcessorMixin
 
 from nemo_automodel.components.models.common import BackendConfig
@@ -635,6 +636,16 @@ def test_replace_siglip_encoder_layers_with_te_fused_supports_flattened_layout(f
 
     assert replace_siglip_encoder_layers_with_te_fused(model) == 1
     assert isinstance(model.vision_model.encoder.layers[0], FusedTESiglipEncoderLayer)
+    assert model._nemo_use_te_fused_siglip_layer is True
+
+
+def test_replace_siglip_encoder_layers_with_te_fused_supports_real_siglip_layout(fake_transformer_engine):
+    del fake_transformer_engine
+    config = SiglipVisionConfig(**_tiny_vision_config())
+    model = SimpleNamespace(select_layer=-1, vision_model=SiglipVisionModel(config))
+
+    assert replace_siglip_encoder_layers_with_te_fused(model) == config.num_hidden_layers
+    assert all(isinstance(layer, FusedTESiglipEncoderLayer) for layer in model.vision_model.encoder.layers)
     assert model._nemo_use_te_fused_siglip_layer is True
 
 
