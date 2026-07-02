@@ -20,13 +20,11 @@ import pytest
 import torch.nn as nn
 
 import nemo_automodel.components.distributed.parallelizer as parallelizer
-from nemo_automodel.components.distributed.optimized_tp_plans import (
-    PARALLELIZE_FUNCTIONS,
-    _parallelize_qwen3_5_vlm,
-)
-from nemo_automodel.components.distributed.parallelizer import (
+from nemo_automodel.components.distributed.tp_plan import (
+    get_hf_tp_shard_plan,
     translate_to_torch_parallel_style,
 )
+from nemo_automodel.components.models.qwen3_5.parallelizer import get_tp_plan
 
 
 class TestTranslateToTorchParallelStyleReplicatedWithGradAllreduce:
@@ -68,23 +66,13 @@ class TestGetHfTpShardPlanSkipsNoneStyles:
                 "layers.0.self_attn.q_norm": "replicated_with_grad_allreduce",
             }
         )
-        plan = parallelizer.get_hf_tp_shard_plan(model)
+        plan = get_hf_tp_shard_plan(model)
         assert "model.layers.0.self_attn.q_proj" in plan
         assert "model.layers.0.self_attn.q_norm" not in plan
 
 
-class TestParallelizeQwen35VlmRegistered:
-    """_parallelize_qwen3_5_vlm is registered in PARALLELIZE_FUNCTIONS and
-    delegates to get_hf_tp_shard_plan so transformers' native base_model_tp_plan
-    is reused."""
-
-    def test_qwen3_5_vlm_entry_present_in_registry(self):
-        # Use the hard-coded qualname string to avoid importing
-        # transformers.models.qwen3_5 at test-collection time, which would
-        # defeat other tests that stub that module before first import.
-        key = "transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5ForConditionalGeneration"
-        assert key in PARALLELIZE_FUNCTIONS
-        assert PARALLELIZE_FUNCTIONS[key] is _parallelize_qwen3_5_vlm
+class TestQwen35VlmSidecar:
+    """The Qwen3.5 model sidecar reuses its native Hugging Face TP plan."""
 
     def test_delegates_to_get_hf_tp_shard_plan(self, monkeypatch):
         sentinel_plan = {"probe": "value"}
@@ -94,9 +82,12 @@ class TestParallelizeQwen35VlmRegistered:
             calls.append(model)
             return sentinel_plan
 
-        monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", fake_get_hf_tp_shard_plan)
+        monkeypatch.setattr(
+            "nemo_automodel.components.models.qwen3_5.parallelizer.get_hf_tp_shard_plan",
+            fake_get_hf_tp_shard_plan,
+        )
         dummy = object()
-        result = _parallelize_qwen3_5_vlm(dummy, sequence_parallel=False)
+        result = get_tp_plan(dummy, sequence_parallel=False)
         assert result is sentinel_plan
         assert calls == [dummy]
 

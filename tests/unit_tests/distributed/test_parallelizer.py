@@ -29,11 +29,9 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
 import nemo_automodel.components.distributed.parallelizer as parallelizer
-from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
 from nemo_automodel.components.distributed.parallelizer import (
     _attention_is_head_sharded,
     _extract_model_layers,
-    _get_parallel_plan,
     _update_attention_head_counts_for_tp,
     apply_fsdp2_sharding_recursively,
     get_hf_tp_shard_plan,
@@ -367,25 +365,6 @@ def mock_distributed_env(monkeypatch):
         "fsdp": fsdp_mock,
         "tensor_parallel": tp_parallel_mock,
     }
-
-
-@pytest.fixture
-def mock_optimized_tp_plans(monkeypatch):
-    """Mock the PARALLELIZE_FUNCTIONS dictionary."""
-    mock_plans = {}
-
-    def mock_llama_plan(model, sequence_parallel=False):
-        return {"model.layers.0.self_attn.q_proj": ColwiseParallel()}
-
-    def mock_gemma3_plan(model, sequence_parallel=False):
-        return {"language_model.layers.0.self_attn.q_proj": ColwiseParallel()}
-
-    # Mock the import to avoid actual dependency
-    with patch("nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS", mock_plans):
-        # Add mock functions for different model types
-        mock_plans[type(MockModel())] = mock_llama_plan
-        mock_plans[type(create_gemma3_mock())] = mock_gemma3_plan
-        yield mock_plans
 
 
 class TestMegatronFSDPStrategyParallelize:
@@ -1021,96 +1000,6 @@ class TestUnshardFsdp2Model:
 
             # Verify reshard was still called despite the exception
             assert test_fsdp_module.reshard_called is True
-
-
-class TestGetParallelPlanClassNameFallback:
-    """Test that _get_parallel_plan matches by qualified class name (module.qualname)."""
-
-    def test_identity_match(self):
-        """Exact class qualname in PARALLELIZE_FUNCTIONS is found."""
-        sentinel_plan = {"layer": ColwiseParallel()}
-        model = MockModel()
-
-        with patch(
-            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {_get_class_qualname(type(model)): lambda m, sp: sentinel_plan},
-        ):
-            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
-        assert plan is sentinel_plan
-
-    def test_class_name_fallback(self):
-        """A different class object with the same module.qualname still matches.
-
-        With the old class-object-keyed dict, identity was required. With the new
-        string-keyed dict, two distinct class objects that share ``__module__`` and
-        ``__qualname__`` resolve to the same key and both match — which is exactly
-        the NeMo-RL wrapping scenario this fix targets.
-        """
-        sentinel_plan = {"layer": ColwiseParallel()}
-
-        # Create a *different* class object with the same name (and therefore the same
-        # module.qualname since both are defined in this test module).
-        DuplicateMockModel = type("MockModel", (nn.Module,), {"forward": lambda self, x: x})
-        assert DuplicateMockModel is not MockModel
-        assert _get_class_qualname(DuplicateMockModel) == _get_class_qualname(MockModel)
-
-        model = MockModel()
-        model.__class__ = DuplicateMockModel  # model's type is the duplicate
-
-        with patch(
-            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {_get_class_qualname(MockModel): lambda m, sp: sentinel_plan},
-        ):
-            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
-        # Matches because module.qualname is the same, even though the class object differs
-        assert plan is sentinel_plan
-
-    def test_nemo_rl_wrapped_class_match(self):
-        """A different class object with the same module and qualname still matches.
-
-        This simulates the NeMo-RL scenario: _get_mixin_wrapped_class() creates a new
-        class via type(...) that preserves __module__ and __qualname__ from the original.
-        Both the original and the wrapper resolve to the same _get_class_qualname() key.
-        """
-        sentinel_plan = {"layer": ColwiseParallel()}
-        original_cls = type(MockModel())
-
-        # Simulate _get_mixin_wrapped_class: create a *new* class object that copies
-        # __module__ and __qualname__ from the original (same qualname, different object)
-        WrappedCls = type(
-            original_cls.__name__,
-            (nn.Module,),
-            {
-                "forward": lambda self, x: x,
-                "__module__": original_cls.__module__,
-                "__qualname__": original_cls.__qualname__,
-            },
-        )
-        assert WrappedCls is not original_cls
-        assert _get_class_qualname(WrappedCls) == _get_class_qualname(original_cls)
-
-        model = MockModel()
-        model.__class__ = WrappedCls  # model's type is the wrapper
-
-        with patch(
-            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {_get_class_qualname(original_cls): lambda m, sp: sentinel_plan},
-        ):
-            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
-        assert plan is sentinel_plan
-
-    def test_no_match_falls_through_to_default(self):
-        """Completely unknown class qualname falls through to the default plan."""
-        model = MockModel()
-        model.__class__ = type("UnknownModel", (nn.Module,), {"forward": lambda self, x: x})
-
-        with patch(
-            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {_get_class_qualname(MockModel): lambda m, sp: {"x": ColwiseParallel()}},
-        ):
-            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
-        # Should get the default Llama3-style plan (has q_proj, k_proj, etc.)
-        assert "model.layers.*.self_attn.q_proj" in plan
 
 
 class TestUpdateAttentionHeadCountsForTP:

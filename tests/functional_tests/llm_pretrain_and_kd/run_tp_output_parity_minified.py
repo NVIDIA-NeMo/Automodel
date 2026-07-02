@@ -57,7 +57,8 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan, _update_attention_head_counts_for_tp
+from nemo_automodel.components.distributed.parallelizer import _update_attention_head_counts_for_tp
+from nemo_automodel.components.distributed.tp_plan import get_tp_plan
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
 from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
 from nemo_automodel.components.models.common.utils import BackendConfig
@@ -458,7 +459,7 @@ def _run_case(
     else:
         tp_shard_plan = None
     tp_mesh = DeviceMesh(device_type, torch.arange(world_size, device="cpu"), mesh_dim_names=("tp",))
-    plan = _get_parallel_plan(tp_model, sequence_parallel=case.sequence_parallel, tp_shard_plan=tp_shard_plan)
+    plan = get_tp_plan(tp_model, sequence_parallel=case.sequence_parallel, tp_shard_plan=tp_shard_plan)
     parallelize_module(tp_model, tp_mesh, plan)
     if case.kind == "nemotron":
         _update_attention_head_counts_for_tp(tp_model, tp_mesh.size())

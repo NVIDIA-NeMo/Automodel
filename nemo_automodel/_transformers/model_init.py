@@ -785,6 +785,61 @@ def _restore_loaded_model_dtype(
         logger.info("Restored checkpoint dtypes for %d tensors from %s", restored_count, pretrained_model_name_or_path)
 
 
+def _parallelizer_module_path(model, architecture: str) -> str | None:
+    """Resolve a model-local parallelizer sidecar without importing its model."""
+    model_module_path = ModelRegistry.get_model_module_path(architecture)
+    if model_module_path is not None:
+        return f"{model_module_path.rpartition('.')[0]}.parallelizer"
+
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if not isinstance(model_type, str):
+        return None
+    return f"nemo_automodel.components.models.{model_type.replace('-', '_')}.parallelizer"
+
+
+def _attach_parallelization_strategy(model, architectures: list[str]) -> None:
+    """Attach a lazy strategy factory when an adapter owns model policy.
+
+    Native model classes declare this factory themselves. This adapter covers
+    the ``force_hf`` and fallback paths for upstream classes that share an
+    architecture name with a native implementation.
+    """
+    if not architectures:
+        return
+
+    architecture = architectures[0]
+    if architecture == "NemotronHForCausalLM":
+
+        def _get_nemotron_h_parallelization_strategy():
+            from nemo_automodel.components.models.nemotron_v3.parallelizer import get_parallelization_strategy
+
+            return get_parallelization_strategy()
+
+        model._nemo_parallelization_strategy_factory = _get_nemotron_h_parallelization_strategy
+
+    if hasattr(model, "_nemo_tp_plan_factory"):
+        return
+    factory_module = _parallelizer_module_path(model, architecture)
+    if factory_module is None:
+        return
+
+    from importlib.util import find_spec
+
+    try:
+        sidecar_exists = find_spec(factory_module) is not None
+    except ModuleNotFoundError:
+        sidecar_exists = False
+    if not sidecar_exists:
+        return
+
+    def _get_nemo_tp_plan(target_model, *, sequence_parallel: bool = False):
+        from importlib import import_module
+
+        return import_module(factory_module).get_tp_plan(target_model, sequence_parallel=sequence_parallel)
+
+    model._nemo_tp_plan_factory = _get_nemo_tp_plan
+
+
 def __init_model(
     cls,
     pretrained_model_name_or_path_or_config,
@@ -843,7 +898,7 @@ def __init_model(
     ):
         try:
             logger.info("Using streaming BnB quantization for memory-efficient loading")
-            return _init_model_bnb_streaming(
+            is_custom_model, model = _init_model_bnb_streaming(
                 cls,
                 pretrained_model_name_or_path,
                 hf_config,
@@ -852,6 +907,8 @@ def __init_model(
                 quantization_config,
                 **kwargs,
             )
+            _attach_parallelization_strategy(model, architectures)
+            return is_custom_model, model
         except FileNotFoundError:
             logger.warning(
                 "Streaming BnB loading unavailable (no safetensors checkpoint); falling back to standard HF loading."
@@ -896,6 +953,7 @@ def __init_model(
         except KeyError:
             pass  # fallback to use the model class from the model object
         model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
+        _attach_parallelization_strategy(model, architectures)
         return False, model
 
     # 2. If we have a custom model implementation available, we prioritize that over HF
@@ -928,7 +986,9 @@ def __init_model(
 
                 kwargs["backend"] = BackendConfig(**kwargs["backend"])
             with local_torch_dtype(torch_dtype, model_cls.__name__):
-                return True, model_cls(hf_config, *model_args, **kwargs)
+                model = model_cls(hf_config, *model_args, **kwargs)
+            _attach_parallelization_strategy(model, architectures)
+            return True, model
 
     # 3. fallback to HF model class wrapped with mixin
     model = None
@@ -988,6 +1048,7 @@ def __init_model(
     except KeyError:
         pass  # fallback to use the model class from the model object
     model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
+    _attach_parallelization_strategy(model, architectures)
     return False, model
 
 

@@ -17,8 +17,6 @@ import logging
 import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from functools import lru_cache
-from types import FunctionType
 from typing import Any, Dict, Generator, List, Optional, Union
 
 import torch
@@ -42,7 +40,7 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
     parallelize_module,
 )
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
@@ -99,16 +97,12 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
-from nemo_automodel._transformers.v4_patches.rotary import _is_nemotron_flash_config
-from nemo_automodel.components.distributed.optimized_tp_plans import (
-    LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
-    PARALLELIZE_FUNCTIONS,
-    VocabParallelEmbedding,
-    _get_class_qualname,
-    get_decilm_nemotron_tp_plan,
-    get_llama_nemotron_super_tp_plan,
-)
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+from nemo_automodel.components.distributed.tp_plan import (
+    get_hf_tp_shard_plan,  # noqa: F401
+    get_tp_plan,
+    translate_to_torch_parallel_style,  # noqa: F401
+)
 
 # TODO(boxiangw): Change to MegatronFSDP once it got published
 HAVE_MEGATRON_FSDP = False
@@ -120,9 +114,6 @@ try:
     HAVE_MEGATRON_FSDP = True
 except (ImportError, FileNotFoundError, OSError):
     pass
-
-# Import as module so tests can patch nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype
-import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_utils
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -280,12 +271,9 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         fsdp2_backward_prefetch_depth: int = 2,
         fsdp2_forward_prefetch_depth: int = 1,
         reshard_after_forward: Optional[bool] = None,
-        fully_shard_fn=None,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
         tp_mesh = device_mesh[tp_mesh_name]
-        if fully_shard_fn is None:
-            fully_shard_fn = fully_shard
 
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
         # if dp_replicate_size > 1, use HSDP, else use FSDP
@@ -314,10 +302,10 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             # Generate or use tensor parallel plan
             model_parallel_plan = {
                 k: translate_to_lora(v)
-                for k, v in _get_parallel_plan(
+                for k, v in get_tp_plan(
                     model,
-                    sequence_parallel,
-                    tp_shard_plan,
+                    sequence_parallel=sequence_parallel,
+                    tp_shard_plan=tp_shard_plan,
                     tp_size=tp_mesh.size(),
                 ).items()
             }
@@ -404,7 +392,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         _patch_fsdp_accumulated_grad_guard()
 
         # Find transformer layers and apply parallelisms
-        apply_fsdp2_sharding_recursively(
+        self._shard_modules_recursively(
             model,
             dp_mesh,
             mp_policy,
@@ -413,13 +401,12 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth,
             reshard_after_forward,
-            fully_shard_fn=fully_shard_fn,
         )
 
         # Apply FSDP to the root model
         # Do not reshard after forward for root model because its parameters
         # will be used in backward immediately
-        model = fully_shard_fn(
+        return self._shard_module(
             model,
             mesh=dp_mesh,
             mp_policy=mp_policy,
@@ -427,467 +414,191 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             offload_policy=offload_policy,
         )
 
-        return model
-
-
-def _nemotronh_decoder_blocks(model: nn.Module) -> tuple[nn.Module, list[nn.Module]]:
-    """Return ``(container, blocks)`` for a NemotronH model's decoder blocks.
-
-    Two distinct classes share the name ``NemotronHForCausalLM``:
-
-    * the HF model keeps its blocks in ``model.backbone.layers`` (an ``nn.ModuleList``), while
-    * the native Nemotron-V3 model (``NemotronV3Model``) keeps them in ``model.model.layers``
-      (an ``nn.ModuleDict`` keyed ``"0".."N-1"``).
-
-    ``container`` is the underlying ``ModuleList``/``ModuleDict`` (so callers can write rewrapped
-    blocks back into the model), and ``blocks`` is the ordered list of block modules.
-    """
-    inner = model.backbone if hasattr(model, "backbone") else model.model
-    container = inner.layers
-    blocks = list(container.values()) if isinstance(container, nn.ModuleDict) else list(container)
-    return container, blocks
-
-
-class NemotronHParallelizationStrategy(ParallelizationStrategy):
-    """Specialized parallelization strategy for NemotronH models."""
-
-    def parallelize(
+    def _shard_module(
         self,
-        model: nn.Module,
-        device_mesh: DeviceMesh,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        offload_policy: Optional[OffloadPolicy] = None,
-        sequence_parallel: bool = False,
-        activation_checkpointing: bool = False,
-        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
-        dp_replicate_mesh_name: str = "dp_replicate",
-        dp_shard_cp_mesh_name: str = "dp_shard_cp",
-        tp_mesh_name: str = "tp",
-        reshard_after_forward: Optional[bool] = None,
-        **kwargs,
+        module: nn.Module,
+        *,
+        mesh: DeviceMesh,
+        mp_policy: Optional[MixedPrecisionPolicy],
+        offload_policy: Optional[OffloadPolicy],
+        reshard_after_forward: Optional[bool],
     ) -> nn.Module:
-        """Apply NemotronH-specific parallelization."""
-        assert not sequence_parallel, "Sequence parallelism is not supported for NemotronHForCausalLM"
-        logger.info("Custom parallel plan is not supported for NemotronHForCausalLM. Using NemotronH-specific TP plan.")
+        """Wrap one FSDP unit.
 
-        block_container, layers = _nemotronh_decoder_blocks(model)
-        tp_mesh = device_mesh[tp_mesh_name]
-        if tp_mesh.size() > 1:
-            model_tp_plan: dict[str, ParallelStyle] = {
-                "lm_head": translate_to_lora(ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)),
-            }
-
-            mlp_tp_plan: dict[str, ParallelStyle] = {
-                "mixer.up_proj": translate_to_lora(ColwiseParallel()),
-                "mixer.down_proj": translate_to_lora(RowwiseParallel()),
-            }
-
-            parallelize_module(model, tp_mesh, model_tp_plan)
-
-            for layer in layers:
-                if layer.block_type == "mlp":
-                    parallelize_module(layer, tp_mesh, mlp_tp_plan)
-
-        # Set up context parallel for Mamba and Attention layers
-        cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
-        if cp_mesh is not None and cp_mesh.size() > 1:
-            cp_group = cp_mesh.get_group()
-
-            for layer in layers:
-                if hasattr(layer, "block_type") and layer.block_type == "mamba":
-                    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
-
-                    mixer = layer.mixer
-                    mixer.cp = MambaContextParallel(
-                        cp_group=cp_group,
-                        num_heads=mixer.num_heads,
-                        head_dim=mixer.head_dim,
-                        n_groups=mixer.n_groups,
-                        d_state=mixer.ssm_state_size,
-                        mixer=mixer,
-                    )
-                elif hasattr(layer, "block_type") and layer.block_type == "attention":
-                    from transformer_engine.pytorch.attention import DotProductAttention
-
-                    attn_module = layer.mixer.attn_module
-                    if isinstance(attn_module, DotProductAttention):
-                        attn_module.set_context_parallel_group(
-                            cp_group,
-                            torch.distributed.get_process_group_ranks(cp_group),
-                            torch.cuda.Stream(),
-                            cp_comm_type="p2p",
-                        )
-
-        if activation_checkpointing:
-            # Write rewrapped blocks back into the real container (ModuleList -> int key,
-            # ModuleDict -> str key) so the model, not just the local handle, is updated.
-            block_items = (
-                block_container.items() if isinstance(block_container, nn.ModuleDict) else enumerate(block_container)
-            )
-            for key, layer in list(block_items):
-                if getattr(layer, "block_type", None) in ("mlp", "mamba"):
-                    block_container[key] = checkpoint_wrapper(layer)
-            # Refresh the local handle so the FSDP wrap below sees the wrapped blocks.
-            _, layers = _nemotronh_decoder_blocks(model)
-
-        dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-
-        fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
-
-        for layer in layers:
-            parallelizer_utils.fully_shard_by_dtype(
-                layer,
-                mesh=dp_mesh,
-                mp_policy=mp_policy,
-                offload_policy=offload_policy,
-                fp32_compute_module_names=fp32_compute_module_names,
-                reshard_after_forward=reshard_after_forward,
-            )
-
-        # do not reshard after forward for root model
-        # because its parameters will be used in backward immediately
+        Model-owned strategies override this hook when a model needs a custom
+        FSDP unit layout or precision policy. The generic strategy never takes
+        a model-specific sharding callback.
+        """
         return fully_shard(
-            model,
-            mesh=dp_mesh,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-            reshard_after_forward=False,
-        )
-
-
-class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
-    """Parallelization strategy for Qwen3.5 dense models with mixed-dtype GatedDeltaNet.
-
-    Qwen3.5 has linear_attn layers with float32 params (A_log, norm) alongside
-    bfloat16 params. Overrides the FSDP sharding step to use fully_shard_by_dtype
-    per layer, and sets the CP mesh on CPAwareGatedDeltaNet modules.
-    """
-
-    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
-        cp_mesh_name = dp_shard_cp_mesh_name.replace("dp_shard_", "")
-        cp_enabled = cp_mesh_name in device_mesh.mesh_dim_names and device_mesh[cp_mesh_name].size() > 1
-
-        # The Qwen3.5 model builds CPAwareGatedDeltaNet with a fp32 ``SSMGate``
-        # (``_fp32_params``) at construction — no runtime patch needed. Keep those
-        # params in their own dtype-uniform fp32 FSDP group (true master weights).
-        fp32_compute_module_names = ("_fp32_params",)
-
-        # Delegate TP, AC, mixed precision to the default strategy, but
-        # override the FSDP sharding to use fully_shard_by_dtype.
-        # Temporarily swap the global — safe because model init is single-threaded
-        # (one model is parallelized at a time). Not safe under concurrent calls.
-        original_fn = globals().get("apply_fsdp2_sharding_recursively")
-        assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
-
-        def _fsdp_by_dtype(
             module,
-            mesh,
-            mp_policy,
-            offload_policy=None,
-            enable_fsdp2_prefetch=True,
-            fsdp2_backward_prefetch_depth=2,
-            fsdp2_forward_prefetch_depth=1,
-            reshard_after_forward=None,
-            fully_shard_fn=None,
-        ):
-            del enable_fsdp2_prefetch, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth, fully_shard_fn
-            pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
+            mesh=mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=reshard_after_forward,
+            offload_policy=offload_policy,
+        )
 
-            if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
-                all_items = list(module.items()) if isinstance(module, nn.ModuleDict) else list(enumerate(module))
-                flat_layer_items = [
-                    (layer_id, child)
-                    for layer_id, child in all_items
-                    if not isinstance(child, (nn.ModuleList, nn.ModuleDict))
-                ]
-                nested_items = [
-                    (layer_id, child)
-                    for layer_id, child in all_items
-                    if isinstance(child, (nn.ModuleList, nn.ModuleDict))
-                ]
+    def _shard_modules_recursively(
+        self,
+        module: nn.Module,
+        mesh: DeviceMesh,
+        mp_policy: Optional[MixedPrecisionPolicy],
+        offload_policy: Optional[OffloadPolicy] = None,
+        enable_fsdp2_prefetch: bool = True,
+        fsdp2_backward_prefetch_depth: int = 2,
+        fsdp2_forward_prefetch_depth: int = 1,
+        reshard_after_forward: Optional[bool] = None,
+    ) -> None:
+        """Recursively wrap FSDP units, optimizing decoder-layer containers."""
+        pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
 
-                for _, child in nested_items:
-                    _fsdp_by_dtype(
-                        child,
-                        mesh,
-                        mp_policy,
-                        offload_policy,
-                        reshard_after_forward=reshard_after_forward,
-                    )
-
-                for enum_id, (_, child) in enumerate(flat_layer_items):
-                    if reshard_after_forward is not None:
-                        layer_reshard_after_forward = reshard_after_forward
-                    elif pp_enabled:
-                        layer_reshard_after_forward = False
-                    else:
-                        layer_reshard_after_forward = enum_id < len(flat_layer_items) - 1
-                    parallelizer_utils.fully_shard_by_dtype(
-                        child,
-                        mesh,
-                        mp_policy,
-                        offload_policy,
-                        fp32_compute_module_names=fp32_compute_module_names,
-                        reshard_after_forward=layer_reshard_after_forward,
-                    )
+        if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
+            # After pipeline splitting, functional.py replaces nn.ModuleList with nn.ModuleDict
+            # (keyed by string layer indices). Normalise both to a list of (key, child) pairs.
+            if isinstance(module, nn.ModuleDict):
+                all_items = list(module.items())
+                is_container = lambda child: isinstance(child, (nn.ModuleList, nn.ModuleDict))
             else:
-                for _, sub in module.named_children():
-                    _fsdp_by_dtype(
-                        sub,
-                        mesh,
-                        mp_policy,
-                        offload_policy,
-                        reshard_after_forward=reshard_after_forward,
-                    )
+                all_items = [(index, module[index]) for index in range(len(module))]
+                is_container = lambda child: isinstance(child, nn.ModuleList)
 
-        globals()["apply_fsdp2_sharding_recursively"] = _fsdp_by_dtype
-        try:
-            result = super().parallelize(
-                model,
-                device_mesh,
-                dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
-                **kwargs,
-            )
-        finally:
-            globals()["apply_fsdp2_sharding_recursively"] = original_fn
+            flat_layer_items = [(key, child) for key, child in all_items if not is_container(child)]
+            nested_items = [(key, child) for key, child in all_items if is_container(child)]
 
-        # Set CP mesh on CPAwareGatedDeltaNet modules
-        if cp_enabled:
-            from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
-
-            cp_mesh = device_mesh[cp_mesh_name]
-            for _, mod in model.named_modules():
-                if isinstance(mod, CPAwareGatedDeltaNet):
-                    mod._cp_mesh = cp_mesh
-
-        return result
-
-
-class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
-    """DeepSeek-V4 keeps a small set of reference-sensitive parameters in fp32."""
-
-    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
-        from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
-
-        return super().parallelize(
-            model,
-            device_mesh,
-            dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
-            fully_shard_fn=fully_shard_deepseek_v4,
-            **kwargs,
-        )
-
-
-class WanParallelizationStrategy(ParallelizationStrategy):
-    """Parallelization strategy for Wan-style transformer modules used in Diffusers.
-
-    Applies TP to condition embedders, FFN projections in each block, and final projection,
-    then applies FSDP sharding similarly to other strategies.
-    """
-
-    def parallelize(
-        self,
-        model: nn.Module,
-        device_mesh: DeviceMesh,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        offload_policy: Optional[OffloadPolicy] = None,
-        sequence_parallel: bool = False,
-        activation_checkpointing: bool = False,
-        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
-        dp_replicate_mesh_name: str = "dp_replicate",
-        dp_shard_cp_mesh_name: str = "dp_shard_cp",
-        tp_mesh_name: str = "tp",
-        **kwargs,
-    ) -> nn.Module:
-        # Not using custom tp_shard_plan; apply Wan-specific plan
-        tp_mesh = device_mesh[tp_mesh_name]
-        dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-
-        # Apply TP only when TP group size > 1
-        if tp_mesh.size() > 1:
-            # Condition embedders if present
-            try:
-                if hasattr(model, "condition_embedder"):
-                    cond = model.condition_embedder
-                    if hasattr(cond, "text_embedder"):
-                        cond.text_embedder = parallelize_module(
-                            cond.text_embedder,
-                            tp_mesh,
-                            {
-                                "linear_1": ColwiseParallel(),
-                                "linear_2": RowwiseParallel(),
-                            },
-                        )
-                    if hasattr(cond, "time_embedder"):
-                        cond.time_embedder = parallelize_module(
-                            cond.time_embedder,
-                            tp_mesh,
-                            {
-                                "linear_1": ColwiseParallel(),
-                                "linear_2": RowwiseParallel(),
-                            },
-                        )
-                    if hasattr(cond, "time_proj"):
-                        cond.time_proj = parallelize_module(
-                            cond.time_proj,
-                            tp_mesh,
-                            {"": ColwiseParallel()},
-                        )
-            except Exception as e:
-                logger.warning(f"Wan strategy: failed to TP condition embedders: {e}")
-
-            # Blocks FFN and final projection
-            try:
-                if hasattr(model, "blocks"):
-                    for block in model.blocks:
-                        if hasattr(block, "ffn"):
-                            block.ffn = parallelize_module(
-                                block.ffn,
-                                tp_mesh,
-                                {
-                                    "net.0.proj": ColwiseParallel(),
-                                    "net.2": RowwiseParallel(),
-                                },
-                            )
-                if hasattr(model, "proj_out"):
-                    model.proj_out = parallelize_module(model.proj_out, tp_mesh, {"": RowwiseParallel()})
-            except Exception as e:
-                logger.warning(f"Wan strategy: failed to TP blocks/proj_out: {e}")
-
-        # Activation checkpointing wraps every WanTransformerBlock so its
-        # forward activations are recomputed on backward instead of being
-        # held in memory. Critical for Wan2.2-A14B (14B params, ~30k-token
-        # video sequence) — without this, fp32 layer-norm casts in the block
-        # forward will OOM even on 8x80GB H100.
-        if activation_checkpointing and hasattr(model, "blocks"):
-            for idx in range(len(model.blocks)):
-                model.blocks[idx] = checkpoint_wrapper(
-                    model.blocks[idx],
-                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            # Recurse into nested layer containers before wrapping their leaves.
+            for _, child_module in nested_items:
+                self._shard_modules_recursively(
+                    child_module,
+                    mesh,
+                    mp_policy,
+                    offload_policy,
+                    enable_fsdp2_prefetch,
+                    fsdp2_backward_prefetch_depth,
+                    fsdp2_forward_prefetch_depth,
+                    reshard_after_forward,
                 )
 
-        # Mixed precision default like Default strategy
-        if not mp_policy:
-            mp_policy = MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.float32,
-                output_dtype=torch.float32,
-            )
-
-        # Apply FSDP sharding recursively and to root
-        apply_fsdp2_sharding_recursively(
-            model,
-            dp_mesh,
-            mp_policy,
-            offload_policy,
-            kwargs.get("enable_fsdp2_prefetch", True),
-            kwargs.get("fsdp2_backward_prefetch_depth", 2),
-            kwargs.get("fsdp2_forward_prefetch_depth", 1),
-        )
-
-        return fully_shard(
-            model,
-            mesh=dp_mesh,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-            reshard_after_forward=False,
-        )
-
-
-class HunyuanParallelizationStrategy(ParallelizationStrategy):
-    """Parallelization strategy for Hunyuan-style transformer modules used in HunyuanVideo."""
-
-    def parallelize(
-        self,
-        model: nn.Module,
-        device_mesh: DeviceMesh,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        offload_policy: Optional[OffloadPolicy] = None,
-        sequence_parallel: bool = False,
-        activation_checkpointing: bool = True,
-        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
-        dp_replicate_mesh_name: str = "dp_replicate",
-        dp_shard_cp_mesh_name: str = "dp_shard_cp",
-        tp_mesh_name: str = "tp",
-        **kwargs,
-    ) -> nn.Module:
-        dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-
-        # Mixed precision default like Default strategy
-        if not mp_policy:
-            mp_policy = MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.float32,
-                output_dtype=torch.bfloat16,
-            )
-        # Apply activation checkpointing to transformer blocks if requested
-        if activation_checkpointing:
-            for idx in range(len(model.transformer_blocks)):
-                model.transformer_blocks[idx] = checkpoint_wrapper(
-                    model.transformer_blocks[idx],
-                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
+                # With PP: keep weights gathered across microbatches (no per-microbatch all-gather).
+                # Without PP: reshard all but last layer to enable forward+backward weight prefetching.
+                if reshard_after_forward is not None:
+                    layer_reshard_after_forward = reshard_after_forward
+                elif pp_enabled:
+                    layer_reshard_after_forward = False
+                else:
+                    layer_reshard_after_forward = enum_id < len(flat_layer_items) - 1
+                self._shard_module(
+                    child_module,
+                    mesh=mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=layer_reshard_after_forward,
+                    offload_policy=offload_policy,
                 )
+                module[layer_key] = child_module
 
-        # Apply FSDP sharding recursively and to root
-        apply_fsdp2_sharding_recursively(
-            model,
-            dp_mesh,
-            mp_policy,
-            offload_policy,
-            kwargs.get("enable_fsdp2_prefetch", True),
-            kwargs.get("fsdp2_backward_prefetch_depth", 2),
-            kwargs.get("fsdp2_forward_prefetch_depth", 1),
-        )
+            # Set up explicit forward/backward prefetch chains when layers are being resharded.
+            # With PP or an explicit no-reshard override, weights are always gathered -- no prefetch needed.
+            should_prefetch = reshard_after_forward is not False and not pp_enabled and enable_fsdp2_prefetch
+            if should_prefetch:
+                fsdp_units = [child for _, child in flat_layer_items if not is_container(child)]
+                if fsdp2_forward_prefetch_depth > 0:
+                    for index in range(len(fsdp_units) - 1):
+                        targets = [
+                            fsdp_units[index + depth]
+                            for depth in range(1, fsdp2_forward_prefetch_depth + 1)
+                            if index + depth < len(fsdp_units)
+                        ]
+                        if targets and hasattr(fsdp_units[index], "set_modules_to_forward_prefetch"):
+                            fsdp_units[index].set_modules_to_forward_prefetch(targets)
+                for index in range(1, len(fsdp_units)):
+                    targets = []
+                    for depth in range(1, fsdp2_backward_prefetch_depth + 1):
+                        if index - depth >= 0:
+                            targets.append(fsdp_units[index - depth])
+                    if targets and hasattr(fsdp_units[index], "set_modules_to_backward_prefetch"):
+                        fsdp_units[index].set_modules_to_backward_prefetch(targets)
+            return
 
-        return fully_shard(
-            model,
-            mesh=dp_mesh,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-            reshard_after_forward=False,
-        )
+        for name, sub_module in module.named_children():
+            # A frozen audio tower never runs in the forward on image/text-only
+            # data (in gemma E4B and E2B models), so wrapping its layers as their own FSDP units leaves those
+            # units never all-gathered. Under gradient accumulation FSDP's
+            # deferred post-backward then dereferences their (never-created)
+            # ``_unsharded_param`` and raises ``AttributeError``. Skip it so its
+            # params stay with the always-run root FSDP unit (which is still
+            # sharded, and whose frozen params have ``grad is None`` so the
+            # accumulate path is a no-op). Mirrors the audio_tower guard in
+            # ``components/moe/parallelizer.py``.
+            if name == "audio_tower" and _subtree_all_frozen(sub_module):
+                continue
+            self._shard_modules_recursively(
+                sub_module,
+                mesh,
+                mp_policy,
+                offload_policy,
+                enable_fsdp2_prefetch,
+                fsdp2_backward_prefetch_depth,
+                fsdp2_forward_prefetch_depth,
+                reshard_after_forward,
+            )
 
 
-# Strategy registry mapping model class names to parallelization strategies
-PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
-    "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
-    "DeepseekV4ForCausalLM": DeepseekV4ParallelizationStrategy(),
-    "Qwen3_5ForConditionalGeneration": Qwen3_5ParallelizationStrategy(),
-    "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
-    "WanTransformer3DModel": WanParallelizationStrategy(),
-    "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
-}
+# The registry is a stable extension point for out-of-tree strategies. Built-in
+# model and adapter strategies use the lazy per-instance protocol below instead
+# of mutating global state during import.
+PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {}
 
-# Default strategy instance
 _DEFAULT_STRATEGY = DefaultParallelizationStrategy()
 
 
 def get_parallelization_strategy(model: nn.Module) -> ParallelizationStrategy:
-    """Get the appropriate parallelization strategy for the given model."""
-    model_name = type(model).__name__
-    return PARALLELIZATION_STRATEGIES.get(model_name, _DEFAULT_STRATEGY)
+    """Return a model-owned, adapter-owned, or registered strategy.
+
+    A native model may expose ``_nemo_parallelization_strategy_factory``. The
+    factory is called only when FSDP2 parallelization is requested, so model
+    imports do not pull in a distributed strategy sidecar. Adapters for
+    upstream model classes may instead attach a ready strategy instance as
+    ``_nemo_parallelization_strategy`` immediately before parallelization.
+    """
+    strategy = getattr(model, "_nemo_parallelization_strategy", None)
+    if strategy is not None:
+        if not isinstance(strategy, ParallelizationStrategy):
+            raise TypeError("_nemo_parallelization_strategy must be a ParallelizationStrategy")
+        return strategy
+
+    strategy_factory = getattr(model, "_nemo_parallelization_strategy_factory", None)
+    if strategy_factory is not None:
+        strategy = strategy_factory()
+        if not isinstance(strategy, ParallelizationStrategy):
+            raise TypeError("_nemo_parallelization_strategy_factory must return a ParallelizationStrategy")
+        return strategy
+
+    return PARALLELIZATION_STRATEGIES.get(type(model).__name__, _DEFAULT_STRATEGY)
 
 
 def register_parallel_strategy(arg=None, *, name: Optional[str] = None):
-    """Decorator to register out-of-tree parallelism strategies.
+    """Register an out-of-tree strategy under a model class name.
 
-    Supports:
-    - @register_parallel_strategy(name="CustomModelName")
+    Args:
+        name: Model class name resolved by get_parallelization_strategy.
+
+    Returns:
+        A decorator that registers a ParallelizationStrategy subclass.
     """
 
     def _register(cls):
-        # The decorator receives a class, not an instance.
-        assert isinstance(cls, type) and issubclass(cls, ParallelizationStrategy), (
-            f"cls must be a subclass of ParallelizationStrategy, but got {type(cls)} {cls}"
-        )
-        assert name is not None, "name is required"
-        assert name not in PARALLELIZATION_STRATEGIES, f"name {name} already registered"
+        if not isinstance(cls, type) or not issubclass(cls, ParallelizationStrategy):
+            raise ValueError(f"Expected ParallelizationStrategy subclass, got {cls!r}")
+        if name is None:
+            raise ValueError("name is required")
+        if name in PARALLELIZATION_STRATEGIES:
+            raise ValueError(f"name {name!r} is already registered")
         PARALLELIZATION_STRATEGIES[name] = cls()
         return cls
 
+    if arg is not None:
+        raise ValueError("register_parallel_strategy must be called with name=<model class name>")
     if name is None:
         raise ValueError("name is required")
-    # If used with parentheses (possibly with arguments)
     return _register
 
 
@@ -1022,254 +733,23 @@ def apply_fsdp2_sharding_recursively(
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
     reshard_after_forward: Optional[bool] = None,
-    fully_shard_fn=None,
 ) -> None:
+    """Apply the default strategy's FSDP2 traversal in place.
+
+    Model-specific traversal and wrapping belong in their own
+    :class:`ParallelizationStrategy`; this compatibility helper deliberately
+    exposes no callback for replacing ``fully_shard``.
     """
-    Recursively apply FSDP2 sharding to modules, with optimizations for ModuleList.
-
-    This utility function traverses a model hierarchy and applies FSDP2 sharding
-    to each module. For ModuleList instances (commonly used for transformer layers),
-    it applies an optimization where the last layer doesn't reshard after forward
-    since FSDP2 will prefetch it immediately.
-
-    Handles both single-level and nested ModuleList/ModuleDict structures. If a
-    ModuleList contains other ModuleLists, it will recurse into them instead of trying
-    to wrap them (since ModuleList doesn't have a forward method).
-
-    Args:
-        module (nn.Module): The module to apply FSDP sharding to.
-        mesh (DeviceMesh): The device mesh for FSDP sharding.
-        mp_policy (Optional[MixedPrecisionPolicy]): Mixed precision policy for FSDP.
-        offload_policy (Optional[OffloadPolicy]): CPU offload policy for FSDP.
-            Defaults to None.
-        enable_fsdp2_prefetch (bool): Enable explicit forward/backward prefetch chains.
-        fsdp2_backward_prefetch_depth (int): Backward prefetch depth.
-        fsdp2_forward_prefetch_depth (int): Forward prefetch depth.
-        reshard_after_forward (Optional[bool]): Optional override for each layer's
-            ``fully_shard`` reshard behavior.
-    Note:
-        This function modifies the module in-place by replacing modules with their
-        FSDP2-subclassed versions.
-    """
-    if fully_shard_fn is None:
-        fully_shard_fn = fully_shard
-
-    pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
-
-    if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
-        # After pipeline splitting, functional.py replaces nn.ModuleList with nn.ModuleDict
-        # (keyed by string layer indices). Normalise both to a list of (key, child) pairs.
-        if isinstance(module, nn.ModuleDict):
-            all_items = list(module.items())
-            _is_container = lambda c: isinstance(c, (nn.ModuleList, nn.ModuleDict))
-        else:
-            all_items = [(i, module[i]) for i in range(len(module))]
-            _is_container = lambda c: isinstance(c, nn.ModuleList)
-
-        flat_layer_items = [(k, c) for k, c in all_items if not _is_container(c)]
-        nested_items = [(k, c) for k, c in all_items if _is_container(c)]
-        nested_lists = nested_items  # kept for len() checks below
-
-        # Recurse into any nested ModuleLists first (unchanged behavior).
-        for layer_id, child_module in nested_lists:
-            apply_fsdp2_sharding_recursively(
-                child_module,
-                mesh,
-                mp_policy,
-                offload_policy,
-                enable_fsdp2_prefetch,
-                fsdp2_backward_prefetch_depth,
-                fsdp2_forward_prefetch_depth,
-                reshard_after_forward,
-                fully_shard_fn=fully_shard_fn,
-            )
-
-        for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
-            # With PP: keep weights gathered across microbatches (no per-microbatch all-gather).
-            # Without PP: reshard all but last layer to enable forward+backward weight prefetching.
-            if reshard_after_forward is not None:
-                layer_reshard_after_forward = reshard_after_forward
-            elif pp_enabled:
-                layer_reshard_after_forward = False
-            else:
-                layer_reshard_after_forward = enum_id < len(flat_layer_items) - 1
-            fully_shard_fn(
-                child_module,
-                mesh=mesh,
-                mp_policy=mp_policy,
-                reshard_after_forward=layer_reshard_after_forward,
-                offload_policy=offload_policy,
-            )
-            module[layer_key] = child_module
-
-        # Set up explicit forward/backward prefetch chains when layers are being resharded.
-        # With PP or an explicit no-reshard override, weights are always gathered -- no prefetch needed.
-        if reshard_after_forward is False:
-            should_prefetch = False
-        else:
-            should_prefetch = not pp_enabled and enable_fsdp2_prefetch
-        if should_prefetch:
-            fsdp_units = [c for _, c in flat_layer_items if not _is_container(c)]
-            if fsdp2_forward_prefetch_depth > 0:
-                for i in range(len(fsdp_units) - 1):
-                    targets = [
-                        fsdp_units[i + j] for j in range(1, fsdp2_forward_prefetch_depth + 1) if i + j < len(fsdp_units)
-                    ]
-                    if targets:
-                        fsdp_units[i].set_modules_to_forward_prefetch(targets)
-            for i in range(1, len(fsdp_units)):
-                targets = []
-                for d in range(1, fsdp2_backward_prefetch_depth + 1):
-                    if i - d >= 0:
-                        targets.append(fsdp_units[i - d])
-                if targets:
-                    fsdp_units[i].set_modules_to_backward_prefetch(targets)
-    else:
-        for name, sub_module in module.named_children():
-            # A frozen audio tower never runs in the forward on image/text-only
-            # data (in gemma E4B and E2B models), so wrapping its layers as their own FSDP units leaves those
-            # units never all-gathered. Under gradient accumulation FSDP's
-            # deferred post-backward then dereferences their (never-created)
-            # ``_unsharded_param`` and raises ``AttributeError``. Skip it so its
-            # params stay with the always-run root FSDP unit (which is still
-            # sharded, and whose frozen params have ``grad is None`` so the
-            # accumulate path is a no-op). Mirrors the audio_tower guard in
-            # ``components/moe/parallelizer.py``.
-            if name == "audio_tower" and _subtree_all_frozen(sub_module):
-                continue
-            apply_fsdp2_sharding_recursively(
-                sub_module,
-                mesh,
-                mp_policy,
-                offload_policy,
-                enable_fsdp2_prefetch,
-                fsdp2_backward_prefetch_depth,
-                fsdp2_forward_prefetch_depth,
-                reshard_after_forward,
-                fully_shard_fn=fully_shard_fn,
-            )
-
-
-def get_hf_tp_shard_plan(model):
-    """Get the Hugging Face tensor parallel plan from the model.
-
-    This function:
-    - Retrieves TP strategies from model class, instance, and inner model levels.
-    - Handles special cases for `embed_tokens` and `lm_head` for speed up.
-    - Converts string-based parallel styles to DTensor parallelization strategies.
-
-    Taken and modified from: https://github.com/NVIDIA/NeMo/blob/6c6169db01bcca73ae8ad3ac35242fadbb9a78ba/nemo/lightning/pytorch/strategies/utils.py#L532
-
-    Args:
-        model: A Hugging Face model instance
-
-    Returns:
-        dict: A dictionary mapping model component paths to their parallelization strategies
-
-    Raises:
-        AssertionError: If no TP plan is found
-    """
-    model_cls = type(model)
-
-    # Handle VL models structure
-    if model_cls in [
-        Qwen2VLForConditionalGeneration,
-        Qwen2_5_VLForConditionalGeneration,
-    ]:
-        inner_model = model.model.language_model
-        model_prefix = "model.language_model"
-
-    elif model_cls == Gemma3ForConditionalGeneration:
-        # In transformers v5, Gemma3 uses 'model' instead of 'language_model'
-        if _is_transformers_v5_or_higher():
-            inner_model = model.model
-            model_prefix = "model"
-        else:
-            inner_model = model.language_model
-            model_prefix = "language_model"
-
-    elif model_cls == Llama4ForConditionalGeneration:
-        inner_model = model.language_model.model
-        model_prefix = "language_model.model"
-
-    elif model_cls in [
-        LlavaForConditionalGeneration,
-        LlavaNextForConditionalGeneration,
-        LlavaNextVideoForConditionalGeneration,
-        LlavaOnevisionForConditionalGeneration,
-    ]:
-        inner_model = model.model.language_model
-        model_prefix = "model.language_model"
-
-    elif model_cls == Mistral3ForConditionalGeneration:
-        inner_model = model.model.language_model
-        model_prefix = "model.language_model"
-
-    elif model_cls.__name__ == "Qwen3_5ForConditionalGeneration":
-        inner_model = model.model.language_model
-        model_prefix = "model.language_model"
-
-    else:
-        inner_model = model.model
-        model_prefix = "model"
-
-    hf_tp_plan = {}
-
-    # model_cls._tp_plan will override model_cls after xxxForCausalLM.post_init() (transformers==4.51.3)
-    if hasattr(model_cls, "_tp_plan") and model_cls._tp_plan is not None:
-        assert isinstance(model_cls._tp_plan, dict), f"model_cls._tp_plan is not a dict: {model_cls._tp_plan}"
-        hf_tp_plan.update(model_cls._tp_plan)
-
-    if hasattr(model, "_tp_plan") and model._tp_plan is not None:
-        hf_tp_plan.update(model._tp_plan)
-
-    if hasattr(inner_model, "_tp_plan") and inner_model._tp_plan is not None:
-        hf_tp_plan.update({f"{model_prefix}.{k}": v for k, v in inner_model._tp_plan.items()})
-
-    assert len(hf_tp_plan) > 0, (
-        f"Hugging Face tp plan is not supported for {model_cls}, please set dtensor_cfg.tensor_parallel_size to 1 or provide a custom_parallel_plan. "
-        "The usage example of custom_parallel_plan can refer to `docs/design-docs/fsdp2-parallel-plan.md`."
+    DefaultParallelizationStrategy()._shard_modules_recursively(
+        module,
+        mesh,
+        mp_policy,
+        offload_policy,
+        enable_fsdp2_prefetch,
+        fsdp2_backward_prefetch_depth,
+        fsdp2_forward_prefetch_depth,
+        reshard_after_forward,
     )
-
-    # hf tp plan not contain embed_tokens, we add it and set to rowwise_rep
-    if f"{model_prefix}.embed_tokens" not in hf_tp_plan:
-        hf_tp_plan[f"{model_prefix}.embed_tokens"] = "rowwise_rep"
-
-    # Build translated plan, skipping HF's MoE-related styles.
-    #
-    # HuggingFace transformers v5 introduced these styles for MoE models, but they do NOT
-    # implement true expert parallelism (where each rank stores only a subset of experts).
-    # Instead, HF's approach:
-    # - local_colwise/local_rowwise: Store expert weights as local tensors (NOT sharded).
-    #   Despite the names, these do NOT perform tensor parallelism on the experts.
-    #   Each rank stores ALL expert weights (full shape), which is memory inefficient.
-    # - ep_router: Modifies routing so each rank only computes with a subset of experts.
-    #   This distributes compute but not memory.
-    # - gather: All-reduces expert outputs across ranks.
-    #
-    # Since these styles result in replicated expert weights (not sharded), and we don't
-    # support HF's routing modification approach, we skip them entirely. The experts will
-    # be replicated across all ranks and computed redundantly, which is correct but not
-    # memory/compute efficient for large MoE models.
-    _hf_moe_styles = {"ep_router", "local_colwise", "local_rowwise", "gather"}
-    translated_plan = {}
-    for k, v in hf_tp_plan.items():
-        if isinstance(v, str) and (v.startswith("ep_") or v in _hf_moe_styles):
-            continue
-        # speed up the tp plan for lm_head
-        if (k == "lm_head" or k == "language_model.lm_head") and v == "colwise_rep":
-            translated_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
-        else:
-            style = translate_to_torch_parallel_style(v)
-            # Translator returns None for styles that should be skipped (e.g.
-            # "replicated_with_grad_allreduce" under FSDP where leaving the
-            # param un-wrapped is equivalent).
-            if style is None:
-                continue
-            translated_plan[k] = style
-
-    logger.info(f"Hugging Face tp plan: {translated_plan}")
-    return translated_plan
 
 
 def import_class_from_path(name: str) -> Any:
@@ -1304,38 +784,6 @@ def import_classes_from_paths(class_paths: List[str]):
         except Exception as e:
             print(f"Warning: Could not import class from path '{path}': {e}")
     return classes
-
-
-@lru_cache
-def translate_to_torch_parallel_style(style: str):
-    """
-    Translates string descriptions to parallelism plans.
-
-    In model configurations, we use a neutral type (string) to specify parallel
-    styles, here we translate them into torch.distributed tensor-parallel
-    types.
-    """
-    assert isinstance(style, str), f"parallel style type should be str, but got {type(style)}"
-
-    if style == "colwise":
-        return ColwiseParallel()
-    elif style == "rowwise":
-        return RowwiseParallel()
-    elif style == "colwise_rep":
-        return ColwiseParallel(output_layouts=Replicate())
-    elif style == "rowwise_rep":
-        return RowwiseParallel(input_layouts=Replicate())
-    elif style == "sequence_parallel":
-        return SequenceParallel()
-    elif style == "replicated_with_grad_allreduce":
-        # transformers v5 style for norm weights (q_norm, k_norm, etc.) that are
-        # replicated across TP ranks but need gradient all-reduce. Under FSDP+TP,
-        # leaving the param un-wrapped (no TP style) is equivalent: FSDP handles
-        # grad sync on its DP/DP_shard mesh, and since the param is replicated on
-        # the TP mesh, no TP-level collective is needed in forward.
-        return None
-    else:
-        raise ValueError(f"Unknown parallel style: {style}")
 
 
 def _attention_is_head_sharded(model_parallel_plan: dict) -> bool:
@@ -1693,201 +1141,6 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
 
     assert all(isinstance(m, nn.Module) for m in layers), "layers shoudl be nn.Module instances"
     return layers
-
-
-def _get_parallel_plan(
-    model: nn.Module,
-    sequence_parallel: bool = False,
-    tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
-    tp_size: int = 1,
-) -> Dict[str, ParallelStyle]:
-    """
-    Select the tensor-parallel plan for the given model.
-
-    Priority order:
-    1) If ``tp_shard_plan`` is provided as a dict or import path, use it.
-    2) If the model type exists in ``PARALLELIZE_FUNCTIONS``, use its optimised plan; on failure, fall back to HF plan.
-    3) Otherwise, prefer the model's HF-native ``_tp_plan`` (via ``get_hf_tp_shard_plan``).
-    4) Otherwise, fall back to the default base plan.
-
-    When ``tp_size > 1`` and the model falls through to path 4 *and* the
-    model class was loaded from a custom-code source (HF's
-    ``trust_remote_code=True`` path, where the dynamic class lives under
-    ``transformers_modules.*``), this raises ``ValueError`` instead of
-    returning the default base plan. On recent PyTorch the default plan's
-    placements do not populate ``shard_order`` and trip an internal assert in
-    ``torch.distributed.tensor._redistribute`` on the first weight
-    redistribute, which surfaces to the user as an opaque PyTorch internal
-    error. Custom-code architectures are the only known-broken case (see
-    https://github.com/NVIDIA-NeMo/Automodel/issues/2243); known HF
-    architectures that happen to fall through (e.g. Mixtral) are left on the
-    default plan with a warning, since they have been working in practice.
-
-    When the model *did* define a ``_tp_plan`` but ``get_hf_tp_shard_plan``
-    raised while translating it (e.g. styles nemo does not recognize), the
-    translator's error message is folded into the ``ValueError`` as a
-    diagnostic so the user can tell whether to add a ``_tp_plan`` from
-    scratch or fix the styles in the one they already have.
-    """
-    model_parallel_plan = None
-    model_cls = type(model)
-
-    if isinstance(tp_shard_plan, dict):
-        model_parallel_plan = tp_shard_plan
-        col_w = max(55, max(map(len, tp_shard_plan.keys()), default=0))
-        plan_lines = "\n".join(f"  {k:<{col_w}} {v}" for k, v in tp_shard_plan.items())
-        logger.info(f"Using parallel plan (dictionary):\n{plan_lines}")
-    elif tp_shard_plan == LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME:
-        model_arch = None
-        if hasattr(model, "config") and hasattr(model.config, "architectures") and model.config.architectures:
-            try:
-                model_arch = model.config.architectures[0]
-            except Exception:
-                model_arch = None
-
-        if model_arch == "DeciLMForCausalLM" and getattr(model.config, "model_type", None) == "nemotron-nas":
-            model_parallel_plan = get_decilm_nemotron_tp_plan(sequence_parallel=sequence_parallel)
-            logger.info(
-                "Using DeciLM/Nemotron-NAS TP plan for named plan %s",
-                LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
-            )
-        else:
-            model_parallel_plan = get_llama_nemotron_super_tp_plan(sequence_parallel=sequence_parallel)
-            logger.info(f"Using named parallel plan: {LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME}")
-    elif tp_shard_plan is not None:
-        try:
-            plan_obj = import_class_from_path(tp_shard_plan)
-            if isinstance(plan_obj, FunctionType):
-                model_parallel_plan = plan_obj()
-            else:
-                model_parallel_plan = plan_obj
-            assert isinstance(model_parallel_plan, dict), (
-                f"Parallel plan must be a dictionary, got {type(model_parallel_plan)}"
-            )
-            logger.info(f"Using provided parallel plan (from path). {tp_shard_plan}")
-        except Exception as e:
-            raise ValueError(
-                f"Custom parallel plan '{tp_shard_plan}' is not valid. "
-                f"Please ensure it is one of the following:\n"
-                "1. A dictionary mapping module names to parallel styles\n"
-                "2. A path to a dictionary\n"
-                "3. A path to a function that returns a dictionary\n"
-                f"Error: {e}"
-            )
-
-    elif (func := PARALLELIZE_FUNCTIONS.get(_get_class_qualname(model_cls))) is not None:
-        try:
-            model_parallel_plan = func(model, sequence_parallel)
-            logger.info(f"Using optimized parallel plan for {model_cls.__name__}.")
-        except Exception as e:
-            logger.info(f"Optimized parallel plan not available: {e}. Falling back to the HF tp plan.")
-            model_parallel_plan = get_hf_tp_shard_plan(model)
-
-    # Fallback: match by bare class __name__ for trust_remote_code models whose
-    # qualified module path contains a snapshot hash and so cannot be stably
-    # registered via _get_class_qualname().
-    elif (func := PARALLELIZE_FUNCTIONS.get(model_cls.__name__)) is not None:
-        try:
-            model_parallel_plan = func(model, sequence_parallel)
-            logger.info(f"Using optimized parallel plan for {model_cls.__name__} (matched by class name).")
-        except Exception as e:
-            logger.info(f"Optimized parallel plan not available: {e}. Falling back to the HF tp plan.")
-            model_parallel_plan = get_hf_tp_shard_plan(model)
-
-    else:
-        # Try HF's per-model _tp_plan first — it correctly handles multimodal
-        # architectures like Mistral3ForConditionalGeneration whose text layers
-        # live under model.language_model.layers.* and would be missed by the
-        # hardcoded llama-style wildcards below.
-        hf_plan = None
-        hf_plan_error: Exception | None = None
-        try:
-            hf_plan = get_hf_tp_shard_plan(model)
-        except Exception as e:
-            hf_plan_error = e
-            logger.info(f"HF tp plan not available ({e}). Falling back to default base plan.")
-
-        if hf_plan:
-            model_parallel_plan = hf_plan
-            logger.info(f"Using HF-native tp plan for {model_cls.__name__}.")
-        else:
-            # HF places dynamic classes loaded via ``trust_remote_code=True`` under the
-            # ``transformers_modules.*`` namespace. Those are the only archs known to
-            # actually crash inside ``_redistribute`` with the default base plan, so we
-            # only fail-fast for them. See https://github.com/NVIDIA-NeMo/Automodel/issues/2243.
-            is_remote_code = (model_cls.__module__ or "").startswith("transformers_modules.")
-            if tp_size > 1 and is_remote_code:
-                # If the model author *did* define `_tp_plan` but it was unusable
-                # (e.g. styles nemo does not recognize), surface that diagnostic so the
-                # user knows whether to (a) add a missing `_tp_plan` from scratch or
-                # (b) fix the styles in the one they already have.
-                diag = f" Note: {hf_plan_error}." if hf_plan_error is not None else ""
-                raise ValueError(
-                    f"No tensor-parallel plan is registered for the custom-code architecture "
-                    f"'{model_cls.__name__}' (loaded via trust_remote_code=True), and no usable "
-                    f"HuggingFace `_tp_plan` was found.{diag} The default base plan cannot be used "
-                    f"at tp_size={tp_size}: it produces DTensor placements without `shard_order` "
-                    "metadata, which trips an internal assert in "
-                    "`torch.distributed.tensor._redistribute` on the first weight redistribute. "
-                    "Register a working plan in one of the following ways:\n"
-                    f"  1. Add an entry for '{model_cls.__name__}' to "
-                    "`nemo_automodel.components.distributed.optimized_tp_plans.PARALLELIZE_FUNCTIONS`.\n"
-                    "  2. Define a `_tp_plan` on the model class with styles nemo recognizes "
-                    "(e.g. `colwise`, `rowwise`, `colwise_rep`, `rowwise_rep`).\n"
-                    "  3. Pass `tp_shard_plan` (dict or import path) when constructing the parallelizer.\n"
-                    "Alternatively, run with tp_size=1."
-                )
-            if tp_size > 1:
-                logger.warning(
-                    "No usable tensor-parallel plan is registered for '%s'. Falling back to the "
-                    "default base plan at tp_size=%d. If you hit an internal assert in "
-                    "`torch.distributed.tensor._redistribute` on `shard_order is not None`, "
-                    "register a plan via `PARALLELIZE_FUNCTIONS`, `_tp_plan`, or `tp_shard_plan`.",
-                    model_cls.__name__,
-                    tp_size,
-                )
-            base_model_tp_plan = {
-                "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
-                "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-                "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-                "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-                "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
-                "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-                "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
-                "model.layers.*.mlp.up_proj": ColwiseParallel(),
-                "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-                "model.layers.*.mlp.down_proj": RowwiseParallel(),
-                "lm_head": ColwiseParallel(output_layouts=Replicate()),
-            }
-            if sequence_parallel:
-                base_model_sp_plan = {
-                    "model.embed_tokens": VocabParallelEmbedding(
-                        input_layouts=Replicate(),
-                        output_layouts=Shard(1),
-                        use_local_output=False,
-                    ),
-                    "model.norm": SequenceParallel(),
-                    "model.layers.*.input_layernorm": SequenceParallel(),
-                    "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
-                    "model.layers.*.post_attention_layernorm": SequenceParallel(),
-                    "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
-                    "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
-                }
-                base_model_tp_plan.update(base_model_sp_plan)
-            model_parallel_plan = base_model_tp_plan
-            logger.info("Using default base TP plan. Compatible with huggingface llama3-style models.")
-
-    # Nemotron-Flash's forward computes `logits / self.lm_head.weight.norm(p=2, dim=1)`.
-    # Under TP, sharding lm_head turns the weight into a DTensor while `logits` is a
-    # plain tensor (output_layouts=Replicate), and the mixed-operand division raises
-    # "aten.div.Tensor got mixed torch.Tensor and DTensor". Drop lm_head from the plan
-    # so its weight stays replicated and the division stays in plain-tensor space.
-    if _is_nemotron_flash_config(getattr(model, "config", None)):
-        for k in ("lm_head", "language_model.lm_head"):
-            if model_parallel_plan.pop(k, None) is not None:
-                logger.info("Nemotron-Flash: excluding %s from TP plan to keep lm_head.weight replicated.", k)
-
-    return model_parallel_plan
 
 
 # Taken and modified from torchtitan
