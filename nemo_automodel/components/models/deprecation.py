@@ -58,29 +58,9 @@ _DEPRECATED_MODEL_YAMLS: dict[str, tuple[str, ...]] = {
         "examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp_dynamic_seq_len.yaml",
         "examples/llm_finetune/llama3_1/llama3_1_8b_instruct_squad_qlora_2node.yaml",
         "examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml",
-        "examples/llm_finetune/llama3_2/customizer_llama_3_2_1b_full_sft.yaml",
-        "examples/llm_finetune/llama3_2/customizer_llama_3_2_1b_full_sft_chat.yaml",
-        "examples/llm_finetune/llama3_2/customizer_llama_3_2_1b_peft.yaml",
-        "examples/llm_finetune/llama3_2/customizer_llama_3_2_1b_peft_packing.yaml",
-        "examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml",
-        "examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_hsdp.yaml",
-        "examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_megatron_fsdp.yaml",
-        "examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml",
-        "examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml",
-        "examples/llm_finetune/llama3_2/llama3_2_1b_squad_flashoptim.yaml",
-        "examples/llm_finetune/llama3_2/llama3_2_1b_squad_megatron_fsdp.yaml",
-        "examples/llm_finetune/llama3_2/llama3_2_1b_squad_neftune.yaml",
-        "examples/llm_finetune/llama3_2/llama3_2_1b_squad_peft.yaml",
-        "examples/llm_finetune/llama3_2/llama3_2_1b_squad_qat.yaml",
-        "examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot.yaml",
-        "examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml",
-        "examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes_2nodes.yaml",
-        "examples/llm_finetune/llama3_2/llama_3_2_3b_instruct_squad.yaml",
-        "examples/llm_finetune/llama3_2/llama_3_2_3b_instruct_squad_peft.yaml",
         "examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml",
         "examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft.yaml",
         "examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft_qlora_spark.yaml",
-        "examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml",
         "examples/llm_pretrain/llama3_70b_pretrain.yaml",
         "examples/speculative/eagle1/llama_eagle1_perfectblend.yaml",
         "examples/speculative/eagle2/llama_eagle2_perfectblend.yaml",
@@ -108,6 +88,23 @@ _DEPRECATED_MODEL_YAMLS: dict[str, tuple[str, ...]] = {
     ),
     "KimiVLForConditionalGeneration": ("examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml",),
 }
+
+
+def _llama_config_name_or_path(config: object) -> str:
+    """Return the HF checkpoint id stored on a Llama config, if any."""
+    return str(getattr(config, "_name_or_path", "") or getattr(config, "name_or_path", "") or "")
+
+
+def is_llama_3_2_1b_config(config: object) -> bool:
+    """Return True when *config* refers to a supported Llama 3.2 1B checkpoint."""
+    return "Llama-3.2-1B" in _llama_config_name_or_path(config)
+
+
+def warn_deprecated_llama_for_causal_lm(config: object) -> None:
+    """Emit a deprecation warning for Llama 3.x except supported 3.2-1B checkpoints."""
+    if is_llama_3_2_1b_config(config):
+        return
+    warn_deprecated_model_class("LlamaForCausalLM")
 
 
 def warn_deprecated_model_class(model_cls_name: str) -> None:

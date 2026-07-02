@@ -23,6 +23,10 @@ configs:
   # -- gpt_oss --
   - gpt_oss/gpt_oss_20b.yaml
 
+  # -- llama --
+  - llama3_2/llama3_2_1b_squad.yaml
+  - llama3_2/llama3_2_1b_hellaswag.yaml
+
   # -- moonlight --
   - moonlight/moonlight_16b_te.yaml
 
@@ -48,6 +52,9 @@ configs:
   # -- gpt_oss --
   - gpt_oss/gpt_oss_20b_peft.yaml
   - gpt_oss/gpt_oss_20b_single_gpu_peft.yaml
+
+  # -- llama --
+  - llama3_2/llama3_2_1b_hellaswag_peft.yaml
 
   # -- nemotron --
   - nemotron/nemotron_nano_8b_v1_squad_peft.yaml

@@ -20,7 +20,6 @@ exempt_models:
   - gemma
   - granite
   - llama3_1
-  - llama3_2
   - llama3_3
   - mistral
   - olmo
