@@ -15,6 +15,7 @@
 """Functional tests for retrieval backbone extraction."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -33,6 +34,83 @@ def test_llama_nemotron_vl_supported_backbone_for_embedding():
     from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
 
     assert SUPPORTED_BACKBONES["llama_nemotron_vl"]["embedding"] == "LlamaNemotronVLModel"
+
+
+def test_biencoder_build_applies_optimized_vl_flags(monkeypatch):
+    import nemo_automodel.components.models.llama_nemotron_vl.model as vl_model
+    from nemo_automodel._transformers import retrieval
+
+    class FakeBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace()
+
+    backbone = FakeBackbone()
+    calls = []
+
+    monkeypatch.setattr(retrieval, "build_encoder_backbone", lambda *args, **kwargs: backbone)
+    monkeypatch.setattr(
+        vl_model, "replace_language_model_with_custom_llama", lambda model: calls.append("custom") or True
+    )
+    monkeypatch.setattr(vl_model, "replace_llama_mlp_with_te_fused", lambda model: calls.append("mlp") or 1)
+    monkeypatch.setattr(vl_model, "replace_llama_qkv_with_te_fused", lambda model: calls.append("qkv") or 1)
+    monkeypatch.setattr(
+        vl_model, "replace_siglip_encoder_layers_with_te_fused", lambda model: calls.append("siglip") or 1
+    )
+    monkeypatch.setattr(
+        vl_model,
+        "disable_unused_siglip_pooling_head_grad",
+        lambda model: calls.append("pooling_head") or 4,
+    )
+
+    model = retrieval.BiEncoderModel.build(
+        "local-vl-model",
+        task="embedding",
+        use_custom_llama_backend=True,
+        use_te_fused_mlp=True,
+        use_te_fused_qkv=True,
+        use_te_fused_siglip_layer=True,
+        disable_unused_siglip_pooling_head=True,
+    )
+
+    assert model.model is backbone
+    assert calls == ["custom", "mlp", "qkv", "siglip", "pooling_head"]
+
+
+def test_biencoder_build_warns_when_optimized_vl_flags_do_not_apply(monkeypatch, caplog):
+    import nemo_automodel.components.models.llama_nemotron_vl.model as vl_model
+    from nemo_automodel._transformers import retrieval
+
+    class FakeBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace()
+
+    monkeypatch.setattr(retrieval, "build_encoder_backbone", lambda *args, **kwargs: FakeBackbone())
+    monkeypatch.setattr(vl_model, "replace_language_model_with_custom_llama", lambda model: False)
+    monkeypatch.setattr(vl_model, "replace_llama_mlp_with_te_fused", lambda model: 0)
+    monkeypatch.setattr(vl_model, "replace_llama_qkv_with_te_fused", lambda model: 0)
+    monkeypatch.setattr(vl_model, "replace_siglip_encoder_layers_with_te_fused", lambda model: 0)
+    monkeypatch.setattr(vl_model, "disable_unused_siglip_pooling_head_grad", lambda model: 0)
+
+    retrieval.BiEncoderModel.build(
+        "local-vl-model",
+        task="embedding",
+        use_custom_llama_backend=True,
+        use_te_fused_mlp=True,
+        use_te_fused_qkv=True,
+        use_te_fused_siglip_layer=True,
+        disable_unused_siglip_pooling_head=True,
+    )
+
+    assert "use_custom_llama_backend requested but the loaded backbone was not replaced" in caplog.text
+    assert "use_te_fused_mlp requested but no custom LLaMA MLP layers were fused" in caplog.text
+    assert "use_te_fused_qkv requested but no custom LLaMA QKV layers were fused" in caplog.text
+    assert "use_te_fused_siglip_layer requested but no SigLIP encoder layers were replaced" in caplog.text
+    assert (
+        "disable_unused_siglip_pooling_head requested but no SigLIP pooling-head parameters were disabled"
+        in caplog.text
+    )
 
 
 def _tiny_mistral3_vlm_config(text_model_type: str) -> Mistral3Config:
