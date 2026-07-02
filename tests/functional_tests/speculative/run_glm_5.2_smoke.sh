@@ -4,15 +4,15 @@
 # Validates: distributed GLM-5.2 target load (expert-parallel + FSDP2, FP8 dequant)
 #   -> online hidden-state capture across the EP shards -> draft training
 #   -> finite, decreasing three-term loss. This is the path the full config
-#   (glm_5.2_dspark.yaml) takes, but with the target shrunk to 4 layers
-#   (target_num_hidden_layers=4) so it fits on ONE 8x80GB node and reaches a step
+#   (glm_5.2_dspark.yaml) takes, but with the target shrunk to 6 layers
+#   (target_num_hidden_layers=6) so it fits on ONE 8x80GB node and reaches a step
 #   in minutes. The full 78-layer target needs multiple nodes (see the full config).
 #
 # PREREQUISITES (the smoke cannot pass without these):
 #   * HybridEP (or DeepEP) installed in the env -- the GLM MoE token dispatcher
 #     requires it; without it setup() raises "HybridEP is not installed".
-#   * 8 GPUs, >=80 GiB each. The smoke loads only 4 target layers (3 dense + the
-#     first MoE layer, ~a few GiB/rank of experts at ep_size=8); the full target
+#   * 8 GPUs, >=80 GiB each. The smoke loads only 6 target layers (3 dense + 3
+#     routed-MoE / IndexShare layers, ~24 GiB/rank at ep_size=8); the full target
 #     would not fit here, hence the reduction.
 #   * A local GLM-5.2 checkpoint.
 #
@@ -77,6 +77,6 @@ echo "  1) FP8 base weights dequantize to bf16 on load (no 'non-finite' on targe
 echo "  2) captured hidden states are full per-rank (no all-gather / not a DTensor)"
 echo "  3) frozen GLM target forward runs with a 2D mask + use_cache=False"
 echo "  4) ep_size=8 divides n_routed_experts=256 (32 experts/rank)"
-echo "  5) per-rank memory is small here (only 4 target layers loaded); the FULL"
+echo "  5) per-rank memory is ~24 GiB here (only 6 target layers loaded); the FULL"
 echo "     78-layer target needs multiple nodes (ep_size>=32); it does not fit on one 8x80GB box"
 echo "DONE. Full log: $LOG"

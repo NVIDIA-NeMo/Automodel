@@ -93,7 +93,9 @@ recipe_args:
   # TileLang build JIT-compiles the GLM DSA indexer / sparse-MLA kernels.
   target_attn_backend: sdpa
   target_dispatcher: hybridep         # MoE token dispatcher for the sharded experts
-  target_experts: gmm                 # grouped-expert GEMM backend
+  # torch_mm needs no optional package; `gmm` is faster but requires grouped_gemm,
+  # which the current AutoModel image does not ship (NameError: ops is not defined).
+  target_experts: torch_mm            # grouped-expert GEMM backend
   target_enable_fsdp_optimizations: true
 
   # --- serial Markov head (semi-autoregressive) ---

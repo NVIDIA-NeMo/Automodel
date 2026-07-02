@@ -4,12 +4,13 @@
 # SINGLE 8x80GB NODE. It is NOT a real training run; use glm_5.2_dspark.yaml (multi-node)
 # for that.
 #
-# Why the target is reduced to 4 layers: the full 78-layer GLM-5.2 with 256 routed experts
-# does not fit on a single node. target_num_hidden_layers=4 loads only the first 4 layers
-# (3 dense + the first MoE layer) so the whole EP / hidden-capture / draft-training pipeline
-# runs end to end on one node. target_layer_ids=[1,2,3] is the 4-layer equivalent of the
-# full target's late layers [75,76,77]. A draft trained here is a pipeline check, not a
-# usable drafter.
+# Why the target is reduced to 6 layers: the full 78-layer GLM-5.2 with 256 routed experts
+# does not fit on a single node. target_num_hidden_layers=6 loads only the first 6 layers
+# (3 dense + 3 routed-MoE / IndexShare layers) so the whole EP / hidden-capture /
+# draft-training pipeline runs end to end on one node (~24 GiB/rank on 8x H100 80GB).
+# target_layer_ids=[3,4,5] is the 6-layer equivalent of the full target's late layers
+# [75,76,77]; all three are MoE layers and exercise the IndexShare top-k carry. A draft
+# trained here is a pipeline check, not a usable drafter.
 #
 # Prereq: HybridEP (or DeepEP) installed, 8x>=80GB GPUs, GLM-5.2 weights local.
 # Run via: tests/functional_tests/speculative/run_glm_5.2_smoke.sh
@@ -42,15 +43,15 @@ recipe_args:
   num_workers: 0
   num_epochs: 1
 
-  # --- smoke: load only the first 4 target layers so the run fits on one node ---
-  target_num_hidden_layers: 4
+  # --- smoke: load only the first 6 target layers so the run fits on one node ---
+  target_num_hidden_layers: 6
 
   # --- draft backbone (same as the full config) ---
   draft_num_hidden_layers: 2
   block_size: 5
   num_anchors: 16                # smoke: few anchors per sequence
   mask_token_id: 154856          # first reserved GLM-5.2 vocab slot (in-vocab; < 154880)
-  target_layer_ids: [1, 2, 3]    # 4-layer equivalent of the full target's late layers [75,76,77]
+  target_layer_ids: [3, 4, 5]    # 6-layer equivalent of the late layers [75,76,77]; all routed-MoE / IndexShare
   freeze_embeddings: true
 
   # --- frozen GLM-5.2 target backend (the real EP path) ---
@@ -58,7 +59,9 @@ recipe_args:
   # switch to tilelang if yours compiles the GLM DSA kernels.
   target_attn_backend: sdpa
   target_dispatcher: hybridep
-  target_experts: gmm
+  # torch_mm needs no optional package; `gmm` requires grouped_gemm, absent from the
+  # current AutoModel image (NameError: ops is not defined).
+  target_experts: torch_mm
   target_enable_fsdp_optimizations: true
 
   # --- heads + objective (same as the full config) ---

@@ -230,10 +230,14 @@ def _resolve_dspark_optimizer_spec(opt_cfg) -> tuple[str, dict]:
     not accept a ``betas`` kwarg (e.g. plain SGD).
     """
     kwargs = dict(opt_cfg.to_dict())
-    target = (
-        opt_cfg.get_as_string("_target_", None) if hasattr(opt_cfg, "get_as_string") else kwargs.get("_target_", None)
-    )
-    kwargs.pop("_target_", None)
+    # ConfigNode resolves ``_target_`` to the callable in ``to_dict``; recover the original
+    # import-path string via ``get_as_string``. Only call it when the key is actually
+    # present: ``ConfigNode.get_as_string`` raises ``KeyError`` for an absent key even
+    # with an explicit ``None`` default (a ``None`` default is never returned), which
+    # crashed every DSpark config whose ``optimizer:`` block omits ``_target_``.
+    target = kwargs.pop("_target_", None)
+    if target is not None and hasattr(opt_cfg, "get_as_string"):
+        target = opt_cfg.get_as_string("_target_")
     kwargs.pop("warmup_ratio", None)
     kwargs.pop("min_lr_ratio", None)
     kwargs["lr"] = float(kwargs["lr"])
@@ -286,6 +290,31 @@ def _resolve_reduced_target_layers(checkpoint_num_layers, requested):
             f"target_num_hidden_layers={n} must be in [1, {checkpoint_num_layers}] (the checkpoint's depth)."
         )
     return n
+
+
+def _repair_glm_5_2_qk_rope_head_dim(target_config, raw_config_dict: dict) -> None:
+    """Restore a ``qk_rope_head_dim`` clobbered by the HF ``head_dim`` attribute map.
+
+    The published GLM-5.2 config carries ``head_dim: 192`` (the attention-kernel head
+    dim) alongside ``qk_rope_head_dim: 64``, and ``GlmMoeDsaConfig``'s
+    ``attribute_map = {"head_dim": "qk_rope_head_dim"}`` lets the former clobber the
+    latter on load: the loaded config reports ``qk_rope_head_dim=192``, so
+    ``kv_a_proj_with_mqa`` builds ``kv_lora_rank + 192 = 704`` wide while the
+    checkpoint ships ``512 + 64 = 576`` and shape validation fails. Restore the raw
+    checkpoint value (the GLM finetune examples apply the same correction via a
+    ``config: head_dim: 64`` override). No-op when the raw config omits the field or
+    the loaded value already matches (e.g. a locally repaired checkpoint view).
+    """
+    raw_qk_rope = raw_config_dict.get("qk_rope_head_dim")
+    if raw_qk_rope is None or int(target_config.qk_rope_head_dim) == int(raw_qk_rope):
+        return
+    logger.warning(
+        "GLM-5.2 config head_dim clobbered qk_rope_head_dim (loaded %s) via the HF attribute_map; "
+        "restoring qk_rope_head_dim=%s from the raw checkpoint config.",
+        target_config.qk_rope_head_dim,
+        raw_qk_rope,
+    )
+    target_config.qk_rope_head_dim = int(raw_qk_rope)
 
 
 def _apply_draft_activation_checkpointing(draft_model: torch.nn.Module, mode: bool | str) -> None:
@@ -420,44 +449,9 @@ class TrainDSparkRecipe(BaseRecipe):
             # GLM-5.2 (GlmMoeDsaForCausalLM) is a ~355B-parameter MLA + DSA MoE LM: load
             # it frozen through the same expert-parallel / FSDP distributed path the GLM
             # finetune recipe uses, sharding the 256 routed experts across ranks instead
-            # of replicating per rank. Its model_type is registered, so AutoConfig /
-            # NeMoAutoModelForCausalLM resolve it directly (unlike DeepSeek V4). DSpark's
-            # forward-hook hidden-state capture needs one non-pipelined self.model(...)
-            # call, so pp_size must be 1 in the recipe's distributed: block; use a larger
-            # ep_size instead of PP to shard the parameter memory.
-            target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
-            n_reduced = _resolve_reduced_target_layers(
-                target_config.num_hidden_layers,
-                recipe_cfg.get("target_num_hidden_layers", None),
-            )
-            if n_reduced is not None:
-                logger.warning(
-                    "Reducing the GLM-5.2 target from %d to %d layers "
-                    "(target_num_hidden_layers): diagnostic/CI only, not a usable drafter.",
-                    target_config.num_hidden_layers,
-                    n_reduced,
-                )
-                target_config.num_hidden_layers = n_reduced
-            architectures = getattr(target_config, "architectures", None) or ["GlmMoeDsaForCausalLM"]
-            if self.device.type != "cuda":
-                raise RuntimeError(
-                    "GLM-5.2 DSpark target training requires CUDA: the target is loaded "
-                    "with the expert-parallel / FSDP distributed path."
-                )
-            self.distributed_setup = create_distributed_setup_from_config(
-                self.cfg,
-                world_size=self.dist_env.world_size,
-            )
-            backend = self._build_glm_5_2_backend(recipe_cfg)
-            self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
-                target_path,
-                trust_remote_code=trust_remote_code,
-                torch_dtype=self.compute_dtype,
-                distributed_setup=self.distributed_setup,
-                backend=backend,
-            )
-            # A distributed-setup-loaded model already lands correctly placed
-            # (sharded as DTensors); a blanket .to(device) afterward is redundant.
+            # of replicating per rank.
+            target_config, self.target_model = self._build_glm_5_2_target(target_path, recipe_cfg, trust_remote_code)
+            architectures = list(getattr(target_config, "architectures", None) or ["GlmMoeDsaForCausalLM"])
         else:
             target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
             architectures = getattr(target_config, "architectures", []) or []
@@ -830,17 +824,78 @@ class TrainDSparkRecipe(BaseRecipe):
             enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
         )
 
+    def _build_glm_5_2_target(self, target_path, recipe_cfg, trust_remote_code):
+        """Load the full GLM-5.2 target as a frozen, expert-parallel / FSDP model.
+
+        Mirrors ``_build_deepseek_v4_target``: an expert-parallel / FSDP distributed
+        setup (derived from the recipe's ``distributed`` block) shards the 256 routed
+        experts across ranks. GLM-5.2's ``model_type`` is registered, so ``AutoConfig``
+        resolves it directly (unlike DeepSeek V4), but the model must still be built
+        with ``from_config`` + ``load_base_model=True``: ``from_pretrained`` re-reads
+        the checkpoint's own config and silently rebuilds the full 78-layer target,
+        discarding the ``target_num_hidden_layers`` reduction (which OOMs on one node).
+        ``from_config`` keeps the (possibly reduced, repaired) config and still loads
+        the checkpoint weights, resolved via ``config.name_or_path``.
+
+        DSpark's forward-hook hidden-state capture needs one non-pipelined
+        ``self.model(...)`` call, so ``pp_size`` must be 1 in the recipe's
+        ``distributed:`` block; use a larger ``ep_size`` instead of PP to shard the
+        parameter memory.
+
+        Returns the resolved (repaired) target config and the sharded target model.
+        """
+        if self.device.type != "cuda":
+            raise RuntimeError(
+                "GLM-5.2 DSpark target training requires CUDA: the target is loaded "
+                "with the expert-parallel / FSDP distributed path."
+            )
+        target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+        # The published config's head_dim=192 clobbers qk_rope_head_dim on load via the
+        # HF attribute_map, breaking checkpoint shape validation (see the helper).
+        raw_config_dict, _ = PretrainedConfig.get_config_dict(target_path, trust_remote_code=trust_remote_code)
+        _repair_glm_5_2_qk_rope_head_dim(target_config, raw_config_dict)
+        n_reduced = _resolve_reduced_target_layers(
+            target_config.num_hidden_layers,
+            recipe_cfg.get("target_num_hidden_layers", None),
+        )
+        if n_reduced is not None:
+            logger.warning(
+                "Reducing the GLM-5.2 target from %d to %d layers "
+                "(target_num_hidden_layers): diagnostic/CI only, not a usable drafter.",
+                target_config.num_hidden_layers,
+                n_reduced,
+            )
+            target_config.num_hidden_layers = n_reduced
+        self.distributed_setup = create_distributed_setup_from_config(
+            self.cfg,
+            world_size=self.dist_env.world_size,
+        )
+        backend = self._build_glm_5_2_backend(recipe_cfg)
+        target_model = NeMoAutoModelForCausalLM.from_config(
+            config=target_config,
+            backend=backend,
+            distributed_setup=self.distributed_setup,
+            load_base_model=True,
+            torch_dtype=self.compute_dtype,
+            trust_remote_code=trust_remote_code,
+        )
+        return target_config, target_model
+
     @staticmethod
     def _build_glm_5_2_backend(recipe_cfg) -> BackendConfig:
         """Build the GLM-5.2 target BackendConfig (mirrors the GLM finetune recipe).
 
         Dense linears and fp32 RMSNorm on torch, an fp32 router gate (the GLM/DeepSeek-V3
-        top-k routing is fp32 for stability), the grouped-expert GEMM, the hybrid-EP token
-        dispatcher, and the HF state-dict adapter that maps (and dequantizes, when the base
-        checkpoint is FP8) the HF weights on load. The target is frozen / forward-only, so
-        SDPA attention is used by default (the DSA indexer emits an additive float bias that
-        SDPA's explicit-mask path accepts); ``target_attn_backend=tilelang`` switches to the
-        fused sparse kernels when a TileLang build is available.
+        top-k routing is fp32 for stability), the ``torch_mm`` grouped-expert GEMM, the
+        hybrid-EP token dispatcher, and the HF state-dict adapter that maps (and
+        dequantizes, when the base checkpoint is FP8) the HF weights on load. The target
+        is frozen / forward-only, so SDPA attention is used by default (the DSA indexer
+        emits an additive float bias that SDPA's explicit-mask path accepts);
+        ``target_attn_backend=tilelang`` switches to the fused sparse kernels when a
+        TileLang build is available. ``target_experts`` defaults to ``torch_mm`` (like
+        the V4 DSpark backend) because ``gmm`` needs the optional ``grouped_gemm``
+        package, which the current AutoModel image does not ship (it fails with
+        ``NameError: ops is not defined``).
         """
         return BackendConfig(
             attn=str(recipe_cfg.get("target_attn_backend", "sdpa")),
@@ -852,7 +907,7 @@ class TrainDSparkRecipe(BaseRecipe):
             rope_fusion=False,
             gate_precision="float32",
             dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
-            experts=str(recipe_cfg.get("target_experts", "gmm")),
+            experts=str(recipe_cfg.get("target_experts", "torch_mm")),
             enable_hf_state_dict_adapter=True,
             enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
         )

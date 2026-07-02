@@ -39,7 +39,11 @@ use the smoke config (it reduces the target to 4 layers).
   `setup()` raises `ImportError: HybridEP is not installed`.
 - For full training: multiple nodes of 8 x >= 80 GiB GPUs (see above). For the smoke: a
   single 8 x >= 80 GiB node (the target is reduced to 4 layers).
-- A local GLM-5.2 checkpoint (or the hub id `zai-org/GLM-5.2`).
+- A local GLM-5.2 checkpoint (or the hub id `zai-org/GLM-5.2`). The published config's
+  `head_dim: 192` clobbers `qk_rope_head_dim` on load (the HF `attribute_map` maps
+  `head_dim -> qk_rope_head_dim`), which would fail checkpoint shape validation; the
+  recipe detects this and restores `qk_rope_head_dim` from the raw config automatically,
+  so the raw snapshot works as-is.
 
 ## 1. Prepare data
 
@@ -61,9 +65,10 @@ span with `{% generation %}` so only those tokens carry loss).
 
 ## 2. Smoke test (run this first, single node)
 
-A fast pipeline-sanity run of the real EP path, with the target shrunk to 4 layers
-(`target_num_hidden_layers=4`, i.e. 3 dense layers + the first MoE layer) so it fits on
-**one** 8x80GB node and reaches a step in minutes. It confirms the distributed target
+A fast pipeline-sanity run of the real EP path, with the target shrunk to 6 layers
+(`target_num_hidden_layers=6`, i.e. 3 dense layers + 3 routed-MoE / IndexShare layers,
+captured feature layers `[3, 4, 5]`) so it fits on **one** 8x80GB node (~24 GiB/rank)
+and reaches a step in minutes. It confirms the distributed target
 loads, hidden capture works across the shards, the draft trains, and the three-term loss is
 finite and trends down:
 
@@ -104,6 +109,10 @@ kernels **if** your TileLang build JIT-compiles them.
 
 - **Verified**: CPU unit tests for the draft / config builder / registry and the RoPE
   `freqs` fp32 pin across a bf16 cast (`tests/unit_tests/speculative/test_dspark_glm_5_2.py`).
+- **Smoke-validated on 8x H100 80GB**: the reduced 6-layer EP8 path (SDPA attention,
+  `torch_mm` experts, activation checkpointing) loads the FP8 checkpoint, captures
+  hidden states across the shards, and trains end to end with a finite three-term
+  loss at ~24 GiB/rank. This is a pipeline check, not a convergence claim.
 - **Needs a first multi-node run**: the full 78-layer distributed target load and
   cross-shard hidden capture at `ep_size>=32`. Points to eyeball during it:
   1. FP8 base weights dequantize to bf16 on load (target forward stays finite).
