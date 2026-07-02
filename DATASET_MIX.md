@@ -50,4 +50,5 @@
 # General support
 ```
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/retrieval_from_scratch_100k_4model_20260612_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/retrieval_from_scratch_200k_english_fuzzy94_4model_plus_qwen36_20260626_qwen3_8B_20hn_0_95_perc.json
 ```
