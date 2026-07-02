@@ -447,6 +447,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     attn_implementation,
                 )
                 inject_te_attention = False
+
         device = torch.cuda.current_device()
 
         # When PEFT is requested, force dequantization of FP8-quantized models.
@@ -1051,6 +1052,17 @@ class _NeMoAutoModelForRetrievalBase:
 
         encoder_cls = getattr(_enc_mod, cls._ENCODER_CLS_NAME)
 
+        # Retrieval encoders bypass the general model builder, so handle the
+        # NeMo ``te`` extension here as well: load through SDPA, then inject
+        # Transformer Engine attention after the backbone is constructed.
+        inject_te_attention = attn_implementation == "te"
+        if inject_te_attention:
+            logger.info(
+                "Retrieval attn_implementation='te' requested: using 'sdpa' for model init "
+                "and injecting TE attention post-init."
+            )
+            attn_implementation = "sdpa"
+
         if attn_implementation == "ffpa":
             from nemo_automodel.components.attention.ffpa_attention import register_ffpa_attention
 
@@ -1143,6 +1155,7 @@ class _NeMoAutoModelForRetrievalBase:
             compile_config=compile_config,
             load_base_model=False,  # encoder_cls.build already loads weights
             cache_dir=build_kwargs.get("cache_dir", hf_constants.HF_HUB_CACHE),
+            inject_te_attention=inject_te_attention,
         )
 
         return model

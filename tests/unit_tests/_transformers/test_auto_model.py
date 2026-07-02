@@ -375,10 +375,13 @@ class TestModelRuntimePatches:
         fake_module = types.SimpleNamespace(apply_model_runtime_patches=fake_hook)
         test_registry = {"FakeArchForCausalLM": ("fake.module.path", "apply_model_runtime_patches")}
 
-        with patch.object(kp, "_MODEL_RUNTIME_PATCHES", test_registry), patch(
-            "nemo_automodel._transformers.kernel_patches.importlib.import_module",
-            return_value=fake_module,
-        ) as mock_import:
+        with (
+            patch.object(kp, "_MODEL_RUNTIME_PATCHES", test_registry),
+            patch(
+                "nemo_automodel._transformers.kernel_patches.importlib.import_module",
+                return_value=fake_module,
+            ) as mock_import,
+        ):
             assert apply_model_runtime_patches(model, mesh) is model
 
         mock_import.assert_called_once_with("fake.module.path")
@@ -401,9 +404,12 @@ class TestModelRuntimePatches:
         shared_spec = ("fake.module.path", "apply_model_runtime_patches")
         test_registry = {"FakeArchA": shared_spec, "FakeArchB": shared_spec}
 
-        with patch.object(kp, "_MODEL_RUNTIME_PATCHES", test_registry), patch(
-            "nemo_automodel._transformers.kernel_patches.importlib.import_module",
-            return_value=fake_module,
+        with (
+            patch.object(kp, "_MODEL_RUNTIME_PATCHES", test_registry),
+            patch(
+                "nemo_automodel._transformers.kernel_patches.importlib.import_module",
+                return_value=fake_module,
+            ),
         ):
             assert apply_model_runtime_patches(model, mesh) is model
 
@@ -1564,6 +1570,33 @@ class TestBuildModelRetryDepth:
 
         assert result is sentinel_model
         assert order == ["runtime_patches", "infrastructure"]
+
+    def test_te_attention_init_uses_sdpa_without_duplicate_kwarg(self):
+        """TE attention is loaded as SDPA, then injected by infrastructure."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        build_kwargs["attn_implementation"] = "te"
+        sentinel_model = MagicMock()
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("sdpa", False)),
+            patch(
+                "nemo_automodel._transformers.auto_model._init_model", return_value=(False, sentinel_model)
+            ) as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_infrastructure",
+                return_value=sentinel_model,
+            ) as mock_apply_infra,
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+
+        assert result is sentinel_model
+        assert mock_init.call_args.args[2] == "sdpa"
+        assert "attn_implementation" not in mock_init.call_args.kwargs
+        assert mock_apply_infra.call_args.kwargs["inject_te_attention"] is True
 
     def test_custom_model_gets_sdpa_patch_when_method_resolved(self):
         """Custom models need resolved SDPA method constraints too, e.g. to exclude cuDNN under AC."""

@@ -25,11 +25,12 @@ import torch.nn.functional as F
 import wandb
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.utils import add_bidirectional_masks_to_retrieval_batch
 from nemo_automodel.components.distributed.config import DDPConfig
+from nemo_automodel.components.distributed.fsdp2 import _patch_is_packed_sequence_for_training
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -58,12 +59,36 @@ def _unwrap_model_for_attrs(model):
     return getattr(model, "module", model)
 
 
+def _materialize_metric_value(value):
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            value = value.detach().cpu().item()
+        else:
+            value = value.detach().cpu()
+    return value
+
+
+def _materialize_metrics_for_logging(log_data: MetricsSample) -> MetricsSample:
+    log_data.metrics = {key: _materialize_metric_value(value) for key, value in log_data.metrics.items()}
+    return log_data
+
+
+def _format_metric_for_log(value, spec: str) -> str:
+    if isinstance(value, torch.Tensor):
+        return "<tensor>" if value.numel() != 1 else format(value.detach().cpu().item(), spec)
+    return format(value, spec)
+
+
 def _get_autocast_ctx(distributed_config):
     """Return the optional recipe-level autocast context."""
     autocast_dtype = getattr(distributed_config, "autocast_dtype", None)
     if autocast_dtype is None or not torch.cuda.is_available():
         return nullcontext()
     return torch.autocast(device_type="cuda", dtype=autocast_dtype)
+
+
+def _move_batch_to_device(batch, device):
+    return {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
 
 def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
@@ -179,7 +204,189 @@ def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
     return query_batch_dict, doc_batch_dict
 
 
-def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_world_size=1):
+def _get_bidirectional_mask_model_config(model):
+    """Return the language model config used for bidirectional mask creation."""
+    model = _unwrap_model_for_attrs(model)
+    backbone = getattr(model, "model", model)
+    language_model = getattr(backbone, "language_model", None)
+    if language_model is not None and getattr(language_model, "config", None) is not None:
+        return language_model.config
+    return getattr(backbone, "config", None)
+
+
+def _get_first_parameter_dtype(model):
+    for param in model.parameters():
+        return param.dtype
+    return None
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _get_bi_encoder_optimization_bool(cfg, key: str, default=False) -> bool:
+    return _as_bool(cfg.get(f"bi_encoder_optimization.{key}", default))
+
+
+def _query_forward_after_passage_forward(model, query, *, use_bypassed_ddp: bool = False):
+    """Run the second forward without a second DDP unused-param traversal when requested."""
+    if use_bypassed_ddp and hasattr(model, "module"):
+        return model.module(query)
+    return model(query)
+
+
+class _AllGatherWithGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gathered: torch.Tensor, source: torch.Tensor):
+        ctx.world_size = torch.distributed.get_world_size()
+        ctx.source_shape = tuple(source.shape)
+        return gathered
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_output = grad_output.contiguous()
+        grad_source = grad_output.new_empty(ctx.source_shape)
+        if hasattr(torch.distributed, "reduce_scatter_tensor"):
+            torch.distributed.reduce_scatter_tensor(
+                grad_source,
+                grad_output,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+        else:
+            chunks = [chunk.contiguous() for chunk in grad_output.chunk(ctx.world_size, dim=0)]
+            torch.distributed.reduce_scatter(
+                grad_source,
+                chunks,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+        return None, grad_source
+
+
+class _DistGatherHandle:
+    def __init__(
+        self,
+        gathered: torch.Tensor | None,
+        source: torch.Tensor | None,
+        preserve_grad: bool,
+        work=None,
+        stream=None,
+    ):
+        self.gathered = gathered
+        self.source = source
+        self.preserve_grad = preserve_grad
+        self.work = work
+        self.stream = stream
+
+    def wait(self):
+        if self.work is not None:
+            self.work.wait()
+        if self.stream is not None:
+            torch.cuda.current_stream(self.gathered.device).wait_stream(self.stream)
+
+        if self.source is None or self.gathered is None:
+            return self.gathered
+        if self.preserve_grad and self.source.requires_grad:
+            return _AllGatherWithGrad.apply(self.gathered, self.source)
+        if self.source.requires_grad:
+            rank = torch.distributed.get_rank()
+            chunks = list(self.gathered.chunk(torch.distributed.get_world_size(), dim=0))
+            chunks[rank] = self.source
+            return torch.cat(chunks, dim=0)
+        return self.gathered
+
+
+def _new_gather_stream(tensor: torch.Tensor | None, priority: int = 0):
+    if tensor is not None and tensor.device.type == "cuda" and torch.cuda.is_available():
+        return torch.cuda.Stream(device=tensor.device, priority=priority)
+    return None
+
+
+def _start_async_dist_gather_tensor(
+    t: torch.Tensor | None,
+    preserve_grad: bool = False,
+    stream=None,
+) -> _DistGatherHandle:
+    """Start an all-gather on a side stream and return a handle for later use."""
+    if t is None:
+        return _DistGatherHandle(None, None, preserve_grad=False)
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return _DistGatherHandle(t, None, preserve_grad=False)
+    world_size = torch.distributed.get_world_size()
+    if world_size <= 1:
+        return _DistGatherHandle(t, None, preserve_grad=False)
+
+    source = t.contiguous()
+    gathered = torch.empty(
+        (world_size * source.shape[0], *source.shape[1:]),
+        dtype=source.dtype,
+        device=source.device,
+    )
+
+    if source.device.type == "cuda" and torch.cuda.is_available():
+        stream = stream or _new_gather_stream(source)
+        stream.wait_stream(torch.cuda.current_stream(source.device))
+        with torch.cuda.stream(stream):
+            work = torch.distributed.all_gather_into_tensor(gathered, source.detach(), async_op=True)
+        return _DistGatherHandle(gathered, source, preserve_grad=preserve_grad, work=work, stream=stream)
+
+    work = torch.distributed.all_gather_into_tensor(gathered, source.detach(), async_op=True)
+    return _DistGatherHandle(gathered, source, preserve_grad=preserve_grad, work=work)
+
+
+def _start_async_dist_gather_tensor_with_dim1_padding(
+    t: torch.Tensor | None,
+    padding_value: int | float | bool = 0,
+    preserve_grad: bool = False,
+    stream=None,
+) -> _DistGatherHandle:
+    """Start an all-gather after padding dim 1 to the max length across ranks."""
+    if t is None:
+        return _DistGatherHandle(None, None, preserve_grad=False)
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return _DistGatherHandle(t, None, preserve_grad=False)
+    if torch.distributed.get_world_size() <= 1:
+        return _DistGatherHandle(t, None, preserve_grad=False)
+
+    local_shape = torch.tensor(t.shape, device=t.device, dtype=torch.long)
+    shapes = [torch.empty_like(local_shape) for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather(shapes, local_shape)
+    max_dim1 = max(int(shape[1].item()) for shape in shapes)
+    if t.shape[1] < max_dim1:
+        pad_shape = list(t.shape)
+        pad_shape[1] = max_dim1 - t.shape[1]
+        padding = t.new_full(pad_shape, padding_value)
+        t = torch.cat([t, padding], dim=1)
+    return _start_async_dist_gather_tensor(t, preserve_grad=preserve_grad, stream=stream)
+
+
+class _BidirectionalMaskCollator:
+    def __init__(self, base_collate_fn, model_config, mask_dtype=None):
+        self.base_collate_fn = base_collate_fn
+        self.model_config = model_config
+        self.mask_dtype = mask_dtype
+
+    def __call__(self, batch):
+        batch = self.base_collate_fn(batch)
+        return add_bidirectional_masks_to_retrieval_batch(
+            batch,
+            model_config=self.model_config,
+            dtype=self.mask_dtype,
+        )
+
+
+def build_dataloader(
+    cfg_dl,
+    tokenizer,
+    seed,
+    batch_size=None,
+    dp_rank=0,
+    dp_world_size=1,
+    precompute_bidirectional_mask=False,
+    bidirectional_mask_model_config=None,
+    bidirectional_mask_dtype=None,
+):
     """Build a DataLoader for encoder training."""
     with ScopedRNG(seed=seed, ranked=True):
         with FirstRankPerNode():
@@ -211,6 +418,17 @@ def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_wor
             dl_kwargs = {"dataset": dataset, "batch_size": batch_size}
 
         dl_kwargs["dataset"] = dataset
+        if precompute_bidirectional_mask:
+            if collate_fn is None:
+                raise ValueError("precompute_bidirectional_mask requires an explicit retrieval collate_fn")
+            if bidirectional_mask_model_config is None:
+                raise ValueError("precompute_bidirectional_mask requires a model config")
+            collate_fn = _BidirectionalMaskCollator(
+                collate_fn,
+                model_config=bidirectional_mask_model_config,
+                mask_dtype=bidirectional_mask_dtype,
+            )
+
         if collate_fn is not None:
             dl_kwargs["collate_fn"] = collate_fn
 
@@ -233,6 +451,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
             timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
         )
         setup_logging()
+
+        if _get_bi_encoder_optimization_bool(self.cfg, "patch_flash_attention_is_packed_sequence"):
+            _patch_is_packed_sequence_for_training()
+            logger.info("Patched transformers._is_packed_sequence for non-packed retrieval training")
 
         apply_cache_compatibility_patches()
         apply_te_patches()
@@ -327,11 +549,18 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         # Might be tokenizer or processor (for VLMs)
         self.tokenizer = self.cfg.tokenizer.instantiate()
-        tokenizer = self.tokenizer.tokenizer if isinstance(self.tokenizer, ProcessorMixin) else self.tokenizer
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = self.tokenizer.eos_token
+        tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        if getattr(tokenizer, "pad_token", None) is None:
+            tokenizer.pad_token = getattr(tokenizer, "eos_token", getattr(self.tokenizer, "eos_token", None))
             tokenizer.padding_side = "left"
 
+        precompute_bidirectional_mask = _get_bi_encoder_optimization_bool(self.cfg, "precompute_bidirectional_mask")
+        bidirectional_mask_model_config = (
+            _get_bidirectional_mask_model_config(self.model_parts[0]) if precompute_bidirectional_mask else None
+        )
+        bidirectional_mask_dtype = (
+            _get_first_parameter_dtype(self.model_parts[0]) if precompute_bidirectional_mask else None
+        )
         self.dataloader = build_dataloader(
             self.cfg.dataloader,
             self.tokenizer,
@@ -339,6 +568,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
             batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
+            precompute_bidirectional_mask=precompute_bidirectional_mask,
+            bidirectional_mask_model_config=bidirectional_mask_model_config,
+            bidirectional_mask_dtype=bidirectional_mask_dtype,
         )
         self.train_n_passages = self.cfg.get("dataloader.dataset.n_passages", 1)
 
@@ -354,6 +586,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 batch_size=val_batch_size,
                 dp_rank=self._get_dp_rank(),
                 dp_world_size=self._get_dp_group_size(),
+                precompute_bidirectional_mask=precompute_bidirectional_mask,
+                bidirectional_mask_model_config=bidirectional_mask_model_config,
+                bidirectional_mask_dtype=bidirectional_mask_dtype,
             )
             self.val_n_passages = self.cfg.get("validation_dataloader.dataset.n_passages", self.train_n_passages)
 
@@ -378,6 +613,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
         )
         self.loss_average_window = deque(maxlen=self.step_scheduler.loss_average_window_steps)
+        self.log_every_steps = int(self.cfg.get("log_every_steps", 1))
+        if self.log_every_steps <= 0:
+            raise ValueError(f"log_every_steps must be greater than 0, got {self.log_every_steps}")
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.load_checkpoint(restore_from)
@@ -400,8 +638,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 # The step scheduler yields a list of batches for gradient accumulation
                 for batches in self.step_scheduler:
                     train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                    self.log_train_metrics(train_log_data)
-                    self._update_progress_bar(pbar, train_log_data.metrics)
+                    log_every_steps = getattr(self, "log_every_steps", 1)
+                    should_log_step = (
+                        log_every_steps == 1
+                        or self.step_scheduler.step % log_every_steps == 0
+                        or self.step_scheduler.is_last_step
+                    )
+                    if should_log_step:
+                        train_log_data = _materialize_metrics_for_logging(train_log_data)
+                        self.log_train_metrics(train_log_data)
+                        self._update_progress_bar(pbar, train_log_data.metrics)
 
                     val_loss = None
                     if self.step_scheduler.is_val_step and self.val_dataloader is not None:
@@ -429,10 +675,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
     def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
         """Forward and backward pass for a single micro-batch."""
-        batch = {
-            k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-            for k, v in batch.items()
-        }
+        batch = _move_batch_to_device(batch, self.dist_env.device)
         query, passage = _unpack_qp(batch)
 
         model = self.model_parts[0]
@@ -448,18 +691,69 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
 
         with train_ctx, sync_ctx:
+            cfg = getattr(self, "cfg", {})
             if is_train:
                 if query is not None:
                     query["run_dummy_vision"] = False
                 if passage is not None:
                     passage["run_dummy_vision"] = True
-            q_reps = model(query)
-            p_reps = model(passage)
             attr_model = _unwrap_model_for_attrs(model)
 
             n_passages = self.train_n_passages
             use_multi_vector_scoring = _uses_multi_vector_scoring(model)
-            if is_train and getattr(attr_model, "do_distributed_inbatch_negative", False):
+            use_dist_neg = is_train and getattr(attr_model, "do_distributed_inbatch_negative", False)
+            gather_stream_priority = (
+                -1 if _get_bi_encoder_optimization_bool(cfg, "overlap_passage_gather_high_priority") else 0
+            )
+            overlap_passage_gather = _get_bi_encoder_optimization_bool(cfg, "overlap_passage_gather_with_query_forward")
+            bypass_second_ddp_forward = (
+                overlap_passage_gather
+                and use_dist_neg
+                and is_train
+                and isinstance(self.distributed_config, DDPConfig)
+                and hasattr(model, "module")
+            )
+            pending_all_p = None
+            pending_all_p_mask = None
+            pending_all_doc_ids = None
+            passage_attention_mask_for_scores = passage["attention_mask"]
+
+            p_reps = model(passage)
+
+            if overlap_passage_gather and use_dist_neg:
+                preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
+                gather_stream = _new_gather_stream(p_reps, priority=gather_stream_priority)
+                if use_multi_vector_scoring:
+                    pending_all_p = _start_async_dist_gather_tensor_with_dim1_padding(
+                        p_reps,
+                        preserve_grad=preserve_gather_grad,
+                        stream=gather_stream,
+                    )
+                    pending_all_p_mask = _start_async_dist_gather_tensor_with_dim1_padding(
+                        passage_attention_mask_for_scores,
+                        padding_value=False,
+                        stream=gather_stream,
+                    )
+                else:
+                    pending_all_p = _start_async_dist_gather_tensor(
+                        p_reps,
+                        preserve_grad=preserve_gather_grad,
+                        stream=gather_stream,
+                    )
+                passage_doc_ids = batch.get("passage_doc_ids")
+                if passage_doc_ids is not None:
+                    pending_all_doc_ids = _start_async_dist_gather_tensor(
+                        passage_doc_ids.contiguous(),
+                        stream=gather_stream,
+                    )
+
+            q_reps = _query_forward_after_passage_forward(
+                model,
+                query,
+                use_bypassed_ddp=bypass_second_ddp_forward,
+            )
+
+            if use_dist_neg:
                 from nemo_automodel.components.models.common.inbatch_neg_utils import (
                     dist_gather_tensor,
                     dist_gather_tensor_with_dim1_padding,
@@ -473,8 +767,18 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
 
                 if use_multi_vector_scoring:
-                    all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
-                    all_p_mask = dist_gather_tensor_with_dim1_padding(passage["attention_mask"], padding_value=False)
+                    all_p = (
+                        pending_all_p.wait()
+                        if pending_all_p is not None
+                        else dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
+                    )
+                    all_p_mask = (
+                        pending_all_p_mask.wait()
+                        if pending_all_p_mask is not None
+                        else dist_gather_tensor_with_dim1_padding(
+                            passage_attention_mask_for_scores, padding_value=False
+                        )
+                    )
                     expected_p = world_size * local_bs * n_passages
                     assert all_p.shape[0] == expected_p, (
                         f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
@@ -487,7 +791,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         rank,
                     )
                 else:
-                    all_p = dist_gather_tensor(p_reps, preserve_grad=preserve_gather_grad)
+                    all_p = (
+                        pending_all_p.wait()
+                        if pending_all_p is not None
+                        else dist_gather_tensor(p_reps, preserve_grad=preserve_gather_grad)
+                    )
                     expected_p = world_size * local_bs * n_passages
                     assert all_p.shape[0] == expected_p, (
                         f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
@@ -498,7 +806,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     scores = scores / self.temperature
                 passage_doc_ids = batch.get("passage_doc_ids")
                 if passage_doc_ids is not None:
-                    all_doc_ids = dist_gather_tensor(passage_doc_ids.contiguous())
+                    all_doc_ids = (
+                        pending_all_doc_ids.wait()
+                        if pending_all_doc_ids is not None
+                        else dist_gather_tensor(passage_doc_ids.contiguous())
+                    )
                     mask_gathered_passages_same_doc_as_positive(
                         scores,
                         all_doc_ids,
@@ -512,7 +824,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         q_reps,
                         p_reps,
                         n_passages,
-                        passage["attention_mask"],
+                        passage_attention_mask_for_scores,
                     )
                 else:
                     scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
@@ -532,7 +844,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
         """Run one optimization step with gradient accumulation."""
         loss_buffer = []
         for idx, batch in enumerate(batches):
-            self._forward_backward_step(idx, batch, loss_buffer=loss_buffer, num_batches=len(batches), is_train=True)
+            self._forward_backward_step(
+                idx,
+                batch,
+                loss_buffer=loss_buffer,
+                num_batches=len(batches),
+                is_train=True,
+            )
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
@@ -547,6 +865,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             num_label_tokens=None,  # Not applicable for encoder
             dp_group_size=self._get_dp_group_size(include_cp=True),
             use_torch_clip_grad_norm=isinstance(self.distributed_config, DDPConfig),
+            return_tensor=True,
         )
 
         self.checkpointer.maybe_wait_for_staging()
@@ -564,9 +883,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
         if torch.distributed.is_initialized():
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
             reporting_loss = reporting_loss / self._get_dp_group_size(include_cp=True)
-        reporting_loss = reporting_loss.cpu().item()
+        reporting_loss = reporting_loss.detach()
         self.loss_average_window.append(reporting_loss)
-        average_loss = sum(self.loss_average_window) / len(self.loss_average_window)
+        average_loss = torch.stack(tuple(self.loss_average_window)).mean()
         elapsed = time.perf_counter() - self.timestamp
         self.timestamp = time.perf_counter()
         mem_allocated = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
@@ -574,7 +893,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         metrics = {
             "loss": reporting_loss,
             "loss_avg_window": average_loss,
-            "grad_norm": grad_norm,
+            "grad_norm": grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else grad_norm,
             "lr": lr,
             "mem": mem_allocated,
             "time_per_step": elapsed,
@@ -677,15 +996,15 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.metric_logger_train.log(log_data)
 
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | loss_avg_window {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s".format(
+            "step {} | epoch {} | loss {} | loss_avg_window {} | grad_norm {} | lr {} | mem {} GiB | time {}s".format(
                 log_data.step,
                 log_data.epoch,
-                log_data.metrics["loss"],
-                log_data.metrics["loss_avg_window"],
-                log_data.metrics["grad_norm"],
-                log_data.metrics["lr"],
-                log_data.metrics["mem"],
-                log_data.metrics["time_per_step"],
+                _format_metric_for_log(log_data.metrics["loss"], ".4f"),
+                _format_metric_for_log(log_data.metrics["loss_avg_window"], ".4f"),
+                _format_metric_for_log(log_data.metrics["grad_norm"], ".4f"),
+                _format_metric_for_log(log_data.metrics["lr"], ".2e"),
+                _format_metric_for_log(log_data.metrics["mem"], ".2f"),
+                _format_metric_for_log(log_data.metrics["time_per_step"], ".2f"),
             )
         )
 

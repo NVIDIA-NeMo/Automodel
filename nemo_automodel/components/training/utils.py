@@ -182,6 +182,7 @@ def clip_grad_norm(
     pp_axis_name: str | None = None,
     foreach: bool = True,
     use_torch_clip_grad_norm: bool = False,
+    return_tensor: bool = False,
 ):
     """Common gradient clipping helper.
 
@@ -205,9 +206,10 @@ def clip_grad_norm(
         pp_axis_name: Pipeline parallel axis name.
         foreach: Whether to use foreach implementation for clipping.
         use_torch_clip_grad_norm: Use PyTorch's optimized regular-tensor clipping path when possible.
+        return_tensor: Keep scalar tensor norms on device instead of calling item().
 
     Returns:
-        Total gradient norm as a float.
+        Total gradient norm as a float by default, or a tensor when return_tensor=True.
     """
     if max_grad_norm is None:
         return 0.0
@@ -247,11 +249,13 @@ def clip_grad_norm(
             pp_mesh=pp_mesh,
         )
 
-    # Convert to float for API compatibility
+    # Convert to float for API compatibility unless the caller wants to defer
+    # host synchronization for logging/metrics.
     if isinstance(grad_norm, torch.Tensor):
-        grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm
         if hasattr(grad_norm, "full_tensor"):
             grad_norm = grad_norm.full_tensor()
+        if not return_tensor:
+            grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm
 
     return grad_norm
 
@@ -319,6 +323,7 @@ def scale_grads_and_clip_grad_norm(
     num_label_tokens: int | None = None,
     dp_group_size: int | None = None,
     use_torch_clip_grad_norm: bool = False,
+    return_tensor: bool = False,
 ):
     """Scale gradients for PP/EP in a single pass, then clip.
 
@@ -376,6 +381,7 @@ def scale_grads_and_clip_grad_norm(
         pp_axis_name=pp_axis_name,
         foreach=foreach,
         use_torch_clip_grad_norm=use_torch_clip_grad_norm,
+        return_tensor=return_tensor,
     )
 
 

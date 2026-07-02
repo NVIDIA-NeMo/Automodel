@@ -1,0 +1,134 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Optimized DDP config for Llama Nemotron VL 1B retrieval fine-tuning.
+#
+# For a throughput-efficient 4x8 GPU DDP run, use this config with:
+#
+#   export PYTORCH_ALLOC_CONF=expandable_segments:True
+#
+# The allocator option helps local_batch_size=2 fit on 80GB GPUs by reducing
+# CUDA memory fragmentation. If your data or model variant needs more memory,
+# lower local_batch_size or enable activation checkpointing. When reducing GPU
+# count, use activation checkpointing if you need a larger per-GPU batch to keep
+# the same global batch without too much gradient accumulation.
+
+recipe: TrainBiEncoderRecipe
+
+seed: 0
+
+temperature: 0.02
+
+# Optional bi-encoder recipe optimizations used by the fast path.
+bi_encoder_optimization:
+  patch_flash_attention_is_packed_sequence: true
+  precompute_bidirectional_mask: true
+  overlap_passage_gather_with_query_forward: true
+  overlap_passage_gather_high_priority: true
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 2
+  ckpt_every_steps: 5000
+  val_every_steps: 500
+  num_epochs: 1
+  log_remote_every_steps: 50
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
+  pretrained_model_name_or_path: nvidia/llama-nemotron-embed-vl-1b-v2
+  pooling: avg
+  l2_normalize: true
+  use_liger_kernel: true
+  use_sdpa_patching: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  do_distributed_inbatch_negative: true
+  detach_distributed_inbatch_negatives: false
+
+  # Optimized LLM backbone.
+  use_custom_llama_backend: true
+  use_te_fused_mlp: true
+  use_te_fused_qkv: true
+
+  # Optimized vision tower and vision-language projection.
+  use_te_fused_siglip_layer: true
+  use_te_fused_vision_projection: true
+  disable_unused_siglip_pooling_head: true
+
+tokenizer:
+  _target_: nemo_automodel.components.models.llama_nemotron_vl.processor.LlamaNemotronVLProcessor.from_pretrained
+  pretrained_model_name_or_path: nvidia/llama-nemotron-embed-vl-1b-v2
+  q_max_length: 512
+  p_max_length: 4096
+  query_prefix: "query:"
+  passage_prefix: "passage:"
+  max_input_tiles: 2
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    model_type: bi_encoder
+    data_dir_list:
+      - path: <DATASETS_PATH>/automodel_colpali/training_datasets/colpali_train.json
+        num_samples: 5000
+      - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
+        num_samples: 5000
+    data_type: train
+    n_passages: 5
+    seed: 42
+    do_shuffle: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.make_vision_collator_from_processor_method
+    collator_fn_name: process_queries_documents_biencoder
+  shuffle: true
+  num_workers: 4
+  pin_memory: true
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 1e-6
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+
+lr_scheduler:
+  lr_warmup_steps: 100
+  lr_decay_style: linear
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./output/nemotron_vl_1b_optimized_ddp_lbs2/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: ddp
+  find_unused_parameters: false
+  static_graph: true
+  bucket_cap_mb: 400
+  gradient_as_bucket_view: true
+
+# Uncomment and configure for W&B logging.
+wandb:
+  project: YOUR_WANDB_PROJECT
+  entity: YOUR_WANDB_ENTITY
+  name: nemotron_vl_1b_optimized_ddp_lbs2
+  enable: false

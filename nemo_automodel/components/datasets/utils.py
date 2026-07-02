@@ -18,6 +18,15 @@ from typing import Optional
 import torch
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
+try:
+    from transformers.masking_utils import create_bidirectional_mask
+
+    _HAS_NATIVE_BIDIRECTIONAL_MASK = True
+except ImportError:
+    from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
+
+    _HAS_NATIVE_BIDIRECTIONAL_MASK = False
+
 
 def batchify(tensor, default_tensor_cls=torch.LongTensor):
     """
@@ -218,6 +227,63 @@ def add_causal_masks_to_batch(batch_dict, model_config):
     )
 
     batch_dict["causal_mask_mapping"] = causal_mask_mapping
+    return batch_dict
+
+
+def _torch_dtype_from_config(value, default=torch.float32):
+    if isinstance(value, torch.dtype):
+        return value
+    if isinstance(value, str):
+        name = value.rsplit(".", 1)[-1]
+        return getattr(torch, name, default)
+    return default
+
+
+def create_bidirectional_mask_for_batch(model_config, attention_mask, device=None, dtype=None):
+    """Create a bidirectional encoder mask from a batched 2D attention mask."""
+    if attention_mask is None:
+        return None
+    if attention_mask.dim() > 2:
+        return attention_mask
+
+    if device is None:
+        device = attention_mask.device
+    if dtype is None:
+        dtype = _torch_dtype_from_config(
+            getattr(model_config, "torch_dtype", None) or getattr(model_config, "dtype", None)
+        )
+    attention_mask = attention_mask.to(device=device)
+
+    if _HAS_NATIVE_BIDIRECTIONAL_MASK:
+        batch_size, seq_len = attention_mask.shape
+        dummy_embeds = torch.empty((batch_size, seq_len, 1), device=device, dtype=dtype)
+        return create_bidirectional_mask(
+            model_config,
+            dummy_embeds,
+            attention_mask=attention_mask,
+        )
+
+    if getattr(model_config, "_attn_implementation", None) == "flash_attention_2":
+        has_masked_tokens = bool((attention_mask == 0).any().item())
+        return attention_mask if has_masked_tokens else None
+
+    return _prepare_4d_attention_mask(attention_mask, dtype)
+
+
+def add_bidirectional_masks_to_retrieval_batch(batch_dict, model_config, dtype=None):
+    """Add q_/d_ bidirectional masks to a retrieval batch."""
+    for prefix in ("q_", "d_"):
+        attention_key = f"{prefix}attention_mask"
+        if attention_key not in batch_dict:
+            continue
+        mask = create_bidirectional_mask_for_batch(
+            model_config=model_config,
+            attention_mask=batch_dict[attention_key],
+            device=batch_dict[attention_key].device,
+            dtype=dtype,
+        )
+        batch_dict[f"{prefix}bidirectional_mask"] = mask
+        batch_dict[f"{prefix}bidirectional_mask_precomputed"] = True
     return batch_dict
 
 
