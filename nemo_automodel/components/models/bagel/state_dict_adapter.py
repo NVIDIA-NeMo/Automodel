@@ -70,13 +70,11 @@ UND_PATTERNS = [
     r"^language_model\.model\.embed_tokens\.weight$",
     r"^language_model\.model\.norm\.weight$",
     r"^language_model\.lm_head\.weight$",
-    r"^language_model\.model\.layers\.\d+\.self_attn\.q_proj\.(weight|bias)$",
-    r"^language_model\.model\.layers\.\d+\.self_attn\.k_proj\.(weight|bias)$",
-    r"^language_model\.model\.layers\.\d+\.self_attn\.v_proj\.(weight|bias)$",
+    r"^language_model\.model\.layers\.\d+\.self_attn\.(q|k|v|qkv)_proj\.(weight|bias)$",
     r"^language_model\.model\.layers\.\d+\.self_attn\.o_proj\.weight$",
     r"^language_model\.model\.layers\.\d+\.self_attn\.q_norm\.weight$",
     r"^language_model\.model\.layers\.\d+\.self_attn\.k_norm\.weight$",
-    r"^language_model\.model\.layers\.\d+\.mlp\.(gate|up|down)_proj\.weight$",
+    r"^language_model\.model\.layers\.\d+\.mlp\.(gate|up|down|gate_up)_proj\.weight$",
     r"^language_model\.model\.layers\.\d+\.input_layernorm\.weight$",
     r"^language_model\.model\.layers\.\d+\.post_attention_layernorm\.weight$",
     r"^vit_model\.",
@@ -85,13 +83,11 @@ UND_PATTERNS = [
 ]
 
 GEN_PATTERNS = [
-    r"^language_model\.model\.layers\.\d+\.self_attn\.q_proj_moe_gen\.(weight|bias)$",
-    r"^language_model\.model\.layers\.\d+\.self_attn\.k_proj_moe_gen\.(weight|bias)$",
-    r"^language_model\.model\.layers\.\d+\.self_attn\.v_proj_moe_gen\.(weight|bias)$",
+    r"^language_model\.model\.layers\.\d+\.self_attn\.(q|k|v|qkv)_proj_moe_gen\.(weight|bias)$",
     r"^language_model\.model\.layers\.\d+\.self_attn\.o_proj_moe_gen\.weight$",
     r"^language_model\.model\.layers\.\d+\.self_attn\.q_norm_moe_gen\.weight$",
     r"^language_model\.model\.layers\.\d+\.self_attn\.k_norm_moe_gen\.weight$",
-    r"^language_model\.model\.layers\.\d+\.mlp_moe_gen\.(gate|up|down)_proj\.weight$",
+    r"^language_model\.model\.layers\.\d+\.mlp_moe_gen\.(gate|up|down|gate_up)_proj\.weight$",
     r"^language_model\.model\.layers\.\d+\.input_layernorm_moe_gen\.weight$",
     r"^language_model\.model\.layers\.\d+\.post_attention_layernorm_moe_gen\.weight$",
     r"^language_model\.model\.norm_moe_gen\.weight$",
@@ -106,6 +102,10 @@ VAE_PATTERNS = [
     r"^decoder\.",
 ]
 
+EXTRA_STATE_PATTERNS = [
+    r"\._extra_state$",
+]
+
 # No physical tensor sharing: embed_tokens / lm_head / final norm are UND-side
 # but are logically READ by the gen path (gen tokens use text embeddings).
 SHARED_PATTERNS: list[str] = []
@@ -118,10 +118,54 @@ def _compile(patterns: list[str]) -> list[re.Pattern]:
 _UND_RES = _compile(UND_PATTERNS)
 _GEN_RES = _compile(GEN_PATTERNS)
 _VAE_RES = _compile(VAE_PATTERNS)
+_EXTRA_STATE_RES = _compile(EXTRA_STATE_PATTERNS)
+
+_SPLIT_QKV_RE = re.compile(r"^(.*\.self_attn)\.(q_proj|k_proj|v_proj)(_moe_gen)?\.(weight|bias)$")
+_SPLIT_GATE_UP_RE = re.compile(r"^(.*\.mlp(?:_moe_gen)?)\.(gate_proj|up_proj)\.weight$")
+_FUSED_QKV_RE = re.compile(r"^(.*\.self_attn)\.qkv_proj(_moe_gen)?\.(weight|bias)$")
+_FUSED_GATE_UP_RE = re.compile(r"^(.*\.mlp(?:_moe_gen)?)\.gate_up_proj\.weight$")
 
 
 def _matches_any(key: str, patterns: list[re.Pattern]) -> bool:
     return any(p.search(key) is not None for p in patterns)
+
+
+def _fuse_split_projections(weights: dict[str, Any]) -> dict[str, Any]:
+    """Replace complete Q/K/V and gate/up groups with their fused tensors."""
+    import torch
+
+    qkv_groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    gate_up_groups: dict[str, dict[str, Any]] = {}
+
+    for key in list(weights):
+        qkv_match = _SPLIT_QKV_RE.match(key)
+        if qkv_match:
+            prefix, projection, gen_suffix, weight_or_bias = qkv_match.groups()
+            group = (prefix, gen_suffix or "", weight_or_bias)
+            qkv_groups.setdefault(group, {})[projection] = weights.pop(key)
+            continue
+        gate_up_match = _SPLIT_GATE_UP_RE.match(key)
+        if gate_up_match:
+            prefix, projection = gate_up_match.groups()
+            gate_up_groups.setdefault(prefix, {})[projection] = weights.pop(key)
+
+    for (prefix, gen_suffix, weight_or_bias), parts in qkv_groups.items():
+        missing = {"q_proj", "k_proj", "v_proj"} - parts.keys()
+        if missing:
+            raise KeyError(
+                f"Cannot fuse {prefix}.qkv_proj{gen_suffix}.{weight_or_bias}: missing split tensors {sorted(missing)}."
+            )
+        weights[f"{prefix}.qkv_proj{gen_suffix}.{weight_or_bias}"] = torch.cat(
+            [parts["q_proj"], parts["k_proj"], parts["v_proj"]], dim=0
+        )
+
+    for prefix, parts in gate_up_groups.items():
+        missing = {"gate_proj", "up_proj"} - parts.keys()
+        if missing:
+            raise KeyError(f"Cannot fuse {prefix}.gate_up_proj.weight: missing split tensors {sorted(missing)}.")
+        weights[f"{prefix}.gate_up_proj.weight"] = torch.cat([parts["gate_proj"], parts["up_proj"]], dim=0)
+
+    return weights
 
 
 def _normalize_stage(stage: Any) -> str:
@@ -139,10 +183,12 @@ def _normalize_stage(stage: Any) -> str:
 
 
 def _partition(state_dict: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Partition a flat checkpoint dict into UND / GEN / VAE / unknown buckets."""
-    buckets: dict[str, dict[str, Any]] = {"und": {}, "gen": {}, "vae": {}, "unknown": {}}
+    """Partition a flat checkpoint dict into UND / GEN / VAE / extra / unknown buckets."""
+    buckets: dict[str, dict[str, Any]] = {"und": {}, "gen": {}, "vae": {}, "extra": {}, "unknown": {}}
     for key, tensor in state_dict.items():
-        if _matches_any(key, _UND_RES):
+        if _matches_any(key, _EXTRA_STATE_RES):
+            buckets["extra"][key] = tensor
+        elif _matches_any(key, _UND_RES):
             buckets["und"][key] = tensor
         elif _matches_any(key, _GEN_RES):
             buckets["gen"][key] = tensor
@@ -167,8 +213,8 @@ class BagelStateDictAdapter(StateDictAdapter):
     and handles this root mapping.
 
     Args:
-        config: ``BagelConfig`` (or ``None``; currently only used for log
-            context — no shape sanity checks yet).
+        config: ``BagelConfig``. Its text config selects split versus fused
+            projection layout and supplies the Q/K/V split sizes for export.
         stage: Default stage used when ``from_hf`` is called without an
             explicit ``stage`` kwarg. Accepts ``"stage1"`` / ``"stage2"`` or
             ``1`` / ``2``.
@@ -189,6 +235,52 @@ class BagelStateDictAdapter(StateDictAdapter):
 
     def _strip_nemo_root(self, key: str) -> str:
         return key.removeprefix("model.")
+
+    def _text_config(self) -> Any:
+        if self.config is None:
+            return None
+        return getattr(self.config, "text_config", None) or getattr(self.config, "llm_config", None)
+
+    def _uses_fused_projections(self) -> bool:
+        text_config = self._text_config()
+        return bool(text_config is not None and getattr(text_config, "fused_projections", False))
+
+    def _qkv_split_sizes(self) -> tuple[int, int, int]:
+        text_config = self._text_config()
+        if text_config is None:
+            raise RuntimeError(
+                "Splitting a fused BAGEL qkv_proj requires a config with num_attention_heads, "
+                "num_key_value_heads, and hidden_size."
+            )
+        head_dim = getattr(text_config, "head_dim", None) or (
+            text_config.hidden_size // text_config.num_attention_heads
+        )
+        q_size = text_config.num_attention_heads * head_dim
+        kv_size = text_config.num_key_value_heads * head_dim
+        return q_size, kv_size, kv_size
+
+    def _split_fused_projection(self, key: str, tensor: "torch.Tensor") -> list[tuple[str, "torch.Tensor"]]:
+        qkv_match = _FUSED_QKV_RE.match(key)
+        if qkv_match:
+            prefix, gen_suffix, weight_or_bias = qkv_match.groups()
+            q_size, k_size, v_size = self._qkv_split_sizes()
+            q, k, v = tensor.split([q_size, k_size, v_size], dim=0)
+            gen_suffix = gen_suffix or ""
+            return [
+                (f"{prefix}.q_proj{gen_suffix}.{weight_or_bias}", q),
+                (f"{prefix}.k_proj{gen_suffix}.{weight_or_bias}", k),
+                (f"{prefix}.v_proj{gen_suffix}.{weight_or_bias}", v),
+            ]
+
+        gate_up_match = _FUSED_GATE_UP_RE.match(key)
+        if gate_up_match:
+            (prefix,) = gate_up_match.groups()
+            gate, up = tensor.chunk(2, dim=0)
+            return [
+                (f"{prefix}.gate_proj.weight", gate),
+                (f"{prefix}.up_proj.weight", up),
+            ]
+        return [(key, tensor)]
 
     # ------------------------------------------------------------------
     # from_hf: upstream BAGEL checkpoint -> NeMo module tree.
@@ -225,6 +317,16 @@ class BagelStateDictAdapter(StateDictAdapter):
         """
         stage = _normalize_stage(stage if stage is not None else self.stage)
         buckets = _partition({self._strip_nemo_root(k): v for k, v in hf_state_dict.items()})
+
+        if self._uses_fused_projections():
+            _fuse_split_projections(buckets["und"])
+            _fuse_split_projections(buckets["gen"])
+
+        if buckets["extra"]:
+            logger.info(
+                "BagelStateDictAdapter.from_hf: dropping %d Transformer-Engine _extra_state key(s).",
+                len(buckets["extra"]),
+            )
 
         if buckets["unknown"]:
             sample = list(buckets["unknown"])[:5]
@@ -273,11 +375,15 @@ class BagelStateDictAdapter(StateDictAdapter):
         """
         exclude_key_regex = kwargs.get("exclude_key_regex")
         exclude_pattern = re.compile(exclude_key_regex) if exclude_key_regex else None
-        return {
-            self._nemo_to_hf_key(k): v
-            for k, v in state_dict.items()
-            if exclude_pattern is None or not exclude_pattern.match(k)
-        }
+        converted: dict[str, "torch.Tensor"] = {}
+        for nemo_key, tensor in state_dict.items():
+            if "._extra_state" in nemo_key:
+                continue
+            if exclude_pattern is not None and exclude_pattern.match(nemo_key):
+                continue
+            hf_key = self._nemo_to_hf_key(nemo_key)
+            converted.update(self._split_fused_projection(hf_key, tensor))
+        return converted
 
     # ------------------------------------------------------------------
     # Per-tensor rename (DCP save path).
@@ -290,9 +396,11 @@ class BagelStateDictAdapter(StateDictAdapter):
     ) -> list[tuple[str, "torch.Tensor"]]:
         """Return ``[(hf_fqn, tensor)]`` for a single NeMo tensor.
 
-        Identity for BAGEL checkpoint keys.
+        Fused projections are split into the standard HF checkpoint layout.
         """
-        return [(self._nemo_to_hf_key(fqn), tensor)]
+        if "._extra_state" in fqn:
+            return []
+        return self._split_fused_projection(self._nemo_to_hf_key(fqn), tensor)
 
 
 # ---------------------------------------------------------------------------

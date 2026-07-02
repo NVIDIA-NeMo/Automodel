@@ -49,9 +49,15 @@ from nemo_automodel.components.models.bagel.state_dict_adapter import (
     BagelStateDictAdapter,
     load_bagel_checkpoint_state_dict,
 )
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 logger = logging.getLogger(__name__)
+
+
+def _default_bagel_backend() -> BackendConfig:
+    """Return the existing torch/FlexAttention BAGEL backend."""
+    return BackendConfig(attn="flex", linear="torch", rms_norm="torch_fp32", rope_fusion=False)
 
 
 def _stage_to_int(stage: Union[int, str]) -> int:
@@ -144,12 +150,13 @@ class BagelModel(nn.Module):
     ``BagelForUnifiedMultimodal.forward``.
     """
 
-    def __init__(self, config: BagelConfig) -> None:
+    def __init__(self, config: BagelConfig, backend: Optional[BackendConfig] = None) -> None:
         super().__init__()
         self.config = config
+        self.backend = backend or _default_bagel_backend()
 
         # Text backbone - always present.
-        self.language_model = Qwen2ForCausalLM(config.text_config)
+        self.language_model = Qwen2ForCausalLM(config.text_config, backend=self.backend)
 
         # Understanding-side vision path. Built whenever the BAGEL config keeps
         # visual understanding enabled.
@@ -223,11 +230,12 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: BagelConfig) -> None:
+    def __init__(self, config: BagelConfig, backend: Optional[BackendConfig] = None) -> None:
         super().__init__()
         _prepare_config_for_stage(config)
         self.config = config
-        self.model = BagelModel(config)
+        self.backend = backend or _default_bagel_backend()
+        self.model = BagelModel(config, backend=self.backend)
         _convert_patch_embedding_for_packed_vit(self.model, config)
 
         # Light state-dict adapter hook used by HFCheckpointingMixin /

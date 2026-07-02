@@ -340,6 +340,16 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     ):
         """Build BAGEL from HF backbones and apply the configured infrastructure."""
         logger.info("Building BAGEL from HF backbones (artifact_source=%s, stage=%d)", artifact_path, stage)
+        backend_cfg = self.cfg.get("model.backend", None)
+        if backend_cfg is not None:
+            from nemo_automodel.components.models.common import BackendConfig
+
+            if hasattr(backend_cfg, "to_dict"):
+                backend_cfg = backend_cfg.to_dict()
+            if isinstance(backend_cfg, dict):
+                backend_cfg = BackendConfig(**backend_cfg)
+            elif not isinstance(backend_cfg, BackendConfig):
+                raise TypeError(f"model.backend must be a mapping or BackendConfig, got {type(backend_cfg)!r}")
         with ScopedRNG(seed=rank_seed, ranked=False):
             model = build_bagel_from_hf_backbones(
                 model_cfg=self.cfg.model,
@@ -347,6 +357,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 vae_config=self.cfg.get("model.vae_config", None),
                 meta_init=True,
                 load_backbone_weights=False,
+                backend=backend_cfg,
             )
             if freeze_before_infrastructure:
                 model.eval()

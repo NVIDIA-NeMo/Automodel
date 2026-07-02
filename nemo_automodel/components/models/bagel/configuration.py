@@ -46,11 +46,12 @@ from nemo_automodel.components.models.bagel.modeling_siglip_navit import SiglipV
 def _coerce_text_config(cfg: Union[Dict[str, Any], Qwen2Config, None]) -> Qwen2Config:
     """Coerce ``cfg`` into a ``Qwen2Config`` with BAGEL's extra attributes set.
 
-    BAGEL adds three attributes to Qwen2Config that aren't part of stock
+    BAGEL adds four attributes to Qwen2Config that aren't part of stock
     transformers:
     * ``qk_norm`` (bool, default True for BAGEL-7B-MoT)
     * ``layer_module`` (``"Qwen2DecoderLayer"`` or ``"Qwen2MoTDecoderLayer"``)
     * ``freeze_und`` (bool, default False)
+    * ``fused_projections`` (bool, default False)
 
     We also ensure ``pad_token_id`` is populated. Some checkpoint configs omit
     it, and transformers 5.x raises ``AttributeError`` on missing config attrs.
@@ -70,6 +71,8 @@ def _coerce_text_config(cfg: Union[Dict[str, Any], Qwen2Config, None]) -> Qwen2C
         cfg.layer_module = "Qwen2DecoderLayer"
     if not hasattr(cfg, "freeze_und"):
         cfg.freeze_und = False
+    if not hasattr(cfg, "fused_projections"):
+        cfg.fused_projections = False
 
     # pad_token_id: Qwen2Config's default is None, which Qwen2Model tolerates
     # (nn.Embedding accepts padding_idx=None). The packed training path reads

@@ -113,12 +113,35 @@ def _copy_qwen_mot_weights_from_und(language_model) -> int:
     return copied
 
 
+def _uses_fused_qwen_projections(language_model) -> bool:
+    """Return whether the target Qwen module tree expects fused projection keys."""
+    fused_suffixes = (
+        "self_attn.qkv_proj.weight",
+        "self_attn.qkv_proj_moe_gen.weight",
+        "mlp.gate_up_proj.weight",
+        "mlp_moe_gen.gate_up_proj.weight",
+    )
+    return any(
+        _normalize_wrapped_param_name(name).endswith(fused_suffixes) for name, _ in language_model.named_parameters()
+    )
+
+
 def _load_qwen_backbone_into_bagel(model, llm_path: str, *, copy_init_moe: bool) -> None:
     """Load vanilla Qwen weights into BAGEL's language model after AM sharding."""
     from nemo_automodel.components.checkpoint.checkpointing import _load_full_state_dict_into_model
 
     logger.info("Loading Qwen backbone from %s", llm_path)
     state_dict = _load_hf_state_dict(llm_path)
+    if _uses_fused_qwen_projections(model.model.language_model):
+        from nemo_automodel.components.models.bagel.state_dict_adapter import _fuse_split_projections
+
+        before_count = len(state_dict)
+        _fuse_split_projections(state_dict)
+        logger.info(
+            "HF-backbone Qwen projection fusion: %d -> %d tensor(s)",
+            before_count,
+            len(state_dict),
+        )
     _load_full_state_dict_into_model([model.model.language_model], state_dict)
     logger.info("HF-backbone Qwen load: loaded %d tensor(s)", len(state_dict))
     del state_dict
@@ -215,6 +238,7 @@ def build_bagel_from_hf_backbones(
     vae_config: Dict[str, int] | None,
     meta_init: bool = False,
     load_backbone_weights: bool = True,
+    backend: Any = None,
 ) -> torch.nn.Module:
     """Build BAGEL from upstream Qwen/SigLIP backbone configs."""
     from transformers import Qwen2Config
@@ -241,6 +265,7 @@ def build_bagel_from_hf_backbones(
     llm_config.qk_norm = bool(model_cfg.get("llm_qk_norm", True))
     llm_config.tie_word_embeddings = bool(model_cfg.get("tie_word_embeddings", False))
     llm_config.freeze_und = bool(model_cfg.get("freeze_und", False))
+    llm_config.fused_projections = bool(model_cfg.get("fused_projections", False))
 
     vit_config = _load_siglip_vision_config(vit_path) if visual_und else None
 
@@ -276,9 +301,9 @@ def build_bagel_from_hf_backbones(
             from nemo_automodel.components.utils.model_utils import init_empty_weights
 
             with no_init_weights(), init_empty_weights():
-                model = BagelForUnifiedMultimodal(bagel_config)
+                model = BagelForUnifiedMultimodal(bagel_config, backend=backend)
         else:
-            model = BagelForUnifiedMultimodal(bagel_config)
+            model = BagelForUnifiedMultimodal(bagel_config, backend=backend)
     finally:
         torch.set_default_dtype(original_dtype)
 
