@@ -328,7 +328,14 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
         return
 
     logger.info(f"Saving encoder model to {save_directory}")
-    model.model.save_pretrained(save_directory)
+    state_dict = model.state_dict()
+    adapter = getattr(model, "state_dict_adapter", None)
+    if adapter is not None:
+        state_dict = adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*")
+        for key, value in list(state_dict.items()):
+            if isinstance(value, torch.Tensor) and not value.is_contiguous():
+                state_dict[key] = value.contiguous()
+    model.model.save_pretrained(save_directory, state_dict=state_dict)
 
 
 # HuggingFace model_type -> task -> bidirectional architecture class name in ModelRegistry
@@ -359,7 +366,8 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
         encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
     else:
         encoder.name_or_path = getattr(model.config, "name_or_path", "")
-    encoder.state_dict_adapter = EncoderStateDictAdapter()
+    adapter_factory = getattr(model, "get_encoder_state_dict_adapter", None)
+    encoder.state_dict_adapter = adapter_factory() if callable(adapter_factory) else EncoderStateDictAdapter()
     configure_encoder_metadata(model, model.config)
 
 

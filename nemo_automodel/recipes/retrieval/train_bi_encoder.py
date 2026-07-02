@@ -30,6 +30,7 @@ from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.utils import add_bidirectional_masks_to_retrieval_batch
 from nemo_automodel.components.distributed.config import DDPConfig
+from nemo_automodel.components.distributed.fsdp2 import _patch_is_packed_sequence_for_training
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -58,23 +59,24 @@ def _unwrap_model_for_attrs(model):
     return getattr(model, "module", model)
 
 
-def _is_device_scalar(value) -> bool:
-    return isinstance(value, torch.Tensor) and value.numel() == 1 and value.device.type != "cpu"
-
-
-def _format_metric_for_log(value, spec: str) -> str:
-    if _is_device_scalar(value):
-        return "<deferred>"
+def _materialize_metric_value(value):
     if isinstance(value, torch.Tensor):
         if value.numel() == 1:
             value = value.detach().cpu().item()
         else:
-            return "<tensor>"
+            value = value.detach().cpu()
+    return value
+
+
+def _materialize_metrics_for_logging(log_data: MetricsSample) -> MetricsSample:
+    log_data.metrics = {key: _materialize_metric_value(value) for key, value in log_data.metrics.items()}
+    return log_data
+
+
+def _format_metric_for_log(value, spec: str) -> str:
+    if isinstance(value, torch.Tensor):
+        return "<tensor>" if value.numel() != 1 else format(value.detach().cpu().item(), spec)
     return format(value, spec)
-
-
-def _metrics_for_progress(metrics: dict) -> dict:
-    return {key: value for key, value in metrics.items() if not _is_device_scalar(value)}
 
 
 def _get_autocast_ctx(distributed_config):
@@ -228,26 +230,6 @@ def _get_bi_encoder_optimization_bool(cfg, key: str, default=False) -> bool:
     return _as_bool(cfg.get(f"bi_encoder_optimization.{key}", default))
 
 
-def _patch_flash_attention_is_packed_sequence_for_non_packed_training() -> bool:
-    """Avoid the HF FlashAttention packed-sequence check host sync for standard retrieval batches."""
-    try:
-        import transformers.modeling_flash_attention_utils as fa_utils
-    except ImportError:
-        return False
-
-    if getattr(fa_utils, "_is_packed_sequence_patched", False):
-        return True
-    if not hasattr(fa_utils, "_is_packed_sequence"):
-        return False
-
-    def _is_packed_sequence_no_sync(position_ids, batch_size):
-        return False
-
-    fa_utils._is_packed_sequence = _is_packed_sequence_no_sync
-    fa_utils._is_packed_sequence_patched = True
-    return True
-
-
 def _query_forward_after_passage_forward(model, query, *, use_bypassed_ddp: bool = False):
     """Run the second forward without a second DDP unused-param traversal when requested."""
     if use_bypassed_ddp and hasattr(model, "module"):
@@ -379,6 +361,21 @@ def _start_async_dist_gather_tensor_with_dim1_padding(
     return _start_async_dist_gather_tensor(t, preserve_grad=preserve_grad, stream=stream)
 
 
+class _BidirectionalMaskCollator:
+    def __init__(self, base_collate_fn, model_config, mask_dtype=None):
+        self.base_collate_fn = base_collate_fn
+        self.model_config = model_config
+        self.mask_dtype = mask_dtype
+
+    def __call__(self, batch):
+        batch = self.base_collate_fn(batch)
+        return add_bidirectional_masks_to_retrieval_batch(
+            batch,
+            model_config=self.model_config,
+            dtype=self.mask_dtype,
+        )
+
+
 def build_dataloader(
     cfg_dl,
     tokenizer,
@@ -426,20 +423,11 @@ def build_dataloader(
                 raise ValueError("precompute_bidirectional_mask requires an explicit retrieval collate_fn")
             if bidirectional_mask_model_config is None:
                 raise ValueError("precompute_bidirectional_mask requires a model config")
-            base_collate_fn = collate_fn
-
-            def collate_fn(
-                batch,
-                base_fn=base_collate_fn,
+            collate_fn = _BidirectionalMaskCollator(
+                collate_fn,
                 model_config=bidirectional_mask_model_config,
                 mask_dtype=bidirectional_mask_dtype,
-            ):
-                batch = base_fn(batch)
-                return add_bidirectional_masks_to_retrieval_batch(
-                    batch,
-                    model_config=model_config,
-                    dtype=mask_dtype,
-                )
+            )
 
         if collate_fn is not None:
             dl_kwargs["collate_fn"] = collate_fn
@@ -465,10 +453,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
         setup_logging()
 
         if _get_bi_encoder_optimization_bool(self.cfg, "patch_flash_attention_is_packed_sequence"):
-            if _patch_flash_attention_is_packed_sequence_for_non_packed_training():
-                logger.info("Patched transformers._is_packed_sequence for non-packed retrieval training")
-            else:
-                logger.warning("Could not patch transformers._is_packed_sequence")
+            _patch_is_packed_sequence_for_training()
+            logger.info("Patched transformers._is_packed_sequence for non-packed retrieval training")
 
         apply_cache_compatibility_patches()
         apply_te_patches()
@@ -659,8 +645,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         or self.step_scheduler.is_last_step
                     )
                     if should_log_step:
+                        train_log_data = _materialize_metrics_for_logging(train_log_data)
                         self.log_train_metrics(train_log_data)
-                        self._update_progress_bar(pbar, _metrics_for_progress(train_log_data.metrics))
+                        self._update_progress_bar(pbar, train_log_data.metrics)
 
                     val_loss = None
                     if self.step_scheduler.is_val_step and self.val_dataloader is not None:

@@ -103,6 +103,27 @@ def test_save_encoder_pretrained_forwards_is_final_checkpoint(tmp_path, kwargs, 
     )
 
 
+def test_save_encoder_pretrained_adapts_and_materializes_state_dict(tmp_path):
+    """Direct retrieval saves should pass HF-format contiguous tensors to save_pretrained."""
+    from nemo_automodel._transformers.retrieval import save_encoder_pretrained
+
+    class Adapter:
+        def to_hf(self, state_dict, **kwargs):
+            del kwargs
+            return {"split.weight": state_dict["model.fused.weight"][:, :1]}
+
+    model = MagicMock()
+    model.state_dict.return_value = {"model.fused.weight": torch.arange(4).reshape(2, 2)}
+    model.state_dict_adapter = Adapter()
+
+    save_encoder_pretrained(model, str(tmp_path))
+
+    model.model.save_pretrained.assert_called_once()
+    saved_state_dict = model.model.save_pretrained.call_args.kwargs["state_dict"]
+    assert torch.equal(saved_state_dict["split.weight"], torch.tensor([[0], [2]]))
+    assert saved_state_dict["split.weight"].is_contiguous()
+
+
 def test_extract_submodel_unsupported_embedding_from_local_vlm(tmp_path):
     """Unsupported extracted text backbones are returned directly for bi-encoder use."""
     from nemo_automodel._transformers import retrieval

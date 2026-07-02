@@ -3,6 +3,7 @@
 
 import inspect
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -34,6 +35,17 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, logging
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+from nemo_automodel.components.models.llama.rope_utils import (
+    LlamaRotaryEmbedding as OptimizedLlamaRotaryEmbedding,
+)
+from nemo_automodel.components.models.llama.rope_utils import (
+    apply_rotary_pos_emb as _apply_rotary_pos_emb,
+)
+from nemo_automodel.components.models.llama.rope_utils import (
+    apply_rotary_pos_emb_fused as _apply_rotary_pos_emb_fused,
+)
+from nemo_automodel.shared.import_utils import safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 logger = logging.get_logger(__name__)
@@ -42,6 +54,16 @@ logger = logging.get_logger(__name__)
 def _delete_module_attr(module: nn.Module, name: str) -> None:
     if hasattr(module, name):
         delattr(module, name)
+
+
+def _require_transformer_engine(feature_name: str) -> None:
+    te_available, _ = safe_import_te()
+    if not te_available:
+        raise RuntimeError(
+            f"{feature_name} requires Transformer Engine, but transformer_engine could not be imported. "
+            "Disable the corresponding use_te_fused_* option or run in an environment with a working "
+            "Transformer Engine installation."
+        )
 
 
 # ============================================================================
@@ -153,6 +175,274 @@ class LlamaNemotronVLConfig(PretrainedConfig):
         self.img_context_token_id = img_context_token_id
         self.max_input_tiles = max_input_tiles
         super().__init__(**kwargs)
+
+
+def _get_config_value(config, name: str, default=None):
+    if isinstance(config, dict):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def _pop_to(state_dict: dict, source: str, target: str) -> None:
+    value = state_dict.pop(source, None)
+    if value is not None:
+        state_dict[target] = value
+
+
+def _cat_from(state_dict: dict, sources: tuple[str, ...], target: str) -> None:
+    values = [state_dict.pop(source, None) for source in sources]
+    if all(value is not None for value in values):
+        state_dict[target] = torch.cat(values, dim=0)
+        return
+    for source, value in zip(sources, values, strict=True):
+        if value is not None:
+            state_dict[source] = value
+
+
+def _filter_converted_pairs(pairs: list[tuple[str, Any]], exclude_key_regex: str | None) -> list[tuple[str, Any]]:
+    if exclude_key_regex is None:
+        return pairs
+    return [(key, value) for key, value in pairs if not re.match(exclude_key_regex, key)]
+
+
+class LlamaNemotronVLEncoderStateDictAdapter(EncoderStateDictAdapter):
+    """HF-compatible state-dict adapter for optimized LlamaNemotron VL retrieval checkpoints."""
+
+    def __init__(self, model: "LlamaNemotronVLModel"):
+        super().__init__()
+        self.llm_config = model.config.llm_config
+        self.vision_config = model.config.vision_config
+        self.use_te_fused_llama_mlp = getattr(model, "_nemo_use_te_fused_llama_mlp", False)
+        self.use_te_fused_llama_qkv = getattr(model, "_nemo_use_te_fused_llama_qkv", False)
+        self.use_te_fused_siglip_layer = getattr(model, "_nemo_use_te_fused_siglip_layer", False)
+        self.use_te_fused_vision_projection = getattr(model, "_nemo_use_te_fused_vision_projection", False)
+
+    def to_hf(self, state_dict, **kwargs):
+        hf_state_dict = {}
+        for fqn, tensor in state_dict.items():
+            for key, value in self.convert_single_tensor_to_hf(fqn, tensor, **kwargs):
+                hf_state_dict[key] = value
+        return hf_state_dict
+
+    def from_hf(self, hf_state_dict, device_mesh=None, **kwargs):
+        optimized_state_dict = dict(hf_state_dict)
+        self._hf_to_optimized(optimized_state_dict)
+        return super().from_hf(optimized_state_dict, device_mesh=device_mesh, **kwargs)
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        key = self._strip_model_prefix(fqn)
+        if key is None:
+            return []
+
+        converted = self._optimized_single_tensor_to_hf(key, tensor)
+        return _filter_converted_pairs(converted, kwargs.get("exclude_key_regex"))
+
+    def _llama_sizes(self) -> tuple[int, int, int, int]:
+        hidden_size = _get_config_value(self.llm_config, "hidden_size")
+        num_attention_heads = _get_config_value(self.llm_config, "num_attention_heads")
+        num_key_value_heads = _get_config_value(self.llm_config, "num_key_value_heads", num_attention_heads)
+        head_dim = _get_config_value(self.llm_config, "head_dim", hidden_size // num_attention_heads)
+        intermediate_size = _get_config_value(self.llm_config, "intermediate_size")
+        return (
+            num_attention_heads * head_dim,
+            num_key_value_heads * head_dim,
+            num_key_value_heads * head_dim,
+            intermediate_size,
+        )
+
+    def _optimized_single_tensor_to_hf(self, key: str, tensor: Any) -> list[tuple[str, Any]]:
+        q_size, k_size, v_size, intermediate_size = self._llama_sizes()
+        layer_match = re.match(
+            r"^language_model\.layers\.(\d+)\.(self_attn\.pre_attention_qkv|mlp)\.fused\.(.+)$",
+            key,
+        )
+        if layer_match:
+            layer_idx, fused_module, suffix = layer_match.groups()
+            prefix = f"language_model.layers.{layer_idx}."
+            if self.use_te_fused_llama_qkv and fused_module == "self_attn.pre_attention_qkv":
+                if suffix == "layer_norm_weight":
+                    return [(f"{prefix}input_layernorm.weight", tensor)]
+                if suffix == "weight":
+                    q, k, v = tensor.split((q_size, k_size, v_size), dim=0)
+                    return [
+                        (f"{prefix}self_attn.q_proj.weight", q),
+                        (f"{prefix}self_attn.k_proj.weight", k),
+                        (f"{prefix}self_attn.v_proj.weight", v),
+                    ]
+                if suffix == "bias":
+                    q, k, v = tensor.split((q_size, k_size, v_size), dim=0)
+                    return [
+                        (f"{prefix}self_attn.q_proj.bias", q),
+                        (f"{prefix}self_attn.k_proj.bias", k),
+                        (f"{prefix}self_attn.v_proj.bias", v),
+                    ]
+            if self.use_te_fused_llama_mlp and fused_module == "mlp":
+                if suffix == "layer_norm_weight":
+                    return [(f"{prefix}post_attention_layernorm.weight", tensor)]
+                if suffix == "fc1_weight":
+                    gate, up = tensor.split((intermediate_size, intermediate_size), dim=0)
+                    return [(f"{prefix}mlp.gate_proj.weight", gate), (f"{prefix}mlp.up_proj.weight", up)]
+                if suffix == "fc1_bias":
+                    gate, up = tensor.split((intermediate_size, intermediate_size), dim=0)
+                    return [(f"{prefix}mlp.gate_proj.bias", gate), (f"{prefix}mlp.up_proj.bias", up)]
+                if suffix == "fc2_weight":
+                    return [(f"{prefix}mlp.down_proj.weight", tensor)]
+                if suffix == "fc2_bias":
+                    return [(f"{prefix}mlp.down_proj.bias", tensor)]
+
+        vision_match = re.match(
+            r"^vision_model\.vision_model\.encoder\.layers\.(\d+)\.mlp\.fused\.(.+)$",
+            key,
+        )
+        if self.use_te_fused_siglip_layer and vision_match:
+            layer_idx, suffix = vision_match.groups()
+            prefix = f"vision_model.vision_model.encoder.layers.{layer_idx}."
+            hidden_size = _get_config_value(self.vision_config, "hidden_size")
+            if suffix == "self_attention.layernorm_qkv.layer_norm_weight":
+                return [(f"{prefix}layer_norm1.weight", tensor)]
+            if suffix == "self_attention.layernorm_qkv.layer_norm_bias":
+                return [(f"{prefix}layer_norm1.bias", tensor)]
+            if suffix == "self_attention.layernorm_qkv.weight":
+                q, k, v = tensor.split((hidden_size, hidden_size, hidden_size), dim=0)
+                return [
+                    (f"{prefix}self_attn.q_proj.weight", q),
+                    (f"{prefix}self_attn.k_proj.weight", k),
+                    (f"{prefix}self_attn.v_proj.weight", v),
+                ]
+            if suffix == "self_attention.layernorm_qkv.bias":
+                q, k, v = tensor.split((hidden_size, hidden_size, hidden_size), dim=0)
+                return [
+                    (f"{prefix}self_attn.q_proj.bias", q),
+                    (f"{prefix}self_attn.k_proj.bias", k),
+                    (f"{prefix}self_attn.v_proj.bias", v),
+                ]
+            if suffix == "self_attention.proj.weight":
+                return [(f"{prefix}self_attn.out_proj.weight", tensor)]
+            if suffix == "self_attention.proj.bias":
+                return [(f"{prefix}self_attn.out_proj.bias", tensor)]
+            if suffix == "layernorm_mlp.layer_norm_weight":
+                return [(f"{prefix}layer_norm2.weight", tensor)]
+            if suffix == "layernorm_mlp.layer_norm_bias":
+                return [(f"{prefix}layer_norm2.bias", tensor)]
+            if suffix == "layernorm_mlp.fc1_weight":
+                return [(f"{prefix}mlp.fc1.weight", tensor)]
+            if suffix == "layernorm_mlp.fc1_bias":
+                return [(f"{prefix}mlp.fc1.bias", tensor)]
+            if suffix == "layernorm_mlp.fc2_weight":
+                return [(f"{prefix}mlp.fc2.weight", tensor)]
+            if suffix == "layernorm_mlp.fc2_bias":
+                return [(f"{prefix}mlp.fc2.bias", tensor)]
+
+        if self.use_te_fused_vision_projection:
+            projection_map = {
+                "mlp1.norm_fc1.layer_norm_weight": "mlp1.0.weight",
+                "mlp1.norm_fc1.layer_norm_bias": "mlp1.0.bias",
+                "mlp1.norm_fc1.weight": "mlp1.1.weight",
+                "mlp1.norm_fc1.bias": "mlp1.1.bias",
+                "mlp1.fc2.weight": "mlp1.3.weight",
+                "mlp1.fc2.bias": "mlp1.3.bias",
+            }
+            if key in projection_map:
+                return [(projection_map[key], tensor)]
+
+        return [(key, tensor)]
+
+    def _hf_to_optimized(self, state_dict: dict) -> None:
+        _, _, _, intermediate_size = self._llama_sizes()
+        for layer_idx in range(_get_config_value(self.llm_config, "num_hidden_layers", 0)):
+            prefix = f"language_model.layers.{layer_idx}."
+            if self.use_te_fused_llama_qkv:
+                fused_prefix = f"{prefix}self_attn.pre_attention_qkv.fused."
+                _pop_to(state_dict, f"{prefix}input_layernorm.weight", f"{fused_prefix}layer_norm_weight")
+                _cat_from(
+                    state_dict,
+                    (
+                        f"{prefix}self_attn.q_proj.weight",
+                        f"{prefix}self_attn.k_proj.weight",
+                        f"{prefix}self_attn.v_proj.weight",
+                    ),
+                    f"{fused_prefix}weight",
+                )
+                _cat_from(
+                    state_dict,
+                    (
+                        f"{prefix}self_attn.q_proj.bias",
+                        f"{prefix}self_attn.k_proj.bias",
+                        f"{prefix}self_attn.v_proj.bias",
+                    ),
+                    f"{fused_prefix}bias",
+                )
+            if self.use_te_fused_llama_mlp:
+                fused_prefix = f"{prefix}mlp.fused."
+                _pop_to(state_dict, f"{prefix}post_attention_layernorm.weight", f"{fused_prefix}layer_norm_weight")
+                _cat_from(
+                    state_dict,
+                    (f"{prefix}mlp.gate_proj.weight", f"{prefix}mlp.up_proj.weight"),
+                    f"{fused_prefix}fc1_weight",
+                )
+                _cat_from(
+                    state_dict,
+                    (f"{prefix}mlp.gate_proj.bias", f"{prefix}mlp.up_proj.bias"),
+                    f"{fused_prefix}fc1_bias",
+                )
+                if f"{fused_prefix}fc1_weight" in state_dict:
+                    assert state_dict[f"{fused_prefix}fc1_weight"].shape[0] == 2 * intermediate_size
+                _pop_to(state_dict, f"{prefix}mlp.down_proj.weight", f"{fused_prefix}fc2_weight")
+                _pop_to(state_dict, f"{prefix}mlp.down_proj.bias", f"{fused_prefix}fc2_bias")
+
+        if self.use_te_fused_siglip_layer:
+            self._siglip_hf_to_optimized(state_dict)
+        if self.use_te_fused_vision_projection:
+            self._vision_projection_hf_to_optimized(state_dict)
+
+    def _siglip_hf_to_optimized(self, state_dict: dict) -> None:
+        for layer_idx in range(_get_config_value(self.vision_config, "num_hidden_layers", 0)):
+            prefix = f"vision_model.vision_model.encoder.layers.{layer_idx}."
+            fused_prefix = f"{prefix}mlp.fused."
+            _pop_to(
+                state_dict,
+                f"{prefix}layer_norm1.weight",
+                f"{fused_prefix}self_attention.layernorm_qkv.layer_norm_weight",
+            )
+            _pop_to(
+                state_dict,
+                f"{prefix}layer_norm1.bias",
+                f"{fused_prefix}self_attention.layernorm_qkv.layer_norm_bias",
+            )
+            _cat_from(
+                state_dict,
+                (
+                    f"{prefix}self_attn.q_proj.weight",
+                    f"{prefix}self_attn.k_proj.weight",
+                    f"{prefix}self_attn.v_proj.weight",
+                ),
+                f"{fused_prefix}self_attention.layernorm_qkv.weight",
+            )
+            _cat_from(
+                state_dict,
+                (
+                    f"{prefix}self_attn.q_proj.bias",
+                    f"{prefix}self_attn.k_proj.bias",
+                    f"{prefix}self_attn.v_proj.bias",
+                ),
+                f"{fused_prefix}self_attention.layernorm_qkv.bias",
+            )
+            _pop_to(state_dict, f"{prefix}self_attn.out_proj.weight", f"{fused_prefix}self_attention.proj.weight")
+            _pop_to(state_dict, f"{prefix}self_attn.out_proj.bias", f"{fused_prefix}self_attention.proj.bias")
+            _pop_to(state_dict, f"{prefix}layer_norm2.weight", f"{fused_prefix}layernorm_mlp.layer_norm_weight")
+            _pop_to(state_dict, f"{prefix}layer_norm2.bias", f"{fused_prefix}layernorm_mlp.layer_norm_bias")
+            _pop_to(state_dict, f"{prefix}mlp.fc1.weight", f"{fused_prefix}layernorm_mlp.fc1_weight")
+            _pop_to(state_dict, f"{prefix}mlp.fc1.bias", f"{fused_prefix}layernorm_mlp.fc1_bias")
+            _pop_to(state_dict, f"{prefix}mlp.fc2.weight", f"{fused_prefix}layernorm_mlp.fc2_weight")
+            _pop_to(state_dict, f"{prefix}mlp.fc2.bias", f"{fused_prefix}layernorm_mlp.fc2_bias")
+
+    def _vision_projection_hf_to_optimized(self, state_dict: dict) -> None:
+        _pop_to(state_dict, "mlp1.0.weight", "mlp1.norm_fc1.layer_norm_weight")
+        _pop_to(state_dict, "mlp1.0.bias", "mlp1.norm_fc1.layer_norm_bias")
+        _pop_to(state_dict, "mlp1.1.weight", "mlp1.norm_fc1.weight")
+        _pop_to(state_dict, "mlp1.1.bias", "mlp1.norm_fc1.bias")
+        _pop_to(state_dict, "mlp1.3.weight", "mlp1.fc2.weight")
+        _pop_to(state_dict, "mlp1.3.bias", "mlp1.fc2.bias")
 
 
 # Check if native create_bidirectional_mask exists (transformers >= 5.0)
@@ -404,148 +694,6 @@ class LlamaBidirectionalModel(HFLlamaModel):
         )
 
 
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def _apply_rotary_pos_emb_fused(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb as te_apply_rope
-
-    q_bshd = q.permute(0, 2, 1, 3)
-    k_bshd = k.permute(0, 2, 1, 3)
-    q_bshd = te_apply_rope(q_bshd, freqs_cis, tensor_format="bshd", fused=True)
-    k_bshd = te_apply_rope(k_bshd, freqs_cis, tensor_format="bshd", fused=True)
-    return q_bshd.permute(0, 2, 1, 3), k_bshd.permute(0, 2, 1, 3)
-
-
-def _get_rope_config(config) -> tuple[float, dict]:
-    if hasattr(config, "rope_parameters") and config.rope_parameters:
-        rope_params = config.rope_parameters
-        base = rope_params.get("rope_theta", 10000.0)
-        rope_scaling = rope_params
-    else:
-        base = getattr(config, "rope_theta", 10000.0)
-        rope_scaling = getattr(config, "rope_scaling", {}) or {}
-    return base, rope_scaling
-
-
-def _compute_default_inv_freq(config, device: torch.device | None = None) -> tuple[torch.Tensor, float]:
-    base, _ = _get_rope_config(config)
-    dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-    partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-    dim = int(dim * partial_rotary_factor)
-    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float32) / dim))
-    return inv_freq, 1.0
-
-
-def _compute_llama3_inv_freq(config, device: torch.device | None = None) -> tuple[torch.Tensor, float]:
-    inv_freq, _ = _compute_default_inv_freq(config, device)
-    _, rope_scaling = _get_rope_config(config)
-    factor = rope_scaling.get("factor", 1.0)
-    low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
-    high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
-    old_context_len = rope_scaling.get("original_max_position_embeddings", config.max_position_embeddings)
-
-    low_freq_wavelen = old_context_len / low_freq_factor
-    high_freq_wavelen = old_context_len / high_freq_factor
-    wavelen = 2 * math.pi / inv_freq
-    inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
-    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
-    smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
-    is_medium_freq = (~(wavelen < high_freq_wavelen)) & (~(wavelen > low_freq_wavelen))
-    inv_freq_llama = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
-    return inv_freq_llama, 1.0
-
-
-class OptimizedLlamaRotaryEmbedding(nn.Module):
-    """Local RoPE helper for the optimized VL-only LLaMA backend."""
-
-    inv_freq: torch.Tensor
-
-    def __init__(self, config, device: torch.device | None = None, rope_fusion: bool = False):
-        super().__init__()
-        self.max_seq_len_cached = 0
-        self.rope_fusion = rope_fusion
-        self.dtype = getattr(config, "torch_dtype", None) or torch.float32
-
-        rope_functions = {
-            "default": _compute_default_inv_freq,
-            "llama3": _compute_llama3_inv_freq,
-        }
-        _, rope_scaling = _get_rope_config(config)
-        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
-        compute_fn = rope_functions.get(rope_type)
-        if compute_fn is None:
-            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-
-            compute_fn = ROPE_INIT_FUNCTIONS.get(rope_type)
-            if compute_fn is None:
-                supported = sorted(set(rope_functions) | set(ROPE_INIT_FUNCTIONS))
-                raise ValueError(f"Unsupported RoPE rope_type={rope_type!r}; expected one of {supported}.")
-
-        inv_freq, self.attention_scaling = compute_fn(config, device)
-        self._rope_config = config
-        self._inv_freq_compute_fn = compute_fn
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.register_buffer("_cos_cache", None, persistent=False)
-        self.register_buffer("_sin_cache", None, persistent=False)
-        self.register_buffer("_freqs_cache", None, persistent=False)
-
-    def _build_cache(self, seq_len: int, device: torch.device) -> None:
-        self.max_seq_len_cached = seq_len
-        inv_freq, attention_scaling = self._inv_freq_compute_fn(self._rope_config, device)
-        self.attention_scaling = attention_scaling
-        self.inv_freq = inv_freq
-        t = torch.arange(seq_len, device=device, dtype=torch.float32)
-        inv_freq = inv_freq.to(device=device, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos() * self.attention_scaling
-        sin = emb.sin() * self.attention_scaling
-        self._cos_cache = cos.to(dtype=self.dtype)
-        self._sin_cache = sin.to(dtype=self.dtype)
-        if self.rope_fusion:
-            self._freqs_cache = emb.to(dtype=self.dtype).unsqueeze(1).unsqueeze(1).contiguous()
-
-    def _ensure_cache(self, seq_len: int, device: torch.device) -> None:
-        if self._cos_cache is None or seq_len > self.max_seq_len_cached:
-            self._build_cache(seq_len, device)
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.rope_fusion:
-            seq_len = position_ids.shape[-1]
-            self._ensure_cache(seq_len, x.device)
-            cos = self._cos_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
-            sin = self._sin_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
-            return cos, sin, self._freqs_cache[:seq_len]
-
-        needed = max(int(position_ids.max().item()) + 1, position_ids.shape[-1])
-        self._ensure_cache(needed, x.device)
-        cos = self._cos_cache[position_ids]
-        sin = self._sin_cache[position_ids]
-        return cos, sin
-
-
 class OptimizedLlamaAttention(nn.Module):
     """Local LLaMA attention used only by the optimized Nemotron VL retriever path."""
 
@@ -671,6 +819,7 @@ class OptimizedFusedTERMSNormMLP(nn.Module):
 
     def __init__(self, source_norm: nn.Module, source_mlp: OptimizedLlamaMLP, eps: float):
         super().__init__()
+        _require_transformer_engine(type(self).__name__)
         from transformer_engine.pytorch import LayerNormMLP
 
         norm_weight = source_norm.weight
@@ -706,6 +855,7 @@ class OptimizedFusedTERMSNormQKV(nn.Module):
 
     def __init__(self, source_norm: nn.Module, source_attn: OptimizedLlamaAttention, eps: float):
         super().__init__()
+        _require_transformer_engine(type(self).__name__)
         from transformer_engine.pytorch import LayerNormLinear
 
         norm_weight = source_norm.weight
@@ -818,7 +968,7 @@ class OptimizedLlamaBidirectionalModel(PreTrainedModel):
 
     def __init__(self, config: LlamaBidirectionalConfig, backend: BackendConfig | None = None):
         super().__init__(config)
-        backend = backend or BackendConfig(rms_norm="te", rope_fusion=True)
+        backend = backend or BackendConfig()
         self.backend = backend
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -981,6 +1131,7 @@ def replace_language_model_with_custom_llama(
         )
 
     model.language_model = new_language_model
+    model._nemo_use_custom_llama_backend = True
     logger.info(
         "Replaced LlamaNemotronVL language model with local optimized LLaMA stack "
         "(backend=%s, ignored_te_extra_state=%d)",
@@ -992,6 +1143,7 @@ def replace_language_model_with_custom_llama(
 
 def replace_llama_mlp_with_te_fused(model: nn.Module) -> int:
     """Fuse post-attention RMSNorm and SwiGLU in the custom LLaMA stack."""
+    _require_transformer_engine("use_te_fused_mlp")
     language_model = getattr(model, "language_model", None)
     layers = getattr(language_model, "layers", None)
     if layers is None:
@@ -1012,11 +1164,14 @@ def replace_llama_mlp_with_te_fused(model: nn.Module) -> int:
         fused_count += 1
 
     logger.info("Fused custom LLaMA post-attention RMSNorm + SwiGLU layers: %d", fused_count)
+    if fused_count:
+        model._nemo_use_te_fused_llama_mlp = True
     return fused_count
 
 
 def replace_llama_qkv_with_te_fused(model: nn.Module) -> int:
     """Fuse custom LLaMA input RMSNorm and Q/K/V projections with TE."""
+    _require_transformer_engine("use_te_fused_qkv")
     language_model = getattr(model, "language_model", None)
     layers = getattr(language_model, "layers", None)
     if layers is None:
@@ -1040,6 +1195,8 @@ def replace_llama_qkv_with_te_fused(model: nn.Module) -> int:
         fused_count += 1
 
     logger.info("Fused custom LLaMA input RMSNorm + QKV layers: %d", fused_count)
+    if fused_count:
+        model._nemo_use_te_fused_llama_qkv = True
     return fused_count
 
 
@@ -1048,6 +1205,7 @@ class FusedTEVisionProjection(nn.Module):
 
     def __init__(self, source_mlp: nn.Sequential):
         super().__init__()
+        _require_transformer_engine(type(self).__name__)
         from transformer_engine.pytorch import LayerNormLinear
 
         source_norm, source_fc1, source_fc2 = source_mlp[0], source_mlp[1], source_mlp[3]
@@ -1078,6 +1236,7 @@ class FusedTESiglipTransformerLayer(nn.Module):
 
     def __init__(self, source_layer: nn.Module):
         super().__init__()
+        _require_transformer_engine(type(self).__name__)
         from transformer_engine.pytorch import TransformerLayer
 
         source_attn = source_layer.self_attn
@@ -1154,6 +1313,13 @@ class FusedTESiglipEncoderLayer(nn.Module):
 
 def replace_siglip_encoder_layers_with_te_fused(model: nn.Module) -> int:
     """Replace loaded HF SigLIP encoder layers with full TE TransformerLayer equivalents."""
+    select_layer = getattr(model, "select_layer", getattr(getattr(model, "config", None), "select_layer", -1))
+    if select_layer != -1:
+        raise ValueError(
+            "use_te_fused_siglip_layer currently requires LlamaNemotronVL select_layer=-1. "
+            "The TE SigLIP wrapper does not preserve intermediate hidden-state recording."
+        )
+    _require_transformer_engine("use_te_fused_siglip_layer")
     vision_model = getattr(model, "vision_model", None)
     vision_transformer = getattr(vision_model, "vision_model", None)
     encoder = getattr(vision_transformer, "encoder", None)
@@ -1169,15 +1335,19 @@ def replace_siglip_encoder_layers_with_te_fused(model: nn.Module) -> int:
         replaced += 1
 
     logger.info("Replaced SigLIP encoder layers with TE TransformerLayer: layers=%d", replaced)
+    if replaced:
+        model._nemo_use_te_fused_siglip_layer = True
     return replaced
 
 
 def replace_vision_projection_with_te(model: nn.Module) -> bool:
     """Replace the vision-to-language projection with a trainable TE prefix."""
+    _require_transformer_engine("use_te_fused_vision_projection")
     projection = getattr(model, "mlp1", None)
     if not isinstance(projection, nn.Sequential) or len(projection) != 4:
         return False
     model.mlp1 = FusedTEVisionProjection(projection)
+    model._nemo_use_te_fused_vision_projection = True
     logger.info("Fused vision projection LayerNorm + first Linear")
     return True
 
@@ -1319,6 +1489,9 @@ class LlamaNemotronVLModel(PreTrainedModel):
                 f"nondeterministic and incorrect image embeddings. "
                 f"Please use transformers <=4.53.x or >=4.56.0."
             )
+
+    def get_encoder_state_dict_adapter(self):
+        return LlamaNemotronVLEncoderStateDictAdapter(self)
 
     def _embed_batch(self, inputs: Dict[str, Any], pool_type: Optional[str] = None):
         """

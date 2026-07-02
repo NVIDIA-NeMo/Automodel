@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -24,7 +26,9 @@ from transformers.processing_utils import ProcessorMixin
 from nemo_automodel.components.models.llama_nemotron_vl.model import (
     LlamaBidirectionalConfig,
     LlamaNemotronVLConfig,
+    LlamaNemotronVLEncoderStateDictAdapter,
     LlamaNemotronVLModel,
+    replace_siglip_encoder_layers_with_te_fused,
 )
 from nemo_automodel.components.models.llama_nemotron_vl.processor import (
     LlamaNemotronVLImageProcessor,
@@ -191,6 +195,142 @@ def _tiny_llm_config():
         "num_attention_heads": 1,
         "num_key_value_heads": 1,
     }
+
+
+def _adapter_with_all_fusions():
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            llm_config=LlamaBidirectionalConfig(
+                architectures=["LlamaBidirectionalModel"],
+                model_type="llama",
+                vocab_size=32,
+                hidden_size=4,
+                intermediate_size=6,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=2,
+            ),
+            vision_config=SiglipVisionConfig(
+                hidden_size=4,
+                image_size=4,
+                patch_size=2,
+                num_hidden_layers=1,
+                num_attention_heads=1,
+                intermediate_size=8,
+            ),
+        ),
+        _nemo_use_te_fused_llama_mlp=True,
+        _nemo_use_te_fused_llama_qkv=True,
+        _nemo_use_te_fused_siglip_layer=True,
+        _nemo_use_te_fused_vision_projection=True,
+    )
+    return LlamaNemotronVLEncoderStateDictAdapter(model)
+
+
+def test_vl_encoder_state_dict_adapter_exports_hf_keys_for_fused_layers():
+    adapter = _adapter_with_all_fusions()
+    state_dict = {
+        "model.language_model.layers.0.self_attn.pre_attention_qkv.fused.layer_norm_weight": torch.ones(4),
+        "model.language_model.layers.0.self_attn.pre_attention_qkv.fused.weight": torch.arange(32).reshape(8, 4),
+        "model.language_model.layers.0.mlp.fused.layer_norm_weight": torch.ones(4) * 2,
+        "model.language_model.layers.0.mlp.fused.fc1_weight": torch.arange(48).reshape(12, 4),
+        "model.language_model.layers.0.mlp.fused.fc2_weight": torch.arange(24).reshape(4, 6),
+        "model.vision_model.vision_model.encoder.layers.0.mlp.fused.self_attention.layernorm_qkv.layer_norm_weight": torch.ones(
+            4
+        ),
+        "model.vision_model.vision_model.encoder.layers.0.mlp.fused.self_attention.layernorm_qkv.weight": torch.arange(
+            48
+        ).reshape(12, 4),
+        "model.vision_model.vision_model.encoder.layers.0.mlp.fused.self_attention.proj.weight": torch.arange(
+            16
+        ).reshape(4, 4),
+        "model.vision_model.vision_model.encoder.layers.0.mlp.fused.layernorm_mlp.fc1_weight": torch.arange(32).reshape(
+            8, 4
+        ),
+        "model.mlp1.norm_fc1.layer_norm_weight": torch.ones(8),
+        "model.mlp1.norm_fc1.weight": torch.arange(32).reshape(4, 8),
+        "model.mlp1.fc2.weight": torch.arange(16).reshape(4, 4),
+    }
+
+    hf_state_dict = adapter.to_hf(state_dict)
+
+    assert "language_model.layers.0.self_attn.pre_attention_qkv.fused.weight" not in hf_state_dict
+    assert torch.equal(
+        hf_state_dict["language_model.layers.0.self_attn.q_proj.weight"],
+        torch.arange(32).reshape(8, 4)[:4],
+    )
+    assert torch.equal(
+        hf_state_dict["language_model.layers.0.self_attn.k_proj.weight"],
+        torch.arange(32).reshape(8, 4)[4:6],
+    )
+    assert torch.equal(
+        hf_state_dict["language_model.layers.0.mlp.gate_proj.weight"],
+        torch.arange(48).reshape(12, 4)[:6],
+    )
+    assert (
+        "vision_model.vision_model.encoder.layers.0.mlp.fused.self_attention.layernorm_qkv.weight" not in hf_state_dict
+    )
+    assert torch.equal(
+        hf_state_dict["vision_model.vision_model.encoder.layers.0.self_attn.v_proj.weight"],
+        torch.arange(48).reshape(12, 4)[8:12],
+    )
+    assert torch.equal(hf_state_dict["mlp1.0.weight"], torch.ones(8))
+    assert torch.equal(hf_state_dict["mlp1.1.weight"], torch.arange(32).reshape(4, 8))
+
+
+def test_vl_encoder_state_dict_adapter_exports_single_fused_tensor_to_hf_keys():
+    adapter = _adapter_with_all_fusions()
+    tensor = torch.arange(32).reshape(8, 4)
+
+    converted = adapter.convert_single_tensor_to_hf(
+        "model.language_model.layers.0.self_attn.pre_attention_qkv.fused.weight",
+        tensor,
+    )
+
+    assert [key for key, _ in converted] == [
+        "language_model.layers.0.self_attn.q_proj.weight",
+        "language_model.layers.0.self_attn.k_proj.weight",
+        "language_model.layers.0.self_attn.v_proj.weight",
+    ]
+    assert torch.equal(converted[0][1], tensor[:4])
+    assert torch.equal(converted[1][1], tensor[4:6])
+    assert torch.equal(converted[2][1], tensor[6:8])
+
+
+def test_vl_encoder_state_dict_adapter_imports_hf_keys_for_fused_layers():
+    adapter = _adapter_with_all_fusions()
+    hf_state_dict = {
+        "language_model.layers.0.input_layernorm.weight": torch.ones(4),
+        "language_model.layers.0.self_attn.q_proj.weight": torch.ones(4, 4),
+        "language_model.layers.0.self_attn.k_proj.weight": torch.ones(2, 4) * 2,
+        "language_model.layers.0.self_attn.v_proj.weight": torch.ones(2, 4) * 3,
+        "language_model.layers.0.post_attention_layernorm.weight": torch.ones(4) * 4,
+        "language_model.layers.0.mlp.gate_proj.weight": torch.ones(6, 4),
+        "language_model.layers.0.mlp.up_proj.weight": torch.ones(6, 4) * 2,
+        "language_model.layers.0.mlp.down_proj.weight": torch.ones(4, 6),
+        "mlp1.0.weight": torch.ones(8),
+        "mlp1.1.weight": torch.ones(4, 8),
+        "mlp1.3.weight": torch.ones(4, 4),
+    }
+
+    internal_state_dict = adapter.from_hf(hf_state_dict)
+
+    assert "model.language_model.layers.0.self_attn.q_proj.weight" not in internal_state_dict
+    fused_qkv = internal_state_dict["model.language_model.layers.0.self_attn.pre_attention_qkv.fused.weight"]
+    assert fused_qkv.shape == (8, 4)
+    assert torch.equal(fused_qkv[:4], torch.ones(4, 4))
+    assert torch.equal(fused_qkv[4:6], torch.ones(2, 4) * 2)
+    assert "model.language_model.layers.0.mlp.gate_proj.weight" not in internal_state_dict
+    assert internal_state_dict["model.language_model.layers.0.mlp.fused.fc1_weight"].shape == (12, 4)
+    assert "model.mlp1.0.weight" not in internal_state_dict
+    assert torch.equal(internal_state_dict["model.mlp1.norm_fc1.layer_norm_weight"], torch.ones(8))
+
+
+def test_siglip_te_fusion_rejects_intermediate_select_layer():
+    model = SimpleNamespace(select_layer=0, config=SimpleNamespace(select_layer=0))
+    with pytest.raises(ValueError, match="select_layer=-1"):
+        replace_siglip_encoder_layers_with_te_fused(model)
 
 
 def test_processor_initializes_tokenizer_for_pixel_values(processor):
