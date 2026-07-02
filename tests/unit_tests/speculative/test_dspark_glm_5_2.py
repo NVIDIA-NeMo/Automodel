@@ -88,8 +88,10 @@ def _tiny_model_args(markov_head_type: str = "vanilla") -> _Args:
     )
 
 
-def _build_model(markov_head_type: str = "vanilla") -> Glm5_2DSparkModel:
-    draft_config = build_glm_5_2_draft_config(_tiny_target_config(), _tiny_model_args(markov_head_type))
+def _build_model(markov_head_type: str = "vanilla", **overrides) -> Glm5_2DSparkModel:
+    model_args = _tiny_model_args(markov_head_type)
+    model_args.update(overrides)
+    draft_config = build_glm_5_2_draft_config(_tiny_target_config(), model_args)
     model = Glm5_2DSparkModel(draft_config).to(dtype=torch.float32).eval()
     model.initialize_embeddings_and_head(
         embed_tokens=torch.nn.Embedding(VOCAB, HIDDEN),
@@ -211,3 +213,92 @@ def test_bf16_forward_runs():
         out = _forward(model, batch)
     assert out.draft_logits.dtype == torch.bfloat16
     assert torch.isfinite(out.draft_logits).all()
+
+
+def test_predict_confidence_step_variants():
+    hidden_states = torch.randn(BATCH, HIDDEN)
+    prev_token_ids = torch.arange(BATCH)
+
+    no_confidence = _build_model(markov_rank=0, confidence_head_alpha=0.0)
+    assert no_confidence.predict_confidence_step(hidden_states) is None
+
+    plain_confidence = _build_model(
+        markov_rank=0,
+        confidence_head_alpha=1.0,
+        confidence_head_with_markov=False,
+    )
+    plain_pred = plain_confidence.predict_confidence_step(hidden_states)
+    assert plain_pred.shape == (BATCH,)
+    assert plain_pred.dtype == torch.float32
+
+    markov_confidence = _build_model()
+    with pytest.raises(AssertionError):
+        markov_confidence.predict_confidence_step(hidden_states)
+    markov_pred = markov_confidence.predict_confidence_step(hidden_states, prev_token_ids)
+    assert markov_pred.shape == (BATCH,)
+    assert torch.isfinite(markov_pred).all()
+
+
+def test_sample_draft_tokens_variants():
+    first_prev_token_ids = torch.arange(BATCH)
+    empty_logits = torch.empty(BATCH, 0, VOCAB)
+    model = _build_model()
+
+    empty_tokens, returned_empty_logits = model.sample_draft_tokens(
+        empty_logits,
+        first_prev_token_ids=first_prev_token_ids,
+    )
+    assert empty_tokens.shape == (BATCH, 0)
+    assert returned_empty_logits is empty_logits
+
+    base_logits = torch.randn(BATCH, BLOCK_SIZE, VOCAB)
+    no_markov = _build_model(markov_rank=0, confidence_head_alpha=0.0)
+    plain_tokens, plain_logits = no_markov.sample_draft_tokens(
+        base_logits,
+        first_prev_token_ids=first_prev_token_ids,
+    )
+    assert plain_tokens.shape == (BATCH, BLOCK_SIZE)
+    assert plain_logits is base_logits
+
+    markov_tokens, markov_logits = model.sample_draft_tokens(
+        base_logits,
+        first_prev_token_ids=first_prev_token_ids,
+    )
+    assert markov_tokens.shape == (BATCH, BLOCK_SIZE)
+    assert markov_logits.shape == base_logits.shape
+
+
+@pytest.mark.parametrize("markov_rank", [0, 16])
+def test_sample_draft_token_step(markov_rank):
+    model = _build_model(
+        markov_rank=markov_rank,
+        confidence_head_alpha=1.0 if markov_rank else 0.0,
+    )
+    base_logits = torch.randn(BATCH, VOCAB)
+    prev_token_ids = torch.arange(BATCH)
+
+    sampled_token_ids, step_logits = model.sample_draft_token_step(
+        base_logits,
+        prev_token_ids=prev_token_ids,
+    )
+    assert sampled_token_ids.shape == (BATCH,)
+    assert step_logits.shape == base_logits.shape
+    assert torch.isfinite(step_logits).all()
+
+    with pytest.raises(AssertionError, match="expects base_logits"):
+        model.sample_draft_token_step(
+            base_logits.unsqueeze(1),
+            prev_token_ids=prev_token_ids,
+        )
+
+
+def test_forward_confidence_without_markov_features():
+    model = _build_model(
+        markov_rank=0,
+        confidence_head_alpha=1.0,
+        confidence_head_with_markov=False,
+    )
+    with torch.no_grad():
+        out = _forward(model, _batch())
+    assert out.confidence_pred.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE)
+    assert torch.isfinite(out.confidence_pred).all()
