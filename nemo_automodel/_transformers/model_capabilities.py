@@ -54,16 +54,18 @@ class ModelCapabilities:
         supports_cp: Context parallelism.
         supports_pp: Pipeline parallelism.
         supports_ep: Expert parallelism (MoE).
+        supports_thd: Native THD packed-sequence inputs.
     """
 
     supports_tp: bool = False
     supports_cp: bool = False
     supports_pp: bool = False
     supports_ep: bool = False
+    supports_thd: bool = False
 
 
 def _to_canonical(caps_obj) -> ModelCapabilities:
-    """Re-pack any object with the four ``supports_*`` fields into the canonical type.
+    """Re-pack a model capability declaration into the canonical type.
 
     Per-class nested ``ModelCapabilities`` dataclasses are their own types; this
     converts them to the canonical :class:`ModelCapabilities` so callers see a
@@ -76,6 +78,7 @@ def _to_canonical(caps_obj) -> ModelCapabilities:
         supports_cp=bool(caps_obj.supports_cp),
         supports_pp=bool(caps_obj.supports_pp),
         supports_ep=bool(caps_obj.supports_ep),
+        supports_thd=bool(getattr(caps_obj, "supports_thd", False)),
     )
 
 

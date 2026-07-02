@@ -42,7 +42,7 @@ def test_every_registered_arch_declares_capabilities():
     """Every architecture in ``MODEL_ARCH_MAPPING`` must declare capabilities
     via exactly one of:
 
-      * a nested ``ModelCapabilities`` dataclass (for classes that has no variants or every model that maps to 
+      * a nested ``ModelCapabilities`` dataclass (for classes that has no variants or every model that maps to
       this class shares the same parallelism story), or
       * a ``get_capabilities(cls, config)`` classmethod (for classes that
         serve multiple variants ex: gemma4, ernie4.5).
@@ -92,8 +92,8 @@ def test_every_registered_arch_declares_capabilities():
             f"{details}\n\n"
             "Fix by either:\n"
             "  1. For classes with a single capability profile, add a nested\n"
-            "     `@dataclass(frozen=True) class ModelCapabilities` with the four\n"
-            "     `supports_tp/cp/pp/ep` flags, matching the pattern in\n"
+            "     `@dataclass(frozen=True) class ModelCapabilities` with the\n"
+            "     relevant `supports_*` flags, matching the pattern in\n"
             "     `nemo_automodel/components/models/llama/model.py`.\n"
             "  2. For classes serving multiple checkpoint variants (e.g. dense vs.\n"
             "     MoE), add a `@classmethod get_capabilities(cls, config)` that\n"
@@ -140,6 +140,7 @@ class _StaticCaps:
     supports_cp: bool = False
     supports_pp: bool = True
     supports_ep: bool = False
+    supports_thd: bool = True
 
 
 class _FakeStaticModel(nn.Module):
@@ -190,12 +191,14 @@ def test_query_returns_canonical_type_for_static_class():
     assert caps.supports_pp is True
     assert caps.supports_cp is False
     assert caps.supports_ep is False
+    assert caps.supports_thd is True
 
 
 def test_query_static_class_from_instance():
     caps = query_capabilities(_FakeStaticModel())
     assert type(caps) is ModelCapabilities
     assert caps.supports_tp is True
+    assert caps.supports_thd is True
 
 
 def test_query_dynamic_class_requires_config():

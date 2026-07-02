@@ -26,6 +26,8 @@ import math
 import torch
 import torch.distributed as dist
 
+_SEQ_LENS_PADDING_VALUE = -1000
+
 
 def _lcm(a: int, b: int) -> int:
     return abs(a * b) // math.gcd(a, b) if a and b else max(a, b)
@@ -99,6 +101,86 @@ def dsv4_cp_all_gather_metadata(tensor: torch.Tensor | None, *, dim: int, cp_gro
     return torch.cat(parts, dim=dim)
 
 
+def build_packed_seq_ids(
+    seq_lens_padded: torch.Tensor,
+    *,
+    seq_len: int,
+    device: torch.device,
+    padding_value: int = _SEQ_LENS_PADDING_VALUE,
+) -> torch.Tensor:
+    """Build per-token packed sequence IDs from padded packed lengths.
+
+    IDs are 1-based within each batch row; 0 marks trailing pack padding that
+    belongs to no sequence. ``seq_lens_padded`` may be right-padded with
+    ``padding_value`` to make rows rectangular.
+    """
+    if seq_lens_padded.dim() == 1:
+        seq_lens_padded = seq_lens_padded.unsqueeze(0)
+    lengths = seq_lens_padded.to(device=device, dtype=torch.long)
+    seq_ids = torch.zeros((lengths.shape[0], seq_len), dtype=torch.long, device=device)
+    for batch_idx in range(lengths.shape[0]):
+        offset = 0
+        doc_id = 1
+        for length in lengths[batch_idx].tolist():
+            if int(length) == padding_value:
+                continue
+            length = max(int(length), 0)
+            if length == 0:
+                doc_id += 1
+                continue
+            end = min(offset + length, seq_len)
+            if end > offset:
+                seq_ids[batch_idx, offset:end] = doc_id
+            offset += length
+            doc_id += 1
+            if offset >= seq_len:
+                break
+    return seq_ids
+
+
+def build_dsv4_cp_packed_causal_padding_mask(
+    *,
+    position_ids: torch.Tensor,
+    packed_seq_ids: torch.Tensor,
+    dtype: torch.dtype,
+    device: torch.device,
+    cp_group,
+    padding_mask: torch.Tensor | None = None,
+    sliding_window: int | None = None,
+) -> torch.Tensor:
+    """Build local-query/global-key additive mask for packed DSV4 CP.
+
+    ``packed_seq_ids`` is local to the CP rank. The function all-gathers sequence
+    IDs and document-local positions for the key side, then applies same-document,
+    causal, padding, and optional sliding-window constraints.
+    """
+    if position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+    if packed_seq_ids.dim() == 1:
+        packed_seq_ids = packed_seq_ids.unsqueeze(0)
+
+    q_pos = position_ids.to(device=device, dtype=torch.long)
+    q_seq = packed_seq_ids.to(device=device, dtype=torch.long)
+    k_pos = dsv4_cp_all_gather_metadata(q_pos, dim=1, cp_group=cp_group)
+    k_seq = dsv4_cp_all_gather_metadata(q_seq, dim=1, cp_group=cp_group)
+
+    allowed = (q_seq.unsqueeze(-1) > 0) & (q_seq.unsqueeze(-1) == k_seq.unsqueeze(1))
+    allowed = allowed & (k_pos.unsqueeze(1) <= q_pos.unsqueeze(-1))
+    if sliding_window is not None:
+        allowed = allowed & ((q_pos.unsqueeze(-1) - k_pos.unsqueeze(1)) < sliding_window)
+
+    padding_mask_full = dsv4_cp_all_gather_metadata(padding_mask, dim=1, cp_group=cp_group)
+    if padding_mask_full is not None:
+        allowed = allowed & ~padding_mask_full.to(device=device, dtype=torch.bool).unsqueeze(1)
+
+    min_value = torch.finfo(dtype).min
+    return torch.where(
+        allowed.unsqueeze(1),
+        torch.zeros((), dtype=dtype, device=device),
+        torch.full((), min_value, dtype=dtype, device=device),
+    )
+
+
 def build_dsv4_cp_causal_padding_mask(
     *,
     position_ids: torch.Tensor,
@@ -167,16 +249,202 @@ def _pad_position_ids_seq_dim_(position_ids: torch.Tensor, seq_dim: int, pad_len
     return torch.cat((position_ids, last + inc), dim=seq_dim)
 
 
+def _valid_packed_lengths(row: torch.Tensor, padding_value: int = _SEQ_LENS_PADDING_VALUE) -> list[int]:
+    return [max(int(x), 0) for x in row.tolist() if int(x) != padding_value]
+
+
+def _pad_length(length: int, multiple: int) -> int:
+    multiple = max(int(multiple), 1)
+    return length + ((-length) % multiple)
+
+
+def _pad_1d(values: list[int], width: int, padding_value: int = _SEQ_LENS_PADDING_VALUE) -> torch.Tensor:
+    if len(values) < width:
+        values = [*values, *([padding_value] * (width - len(values)))]
+    return torch.tensor(values, dtype=torch.long)
+
+
+def _repad_dsv4_packed_batch(
+    batch: dict,
+    *,
+    cp_size: int,
+    pad_multiple: int,
+    padding_token_id: int,
+    sync_packed_length: bool = False,
+    loss_mask: torch.Tensor | None = None,
+) -> tuple[dict, torch.Tensor | None]:
+    """Insert DSV4 compression-safe padding into packed BSHD rows before CP slicing.
+
+    The generic packed dataset may pad each packed sequence only for TE CP. DSV4
+    compression additionally needs document boundaries to align to compressor
+    windows; CSA then uses ``packed_seq_ids`` to reset the previous-window overlap.
+    This routine rebuilds each row from real sequence spans, pads every span to
+    ``pad_multiple``, and appends row-level pack padding with sequence ID 0. When
+    requested for HybridEP, the final physical length is max-reduced across ranks
+    before CP slicing so every rank in a flattened DP x CP expert group is uniform.
+    """
+    if "seq_lens" not in batch:
+        raise KeyError("DSV4 packed context parallelism requires `seq_lens` in the batch.")
+
+    seq_lens = batch["seq_lens"]
+    seq_lens_padded = batch.get("seq_lens_padded", seq_lens)
+    if seq_lens.dim() == 1:
+        seq_lens = seq_lens.unsqueeze(0)
+    if seq_lens_padded.dim() == 1:
+        seq_lens_padded = seq_lens_padded.unsqueeze(0)
+
+    has_inputs_embeds = "inputs_embeds" in batch
+    has_input_ids = "input_ids" in batch
+    assert has_inputs_embeds ^ has_input_ids, (
+        "make_dsv4_contiguous_shard_cp_batch_and_ctx requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
+    )
+    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
+    primary = batch[primary_key]
+    labels = batch.get("labels")
+    if labels is None:
+        raise KeyError("DSV4 context parallelism requires `labels` in the batch.")
+
+    batch_size = primary.shape[0]
+    rebuilt_primary = []
+    rebuilt_labels = []
+    rebuilt_loss_mask = [] if loss_mask is not None else None
+    rebuilt_positions = []
+    rebuilt_padding = []
+    rebuilt_seq_ids = []
+    new_seq_lens: list[list[int]] = []
+    new_seq_lens_padded: list[list[int]] = []
+    row_lengths = []
+
+    for batch_idx in range(batch_size):
+        real_lengths = _valid_packed_lengths(seq_lens[batch_idx])
+        padded_lengths = _valid_packed_lengths(seq_lens_padded[batch_idx])
+        if len(padded_lengths) < len(real_lengths):
+            padded_lengths.extend(real_lengths[len(padded_lengths) :])
+
+        primary_parts = []
+        label_parts = []
+        loss_parts = []
+        pos_parts = []
+        padding_parts = []
+        seq_id_parts = []
+        row_seq_lens = []
+        row_padded_lens = []
+        old_offset = 0
+
+        for doc_idx, real_len in enumerate(real_lengths):
+            old_padded_len = max(padded_lengths[doc_idx], real_len)
+            if old_offset + real_len > primary.shape[1]:
+                raise ValueError(
+                    "Packed DSV4 batch metadata exceeds token row length: "
+                    f"{old_offset + real_len=} > {primary.shape[1]=}"
+                )
+            new_padded_len = _pad_length(real_len, pad_multiple)
+            pad_len = new_padded_len - real_len
+
+            primary_real = primary[batch_idx, old_offset : old_offset + real_len]
+            labels_real = labels[batch_idx, old_offset : old_offset + real_len]
+            primary_parts.append(primary_real)
+            label_parts.append(labels_real)
+            if loss_mask is not None:
+                loss_parts.append(loss_mask[batch_idx, old_offset : old_offset + real_len])
+
+            if pad_len:
+                if has_inputs_embeds:
+                    primary_pad = primary.new_zeros((pad_len, *primary.shape[2:]))
+                else:
+                    primary_pad = torch.full((pad_len,), padding_token_id, dtype=primary.dtype, device=primary.device)
+                primary_parts.append(primary_pad)
+                label_parts.append(torch.full((pad_len,), -100, dtype=labels.dtype, device=labels.device))
+                if loss_mask is not None:
+                    loss_parts.append(torch.zeros((pad_len,), dtype=loss_mask.dtype, device=loss_mask.device))
+
+            pos_parts.append(torch.arange(new_padded_len, dtype=torch.long, device=primary.device))
+            padding_parts.append(
+                torch.cat(
+                    (
+                        torch.zeros(real_len, dtype=torch.bool, device=primary.device),
+                        torch.ones(pad_len, dtype=torch.bool, device=primary.device),
+                    )
+                )
+            )
+            seq_id_parts.append(torch.full((new_padded_len,), doc_idx + 1, dtype=torch.long, device=primary.device))
+            row_seq_lens.append(real_len)
+            row_padded_lens.append(new_padded_len)
+            old_offset += old_padded_len
+
+        rebuilt_primary.append(torch.cat(primary_parts, dim=0))
+        rebuilt_labels.append(torch.cat(label_parts, dim=0))
+        if loss_mask is not None and rebuilt_loss_mask is not None:
+            rebuilt_loss_mask.append(torch.cat(loss_parts, dim=0))
+        rebuilt_positions.append(torch.cat(pos_parts, dim=0))
+        rebuilt_padding.append(torch.cat(padding_parts, dim=0))
+        rebuilt_seq_ids.append(torch.cat(seq_id_parts, dim=0))
+        new_seq_lens.append(row_seq_lens)
+        new_seq_lens_padded.append(row_padded_lens)
+        row_lengths.append(rebuilt_primary[-1].shape[0])
+
+    total_seq_len = _pad_length(max(row_lengths), cp_size * pad_multiple)
+    if sync_packed_length and dist.is_available() and dist.is_initialized():
+        # HybridEP flattens DP x CP into one EP group and requires every rank to
+        # contribute the same number of tokens. Different DP packs can acquire
+        # different amounts of per-document compression padding.
+        length = torch.tensor(total_seq_len, dtype=torch.int64, device=primary.device)
+        dist.all_reduce(length, op=dist.ReduceOp.MAX)
+        total_seq_len = int(length.item())
+
+    def _right_pad_rows(rows: list[torch.Tensor], fill_value, *, dtype=None) -> torch.Tensor:
+        padded = []
+        for row in rows:
+            pad_len = total_seq_len - row.shape[0]
+            if pad_len:
+                pad_shape = (pad_len, *row.shape[1:])
+                pad = torch.full(pad_shape, fill_value, dtype=dtype or row.dtype, device=row.device)
+                row = torch.cat((row, pad), dim=0)
+            padded.append(row)
+        return torch.stack(padded, dim=0)
+
+    if has_inputs_embeds:
+        batch["inputs_embeds"] = _right_pad_rows(rebuilt_primary, 0)
+    else:
+        batch["input_ids"] = _right_pad_rows(rebuilt_primary, padding_token_id)
+    batch["labels"] = _right_pad_rows(rebuilt_labels, -100)
+    batch["position_ids"] = _right_pad_rows(rebuilt_positions, 0, dtype=torch.long)
+    batch["padding_mask"] = _right_pad_rows(rebuilt_padding, True, dtype=torch.bool)
+    batch["packed_seq_ids"] = _right_pad_rows(rebuilt_seq_ids, 0, dtype=torch.long)
+
+    width = max(len(row) for row in new_seq_lens)
+    batch["seq_lens"] = torch.stack(
+        [_pad_1d(row, width).to(device=primary.device) for row in new_seq_lens],
+        dim=0,
+    )
+    batch["seq_lens_padded"] = torch.stack(
+        [_pad_1d(row, width).to(device=primary.device) for row in new_seq_lens_padded],
+        dim=0,
+    )
+    batch["qkv_format"] = "thd"
+
+    if loss_mask is not None and rebuilt_loss_mask is not None:
+        loss_mask = _right_pad_rows(rebuilt_loss_mask, 0)
+    return batch, loss_mask
+
+
 def make_dsv4_contiguous_shard_cp_batch_and_ctx(
-    cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id: int = 0, pad_multiple: int | None = None
+    cp_mesh,
+    tp_mesh,
+    batch,
+    *,
+    loss_mask=None,
+    padding_token_id: int = 0,
+    pad_multiple: int | None = None,
+    sync_packed_length: bool = False,
 ):
     """Contiguously shard a batch for DeepSeek V4 Miles-style context parallelism.
 
     Attached to the batch as ``_cp_make_batch_fn`` (via ``functools.partial`` to bind
-    ``pad_multiple``) and invoked by ``cp_utils.make_cp_batch_and_ctx``. Each CP rank
-    keeps one ``seq_start:seq_end`` slice; DSV4 attention all-gathers K/V across CP
-    ranks during forward. No collective happens here -- this is the batch-side
-    counterpart of ``cp.py``'s activation gathers. Returns ``(nullcontext, batch)``.
+    ``pad_multiple``) and invoked by ``cp_utils.make_cp_batch_and_ctx``. HybridEP can
+    first max-reduce packed lengths so every rank contributes a uniform token count.
+    Each CP rank then keeps one ``seq_start:seq_end`` slice; DSV4 attention all-gathers
+    K/V across CP ranks during forward. Returns ``(nullcontext, batch)``.
 
     ``pad_multiple`` is the required *per-CP-rank* shard multiple (from
     ``dsv4_cp_local_seq_multiple``); the global sequence is padded so it is divisible
@@ -184,11 +452,16 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     """
     import contextlib
 
-    if "cu_seqlens" in batch or batch.get("qkv_format") == "thd":
-        raise NotImplementedError("DeepSeek V4 context parallelism with packed sequences is not implemented yet.")
-
     cp_size = cp_mesh.size()
-    divisor = cp_size * max(int(pad_multiple or 2), 2)
+    local_multiple = max(int(pad_multiple or 2), 2)
+    divisor = cp_size * local_multiple
+
+    packed = batch.get("qkv_format") == "thd" or "seq_lens" in batch or "cu_seqlens" in batch
+    if "cu_seqlens" in batch and "seq_lens" not in batch:
+        raise NotImplementedError(
+            "DeepSeek V4 model-owned packed CP expects BSHD packed metadata (`seq_lens`); "
+            "pre-flattened `cu_seqlens` batches should use the TE CP path."
+        )
 
     # attention_mask -> padding_mask (True == pad) so CP attention can rebuild the
     # local-query/global-key mask after K/V is all-gathered.
@@ -199,6 +472,16 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
             batch["padding_mask"] = diagonal.logical_not() if attention_mask.dtype == torch.bool else diagonal != 0
         else:
             batch["padding_mask"] = attention_mask.bool().logical_not()
+
+    if packed:
+        batch, loss_mask = _repad_dsv4_packed_batch(
+            batch,
+            cp_size=cp_size,
+            pad_multiple=local_multiple,
+            padding_token_id=padding_token_id,
+            sync_packed_length=sync_packed_length,
+            loss_mask=loss_mask,
+        )
 
     has_inputs_embeds = "inputs_embeds" in batch
     has_input_ids = "input_ids" in batch
@@ -264,6 +547,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     _slice_seq("labels", 1)
     _slice_seq("position_ids", pos_seq_dim)
     _slice_seq("padding_mask", 1)
+    _slice_seq("packed_seq_ids", 1)
     if loss_mask is not None:
         batch["loss_mask"] = loss_mask[:, seq_start:seq_end].contiguous()
 
