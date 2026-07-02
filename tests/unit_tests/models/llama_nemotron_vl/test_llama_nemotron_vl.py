@@ -223,7 +223,6 @@ def _adapter_with_all_fusions():
         _nemo_use_te_fused_llama_mlp=True,
         _nemo_use_te_fused_llama_qkv=True,
         _nemo_use_te_fused_siglip_layer=True,
-        _nemo_use_te_fused_vision_projection=True,
     )
     return LlamaNemotronVLEncoderStateDictAdapter(model)
 
@@ -248,9 +247,6 @@ def test_vl_encoder_state_dict_adapter_exports_hf_keys_for_fused_layers():
         "model.vision_model.vision_model.encoder.layers.0.mlp.fused.layernorm_mlp.fc1_weight": torch.arange(32).reshape(
             8, 4
         ),
-        "model.mlp1.norm_fc1.layer_norm_weight": torch.ones(8),
-        "model.mlp1.norm_fc1.weight": torch.arange(32).reshape(4, 8),
-        "model.mlp1.fc2.weight": torch.arange(16).reshape(4, 4),
     }
 
     hf_state_dict = adapter.to_hf(state_dict)
@@ -275,8 +271,6 @@ def test_vl_encoder_state_dict_adapter_exports_hf_keys_for_fused_layers():
         hf_state_dict["vision_model.vision_model.encoder.layers.0.self_attn.v_proj.weight"],
         torch.arange(48).reshape(12, 4)[8:12],
     )
-    assert torch.equal(hf_state_dict["mlp1.0.weight"], torch.ones(8))
-    assert torch.equal(hf_state_dict["mlp1.1.weight"], torch.arange(32).reshape(4, 8))
 
 
 def test_vl_encoder_state_dict_adapter_exports_single_fused_tensor_to_hf_keys():
@@ -323,8 +317,7 @@ def test_vl_encoder_state_dict_adapter_imports_hf_keys_for_fused_layers():
     assert torch.equal(fused_qkv[4:6], torch.ones(2, 4) * 2)
     assert "model.language_model.layers.0.mlp.gate_proj.weight" not in internal_state_dict
     assert internal_state_dict["model.language_model.layers.0.mlp.fused.fc1_weight"].shape == (12, 4)
-    assert "model.mlp1.0.weight" not in internal_state_dict
-    assert torch.equal(internal_state_dict["model.mlp1.norm_fc1.layer_norm_weight"], torch.ones(8))
+    assert torch.equal(internal_state_dict["model.mlp1.0.weight"], torch.ones(8))
 
 
 def test_siglip_te_fusion_rejects_intermediate_select_layer():

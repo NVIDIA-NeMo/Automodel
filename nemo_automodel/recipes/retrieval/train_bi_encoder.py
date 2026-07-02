@@ -230,137 +230,6 @@ def _get_bi_encoder_optimization_bool(cfg, key: str, default=False) -> bool:
     return _as_bool(cfg.get(f"bi_encoder_optimization.{key}", default))
 
 
-def _query_forward_after_passage_forward(model, query, *, use_bypassed_ddp: bool = False):
-    """Run the second forward without a second DDP unused-param traversal when requested."""
-    if use_bypassed_ddp and hasattr(model, "module"):
-        return model.module(query)
-    return model(query)
-
-
-class _AllGatherWithGrad(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, gathered: torch.Tensor, source: torch.Tensor):
-        ctx.world_size = torch.distributed.get_world_size()
-        ctx.source_shape = tuple(source.shape)
-        return gathered
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        grad_output = grad_output.contiguous()
-        grad_source = grad_output.new_empty(ctx.source_shape)
-        if hasattr(torch.distributed, "reduce_scatter_tensor"):
-            torch.distributed.reduce_scatter_tensor(
-                grad_source,
-                grad_output,
-                op=torch.distributed.ReduceOp.SUM,
-            )
-        else:
-            chunks = [chunk.contiguous() for chunk in grad_output.chunk(ctx.world_size, dim=0)]
-            torch.distributed.reduce_scatter(
-                grad_source,
-                chunks,
-                op=torch.distributed.ReduceOp.SUM,
-            )
-        return None, grad_source
-
-
-class _DistGatherHandle:
-    def __init__(
-        self,
-        gathered: torch.Tensor | None,
-        source: torch.Tensor | None,
-        preserve_grad: bool,
-        work=None,
-        stream=None,
-    ):
-        self.gathered = gathered
-        self.source = source
-        self.preserve_grad = preserve_grad
-        self.work = work
-        self.stream = stream
-
-    def wait(self):
-        if self.work is not None:
-            self.work.wait()
-        if self.stream is not None:
-            torch.cuda.current_stream(self.gathered.device).wait_stream(self.stream)
-
-        if self.source is None or self.gathered is None:
-            return self.gathered
-        if self.preserve_grad and self.source.requires_grad:
-            return _AllGatherWithGrad.apply(self.gathered, self.source)
-        if self.source.requires_grad:
-            rank = torch.distributed.get_rank()
-            chunks = list(self.gathered.chunk(torch.distributed.get_world_size(), dim=0))
-            chunks[rank] = self.source
-            return torch.cat(chunks, dim=0)
-        return self.gathered
-
-
-def _new_gather_stream(tensor: torch.Tensor | None, priority: int = 0):
-    if tensor is not None and tensor.device.type == "cuda" and torch.cuda.is_available():
-        return torch.cuda.Stream(device=tensor.device, priority=priority)
-    return None
-
-
-def _start_async_dist_gather_tensor(
-    t: torch.Tensor | None,
-    preserve_grad: bool = False,
-    stream=None,
-) -> _DistGatherHandle:
-    """Start an all-gather on a side stream and return a handle for later use."""
-    if t is None:
-        return _DistGatherHandle(None, None, preserve_grad=False)
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        return _DistGatherHandle(t, None, preserve_grad=False)
-    world_size = torch.distributed.get_world_size()
-    if world_size <= 1:
-        return _DistGatherHandle(t, None, preserve_grad=False)
-
-    source = t.contiguous()
-    gathered = torch.empty(
-        (world_size * source.shape[0], *source.shape[1:]),
-        dtype=source.dtype,
-        device=source.device,
-    )
-
-    if source.device.type == "cuda" and torch.cuda.is_available():
-        stream = stream or _new_gather_stream(source)
-        stream.wait_stream(torch.cuda.current_stream(source.device))
-        with torch.cuda.stream(stream):
-            work = torch.distributed.all_gather_into_tensor(gathered, source.detach(), async_op=True)
-        return _DistGatherHandle(gathered, source, preserve_grad=preserve_grad, work=work, stream=stream)
-
-    work = torch.distributed.all_gather_into_tensor(gathered, source.detach(), async_op=True)
-    return _DistGatherHandle(gathered, source, preserve_grad=preserve_grad, work=work)
-
-
-def _start_async_dist_gather_tensor_with_dim1_padding(
-    t: torch.Tensor | None,
-    padding_value: int | float | bool = 0,
-    preserve_grad: bool = False,
-    stream=None,
-) -> _DistGatherHandle:
-    """Start an all-gather after padding dim 1 to the max length across ranks."""
-    if t is None:
-        return _DistGatherHandle(None, None, preserve_grad=False)
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        return _DistGatherHandle(t, None, preserve_grad=False)
-    if torch.distributed.get_world_size() <= 1:
-        return _DistGatherHandle(t, None, preserve_grad=False)
-
-    local_shape = torch.tensor(t.shape, device=t.device, dtype=torch.long)
-    shapes = [torch.empty_like(local_shape) for _ in range(torch.distributed.get_world_size())]
-    torch.distributed.all_gather(shapes, local_shape)
-    max_dim1 = max(int(shape[1].item()) for shape in shapes)
-    if t.shape[1] < max_dim1:
-        pad_shape = list(t.shape)
-        pad_shape[1] = max_dim1 - t.shape[1]
-        padding = t.new_full(pad_shape, padding_value)
-        t = torch.cat([t, padding], dim=1)
-    return _start_async_dist_gather_tensor(t, preserve_grad=preserve_grad, stream=stream)
-
-
 class _BidirectionalMaskCollator:
     def __init__(self, base_collate_fn, model_config, mask_dtype=None):
         self.base_collate_fn = base_collate_fn
@@ -691,7 +560,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
 
         with train_ctx, sync_ctx:
-            cfg = getattr(self, "cfg", {})
             if is_train:
                 if query is not None:
                     query["run_dummy_vision"] = False
@@ -702,56 +570,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
             n_passages = self.train_n_passages
             use_multi_vector_scoring = _uses_multi_vector_scoring(model)
             use_dist_neg = is_train and getattr(attr_model, "do_distributed_inbatch_negative", False)
-            gather_stream_priority = (
-                -1 if _get_bi_encoder_optimization_bool(cfg, "overlap_passage_gather_high_priority") else 0
-            )
-            overlap_passage_gather = _get_bi_encoder_optimization_bool(cfg, "overlap_passage_gather_with_query_forward")
-            bypass_second_ddp_forward = (
-                overlap_passage_gather
-                and use_dist_neg
-                and is_train
-                and isinstance(self.distributed_config, DDPConfig)
-                and hasattr(model, "module")
-            )
-            pending_all_p = None
-            pending_all_p_mask = None
-            pending_all_doc_ids = None
             passage_attention_mask_for_scores = passage["attention_mask"]
 
             p_reps = model(passage)
-
-            if overlap_passage_gather and use_dist_neg:
-                preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
-                gather_stream = _new_gather_stream(p_reps, priority=gather_stream_priority)
-                if use_multi_vector_scoring:
-                    pending_all_p = _start_async_dist_gather_tensor_with_dim1_padding(
-                        p_reps,
-                        preserve_grad=preserve_gather_grad,
-                        stream=gather_stream,
-                    )
-                    pending_all_p_mask = _start_async_dist_gather_tensor_with_dim1_padding(
-                        passage_attention_mask_for_scores,
-                        padding_value=False,
-                        stream=gather_stream,
-                    )
-                else:
-                    pending_all_p = _start_async_dist_gather_tensor(
-                        p_reps,
-                        preserve_grad=preserve_gather_grad,
-                        stream=gather_stream,
-                    )
-                passage_doc_ids = batch.get("passage_doc_ids")
-                if passage_doc_ids is not None:
-                    pending_all_doc_ids = _start_async_dist_gather_tensor(
-                        passage_doc_ids.contiguous(),
-                        stream=gather_stream,
-                    )
-
-            q_reps = _query_forward_after_passage_forward(
-                model,
-                query,
-                use_bypassed_ddp=bypass_second_ddp_forward,
-            )
+            q_reps = model(query)
 
             if use_dist_neg:
                 from nemo_automodel.components.models.common.inbatch_neg_utils import (
@@ -767,17 +589,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
 
                 if use_multi_vector_scoring:
-                    all_p = (
-                        pending_all_p.wait()
-                        if pending_all_p is not None
-                        else dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
-                    )
-                    all_p_mask = (
-                        pending_all_p_mask.wait()
-                        if pending_all_p_mask is not None
-                        else dist_gather_tensor_with_dim1_padding(
-                            passage_attention_mask_for_scores, padding_value=False
-                        )
+                    all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
+                    all_p_mask = dist_gather_tensor_with_dim1_padding(
+                        passage_attention_mask_for_scores, padding_value=False
                     )
                     expected_p = world_size * local_bs * n_passages
                     assert all_p.shape[0] == expected_p, (
@@ -791,11 +605,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         rank,
                     )
                 else:
-                    all_p = (
-                        pending_all_p.wait()
-                        if pending_all_p is not None
-                        else dist_gather_tensor(p_reps, preserve_grad=preserve_gather_grad)
-                    )
+                    all_p = dist_gather_tensor(p_reps, preserve_grad=preserve_gather_grad)
                     expected_p = world_size * local_bs * n_passages
                     assert all_p.shape[0] == expected_p, (
                         f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
@@ -806,11 +616,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     scores = scores / self.temperature
                 passage_doc_ids = batch.get("passage_doc_ids")
                 if passage_doc_ids is not None:
-                    all_doc_ids = (
-                        pending_all_doc_ids.wait()
-                        if pending_all_doc_ids is not None
-                        else dist_gather_tensor(passage_doc_ids.contiguous())
-                    )
+                    all_doc_ids = dist_gather_tensor(passage_doc_ids.contiguous())
                     mask_gathered_passages_same_doc_as_positive(
                         scores,
                         all_doc_ids,

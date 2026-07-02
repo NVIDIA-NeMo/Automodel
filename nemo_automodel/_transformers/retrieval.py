@@ -403,7 +403,6 @@ class BiEncoderModel(nn.Module):
         trust_remote_code: bool = False,
         disable_unused_siglip_pooling_head: bool = False,
         use_te_fused_siglip_layer: bool = False,
-        use_te_fused_vision_projection: bool = False,
         use_custom_llama_backend: bool = False,
         use_te_fused_mlp: bool = False,
         use_te_fused_qkv: bool = False,
@@ -460,17 +459,6 @@ class BiEncoderModel(nn.Module):
                 logger.warning(
                     "disable_unused_siglip_pooling_head requested but no SigLIP pooling-head parameters were disabled"
                 )
-        if use_te_fused_vision_projection:
-            try:
-                from nemo_automodel.components.models.llama_nemotron_vl.model import (
-                    replace_vision_projection_with_te,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "Vision projection fusion requested but the VL helper could not be imported"
-                ) from exc
-            if not replace_vision_projection_with_te(backbone):
-                logger.warning("use_te_fused_vision_projection requested but no compatible mlp1 was found")
         if freeze_config is not None:
             apply_parameter_freezing(backbone, freeze_config)
 

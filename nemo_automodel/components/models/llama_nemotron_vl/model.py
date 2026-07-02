@@ -9,7 +9,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import transformers
 from torch.nn import CrossEntropyLoss
 from transformers import AutoConfig, AutoProcessor, PreTrainedModel
@@ -215,7 +214,6 @@ class LlamaNemotronVLEncoderStateDictAdapter(EncoderStateDictAdapter):
         self.use_te_fused_llama_mlp = getattr(model, "_nemo_use_te_fused_llama_mlp", False)
         self.use_te_fused_llama_qkv = getattr(model, "_nemo_use_te_fused_llama_qkv", False)
         self.use_te_fused_siglip_layer = getattr(model, "_nemo_use_te_fused_siglip_layer", False)
-        self.use_te_fused_vision_projection = getattr(model, "_nemo_use_te_fused_vision_projection", False)
 
     def to_hf(self, state_dict, **kwargs):
         hf_state_dict = {}
@@ -333,18 +331,6 @@ class LlamaNemotronVLEncoderStateDictAdapter(EncoderStateDictAdapter):
             if suffix == "layernorm_mlp.fc2_bias":
                 return [(f"{prefix}mlp.fc2.bias", tensor)]
 
-        if self.use_te_fused_vision_projection:
-            projection_map = {
-                "mlp1.norm_fc1.layer_norm_weight": "mlp1.0.weight",
-                "mlp1.norm_fc1.layer_norm_bias": "mlp1.0.bias",
-                "mlp1.norm_fc1.weight": "mlp1.1.weight",
-                "mlp1.norm_fc1.bias": "mlp1.1.bias",
-                "mlp1.fc2.weight": "mlp1.3.weight",
-                "mlp1.fc2.bias": "mlp1.3.bias",
-            }
-            if key in projection_map:
-                return [(projection_map[key], tensor)]
-
         return [(key, tensor)]
 
     def _hf_to_optimized(self, state_dict: dict) -> None:
@@ -392,8 +378,6 @@ class LlamaNemotronVLEncoderStateDictAdapter(EncoderStateDictAdapter):
 
         if self.use_te_fused_siglip_layer:
             self._siglip_hf_to_optimized(state_dict)
-        if self.use_te_fused_vision_projection:
-            self._vision_projection_hf_to_optimized(state_dict)
 
     def _siglip_hf_to_optimized(self, state_dict: dict) -> None:
         for layer_idx in range(_get_config_value(self.vision_config, "num_hidden_layers", 0)):
@@ -435,14 +419,6 @@ class LlamaNemotronVLEncoderStateDictAdapter(EncoderStateDictAdapter):
             _pop_to(state_dict, f"{prefix}mlp.fc1.bias", f"{fused_prefix}layernorm_mlp.fc1_bias")
             _pop_to(state_dict, f"{prefix}mlp.fc2.weight", f"{fused_prefix}layernorm_mlp.fc2_weight")
             _pop_to(state_dict, f"{prefix}mlp.fc2.bias", f"{fused_prefix}layernorm_mlp.fc2_bias")
-
-    def _vision_projection_hf_to_optimized(self, state_dict: dict) -> None:
-        _pop_to(state_dict, "mlp1.0.weight", "mlp1.norm_fc1.layer_norm_weight")
-        _pop_to(state_dict, "mlp1.0.bias", "mlp1.norm_fc1.layer_norm_bias")
-        _pop_to(state_dict, "mlp1.1.weight", "mlp1.norm_fc1.weight")
-        _pop_to(state_dict, "mlp1.1.bias", "mlp1.norm_fc1.bias")
-        _pop_to(state_dict, "mlp1.3.weight", "mlp1.fc2.weight")
-        _pop_to(state_dict, "mlp1.3.bias", "mlp1.fc2.bias")
 
 
 # Check if native create_bidirectional_mask exists (transformers >= 5.0)
@@ -1200,37 +1176,6 @@ def replace_llama_qkv_with_te_fused(model: nn.Module) -> int:
     return fused_count
 
 
-class FusedTEVisionProjection(nn.Module):
-    """Fuse the vision-to-language projection's LayerNorm and first Linear."""
-
-    def __init__(self, source_mlp: nn.Sequential):
-        super().__init__()
-        _require_transformer_engine(type(self).__name__)
-        from transformer_engine.pytorch import LayerNormLinear
-
-        source_norm, source_fc1, source_fc2 = source_mlp[0], source_mlp[1], source_mlp[3]
-        self.norm_fc1 = LayerNormLinear(
-            in_features=source_fc1.in_features,
-            out_features=source_fc1.out_features,
-            eps=source_norm.eps,
-            normalization="LayerNorm",
-            bias=True,
-            params_dtype=source_norm.weight.dtype,
-            device=source_norm.weight.device,
-        )
-        self.fc2 = source_fc2
-        with torch.no_grad():
-            self.norm_fc1.layer_norm_weight.copy_(source_norm.weight)
-            self.norm_fc1.layer_norm_bias.copy_(source_norm.bias)
-            self.norm_fc1.weight.copy_(source_fc1.weight)
-            self.norm_fc1.bias.copy_(source_fc1.bias)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.norm_fc1(hidden_states)
-        hidden_states = F.gelu(hidden_states, approximate="none")
-        return self.fc2(hidden_states)
-
-
 class FusedTESiglipTransformerLayer(nn.Module):
     """Transformer Engine implementation of one complete SigLIP encoder layer."""
 
@@ -1338,18 +1283,6 @@ def replace_siglip_encoder_layers_with_te_fused(model: nn.Module) -> int:
     if replaced:
         model._nemo_use_te_fused_siglip_layer = True
     return replaced
-
-
-def replace_vision_projection_with_te(model: nn.Module) -> bool:
-    """Replace the vision-to-language projection with a trainable TE prefix."""
-    _require_transformer_engine("use_te_fused_vision_projection")
-    projection = getattr(model, "mlp1", None)
-    if not isinstance(projection, nn.Sequential) or len(projection) != 4:
-        return False
-    model.mlp1 = FusedTEVisionProjection(projection)
-    model._nemo_use_te_fused_vision_projection = True
-    logger.info("Fused vision projection LayerNorm + first Linear")
-    return True
 
 
 def disable_unused_siglip_pooling_head_grad(model: nn.Module) -> int:

@@ -34,8 +34,6 @@ temperature: 0.02
 bi_encoder_optimization:
   patch_flash_attention_is_packed_sequence: true
   precompute_bidirectional_mask: true
-  overlap_passage_gather_with_query_forward: true
-  overlap_passage_gather_high_priority: true
 
 step_scheduler:
   global_batch_size: 64
@@ -66,9 +64,8 @@ model:
   use_te_fused_mlp: true
   use_te_fused_qkv: true
 
-  # Optimized vision tower and vision-language projection.
+  # Optimized vision tower.
   use_te_fused_siglip_layer: true
-  use_te_fused_vision_projection: true
   disable_unused_siglip_pooling_head: true
 
 tokenizer:
