@@ -322,8 +322,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
         setup_logging()
 
         if _get_bi_encoder_optimization_bool(self.cfg, "patch_flash_attention_is_packed_sequence"):
-            _patch_is_packed_sequence_for_training()
-            logger.info("Patched transformers._is_packed_sequence for non-packed retrieval training")
+            if _patch_is_packed_sequence_for_training():
+                logger.info("Patched transformers._is_packed_sequence for non-packed retrieval training")
+            else:
+                logger.warning(
+                    "Could not patch transformers._is_packed_sequence; the private flash-attention helper "
+                    "may have moved in this transformers version."
+                )
 
         apply_cache_compatibility_patches()
         apply_te_patches()

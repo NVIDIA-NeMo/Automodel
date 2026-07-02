@@ -204,6 +204,27 @@ def _filter_converted_pairs(pairs: list[tuple[str, Any]], exclude_key_regex: str
     return [(key, value) for key, value in pairs if not re.match(exclude_key_regex, key)]
 
 
+def _get_siglip_vision_transformer(model: nn.Module) -> nn.Module | None:
+    """Return the SigLIP transformer for nested and flattened HF layouts."""
+    vision_model = getattr(model, "vision_model", None)
+    nested = getattr(vision_model, "vision_model", None)
+    if getattr(nested, "encoder", None) is not None or getattr(nested, "head", None) is not None:
+        return nested
+    if getattr(vision_model, "encoder", None) is not None or getattr(vision_model, "head", None) is not None:
+        return vision_model
+    return None
+
+
+def _get_siglip_state_prefix(model: nn.Module) -> str:
+    """Return the state-dict prefix for the active SigLIP layout."""
+    vision_model = getattr(model, "vision_model", None)
+    if getattr(getattr(vision_model, "vision_model", None), "encoder", None) is not None:
+        return "vision_model.vision_model"
+    if getattr(vision_model, "encoder", None) is not None:
+        return "vision_model"
+    return "vision_model.vision_model"
+
+
 class LlamaNemotronVLEncoderStateDictAdapter(EncoderStateDictAdapter):
     """HF-compatible state-dict adapter for optimized LlamaNemotron VL retrieval checkpoints."""
 
@@ -214,6 +235,7 @@ class LlamaNemotronVLEncoderStateDictAdapter(EncoderStateDictAdapter):
         self.use_te_fused_llama_mlp = getattr(model, "_nemo_use_te_fused_llama_mlp", False)
         self.use_te_fused_llama_qkv = getattr(model, "_nemo_use_te_fused_llama_qkv", False)
         self.use_te_fused_siglip_layer = getattr(model, "_nemo_use_te_fused_siglip_layer", False)
+        self.vision_state_prefix = _get_siglip_state_prefix(model)
 
     def to_hf(self, state_dict, **kwargs):
         hf_state_dict = {}
@@ -288,13 +310,10 @@ class LlamaNemotronVLEncoderStateDictAdapter(EncoderStateDictAdapter):
                 if suffix == "fc2_bias":
                     return [(f"{prefix}mlp.down_proj.bias", tensor)]
 
-        vision_match = re.match(
-            r"^vision_model\.vision_model\.encoder\.layers\.(\d+)\.mlp\.fused\.(.+)$",
-            key,
-        )
+        vision_match = re.match(r"^(vision_model(?:\.vision_model)?)\.encoder\.layers\.(\d+)\.mlp\.fused\.(.+)$", key)
         if self.use_te_fused_siglip_layer and vision_match:
-            layer_idx, suffix = vision_match.groups()
-            prefix = f"vision_model.vision_model.encoder.layers.{layer_idx}."
+            vision_prefix, layer_idx, suffix = vision_match.groups()
+            prefix = f"{vision_prefix}.encoder.layers.{layer_idx}."
             hidden_size = _get_config_value(self.vision_config, "hidden_size")
             if suffix == "self_attention.layernorm_qkv.layer_norm_weight":
                 return [(f"{prefix}layer_norm1.weight", tensor)]
@@ -381,7 +400,7 @@ class LlamaNemotronVLEncoderStateDictAdapter(EncoderStateDictAdapter):
 
     def _siglip_hf_to_optimized(self, state_dict: dict) -> None:
         for layer_idx in range(_get_config_value(self.vision_config, "num_hidden_layers", 0)):
-            prefix = f"vision_model.vision_model.encoder.layers.{layer_idx}."
+            prefix = f"{self.vision_state_prefix}.encoder.layers.{layer_idx}."
             fused_prefix = f"{prefix}mlp.fused."
             _pop_to(
                 state_dict,
@@ -439,6 +458,32 @@ _dynamic_cache_init_params = inspect.signature(DynamicCache.__init__).parameters
 _USE_PLURAL_CACHE_PARAM = "past_key_values" in _decoder_forward_params
 # DynamicCache accepts config parameter in >= 4.56
 _DYNAMIC_CACHE_ACCEPTS_CONFIG = "config" in _dynamic_cache_init_params
+
+
+def _create_bidirectional_attention_mask(
+    config: PretrainedConfig,
+    input_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    bidirectional_mask: torch.Tensor | None = None,
+    bidirectional_mask_precomputed: bool = False,
+) -> torch.Tensor | None:
+    if bidirectional_mask_precomputed:
+        return bidirectional_mask
+    if attention_mask is None:
+        return None
+
+    if _HAS_NATIVE_BIDIRECTIONAL_MASK:
+        return create_bidirectional_mask(
+            config,
+            input_embeds,
+            attention_mask=attention_mask,
+        )
+
+    if getattr(config, "_attn_implementation", None) == "flash_attention_2":
+        has_masked_tokens = (attention_mask == 0).any()
+        return attention_mask if has_masked_tokens else None
+
+    return _prepare_4d_attention_mask(attention_mask, input_embeds.dtype)
 
 
 def split_model(model_path, device):
@@ -564,24 +609,13 @@ class LlamaBidirectionalModel(HFLlamaModel):
         bidirectional_mask: torch.Tensor | None = None,
         bidirectional_mask_precomputed: bool = False,
     ) -> torch.Tensor | None:
-        if bidirectional_mask_precomputed:
-            return bidirectional_mask
-        if attention_mask is None:
-            return None
-
-        if _HAS_NATIVE_BIDIRECTIONAL_MASK:
-            return create_bidirectional_mask(
-                self.config,
-                input_embeds,
-                attention_mask=attention_mask,
-            )
-
-        # Fallback for transformers < 5.0
-        if getattr(self.config, "_attn_implementation", None) == "flash_attention_2":
-            has_masked_tokens = (attention_mask == 0).any()
-            return attention_mask if has_masked_tokens else None
-
-        return _prepare_4d_attention_mask(attention_mask, input_embeds.dtype)
+        return _create_bidirectional_attention_mask(
+            self.config,
+            input_embeds,
+            attention_mask,
+            bidirectional_mask,
+            bidirectional_mask_precomputed,
+        )
 
     def forward(
         self,
@@ -890,17 +924,6 @@ class OptimizedLlamaDecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
-        if getattr(self, "self_attn", None) is None:
-            return self.mlp(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_embeddings=position_embeddings,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                **kwargs,
-            )
-
         residual = hidden_states
         if getattr(self, "input_layernorm", None) is not None:
             hidden_states = self.input_layernorm(hidden_states)
@@ -969,23 +992,13 @@ class OptimizedLlamaBidirectionalModel(PreTrainedModel):
         bidirectional_mask: torch.Tensor | None = None,
         bidirectional_mask_precomputed: bool = False,
     ) -> torch.Tensor | None:
-        if bidirectional_mask_precomputed:
-            return bidirectional_mask
-        if attention_mask is None:
-            return None
-
-        if _HAS_NATIVE_BIDIRECTIONAL_MASK:
-            return create_bidirectional_mask(
-                self.config,
-                input_embeds,
-                attention_mask=attention_mask,
-            )
-
-        if getattr(self.config, "_attn_implementation", None) == "flash_attention_2":
-            has_masked_tokens = (attention_mask == 0).any()
-            return attention_mask if has_masked_tokens else None
-
-        return _prepare_4d_attention_mask(attention_mask, input_embeds.dtype)
+        return _create_bidirectional_attention_mask(
+            self.config,
+            input_embeds,
+            attention_mask,
+            bidirectional_mask,
+            bidirectional_mask_precomputed,
+        )
 
     def forward(
         self,
@@ -1265,8 +1278,7 @@ def replace_siglip_encoder_layers_with_te_fused(model: nn.Module) -> int:
             "The TE SigLIP wrapper does not preserve intermediate hidden-state recording."
         )
     _require_transformer_engine("use_te_fused_siglip_layer")
-    vision_model = getattr(model, "vision_model", None)
-    vision_transformer = getattr(vision_model, "vision_model", None)
+    vision_transformer = _get_siglip_vision_transformer(model)
     encoder = getattr(vision_transformer, "encoder", None)
     layers = getattr(encoder, "layers", None)
     if layers is None:
@@ -1287,8 +1299,7 @@ def replace_siglip_encoder_layers_with_te_fused(model: nn.Module) -> int:
 
 def disable_unused_siglip_pooling_head_grad(model: nn.Module) -> int:
     """Disable the unused SigLIP pooling head for retrieval feature extraction."""
-    vision_model = getattr(model, "vision_model", None)
-    vision_transformer = getattr(vision_model, "vision_model", None)
+    vision_transformer = _get_siglip_vision_transformer(model)
     pooling_head = getattr(vision_transformer, "head", None)
     if pooling_head is None:
         return 0

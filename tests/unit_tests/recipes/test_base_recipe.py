@@ -21,7 +21,12 @@ import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.recipes.base_recipe import BaseRecipe, _find_latest_checkpoint, is_distributed_stateful
+from nemo_automodel.recipes.base_recipe import (
+    BaseRecipe,
+    _find_latest_checkpoint,
+    _unwrap_ddp_for_checkpoint_model_load,
+    is_distributed_stateful,
+)
 
 try:
     import expecttest
@@ -209,6 +214,24 @@ class _ToyRecipe(BaseRecipe):
         if cfg_dict is None:
             cfg_dict = {"test": "config"}
         self.cfg = ConfigNode(cfg_dict)
+
+
+def test_unwrap_ddp_for_checkpoint_model_load_handles_lists(monkeypatch):
+    """Checkpoint model load must see adapters on DDP-wrapped inner modules."""
+
+    class FakeDDP(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+    import nemo_automodel.recipes.base_recipe as base_recipe_module
+
+    monkeypatch.setattr(base_recipe_module, "DistributedDataParallel", FakeDDP)
+    inner = nn.Linear(2, 2)
+    wrapped = FakeDDP(inner)
+
+    assert _unwrap_ddp_for_checkpoint_model_load(wrapped) is inner
+    assert _unwrap_ddp_for_checkpoint_model_load([wrapped]) == [inner]
 
 
 def test_dp_allreduce_uses_world_group_without_device_mesh(tmp_path, monkeypatch):

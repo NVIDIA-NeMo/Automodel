@@ -430,15 +430,15 @@ class BiEncoderModel(nn.Module):
                 raise RuntimeError("Custom Llama backend requested but the VL helper could not be imported") from exc
             replaced = replace_language_model_with_custom_llama(backbone)
             if not replaced:
-                logger.warning("use_custom_llama_backend requested but the loaded backbone was not replaced")
+                raise RuntimeError("use_custom_llama_backend requested but the loaded backbone was not replaced")
             if use_te_fused_mlp:
                 fused = replace_llama_mlp_with_te_fused(backbone)
                 if fused == 0:
-                    logger.warning("use_te_fused_mlp requested but no custom LLaMA MLP layers were fused")
+                    raise RuntimeError("use_te_fused_mlp requested but no custom LLaMA MLP layers were fused")
             if use_te_fused_qkv:
                 fused = replace_llama_qkv_with_te_fused(backbone)
                 if fused == 0:
-                    logger.warning("use_te_fused_qkv requested but no custom LLaMA QKV layers were fused")
+                    raise RuntimeError("use_te_fused_qkv requested but no custom LLaMA QKV layers were fused")
         if use_te_fused_siglip_layer or disable_unused_siglip_pooling_head:
             try:
                 from nemo_automodel.components.models.llama_nemotron_vl.model import (
@@ -452,11 +452,11 @@ class BiEncoderModel(nn.Module):
         if use_te_fused_siglip_layer:
             replaced = replace_siglip_encoder_layers_with_te_fused(backbone)
             if replaced == 0:
-                logger.warning("use_te_fused_siglip_layer requested but no SigLIP encoder layers were replaced")
+                raise RuntimeError("use_te_fused_siglip_layer requested but no SigLIP encoder layers were replaced")
         if disable_unused_siglip_pooling_head:
             disabled = disable_unused_siglip_pooling_head_grad(backbone)
             if disabled == 0:
-                logger.warning(
+                raise RuntimeError(
                     "disable_unused_siglip_pooling_head requested but no SigLIP pooling-head parameters were disabled"
                 )
         if freeze_config is not None:

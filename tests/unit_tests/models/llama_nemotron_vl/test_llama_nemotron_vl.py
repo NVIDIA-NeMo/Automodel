@@ -354,6 +354,37 @@ def _adapter_with_all_fusions():
     return LlamaNemotronVLEncoderStateDictAdapter(model)
 
 
+def _adapter_with_flattened_siglip_fusion():
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            llm_config=LlamaBidirectionalConfig(
+                architectures=["LlamaBidirectionalModel"],
+                model_type="llama",
+                vocab_size=32,
+                hidden_size=4,
+                intermediate_size=6,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=2,
+            ),
+            vision_config=SiglipVisionConfig(
+                hidden_size=4,
+                image_size=4,
+                patch_size=2,
+                num_hidden_layers=1,
+                num_attention_heads=1,
+                intermediate_size=8,
+            ),
+        ),
+        vision_model=SimpleNamespace(encoder=SimpleNamespace(layers=nn.ModuleList())),
+        _nemo_use_te_fused_llama_mlp=False,
+        _nemo_use_te_fused_llama_qkv=False,
+        _nemo_use_te_fused_siglip_layer=True,
+    )
+    return LlamaNemotronVLEncoderStateDictAdapter(model)
+
+
 def test_vl_encoder_state_dict_adapter_exports_hf_keys_for_fused_layers():
     adapter = _adapter_with_all_fusions()
     state_dict = {
@@ -417,6 +448,38 @@ def test_vl_encoder_state_dict_adapter_exports_single_fused_tensor_to_hf_keys():
     assert torch.equal(converted[0][1], tensor[:4])
     assert torch.equal(converted[1][1], tensor[4:6])
     assert torch.equal(converted[2][1], tensor[6:8])
+
+
+def test_vl_encoder_state_dict_adapter_supports_flattened_siglip_keys():
+    adapter = _adapter_with_flattened_siglip_fusion()
+    tensor = torch.arange(48).reshape(12, 4)
+
+    converted = adapter.convert_single_tensor_to_hf(
+        "model.vision_model.encoder.layers.0.mlp.fused.self_attention.layernorm_qkv.weight",
+        tensor,
+    )
+
+    assert [key for key, _ in converted] == [
+        "vision_model.encoder.layers.0.self_attn.q_proj.weight",
+        "vision_model.encoder.layers.0.self_attn.k_proj.weight",
+        "vision_model.encoder.layers.0.self_attn.v_proj.weight",
+    ]
+
+    hf_state_dict = {
+        "vision_model.encoder.layers.0.layer_norm1.weight": torch.ones(4),
+        "vision_model.encoder.layers.0.self_attn.q_proj.weight": torch.ones(4, 4),
+        "vision_model.encoder.layers.0.self_attn.k_proj.weight": torch.ones(4, 4) * 2,
+        "vision_model.encoder.layers.0.self_attn.v_proj.weight": torch.ones(4, 4) * 3,
+    }
+    internal_state_dict = adapter.from_hf(hf_state_dict)
+
+    assert (
+        "model.vision_model.encoder.layers.0.mlp.fused.self_attention.layernorm_qkv.layer_norm_weight"
+        in internal_state_dict
+    )
+    assert "model.vision_model.encoder.layers.0.self_attn.q_proj.weight" not in internal_state_dict
+    fused_qkv = internal_state_dict["model.vision_model.encoder.layers.0.mlp.fused.self_attention.layernorm_qkv.weight"]
+    assert fused_qkv.shape == (12, 4)
 
 
 def test_vl_encoder_state_dict_adapter_imports_hf_keys_for_fused_layers():
@@ -518,41 +581,46 @@ def test_te_llama_mlp_and_qkv_replacements_use_fused_modules(fake_transformer_en
     assert holder._nemo_use_te_fused_llama_qkv is True
 
 
+class _FakeSiglipAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.num_heads = 1
+        self.head_dim = 8
+        self.dropout = 0.0
+        self.q_proj = nn.Linear(8, 8)
+        self.k_proj = nn.Linear(8, 8)
+        self.v_proj = nn.Linear(8, 8)
+        self.out_proj = nn.Linear(8, 8)
+
+
+class _FakeSiglipMLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(8, 16)
+        self.fc2 = nn.Linear(16, 8)
+
+
+class _FakeSiglipLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed_dim = 8
+        self.self_attn = _FakeSiglipAttention()
+        self.layer_norm1 = nn.LayerNorm(8)
+        self.layer_norm2 = nn.LayerNorm(8)
+        self.mlp = _FakeSiglipMLP()
+
+
+def _fake_siglip_vision_transformer():
+    return SimpleNamespace(encoder=SimpleNamespace(layers=nn.ModuleList([_FakeSiglipLayer()])))
+
+
 def test_replace_siglip_encoder_layers_with_te_fused_swaps_layers(fake_transformer_engine):
     del fake_transformer_engine
-
-    class FakeSiglipAttention(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.num_heads = 1
-            self.head_dim = 8
-            self.dropout = 0.0
-            self.q_proj = nn.Linear(8, 8)
-            self.k_proj = nn.Linear(8, 8)
-            self.v_proj = nn.Linear(8, 8)
-            self.out_proj = nn.Linear(8, 8)
-
-    class FakeSiglipMLP(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.fc1 = nn.Linear(8, 16)
-            self.fc2 = nn.Linear(16, 8)
-
-    class FakeSiglipLayer(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed_dim = 8
-            self.self_attn = FakeSiglipAttention()
-            self.layer_norm1 = nn.LayerNorm(8)
-            self.layer_norm2 = nn.LayerNorm(8)
-            self.mlp = FakeSiglipMLP()
 
     model = SimpleNamespace(
         select_layer=-1,
         vision_model=SimpleNamespace(
-            vision_model=SimpleNamespace(
-                encoder=SimpleNamespace(layers=nn.ModuleList([FakeSiglipLayer()])),
-            )
+            vision_model=_fake_siglip_vision_transformer(),
         ),
     )
 
@@ -561,10 +629,31 @@ def test_replace_siglip_encoder_layers_with_te_fused_swaps_layers(fake_transform
     assert model._nemo_use_te_fused_siglip_layer is True
 
 
+def test_replace_siglip_encoder_layers_with_te_fused_supports_flattened_layout(fake_transformer_engine):
+    del fake_transformer_engine
+    model = SimpleNamespace(select_layer=-1, vision_model=_fake_siglip_vision_transformer())
+
+    assert replace_siglip_encoder_layers_with_te_fused(model) == 1
+    assert isinstance(model.vision_model.encoder.layers[0], FusedTESiglipEncoderLayer)
+    assert model._nemo_use_te_fused_siglip_layer is True
+
+
 def test_disable_unused_siglip_pooling_head_grad_disables_head():
     pooling_head = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 2))
     vision_transformer = SimpleNamespace(head=pooling_head, use_head=True)
     model = SimpleNamespace(vision_model=SimpleNamespace(vision_model=vision_transformer))
+
+    disabled = disable_unused_siglip_pooling_head_grad(model)
+
+    assert disabled == sum(param.numel() for param in pooling_head.parameters())
+    assert vision_transformer.use_head is False
+    assert all(not param.requires_grad for param in pooling_head.parameters())
+
+
+def test_disable_unused_siglip_pooling_head_grad_supports_flattened_layout():
+    pooling_head = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 2))
+    vision_transformer = SimpleNamespace(head=pooling_head, use_head=True)
+    model = SimpleNamespace(vision_model=vision_transformer)
 
     disabled = disable_unused_siglip_pooling_head_grad(model)
 

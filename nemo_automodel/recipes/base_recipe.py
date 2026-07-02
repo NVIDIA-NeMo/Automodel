@@ -136,6 +136,15 @@ def is_model(object):
     )
 
 
+def _unwrap_ddp_for_checkpoint_model_load(model):
+    """Unwrap DDP before model checkpoint load so adapters on the inner module are visible."""
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    if isinstance(model, list):
+        return [_unwrap_ddp_for_checkpoint_model_load(item) for item in model]
+    return model
+
+
 def _list_existing_checkpoints(ckpt_root: Path) -> list[Path]:
     """Return existing checkpoint directories under ckpt_root (matching '*step_*')."""
     if not ckpt_root.exists():
@@ -668,25 +677,24 @@ class BaseRecipe:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
 
         model, optimizer, scheduler = self._load_checkpoint_tracked_state(ckpt_dir)
+        model_for_load = _unwrap_ddp_for_checkpoint_model_load(model)
 
         # Composite models (e.g. ``Gemma4WithDrafter``) save weights to multiple
         # HF-format sub-directories instead of a single ``model/`` dir. Dispatch
         # to the model's own ``load_pretrained`` when it provides one so the
         # composite knows how to read its custom layout. This mirrors the
         # save-side dispatch in ``save_checkpoint``.
-        from torch.nn.parallel import DistributedDataParallel
-
         # ``model`` here may be a single ``nn.Module`` (LLM/diffusion recipes)
         # or a ``list[nn.Module]`` (VLM recipe stores ``self.model_parts``).
         # Peek at the first element when given a single-item list so we can
         # check for the composite hook regardless of recipe shape.
-        candidate = model[0] if isinstance(model, list) and len(model) == 1 else model
-        if isinstance(candidate, DistributedDataParallel):
-            candidate = candidate.module
+        candidate = (
+            model_for_load[0] if isinstance(model_for_load, list) and len(model_for_load) == 1 else model_for_load
+        )
         if hasattr(candidate, "load_pretrained") and hasattr(candidate.load_pretrained, "__func__"):
             candidate.load_pretrained(ckpt_dir, checkpointer=self.checkpointer)
         else:
-            self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
+            self.checkpointer.load_model(model_for_load, os.path.join(ckpt_dir, "model"))
         self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
 
     def _log_experiment_details(self):
