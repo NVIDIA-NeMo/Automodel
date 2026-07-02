@@ -216,6 +216,20 @@ class TestModelSupportsTP:
             assert model.supports.supports_tp is False
 
 
+class TestModelSupportsTHD:
+    def test_native_thd_capability_is_exposed(self):
+        model = _DeepseekV4Like()
+        _attach(model)
+        assert model.supports.supports_thd is True
+        assert model.supports_thd is True
+
+    def test_native_thd_defaults_false(self):
+        model = _Bare()
+        _attach(model)
+        assert model.supports.supports_thd is False
+        assert model.supports_thd is False
+
+
 class TestModelSupportsPP:
     def test_pp_true(self):
         model = _WithPP()

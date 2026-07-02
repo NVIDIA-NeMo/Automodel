@@ -290,6 +290,11 @@ class ModelSupports:
         return _supports_seq_lens(model) and sp_attn_backend
 
     @property
+    def supports_thd(self) -> bool:
+        """Model owns its native THD packed-sequence input path."""
+        return _supports_thd(self._model)
+
+    @property
     def supports_generate(self) -> bool:
         """Model has a ``generate()`` method for autoregressive inference."""
         return callable(getattr(self._model, "generate", None))

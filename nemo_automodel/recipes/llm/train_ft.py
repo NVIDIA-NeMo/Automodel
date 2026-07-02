@@ -443,13 +443,17 @@ def build_dataloader(
                 logger.info(f"Configured neat packing for attn_implementation={_attn_impl}")
             else:
                 # "thd" — existing packing logic
+                # Native THD models perform their own CP alignment after collation.
+                # Generic per-document CP padding would change pack boundaries and
+                # make otherwise equivalent CP sizes train on different samples.
+                packing_cp_size = 1 if bool(getattr(model, "supports_thd", False)) else cp_size
                 ds = pack_dataset(
                     ds,
                     split=cfg_ds.split,
                     packed_sequence_size=packed_sequence_size,
                     max_packs=getattr(cfg_ps, "max_packs", None),
                     padding_idx=getattr(tokenizer, "pad_token_id", 0),
-                    cp_size=cp_size,
+                    cp_size=packing_cp_size,
                 )
 
         if isinstance(ds, MegatronPretraining):
@@ -1171,7 +1175,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # before make_cp_batch_and_ctx shards the batch, instead of the default
             # load-balanced context_parallel path.
             _model_cp = self.model_parts[0] if hasattr(self, "model_parts") else None
-            if cp_size > 1 and _model_cp is not None and hasattr(_model_cp, "prepare_model_inputs_for_cp"):
+            model_owns_thd = _thd_collater and bool(getattr(_model_cp, "supports_thd", False))
+            if (
+                (cp_size > 1 or model_owns_thd)
+                and _model_cp is not None
+                and hasattr(_model_cp, "prepare_model_inputs_for_cp")
+            ):
                 batch.update(
                     _model_cp.prepare_model_inputs_for_cp(input_ids=batch["input_ids"], num_chunks=_num_chunks_value)
                 )
