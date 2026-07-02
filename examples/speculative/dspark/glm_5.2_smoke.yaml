@@ -1,0 +1,87 @@
+# GLM-5.2 DSpark SMOKE config: a fast pipeline-sanity run of the REAL recipe path
+# (expert-parallel ep_size=8, hybrid-EP dispatcher, FP8 dequant, online hidden-state
+# capture, draft training), shrunk so it reaches a training step in a few minutes ON A
+# SINGLE 8x80GB NODE. It is NOT a real training run; use glm_5.2_dspark.yaml (multi-node)
+# for that.
+#
+# Why the target is reduced to 4 layers: the full 78-layer GLM-5.2 with 256 routed experts
+# does not fit on a single node. target_num_hidden_layers=4 loads only the first 4 layers
+# (3 dense + the first MoE layer) so the whole EP / hidden-capture / draft-training pipeline
+# runs end to end on one node. target_layer_ids=[1,2,3] is the 4-layer equivalent of the
+# full target's late layers [75,76,77]. A draft trained here is a pipeline check, not a
+# usable drafter.
+#
+# Prereq: HybridEP (or DeepEP) installed, 8x>=80GB GPUs, GLM-5.2 weights local.
+# Run via: tests/functional_tests/speculative/run_glm_5.2_smoke.sh
+recipe: TrainDSparkRecipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+distributed:
+  strategy: fsdp2
+  defer_fsdp_grad_sync: true
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8                     # must divide n_routed_experts (256)
+  activation_checkpointing: true # smoke: trade compute for memory headroom
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+recipe_args:
+  target_model_name_or_path: /path/to/GLM-5.2   # <-- set to your local GLM-5.2 checkout
+  train_data_path: ./glm_smoke_data              # <-- tiny smoke data (the run script builds it)
+  val_data_path: null
+  output_dir: ./outputs/glm_smoke
+  seq_length: 512                # smoke: short sequences
+  micro_batch_size: 1
+  grad_accumulation_steps: 1     # smoke: optimizer step every micro-batch
+  num_workers: 0
+  num_epochs: 1
+
+  # --- smoke: load only the first 4 target layers so the run fits on one node ---
+  target_num_hidden_layers: 4
+
+  # --- draft backbone (same as the full config) ---
+  draft_num_hidden_layers: 2
+  block_size: 5
+  num_anchors: 16                # smoke: few anchors per sequence
+  mask_token_id: 154856          # first reserved GLM-5.2 vocab slot (in-vocab; < 154880)
+  target_layer_ids: [1, 2, 3]    # 4-layer equivalent of the full target's late layers [75,76,77]
+  freeze_embeddings: true
+
+  # --- frozen GLM-5.2 target backend (the real EP path) ---
+  # sdpa: reliable everywhere. TileLang is faster but its JIT can fail on some builds;
+  # switch to tilelang if yours compiles the GLM DSA kernels.
+  target_attn_backend: sdpa
+  target_dispatcher: hybridep
+  target_experts: gmm
+  target_enable_fsdp_optimizations: true
+
+  # --- heads + objective (same as the full config) ---
+  markov_rank: 256
+  markov_head_type: vanilla
+  confidence_head_alpha: 1.0
+  confidence_head_with_markov: true
+  ce_loss_alpha: 0.1
+  l1_loss_alpha: 0.9
+  loss_decay_gamma: 4.0
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 1             # smoke: log every step
+  max_grad_norm: 1.0
+
+optimizer:
+  lr: 6.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  warmup_ratio: 0.0              # smoke: no warmup, see movement immediately
+  min_lr_ratio: 0.1
+
+checkpoint:
+  enabled: false                 # smoke: don't write checkpoints
+  dequantize_base_checkpoint: true

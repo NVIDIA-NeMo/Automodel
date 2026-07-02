@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DSpark draft-model training recipe (Qwen3, Gemma4, DeepSeek V4, and MiniMax M3 VL targets).
+"""DSpark draft-model training recipe (Qwen3, Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 VL targets).
 
 DSpark is a semi-autoregressive parallel drafter: a parallel backbone produces a
 block of tokens per anchor in one pass, a serial Markov head injects intra-block
@@ -68,6 +68,7 @@ from nemo_automodel.components.optim.optimizer import build_optimizer
 from nemo_automodel.components.speculative.dspark.config import (
     build_deepseek_v4_draft_config,
     build_gemma4_draft_config,
+    build_glm_5_2_draft_config,
     build_minimax_m3_draft_config,
 )
 from nemo_automodel.components.speculative.dspark.core import DSparkTrainerModule
@@ -97,6 +98,7 @@ logger = logging.getLogger(__name__)
 _GEMMA4_MODEL_TYPES = ("gemma4", "gemma4_unified")
 _MINIMAX_M3_MODEL_TYPES = ("minimax_m3_vl",)
 _DEEPSEEK_V4_MODEL_TYPE = "deepseek_v4"
+_GLM_5_2_MODEL_TYPE = "glm_moe_dsa"
 
 _DSPARK_MM_KEYS = tuple(k for k in VLM_INPUT_KEYS if k != "input_ids")
 
@@ -305,7 +307,7 @@ def _apply_draft_activation_checkpointing(draft_model: torch.nn.Module, mode: bo
 
 
 class TrainDSparkRecipe(BaseRecipe):
-    """Recipe for DSpark draft-model training on Qwen3, Gemma4, DeepSeek V4, and MiniMax M3 VL targets."""
+    """Recipe for DSpark draft-model training on Qwen3, Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 VL targets."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -331,6 +333,7 @@ class TrainDSparkRecipe(BaseRecipe):
         trust_remote_code = bool(recipe_cfg.get("trust_remote_code", False))
         target_model_type = _read_target_model_type(target_path, trust_remote_code)
         is_deepseek_v4_target = target_model_type == _DEEPSEEK_V4_MODEL_TYPE
+        is_glm_5_2_target = target_model_type == _GLM_5_2_MODEL_TYPE
         is_gemma4_target = target_model_type in _GEMMA4_MODEL_TYPES
         is_minimax_m3_target = target_model_type in _MINIMAX_M3_MODEL_TYPES
         is_multimodal = bool(recipe_cfg.get("multimodal", False))
@@ -410,6 +413,48 @@ class TrainDSparkRecipe(BaseRecipe):
                 # config declaring some, and DSpark trains its own separate draft
                 # regardless, so disable the target's native MTP modules.
                 text_config=target_text_overrides,
+            )
+            # A distributed-setup-loaded model already lands correctly placed
+            # (sharded as DTensors); a blanket .to(device) afterward is redundant.
+        elif is_glm_5_2_target:
+            # GLM-5.2 (GlmMoeDsaForCausalLM) is a ~355B-parameter MLA + DSA MoE LM: load
+            # it frozen through the same expert-parallel / FSDP distributed path the GLM
+            # finetune recipe uses, sharding the 256 routed experts across ranks instead
+            # of replicating per rank. Its model_type is registered, so AutoConfig /
+            # NeMoAutoModelForCausalLM resolve it directly (unlike DeepSeek V4). DSpark's
+            # forward-hook hidden-state capture needs one non-pipelined self.model(...)
+            # call, so pp_size must be 1 in the recipe's distributed: block; use a larger
+            # ep_size instead of PP to shard the parameter memory.
+            target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+            n_reduced = _resolve_reduced_target_layers(
+                target_config.num_hidden_layers,
+                recipe_cfg.get("target_num_hidden_layers", None),
+            )
+            if n_reduced is not None:
+                logger.warning(
+                    "Reducing the GLM-5.2 target from %d to %d layers "
+                    "(target_num_hidden_layers): diagnostic/CI only, not a usable drafter.",
+                    target_config.num_hidden_layers,
+                    n_reduced,
+                )
+                target_config.num_hidden_layers = n_reduced
+            architectures = getattr(target_config, "architectures", None) or ["GlmMoeDsaForCausalLM"]
+            if self.device.type != "cuda":
+                raise RuntimeError(
+                    "GLM-5.2 DSpark target training requires CUDA: the target is loaded "
+                    "with the expert-parallel / FSDP distributed path."
+                )
+            self.distributed_setup = create_distributed_setup_from_config(
+                self.cfg,
+                world_size=self.dist_env.world_size,
+            )
+            backend = self._build_glm_5_2_backend(recipe_cfg)
+            self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
+                target_path,
+                trust_remote_code=trust_remote_code,
+                torch_dtype=self.compute_dtype,
+                distributed_setup=self.distributed_setup,
+                backend=backend,
             )
             # A distributed-setup-loaded model already lands correctly placed
             # (sharded as DTensors); a blanket .to(device) afterward is redundant.
@@ -508,17 +553,17 @@ class TrainDSparkRecipe(BaseRecipe):
                 )
 
         # The Qwen3 / Gemma4 drafts consume a flex_attention BlockMask during training.
-        # The DeepSeek V4 draft instead consumes a dense additive mask (the DFlash SDPA
-        # path), so it is exempt from the flex_attention requirement.
+        # The DeepSeek V4 and GLM-5.2 drafts instead consume a dense additive mask
+        # (the DFlash SDPA path), so they are exempt from the flex_attention requirement.
         attention_backend = recipe_cfg.get("attention_backend", "flex_attention")
-        if not is_deepseek_v4_target and attention_backend != "flex_attention":
+        if not (is_deepseek_v4_target or is_glm_5_2_target) and attention_backend != "flex_attention":
             raise ValueError(f"DSpark training requires attention_backend='flex_attention', got {attention_backend!r}.")
         confidence_head_alpha = float(recipe_cfg.get("confidence_head_alpha", 1.0))
         markov_rank = int(recipe_cfg.get("markov_rank", 256))
 
-        if is_deepseek_v4_target or is_gemma4_target or is_minimax_m3_target:
-            # Gemma4, DeepSeek V4, and MiniMax M3 drafts share one typed draft-config
-            # builder that takes the same DSpark model-args bundle.
+        if is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_minimax_m3_target:
+            # Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 drafts share one typed
+            # draft-config builder that takes the same DSpark model-args bundle.
             margs = _DraftArgs(
                 num_draft_layers=draft_num_hidden_layers,
                 target_layer_ids=target_layer_ids,
@@ -534,6 +579,11 @@ class TrainDSparkRecipe(BaseRecipe):
                 # The V4 draft is always dense and fixes _attn_implementation to "sdpa"
                 # inside the builder, so it is not overridden by attention_backend.
                 draft_config_obj = build_deepseek_v4_draft_config(target_config, margs)
+                draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
+            elif is_glm_5_2_target:
+                # The GLM draft is always dense and fixes _attn_implementation to "sdpa"
+                # inside the builder, so it is not overridden by attention_backend.
+                draft_config_obj = build_glm_5_2_draft_config(target_config, margs)
                 draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
             elif is_minimax_m3_target:
                 # MiniMax M3 draft is built from the target's text sub-config (text_config).
@@ -575,8 +625,8 @@ class TrainDSparkRecipe(BaseRecipe):
         # training only the backbone, fc, Markov head, and confidence head.
         embed_src = self.target_wrapper.get_input_embeddings()
         head_src = self.target_wrapper.get_output_embeddings()
-        if is_deepseek_v4_target or is_minimax_m3_target:
-            # The V4 / MiniMax M3 target's embed_tokens / lm_head are expert-parallel /
+        if is_deepseek_v4_target or is_glm_5_2_target or is_minimax_m3_target:
+            # The V4 / GLM / MiniMax M3 target's embed_tokens / lm_head are expert-parallel /
             # FSDP-sharded DTensors; gather them to full tensors before the draft copies them.
             embed_src = _gather_full_weight_module(embed_src)
             head_src = _gather_full_weight_module(head_src)
@@ -776,6 +826,33 @@ class TrainDSparkRecipe(BaseRecipe):
             rope_fusion=False,
             dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
             experts=str(recipe_cfg.get("target_experts", "torch_mm")),
+            enable_hf_state_dict_adapter=True,
+            enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
+        )
+
+    @staticmethod
+    def _build_glm_5_2_backend(recipe_cfg) -> BackendConfig:
+        """Build the GLM-5.2 target BackendConfig (mirrors the GLM finetune recipe).
+
+        Dense linears and fp32 RMSNorm on torch, an fp32 router gate (the GLM/DeepSeek-V3
+        top-k routing is fp32 for stability), the grouped-expert GEMM, the hybrid-EP token
+        dispatcher, and the HF state-dict adapter that maps (and dequantizes, when the base
+        checkpoint is FP8) the HF weights on load. The target is frozen / forward-only, so
+        SDPA attention is used by default (the DSA indexer emits an additive float bias that
+        SDPA's explicit-mask path accepts); ``target_attn_backend=tilelang`` switches to the
+        fused sparse kernels when a TileLang build is available.
+        """
+        return BackendConfig(
+            attn=str(recipe_cfg.get("target_attn_backend", "sdpa")),
+            # The target is frozen / forward-only, so plain torch linears (which also keep
+            # embed_tokens / lm_head as plain-shaped weights) are used, matching the V4 /
+            # MiniMax M3 frozen-target backends.
+            linear="torch",
+            rms_norm="torch_fp32",
+            rope_fusion=False,
+            gate_precision="float32",
+            dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
+            experts=str(recipe_cfg.get("target_experts", "gmm")),
             enable_hf_state_dict_adapter=True,
             enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
         )
