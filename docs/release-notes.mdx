@@ -160,6 +160,9 @@ description: ""
   MoE, single-GPU runs, and `torch.compile`.
 - **Memory-efficient LoRA:** `use_memory_efficient_lora` reduces adapter
   training memory requirements.
+- **Dion-family optimizers:** Typed recipe configurations for Dion, Dion2,
+  Muon, and NorMuon, plus a Qwen2.5-7B Muon fine-tuning recipe and corrected
+  FSDP mesh alignment.
 - **Qwen3.5/3.6 VLM context parallelism:** Image/video embeddings and mRoPE
   positions are prepared before sequence sharding; the dense sequence index is
   passed to linear attention, with a CP-aware validation denominator.
