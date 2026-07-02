@@ -38,7 +38,7 @@ use the smoke runner (it derives a temporary config with only 6 target layers).
 - **HybridEP** (or DeepEP) installed. The GLM MoE token dispatcher requires it; without it
   `setup()` raises `ImportError: HybridEP is not installed`.
 - For full training: multiple nodes of 8 x >= 80 GiB GPUs (see above). For the smoke: a
-  single 8 x >= 80 GiB node (the target is reduced to 4 layers).
+  single 8 x >= 80 GiB node (the target is reduced to 6 layers).
 - A local GLM-5.2 checkpoint (or the hub id `zai-org/GLM-5.2`). The published config's
   `head_dim: 192` clobbers `qk_rope_head_dim` on load (the HF `attribute_map` maps
   `head_dim -> qk_rope_head_dim`), which would fail checkpoint shape validation; the
