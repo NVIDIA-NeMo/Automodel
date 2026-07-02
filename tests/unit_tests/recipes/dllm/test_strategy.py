@@ -401,6 +401,8 @@ def test_dflash_setup_extra_resolves_fake_target_and_config(monkeypatch):
                 "overlap_anchors": False,
                 "use_fused_linear_ce": False,
                 "ce_chunk_size": 17,
+                "loss_type": "dpace",
+                "dpace_alpha": 0.25,
             },
             "dataset": {"seq_length": 128},
         },
@@ -430,6 +432,8 @@ def test_dflash_setup_extra_resolves_fake_target_and_config(monkeypatch):
     assert isinstance(strategy.dflash_loss_fn, DFlashDecayLoss)
     assert strategy.dflash_loss_fn.loss_gamma == 4.0
     assert strategy.dflash_loss_fn.chunk_size == 17
+    assert strategy.dflash_loss_fn.loss_type == "dpace"
+    assert strategy.dflash_loss_fn.dpace_alpha == 0.25
 
 
 def test_dflash_setup_extra_requires_target_model_id():

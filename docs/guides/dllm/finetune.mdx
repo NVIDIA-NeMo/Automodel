@@ -11,9 +11,9 @@ This approach enables **parallel token generation** and **bidirectional attentio
 
 NeMo AutoModel currently supports the following dLLM model families:
 
-- **LLaDA / LLaDA2 (MDLM)** — Bidirectional masked diffusion. The model receives corrupted tokens and predicts the clean token at each masked position (see [LLaDA2 paper](https://arxiv.org/abs/2602.08676)).
-- **Nemotron-Labs-Diffusion (Hybrid)** — Combines diffusion with an autoregressive loss. During training, the model processes clean tokens plus a `masked_indices` sidecar and learns both a diffusion objective and an AR objective simultaneously.
-- **DFlash** — Speculative block diffusion. A small draft model proposes tokens for a block conditioned on frozen target LM hidden states; a decay-weighted loss trains it to predict the target's distribution (see [DFlash paper](https://arxiv.org/abs/2602.06036)).
+- **LLaDA/LLaDA2 (MDLM):** Bidirectional masked diffusion. The model receives corrupted tokens and predicts the clean token at each masked position (see [LLaDA2 paper](https://arxiv.org/abs/2602.08676)).
+- **Nemotron-Labs-Diffusion (Hybrid):** Combines diffusion with an autoregressive loss. During training, the model processes clean tokens plus a `masked_indices` sidecar and learns both a diffusion objective and an AR objective simultaneously.
+- **DFlash:** Speculative block diffusion. A small draft model proposes tokens for a block conditioned on frozen target LM hidden states; a decay-weighted loss trains it to predict the target's distribution (see [DFlash paper](https://arxiv.org/abs/2602.06036)).
 
 ### Workflow Overview
 
@@ -60,8 +60,8 @@ For the full set of installation methods, see the [installation guide](/get-star
 
 dLLM fine-tuning is driven by:
 
-1. A **recipe script** ([`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/dllm/train_ft.py)) — orchestrates the training loop with dLLM-specific corruption, loss, and batch handling.
-2. A **YAML configuration file** — specifies the model, data, optimizer, dLLM-specific settings, and distributed training strategy.
+1. A **recipe script** ([`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/dllm/train_ft.py)) that orchestrates the training loop with dLLM-specific corruption, loss, and batch handling.
+2. A **YAML configuration file** that specifies the model, data, optimizer, dLLM-specific settings, and distributed training strategy.
 
 The recipe uses a **strategy pattern** to handle differences between model families. The `dllm.mode` field in the YAML selects the strategy:
 
@@ -153,6 +153,8 @@ dflash:
   num_blocks_per_sample: 512                    # Paper default (Appendix A.1)
   attention_backend: flex_attention             # required for N > ~64; sdpa OOMs
   overlap_anchors: true                         # paper samples anchors independently
+  loss_type: dflash                             # dflash | dpace | dpace-cumulative-confidence-only | dpace-continuation-value-only
+  dpace_alpha: 0.5                              # smoothing alpha for the D-PACE variants
 ```
 
 | Field | Description |
@@ -163,6 +165,14 @@ dflash:
 | `dflash.num_blocks_per_sample` | Number of anchor blocks processed per sequence per step (paper default: 512, Appendix A.1) |
 | `dflash.attention_backend` | `flex_attention` (sparse, scales to 512 anchors) or `sdpa` (dense, OOMs above ~64). Default `sdpa` for backward compat — set to `flex_attention` for production runs |
 | `dflash.overlap_anchors` | `true` (paper, independent sampling) or `false` (non-overlapping stars-and-bars, caps at `seq_len // block_size`) |
+| `dflash.loss_type` | `dflash` (decay-weighted CE, default) or a D-PACE variant: `dpace`, `dpace-cumulative-confidence-only`, `dpace-continuation-value-only` (detached confidence-aware weights) |
+| `dflash.dpace_alpha` | Smoothing α in `[0, 1]` for the D-PACE confidence products; ignored when `loss_type: dflash` |
+
+<Note>
+The `dpace*` variants implement D-PACE (Dynamic Position-Aware Cross-Entropy),
+which reweights each position by detached cumulative draft confidence; see
+[arXiv:2605.18810](https://arxiv.org/abs/2605.18810).
+</Note>
 
 #### DFlash Training Metrics
 
@@ -171,8 +181,8 @@ In addition to the shared metrics (`loss`, `grad_norm`, `lr`, `mem`, `tps`,
 
 | Metric | Meaning | Where |
 |--------|---------|-------|
-| `draft_acc` | Overall fraction of valid block positions where `argmax(draft_logits) == target_token` | Console line + wandb / mlflow / comet + file logger |
-| `draft_acc_k{k}` | Same fraction restricted to block offset `k` (`k = 1..block_size-1`) — the acceptance-length curve | wandb / mlflow / comet + file logger (one panel per offset); intentionally omitted from the console line to keep it readable |
+| `draft_acc` | Overall fraction of valid block positions where `argmax(draft_logits) == target_token` | Console line and wandb / mlflow / comet and file logger |
+| `draft_acc_k{k}` | Same fraction restricted to block offset `k` (`k = 1..block_size-1`), the acceptance-length curve | wandb / mlflow / comet and file logger (one panel per offset); intentionally omitted from the console line to keep it readable |
 
 Both are computed for free inside the chunked linear-CE path (same logits used
 for the loss) and DP/CP-reduced via per-rank raw `(correct, count)` sums that
@@ -219,6 +229,7 @@ Then point the recipe's `dataset.path_or_dataset_id` at the regenerated
 parquet shards (`/data/dflash-train-regen`) instead of the raw HF dataset.
 
 ## Fine-Tune the Model
+Run the following commands to launch fine-tuning for each supported model family.
 
 ### Fine-Tune LLaDA2
 

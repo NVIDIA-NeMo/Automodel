@@ -320,6 +320,102 @@ class TestDFlashDecayLoss:
 
         assert not torch.allclose(loss_fast, loss_slow, atol=1e-3)
 
+    def test_invalid_loss_type_raises(self):
+        with pytest.raises(ValueError, match="loss_type must be"):
+            DFlashDecayLoss(loss_type="bogus")
+
+    def test_invalid_dpace_alpha_raises(self):
+        with pytest.raises(ValueError, match="dpace_alpha must be"):
+            DFlashDecayLoss(loss_type="dpace", dpace_alpha=1.5)
+
+    def test_dpace_raises_when_block_size_does_not_partition(self):
+        """D-PACE must reject a block_size that doesn't divide T -- cumprod would
+        run across blocks and underflow -- rather than silently mis-weight."""
+        loss_fn = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.5)
+        logits = torch.randn(1, 7, 9)  # T=7 is not a multiple of block_size-1=3
+        target_ids = torch.randint(0, 9, (1, 7))
+        block_mask = torch.ones(1, 7)
+        with pytest.raises(ValueError, match="multiple of"):
+            loss_fn(logits, target_ids, block_mask, block_size=4)
+
+    @pytest.mark.parametrize(
+        "loss_type",
+        ["dpace", "dpace-cumulative-confidence-only", "dpace-continuation-value-only"],
+    )
+    def test_dpace_matches_reference_with_block_reset(self, loss_type):
+        torch.manual_seed(13)
+        bsz, n, bs, vocab = 2, 3, 5, 17
+        t_per = bs - 1
+        logits = torch.randn(bsz, n * t_per, vocab)
+        target_ids = torch.randint(0, vocab, (bsz, n * t_per))
+        block_mask = (torch.rand(bsz, n * t_per) > 0.25).float()
+        alpha = 0.35
+
+        token_nll = F.cross_entropy(
+            logits.reshape(-1, vocab),
+            target_ids.reshape(-1),
+            reduction="none",
+        ).view(bsz, n, t_per)
+        mask = block_mask.view(bsz, n, t_per)
+        prob = torch.exp(-token_nll)
+        smooth = torch.where(mask > 0, (1.0 - alpha) * prob + alpha, torch.ones_like(prob))
+        prefix = torch.cumprod(smooth, dim=-1)
+        suffix = torch.flip(torch.cumsum(torch.flip(prefix * mask, dims=[-1]), dim=-1), dims=[-1])
+        if loss_type == "dpace-cumulative-confidence-only":
+            ref_weight = prefix
+        elif loss_type == "dpace-continuation-value-only":
+            ref_weight = suffix / prefix.clamp_min(torch.finfo(prefix.dtype).tiny)
+        else:
+            ref_weight = suffix
+        # normalize="mean" => weighted mean, so this validates the D-PACE weights
+        # independent of the token-count denominator.
+        expected = (token_nll * mask * ref_weight).sum() / ((mask * ref_weight).sum() + 1e-6)
+
+        got = DFlashDecayLoss(loss_type=loss_type, dpace_alpha=alpha, normalize="mean")(
+            logits,
+            target_ids,
+            block_mask,
+            block_size=bs,
+        ).total_loss
+
+        assert torch.isclose(expected, got, atol=1e-6)
+
+    def test_dpace_honors_num_tokens_not_batch_size(self):
+        """D-PACE must normalize by the global ``num_tokens`` (the default
+        ``normalize="tokens"``), like dflash — not the local batch size — so
+        ``loss_type`` stays orthogonal to the normalization denominator."""
+        torch.manual_seed(7)
+        bsz, n, bs, vocab = 2, 3, 5, 17
+        logits = torch.randn(bsz, n * (bs - 1), vocab)
+        target_ids = torch.randint(0, vocab, (bsz, n * (bs - 1)))
+        block_mask = torch.ones(bsz, n * (bs - 1))
+        loss_fn = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.5)  # normalize="tokens"
+
+        num_tokens = 37
+        scaled = loss_fn(logits, target_ids, block_mask, num_tokens=num_tokens, block_size=bs).total_loss
+        raw = loss_fn(logits, target_ids, block_mask, num_tokens=None, block_size=bs).total_loss
+        # Dividing by num_tokens (not bsz=2) scales the summed loss by 1/num_tokens.
+        assert torch.isclose(scaled * num_tokens, raw, atol=1e-5)
+
+    def test_dpace_alpha_changes_loss(self, dflash_inputs):
+        torch.manual_seed(19)
+        logits, target_ids, block_mask = dflash_inputs
+
+        low_alpha = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.1)(
+            logits,
+            target_ids,
+            block_mask,
+            block_size=4,
+        ).total_loss
+        high_alpha = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.9)(
+            logits,
+            target_ids,
+            block_mask,
+            block_size=4,
+        ).total_loss
+
+        assert not torch.allclose(low_alpha, high_alpha, atol=1e-4)
+
 
 class TestDFlashDraftAccuracy:
     """Per-position draft top-1 accuracy (correct, count) sums.
@@ -381,7 +477,11 @@ class TestDFlashDraftAccuracy:
         assert correct_per_pos is None
         assert count_per_pos is None
 
-    def test_fused_matches_nonfused(self):
+    @pytest.mark.parametrize(
+        "loss_type",
+        ["dflash", "dpace", "dpace-cumulative-confidence-only", "dpace-continuation-value-only"],
+    )
+    def test_fused_matches_nonfused(self, loss_type):
         """forward_fused and forward must agree on loss and per-position sums."""
         torch.manual_seed(3)
         B, N, bs, D, V = 2, 2, 4, 16, 32
@@ -391,7 +491,12 @@ class TestDFlashDraftAccuracy:
         bias = torch.randn(V)
         target_ids = torch.randint(0, V, (B, T))
         block_mask = torch.ones(B, T)
-        loss_fn = DFlashDecayLoss(loss_gamma=7.0, use_fused_linear_ce=True, chunk_size=4)
+        loss_fn = DFlashDecayLoss(
+            loss_gamma=7.0,
+            use_fused_linear_ce=True,
+            chunk_size=4,
+            loss_type=loss_type,
+        )
 
         logits = torch.nn.functional.linear(hidden, weight, bias)
         ref = loss_fn(logits, target_ids, block_mask, num_tokens=B * T, block_size=bs)
