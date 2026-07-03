@@ -31,6 +31,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 import nemo_automodel.recipes.llm.train_dflash as train_dflash
 from nemo_automodel.components.speculative.dflash.core import DFlashStepMetrics, DFlashTrainerModule, _to_full_tensor
+from nemo_automodel.components.speculative.dflash.domino_core import DominoStepMetrics, DominoTrainerModule
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
 
@@ -58,7 +59,7 @@ def single_rank_pg():
             dist.destroy_process_group()
 
 
-def _draft_model():
+def _draft_model(dflash_config_extra=None):
     cfg = Qwen3Config(
         vocab_size=VOCAB,
         hidden_size=HIDDEN,
@@ -75,8 +76,26 @@ def _draft_model():
     cfg.num_target_layers = NUM_TARGET_LAYERS
     cfg.block_size = BLOCK_SIZE
     cfg.dflash_config = {"mask_token_id": MASK_ID, "target_layer_ids": TARGET_LAYER_IDS}
+    if dflash_config_extra:
+        cfg.dflash_config.update(dflash_config_extra)
     cfg._attn_implementation = "sdpa"
     return Qwen3DFlashDraftModel(cfg)
+
+
+def _tp_target_modules():
+    """A column-parallel lm_head + vocab-parallel embed_tokens, both returning DTensors."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Replicate, Shard
+    from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
+
+    lm_head = nn.Linear(HIDDEN, VOCAB, bias=False)
+    embed = nn.Embedding(VOCAB, HIDDEN)
+    mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
+    parallelize_module(lm_head, mesh, ColwiseParallel(output_layouts=Shard(-1), use_local_output=False))
+    parallelize_module(
+        embed, mesh, RowwiseParallel(input_layouts=Replicate(), output_layouts=Replicate(), use_local_output=False)
+    )
+    return lm_head, embed
 
 
 # --------------------------------------------------------------------------- #
@@ -108,19 +127,9 @@ def test_trainer_runs_with_tensor_parallel_target(single_rank_pg):
     """A column-parallel lm_head and vocab-parallel embed_tokens return DTensors;
     the trainer must gather them, keep them non-registered (so DDP sees only the
     draft), run a finite forward, and flow gradients to the draft."""
-    from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.tensor import Replicate, Shard
-    from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
-
     torch.manual_seed(0)
     draft = _draft_model()
-    lm_head = nn.Linear(HIDDEN, VOCAB, bias=False)
-    embed = nn.Embedding(VOCAB, HIDDEN)
-    mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
-    parallelize_module(lm_head, mesh, ColwiseParallel(output_layouts=Shard(-1), use_local_output=False))
-    parallelize_module(
-        embed, mesh, RowwiseParallel(input_layouts=Replicate(), output_layouts=Replicate(), use_local_output=False)
-    )
+    lm_head, embed = _tp_target_modules()
 
     trainer = DFlashTrainerModule(
         draft_model=draft,
@@ -152,6 +161,57 @@ def test_trainer_runs_with_tensor_parallel_target(single_rank_pg):
     assert all(torch.isfinite(p.grad).all() for p in draft.parameters() if p.grad is not None)
     grad = sum(p.grad.abs().sum().item() for p in draft.parameters() if p.grad is not None)
     assert grad > 0
+
+
+@pytest.mark.parametrize("shift_label", [True, False])
+def test_domino_trainer_runs_with_tensor_parallel_target(single_rank_pg, shift_label):
+    """Regression: Domino used to consume the TP target's ``lm_head`` /
+    ``embed_tokens`` outputs without ``_to_full_tensor``, so the vocab-sharded
+    DTensors crashed the reshape / GRU / cross_entropy on the first step. Both
+    ``shift_label`` branches embed block tokens, so both are exercised."""
+    torch.manual_seed(0)
+    draft = _draft_model(
+        {
+            "projector_type": "domino",
+            "emb_dim": 16,
+            "gru_hidden_dim": 16,
+            "pure_draft_prefix_len": 1,
+            "shift_label": shift_label,
+        }
+    )
+    lm_head, embed = _tp_target_modules()
+
+    trainer = DominoTrainerModule(
+        draft_model=draft,
+        target_lm_head=lm_head,
+        target_embed_tokens=embed,
+        mask_token_id=MASK_ID,
+        block_size=BLOCK_SIZE,
+        attention_backend="sdpa",
+        num_anchors=8,
+        loss_decay_gamma=7.0,
+        shift_label=shift_label,
+    )
+
+    input_ids = torch.randint(0, VOCAB - 1, (2, 24))
+    hidden = torch.randn(2, 24, len(TARGET_LAYER_IDS) * HIDDEN)
+    loss_mask = torch.ones(2, 24)
+    # lambda_base=0.5 keeps both the corrected and the base CE in the loss, so
+    # gradients flow through the correction head and the backbone alike.
+    out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask, lambda_base=0.5)
+
+    assert isinstance(out, DominoStepMetrics)
+    assert torch.isfinite(out.loss) and out.loss.item() > 0
+
+    out.loss.backward()
+    assert all(torch.isfinite(p.grad).all() for p in draft.parameters() if p.grad is not None)
+    head_grad = sum(
+        p.grad.abs().sum().item()
+        for m in (draft.prefix_gru, draft.embed_proj)
+        for p in m.parameters()
+        if p.grad is not None
+    )
+    assert head_grad > 0
 
 
 # --------------------------------------------------------------------------- #
