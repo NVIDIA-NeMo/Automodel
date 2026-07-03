@@ -22,6 +22,7 @@ checkpoint-sized nested configs and optional GPU dependencies.
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 
 def test_bagel_imports() -> None:
@@ -59,3 +60,50 @@ def test_bagel_stage1_config_drops_generation_path() -> None:
 
     assert cfg.visual_gen is False
     assert cfg.text_config.layer_module == "Qwen2DecoderLayer"
+
+
+def test_bagel_config_forwards_fused_projection_override_to_text_config() -> None:
+    from nemo_automodel.components.models.bagel.configuration import BagelConfig
+
+    cfg = BagelConfig(fused_projections=True)
+
+    assert cfg.fused_projections is True
+    assert cfg.text_config.fused_projections is True
+    restored = BagelConfig.from_dict(cfg.to_dict())
+    assert restored.fused_projections is True
+    assert restored.text_config.fused_projections is True
+
+
+def test_bagel_from_pretrained_passes_config_to_projection_adapter(monkeypatch, tmp_path) -> None:
+    import nemo_automodel.components.models.bagel.model as bagel_model
+
+    config = SimpleNamespace(stage=None)
+    captured = {}
+
+    monkeypatch.setattr(
+        bagel_model.BagelConfig,
+        "from_pretrained",
+        classmethod(lambda cls, *args, **kwargs: config),
+    )
+    def _fake_init(self, cfg, backend=None):
+        self.config = cfg
+        captured["backend"] = backend
+
+    monkeypatch.setattr(bagel_model.BagelForUnifiedMultimodal, "__init__", _fake_init)
+    monkeypatch.setattr(
+        bagel_model.BagelForUnifiedMultimodal,
+        "load_state_dict",
+        lambda self, state_dict, strict: ([], []),
+    )
+
+    def _fake_load_checkpoint(*args, **kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(bagel_model, "load_bagel_checkpoint_state_dict", _fake_load_checkpoint)
+
+    backend = {"linear": "te"}
+    bagel_model.BagelForUnifiedMultimodal.from_pretrained(tmp_path, stage=2, backend=backend)
+
+    assert captured["config"] is config
+    assert captured["backend"] is backend

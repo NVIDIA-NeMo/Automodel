@@ -465,14 +465,22 @@ class Checkpointer:
 
         model_state = ModelState(model, self.config.is_peft)
         state_dict = model_state.state_dict()
+        state_dict_adapter = getattr(model_state.model[0], "state_dict_adapter", None)
+        use_native_checkpoint_layout = (
+            not should_write_consolidated
+            and callable(getattr(state_dict_adapter, "uses_native_checkpoint_layout", None))
+            and state_dict_adapter.uses_native_checkpoint_layout()
+        )
 
-        # Convert to HF format if using custom model implementations.
+        # Convert custom models to HF layout unless their adapter explicitly
+        # preserves a fused native layout for ordinary DCP checkpoint/resume.
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
             quantization=False,
             device_mesh=self.moe_mesh,
             v4_compatible=self.config.v4_compatible,
+            native_checkpoint=use_native_checkpoint_layout,
         )
         # MoE adapters return non-contiguous views; safetensors.save rejects those.
         _materialize_to_hf_views_for_save(state_dict)
@@ -714,6 +722,12 @@ class Checkpointer:
         storage_reader = self._get_storage_reader(
             model_path, reader_key_mapping, is_init_step=is_init_step, is_safetensors=is_safetensors
         )
+        state_dict_adapter = getattr(model_state.model[0], "state_dict_adapter", None)
+        use_native_checkpoint_layout = (
+            not is_init_step
+            and callable(getattr(state_dict_adapter, "uses_native_checkpoint_layout", None))
+            and state_dict_adapter.uses_native_checkpoint_layout()
+        )
 
         # MoE adapters return views into model storage; DCP writes safetensors
         # data straight through them and from_hf skips the rebuild.
@@ -722,6 +736,7 @@ class Checkpointer:
             state_dict,
             quantization=self.config.dequantize_base_checkpoint,
             device_mesh=self.moe_mesh,
+            native_checkpoint=use_native_checkpoint_layout,
         )
 
         compat_tied_lm_head_source_key: str | None = None
@@ -818,7 +833,12 @@ class Checkpointer:
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
-        state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
+        state_dict = _maybe_adapt_state_dict_from_hf(
+            model_state.model[0],
+            state_dict,
+            moe_mesh=self.moe_mesh,
+            native_checkpoint=use_native_checkpoint_layout,
+        )
         expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
         loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
         # MoE experts load in-place via strided views into model storage (DCP writes through
@@ -2270,7 +2290,10 @@ def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optio
 
 
 def _maybe_adapt_state_dict_from_hf(
-    model_part: nn.Module, state_dict: dict[str, torch.Tensor], moe_mesh: Optional[DeviceMesh] = None
+    model_part: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    moe_mesh: Optional[DeviceMesh] = None,
+    **kwargs,
 ) -> dict[str, torch.Tensor]:
     """
     Custom models use state dict adapters to convert the state dict from the Hugging Face format to the native format.
@@ -2279,5 +2302,5 @@ def _maybe_adapt_state_dict_from_hf(
     if adapter:
         ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
         ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh
-        return adapter.from_hf(state_dict, device_mesh=ep_mesh)
+        return adapter.from_hf(state_dict, device_mesh=ep_mesh, **kwargs)
     return state_dict

@@ -27,6 +27,15 @@ model:
   pretrained_model_name_or_path: ByteDance-Seed/BAGEL-7B-MoT
   torch_dtype: float32
   stage: 2
+  # BAGEL attention remains packed FlexAttention with unfused RoPE. Linear
+  # and RMSNorm modules can independently use torch or Transformer Engine.
+  backend:
+    attn: flex
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+  # Pack Q/K/V and gate/up weights into one projection per group.
+  fused_projections: false
   # Optional override. If omitted, the recipe uses ae.safetensors from the
   # local checkpoint directory or downloads it from the same HF repo. When
   # checkpointing is enabled, ae.safetensors is copied into each checkpoint

@@ -26,6 +26,16 @@ class StateDictAdapter(ABC):
     state dict format and other model state dict formats.
     """
 
+    def uses_native_checkpoint_layout(self) -> bool:
+        """Return whether ordinary DCP save/resume should bypass HF conversion.
+
+        Adapters with fused parameters may opt in when converting those
+        parameters would require a distributed redistribution. Explicit HF
+        export and base-checkpoint initialization still use ``to_hf`` and
+        ``from_hf``.
+        """
+        return False
+
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.

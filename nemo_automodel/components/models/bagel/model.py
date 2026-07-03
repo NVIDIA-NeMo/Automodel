@@ -38,6 +38,7 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
 from nemo_automodel.components.models.bagel.attention_masks import create_sparse_mask
+from nemo_automodel.components.models.bagel.backend import bagel_backend_summary, resolve_bagel_backend
 from nemo_automodel.components.models.bagel.configuration import BagelConfig
 from nemo_automodel.components.models.bagel.connector import BagelMultiModalProjector
 from nemo_automodel.components.models.bagel.embeddings import BagelGridPositionEmbedding, BagelTimestepEmbedding
@@ -53,11 +54,6 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 logger = logging.getLogger(__name__)
-
-
-def _default_bagel_backend() -> BackendConfig:
-    """Return the existing torch/FlexAttention BAGEL backend."""
-    return BackendConfig(attn="flex", linear="torch", rms_norm="torch_fp32", rope_fusion=False)
 
 
 def _stage_to_int(stage: Union[int, str]) -> int:
@@ -153,7 +149,7 @@ class BagelModel(nn.Module):
     def __init__(self, config: BagelConfig, backend: Optional[BackendConfig] = None) -> None:
         super().__init__()
         self.config = config
-        self.backend = backend or _default_bagel_backend()
+        self.backend = resolve_bagel_backend(backend)
 
         # Text backbone - always present.
         self.language_model = Qwen2ForCausalLM(config.text_config, backend=self.backend)
@@ -220,6 +216,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
     """
 
     config_class = BagelConfig
+    backend_config_resolver = staticmethod(resolve_bagel_backend)
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -234,7 +231,15 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         super().__init__()
         _prepare_config_for_stage(config)
         self.config = config
-        self.backend = backend or _default_bagel_backend()
+        self.backend = resolve_bagel_backend(backend)
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logger.info(
+                "Resolved BAGEL backend: %s",
+                bagel_backend_summary(
+                    self.backend,
+                    fused_projections=config.fused_projections,
+                ),
+            )
         self.model = BagelModel(config, backend=self.backend)
         _convert_patch_embedding_for_packed_vit(self.model, config)
 
@@ -325,7 +330,9 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
             strict: If ``True``, raise on state-dict keys that don't match the
                 adapter patterns. Defaults to ``False`` for compatibility with
                 checkpoint sidecar files.
-            **kwargs: Forwarded to ``BagelConfig.from_pretrained``.
+            **kwargs: Model overrides. ``backend`` is passed to the BAGEL model
+                constructor; the remaining values are forwarded to
+                ``BagelConfig.from_pretrained``.
 
         Returns:
             A fully-initialized ``BagelForUnifiedMultimodal`` with weights
@@ -334,13 +341,19 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         """
         path = pathlib.Path(pretrained_model_name_or_path)
 
+        backend = kwargs.pop("backend", None)
         cfg = BagelConfig.from_pretrained(str(path), **kwargs)
         cfg.stage = stage
         stage_int = _stage_to_int(stage)
 
-        model = cls(cfg)
+        model = cls(cfg, backend=backend)
 
-        sd = load_bagel_checkpoint_state_dict(str(path), stage=stage_int, strict=strict)
+        sd = load_bagel_checkpoint_state_dict(
+            str(path),
+            stage=stage_int,
+            strict=strict,
+            config=cfg,
+        )
         missing, unexpected = model.load_state_dict(sd, strict=False)
         if missing:
             # vit_pos_embed.pos_embed is frozen-init'd; missing keys are

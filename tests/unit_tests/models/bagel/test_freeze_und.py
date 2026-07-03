@@ -41,7 +41,7 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 
-def _build_layer(freeze_und: bool):
+def _build_layer(freeze_und: bool, fused_projections: bool):
     """Construct a tiny Qwen2MoTDecoderLayer in MoT mode."""
     from nemo_automodel.components.models.bagel.modeling_qwen2_packed import (
         Qwen2Config,
@@ -61,6 +61,7 @@ def _build_layer(freeze_und: bool):
         qk_norm=True,
         layer_module="Qwen2MoTDecoderLayer",
         freeze_und=freeze_und,
+        fused_projections=fused_projections,
     )
     # Run the whole layer in bf16 to match how it's used inside production
     # autocast (every weight is bf16, every input is bf16, every intermediate
@@ -95,7 +96,9 @@ def _build_packed_inputs(hidden_size: int, head_dim: int):
     # Use additive form with -inf above diagonal.
     def _causal(seq_len: int) -> torch.Tensor:
         m = torch.zeros(seq_len, seq_len, device=device, dtype=torch.bfloat16)
-        m.masked_fill_(torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=1), float("-inf"))
+        m.masked_fill_(
+            torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=1), float("-inf")
+        )
         return m
 
     attention_mask = [_causal(n_und), _causal(n_gen)]
@@ -123,8 +126,58 @@ def _classify(name: str) -> str:
     return "gen" if "moe_gen" in name else "und"
 
 
-def test_freeze_und_zeroes_und_path_grads():
-    cfg, layer = _build_layer(freeze_und=True)
+def _copy_split_layer_to_fused(split, fused) -> None:
+    split_params = dict(split.named_parameters())
+    fused_projection_parts = {
+        "self_attn.qkv_proj.weight": (
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+        ),
+        "self_attn.qkv_proj.bias": (
+            "self_attn.q_proj.bias",
+            "self_attn.k_proj.bias",
+            "self_attn.v_proj.bias",
+        ),
+        "self_attn.qkv_proj_moe_gen.weight": (
+            "self_attn.q_proj_moe_gen.weight",
+            "self_attn.k_proj_moe_gen.weight",
+            "self_attn.v_proj_moe_gen.weight",
+        ),
+        "self_attn.qkv_proj_moe_gen.bias": (
+            "self_attn.q_proj_moe_gen.bias",
+            "self_attn.k_proj_moe_gen.bias",
+            "self_attn.v_proj_moe_gen.bias",
+        ),
+        "mlp.gate_up_proj.weight": ("mlp.gate_proj.weight", "mlp.up_proj.weight"),
+        "mlp_moe_gen.gate_up_proj.weight": (
+            "mlp_moe_gen.gate_proj.weight",
+            "mlp_moe_gen.up_proj.weight",
+        ),
+    }
+    with torch.no_grad():
+        for name, fused_param in fused.named_parameters():
+            if name in fused_projection_parts:
+                fused_param.copy_(torch.cat([split_params[part] for part in fused_projection_parts[name]], dim=0))
+            else:
+                fused_param.copy_(split_params[name])
+
+
+def test_fused_mot_layer_matches_split_forward():
+    split_cfg, split = _build_layer(freeze_und=False, fused_projections=False)
+    _, fused = _build_layer(freeze_und=False, fused_projections=True)
+    _copy_split_layer_to_fused(split, fused)
+    inputs = _build_packed_inputs(split_cfg.hidden_size, split_cfg.hidden_size // split_cfg.num_attention_heads)
+
+    split_output = split(**inputs)
+    fused_output = fused(**inputs)
+
+    torch.testing.assert_close(fused_output, split_output, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("fused_projections", [False, True])
+def test_freeze_und_zeroes_und_path_grads(fused_projections):
+    cfg, layer = _build_layer(freeze_und=True, fused_projections=fused_projections)
     inputs = _build_packed_inputs(cfg.hidden_size, cfg.hidden_size // cfg.num_attention_heads)
     inputs["packed_sequence"] = inputs["packed_sequence"].clone().requires_grad_(True)
 
@@ -155,9 +208,10 @@ def test_freeze_und_zeroes_und_path_grads():
     assert nonzero_gen > 0, "no gen-path param received gradient — test setup is broken"
 
 
-def test_freeze_und_off_propagates_grads_to_und_path():
+@pytest.mark.parametrize("fused_projections", [False, True])
+def test_freeze_und_off_propagates_grads_to_und_path(fused_projections):
     """Control: with freeze_und=False, und-path params should receive gradient."""
-    cfg, layer = _build_layer(freeze_und=False)
+    cfg, layer = _build_layer(freeze_und=False, fused_projections=fused_projections)
     inputs = _build_packed_inputs(cfg.hidden_size, cfg.hidden_size // cfg.num_attention_heads)
     inputs["packed_sequence"] = inputs["packed_sequence"].clone().requires_grad_(True)
 

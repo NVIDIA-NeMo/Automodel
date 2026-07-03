@@ -116,6 +116,7 @@ class BagelConfig(PretrainedConfig):
         visual_und: bool = True,
         visual_gen: bool = False,
         stage: Union[int, str, None] = None,
+        fused_projections: Optional[bool] = None,
         llm_path: str = "",
         vit_path: str = "",
         vae_path: str = "",
@@ -145,6 +146,8 @@ class BagelConfig(PretrainedConfig):
             vision_config = vit_config
 
         self.text_config = _coerce_text_config(text_config)
+        if fused_projections is not None:
+            self.fused_projections = fused_projections
         self.vision_config = _coerce_vision_config(vision_config)
 
         # VAE config is a bare dict: it only carries the autoencoder
@@ -196,6 +199,15 @@ class BagelConfig(PretrainedConfig):
         self.text_config = value
 
     @property
+    def fused_projections(self) -> bool:
+        """Forward the recipe-level projection layout to the text config."""
+        return bool(getattr(self.text_config, "fused_projections", False))
+
+    @fused_projections.setter
+    def fused_projections(self, value: bool) -> None:
+        self.text_config.fused_projections = bool(value)
+
+    @property
     def vit_config(self) -> Optional[SiglipVisionConfig]:
         return self.vision_config
 
@@ -210,6 +222,7 @@ class BagelConfig(PretrainedConfig):
     def to_dict(self) -> Dict[str, Any]:
         output = super().to_dict()
         output.pop("_bagel_vit_select_layer_applied", None)
+        output["fused_projections"] = self.fused_projections
         output["text_config"] = self.text_config.to_dict() if self.text_config is not None else None
         output["vision_config"] = self.vision_config.to_dict() if self.vision_config is not None else None
         return output

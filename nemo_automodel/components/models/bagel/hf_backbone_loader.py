@@ -20,9 +20,12 @@ import gc
 import json
 import logging
 import pathlib
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 import torch
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.common import BackendConfig
 
 logger = logging.getLogger(__name__)
 
@@ -133,10 +136,10 @@ def _load_qwen_backbone_into_bagel(model, llm_path: str, *, copy_init_moe: bool)
     logger.info("Loading Qwen backbone from %s", llm_path)
     state_dict = _load_hf_state_dict(llm_path)
     if _uses_fused_qwen_projections(model.model.language_model):
-        from nemo_automodel.components.models.bagel.state_dict_adapter import _fuse_split_projections
+        from nemo_automodel.components.models.bagel.state_dict_adapter import fuse_qwen_split_projections
 
         before_count = len(state_dict)
-        _fuse_split_projections(state_dict)
+        fuse_qwen_split_projections(state_dict)
         logger.info(
             "HF-backbone Qwen projection fusion: %d -> %d tensor(s)",
             before_count,
@@ -238,7 +241,7 @@ def build_bagel_from_hf_backbones(
     vae_config: Dict[str, int] | None,
     meta_init: bool = False,
     load_backbone_weights: bool = True,
-    backend: Any = None,
+    backend: BackendConfig | None = None,
 ) -> torch.nn.Module:
     """Build BAGEL from upstream Qwen/SigLIP backbone configs."""
     from transformers import Qwen2Config
