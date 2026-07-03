@@ -212,6 +212,68 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
             module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
 
 
+def attach_cp_kv_gather_hooks(model: torch.nn.Module, cp_mesh) -> None:
+    """Context-parallel self-attention for a FROZEN (forward-only) target.
+
+    Torch's ``context_parallel`` ring dispatch does not fire for a plain HuggingFace
+    forward -- q/k/v reach ``F.scaled_dot_product_attention`` as ordinary local
+    tensors, so each rank silently attends only to its own sequence shard and every
+    position past the first shard is wrong. Because the target is frozen (no
+    backward through attention), the correct fix is simple: all-gather K/V across the
+    cp group and attend the local Q against the full K/V with a global causal mask.
+    The O(S^2) attention matrix stays sharded ``[S/cp, S]`` per rank (the memory
+    win); only the O(S) K/V is replicated.
+
+    Assumes contiguous (non-load-balanced) sharding -- rank ``r`` holds global
+    positions ``[r*S_local, (r+1)*S_local)`` -- which is what :func:`make_target_cp_ctx`
+    produces (it disables load balancing). Q/K/V are ``[B, nH, S_local, D]`` at the
+    SDPA call, so the sequence dim is 2.
+    """
+    import torch.nn.functional as F_module
+
+    _original_sdpa = F_module.scaled_dot_product_attention
+    group = cp_mesh.get_group()
+    cp_size = cp_mesh.size()
+    cp_rank = torch.distributed.get_rank(group=group)
+
+    @torch._dynamo.disable
+    def _cp_gather_sdpa(
+        query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, **kwargs
+    ):
+        seq_local = query.shape[2]
+        key = key.contiguous()
+        value = value.contiguous()
+        k_parts = [torch.empty_like(key) for _ in range(cp_size)]
+        v_parts = [torch.empty_like(value) for _ in range(cp_size)]
+        torch.distributed.all_gather(k_parts, key, group=group)
+        torch.distributed.all_gather(v_parts, value, group=group)
+        k_full = torch.cat(k_parts, dim=2)
+        v_full = torch.cat(v_parts, dim=2)
+        # Global causal mask: local query at global position ``cp_rank*seq_local + i``
+        # attends to every key position ``j`` up to and including it.
+        q_pos = torch.arange(seq_local, device=query.device) + cp_rank * seq_local
+        k_pos = torch.arange(k_full.shape[2], device=query.device)
+        mask = q_pos[:, None] >= k_pos[None, :]
+        return _original_sdpa(
+            query, k_full, v_full, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=enable_gqa
+        )
+
+    def _pre_hook(module, args, kwargs):
+        F_module.scaled_dot_product_attention = _cp_gather_sdpa
+        return args, kwargs
+
+    def _post_hook(module, inputs, output):
+        F_module.scaled_dot_product_attention = _original_sdpa
+
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+    for name, module in model.named_modules():
+        if name.endswith("self_attn"):
+            target = module._checkpoint_wrapped_module if isinstance(module, CheckpointWrapper) else module
+            target.register_forward_pre_hook(_pre_hook, with_kwargs=True)
+            target.register_forward_hook(_post_hook, always_call=True)
+
+
 def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
     """Inject CP-aware SDPA into self_attn modules for compile + CP>1 correctness.
 

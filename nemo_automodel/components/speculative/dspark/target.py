@@ -65,9 +65,16 @@ class HFDSparkTargetModel:
         self.cp_mesh = cp_mesh
         self._cp_size = cp_mesh.size() if cp_mesh is not None else 1
         if self._cp_size > 1:
-            from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+            from nemo_automodel.components.distributed.cp_utils import (
+                attach_context_parallel_hooks,
+                attach_cp_kv_gather_hooks,
+            )
 
+            # Strip the 4D mask (self_attn then calls SDPA on the local shard), and
+            # all-gather K/V so each rank attends its local Q against the full sequence
+            # -- torch's ring dispatch does not fire for a plain HF forward.
             attach_context_parallel_hooks(self.model)
+            attach_cp_kv_gather_hooks(self.model, cp_mesh)
 
     def _inner_model(self) -> nn.Module:
         """Return the base transformer module that owns ``layers`` and ``norm``.
