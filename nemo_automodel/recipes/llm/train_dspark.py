@@ -72,8 +72,6 @@ from nemo_automodel.components.speculative.dspark.config import (
     build_minimax_m3_draft_config,
 )
 from nemo_automodel.components.speculative.dspark.core import DSparkTrainerModule
-from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSparkModel
-from nemo_automodel.components.speculative.dspark.draft_minimax_m3 import MiniMaxM3DSparkModel
 from nemo_automodel.components.speculative.dspark.registry import (
     build_target_layer_ids,
     resolve_dspark_draft_spec,
@@ -410,7 +408,9 @@ class TrainDSparkRecipe(BaseRecipe):
                 )
                 target_config.text_config.num_hidden_layers = n_reduced
                 target_text_overrides["num_hidden_layers"] = n_reduced
-            architectures = getattr(target_config, "architectures", []) or []
+            architectures = list(
+                getattr(target_config, "architectures", None) or ["MiniMaxM3SparseForConditionalGeneration"]
+            )
             self.distributed_setup = create_distributed_setup_from_config(
                 self.cfg,
                 world_size=self.dist_env.world_size,
@@ -573,22 +573,18 @@ class TrainDSparkRecipe(BaseRecipe):
                 # The V4 draft is always dense and fixes _attn_implementation to "sdpa"
                 # inside the builder, so it is not overridden by attention_backend.
                 draft_config_obj = build_deepseek_v4_draft_config(target_config, margs)
-                draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
             elif is_glm_5_2_target:
                 # The GLM draft is always dense and fixes _attn_implementation to "sdpa"
                 # inside the builder, so it is not overridden by attention_backend.
                 draft_config_obj = build_glm_5_2_draft_config(target_config, margs)
-                draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
             elif is_minimax_m3_target:
                 # MiniMax M3 draft is built from the target's text sub-config (text_config).
                 draft_config_obj = build_minimax_m3_draft_config(target_config, margs)
                 draft_config_obj._attn_implementation = attention_backend
-                draft_cls = MiniMaxM3DSparkModel
             else:
                 # Gemma4 draft is built from the target's text sub-config (text_config).
                 draft_config_obj = build_gemma4_draft_config(target_config, margs)
                 draft_config_obj._attn_implementation = attention_backend
-                draft_cls = Gemma4DSparkModel
         else:
             # Qwen3-style draft: a small non-causal stack reusing the target's
             # architecture defaults plus the DSpark-specific fields.
@@ -612,8 +608,8 @@ class TrainDSparkRecipe(BaseRecipe):
             draft_config["tie_word_embeddings"] = False
             draft_config_obj = Qwen3Config.from_dict(draft_config)
             draft_config_obj._attn_implementation = attention_backend
-            draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
 
+        draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
         self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
 
         # training only the backbone, fc, Markov head, and confidence head.
