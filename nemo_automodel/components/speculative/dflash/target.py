@@ -52,13 +52,35 @@ class HFDFlashTargetModel:
     -- matching SpecForge's ``extract_context_feature`` (offset 1).
     """
 
-    def __init__(self, model: nn.Module, target_layer_ids: Sequence[int], capture_logits: bool = False):
+    def __init__(
+        self,
+        model: nn.Module,
+        target_layer_ids: Sequence[int],
+        capture_logits: bool = False,
+        cp_mesh=None,
+    ):
         self.model = model.eval()
         self.target_layer_ids = self._validate_layer_ids(target_layer_ids)
         # JetSpec's forward-KL distillation needs the teacher's full-vocab logits.
         # The target forward already computes them (HF returns ``.logits``); keep a
         # reference rather than recomputing. DFlash leaves this off (hard-label CE).
         self.capture_logits = bool(capture_logits)
+        # Context parallelism shards the frozen target forward along the sequence
+        # dim; generate_batch gathers the captured layers (and logits) back to the
+        # full sequence so the draft -- whose block attention mask can't be
+        # sequence-sharded -- stays CP-unaware. cp_mesh is the "cp" submesh (or None).
+        self.cp_mesh = cp_mesh
+        self._cp_size = cp_mesh.size() if cp_mesh is not None else 1
+        if self._cp_size > 1:
+            from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+
+            attach_context_parallel_hooks(self.model)
+
+    def _check_captured(self, captured: dict[int, torch.Tensor]) -> None:
+        if len(captured) != len(self.target_layer_ids):
+            raise RuntimeError(
+                f"Expected {len(self.target_layer_ids)} captured layers but got {len(captured)}: {sorted(captured)}"
+            )
 
     def _validate_layer_ids(self, target_layer_ids: Sequence[int]) -> list[int]:
         num_layers = self.model.config.num_hidden_layers
@@ -113,23 +135,46 @@ class HFDFlashTargetModel:
         extra_kwargs = {
             name: False for name in ("output_hidden_states", "output_attentions", "use_cache") if name in forward_params
         }
+        order = list(self.target_layer_ids)
         try:
-            output = self.model(input_ids=input_ids, attention_mask=attention_mask, **extra_kwargs)
+            if self._cp_size > 1:
+                # Shard the sequence, run the target as ring attention, then gather the
+                # captured layers (and logits) back to the full sequence. The self_attn
+                # hooks strip the mask and force is_causal, so attention_mask is None.
+                from nemo_automodel.components.distributed.cp_utils import gather_cp_seq, make_target_cp_ctx
+
+                if "position_ids" not in forward_params:
+                    raise ValueError(
+                        "Context parallelism requires the target model's forward to accept `position_ids`."
+                    )
+                cp_ctx, cp_input_ids, cp_position_ids, orig_len = make_target_cp_ctx(self.cp_mesh, input_ids)
+                with cp_ctx:
+                    output = self.model(
+                        input_ids=cp_input_ids,
+                        attention_mask=None,
+                        position_ids=cp_position_ids,
+                        **extra_kwargs,
+                    )
+                    self._check_captured(captured)
+                    to_gather = [captured[layer_id] for layer_id in order]
+                    if self.capture_logits:
+                        to_gather.append(getattr(output, "logits", output))
+                    gathered = gather_cp_seq(self.cp_mesh, to_gather, seq_dim=1, orig_len=orig_len)
+                for i, layer_id in enumerate(order):
+                    captured[layer_id] = gathered[i]
+                logits = gathered[-1] if self.capture_logits else None
+            else:
+                output = self.model(input_ids=input_ids, attention_mask=attention_mask, **extra_kwargs)
+                self._check_captured(captured)
+                # The target forward already computed the LM-head logits; keep them only
+                # when a distillation trainer (JetSpec) asked for the teacher distribution.
+                # ``getattr`` handles both HF outputs (``.logits``) and bare-tensor returns.
+                logits = getattr(output, "logits", output) if self.capture_logits else None
         finally:
             for handle in handles:
                 handle.remove()
 
-        if len(captured) != len(self.target_layer_ids):
-            raise RuntimeError(
-                f"Expected {len(self.target_layer_ids)} captured layers but got {len(captured)}: {sorted(captured)}"
-            )
-
-        # The target forward already computed the LM-head logits; keep them only
-        # when a distillation trainer (JetSpec) asked for the teacher distribution.
-        # ``getattr`` handles both HF outputs (``.logits``) and bare-tensor returns.
-        logits = getattr(output, "logits", output) if self.capture_logits else None
-
-        hidden_states = torch.cat([captured[layer_id] for layer_id in self.target_layer_ids], dim=-1)
+        hidden_states = torch.cat([captured[layer_id] for layer_id in order], dim=-1)
         return DFlashTargetBatch(
             hidden_states=hidden_states,
             input_ids=input_ids,

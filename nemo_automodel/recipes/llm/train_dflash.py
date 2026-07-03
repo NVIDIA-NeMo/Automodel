@@ -289,11 +289,26 @@ class TrainDFlashRecipe(BaseRecipe):
         self.dist_setup = None
         self.device_mesh = None
         self.dp_mesh = None
+        # The target forward runs CP on "cp" (long-context memory relief); the draft,
+        # dataloader sampler, and checkpointer key on "dp" (which excludes cp/tp, so
+        # cp ranks in a dp group share data and draft weights). None without a mesh.
+        self.cp_mesh = None
         if self.cfg.get("distributed", None) is not None:
             self.dist_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
             self.device_mesh = self.dist_setup.mesh_context.device_mesh
             self.dp_mesh = _submesh_or_none(self.device_mesh, "dp")
+            self.cp_mesh = _submesh_or_none(self.device_mesh, "cp")
             target_kwargs["distributed_setup"] = self.dist_setup
+            # CP gathers the target's captured layers back to the full sequence; that
+            # gather does not yet handle a TP-sharded (DTensor) sequence, so the two
+            # can't be combined. TP alone (draft replicated over "dp") is fine.
+            cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+            if cp_size > 1 and int(self.cfg.get("distributed.tp_size", 1) or 1) > 1:
+                raise NotImplementedError(
+                    "Context parallelism (cp_size>1) combined with tensor parallelism (tp_size>1) is not "
+                    "yet supported for DFlash; the CP sequence gather does not handle a TP-sharded target "
+                    "output. Set tp_size=1 or cp_size=1."
+                )
         target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         if self.dist_setup is None:
             # ``nn.Module.to`` is in-place; the sharded path is already placed by
@@ -321,7 +336,7 @@ class TrainDFlashRecipe(BaseRecipe):
         Subclasses override to capture extra teacher signals (e.g. JetSpec also
         captures the target logits for its forward-KL distillation).
         """
-        return HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids)
+        return HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids, cp_mesh=self.cp_mesh)
 
     def _build_dflash_config(self, recipe_cfg, target_layer_ids: list[int]) -> dict:
         """Build the draft ``dflash_config`` block. Subclasses extend it (e.g. Domino)."""

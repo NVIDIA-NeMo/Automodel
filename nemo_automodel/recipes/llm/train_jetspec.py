@@ -48,7 +48,9 @@ class TrainJetSpecRecipe(TrainDFlashRecipe):
 
     def _build_target_wrapper(self, target_layer_ids: list[int]) -> HFDFlashTargetModel:
         """Capture the target's full-vocab logits too -- JetSpec distills against them."""
-        return HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids, capture_logits=True)
+        return HFDFlashTargetModel(
+            self.target_model, target_layer_ids=target_layer_ids, capture_logits=True, cp_mesh=self.cp_mesh
+        )
 
     def _build_trainer_module(self, attention_backend: str, recipe_cfg):
         """Build the JetSpec trainer wrapper (causal parallel drafting + forward-KL)."""
