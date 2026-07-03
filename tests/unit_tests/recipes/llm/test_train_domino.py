@@ -110,6 +110,22 @@ def test_build_trainer_module_is_domino():
     assert module.shift_label is True
 
 
+def test_build_trainer_module_defaults_loss_decay_gamma_to_paper_value():
+    """Regression: an unset ``loss_decay_gamma`` used to fall back to ``None``
+    (uniform weighting, decay silently disabled) instead of the paper default
+    (Appendix A.1, matching ``DFlashDecayLoss``'s own default of 7.0)."""
+    recipe = _recipe()
+    recipe.draft_model = _domino_draft(shift_label=True)
+    recipe.mask_token_id = MASK_ID
+    recipe.block_size = BLOCK_SIZE
+    recipe.target_model = SimpleNamespace(
+        get_output_embeddings=lambda: torch.nn.Linear(HIDDEN, VOCAB, bias=False),
+        get_input_embeddings=lambda: torch.nn.Embedding(VOCAB, HIDDEN),
+    )
+    module = recipe._build_trainer_module("sdpa", {})
+    assert module.loss_decay_gamma == 7.0
+
+
 def test_run_trainer_step_injects_lambda_base():
     recipe = _recipe()
     recipe.runtime = SimpleNamespace(global_step=50)
