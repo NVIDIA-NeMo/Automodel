@@ -260,6 +260,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # T x T causal block (Eagle3LlamaAttention merges FA's softmax_lse
         # with the diagonal-extension columns in log space).
         draft_config["attn_implementation"] = recipe_cfg.get("draft_attn_implementation", "eager")
+        # EAGLE-3.1 drafter-side toggles. ``fc_norm`` adds one RMSNorm per aux
+        # hidden-state chunk before ``model.fc``; ``norm_output`` routes the
+        # post-``norm`` hidden state into ``compute_logits``. The draft reads
+        # both from its config (default False), so they must be copied from
+        # ``recipe_args`` into the draft config -- and thereby serialized into
+        # the draft ``config.json`` -- for the flags to take effect at train
+        # and serve time alike.
+        draft_config["fc_norm"] = bool(recipe_cfg.get("fc_norm", False))
+        draft_config["norm_output"] = bool(recipe_cfg.get("norm_output", False))
         # P-EAGLE (parallel drafting). When enabled, the draft registers a
         # learnable ``mask_hidden`` placeholder and the trainer predicts all
         # ``num_depths`` draft tokens in a single COD-subsampled parallel forward
