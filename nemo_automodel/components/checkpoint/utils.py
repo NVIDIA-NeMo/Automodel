@@ -224,7 +224,7 @@ def reject_unsupported_untied_word_embeddings(config: object, model_class_name: 
         model_class_name: ``type(self).__name__`` of the constructing model.
 
     Raises:
-        NotImplementedError: if the controlling ``tie_word_embeddings`` flag is unset.
+        NotImplementedError: if the controlling ``tie_word_embeddings`` flag evaluates to ``False``.
     """
     if not get_controlling_tie_word_embeddings(config, model_class_name):
         raise NotImplementedError(
