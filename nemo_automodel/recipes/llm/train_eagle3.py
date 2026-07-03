@@ -875,6 +875,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         train_loss: float | None = None,
         val_loss: dict[str, float] | None = None,
         best_metric_key: str = "default",
+        is_final_checkpoint: bool = False,
     ) -> None:
         """Persist draft model, optimizer, scheduler, RNG, and EAGLE-3 meta.
 
@@ -882,6 +883,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         ``nn.Module`` attributes (frozen target, target wrapper, trainer module wrapping
         the draft) — only ``draft_model`` should be persisted as the main model. The
         EAGLE-3 vocab mapping tensors ride along through ``_save_extra_state``.
+
+        ``is_final_checkpoint`` is computed by the caller (this hand-rolled loop
+        has no ``step_scheduler`` for the checkpointer to infer it from);
+        ``save_consolidated: final`` exports HF safetensors only when it is True.
         """
         checkpointer = getattr(self, "checkpointer", None)
         if checkpointer is None or not checkpointer.config.enabled:
@@ -929,8 +934,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if is_dist_initialized:
             dist.barrier()
 
-        step_scheduler = getattr(self, "step_scheduler", None)
-        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
         draft_model = self._module().draft_model
         self.checkpointer.save_model(
             draft_model,
@@ -980,12 +983,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         every = getattr(self, "ckpt_every_steps", None)
         if every is None or every <= 0 or self.runtime.global_step % every != 0:
             return False
+        total_optim_steps = getattr(self, "total_optim_steps", None)
+        is_final_checkpoint = total_optim_steps is not None and self.runtime.global_step >= total_optim_steps
         self.save_checkpoint(
             epoch=epoch,
             step=self.runtime.global_step,
             train_loss=None,
             val_loss=None,
             best_metric_key="val_loss",
+            is_final_checkpoint=is_final_checkpoint,
         )
         self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
         return True
@@ -1014,6 +1020,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             train_loss=None,
             val_loss=None,
             best_metric_key="val_loss",
+            is_final_checkpoint=True,
         )
         self._log_saved_checkpoint("final", completed_epochs, gs)
         return True
@@ -1382,6 +1389,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     train_loss=None,
                     val_loss=val_loss_dict,
                     best_metric_key="val_loss",
+                    is_final_checkpoint=epoch + 1 >= self.num_epochs,
                 )
                 self._log_saved_checkpoint("epoch", epoch + 1, self.runtime.global_step)
 
