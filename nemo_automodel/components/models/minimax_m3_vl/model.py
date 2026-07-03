@@ -26,6 +26,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -278,6 +279,7 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig()
         self.model = MiniMaxM3TextModel(config, backend=self.backend, moe_config=moe_config)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
@@ -423,6 +425,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         text_config = config.text_config
         self.backend = backend or BackendConfig()
         self.model = MiniMaxM3TextModel(text_config, backend=self.backend, moe_config=moe_config)

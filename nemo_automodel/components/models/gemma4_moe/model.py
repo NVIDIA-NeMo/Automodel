@@ -982,9 +982,13 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             # Dense Gemma4 — keep vanilla HF model. Attach the model-owned p2p ring
             # CP attention to each HF self-attn so setup_cp_attention can install it
             # when CP is enabled. (The MoE path attaches it per Gemma4MoEDecoderLayer.)
+            # ``cp_full_attn_backend: ffpa`` routes the full-attention head_dim=512
+            # ring chunks through the FFPA CuTeDSL kernel (eligibility re-checked per
+            # call in _ring_use_ffpa_varlen); default "flex" preserves prior behavior.
+            use_ffpa_cp = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower() == "ffpa"
             for module in self.modules():
                 if isinstance(module, Gemma4Attention):
-                    attach_gemma4_cp_ring_attention(module)
+                    attach_gemma4_cp_ring_attention(module, use_ffpa=use_ffpa_cp)
             return
 
         # --- MoE path: replace the text model ---

@@ -49,6 +49,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
 # Use shared rope_utils (same implementation as Llama, supports both config formats)
 from nemo_automodel.components.models.llama.rope_utils import (
@@ -391,6 +392,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         config: Qwen2Config,
         backend: Optional[BackendConfig] = None,
     ):
+        warn_deprecated_model_class("Qwen2ForCausalLM")
         super().__init__(config)
         self.backend = backend or BackendConfig()
         self.model = Qwen2Model(config=config, backend=self.backend)

@@ -26,6 +26,15 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel.components.attention.ffpa_attention import (
+    _FFPA_HEAD_DIM,
+    _ffpa_dense_bwd,
+    _ffpa_dense_fwd,
+    _ffpa_varlen_bwd,
+    _ffpa_varlen_fwd,
+    _ffpa_varlen_ready,
+)
+
 logger = logging.getLogger(__name__)
 _GEMMA4_CP_FLEX_RING_OK_LOGGED = False
 
@@ -95,24 +104,13 @@ def gemma4_vision_group_ids(mm_token_type_ids: torch.Tensor) -> torch.Tensor:
     return torch.where(is_vision, group_ids, torch.full_like(group_ids, -1))
 
 
-# Block masks built by create_block_mask are independent of the K/V *values*: they
-# depend only on the attention type (sliding window), the local/chunk sequence
-# geometry, and the position-level metadata (packing / padding / vision groups).
-# Within a single training step the metadata content is fixed by *position*, so for
-# a given (layer-type, chunk geometry) every one of E4B's 42 layers builds an
-# identical mask -- and create_block_mask costs ~7.6ms/call, dominating short-seq CP
-# step time (~66%). We cache on the position scalars only (never on tensor storage
-# -- the CUDA allocator recycles addresses, so a data_ptr key could alias distinct
-# content and return a stale mask). Correctness across steps is preserved by
-# clearing the cache whenever the batch's metadata object changes; the object is
-# held as the generation token so its identity can't be recycled while it is live.
+# create_block_mask (~7.6ms/call) depends only on attention type + sequence geometry +
+# position metadata, so all same-type layers in a step build an identical mask. Cache on the
+# position scalars (not tensor storage -- the CUDA allocator recycles addresses, so a
+# data_ptr key could alias stale content) and clear it when the batch's metadata object
+# changes, holding that object as the generation token so its data_ptr can't be recycled live.
 _BLOCK_MASK_CACHE: dict = {}
-# [data_ptr, held-tensor]: the metadata tensor is re-wrapped into a fresh Python
-# object every layer but shares one storage within a step (and the detached
-# backward metadata shares it too), so we detect a new batch by its data_ptr.
-# The tensor is held so the allocator cannot recycle that address mid-step, which
-# would otherwise let a later step's distinct content collide on the same pointer.
-_BLOCK_MASK_GEN: list = [None, None]
+_BLOCK_MASK_GEN: list = [None, None]  # [data_ptr, held-tensor]
 
 
 def _block_mask_set_generation(gen_tensor) -> None:
@@ -149,13 +147,9 @@ def _compiled_flex_attention(attention_module: torch.nn.Module):
 def _duck_shape_disabled():
     """Locally disable flex duck-shape specialization for the wrapped flex call.
 
-    With variable-length (unpacked) batches the compiled flex kernel otherwise
-    guards on incidental dim-equalities (e.g. ``block_mask.kv_indices.size()[2] ==
-    key.size()[1]``) and recompiles on every new sequence length, collapsing
-    throughput to ~warmup speed. ``use_duck_shape`` is read by dynamo at (re)trace
-    time -- which happens inside the flex call -- so scoping it to the call window
-    is sufficient and, unlike setting it once at compile time, does not leave the
-    process-global ``torch.fx`` config mutated for unrelated ``torch.compile`` users.
+    Otherwise the compiled flex kernel guards on incidental dim-equalities and recompiles on
+    every new sequence length. Dynamo reads ``use_duck_shape`` at (re)trace time inside the
+    flex call, so scoping it to the call window avoids mutating the process-global fx config.
     """
     from torch.fx.experimental import _config as _fx_config
 
@@ -196,23 +190,14 @@ def _ring_exchange(
     cp_rank: int,
     cp_size: int,
 ) -> None:
-    if not tensors:
-        return
-
-    ranks = torch.distributed.get_process_group_ranks(cp_group)
-    send_dst = ranks[(cp_rank + 1) % cp_size]
-    recv_src = ranks[(cp_rank - 1) % cp_size]
-
-    send_ops = [
-        torch.distributed.P2POp(torch.distributed.isend, send_tensor.contiguous(), send_dst, cp_group)
-        for send_tensor, _ in tensors
-    ]
-    recv_ops = [
-        torch.distributed.P2POp(torch.distributed.irecv, recv_tensor, recv_src, cp_group) for _, recv_tensor in tensors
-    ]
-    ops = send_ops + recv_ops if cp_rank % 2 == 0 else recv_ops + send_ops
-    for req in torch.distributed.batch_isend_irecv(ops):
-        req.wait()
+    """One ring rotation step: send to ``cp_rank+1``, receive from ``cp_rank-1`` (p2p)."""
+    _direct_exchange(
+        tensors,
+        cp_group=cp_group,
+        cp_rank=cp_rank,
+        send_cp_rank=(cp_rank + 1) % cp_size,
+        recv_cp_rank=(cp_rank - 1) % cp_size,
+    )
 
 
 def _direct_exchange(
@@ -240,6 +225,44 @@ def _direct_exchange(
     ops = send_ops + recv_ops if cp_rank % 2 == 0 else recv_ops + send_ops
     for req in torch.distributed.batch_isend_irecv(ops):
         req.wait()
+
+
+def _route_kv_grads_to_owners(
+    grad_key_by_owner: dict[int, torch.Tensor],
+    grad_value_by_owner: dict[int, torch.Tensor],
+    *,
+    cp_group: Any,
+    cp_rank: int,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sum each KV owner's dK/dV from every rank whose queries attended it.
+
+    In the ring forward, rank ``r``'s queries attend the chunks owned by ranks
+    ``r, r-1, ..., 0``, so backward produces a dK/dV contribution for each of those
+    owners on rank ``r``. This sends each owner's contribution back to that owner
+    (p2p) and sums them, returning the local rank's accumulated ``(grad_key,
+    grad_value)``. Shared by the Flex and FFPA-varlen ring backward passes.
+    """
+    grad_key = grad_key_by_owner[cp_rank].contiguous()
+    grad_value = grad_value_by_owner[cp_rank].contiguous()
+    for distance in range(1, cp_size):
+        send_owner = (cp_rank - distance) % cp_size
+        recv_query_rank = (cp_rank + distance) % cp_size
+        recv_grad_key = torch.empty_like(grad_key)
+        recv_grad_value = torch.empty_like(grad_value)
+        _direct_exchange(
+            [
+                (grad_key_by_owner[send_owner], recv_grad_key),
+                (grad_value_by_owner[send_owner], recv_grad_value),
+            ],
+            cp_group=cp_group,
+            cp_rank=cp_rank,
+            send_cp_rank=send_owner,
+            recv_cp_rank=recv_query_rank,
+        )
+        grad_key = grad_key + recv_grad_key
+        grad_value = grad_value + recv_grad_value
+    return grad_key, grad_value
 
 
 def _merge_flex_chunk(
@@ -508,6 +531,503 @@ def _zero_if_none(grad: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor
     return torch.zeros_like(like) if grad is None else grad
 
 
+# FFPA CuTeDSL ring path (head_dim=512 full-attention). Each ring KV chunk runs the dense
+# kernel on the raw [B, H, S, D] tensors when its segment is dense-eligible (single document
+# per row, optionally with a pad suffix -- zero gather/scatter), else the varlen THD path
+# (gather -> _varlen_{fwd,bwd}_cute -> scatter, the only way to mask across documents within a
+# shard). Other layers/batches (sliding-window, no kernel) use compiled FlexAttention.
+
+
+def _ffpa_varlen_ring_available() -> bool:
+    """Whether the FFPA CuTeDSL *varlen* ops are ready (CPU-test monkeypatch seam)."""
+    return _ffpa_varlen_ready()
+
+
+def _row_single_doc_prefix(row: list[int]) -> bool:
+    """Row's real (``>0``) tokens are one document forming a contiguous prefix (pad, if any, is
+    a trailing suffix) -- the shape a single-document shard takes after tail padding."""
+    doc = None
+    seen_pad = False
+    for d in row:
+        if d <= 0:
+            seen_pad = True
+        else:
+            if seen_pad:
+                return False  # a real token after padding -> not a clean prefix
+            if doc is None:
+                doc = d
+            elif d != doc:
+                return False  # a second document
+    return doc is not None
+
+
+def _row_single_doc_full(row: list[int]) -> bool:
+    """Row is exactly one document with no padding (every position the same ``>0`` id)."""
+    doc = row[0] if row else 0
+    if doc <= 0:
+        return False
+    return all(d == doc for d in row)
+
+
+def _build_packed_ring_segments(q_ids: torch.Tensor, k_ids: torch.Tensor) -> dict[str, Any] | None:
+    """Per-document varlen segments shared between a query shard and one KV chunk.
+
+    ``q_ids``/``k_ids`` are the ``[B, S]`` ``_packed_seq_ids`` (``0`` = pad, ``>0`` = doc id).
+    For each doc in *both* shards, pair its query/key tokens into one segment; returns flat
+    gather indices into ``B*S`` + int32 ``cu_seqlens`` (``cu_q[i]`` pairs ``cu_k[i]``), or
+    ``None`` when no doc is shared.
+
+    Dense-routing flags (consumed by :func:`_chunk_dense_eligible`): ``dense_local`` /
+    ``dense_cross`` say whether the chunk can skip the THD gather/scatter and feed the raw
+    ``[B, H, S, D]`` tensors to the dense FFPA kernel when used as the local (causal) or cross
+    (non-causal) chunk; ``pad_rows`` is the ``[B, S]`` pad-query mask to zero after a dense run
+    (``None`` when unpadded).
+    """
+    B, Sq = q_ids.shape
+    Sk = k_ids.shape[1]
+    device = q_ids.device
+    q_index: list[int] = []
+    k_index: list[int] = []
+    cu_q: list[int] = [0]
+    cu_k: list[int] = [0]
+    max_q = 0
+    max_k = 0
+    # One device->host sync per shard (the id maps are tiny [B, S] int tensors);
+    # everything below is plain Python so we never sync per document.
+    q_ids_cpu = q_ids.tolist()
+    k_ids_cpu = k_ids.tolist()
+    for b in range(B):
+        qrow = q_ids_cpu[b]
+        krow = k_ids_cpu[b]
+        k_by_doc: dict[int, list[int]] = {}
+        for pos, d in enumerate(krow):
+            if d > 0:
+                k_by_doc.setdefault(d, []).append(pos + b * Sk)
+        q_by_doc: dict[int, list[int]] = {}  # dict preserves first-occurrence (== ascending position) order
+        for pos, d in enumerate(qrow):
+            if d > 0:
+                q_by_doc.setdefault(d, []).append(pos + b * Sq)
+        for d, qpos in q_by_doc.items():
+            kpos = k_by_doc.get(d)
+            if not kpos:
+                continue
+            q_index.extend(qpos)
+            k_index.extend(kpos)
+            cu_q.append(cu_q[-1] + len(qpos))
+            cu_k.append(cu_k[-1] + len(kpos))
+            max_q = max(max_q, len(qpos))
+            max_k = max(max_k, len(kpos))
+    if not q_index:
+        return None
+    # Dense eligibility: a chunk can skip the THD detour only if it needs no cross-document
+    # masking. The query shard must be one document per row, any pad confined to a trailing
+    # suffix (``_row_single_doc_prefix``) -- enough for the local chunk, where k == q and causal
+    # masking already hides the pad tail. A cross chunk has no causal mask to hide a second
+    # document or pad in its KV, so it also needs the KV chunk to be that one document in full
+    # (``_row_single_doc_full``).
+    q_single_doc = all(_row_single_doc_prefix(row) for row in q_ids_cpu)
+    k_single_doc = all(_row_single_doc_full(row) for row in k_ids_cpu)
+    has_pad = any(d <= 0 for row in q_ids_cpu for d in row)
+    return {
+        "q_index": torch.tensor(q_index, dtype=torch.long, device=device),
+        "k_index": torch.tensor(k_index, dtype=torch.long, device=device),
+        "cu_q": torch.tensor(cu_q, dtype=torch.int32, device=device),
+        "cu_k": torch.tensor(cu_k, dtype=torch.int32, device=device),
+        "max_q": max_q,
+        "max_k": max_k,
+        "dense_local": q_single_doc,
+        "dense_cross": q_single_doc and k_single_doc,
+        "pad_rows": (q_ids <= 0) if has_pad else None,
+    }
+
+
+def _chunk_dense_eligible(seg: dict[str, Any], causal: bool) -> bool:
+    """Select this chunk's dense-kernel eligibility for its role in the ring.
+
+    A local chunk runs causally (``causal=True``), a cross chunk non-causally; the two precomputed
+    flags from :func:`_build_packed_ring_segments` differ because only the cross chunk lacks a
+    causal mask to hide a second document or a pad tail in its KV. Dense-eligible chunks still
+    zero their pad query rows afterwards via ``seg["pad_rows"]``.
+    """
+    return seg["dense_local"] if causal else seg["dense_cross"]
+
+
+# Ring segments depend only on the doc maps + ring geometry, not the Q/K/V values, and are
+# identical forward and backward. Cache once per step (keyed on the q doc map's pinned
+# data_ptr) so the ``.tolist()`` D->H sync + Python pairing in _build_packed_ring_segments
+# runs once per ring chunk per step, not once per chunk per layer per pass.
+_RING_SEGMENT_CACHE: dict = {}
+_RING_SEGMENT_GEN: list = [None, None]
+
+
+def _ring_segment_set_generation(gen_tensor: torch.Tensor) -> None:
+    """Clear the ring-segment cache when a new batch (new q doc map) arrives."""
+    ptr = gen_tensor.data_ptr()
+    if ptr != _RING_SEGMENT_GEN[0]:
+        _RING_SEGMENT_CACHE.clear()
+        _RING_SEGMENT_GEN[0] = ptr
+        _RING_SEGMENT_GEN[1] = gen_tensor  # pin the storage for the duration of the step
+
+
+def _cached_ring_segments(
+    q_ids: torch.Tensor, k_ids: torch.Tensor, *, cp_rank: int, owner: int, cp_size: int
+) -> dict[str, Any] | None:
+    """Per-step cache around :func:`_build_packed_ring_segments`.
+
+    ``owner`` uniquely identifies the rotated k doc map within a step (each rank's
+    shard is visited exactly once), so ``(cp_rank, owner, cp_size, B, Sq, Sk)``
+    keyed under the current q-doc-map generation uniquely identifies the segment.
+    ``None`` (no shared document) is cached too.
+    """
+    _ring_segment_set_generation(q_ids)
+    key = (cp_rank, owner, cp_size, q_ids.shape[0], q_ids.shape[1], k_ids.shape[1])
+    if key in _RING_SEGMENT_CACHE:
+        return _RING_SEGMENT_CACHE[key]
+    seg = _build_packed_ring_segments(q_ids, k_ids)
+    if len(_RING_SEGMENT_CACHE) >= 256:
+        _RING_SEGMENT_CACHE.pop(next(iter(_RING_SEGMENT_CACHE)))
+    _RING_SEGMENT_CACHE[key] = seg
+    return seg
+
+
+def _gather_thd(t_bhsd: torch.Tensor, flat_index: torch.Tensor) -> torch.Tensor:
+    """``[B, H, S, D]`` -> packed ``[T, H, D]`` at flat ``b*S + pos`` indices."""
+    B, H, S, D = t_bhsd.shape
+    return t_bhsd.transpose(1, 2).reshape(B * S, H, D).index_select(0, flat_index)
+
+
+def _scatter_thd(packed: torch.Tensor, flat_index: torch.Tensor, B: int, H: int, S: int) -> torch.Tensor:
+    """Inverse of :func:`_gather_thd`: ``[T, H, D]`` -> ``[B, H, S, D]`` (0 elsewhere)."""
+    D = packed.shape[-1]
+    out = torch.zeros(B * S, H, D, dtype=packed.dtype, device=packed.device)
+    out.index_copy_(0, flat_index, packed)
+    return out.view(B, S, H, D).transpose(1, 2)
+
+
+def _scatter_lse(lse_pack: torch.Tensor, flat_index: torch.Tensor, B: int, Hq: int, S: int) -> torch.Tensor:
+    """Varlen LSE ``[Hq, T]`` -> dense ``[B, Hq, S]`` (``-inf`` for non-participating rows)."""
+    flat = torch.full((B * S, Hq), float("-inf"), dtype=torch.float32, device=lse_pack.device)
+    flat.index_copy_(0, flat_index, lse_pack.transpose(0, 1).to(torch.float32))
+    return flat.view(B, S, Hq).permute(0, 2, 1).contiguous()
+
+
+def _gather_lse(lse_dense: torch.Tensor, flat_index: torch.Tensor) -> torch.Tensor:
+    """Dense ``[B, Hq, S]`` -> packed ``[Hq, T]`` (inverse of :func:`_scatter_lse`)."""
+    B, Hq, S = lse_dense.shape
+    return lse_dense.permute(0, 2, 1).reshape(B * S, Hq).index_select(0, flat_index).transpose(0, 1).contiguous()
+
+
+def _merge_ffpa_packed_chunk(
+    out_acc: torch.Tensor | None,
+    lse_acc: torch.Tensor | None,
+    out_step: torch.Tensor,
+    lse_step: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``-inf``-safe online-softmax merge: like :func:`_merge_flex_chunk` but a row where both
+    inputs are ``-inf`` (pad query no chunk covered) keeps 0 instead of ``NaN``.
+
+    On finite rows ``old_scale + new_scale == 1``, so the combine is a single ``lerp``; the only
+    ``NaN`` is the both-``-inf`` row, which ``nan_to_num_`` zeroes (leaving its already-0 output).
+    The fused ``lerp`` is ~2.5x cheaper than the explicit ``isneginf``/``where`` form.
+    """
+    if out_acc is None or lse_acc is None:
+        return out_step, lse_step
+    lse_next = torch.logaddexp(lse_acc, lse_step)
+    new_scale = torch.exp(lse_step - lse_next).nan_to_num_(nan=0.0).unsqueeze(-1)
+    return torch.lerp(out_acc, out_step, new_scale), lse_next
+
+
+# A cross/straddle chunk shares only a small token subset (T << B*S), so scattering its packed
+# result to a full [B, Hq, S, D] tensor + a full-tensor merge/add does O(B*S) work for a T-row
+# effect. Like TransformerEngine's thd_out_correction / thd_grad_correction, we instead update
+# in place at just the live rows (advanced-index on the permuted view), keeping the accumulator
+# BSHD-contiguous so the dense path is untouched. Measured (H20Z, fp16, D=512): wins below
+# T/(B*S) ~= 0.3 (2.3x at 0.05), loses above (strided in-place < contiguous scatter at full T),
+# so gate at 0.25. The gather is deliberately left as transpose+reshape+index_select -- an
+# advanced-index gather moves less data but is uniformly slower (coalescing wins).
+_LIVE_ROW_MERGE_MAX_FRACTION = 0.25
+
+
+def _use_live_row_merge(num_live: int, num_rows: int) -> bool:
+    """True when the live-token subset is small enough for in-place updates to beat scatter."""
+    return num_live <= _LIVE_ROW_MERGE_MAX_FRACTION * num_rows
+
+
+def _merge_live_chunk_(
+    out_acc: torch.Tensor,
+    lse_acc: torch.Tensor,
+    out_pack: torch.Tensor,
+    lse_pack: torch.Tensor,
+    flat_index: torch.Tensor,
+) -> None:
+    """In-place online-softmax merge of one varlen chunk at its ``flat_index`` live rows only.
+
+    Like :func:`_merge_ffpa_packed_chunk` but updates only the ``T`` live rows of the running
+    ``[B, Hq, S, D]``/``[B, Hq, S]`` accumulators. The cheap ``lerp`` (no ``-inf`` guard) is safe:
+    a cross chunk targets only real query tokens, all of which the local chunk already covered,
+    so ``lse_acc`` is finite at every live row.
+    """
+    B, Hq, S, D = out_acc.shape
+    out_view = out_acc.permute(0, 2, 1, 3)  # [B, S, Hq, D] view
+    lse_view = lse_acc.permute(0, 2, 1)  # [B, S, Hq] view
+    b_idx = torch.div(flat_index, S, rounding_mode="floor")
+    pos = flat_index - b_idx * S
+    acc_rows = out_view[b_idx, pos]  # [T, Hq, D]
+    lse_step = lse_pack.transpose(0, 1)  # [T, Hq]
+    lse_next = torch.logaddexp(lse_view[b_idx, pos], lse_step)
+    new_scale = torch.exp(lse_step - lse_next).unsqueeze(-1)  # [T, Hq, 1]
+    out_view[b_idx, pos] = torch.lerp(acc_rows, out_pack, new_scale)
+    lse_view[b_idx, pos] = lse_next
+
+
+def _grad_add_live_(grad_bhsd: torch.Tensor, grad_pack: torch.Tensor, flat_index: torch.Tensor) -> None:
+    """Add ``grad_pack[T, H, D]`` into ``grad_bhsd[B, H, S, D]`` at the ``flat_index`` rows only.
+
+    The in-place advanced-index update on the permuted view keeps ``grad_bhsd`` BSHD-contiguous
+    (dense backward adds full tensors into it unchanged) and avoids the ``torch.zeros`` +
+    full-tensor add of ``grad = grad + _scatter_thd(...)``. ``flat_index`` is duplicate-free, so
+    the assign is a true add.
+    """
+    B, H, S, D = grad_bhsd.shape
+    grad_view = grad_bhsd.permute(0, 2, 1, 3)  # [B, S, H, D] view
+    b_idx = torch.div(flat_index, S, rounding_mode="floor")
+    pos = flat_index - b_idx * S
+    grad_view[b_idx, pos] += grad_pack
+
+
+def _ffpa_varlen_forward_chunk(
+    q_pack: torch.Tensor,
+    k_pack: torch.Tensor,
+    v_pack: torch.Tensor,
+    seg: dict[str, Any],
+    *,
+    scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One ring KV chunk via the FFPA varlen forward. Returns ``(out[T,Hq,D], lse[Hq,T])``."""
+    return _ffpa_varlen_fwd(
+        q_pack, k_pack, v_pack, seg["cu_q"], seg["cu_k"], seg["max_q"], seg["max_k"], scale=scale, causal=causal
+    )
+
+
+def _ffpa_varlen_backward_chunk(
+    grad_out_pack: torch.Tensor,
+    q_pack: torch.Tensor,
+    k_pack: torch.Tensor,
+    v_pack: torch.Tensor,
+    out_pack: torch.Tensor,
+    lse_pack: torch.Tensor,
+    seg: dict[str, Any],
+    *,
+    scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-chunk FFPA varlen backward using the *global* merged out/lse (packed)."""
+    return _ffpa_varlen_bwd(
+        grad_out_pack,
+        q_pack,
+        k_pack,
+        v_pack,
+        out_pack,
+        lse_pack,
+        seg["cu_q"],
+        seg["cu_k"],
+        seg["max_q"],
+        seg["max_k"],
+        scale=scale,
+        causal=causal,
+    )
+
+
+def _ring_use_ffpa_varlen(attention_module: torch.nn.Module, ctx: Any) -> bool:
+    """Whether this ring attention call may use the FFPA *varlen* ring path.
+
+    The decision gates collective p2p exchanges so it must be rank-uniform: it
+    depends only on the per-layer config, the head_dim / dtype / scale, and
+    *whether* ``_packed_seq_ids`` is present (a batch-level fact) -- never on
+    per-rank slice content. This path *requires* ``_packed_seq_ids`` (the document
+    map drives the varlen ``cu_seqlens``); Gemma4's manual CP batch always attaches
+    one, so it is the sole FFPA path real CP training takes.
+    """
+    if not getattr(attention_module, "_gemma4_cp_use_ffpa", False):
+        return False
+    if not ctx.is_causal:
+        return False
+    if getattr(attention_module, "sliding_window", None) is not None:
+        return False
+    if ctx.metadata.get("_packed_seq_ids") is None:
+        return False
+    if ctx.query.shape[-1] != _FFPA_HEAD_DIM:
+        return False
+    if ctx.query.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if ctx.scale is None:
+        return False
+    return _ffpa_varlen_ring_available()
+
+
+def _run_gemma4_cp_ffpa_varlen_ring_forward(
+    ctx: Any, *, seg_sink: dict[int, Any] | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward of the FFPA ring: rotate K/V, per-chunk dense-or-varlen FFPA, online-merge.
+
+    Returns ``(out_final[B,Hq,S,D] fp32, lse_final[B,Hq,S] fp32)``. ``owner > cp_rank`` chunks
+    are causally skipped; chunks sharing no document contribute nothing; pad query rows stay 0.
+    When ``seg_sink`` is given, each processed ``owner``'s segment is recorded (``owner -> seg``)
+    so the backward reuses the same path choice and indices.
+    """
+    q = ctx.query
+    B, Hq, S, _D = q.shape
+    q_ids = ctx.metadata.get("_packed_seq_ids")
+    if q_ids is None:
+        raise RuntimeError("Gemma4 CP FFPA ring requires _packed_seq_ids in metadata.")
+    # The local (causal, first) chunk is processed first; when it runs dense it covers every real
+    # query row (pad rows stay 0, never -inf), so the cheap non-guarded merge is then safe for all
+    # later chunks. Genuinely multi-document local shards keep the -inf-safe merge.
+    local_seg = _cached_ring_segments(q_ids, q_ids, cp_rank=ctx.cp_rank, owner=ctx.cp_rank, cp_size=ctx.cp_size)
+    local_dense = local_seg is not None and _chunk_dense_eligible(local_seg, True)
+    merge = _merge_flex_chunk if local_dense else _merge_ffpa_packed_chunk
+    out_acc = None
+    lse_acc = None
+    for owner, key_chunk, value_chunk, meta in _collect_ring_kv_chunks(ctx):
+        if owner > ctx.cp_rank:
+            continue
+        seg = _cached_ring_segments(
+            q_ids, meta.get("_packed_seq_ids"), cp_rank=ctx.cp_rank, owner=owner, cp_size=ctx.cp_size
+        )
+        if seg_sink is not None:
+            seg_sink[owner] = seg
+        if seg is None:
+            continue
+        causal = owner == ctx.cp_rank
+        if _chunk_dense_eligible(seg, causal):
+            out_step, lse_step = _ffpa_dense_fwd(q, key_chunk, value_chunk, scale=ctx.scale, causal=causal)
+            out_step = out_step.to(torch.float32)
+            pad_rows = seg["pad_rows"]
+            if pad_rows is not None:
+                # zero pad query rows (they attended garbage); mirrors Flex empty_query_rows
+                out_step = out_step.masked_fill(pad_rows[:, None, :, None], 0)
+            out_acc, lse_acc = merge(out_acc, lse_acc, out_step, lse_step)
+            continue
+        q_index = seg["q_index"]
+        q_pack = _gather_thd(q, q_index)
+        k_pack = _gather_thd(key_chunk, seg["k_index"])
+        v_pack = _gather_thd(value_chunk, seg["k_index"])
+        out_pack, lse_pack = _ffpa_varlen_forward_chunk(q_pack, k_pack, v_pack, seg, scale=ctx.scale, causal=causal)
+        out_pack = out_pack.to(torch.float32)
+        if out_acc is not None and _use_live_row_merge(q_index.numel(), B * S):
+            # small cross/straddle subset -> in-place live-row merge (skips the full scatter+merge)
+            _merge_live_chunk_(out_acc, lse_acc, out_pack, lse_pack, q_index)
+        else:
+            out_step = _scatter_thd(out_pack, q_index, B, Hq, S)
+            lse_step = _scatter_lse(lse_pack, q_index, B, Hq, S)
+            out_acc, lse_acc = merge(out_acc, lse_acc, out_step, lse_step)
+    if out_acc is None or lse_acc is None:
+        # All-pad query shard (no shared doc): return 0/-inf, never raise -- a one-rank
+        # raise desyncs the ring p2p and hangs the job. Mirrors the Flex path.
+        out_acc = torch.zeros(B, Hq, S, _D, dtype=torch.float32, device=q.device)
+        lse_acc = torch.full((B, Hq, S), float("-inf"), dtype=torch.float32, device=q.device)
+    return out_acc, lse_acc
+
+
+class _Gemma4FFPAVarlenRingAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(autograd_ctx, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, ring_ctx: Any):
+        runtime_ctx = replace(ring_ctx, query=query, key=key, value=value)
+        seg_by_owner: dict[int, Any] = {}
+        out_final, lse_final = _run_gemma4_cp_ffpa_varlen_ring_forward(runtime_ctx, seg_sink=seg_by_owner)
+        out = out_final.to(query.dtype)
+        autograd_ctx.save_for_backward(query, key, value, out, lse_final)
+        autograd_ctx.ring_segments = seg_by_owner
+        autograd_ctx.ring_ctx = replace(
+            ring_ctx,
+            query=None,
+            key=None,
+            value=None,
+            metadata=_detach_metadata(ring_ctx.metadata),
+        )
+        return out
+
+    @staticmethod
+    def backward(autograd_ctx, grad_output: torch.Tensor):
+        query, key, value, out_final, lse_final = autograd_ctx.saved_tensors
+        ring_ctx = autograd_ctx.ring_ctx
+        cp_size = ring_ctx.cp_size
+        cp_rank = ring_ctx.cp_rank
+        B, Hq, S, _D = query.shape
+        Hkv = key.shape[1]
+        seg_by_owner = autograd_ctx.ring_segments
+
+        collect_ctx = replace(ring_ctx, query=query, key=key, value=value)
+        grad_query = torch.zeros_like(query, dtype=torch.float32)
+        grad_key_by_owner = {owner: torch.zeros_like(key) for owner in range(cp_size)}
+        grad_value_by_owner = {owner: torch.zeros_like(value) for owner in range(cp_size)}
+
+        for owner, key_chunk, value_chunk, _meta in _collect_ring_kv_chunks(collect_ctx):
+            if owner > cp_rank:
+                continue
+            seg = seg_by_owner.get(owner)
+            if seg is None:
+                continue
+            causal = owner == cp_rank
+            if _chunk_dense_eligible(seg, causal):
+                # Dense backward fed the global out/lse (no gather/scatter). For the pad path,
+                # zero grad_output's pad rows -- the forward forced those outputs to 0.
+                grad_out_chunk = grad_output
+                pad_rows = seg["pad_rows"]
+                if pad_rows is not None:
+                    grad_out_chunk = grad_output.masked_fill(pad_rows[:, None, :, None], 0)
+                dq_step, dk_step, dv_step = _ffpa_dense_bwd(
+                    grad_out_chunk,
+                    query,
+                    key_chunk,
+                    value_chunk,
+                    out_final,
+                    lse_final,
+                    scale=ring_ctx.scale,
+                    causal=causal,
+                )
+                grad_query = grad_query + dq_step.to(torch.float32)
+                grad_key_by_owner[owner] = grad_key_by_owner[owner] + dk_step.to(key.dtype)
+                grad_value_by_owner[owner] = grad_value_by_owner[owner] + dv_step.to(value.dtype)
+                continue
+            q_index = seg["q_index"]
+            k_index = seg["k_index"]
+            q_pack = _gather_thd(query, q_index)
+            k_pack = _gather_thd(key_chunk, k_index)
+            v_pack = _gather_thd(value_chunk, k_index)
+            out_pack = _gather_thd(out_final, q_index)
+            grad_out_pack = _gather_thd(grad_output, q_index)
+            lse_pack = _gather_lse(lse_final, q_index)
+            dq_pack, dk_pack, dv_pack = _ffpa_varlen_backward_chunk(
+                grad_out_pack, q_pack, k_pack, v_pack, out_pack, lse_pack, seg, scale=ring_ctx.scale, causal=causal
+            )
+            n_rows = B * S
+            # small subset -> in-place live-row accumulate; larger -> scatter+add (see fwd note)
+            if _use_live_row_merge(q_index.numel(), n_rows):
+                _grad_add_live_(grad_query, dq_pack.to(torch.float32), q_index)
+            else:
+                grad_query = grad_query + _scatter_thd(dq_pack.to(torch.float32), q_index, B, Hq, S)
+            if _use_live_row_merge(k_index.numel(), n_rows):
+                _grad_add_live_(grad_key_by_owner[owner], dk_pack.to(key.dtype), k_index)
+                _grad_add_live_(grad_value_by_owner[owner], dv_pack.to(value.dtype), k_index)
+            else:
+                grad_key_by_owner[owner] = grad_key_by_owner[owner] + _scatter_thd(
+                    dk_pack.to(key.dtype), k_index, B, Hkv, S
+                )
+                grad_value_by_owner[owner] = grad_value_by_owner[owner] + _scatter_thd(
+                    dv_pack.to(value.dtype), k_index, B, Hkv, S
+                )
+
+        # All-pad shard: grads stay 0; do NOT raise (the dK/dV p2p below is rank-uniform,
+        # so a one-rank raise desyncs the ring). Forward returned 0 for these rows too.
+
+        grad_key, grad_value = _route_kv_grads_to_owners(
+            grad_key_by_owner, grad_value_by_owner, cp_group=ring_ctx.cp_group, cp_rank=cp_rank, cp_size=cp_size
+        )
+        return grad_query.to(query.dtype), grad_key, grad_value, None
+
+
 class _Gemma4FlexRingAttention(torch.autograd.Function):
     @staticmethod
     def forward(autograd_ctx, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, ring_ctx: Any):
@@ -579,31 +1099,33 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
             owner: _zero_if_none(grads[1 + num_chunks + idx], value_reqs[idx]) for idx, owner in enumerate(owners)
         }
 
-        grad_key = grad_key_by_owner[ring_ctx.cp_rank].contiguous()
-        grad_value = grad_value_by_owner[ring_ctx.cp_rank].contiguous()
-        for distance in range(1, ring_ctx.cp_size):
-            send_owner = (ring_ctx.cp_rank - distance) % ring_ctx.cp_size
-            recv_query_rank = (ring_ctx.cp_rank + distance) % ring_ctx.cp_size
-            recv_grad_key = torch.empty_like(grad_key)
-            recv_grad_value = torch.empty_like(grad_value)
-            _direct_exchange(
-                [
-                    (grad_key_by_owner[send_owner], recv_grad_key),
-                    (grad_value_by_owner[send_owner], recv_grad_value),
-                ],
-                cp_group=ring_ctx.cp_group,
-                cp_rank=ring_ctx.cp_rank,
-                send_cp_rank=send_owner,
-                recv_cp_rank=recv_query_rank,
-            )
-            grad_key = grad_key + recv_grad_key
-            grad_value = grad_value + recv_grad_value
-
+        grad_key, grad_value = _route_kv_grads_to_owners(
+            grad_key_by_owner,
+            grad_value_by_owner,
+            cp_group=ring_ctx.cp_group,
+            cp_rank=ring_ctx.cp_rank,
+            cp_size=ring_ctx.cp_size,
+        )
         return grad_query, grad_key, grad_value, None
 
 
 def _run_gemma4_cp_ring_attention(attention_module: torch.nn.Module, ctx: Any) -> torch.Tensor:
-    """Run Gemma4 local-query/ring-key CP attention with FlexAttention."""
+    """Run Gemma4 local-query/ring-key CP attention.
+
+    Full-attention (global) head_dim=512 layers run their per-chunk attention
+    through the FFPA CuTeDSL kernel (``_ring_use_ffpa_varlen`` gate), choosing per
+    chunk between the *dense* ``_fwd_cute`` path (single full document per row -- the
+    unpacked / synthesized-single-document case -- on the raw ``[B, H, S, D]`` tensors,
+    zero gather/scatter) and the *varlen* ``_varlen_fwd_cute`` path (genuinely packed /
+    straddling shards, which need cross-document masking via THD ``cu_seqlens``). The
+    manual CP batch always attaches a ``_packed_seq_ids`` map
+    (``cp_batch._synthesize_single_document_seq_ids`` injects a trivial single-document
+    one when the batch is not packed), so this is the path real CP training -- packed or
+    unpacked -- always takes. Every other layer / batch (sliding-window, no kernel,
+    wrong dtype/head_dim) keeps using compiled FlexAttention.
+    """
+    if _ring_use_ffpa_varlen(attention_module, ctx):
+        return _Gemma4FFPAVarlenRingAttention.apply(ctx.query, ctx.key, ctx.value, ctx)
     return _Gemma4FlexRingAttention.apply(ctx.query, ctx.key, ctx.value, ctx)
 
 
@@ -729,14 +1251,20 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
     attention_module.register_forward_hook(_post_hook, always_call=True)
 
 
-def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module) -> None:
+def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module, *, use_ffpa: bool = False) -> None:
     """Register Gemma4's model-owned p2p ring CP attention on a self-attention module.
 
     Declares the metadata keys the ring needs and exposes ``setup_cp_attention(cp_mesh)``
     -- the model-owned CP-attention seam the parallelizer calls (with the CP mesh)
     instead of cp_utils' generic SDPA hooks. ``run_cp_manual_attention`` is also bound
     as the ring entry point.
+
+    ``use_ffpa`` opts the (full-attention, head_dim=512) ring chunks into the FFPA
+    CuTeDSL kernel; ``_ring_use_ffpa_varlen`` still verifies per-call eligibility, so
+    this is a no-op for sliding-window layers, non-512 head_dim, wrong dtype, or when
+    the FFPA kernel is unavailable.
     """
+    attention_module._gemma4_cp_use_ffpa = bool(use_ffpa)
     attention_module._cp_manual_metadata_keys = (
         "mm_token_type_ids",
         "_packed_seq_ids",

@@ -24,6 +24,8 @@ from dataclasses import dataclass
 
 from transformers import PreTrainedModel
 
+from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import DeepseekV4DSparkModel
+from nemo_automodel.components.speculative.dspark.draft_glm_5_2 import Glm5_2DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_qwen3 import Qwen3DSparkModel
 
 
@@ -44,6 +46,14 @@ _DENSE_ARCHITECTURES: tuple[str, ...] = (
 DSPARK_DRAFT_REGISTRY: dict[str, DraftSpec] = {
     arch: DraftSpec(draft_cls=Qwen3DSparkModel) for arch in _DENSE_ARCHITECTURES
 }
+# DeepSeek V4 target: a V4-attention draft (Q-LoRA, single shared K=V latent,
+# grouped O-LoRA, interleaved partial RoPE), registered separately from the
+# Qwen3-style drafts because its backbone differs.
+DSPARK_DRAFT_REGISTRY["DeepseekV4ForCausalLM"] = DraftSpec(draft_cls=DeepseekV4DSparkModel)
+# GLM-5.2 target (HF arch GlmMoeDsaForCausalLM): a dense GLM MLA draft (DeepSeek-V3-style
+# Q-LoRA + compressed KV latent + interleaved complex RoPE), with the DSA indexer and MoE
+# dropped. Registered separately because its MLA backbone differs from V4's.
+DSPARK_DRAFT_REGISTRY["GlmMoeDsaForCausalLM"] = DraftSpec(draft_cls=Glm5_2DSparkModel)
 
 
 def resolve_dspark_draft_spec(architectures: list[str]) -> DraftSpec:

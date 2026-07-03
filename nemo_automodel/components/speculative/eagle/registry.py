@@ -40,6 +40,7 @@ from dataclasses import dataclass
 
 from transformers import PreTrainedModel
 
+from nemo_automodel.components.speculative.eagle.draft_deepseek import DeepseekV3Eagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
@@ -76,6 +77,12 @@ EAGLE3_DRAFT_REGISTRY: dict[str, DraftSpec] = {
 # draft class to reproduce gpt-oss's YaRN RoPE -- see ``draft_gpt_oss.py``.
 # Only EAGLE-3 is wired up; EAGLE-1/2 for gpt-oss is not validated yet.
 EAGLE3_DRAFT_REGISTRY["GptOssForCausalLM"] = DraftSpec(draft_cls=GptOssEagle3DraftModel)
+
+# DeepSeek-V3 MLA target. Multi-head Latent Attention (low-rank q/kv projections,
+# interleaved RoPE on the rope slice, and a value head dim that differs from the
+# q/k head dim) cannot be represented by the Llama-style dense draft, so it gets a
+# dedicated MLA draft -- see ``draft_deepseek.py``. Only EAGLE-3 is wired up.
+EAGLE3_DRAFT_REGISTRY["DeepseekV3ForCausalLM"] = DraftSpec(draft_cls=DeepseekV3Eagle3DraftModel)
 
 
 EAGLE1_DRAFT_REGISTRY: dict[str, DraftSpec] = {

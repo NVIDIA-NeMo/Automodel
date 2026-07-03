@@ -29,6 +29,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextRotaryEmbedding as HFQwen3OmniMoeThinkerTextRotaryEmbedding,
 )
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
@@ -257,6 +258,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     ):
         base_config = config.thinker_config if hasattr(config, "thinker_config") else config
         backend = backend or BackendConfig()
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
 
         # _init_model() only overrides the top-level hf_config.torch_dtype; for
         # Omni configs the real params live under thinker_config.text_config /
