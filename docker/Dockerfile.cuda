@@ -64,7 +64,7 @@ ENV CUDA_HOME=/usr/local/cuda \
     MAX_JOBS=8 \
     RDMA_CORE_HOME=/usr \
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=hardlink
 
 WORKDIR /opt/Automodel
 
@@ -75,8 +75,9 @@ ARG CUDA_EXTRA=cu13
 ARG EP_BACKENDS="deepep_v2"
 ARG UV_SYNC_ARGS="--locked --no-default-groups --group test"
 
-RUN --mount=type=cache,target=/root/.cache/uv <<"EOF" bash -eux
+RUN <<"EOF" bash -eux
 base_ld_library_path="/usr/local/cuda/lib64:/usr/lib/$(gcc -dumpmachine)"
+export UV_CACHE_DIR=/opt/uv-cache
 mkdir -p /opt/venvs /opt/ep-envs /opt/ep-runtime
 
 case "${CUDA_EXTRA}" in
@@ -185,13 +186,15 @@ test "$#" -gt 0
 ln -sfn "/opt/venvs/$1" /opt/venv
 ln -sfn "/opt/ep-runtime/$1" /opt/ep-runtime/default
 ln -sfn "/opt/ep-envs/$1.sh" /opt/automodel-env.sh
+rm -rf "${UV_CACHE_DIR}"
 EOF
 
 COPY . /opt/Automodel
 
 # Install the project itself after the dependency-only layer. This is a no-op
 # for compiled dependencies unless pyproject.toml or uv.lock changed.
-RUN --mount=type=cache,target=/root/.cache/uv <<"EOF" bash -eux
+RUN <<"EOF" bash -eux
+export UV_CACHE_DIR=/opt/uv-cache
 for backend in ${EP_BACKENDS}; do
     if [[ "${backend}" == "deepep_v1" ]]; then
         cuda_extra=cu13_legacy
@@ -203,6 +206,7 @@ for backend in ${EP_BACKENDS}; do
     source "/opt/ep-envs/${backend}.sh"
     uv sync ${UV_SYNC_ARGS} --extra "${cuda_extra}" --extra "${backend}"
 done
+rm -rf "${UV_CACHE_DIR}"
 EOF
 
 ENV AUTOMODEL_EP_BACKENDS="${EP_BACKENDS}" \
