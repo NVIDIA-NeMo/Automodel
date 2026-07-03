@@ -33,6 +33,22 @@ model-card files that share a frontmatter `slug:` are compatibility copies and
 must stay byte-identical, so apply a body-only edit to every copy
 (`check_docs.py` rejects copies that differ).
 
+## Prose style
+
+Use this checklist for prose added or substantively edited by the current task before sending docs PRs for tech-pubs
+review. Do not rewrite unrelated existing lines solely to apply these preferences; keep broader copy editing in a
+dedicated docs PR.
+
+- For new or substantively edited cross-doc pointers, prefer `Refer to ...` when it reads naturally. Do not
+  mechanically replace every use of `See` or `See also`.
+- Drop polite filler such as `please` from procedural instructions.
+- Use active, present-tense verbs for deterministic steps: `This script downloads...`, not `This script will download...`.
+- Use `and`, not `&`, in headings and section labels.
+- Write task-oriented, Title Case headings, such as `Run the Training Pipeline` or `Download and Prepare the Dataset`.
+- Label examples explicitly, such as `JSONL example (one example per line):` or `Training file example (single JSON):`.
+- Keep product and modality capitalization consistent: `NeMo AutoModel`, `LLM`, `VLM`, `Diffusion Models`.
+- For overview and index pages, make quick links and guide lists representative across all supported task families.
+
 ## Other tasks
 
 Read only the reference that matches the task:
