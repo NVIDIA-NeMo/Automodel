@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# To run this recipe:
+# From a source checkout, use uv to run with the project dependencies:
+#   uv run automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
+# In the NeMo AutoModel container or another environment with dependencies already installed:
 #   automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
@@ -31,7 +33,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 30
 
 model:
   _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained

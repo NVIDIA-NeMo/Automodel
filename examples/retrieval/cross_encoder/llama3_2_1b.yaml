@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# To run this recipe:
+# From a source checkout, use uv to run with the project dependencies:
+#   uv run automodel examples/retrieval/cross_encoder/llama3_2_1b.yaml --nproc-per-node 8
+# In the NeMo AutoModel container or another environment with dependencies already installed:
 #   automodel examples/retrieval/cross_encoder/llama3_2_1b.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
@@ -29,7 +31,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 30
 
 model:
   _target_: nemo_automodel.NeMoAutoModelCrossEncoder.from_pretrained
@@ -50,9 +52,8 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
   model_type: cross_encoder
   data_dir_list:
-    - retriever_models_research/training_datasets/nqsh_shuffled_50k.json
-    - retriever_models_research/training_datasets/mldr_en_perc95_small.json
-    - retriever_models_research/training_datasets/miracl_train_es_llama3_1b_4m_512len.json
+    - hf://nvidia/embed-nemotron-dataset-v1/FEVER
+    - hf://nvidia/embed-nemotron-dataset-v1/SyntheticClassificationData
   data_type: train
   n_passages: 5
   seed: 42
