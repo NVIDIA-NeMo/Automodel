@@ -346,6 +346,64 @@ def test_encoder_build_and_save(tmp_path, monkeypatch):
     assert any("save1" in p for p in model.model.saved)
 
 
+@pytest.mark.parametrize(
+    ("pooling_arg", "l2_arg", "expected_pooling", "expected_l2_normalize"),
+    [(None, None, "last", False), ("cls", True, "cls", True)],
+)
+def test_biencoder_build_resolves_saved_retrieval_metadata(
+    monkeypatch,
+    pooling_arg,
+    l2_arg,
+    expected_pooling,
+    expected_l2_normalize,
+):
+    """Saved retrieval metadata should restore wrapper options unless explicitly overridden."""
+    import nemo_automodel._transformers.retrieval as encoder_module
+
+    class FakeConfig:
+        model_type = "qwen3"
+        nemo_retrieval = {"task": "embedding", "pooling": "last", "l2_normalize": False}
+
+    calls = {}
+
+    def fake_auto_config_from_pretrained(*args, **kwargs):
+        return FakeConfig()
+
+    def fake_build_encoder_backbone(
+        model_name_or_path,
+        task,
+        trust_remote_code=False,
+        pooling=None,
+        loaded_config=None,
+        **hf_kwargs,
+    ):
+        calls["model_name_or_path"] = model_name_or_path
+        calls["task"] = task
+        calls["pooling"] = pooling
+        calls["loaded_config"] = loaded_config
+        return FakeLM(hidden=16)
+
+    monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
+    monkeypatch.setattr(encoder_module, "build_encoder_backbone", fake_build_encoder_backbone)
+
+    kwargs = {}
+    if pooling_arg is not None:
+        kwargs["pooling"] = pooling_arg
+    if l2_arg is not None:
+        kwargs["l2_normalize"] = l2_arg
+    model = BiEncoderModel.build("saved-export", **kwargs)
+
+    assert model.pooling == expected_pooling
+    assert model.l2_normalize is expected_l2_normalize
+    assert calls["pooling"] == expected_pooling
+    assert calls["loaded_config"].nemo_retrieval["pooling"] == "last"
+    assert model.config.nemo_retrieval == {
+        "task": "embedding",
+        "pooling": expected_pooling,
+        "l2_normalize": expected_l2_normalize,
+    }
+
+
 def test_llama_bidirectional_forward_paths(monkeypatch):
     cfg = LlamaBidirectionalConfig(
         vocab_size=64, hidden_size=16, num_hidden_layers=1, num_attention_heads=1, intermediate_size=32, pad_token_id=0
@@ -544,11 +602,16 @@ def test_configure_encoder_metadata_sets_auto_map_for_retrieval():
     FakeCfg = type("LlamaBidirectionalConfig", (), {})
     fake.config = FakeCfg()
 
-    configure_encoder_metadata(fake, fake.config)
+    configure_encoder_metadata(fake, fake.config, task="embedding", pooling="last", l2_normalize=False)
 
     assert fake.config.architectures == ["LlamaBidirectionalModel"]
     assert "auto_map" in vars(fake.config)
     assert "AutoModel" in fake.config.auto_map
+    assert fake.config.nemo_retrieval == {
+        "task": "embedding",
+        "pooling": "last",
+        "l2_normalize": False,
+    }
 
 
 def test_init_encoder_common_name_or_path_for_generic():
