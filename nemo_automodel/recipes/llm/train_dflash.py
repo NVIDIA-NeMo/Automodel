@@ -336,7 +336,9 @@ class TrainDFlashRecipe(BaseRecipe):
         Subclasses override to capture extra teacher signals (e.g. JetSpec also
         captures the target logits for its forward-KL distillation).
         """
-        return HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids, cp_mesh=self.cp_mesh)
+        return HFDFlashTargetModel(
+            self.target_model, target_layer_ids=target_layer_ids, cp_mesh=getattr(self, "cp_mesh", None)
+        )
 
     def _build_dflash_config(self, recipe_cfg, target_layer_ids: list[int]) -> dict:
         """Build the draft ``dflash_config`` block. Subclasses extend it (e.g. Domino)."""
