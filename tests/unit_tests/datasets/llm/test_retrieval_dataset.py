@@ -169,6 +169,7 @@ def test_load_datasets_normalizes_and_errors(tmp_path, monkeypatch):
         "data": [
             {
                 "question_id": "q1",
+                "original_question_id": "q-root",
                 "question": "What?",
                 "corpus_id": "corpusA",
                 "pos_doc": [{"id": "p1"}],
@@ -183,6 +184,7 @@ def test_load_datasets_normalizes_and_errors(tmp_path, monkeypatch):
     assert len(dataset) == 1
     row = dataset[0]
     assert row["question_id"] == "q1"
+    assert row["original_question_id"] == "q-root"
     assert row["pos_doc"][0]["id"] == "p1"
     assert row["neg_doc"][0]["id"] == "n1" and row["neg_doc"][1]["id"] == "n2"
     assert "corpusA" in corpus_dict
@@ -1383,6 +1385,7 @@ def test_load_hf_subset_synthesizes_question_id(tmp_path, monkeypatch):
 
     data_list, _ = rd._load_hf_subset("org/repo", "MySub")
     assert data_list[0]["question_id"] == "MySub:0"
+    assert data_list[0]["original_question_id"] == "MySub:0"
 
 
 def test_load_hf_subset_allows_empty_neg_doc(tmp_path, monkeypatch):
