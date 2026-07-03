@@ -51,13 +51,23 @@ class HFDSparkTargetModel:
     norm captures the post-norm last hidden state.
     """
 
-    def __init__(self, model: nn.Module, target_layer_ids: Sequence[int]):
+    def __init__(self, model: nn.Module, target_layer_ids: Sequence[int], cp_mesh=None):
         self.model = model.eval()
         self._num_layers = len(self._get_transformer_layers())
         # ``-1`` (the embedding output) is accepted, matching
         # ``common.extract_context_feature`` and the draft ``fc`` sizing in the
         # config builders.
         self.target_layer_ids = validate_target_layer_ids(list(target_layer_ids), self._num_layers)
+        # Context parallelism shards this frozen forward along the sequence dim;
+        # generate_batch gathers the captured hidden states back to the full
+        # sequence so the draft's anchor/block masks stay CP-unaware. cp_mesh is the
+        # "cp" submesh (or None).
+        self.cp_mesh = cp_mesh
+        self._cp_size = cp_mesh.size() if cp_mesh is not None else 1
+        if self._cp_size > 1:
+            from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+
+            attach_context_parallel_hooks(self.model)
 
     def _inner_model(self) -> nn.Module:
         """Return the base transformer module that owns ``layers`` and ``norm``.
@@ -168,19 +178,46 @@ class HFDSparkTargetModel:
         # last-layer feature (post-norm), matching the HF offset-1 convention.
         handles.append(self._get_final_norm().register_forward_hook(_make_hook("norm")))
 
-        forward_kwargs = filter_forward_kwargs(
-            self.model,
-            dict(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, **mm_kwargs),
-        )
+        if self._cp_size > 1:
+            # Shard the sequence, run the target as ring attention, then gather every
+            # captured hidden state back to the full sequence. The self_attn hooks
+            # strip the mask and force is_causal, so attention_mask is None.
+            from nemo_automodel.components.distributed.cp_utils import gather_cp_seq, make_target_cp_ctx
 
-        try:
-            self.model(**forward_kwargs)
-        finally:
-            for handle in handles:
-                handle.remove()
-
-        if "norm" not in captured:
-            raise RuntimeError("DSpark target capture did not record the final-norm output.")
+            cp_ctx, cp_input_ids, cp_position_ids, orig_len = make_target_cp_ctx(self.cp_mesh, input_ids)
+            forward_kwargs = filter_forward_kwargs(
+                self.model,
+                dict(
+                    input_ids=cp_input_ids,
+                    attention_mask=None,
+                    position_ids=cp_position_ids,
+                    use_cache=False,
+                    **mm_kwargs,
+                ),
+            )
+            try:
+                with cp_ctx:
+                    self.model(**forward_kwargs)
+                    if "norm" not in captured:
+                        raise RuntimeError("DSpark target capture did not record the final-norm output.")
+                    keys = list(captured.keys())
+                    gathered = gather_cp_seq(self.cp_mesh, [captured[k] for k in keys], seq_dim=1, orig_len=orig_len)
+            finally:
+                for handle in handles:
+                    handle.remove()
+            captured = dict(zip(keys, gathered))
+        else:
+            forward_kwargs = filter_forward_kwargs(
+                self.model,
+                dict(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, **mm_kwargs),
+            )
+            try:
+                self.model(**forward_kwargs)
+            finally:
+                for handle in handles:
+                    handle.remove()
+            if "norm" not in captured:
+                raise RuntimeError("DSpark target capture did not record the final-norm output.")
 
         def _feature(layer_id: int) -> torch.Tensor:
             if layer_id == -1:
