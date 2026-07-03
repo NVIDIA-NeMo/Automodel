@@ -467,6 +467,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         tp_size = int(self.cfg.get("distributed.tp_size", 1) or 1)
         _validate_cp_gates(cp_size, backend, packed_sequence_size)
         _validate_tp_gates(tp_size, backend, cp_size)
+        # The CP K/V-gather hook attends via the target's torch SDPA call; a
+        # custom-attention (non-HF) target would silently skip it and each rank would
+        # see only its own shard, so require the HF target path.
+        if cp_size > 1 and not bool(recipe_cfg.get("target_force_hf", False)):
+            raise NotImplementedError(
+                "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
+                "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
+            )
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
         elif backend == "sglang":

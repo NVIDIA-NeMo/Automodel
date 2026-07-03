@@ -168,7 +168,10 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         self.cp_mesh = cp_mesh
         self._cp_size = cp_mesh.size() if cp_mesh is not None else 1
         if self._cp_size > 1:
-            from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+            from nemo_automodel.components.distributed.cp_utils import (
+                attach_context_parallel_hooks,
+                attach_cp_kv_gather_hooks,
+            )
 
             attach_context_parallel_hooks(self.model)
             n_self_attn = sum(1 for name, _ in self.model.named_modules() if name.endswith("self_attn"))
@@ -178,6 +181,11 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
                     "'*self_attn' (so the causal mask is fixed under sequence sharding), but none "
                     "were found on the target model."
                 )
+            # torch's context_parallel ring does not fire for a plain HF forward (q/k/v
+            # reach SDPA as local tensors), so each rank would attend only to its own
+            # shard. Since the target is frozen, all-gather K/V and attend the local Q
+            # against the full sequence.
+            attach_cp_kv_gather_hooks(self.model, cp_mesh)
 
     def _check_captured(self, captured: dict[int, torch.Tensor]) -> None:
         if len(captured) != len(self.aux_layer_ids):
