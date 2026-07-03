@@ -52,7 +52,7 @@ from nemo_automodel.components.attention.dflash_mask import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
-from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule
+from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, _to_full_tensor
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 
@@ -189,14 +189,16 @@ class DominoTrainerModule(DFlashTrainerModule):
     ) -> torch.Tensor:
         """Add the GRU-conditioned low-rank correction to the suffix base logits."""
         bsz, n, bs = target_ids.shape
+        # A tensor-parallel target's embed_tokens is vocab-parallel and returns a
+        # DTensor; gather it so the (plain) GRU consumes a plain tensor.
         if self.shift_label:
-            block_emb = self.embed_tokens(prev_ids)
+            block_emb = _to_full_tensor(self.embed_tokens(prev_ids))
             gru_inputs = block_emb.reshape(bsz * n, bs, -1)
             gru_out, _ = self.draft_model.prefix_gru(gru_inputs)
             gru_out = gru_out.reshape(bsz, n, bs, -1)
             prefix_states = gru_out[:, :, self._suffix_start :, :]
         else:
-            block_emb = self.embed_tokens(target_ids)
+            block_emb = _to_full_tensor(self.embed_tokens(target_ids))
             gru_inputs = block_emb[:, :, : bs - 1, :].reshape(bsz * n, bs - 1, -1)
             gru_out, _ = self.draft_model.prefix_gru(gru_inputs)
             gru_out = gru_out.reshape(bsz, n, bs - 1, -1)
@@ -317,7 +319,9 @@ class DominoTrainerModule(DFlashTrainerModule):
         target_ids = torch.gather(input_ids.unsqueeze(1).expand(-1, n, -1), 2, safe_target_indices)
 
         bsz, n, bs = target_ids.shape
-        base_logits = self.lm_head(output_hidden)
+        # A tensor-parallel target's lm_head is column-parallel and returns
+        # vocab-sharded (DTensor) logits; gather to a full tensor for the loss.
+        base_logits = _to_full_tensor(self.lm_head(output_hidden))
         hidden4d, prev_ids = self._build_domino_head_inputs(
             input_ids=input_ids,
             anchor_positions=anchor_positions,
