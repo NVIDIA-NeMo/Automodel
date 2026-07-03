@@ -9,6 +9,7 @@ import shutil
 import time
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.distributed
@@ -20,7 +21,6 @@ from nemo_automodel.components.loss.embedding_distill import EmbeddingDistillLos
 from nemo_automodel.components.loss.infonce import InfoNCEDistillLoss, InfoNCELoss
 from nemo_automodel.components.loss.intermediate_distill import IntermediateDistillLoss
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from nemo_automodel.recipes.llm.train_ft import build_lr_scheduler
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 
 logger = logging.getLogger(__name__)
@@ -287,11 +287,7 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
             if self.teacher_model is not None and hasattr(self.teacher_model, "attach_intermediate_capture"):
                 self.teacher_model.attach_intermediate_capture(teacher_layers)
 
-        projection_lr = self.cfg.get("projection_lr", None)
-        restore_from = self.cfg.get("checkpoint.restore_from", None)
         self._sync_projection_parameters()
-        if restore_from is None:
-            self._rebuild_optimizer_with_projection_group(projection_lr)
 
     def _projection_parameters(self) -> list[torch.nn.Parameter]:
         model = self.model_parts[0]
@@ -337,11 +333,13 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
             torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.SUM, group=dp_group)
             param.grad.div_(dp_size)
 
-    def _rebuild_optimizer_with_projection_group(self, projection_lr: float | None) -> None:
+    def _build_optimizer_param_groups(self) -> list[dict[str, Any]]:
+        """Build optimizer groups with projection params isolated before checkpoint restore."""
         model = self.model_parts[0]
         decay_params = []
         no_decay_params = []
         proj_params = []
+        projection_lr = self.cfg.get("projection_lr", None)
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
@@ -366,14 +364,14 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
                 group["lr"] = float(projection_lr)
             param_groups.append(group)
 
-        new_optimizer = self.cfg.optimizer.instantiate(params=param_groups)
-        if not isinstance(self.optimizer, list):
-            raise TypeError(f"Expected optimizer to be a list, got {type(self.optimizer)}")
-        self.optimizer[:] = [new_optimizer]
-
-        new_lr_schedulers = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
-        if isinstance(self.lr_scheduler, list):
-            self.lr_scheduler[:] = [] if new_lr_schedulers is None else list(new_lr_schedulers)
+        assert param_groups, "no trainable parameters found"
+        logger.info(
+            "Optimizer param groups: decay=%d, no_decay=%d, projection=%d",
+            len(decay_params),
+            len(no_decay_params),
+            len(proj_params),
+        )
+        return param_groups
 
     def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
         uses_hard_negatives = self.loss_weights["nce"] > 0 or self.loss_weights["nce_kd"] > 0
