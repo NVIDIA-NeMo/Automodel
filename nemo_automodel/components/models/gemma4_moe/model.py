@@ -78,6 +78,7 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     CausalLMOutputWithPast = _make_missing("CausalLMOutputWithPast")
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_untied_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
@@ -925,6 +926,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     ):
         if not _GEMMA4_HF_AVAILABLE:
             raise UnavailableError("transformers.models.gemma4 is not available.")
+        # Gemma4 is tied by default; untying would need a materialized separate
+        # lm_head NeMo doesn't build, so reject tie_word_embeddings=False up front.
+        reject_unsupported_untied_word_embeddings(config, type(self).__name__)
         backend = backend or BackendConfig()
 
         # Merge text_config overrides (e.g. from YAML) into the proper config
