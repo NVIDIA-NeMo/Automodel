@@ -190,15 +190,16 @@ class DominoTrainerModule(DFlashTrainerModule):
         """Add the GRU-conditioned low-rank correction to the suffix base logits."""
         bsz, n, bs = target_ids.shape
         # A tensor-parallel target's embed_tokens is vocab-parallel and returns a
-        # DTensor; gather it so the (plain) GRU consumes a plain tensor.
+        # DTensor; gather it so the (plain) GRU consumes a plain tensor. ``prev_ids``
+        # already equals ``target_ids`` when not ``shift_label`` (set by
+        # ``_build_domino_head_inputs``), so one embed call covers both branches.
+        block_emb = _to_full_tensor(self.embed_tokens(prev_ids))
         if self.shift_label:
-            block_emb = _to_full_tensor(self.embed_tokens(prev_ids))
             gru_inputs = block_emb.reshape(bsz * n, bs, -1)
             gru_out, _ = self.draft_model.prefix_gru(gru_inputs)
             gru_out = gru_out.reshape(bsz, n, bs, -1)
             prefix_states = gru_out[:, :, self._suffix_start :, :]
         else:
-            block_emb = _to_full_tensor(self.embed_tokens(target_ids))
             gru_inputs = block_emb[:, :, : bs - 1, :].reshape(bsz * n, bs - 1, -1)
             gru_out, _ = self.draft_model.prefix_gru(gru_inputs)
             gru_out = gru_out.reshape(bsz, n, bs - 1, -1)
