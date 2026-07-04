@@ -270,9 +270,15 @@ def attach_cp_kv_gather_hooks(model: torch.nn.Module, cp_mesh) -> None:
         q_pos = torch.arange(seq_local, device=query.device) + cp_rank * seq_local
         k_pos = torch.arange(k_full.shape[2], device=query.device)
         mask = q_pos[:, None] >= k_pos[None, :]
-        return _original_sdpa(
-            query, k_full, v_full, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=enable_gqa
-        )
+        # The target's forward may run inside an sdpa_kernel context that excludes
+        # MATH (e.g. [FLASH, EFFICIENT]); flash/efficient reject a boolean mask with
+        # GQA, so pin a MATH-inclusive context for this gather attention.
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+            return _original_sdpa(
+                query, k_full, v_full, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=enable_gqa
+            )
 
     def _pre_hook(module, args, kwargs):
         F_module.scaled_dot_product_attention = _cp_gather_sdpa
