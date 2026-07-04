@@ -58,6 +58,63 @@ def _cp_shift_left(tensor: torch.Tensor, cp_group) -> torch.Tensor:
     return shifted
 
 
+def _cp_shift_left_zigzag(tensor: torch.Tensor, cp_group) -> torch.Tensor:
+    """Left-shift a ZIG-ZAG-sharded sequence tensor by one position.
+
+    Under zig-zag sharding rank ``r`` holds two non-contiguous global chunks --
+    the early chunk ``r`` and the late chunk ``2*cp-1-r`` -- laid out locally as
+    ``[early | late]`` (each of length ``c = local_len/2``). A global left-shift
+    therefore rolls each half locally and needs two boundary tokens:
+
+    * the early half's tail (global end of chunk ``r``) is the head of chunk
+      ``r+1`` -- rank ``r+1``'s early head -- except on the last rank, where chunk
+      ``r+1`` is that rank's OWN late chunk, so the fill is local.
+    * the late half's tail (global end of chunk ``2*cp-1-r``) is the head of chunk
+      ``2*cp-r`` -- rank ``r-1``'s late head -- except on rank 0, whose late tail is
+      the global last position and stays zero-filled.
+
+    Two ring P2P exchanges (early head -> ``r-1``, late head -> ``r+1``) cover both.
+    Used for labels / input_ids only (no grad). Applied in lockstep each TTT step
+    this reproduces the global shift exactly. See :func:`_cp_shift_left` for the
+    contiguous-shard analogue.
+    """
+    c = tensor.shape[1] // 2
+    early, late = tensor[:, :c], tensor[:, c:]
+    zero = torch.zeros_like(tensor[:, :1])
+    early_shift = torch.cat((early[:, 1:], zero), dim=1)
+    late_shift = torch.cat((late[:, 1:], zero.clone()), dim=1)
+
+    world = dist.get_world_size(cp_group)
+    if world == 1:
+        # Rank 0 owns [chunk 0 | chunk 1] = the whole sequence in order: the early
+        # tail is the late head, the late tail is the global end (zero).
+        early_shift = torch.cat((early_shift[:, :-1], late[:, :1]), dim=1)
+        return torch.cat((early_shift, late_shift), dim=1)
+
+    rank = dist.get_rank(cp_group)
+    early_head = early[:, :1].contiguous()
+    late_head = late[:, :1].contiguous()
+    recv_early = torch.empty_like(early_head)  # rank+1's early head -> my early tail
+    recv_late = torch.empty_like(late_head)  # rank-1's late head -> my late tail
+    prev = dist.get_global_rank(cp_group, (rank - 1) % world)
+    nxt = dist.get_global_rank(cp_group, (rank + 1) % world)
+    for req in dist.batch_isend_irecv(
+        [
+            dist.P2POp(dist.isend, early_head, prev, group=cp_group),
+            dist.P2POp(dist.irecv, recv_early, nxt, group=cp_group),
+            dist.P2POp(dist.isend, late_head, nxt, group=cp_group),
+            dist.P2POp(dist.irecv, recv_late, prev, group=cp_group),
+        ]
+    ):
+        req.wait()
+
+    early_tail = recv_early if rank < world - 1 else late[:, :1]
+    early_shift = torch.cat((early_shift[:, :-1], early_tail), dim=1)
+    if rank >= 1:  # rank 0's late tail is the global end -> keep the zero fill
+        late_shift = torch.cat((late_shift[:, :-1], recv_late), dim=1)
+    return torch.cat((early_shift, late_shift), dim=1)
+
+
 class _CpAllReduceSum(torch.autograd.Function):
     """Differentiable sum-all-reduce across the cp group.
 
@@ -127,6 +184,7 @@ class Eagle3TrainerModule(nn.Module):
         selected_token_mask: torch.Tensor,
         ttt_steps: int,
         cp_group=None,
+        cp_zigzag: bool = False,
     ):
         super().__init__()
         # The forward pass weighs each TTT step by ``0.8 ** i`` and divides
@@ -149,6 +207,9 @@ class Eagle3TrainerModule(nn.Module):
         # parallelism; the per-step left-shift then rolls tokens across rank
         # boundaries via P2P instead of zero-filling. None for the single-rank path.
         self.cp_group = cp_group
+        # Whether the cp sharding is the load-balanced zig-zag layout (selects the
+        # matching two-neighbour boundary shift) vs the contiguous layout.
+        self.cp_zigzag = cp_zigzag
 
     def forward(
         self,
@@ -270,9 +331,12 @@ class Eagle3TrainerModule(nn.Module):
             running_valid = running_valid + valid_mask.sum()
 
             if step_idx + 1 < self.ttt_steps:
-                shift = (
-                    (lambda t: _cp_shift_left(t, self.cp_group)) if self.cp_group is not None else _shift_left_with_zero
-                )
+                if self.cp_group is None:
+                    shift = _shift_left_with_zero
+                elif self.cp_zigzag:
+                    shift = lambda t: _cp_shift_left_zigzag(t, self.cp_group)  # noqa: E731
+                else:
+                    shift = lambda t: _cp_shift_left(t, self.cp_group)  # noqa: E731
                 cur_input_ids = shift(cur_input_ids)
                 cur_position_mask = shift(cur_position_mask)
                 cur_target_probs = shift(cur_target_probs)

@@ -266,6 +266,9 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         # parallelism: the sequence is sharded across this cp group and the mixed
         # causal/TTT-diagonal attention runs as a differentiable ring. None otherwise.
         self._cp_group = None
+        # When True the cp ring uses the load-balanced zig-zag layout (inputs must
+        # be sharded in zig-zag order); False uses the contiguous ring.
+        self._cp_zigzag = False
 
     def _project_qkv(self, combined_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = combined_states.shape
@@ -343,7 +346,10 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         diagonals stay local. Inputs are ``[B, H, T_local, D]``; the ring works in
         FlashAttention ``[B, T_local, H, D]`` layout.
         """
-        from nemo_automodel.components.distributed.ring_attention import cached_ring_attention
+        from nemo_automodel.components.distributed.ring_attention import (
+            cached_ring_attention,
+            cached_zigzag_ring_attention,
+        )
 
         # RoPE upcasts q/k to fp32; the ring uses FlashAttention (fp16/bf16 only), so
         # cast to the module's compute dtype (matches the plain FA2 path).
@@ -351,7 +357,8 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         qf = q.transpose(1, 2).contiguous().to(dt)
         ckf = [t.transpose(1, 2).contiguous().to(dt) for t in cache_k]
         cvf = [t.transpose(1, 2).contiguous().to(dt) for t in cache_v]
-        out = cached_ring_attention(qf, ckf, cvf, self._cp_group, self.scaling)  # [B, T, H, D]
+        ring = cached_zigzag_ring_attention if self._cp_zigzag else cached_ring_attention
+        out = ring(qf, ckf, cvf, self._cp_group, self.scaling)  # [B, T, H, D]
         return out.reshape(batch_size, seq_len, -1)
 
     def _eager_attention_forward(
@@ -509,16 +516,19 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         return attn_output_bhtd, lse_fa
 
 
-def attach_eagle3_cp_attention(model: nn.Module, cp_group) -> None:
+def attach_eagle3_cp_attention(model: nn.Module, cp_group, zigzag: bool = False) -> None:
     """Route every EAGLE-3 draft attention through the context-parallel ring path.
 
     Sets ``_cp_group`` on each :class:`Eagle3LlamaAttention` so its forward runs the
     differentiable causal-ring + TTT-diagonal attention over the cp-sharded sequence.
-    A no-op ``cp_group`` of size 1 leaves the plain per-rank path in place.
+    A no-op ``cp_group`` of size 1 leaves the plain per-rank path in place. With
+    ``zigzag=True`` the load-balanced zig-zag ring is used (the inputs must then be
+    sharded in zig-zag order); otherwise the contiguous ring.
     """
     for module in model.modules():
         if isinstance(module, Eagle3LlamaAttention):
             module._cp_group = cp_group
+            module._cp_zigzag = zigzag
 
 
 class Eagle3LlamaMLP(nn.Module):
