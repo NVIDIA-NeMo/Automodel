@@ -232,6 +232,10 @@ def attach_cp_kv_gather_hooks(model: torch.nn.Module, cp_mesh) -> None:
     import torch.nn.functional as F_module
 
     _original_sdpa = F_module.scaled_dot_product_attention
+    # The global causal mask depends only on the shard geometry (seq_local, cp
+    # rank/size), which is constant across layers and steps, so build it once and
+    # reuse it rather than reallocating an ``[S_local, S]`` bool tensor per layer.
+    _mask_cache: dict = {}
 
     @torch._dynamo.disable
     def _cp_gather_sdpa(
@@ -266,10 +270,15 @@ def attach_cp_kv_gather_hooks(model: torch.nn.Module, cp_mesh) -> None:
         k_full = torch.cat(k_parts, dim=2)
         v_full = torch.cat(v_parts, dim=2)
         # Global causal mask: local query at global position ``cp_rank*seq_local + i``
-        # attends to every key position ``j`` up to and including it.
-        q_pos = torch.arange(seq_local, device=query.device) + cp_rank * seq_local
-        k_pos = torch.arange(k_full.shape[2], device=query.device)
-        mask = q_pos[:, None] >= k_pos[None, :]
+        # attends to every key position ``j`` up to and including it. Cached on the
+        # shard geometry (constant across layers/steps).
+        mask_key = (seq_local, k_full.shape[2], query.device)
+        mask = _mask_cache.get(mask_key)
+        if mask is None:
+            q_pos = torch.arange(seq_local, device=query.device) + cp_rank * seq_local
+            k_pos = torch.arange(k_full.shape[2], device=query.device)
+            mask = q_pos[:, None] >= k_pos[None, :]
+            _mask_cache[mask_key] = mask
         # The target's forward may run inside an sdpa_kernel context that excludes
         # MATH (e.g. [FLASH, EFFICIENT]); flash/efficient reject a boolean mask with
         # GQA, so pin a MATH-inclusive context for this gather attention.
@@ -277,7 +286,14 @@ def attach_cp_kv_gather_hooks(model: torch.nn.Module, cp_mesh) -> None:
 
         with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
             return _original_sdpa(
-                query, k_full, v_full, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=enable_gqa
+                query,
+                k_full,
+                v_full,
+                attn_mask=mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=scale,
+                enable_gqa=enable_gqa,
             )
 
     def _pre_hook(module, args, kwargs):
