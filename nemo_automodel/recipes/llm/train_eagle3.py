@@ -103,6 +103,7 @@ def _validate_cp_gates(
     target_force_hf: bool = False,
     target_attn_implementation: str | None = None,
     seq_length: int | None = None,
+    cp_zigzag: bool = False,
 ) -> None:
     """Reject context-parallel combinations the EAGLE-3 target path cannot honor.
 
@@ -147,8 +148,14 @@ def _validate_cp_gates(
             "Context parallelism (cp_size>1) runs the EAGLE-3 draft on the ring FlashAttention "
             "kernels, which require the flash-attn package. Install flash-attn or set cp_size=1."
         )
-    if seq_length is not None and seq_length % cp_size != 0:
-        raise ValueError(f"Context parallelism requires seq_length ({seq_length}) divisible by cp_size ({cp_size}).")
+    # Zig-zag chunks the sequence into 2*cp pieces (rank r owns chunks r and 2*cp-1-r),
+    # so it needs divisibility by 2*cp_size; the contiguous shard needs only cp_size.
+    divisor = 2 * cp_size if cp_zigzag else cp_size
+    if seq_length is not None and seq_length % divisor != 0:
+        raise ValueError(
+            f"Context parallelism ({'zig-zag' if cp_zigzag else 'contiguous'}) requires seq_length "
+            f"({seq_length}) divisible by {divisor}."
+        )
 
 
 def _validate_tp_gates(tp_size: int, backend: str, cp_size: int) -> None:
@@ -359,6 +366,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.cp_group = None
         if self.cp_mesh is not None and self.cp_mesh.size() > 1:
             self.cp_group = self.cp_mesh.get_group()
+        # Load-balanced zig-zag sharding for the draft cp ring (vs the default
+        # contiguous shard, which leaves the last rank doing ~2x the causal work).
+        self.cp_zigzag = bool(recipe_cfg.get("cp_zigzag", False))
 
         if parallel_drafting:
             if self.cp_group is not None:
@@ -370,13 +380,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             if self.cp_group is not None:
                 from nemo_automodel.components.speculative.eagle.draft_llama import attach_eagle3_cp_attention
 
-                attach_eagle3_cp_attention(self.draft_model, self.cp_group)
+                attach_eagle3_cp_attention(self.draft_model, self.cp_group, zigzag=self.cp_zigzag)
             trainer_module = Eagle3TrainerModule(
                 self.draft_model,
                 selected_token_ids=selected_token_ids,
                 selected_token_mask=selected_token_mask,
                 ttt_steps=recipe_cfg.ttt_steps,
                 cp_group=self.cp_group,
+                cp_zigzag=self.cp_zigzag,
             ).to(self.device)
         if self.dist_env.world_size > 1:
             # Under context parallelism the draft is replicated across cp ranks
@@ -521,6 +532,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             target_force_hf=bool(recipe_cfg.get("target_force_hf", False)),
             target_attn_implementation=recipe_cfg.get("target_attn_implementation", None),
             seq_length=int(recipe_cfg.get("seq_length", 0) or 0) or None,
+            cp_zigzag=bool(recipe_cfg.get("cp_zigzag", False)),
         )
         _validate_tp_gates(tp_size, backend, cp_size)
         if backend == "remote":
@@ -803,27 +815,46 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         """Shard the draft supervision along the sequence for context parallelism.
 
         The target emits full-sequence aux/logits (gathered); the draft runs sharded,
-        so slice every ``[B, S, ...]`` tensor to this rank's cp shard and inject the
-        global ``position_ids``. No-op without CP.
+        so gather every ``[B, S, ...]`` tensor to this rank's cp shard (via a global
+        index) and inject the matching global ``position_ids``. The index is the
+        contiguous shard by default, or the load-balanced zig-zag layout (rank ``r``
+        owns chunks ``r`` and ``2*cp-1-r``) when ``cp_zigzag``. No-op without CP.
         """
         if getattr(self, "cp_group", None) is None:
             return inputs
         cp_size = self.cp_mesh.size()
         cp_rank = self.cp_mesh.get_local_rank()
         seq_len = inputs["input_ids"].shape[1]
-        if seq_len % cp_size != 0:
-            raise ValueError(f"Context parallelism requires seq_length ({seq_len}) divisible by cp_size ({cp_size}).")
-        local = seq_len // cp_size
-        sl = slice(cp_rank * local, (cp_rank + 1) * local)
+        device = inputs["input_ids"].device
+        if getattr(self, "cp_zigzag", False):
+            if seq_len % (2 * cp_size) != 0:
+                raise ValueError(
+                    f"Zig-zag context parallelism requires seq_length ({seq_len}) divisible by "
+                    f"2*cp_size ({2 * cp_size})."
+                )
+            c = seq_len // (2 * cp_size)
+            idx = torch.cat(
+                (
+                    torch.arange(cp_rank * c, (cp_rank + 1) * c, device=device),
+                    torch.arange((2 * cp_size - 1 - cp_rank) * c, (2 * cp_size - cp_rank) * c, device=device),
+                )
+            )
+        else:
+            if seq_len % cp_size != 0:
+                raise ValueError(
+                    f"Context parallelism requires seq_length ({seq_len}) divisible by cp_size ({cp_size})."
+                )
+            local = seq_len // cp_size
+            idx = torch.arange(cp_rank * local, (cp_rank + 1) * local, device=device)
         out = {
-            k: (v[:, sl].contiguous() if (torch.is_tensor(v) and v.dim() >= 2 and v.shape[1] == seq_len) else v)
+            k: (
+                v.index_select(1, idx).contiguous()
+                if (torch.is_tensor(v) and v.dim() >= 2 and v.shape[1] == seq_len)
+                else v
+            )
             for k, v in inputs.items()
         }
-        out["position_ids"] = (
-            torch.arange(cp_rank * local, (cp_rank + 1) * local, device=inputs["input_ids"].device)
-            .unsqueeze(0)
-            .expand(inputs["input_ids"].shape[0], -1)
-        )
+        out["position_ids"] = idx.unsqueeze(0).expand(inputs["input_ids"].shape[0], -1)
         return out
 
     def _all_reduce_draft_grads_over_cp(self) -> None:
