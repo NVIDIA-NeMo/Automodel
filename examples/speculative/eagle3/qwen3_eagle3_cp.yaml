@@ -52,6 +52,11 @@ recipe_args:
   # CP is incompatible with sequence packing (the 4D block-causal mask), so it
   # is gated off when cp_size > 1. Keep packing disabled here.
   packed_sequence_size: 0
+  # Load-balanced zig-zag sharding for the draft ring: rank r owns chunks r and
+  # 2*cp-1-r so every rank does equal causal work (a contiguous shard leaves the
+  # last rank doing ~2x). Needs seq_length divisible by 2*cp_size. Default false
+  # (contiguous). Same loss/gradients as the contiguous layout, just balanced.
+  cp_zigzag: false
 
 rng:
   seed: 42
