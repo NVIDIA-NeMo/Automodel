@@ -345,9 +345,12 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         """
         from nemo_automodel.components.distributed.ring_attention import cached_ring_attention
 
-        qf = q.transpose(1, 2).contiguous()
-        ckf = [t.transpose(1, 2).contiguous() for t in cache_k]
-        cvf = [t.transpose(1, 2).contiguous() for t in cache_v]
+        # RoPE upcasts q/k to fp32; the ring uses FlashAttention (fp16/bf16 only), so
+        # cast to the module's compute dtype (matches the plain FA2 path).
+        dt = self.o_proj.weight.dtype
+        qf = q.transpose(1, 2).contiguous().to(dt)
+        ckf = [t.transpose(1, 2).contiguous().to(dt) for t in cache_k]
+        cvf = [t.transpose(1, 2).contiguous().to(dt) for t in cache_v]
         out = cached_ring_attention(qf, ckf, cvf, self._cp_group, self.scaling)  # [B, T, H, D]
         return out.reshape(batch_size, seq_len, -1)
 
