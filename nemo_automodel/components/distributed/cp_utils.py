@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import contextlib
-from typing import List, Optional, Set
+from typing import Callable, List, Optional, Set
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -187,6 +187,71 @@ def gather_cp_seq(cp_mesh: DeviceMesh, tensors: List[torch.Tensor], seq_dim: int
     local_tensors = [t.to_local() if isinstance(t, DTensor) else t for t in tensors]
     full = context_parallel_unshard(cp_mesh, local_tensors, [seq_dim] * len(local_tensors))
     return [t.narrow(seq_dim, 0, orig_len).contiguous() for t in full]
+
+
+def run_target_cp_forward_and_gather(
+    cp_mesh: DeviceMesh,
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    forward_kwargs: dict,
+    collect: Callable[[object], List[torch.Tensor]],
+    position_ids: Optional[torch.Tensor] = None,
+    filter_kwargs: bool = False,
+) -> tuple:
+    """Run a frozen target under context parallelism and gather its outputs.
+
+    Shards ``input_ids`` (and ``position_ids``) along the sequence via
+    :func:`make_target_cp_ctx`, runs ``model`` as ring attention with
+    ``attention_mask=None`` (the ``self_attn`` hooks force ``is_causal``), and --
+    still inside the CP context, before any capture hooks are removed -- gathers
+    the tensors returned by ``collect(outputs)`` back to the full sequence with
+    :func:`gather_cp_seq` (``seq_dim=1``, un-padded to ``orig_len``).
+
+    Centralizes the gather-inside-context invariant and the ``seq_dim``/``orig_len``
+    contract shared by the eagle3/dflash/dspark target wrappers, so a fix lands in
+    one place instead of drifting across three copies.
+
+    Args:
+        cp_mesh: The ``cp`` device submesh.
+        model: The frozen target module.
+        input_ids: Full (unsharded) ``[B, T]`` token ids.
+        forward_kwargs: Extra kwargs for ``model.forward``. Must not include
+            ``input_ids`` / ``attention_mask`` / ``position_ids`` -- those are
+            injected here (CP forces ``attention_mask=None``).
+        collect: ``callable(outputs) -> list[Tensor]`` selecting the tensors to
+            gather; invoked inside the CP context after the forward, so it also
+            sees any tensors captured by forward hooks.
+        position_ids: Optional ``[B, T]`` / ``[1, T]`` positions; an arange is
+            injected by :func:`make_target_cp_ctx` when omitted.
+        filter_kwargs: Drop kwargs the model's forward does not accept (via
+            :func:`filter_forward_kwargs`) -- needed for the VLM/MoE targets.
+
+    Returns:
+        ``(outputs, gathered)`` -- the raw model outputs and the list of
+        full-sequence gathered tensors, in the order ``collect`` returned them.
+    """
+    import inspect
+
+    # CP shards the sequence, so the target MUST honor per-shard position_ids;
+    # a target whose forward ignores them would attend at the wrong positions.
+    if "position_ids" not in inspect.signature(model.forward).parameters:
+        raise ValueError("Context parallelism requires the target model's forward to accept `position_ids`.")
+
+    cp_ctx, cp_input_ids, cp_position_ids, orig_len = make_target_cp_ctx(cp_mesh, input_ids, position_ids)
+    call_kwargs = {
+        "input_ids": cp_input_ids,
+        "attention_mask": None,
+        "position_ids": cp_position_ids,
+        **forward_kwargs,
+    }
+    if filter_kwargs:
+        from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+
+        call_kwargs = filter_forward_kwargs(model, call_kwargs)
+    with cp_ctx:
+        outputs = model(**call_kwargs)
+        gathered = gather_cp_seq(cp_mesh, collect(outputs), seq_dim=1, orig_len=orig_len)
+    return outputs, gathered
 
 
 def attach_context_parallel_hooks(model: torch.nn.Module):

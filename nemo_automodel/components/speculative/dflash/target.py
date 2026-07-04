@@ -146,27 +146,19 @@ class HFDFlashTargetModel:
         try:
             if self._cp_size > 1:
                 # Shard the sequence, run the target as ring attention, then gather the
-                # captured layers (and logits) back to the full sequence. The self_attn
-                # hooks strip the mask and force is_causal, so attention_mask is None.
-                from nemo_automodel.components.distributed.cp_utils import gather_cp_seq, make_target_cp_ctx
+                # captured layers (and logits) back to the full sequence.
+                from nemo_automodel.components.distributed.cp_utils import run_target_cp_forward_and_gather
 
-                if "position_ids" not in forward_params:
-                    raise ValueError(
-                        "Context parallelism requires the target model's forward to accept `position_ids`."
-                    )
-                cp_ctx, cp_input_ids, cp_position_ids, orig_len = make_target_cp_ctx(self.cp_mesh, input_ids)
-                with cp_ctx:
-                    output = self.model(
-                        input_ids=cp_input_ids,
-                        attention_mask=None,
-                        position_ids=cp_position_ids,
-                        **extra_kwargs,
-                    )
+                def _collect(output):
                     self._check_captured(captured)
                     to_gather = [captured[layer_id] for layer_id in order]
                     if self.capture_logits:
                         to_gather.append(getattr(output, "logits", output))
-                    gathered = gather_cp_seq(self.cp_mesh, to_gather, seq_dim=1, orig_len=orig_len)
+                    return to_gather
+
+                _output, gathered = run_target_cp_forward_and_gather(
+                    self.cp_mesh, self.model, input_ids, extra_kwargs, _collect
+                )
                 for i, layer_id in enumerate(order):
                     captured[layer_id] = gathered[i]
                 logits = gathered[-1] if self.capture_logits else None

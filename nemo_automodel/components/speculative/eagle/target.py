@@ -316,32 +316,17 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
                 # Packing (which needs the 4D block-causal mask) is gated off
                 # upstream, so attention_mask is None and the self_attn hooks force
                 # is_causal.
-                from nemo_automodel.components.distributed.cp_utils import gather_cp_seq, make_target_cp_ctx
+                from nemo_automodel.components.distributed.cp_utils import run_target_cp_forward_and_gather
 
-                if "position_ids" not in forward_params:
-                    raise ValueError(
-                        "Context parallelism requires the target model's forward to accept `position_ids`."
-                    )
-                cp_ctx, cp_input_ids, cp_position_ids, orig_len = make_target_cp_ctx(
-                    self.cp_mesh, input_ids, position_ids
-                )
-                cp_extra = {k: v for k, v in extra_kwargs.items() if k != "position_ids"}
-                with cp_ctx:
-                    outputs = self.model(
-                        input_ids=cp_input_ids,
-                        attention_mask=None,
-                        position_ids=cp_position_ids,
-                        **cp_extra,
-                    )
+                def _collect(outputs):
                     raw_logits = outputs.logits if hasattr(outputs, "logits") else outputs
                     self._check_captured(captured)
-                    # Gather inside the CP context, before the hooks are removed.
-                    gathered = gather_cp_seq(
-                        self.cp_mesh,
-                        [captured[layer_id] for layer_id in self.aux_layer_ids] + [raw_logits],
-                        seq_dim=1,
-                        orig_len=orig_len,
-                    )
+                    return [captured[layer_id] for layer_id in self.aux_layer_ids] + [raw_logits]
+
+                cp_extra = {k: v for k, v in extra_kwargs.items() if k != "position_ids"}
+                _outputs, gathered = run_target_cp_forward_and_gather(
+                    self.cp_mesh, self.model, input_ids, cp_extra, _collect, position_ids=position_ids
+                )
                 aux_hidden_states = torch.cat(gathered[:-1], dim=-1)
                 target_logits = gathered[-1]
             else:

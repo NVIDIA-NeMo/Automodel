@@ -187,28 +187,26 @@ class HFDSparkTargetModel:
 
         if self._cp_size > 1:
             # Shard the sequence, run the target as ring attention, then gather every
-            # captured hidden state back to the full sequence. The self_attn hooks
-            # strip the mask and force is_causal, so attention_mask is None.
-            from nemo_automodel.components.distributed.cp_utils import gather_cp_seq, make_target_cp_ctx
+            # captured hidden state back to the full sequence.
+            from nemo_automodel.components.distributed.cp_utils import run_target_cp_forward_and_gather
 
-            cp_ctx, cp_input_ids, cp_position_ids, orig_len = make_target_cp_ctx(self.cp_mesh, input_ids)
-            forward_kwargs = filter_forward_kwargs(
-                self.model,
-                dict(
-                    input_ids=cp_input_ids,
-                    attention_mask=None,
-                    position_ids=cp_position_ids,
-                    use_cache=False,
-                    **mm_kwargs,
-                ),
-            )
+            keys: list = []
+
+            def _collect(_outputs):
+                if "norm" not in captured:
+                    raise RuntimeError("DSpark target capture did not record the final-norm output.")
+                keys.extend(captured.keys())
+                return [captured[k] for k in keys]
+
             try:
-                with cp_ctx:
-                    self.model(**forward_kwargs)
-                    if "norm" not in captured:
-                        raise RuntimeError("DSpark target capture did not record the final-norm output.")
-                    keys = list(captured.keys())
-                    gathered = gather_cp_seq(self.cp_mesh, [captured[k] for k in keys], seq_dim=1, orig_len=orig_len)
+                _outputs, gathered = run_target_cp_forward_and_gather(
+                    self.cp_mesh,
+                    self.model,
+                    input_ids,
+                    dict(use_cache=False, **mm_kwargs),
+                    _collect,
+                    filter_kwargs=True,
+                )
             finally:
                 for handle in handles:
                     handle.remove()
