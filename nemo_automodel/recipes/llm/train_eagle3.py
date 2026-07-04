@@ -96,13 +96,24 @@ def _submesh_or_none(device_mesh, name: str):
         return None
 
 
-def _validate_cp_gates(cp_size: int, backend: str, packed_sequence_size: int) -> None:
+def _validate_cp_gates(
+    cp_size: int,
+    backend: str,
+    packed_sequence_size: int,
+    target_force_hf: bool = False,
+    target_attn_implementation: str | None = None,
+    seq_length: int | None = None,
+) -> None:
     """Reject context-parallel combinations the EAGLE-3 target path cannot honor.
 
     CP shards the target forward along the sequence and forces ``is_causal`` (the
     self_attn hooks strip the attention_mask), so it is incompatible with sequence
     packing (which needs the 4D block-causal mask) and with the remote backend
-    (whose target runs out-of-process).
+    (whose target runs out-of-process). Under CP the frozen target must route
+    through HuggingFace ``F.scaled_dot_product_attention`` -- that is the call the
+    K/V-gather hook intercepts -- and the draft runs the flash-attn ring, so all of
+    the target-backend / kernel / divisibility preconditions are checked here so a
+    misconfig fails at setup rather than mid-forward.
     """
     if cp_size > 1 and backend == "remote":
         raise NotImplementedError(
@@ -115,6 +126,29 @@ def _validate_cp_gates(cp_size: int, backend: str, packed_sequence_size: int) ->
             "strips the 4D block-causal mask that packing relies on. Set cp_size=1 or "
             "packed_sequence_size=0."
         )
+    if cp_size <= 1:
+        return
+    if not target_force_hf:
+        raise NotImplementedError(
+            "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
+            "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
+        )
+    if target_attn_implementation != "sdpa":
+        raise NotImplementedError(
+            "Context parallelism (cp_size>1) requires recipe_args.target_attn_implementation=sdpa. "
+            "The K/V-gather hook intercepts F.scaled_dot_product_attention; any other backend "
+            "(e.g. flash_attention_2, the HF auto-select default when flash-attn is installed) "
+            "bypasses the hook, so each rank silently attends only its own shard."
+        )
+    from nemo_automodel.components.distributed.ring_attention import HAVE_FLASH_ATTN
+
+    if not HAVE_FLASH_ATTN:
+        raise RuntimeError(
+            "Context parallelism (cp_size>1) runs the EAGLE-3 draft on the ring FlashAttention "
+            "kernels, which require the flash-attn package. Install flash-attn or set cp_size=1."
+        )
+    if seq_length is not None and seq_length % cp_size != 0:
+        raise ValueError(f"Context parallelism requires seq_length ({seq_length}) divisible by cp_size ({cp_size}).")
 
 
 def _validate_tp_gates(tp_size: int, backend: str, cp_size: int) -> None:
@@ -480,16 +514,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # submeshes are only built later, inside the colocated path).
         cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
         tp_size = int(self.cfg.get("distributed.tp_size", 1) or 1)
-        _validate_cp_gates(cp_size, backend, packed_sequence_size)
+        _validate_cp_gates(
+            cp_size,
+            backend,
+            packed_sequence_size,
+            target_force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            target_attn_implementation=recipe_cfg.get("target_attn_implementation", None),
+            seq_length=int(recipe_cfg.get("seq_length", 0) or 0) or None,
+        )
         _validate_tp_gates(tp_size, backend, cp_size)
-        # The CP K/V-gather hook attends via the target's torch SDPA call; a
-        # custom-attention (non-HF) target would silently skip it and each rank would
-        # see only its own shard, so require the HF target path.
-        if cp_size > 1 and not bool(recipe_cfg.get("target_force_hf", False)):
-            raise NotImplementedError(
-                "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
-                "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
-            )
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
         elif backend == "sglang":

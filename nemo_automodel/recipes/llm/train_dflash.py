@@ -313,13 +313,23 @@ class TrainDFlashRecipe(BaseRecipe):
                     "yet supported for DFlash; the CP sequence gather does not handle a TP-sharded target "
                     "output. Set tp_size=1 or cp_size=1."
                 )
-            # The CP hook attends via the target's torch SDPA call; a custom-attention
-            # (non-HF) target would silently skip it, so require the HF target path.
-            if cp_size > 1 and not bool(recipe_cfg.get("target_force_hf", False)):
-                raise NotImplementedError(
-                    "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
-                    "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
-                )
+            # The CP hook intercepts the target's F.scaled_dot_product_attention call, so
+            # the target must run HuggingFace SDPA: force_hf picks the HF class and
+            # target_attn_implementation=sdpa keeps it off FA2 (the HF auto-select default
+            # when flash-attn is installed), which would bypass the hook and leave each rank
+            # attending only its own shard.
+            if cp_size > 1:
+                if not bool(recipe_cfg.get("target_force_hf", False)):
+                    raise NotImplementedError(
+                        "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
+                        "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
+                    )
+                if recipe_cfg.get("target_attn_implementation", None) != "sdpa":
+                    raise NotImplementedError(
+                        "Context parallelism (cp_size>1) requires recipe_args.target_attn_implementation=sdpa; "
+                        "any other backend (e.g. flash_attention_2) bypasses the K/V-gather hook, so each rank "
+                        "silently attends only its own shard."
+                    )
         target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         if self.dist_setup is None:
             # ``nn.Module.to`` is in-place; the sharded path is already placed by

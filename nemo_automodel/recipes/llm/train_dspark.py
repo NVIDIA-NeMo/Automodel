@@ -391,13 +391,21 @@ class TrainDSparkRecipe(BaseRecipe):
                     "target; the DeepSeek V4 / GLM-5.2 / Gemma4 / MiniMax M3 targets already run under "
                     "their own expert-parallel / FSDP mesh. Set cp_size=1 for those."
                 )
-            # The CP hook attends via the target's torch SDPA call; a custom-attention
-            # (non-HF) target would silently skip it and each rank would see only its
-            # own shard, so require the HF target path.
+            # The CP hook intercepts the target's F.scaled_dot_product_attention call, so
+            # the target must run HuggingFace SDPA: force_hf picks the HF class and
+            # target_attn_implementation=sdpa keeps it off FA2 (the HF auto-select default
+            # when flash-attn is installed), which would bypass the hook and leave each rank
+            # attending only its own shard.
             if not bool(recipe_cfg.get("target_force_hf", False)):
                 raise NotImplementedError(
                     "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
                     "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
+                )
+            if recipe_cfg.get("target_attn_implementation", None) != "sdpa":
+                raise NotImplementedError(
+                    "Context parallelism (cp_size>1) requires recipe_args.target_attn_implementation=sdpa; "
+                    "any other backend (e.g. flash_attention_2) bypasses the K/V-gather hook, so each rank "
+                    "silently attends only its own shard."
                 )
             self.distributed_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
             self.device_mesh = self.distributed_setup.mesh_context.device_mesh
