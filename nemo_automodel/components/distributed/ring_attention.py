@@ -38,6 +38,15 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
+from nemo_automodel.components.distributed.zigzag_ring_attention import (
+    get_half_index as _zz_half_index,
+)
+from nemo_automodel.components.distributed.zigzag_ring_attention import (
+    zigzag_ring_flash_attn_varlen_backward as _zz_backward,
+)
+from nemo_automodel.components.distributed.zigzag_ring_attention import (
+    zigzag_ring_flash_attn_varlen_forward as _zz_forward,
+)
 from nemo_automodel.shared.import_utils import safe_import
 
 HAVE_FLASH_ATTN, _flash_attn = safe_import("flash_attn.flash_attn_interface")
@@ -293,3 +302,108 @@ def cached_ring_attention(
     ck = torch.stack(cache_k, dim=1)  # [B, num_blocks, T, H, D]
     cv = torch.stack(cache_v, dim=1)
     return _CachedRingAttention.apply(q, ck, cv, process_group, scale)
+
+
+class _CachedZigZagRingAttention(torch.autograd.Function):
+    """Load-balanced variant of :class:`_CachedRingAttention`.
+
+    Identical joint softmax -- block 0 is the causal sequence attention, blocks
+    ``i >= 1`` are per-position TTT diagonals -- but block 0 runs the zig-zag ring
+    so every cp rank does equal causal work (a contiguous shard leaves the last
+    rank doing ~2x). This requires the sequence to be sharded in zig-zag order
+    (rank ``r`` owns chunks ``r`` and ``2*cp-1-r``); the diagonals are layout
+    agnostic (``q`` and ``cache_k[i]`` share the shard) so they merge unchanged.
+
+    Layout matches :class:`_CachedRingAttention` (``q`` is ``[1, T, H, D]``,
+    ``cache_*`` are ``[1, num_blocks, T, H, D]``); the zig-zag ring is varlen and
+    unbatched, so ``B == 1``.
+    """
+
+    @staticmethod
+    def forward(ctx, q, cache_k, cache_v, process_group, scale):
+        assert q.shape[0] == 1, "zig-zag ring is varlen/unbatched (B=1)"
+        world = dist.get_world_size(process_group)
+        seqlen = q.shape[1] * world
+        cu_seqlens = torch.tensor([0, seqlen], dtype=torch.int32, device=q.device)
+        half0 = _zz_half_index(cu_seqlens // world, front=True)
+        half1 = _zz_half_index(cu_seqlens // world, front=False)
+        out_ring, lse_ring = _zz_forward(
+            process_group,
+            q,
+            cache_k[:, 0].contiguous(),
+            cache_v[:, 0].contiguous(),
+            cu_seqlens,
+            seqlen,
+            half0,
+            half1,
+            scale,
+            causal=True,
+        )
+        acc_out = out_ring.float()  # [B, T, H, D]
+        acc_lse = lse_ring.transpose(1, 2).float()  # [B, H, T] -> [B, T, H]
+        num_blocks = cache_k.shape[1]
+        q_f = q.float()
+        for i in range(1, num_blocks):
+            lse_i = (q_f * cache_k[:, i].float()).sum(-1) * scale  # [B, T, H]
+            acc_out, acc_lse = _merge_diag(acc_out, acc_lse, cache_v[:, i].float(), lse_i)
+        ctx.save_for_backward(q, cache_k, cache_v, acc_out, acc_lse, cu_seqlens)
+        ctx.process_group = process_group
+        ctx.scale = scale
+        ctx.seqlen = seqlen
+        ctx.half0, ctx.half1 = half0, half1
+        return acc_out.to(q.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, cache_k, cache_v, out, merged_lse, cu_seqlens = ctx.saved_tensors
+        scale, group = ctx.scale, ctx.process_group
+        num_blocks = cache_k.shape[1]
+        grad_out_f = grad_out.float()
+        q_f = q.float()
+
+        dq, dk0, dv0 = _zz_backward(
+            group,
+            grad_out,
+            q,
+            cache_k[:, 0].contiguous(),
+            cache_v[:, 0].contiguous(),
+            out.to(q.dtype),
+            merged_lse.transpose(1, 2).contiguous(),  # [B, T, H] -> [B, H, T]
+            cu_seqlens,
+            ctx.seqlen,
+            ctx.half0,
+            ctx.half1,
+            scale,
+            causal=True,
+        )
+        dq = dq.float()
+        dcache_k = torch.zeros_like(cache_k, dtype=torch.float32)
+        dcache_v = torch.zeros_like(cache_v, dtype=torch.float32)
+        dcache_k[:, 0] = dk0.float()
+        dcache_v[:, 0] = dv0.float()
+
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].float()
+            vi = cache_v[:, i].float()
+            lse_i = (q_f * ki).sum(-1) * scale  # [B, T, H]
+            wi = torch.exp(lse_i - merged_lse)  # joint-softmax weight of this diagonal
+            d_out_i = grad_out_f * wi.unsqueeze(-1)
+            d_lse_i = wi * (grad_out_f * (vi - out)).sum(-1)
+            dq = dq + d_lse_i.unsqueeze(-1) * scale * ki
+            dcache_k[:, i] = d_lse_i.unsqueeze(-1) * scale * q_f
+            dcache_v[:, i] = d_out_i
+
+        return dq.to(q.dtype), dcache_k.to(cache_k.dtype), dcache_v.to(cache_v.dtype), None, None
+
+
+def cached_zigzag_ring_attention(
+    q: torch.Tensor, cache_k: list[torch.Tensor], cache_v: list[torch.Tensor], process_group, scale: float
+) -> torch.Tensor:
+    """Load-balanced :func:`cached_ring_attention` (zig-zag block-0 ring).
+
+    Inputs must be in zig-zag-sharded layout (see :class:`_CachedZigZagRingAttention`).
+    ``q`` is ``[1, T, H, D]``; ``cache_k``/``cache_v`` are lists of ``[1, T, H, D]``.
+    """
+    ck = torch.stack(cache_k, dim=1)  # [B, num_blocks, T, H, D]
+    cv = torch.stack(cache_v, dim=1)
+    return _CachedZigZagRingAttention.apply(q, ck, cv, process_group, scale)
