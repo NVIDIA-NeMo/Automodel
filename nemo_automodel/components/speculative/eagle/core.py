@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from nemo_automodel.components.loss.soft_ce import masked_soft_cross_entropy
@@ -28,6 +29,68 @@ def _shift_left_with_zero(tensor: torch.Tensor) -> torch.Tensor:
     """Shift a batched sequence tensor left and zero-fill the tail."""
     tail = torch.zeros_like(tensor[:, :1])
     return torch.cat((tensor[:, 1:], tail), dim=1)
+
+
+def _cp_shift_left(tensor: torch.Tensor, cp_group) -> torch.Tensor:
+    """Left-shift a context-parallel-sharded sequence tensor by one position.
+
+    Each rank holds a contiguous ``S/cp`` shard. A plain left-shift would zero-fill
+    the boundary, but the token that rolls into rank ``r``'s tail lives at rank
+    ``r+1``'s head. Shift locally, then P2P the neighbour's (current) head into the
+    tail; the last rank keeps the zero fill. Applied in lockstep each TTT step this
+    reproduces the global shift exactly. Used for labels / input_ids only (no grad).
+    """
+    shifted = torch.cat((tensor[:, 1:], torch.zeros_like(tensor[:, :1])), dim=1)
+    world = dist.get_world_size(cp_group)
+    if world == 1:
+        return shifted
+    rank = dist.get_rank(cp_group)
+    head = tensor[:, :1].contiguous()
+    recv = torch.empty_like(head)
+    send_to = dist.get_global_rank(cp_group, (rank - 1) % world)  # my head -> rank-1
+    recv_from = dist.get_global_rank(cp_group, (rank + 1) % world)  # rank+1's head -> my tail
+    for req in dist.batch_isend_irecv(
+        [dist.P2POp(dist.isend, head, send_to, group=cp_group), dist.P2POp(dist.irecv, recv, recv_from, group=cp_group)]
+    ):
+        req.wait()
+    if rank != world - 1:  # the last rank has no successor -> keep the zero fill
+        shifted = torch.cat((shifted[:, :-1], recv), dim=1)
+    return shifted
+
+
+class _CpAllReduceSum(torch.autograd.Function):
+    """Differentiable sum-all-reduce across the cp group.
+
+    Forward sums per-rank inputs into a replicated total. Each rank uses that total
+    identically, so the loss gradient w.r.t. this rank's input is just the incoming
+    grad (coefficient 1) -- hence the identity backward.
+    """
+
+    @staticmethod
+    def forward(ctx, x, cp_group):
+        y = x.clone()
+        dist.all_reduce(y, op=dist.ReduceOp.SUM, group=cp_group)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad, None
+
+
+def _cp_global_step_loss(step_loss: torch.Tensor, position_mask: torch.Tensor, cp_group) -> torch.Tensor:
+    """Renormalize a per-shard masked-mean loss over the full cp sequence.
+
+    ``step_loss`` is the mean over this rank's LOCAL supervised positions. Recover the
+    local sum (mean * count), sum both across cp (the sum differentiably), and divide
+    by the global count -- so the loss value equals the full-sequence loss and the
+    backprop'd gradient is the global gradient.
+    """
+    count = position_mask.sum()
+    local_sum = step_loss * count
+    total_sum = _CpAllReduceSum.apply(local_sum, cp_group)
+    total_count = count.detach().clone()
+    dist.all_reduce(total_count, op=dist.ReduceOp.SUM, group=cp_group)
+    return total_sum / total_count.clamp_min(1.0)
 
 
 def _compute_target_distribution(
@@ -63,6 +126,7 @@ class Eagle3TrainerModule(nn.Module):
         selected_token_ids: torch.Tensor,
         selected_token_mask: torch.Tensor,
         ttt_steps: int,
+        cp_group=None,
     ):
         super().__init__()
         # The forward pass weighs each TTT step by ``0.8 ** i`` and divides
@@ -81,6 +145,10 @@ class Eagle3TrainerModule(nn.Module):
         self.register_buffer("selected_token_ids", selected_token_ids, persistent=True)
         self.register_buffer("selected_token_mask", selected_token_mask, persistent=True)
         self.ttt_steps = ttt_steps
+        # cp process group when the draft runs sequence-sharded under context
+        # parallelism; the per-step left-shift then rolls tokens across rank
+        # boundaries via P2P instead of zero-filling. None for the single-rank path.
+        self.cp_group = cp_group
 
     def forward(
         self,
@@ -189,6 +257,11 @@ class Eagle3TrainerModule(nn.Module):
                 target_probs=cur_target_probs,
                 position_mask=step_position_mask,
             )
+            # Under CP each rank sees only its sequence shard; renormalize the step
+            # loss over the full cp sequence so the value and gradient match the
+            # single-GPU run (the draft grads are then summed across cp by the recipe).
+            if self.cp_group is not None:
+                step_loss = _cp_global_step_loss(step_loss, step_position_mask, self.cp_group)
             running_loss = running_loss + step_loss * (0.8**step_idx)
 
             valid_mask = step_position_mask.squeeze(-1).bool()
@@ -197,10 +270,19 @@ class Eagle3TrainerModule(nn.Module):
             running_valid = running_valid + valid_mask.sum()
 
             if step_idx + 1 < self.ttt_steps:
-                cur_input_ids = _shift_left_with_zero(cur_input_ids)
-                cur_position_mask = _shift_left_with_zero(cur_position_mask)
-                cur_target_probs = _shift_left_with_zero(cur_target_probs)
+                shift = (
+                    (lambda t: _cp_shift_left(t, self.cp_group)) if self.cp_group is not None else _shift_left_with_zero
+                )
+                cur_input_ids = shift(cur_input_ids)
+                cur_position_mask = shift(cur_position_mask)
+                cur_target_probs = shift(cur_target_probs)
 
         avg_loss = running_loss / weight_sum
+        if self.cp_group is not None:
+            # Sum the accuracy counters over the cp shards for a full-sequence metric.
+            running_correct = running_correct.clone()
+            running_valid = running_valid.clone()
+            dist.all_reduce(running_correct, op=dist.ReduceOp.SUM, group=self.cp_group)
+            dist.all_reduce(running_valid, op=dist.ReduceOp.SUM, group=self.cp_group)
         accuracy = running_correct / running_valid.clamp_min(1.0)
         return Eagle3StepMetrics(loss=avg_loss, accuracy=accuracy, valid_tokens=running_valid)

@@ -262,6 +262,10 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
             self.num_heads * self.head_dim, config.hidden_size, bias=getattr(config, "attention_bias", False)
         )
         self.rotary_emb = LlamaRotaryEmbedding(config)
+        # Set by attach_eagle3_cp_attention when the draft runs under context
+        # parallelism: the sequence is sharded across this cp group and the mixed
+        # causal/TTT-diagonal attention runs as a differentiable ring. None otherwise.
+        self._cp_group = None
 
     def _project_qkv(self, combined_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = combined_states.shape
@@ -312,7 +316,9 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         cache_k.append(k)
         cache_v.append(v)
 
-        if self.attn_implementation == "flash_attention_2":
+        if self._cp_group is not None:
+            attn_output = self._cp_ring_attention_forward(q, cache_k, cache_v, batch_size, seq_len)
+        elif self.attn_implementation == "flash_attention_2":
             attn_output = self._flash_attention_forward(
                 q, cache_k, cache_v, step_idx, batch_size, seq_len, cu_seqlens, max_seqlen
             )
@@ -321,6 +327,29 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
                 q, cache_k, cache_v, attention_mask, step_idx, batch_size, seq_len
             )
         return self.o_proj(attn_output)
+
+    def _cp_ring_attention_forward(
+        self,
+        q: torch.Tensor,
+        cache_k: list[torch.Tensor],
+        cache_v: list[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Context-parallel counterpart of ``_eager_attention_forward``.
+
+        The sequence is sharded across ``self._cp_group``; block-0 (``Q @ K_0^T``,
+        causal over the full sequence) runs as a ring while the per-position TTT
+        diagonals stay local. Inputs are ``[B, H, T_local, D]``; the ring works in
+        FlashAttention ``[B, T_local, H, D]`` layout.
+        """
+        from nemo_automodel.components.distributed.ring_attention import cached_ring_attention
+
+        qf = q.transpose(1, 2).contiguous()
+        ckf = [t.transpose(1, 2).contiguous() for t in cache_k]
+        cvf = [t.transpose(1, 2).contiguous() for t in cache_v]
+        out = cached_ring_attention(qf, ckf, cvf, self._cp_group, self.scaling)  # [B, T, H, D]
+        return out.reshape(batch_size, seq_len, -1)
 
     def _eager_attention_forward(
         self,
@@ -475,6 +504,18 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
             )
         lse_fa = lse_flat.transpose(0, 1).reshape(batch_size, seq_len, num_heads).permute(0, 2, 1)
         return attn_output_bhtd, lse_fa
+
+
+def attach_eagle3_cp_attention(model: nn.Module, cp_group) -> None:
+    """Route every EAGLE-3 draft attention through the context-parallel ring path.
+
+    Sets ``_cp_group`` on each :class:`Eagle3LlamaAttention` so its forward runs the
+    differentiable causal-ring + TTT-diagonal attention over the cp-sharded sequence.
+    A no-op ``cp_group`` of size 1 leaves the plain per-rank path in place.
+    """
+    for module in model.modules():
+        if isinstance(module, Eagle3LlamaAttention):
+            module._cp_group = cp_group
 
 
 class Eagle3LlamaMLP(nn.Module):
