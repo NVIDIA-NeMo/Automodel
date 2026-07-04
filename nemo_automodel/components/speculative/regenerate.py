@@ -313,7 +313,10 @@ async def _regenerate_one(
         "top_p": gen_cfg.top_p,
     }
     if gen_cfg.reasoning == "disable":
-        payload["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        # Must be a top-level body field: "extra_body" is an OpenAI Python-client
+        # convenience, and this raw-JSON POST would send it literally for the
+        # server to ignore, silently leaving thinking enabled.
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
     msg = await _chat_completion(session, url, payload, timeout_s=timeout_s, max_retries=max_retries)
     resp_msg: dict[str, Any] = {"role": "assistant", "content": msg.get("content", "")}
     if gen_cfg.reasoning == "save":
@@ -515,7 +518,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Reasoning mode: 'none' for standard models (default), "
             "'save' to store reasoning_content from the response, "
-            "or 'disable' to suppress thinking via extra_body chat_template_kwargs."
+            "or 'disable' to suppress thinking via the top-level chat_template_kwargs request field."
         ),
     )
     parser.add_argument(
