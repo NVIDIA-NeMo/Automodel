@@ -232,14 +232,30 @@ def attach_cp_kv_gather_hooks(model: torch.nn.Module, cp_mesh) -> None:
     import torch.nn.functional as F_module
 
     _original_sdpa = F_module.scaled_dot_product_attention
-    group = cp_mesh.get_group()
-    cp_size = cp_mesh.size()
-    cp_rank = torch.distributed.get_rank(group=group)
 
     @torch._dynamo.disable
     def _cp_gather_sdpa(
         query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, **kwargs
     ):
+        # The K/V all-gather needs a live cp process group. Without one (a unit test
+        # exercising the surrounding logic; real CP always has one) fall back to plain
+        # local SDPA -- mirrors the ``cp_mesh.size() <= 1`` graceful no-ops elsewhere.
+        if not torch.distributed.is_initialized():
+            return _original_sdpa(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
+        # Resolve the cp group lazily (at forward time): attaching the hook must not
+        # require a live process group, so a mesh mock with only ``.size()`` works.
+        group = cp_mesh.get_group()
+        cp_size = cp_mesh.size()
+        cp_rank = torch.distributed.get_rank(group=group)
         seq_local = query.shape[2]
         key = key.contiguous()
         value = value.contiguous()
