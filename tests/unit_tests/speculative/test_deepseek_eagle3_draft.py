@@ -28,8 +28,12 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
+from nemo_automodel.components.models.deepseek_v3.rope_utils import precompute_freqs_cis
 from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule
-from nemo_automodel.components.speculative.eagle.draft_deepseek import DeepseekV3Eagle3DraftModel
+from nemo_automodel.components.speculative.eagle.draft_deepseek import (
+    DeepseekV3Eagle3DraftModel,
+    _resolve_rope_theta,
+)
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
 
 _VOCAB = 64
@@ -178,3 +182,54 @@ def test_rope_freqs_stays_fp32_after_bf16_cast():
         assert torch.allclose(rope_freqs, ref[n], rtol=1e-6, atol=1e-8), n
     # The pin is rope-only: the rest of the draft still casts to bf16.
     assert any(p.dtype == torch.bfloat16 for p in draft.parameters())
+
+
+def test_resolve_rope_theta_prefers_rope_parameters():
+    """transformers 5.x drops the top-level ``rope_theta``; it lives under ``rope_parameters``."""
+    config = PretrainedConfig()
+    config.rope_parameters = {"rope_theta": 123456.0}
+    config.rope_theta = 10000.0  # a stale top-level value must lose to rope_parameters
+    assert _resolve_rope_theta(config) == 123456.0
+
+
+def test_resolve_rope_theta_falls_back_to_top_level_then_default():
+    """Older configs with only a top-level ``rope_theta`` (or none at all) still resolve."""
+    config = PretrainedConfig()
+    config.rope_parameters = None
+    config.rope_theta = 5000.0
+    assert _resolve_rope_theta(config) == 5000.0
+
+    bare = PretrainedConfig()
+    bare.rope_parameters = None
+    assert _resolve_rope_theta(bare) == 10000.0
+
+
+def test_rope_freqs_follow_rope_parameters_theta():
+    """The draft's rotary table must use the target's ``rope_parameters`` base.
+
+    A real ``DeepseekV3Config`` carries ``rope_theta`` only inside
+    ``rope_parameters`` (no top-level attribute), so reading it with a bare
+    ``getattr(config, "rope_theta", 10000.0)`` silently pins the draft's RoPE
+    base to 10000 and dephases it from any target with a different base. Build
+    the draft from such a config and check the frequency table end to end,
+    including the fp32 recompute that follows a bf16 cast.
+    """
+    config = _build_config()
+    del config.rope_theta
+    config.rope_parameters = {"rope_theta": 123456.0}
+    torch.manual_seed(0)
+    draft = DeepseekV3Eagle3DraftModel(config).to(torch.float32)
+
+    expected = precompute_freqs_cis(config.qk_rope_head_dim, config.max_position_embeddings, 123456.0, None)
+    default_theta = precompute_freqs_cis(config.qk_rope_head_dim, config.max_position_embeddings, 10000.0, None)
+    assert not torch.allclose(expected, default_theta)
+
+    freq_names = [n for n, _ in draft.named_buffers() if n.endswith("rope_freqs")]
+    assert freq_names, "expected at least one rope_freqs buffer on the MLA draft"
+    for n in freq_names:
+        assert torch.allclose(draft.get_buffer(n), expected, rtol=1e-6, atol=1e-8), n
+
+    # The post-cast fp32 recompute must resolve the same theta, not the default.
+    draft = draft.to(torch.bfloat16)
+    for n in freq_names:
+        assert torch.allclose(draft.get_buffer(n), expected, rtol=1e-6, atol=1e-8), n
