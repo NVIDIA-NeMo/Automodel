@@ -62,6 +62,12 @@ def get_args():
         default=None
     )
     parser.add_argument(
+        '--account',
+        type=str,
+        help='Slurm account to use for the job',
+        default='nemotron_retriever_dev',
+    )
+    parser.add_argument(
         '--partition',
         type=str,
         help='Partition - e.g. interactive',
@@ -256,6 +262,7 @@ def main():
         eval_executor = run.LocalExecutor()
     else:
         train_executor = draco(
+            account=args.account,
             container_image = args.container_image,
             partition = args.partition,
             nodes = int(args.num_nodes),        
@@ -264,6 +271,7 @@ def main():
             gpus_per_node=0 if args.partition == "cpu" else 8,
         )
         eval_executor = draco(
+            account=args.account,
             container_image = args.container_image,
             partition = args.partition,
             nodes = 1,
@@ -273,7 +281,7 @@ def main():
     
     if args.checkpoint_directory is None:
         if isinstance(train_executor, run.SlurmExecutor):
-            checkpoints_directory = f"/lustre/fsw/portfolios/llmservice/users/{username}/model_checkpoints"
+            checkpoints_directory = f"/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/{username}/model_checkpoints"
         else:
             checkpoints_directory = "/model_checkpoints"
     else:
