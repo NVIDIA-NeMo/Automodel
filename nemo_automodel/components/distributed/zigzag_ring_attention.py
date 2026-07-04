@@ -60,7 +60,7 @@ class RingComm:
 
     def send_recv(self, to_send: torch.Tensor, recv_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
         res = torch.empty_like(to_send) if recv_tensor is None else recv_tensor
-        self._ops.append(dist.P2POp(dist.isend, to_send, self.send_rank, group=self._pg))
+        self._ops.append(dist.P2POp(dist.isend, to_send.contiguous(), self.send_rank, group=self._pg))
         self._ops.append(dist.P2POp(dist.irecv, res, self.recv_rank, group=self._pg))
         return res
 

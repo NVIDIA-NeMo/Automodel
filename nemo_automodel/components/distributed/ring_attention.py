@@ -33,11 +33,12 @@ is guarded so this module never breaks import of the package when it is absent.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.distributed as dist
 
+from nemo_automodel.components.distributed.zigzag_ring_attention import (
+    RingComm,
+)
 from nemo_automodel.components.distributed.zigzag_ring_attention import (
     get_half_index as _zz_half_index,
 )
@@ -88,42 +89,6 @@ def _init_out_and_lse(block_out: torch.Tensor, block_lse: torch.Tensor) -> tuple
     out = block_out.to(torch.float32)
     lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1).to(torch.float32)
     return out, lse
-
-
-class RingComm:
-    """One-hop p2p ring: send to ``rank+1``, receive from ``rank-1`` (cp group order)."""
-
-    def __init__(self, process_group: Optional[dist.ProcessGroup]):
-        self._pg = process_group
-        self._ops: list[dist.P2POp] = []
-        self._reqs = None
-        self.rank = dist.get_rank(process_group)
-        self.world_size = dist.get_world_size(process_group)
-        send = (self.rank + 1) % self.world_size
-        recv = (self.rank - 1) % self.world_size
-        if process_group is not None:
-            send = dist.get_global_rank(process_group, send)
-            recv = dist.get_global_rank(process_group, recv)
-        self.send_rank, self.recv_rank = send, recv
-
-    def send_recv(self, to_send: torch.Tensor, recv_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
-        res = torch.empty_like(to_send) if recv_tensor is None else recv_tensor
-        self._ops.append(dist.P2POp(dist.isend, to_send.contiguous(), self.send_rank, group=self._pg))
-        self._ops.append(dist.P2POp(dist.irecv, res, self.recv_rank, group=self._pg))
-        return res
-
-    def commit(self) -> None:
-        if self._reqs is not None:
-            raise RuntimeError("RingComm.commit called twice")
-        self._reqs = dist.batch_isend_irecv(self._ops)
-
-    def wait(self) -> None:
-        if self._reqs is None:
-            raise RuntimeError("RingComm.wait called before commit")
-        for req in self._reqs:
-            req.wait()
-        self._reqs = None
-        self._ops = []
 
 
 def ring_flash_attn_forward(
