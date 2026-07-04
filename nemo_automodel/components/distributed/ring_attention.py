@@ -198,3 +198,98 @@ def ring_flash_attn_backward(
         d_kv_comm.commit()
     d_kv_comm.wait()
     return dq.to(q.dtype), next_dk.to(k.dtype), next_dv.to(v.dtype)
+
+
+def _merge_diag(out, lse, block_out, block_lse):
+    """Merge a per-position diagonal block ``(block_out, block_lse)`` into ``(out, lse)``.
+
+    ``out``/``block_out`` are ``[B, T, H, D]`` fp32; ``lse``/``block_lse`` are ``[B, T, H]``.
+    """
+    new_lse = torch.logaddexp(lse, block_lse)
+    out = out * torch.exp(lse - new_lse).unsqueeze(-1) + block_out * torch.exp(block_lse - new_lse).unsqueeze(-1)
+    return out, new_lse
+
+
+class _CachedRingAttention(torch.autograd.Function):
+    """EAGLE-3 mixed attention under context parallelism.
+
+    ``cache_k[:, 0]`` / ``cache_v[:, 0]`` are the step-0 sequence K/V: Q attends
+    to them **causally over the full (cp-sharded) sequence** via the ring. Every
+    later block ``i >= 1`` is a TTT cache step contributing a **per-position
+    diagonal** ``lse_i[t] = (Q_t . K_i_t) * scale`` with value ``V_i_t`` (same
+    position, no cross-rank comms). Both are fused in one softmax via the
+    online-softmax log-sum-exp merge. The block-0 backward reuses the *merged*
+    output/lse so it produces the correct joint-softmax gradient (the standard
+    FlashAttention backward identity); the diagonal grads are added in closed form.
+
+    Layout: ``q``/``cache_k``/``cache_v`` are FlashAttention-style ``[B, T, H, D]``
+    (``cache_*`` carry a block axis: ``[B, num_blocks, T, H, D]``).
+    """
+
+    @staticmethod
+    def forward(ctx, q, cache_k, cache_v, process_group, scale):
+        out_ring, lse_ring = ring_flash_attn_forward(
+            process_group, q, cache_k[:, 0].contiguous(), cache_v[:, 0].contiguous(), scale, causal=True
+        )
+        acc_out = out_ring.float()  # [B, T, H, D]
+        acc_lse = lse_ring.transpose(1, 2).float()  # [B, H, T] -> [B, T, H]
+        num_blocks = cache_k.shape[1]
+        q_f = q.float()
+        for i in range(1, num_blocks):
+            lse_i = (q_f * cache_k[:, i].float()).sum(-1) * scale  # [B, T, H]
+            acc_out, acc_lse = _merge_diag(acc_out, acc_lse, cache_v[:, i].float(), lse_i)
+        ctx.save_for_backward(q, cache_k, cache_v, acc_out, acc_lse)
+        ctx.process_group = process_group
+        ctx.scale = scale
+        return acc_out.to(q.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, cache_k, cache_v, out, merged_lse = ctx.saved_tensors
+        scale, group = ctx.scale, ctx.process_group
+        num_blocks = cache_k.shape[1]
+        grad_out_f = grad_out.float()
+        q_f = q.float()
+
+        dq, dk0, dv0 = ring_flash_attn_backward(
+            group,
+            grad_out,
+            q,
+            cache_k[:, 0].contiguous(),
+            cache_v[:, 0].contiguous(),
+            out.to(q.dtype),
+            merged_lse.transpose(1, 2).contiguous(),  # [B, T, H] -> [B, H, T]
+            scale,
+            causal=True,
+        )
+        dq = dq.float()
+        dcache_k = torch.zeros_like(cache_k, dtype=torch.float32)
+        dcache_v = torch.zeros_like(cache_v, dtype=torch.float32)
+        dcache_k[:, 0] = dk0.float()
+        dcache_v[:, 0] = dv0.float()
+
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].float()
+            vi = cache_v[:, i].float()
+            lse_i = (q_f * ki).sum(-1) * scale  # [B, T, H]
+            wi = torch.exp(lse_i - merged_lse)  # joint-softmax weight of this diagonal
+            d_out_i = grad_out_f * wi.unsqueeze(-1)
+            d_lse_i = wi * (grad_out_f * (vi - out)).sum(-1)
+            dq = dq + d_lse_i.unsqueeze(-1) * scale * ki
+            dcache_k[:, i] = d_lse_i.unsqueeze(-1) * scale * q_f
+            dcache_v[:, i] = d_out_i
+
+        return dq.to(q.dtype), dcache_k.to(cache_k.dtype), dcache_v.to(cache_v.dtype), None, None
+
+
+def cached_ring_attention(
+    q: torch.Tensor, cache_k: list[torch.Tensor], cache_v: list[torch.Tensor], process_group, scale: float
+) -> torch.Tensor:
+    """EAGLE-3 mixed causal-ring + TTT-diagonal attention (see :class:`_CachedRingAttention`).
+
+    ``q`` is ``[B, T, H, D]``; ``cache_k``/``cache_v`` are lists of ``[B, T, H, D]``
+    (index 0 = sequence, 1.. = TTT cache steps). Returns ``[B, T, H, D]``.
+    """
+    ck = torch.stack(cache_k, dim=1)  # [B, num_blocks, T, H, D]
+    cv = torch.stack(cache_v, dim=1)
+    return _CachedRingAttention.apply(q, ck, cv, process_group, scale)
