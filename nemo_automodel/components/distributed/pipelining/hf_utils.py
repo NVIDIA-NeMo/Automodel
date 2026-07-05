@@ -266,6 +266,9 @@ def create_pipeline_forward_causal_lm() -> Callable:
                 raise ValueError("Expected hidden states as input for pipeline stage without inner model")
             outputs = None
 
+        if getattr(self, "_pp_return_hidden_states", False) is True:
+            return hidden_states
+
         if hasattr(self, "lm_head") and self.lm_head is not None:
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
             logits = self.lm_head(hidden_states[:, slice_indices, :])
@@ -676,6 +679,7 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
             inner_model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), inner_model)
         if patch_causal_lm_model:
             model.forward = types.MethodType(create_pipeline_forward_causal_lm(), model)
+            model._pp_return_hidden_states_supported = True
     else:
         if patch_inner_model:
             model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), model)

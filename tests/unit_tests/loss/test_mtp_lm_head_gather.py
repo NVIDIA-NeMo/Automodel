@@ -199,6 +199,31 @@ def test_mtp_loss_grads_match_reference(ref_cce):
         torch.testing.assert_close(a.grad, b.grad, rtol=1e-4, atol=1e-6)
 
 
+def test_pipeline_loss_fused_ce_routes_bare_tensor_as_hidden_states():
+    """PP fused-CE contract: the last stage skips lm_head and emits a bare
+    hidden-states tensor"""
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    m = _TinyModel()
+    m.training = False  # a bare tensor carries no MTP tail regardless
+    loss_mod = PipelineCausalLMLoss(FusedLinearCrossEntropy(), m)
+
+    hidden = torch.randn(B, S, H)  # what the last PP stage now emits
+    labels = torch.randint(0, V, (B, S))
+
+    captured = {}
+
+    def fake_calc(loss_fn, **kw):
+        captured.update(kw)
+        return torch.zeros((), requires_grad=True)
+
+    with mock.patch.object(_mtp, "calculate_loss", side_effect=fake_calc):
+        loss_mod(hidden, labels)
+
+    assert captured["hidden_states"] is hidden
+    assert captured["logits"] is None
+
+
 def test_non_fused_path_does_not_gather_lm_head():
     """Logit-based losses (non-Fused) must not trigger the LM-head weight gather."""
     hs, labels = _inputs()
