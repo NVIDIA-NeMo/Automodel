@@ -372,3 +372,49 @@ class TestBackendConfigCompileAttn:
         # compile_mla was consolidated into the generic compile_attn flag.
         with pytest.raises(TypeError):
             BackendConfig(compile_mla=True)
+
+
+class TestBackendConfigPartialCudaGraphs:
+    def test_empty_module_list_disables_cuda_graphs(self):
+        assert BackendConfig().cuda_graph_modules == []
+
+    def test_accepts_megatron_moe_module_names(self):
+        modules = ["attn", "moe_router", "moe_preprocess"]
+        config = BackendConfig(
+            attn="te",
+            dispatcher="hybridep",
+            cuda_graph_modules=modules,
+        )
+
+        assert config.cuda_graph_modules == modules
+
+    @pytest.mark.parametrize("modules", ["attn", ("attn",)])
+    def test_modules_must_be_a_list(self, modules):
+        with pytest.raises(TypeError, match="must be a list"):
+            BackendConfig(cuda_graph_modules=modules)
+
+    def test_module_names_must_be_strings(self):
+        with pytest.raises(TypeError, match="entries must be strings"):
+            BackendConfig(cuda_graph_modules=[1])
+
+    def test_rejects_unknown_or_duplicate_modules(self):
+        with pytest.raises(ValueError, match="Unsupported cuda_graph_modules"):
+            BackendConfig(cuda_graph_modules=["mlp"])
+        with pytest.raises(ValueError, match="must not contain duplicates"):
+            BackendConfig(attn="te", cuda_graph_modules=["attn", "attn"])
+
+    def test_attention_requires_te_backend(self):
+        with pytest.raises(ValueError, match="requires attn='te'"):
+            BackendConfig(
+                attn="sdpa",
+                cuda_graph_modules=["attn"],
+            )
+
+    def test_preprocess_requires_router_and_hybridep(self):
+        with pytest.raises(ValueError, match="requires 'moe_router'"):
+            BackendConfig(cuda_graph_modules=["moe_preprocess"])
+        with pytest.raises(ValueError, match="requires dispatcher='hybridep'"):
+            BackendConfig(
+                dispatcher="deepep",
+                cuda_graph_modules=["moe_router", "moe_preprocess"],
+            )

@@ -209,6 +209,19 @@ class FakeBalancedGate(nn.Module):
         self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
 
 
+class _GateRoutingCore(nn.Module):
+    """Parameterless, fixed-shape portion of a learned MoE router.
+
+    The gate projection remains eager so FSDP can unshard its DTensor parameters.
+    The owning gate is passed as a non-tensor control so this child remains an
+    independent, parameterless CUDA graph boundary and survives model copies.
+    """
+
+    def forward(self, scores: torch.Tensor, gate: "Gate") -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Select experts and compute routing probabilities from projected scores."""
+        return gate._route_scores(scores)
+
+
 class Gate(nn.Module):
     """
     Gating mechanism for routing inputs in a mixture-of-experts (MoE) model.
@@ -292,38 +305,12 @@ class Gate(nn.Module):
         self.router_replay: Optional[RouterReplay] = (
             RouterReplay() if getattr(config, "enable_routing_replay", False) else None
         )
+        self.routing_core = _GateRoutingCore()
+        self.use_routing_core = False
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        token_mask: torch.Tensor,
-        cp_mesh: Optional[DeviceMesh],
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass for the gating mechanism.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            token_mask (torch.Tensor): Boolean mask indicating valid tokens.
-            cp_mesh (Optional[DeviceMesh]): Device mesh for context parallel computation.
-
-        Returns:
-            weights (torch.Tensor): Routing weights for the selected experts.
-            indices (torch.Tensor): Indices of the selected experts.
-            aux_loss (Optional[torch.Tensor]): Auxiliary loss for load balancing.
-        """
-        original_dtype = x.dtype
-
-        if self.gate_precision is not None:
-            x_compute = x.to(dtype=self.gate_precision)
-            weight = self.weight.to(dtype=self.gate_precision)
-            bias = self.bias.to(dtype=self.gate_precision) if self.bias is not None else None
-        else:
-            x_compute = x
-            weight = self.weight.to(dtype=x.dtype)
-            bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
-
-        scores = F.linear(x_compute, weight, bias=bias)
+    def _route_scores(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Apply fixed-shape expert selection and probability math to router logits."""
+        num_tokens = scores.size(0)
 
         if self.score_func == "softmax":
             if self.softmax_before_topk:
@@ -357,7 +344,7 @@ class Gate(nn.Module):
                 scores_for_choice = scores
 
             if self.n_groups > 1:
-                scores_for_choice = scores_for_choice.view(x.size(0), self.n_groups, -1)
+                scores_for_choice = scores_for_choice.view(num_tokens, self.n_groups, -1)
                 group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
 
                 group_idx = group_scores.topk(self.topk_groups, dim=-1)[1]
@@ -388,12 +375,12 @@ class Gate(nn.Module):
                 scores_for_choice = scores_for_choice + self.e_score_correction_bias
 
             if self.n_groups > 1:
-                scores_for_choice = scores_for_choice.view(x.size(0), self.n_groups, -1)
+                scores_for_choice = scores_for_choice.view(num_tokens, self.n_groups, -1)
                 group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
                 group_idx = torch.topk(group_scores, k=self.topk_groups, dim=-1, sorted=False)[1]
                 group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
-                score_mask = group_mask.unsqueeze(-1).expand_as(scores_for_choice).reshape(x.size(0), -1)
-                scores_for_choice = scores_for_choice.reshape(x.size(0), -1).masked_fill(
+                score_mask = group_mask.unsqueeze(-1).expand_as(scores_for_choice).reshape(num_tokens, -1)
+                scores_for_choice = scores_for_choice.reshape(num_tokens, -1).masked_fill(
                     ~score_mask.bool(), float("-inf")
                 )
 
@@ -409,7 +396,7 @@ class Gate(nn.Module):
                 scores = scores + self.e_score_correction_bias
 
             if self.n_groups > 1:
-                scores = scores.view(x.size(0), self.n_groups, -1)
+                scores = scores.view(num_tokens, self.n_groups, -1)
                 if self.e_score_correction_bias is None:
                     group_scores = scores.amax(dim=-1)
                 else:
@@ -430,6 +417,43 @@ class Gate(nn.Module):
             original_scores = original_scores / denom_s
 
         weights = weights * self.route_scale
+        return weights, indices, original_scores
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        cp_mesh: Optional[DeviceMesh],
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Forward pass for the gating mechanism.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            token_mask (torch.Tensor): Boolean mask indicating valid tokens.
+            cp_mesh (Optional[DeviceMesh]): Device mesh for context parallel computation.
+
+        Returns:
+            weights (torch.Tensor): Routing weights for the selected experts.
+            indices (torch.Tensor): Indices of the selected experts.
+            aux_loss (Optional[torch.Tensor]): Auxiliary loss for load balancing.
+        """
+        original_dtype = x.dtype
+
+        if self.gate_precision is not None:
+            x_compute = x.to(dtype=self.gate_precision)
+            weight = self.weight.to(dtype=self.gate_precision)
+            bias = self.bias.to(dtype=self.gate_precision) if self.bias is not None else None
+        else:
+            x_compute = x
+            weight = self.weight.to(dtype=x.dtype)
+            bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+
+        scores = F.linear(x_compute, weight, bias=bias)
+        if self.use_routing_core:
+            weights, indices, original_scores = self.routing_core(scores, self)
+        else:
+            weights, indices, original_scores = self._route_scores(scores)
 
         if self.gate_precision is not None:
             weights = weights.to(dtype=original_dtype)
@@ -639,6 +663,7 @@ class MoE(nn.Module):
             self.gate = FakeBalancedGate(config, noise=backend.fake_gate_noise)
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
+            self.gate.use_routing_core = "moe_router" in backend.cuda_graph_modules
         if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
             warnings.warn(
                 f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "

@@ -15,7 +15,7 @@
 import importlib.util
 import logging
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
@@ -23,6 +23,7 @@ from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 logger = logging.getLogger(__name__)
+
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
@@ -191,6 +192,10 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
+        cuda_graph_modules: Per-layer modules to capture with Transformer Engine,
+            following Megatron Core's ``cuda_graph_modules`` names. AutoModel currently
+            supports ``attn``, ``moe_router``, and ``moe_preprocess``. An empty list
+            disables CUDA graphs. ``moe_preprocess`` requires ``moe_router``.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -226,6 +231,7 @@ class BackendConfig:
     # fullgraph can't trace), so it requires attn="sdpa", linear="torch", rms_norm="torch",
     # rope_fusion=False. Default False.
     compile_attn: bool = False
+    cuda_graph_modules: list[Literal["attn", "moe_router", "moe_preprocess"]] = field(default_factory=list)
 
     def __post_init__(self):
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
@@ -261,6 +267,32 @@ class BackendConfig:
             self.dispatcher = "torch"
             self.experts = "torch_mm"
 
+        if not isinstance(self.cuda_graph_modules, list):
+            raise TypeError("cuda_graph_modules must be a list")
+        if not all(isinstance(module, str) for module in self.cuda_graph_modules):
+            raise TypeError("cuda_graph_modules entries must be strings")
+        supported_cuda_graph_modules = {"attn", "moe_router", "moe_preprocess"}
+        unknown_cuda_graph_modules = set(self.cuda_graph_modules) - supported_cuda_graph_modules
+        if unknown_cuda_graph_modules:
+            raise ValueError(
+                "Unsupported cuda_graph_modules: "
+                f"{sorted(unknown_cuda_graph_modules)}; supported modules are "
+                f"{sorted(supported_cuda_graph_modules)}"
+            )
+        if len(self.cuda_graph_modules) != len(set(self.cuda_graph_modules)):
+            raise ValueError("cuda_graph_modules must not contain duplicates")
+        if "attn" in self.cuda_graph_modules and self.attn != "te":
+            raise ValueError("'attn' in cuda_graph_modules requires attn='te'")
+        if "attn" in self.cuda_graph_modules and self.te_fp8 is not None:
+            recipe_fp8_dpa = getattr(self.te_fp8.recipe, "fp8_dpa", False)
+            if recipe_fp8_dpa:
+                raise ValueError("'attn' in cuda_graph_modules requires BF16 dot-product attention (fp8_dpa=False)")
+        if "moe_preprocess" in self.cuda_graph_modules and "moe_router" not in self.cuda_graph_modules:
+            raise ValueError("'moe_preprocess' in cuda_graph_modules requires 'moe_router'")
+        if "moe_router" in self.cuda_graph_modules and self.fake_balanced_gate:
+            raise ValueError("'moe_router' in cuda_graph_modules requires the learned Gate (fake_balanced_gate=False)")
+        if "moe_preprocess" in self.cuda_graph_modules and self.dispatcher != "hybridep":
+            raise ValueError("'moe_preprocess' in cuda_graph_modules requires dispatcher='hybridep'")
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
         if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":
             raise ValueError(
