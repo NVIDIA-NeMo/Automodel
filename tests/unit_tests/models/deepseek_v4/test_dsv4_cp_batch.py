@@ -273,13 +273,17 @@ def test_contiguous_shard_requires_labels():
 # DeepseekV4ForCausalLM CP-prep hook                                           #
 # --------------------------------------------------------------------------- #
 def test_prepare_model_inputs_for_cp_returns_make_batch_fn_and_flag():
+    from nemo_automodel.components.distributed.cp_sharder import full_logits_grad_touch
+
     # The method only reads self.config, so a lightweight stand-in suffices.
     cfg = SimpleNamespace(compress_ratios=[0, 4, 128])
     fake_self = SimpleNamespace(config=cfg)
     prepared = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, input_ids=torch.arange(8).view(1, 8))
 
-    assert prepared["_cp_full_logits_grad_touch"] is True
-    fn = prepared["_cp_make_batch_fn"]
+    sharder = prepared["cp_sharder"]
+    assert sharder.finalize_loss_fn is full_logits_grad_touch
+    assert sharder.layout == "contiguous"
+    fn = sharder.shard_batch
     # the partial binds the config-derived per-rank multiple (lcm(8,128) == 128)
     assert fn.keywords["pad_multiple"] == 128
     assert fn.func is make_dsv4_contiguous_shard_cp_batch_and_ctx
@@ -299,8 +303,8 @@ def test_forward_pre_embed_only_branch_delegates_to_prepare():
         fake_self, input_ids=input_ids
     )
     out = DeepseekV4ForCausalLM.forward(fake_self, torch.arange(8).view(1, 8), _pre_embed_only=True)
-    assert out["_cp_full_logits_grad_touch"] is True
-    assert out["_cp_make_batch_fn"].keywords["pad_multiple"] == 8
+    assert out["cp_sharder"].finalize_loss_fn is not None
+    assert out["cp_sharder"].shard_batch.keywords["pad_multiple"] == 8
 
 
 def test_setup_cp_attention_stores_group():
@@ -312,8 +316,10 @@ def test_setup_cp_attention_stores_group():
 
 
 def test_module_exposes_pad_helper_noops():
+    from nemo_automodel.components.distributed import cp_sharder
+
     # pad_len <= 0 is a no-op (returns the same tensor object) for both pad helpers.
     t = torch.arange(6).view(1, 6)
-    assert cpmod._pad_tensor_seq_dim_(t, 1, 0, 0) is t
+    assert cp_sharder._pad_tensor_seq_dim_(t, 1, 0, 0) is t
     pos = torch.arange(6).view(1, 6)
-    assert cpmod._pad_position_ids_seq_dim_(pos, 1, 0) is pos
+    assert cp_sharder._pad_position_ids_seq_dim_(pos, 1, 0) is pos

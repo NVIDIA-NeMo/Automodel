@@ -78,6 +78,7 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     CausalLMOutputWithPast = _make_missing("CausalLMOutputWithPast")
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
+from nemo_automodel.components.distributed.cp_sharder import CPSharder, contiguous_local_indices
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
@@ -912,7 +913,13 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         """
         self.setup_cp_attention(cp_mesh)
         return make_contiguous_shard_cp_batch_and_ctx(
-            cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id
+            cp_mesh,
+            tp_mesh,
+            batch,
+            loss_mask=loss_mask,
+            padding_token_id=padding_token_id,
+            extra_seq_keys={"_gemma4_vision_group_ids": 1},
+            extra_pad_values={"_gemma4_vision_group_ids": -1},
         )
 
     def __init__(
@@ -1318,12 +1325,14 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             "mm_token_type_ids": mm_token_type_ids
             if mm_token_type_ids is not None
             else special_image_mask.to(torch.long),
-            "_cp_make_batch_fn": self._cp_shard_batch,
+            "cp_sharder": CPSharder(
+                shard_batch=self._cp_shard_batch,
+                local_token_global_indices=contiguous_local_indices,
+                layout="contiguous",
+            ),
             "_gemma4_vision_group_ids": gemma4_vision_group_ids(
                 mm_token_type_ids if mm_token_type_ids is not None else special_image_mask.to(torch.long)
             ),
-            "_cp_metadata_seq_dims": {"_gemma4_vision_group_ids": 1},
-            "_cp_metadata_pad_values": {"_gemma4_vision_group_ids": -1},
         }
 
         per_layer_inputs = self._prepare_per_layer_inputs_for_cp(input_ids, special_image_mask)

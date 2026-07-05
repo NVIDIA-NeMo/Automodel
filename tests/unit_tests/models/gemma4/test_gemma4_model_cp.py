@@ -577,7 +577,7 @@ def test_cp_shard_batch_installs_ring_then_delegates(monkeypatch):
     sentinel = ("ctx", {"sharded": True})
     seen = {}
 
-    def fake_shard(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+    def fake_shard(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0, **kwargs):
         seen.update(
             cp_mesh=cp_mesh, tp_mesh=tp_mesh, batch=batch, loss_mask=loss_mask, padding_token_id=padding_token_id
         )
@@ -600,7 +600,7 @@ def test_prepare_model_inputs_attaches_cp_shard_batch_fn():
     model = Gemma4ForConditionalGeneration(_cfg(enable_moe_block=False), backend=_backend()).to(torch.bfloat16)
     prepared = model.prepare_model_inputs_for_cp(input_ids=torch.tensor([[1, 2, 3, 4]]))
     # The model attaches its own bound batch-sharding callable (model-owned install seam).
-    assert prepared["_cp_make_batch_fn"] == model._cp_shard_batch
+    assert prepared["cp_sharder"].shard_batch == model._cp_shard_batch
 
 
 # ---------------------------------------------------------------------------

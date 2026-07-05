@@ -795,22 +795,33 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
         """Model-owned context-parallel batch prep (Miles-style contiguous shard).
 
-        Returns the keys ``cp_utils.make_cp_batch_and_ctx`` needs to delegate CP
-        sharding back to this model: a ``_cp_make_batch_fn`` callable (with the
-        config-derived per-rank shard multiple bound) plus a flag asking the recipe
-        to keep the full logits in the autograd graph so every CP rank's backward
-        reaches all parameters even when its local loss is fully masked. DSV4 embeds
-        internally, so (unlike VLM models) this does not pre-embed -- it leaves
-        ``input_ids`` for the sharding callable.
+        Returns a ``CPSharder`` (under the ``"cp_sharder"`` batch key) so
+        ``cp_utils.make_cp_batch_and_ctx`` delegates CP sharding back to this
+        model: the sharding callable has the config-derived per-rank shard
+        multiple bound, and ``finalize_loss`` keeps the full logits in the
+        autograd graph so every CP rank's backward reaches all parameters even
+        when its local loss is fully masked. DSV4 embeds internally, so (unlike
+        VLM models) this does not pre-embed -- it leaves ``input_ids`` for the
+        sharding callable.
         """
         from functools import partial  # noqa: PLC0415
 
+        from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
+            CPSharder,
+            contiguous_local_indices,
+            full_logits_grad_touch,
+        )
+
         return {
-            "_cp_make_batch_fn": partial(
-                make_dsv4_contiguous_shard_cp_batch_and_ctx,
-                pad_multiple=dsv4_cp_local_seq_multiple(self.config),
+            "cp_sharder": CPSharder(
+                shard_batch=partial(
+                    make_dsv4_contiguous_shard_cp_batch_and_ctx,
+                    pad_multiple=dsv4_cp_local_seq_multiple(self.config),
+                ),
+                local_token_global_indices=contiguous_local_indices,
+                finalize_loss_fn=full_logits_grad_touch,
+                layout="contiguous",
             ),
-            "_cp_full_logits_grad_touch": True,
         }
 
     def forward(

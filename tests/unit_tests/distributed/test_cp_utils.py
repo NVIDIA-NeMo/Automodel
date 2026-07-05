@@ -30,6 +30,7 @@ import torch
 
 # Import module under test
 from nemo_automodel.components.distributed import cp_utils as _cu
+from nemo_automodel.components.distributed import cp_sharder as _cs
 from nemo_automodel.components.models.gemma4_moe import cp_batch as _cm
 
 
@@ -553,14 +554,14 @@ def test_synthesize_single_document_seq_ids_from_padding_mask():
         "input_ids": torch.zeros(1, 6, dtype=torch.long),
         "padding_mask": torch.tensor([[False, False, False, False, True, True]]),
     }
-    _cm._synthesize_single_document_seq_ids(batch, "input_ids", 6)
+    _cs._synthesize_single_document_seq_ids(batch, "input_ids", 6)
     assert torch.equal(batch["_packed_seq_ids"], torch.tensor([[1, 1, 1, 1, 0, 0]]))
 
 
 def test_synthesize_single_document_seq_ids_all_ones_without_padding_mask():
     # No padding info -> single document spanning the whole sequence.
     batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
-    _cm._synthesize_single_document_seq_ids(batch, "input_ids", 4)
+    _cs._synthesize_single_document_seq_ids(batch, "input_ids", 4)
     assert torch.equal(batch["_packed_seq_ids"], torch.tensor([[1, 1, 1, 1]]))
 
 
@@ -568,5 +569,5 @@ def test_synthesize_single_document_seq_ids_noop_when_present():
     # Genuinely packed input already carries `_packed_seq_ids`; leave it untouched.
     existing = torch.tensor([[1, 1, 2, 2, 0, 0]])
     batch = {"input_ids": torch.zeros(1, 6, dtype=torch.long), "_packed_seq_ids": existing}
-    _cm._synthesize_single_document_seq_ids(batch, "input_ids", 6)
+    _cs._synthesize_single_document_seq_ids(batch, "input_ids", 6)
     assert torch.equal(batch["_packed_seq_ids"], existing)

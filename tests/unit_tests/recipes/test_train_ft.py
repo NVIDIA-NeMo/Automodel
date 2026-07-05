@@ -2249,8 +2249,8 @@ class TestRunValidationToolCallEval:
 
 
 def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
-    """Non-PP step: the model-owned CP hook attaches its batch prep, and the
-    ``_cp_full_logits_grad_touch`` flag adds the zero-valued full-logits term so
+    """Non-PP step: the model-owned CP hook attaches its CPSharder, and its
+    ``finalize_loss`` grad touch adds the zero-valued full-logits term so
     backward still reaches every parameter."""
     from contextlib import nullcontext
 
@@ -2289,7 +2289,19 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
         def prepare_model_inputs_for_cp(self, input_ids, **kwargs):
             self.prepared = True
             self.num_chunks = kwargs.get("num_chunks")
-            return {"_cp_full_logits_grad_touch": True}
+            from nemo_automodel.components.distributed.cp_sharder import (
+                CPSharder,
+                contiguous_local_indices,
+                full_logits_grad_touch,
+            )
+
+            return {
+                "cp_sharder": CPSharder(
+                    shard_batch=lambda cp_mesh, tp_mesh, batch, **k: (nullcontext, batch),
+                    local_token_global_indices=contiguous_local_indices,
+                    finalize_loss_fn=full_logits_grad_touch,
+                )
+            }
 
         def forward(self, **batch):
             logits = (self.lin(batch["input_ids"].float()) + 50.0).to(torch.float16)

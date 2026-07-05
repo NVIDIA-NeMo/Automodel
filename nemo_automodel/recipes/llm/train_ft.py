@@ -1156,6 +1156,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         _use_te_value = _thd_collater
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
         cp_size = getattr(getattr(self, "dist_setup", None), "cp_size", self.cfg.get("distributed.cp_size", 1))
+        cp_sharder = None
         if self.magi.enabled:
             train_ctx, batch = self.magi.prepare_llm_batch(  # pragma: no cover - requires GPU + magi_attention
                 self.model_parts[0] if hasattr(self, "model_parts") else None,
@@ -1167,14 +1168,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
         else:
             # Model-owned context parallelism: if the model exposes a CP input-prep
-            # hook, let it attach its own batch-sharding callable (``_cp_make_batch_fn``)
-            # before make_cp_batch_and_ctx shards the batch, instead of the default
-            # load-balanced context_parallel path.
+            # hook, let it attach its own batch sharder (a ``CPSharder`` under the
+            # ``cp_sharder`` key) before make_cp_batch_and_ctx shards the batch,
+            # instead of the default load-balanced context_parallel path. Keep a
+            # reference for the per-microbatch ``finalize_loss`` hook below.
             _model_cp = self.model_parts[0] if hasattr(self, "model_parts") else None
             if cp_size > 1 and _model_cp is not None and hasattr(_model_cp, "prepare_model_inputs_for_cp"):
-                batch.update(
-                    _model_cp.prepare_model_inputs_for_cp(input_ids=batch["input_ids"], num_chunks=_num_chunks_value)
+                prepared = _model_cp.prepare_model_inputs_for_cp(
+                    input_ids=batch["input_ids"], num_chunks=_num_chunks_value
                 )
+                cp_sharder = prepared.get("cp_sharder")
+                batch.update(prepared)
             train_ctx, batch = make_cp_batch_and_ctx(
                 self.device_mesh,
                 batch,
@@ -1291,16 +1295,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         cu_seqlens=batch.get("cu_seqlens"),
                         lm_weight=shared_lm_weight,
                     )
-                # Model-owned CP (e.g. DSV4) can request a zero-valued full-logits
-                # term so every CP rank's backward reaches all parameters even when
-                # its local loss is fully masked (avoids FSDP2 unused-parameter hangs).
-                if is_train and batch.get("_cp_full_logits_grad_touch"):
-                    logits = getattr(out, "logits", out)
-                    if isinstance(logits, torch.Tensor):
-                        # Promote to fp32 before summing: bf16 logits over a large
-                        # vocab (e.g. DSV4's 129280) overflow to inf, and inf * 0.0
-                        # would be nan, poisoning local_loss and the backward pass.
-                        local_loss = local_loss + logits.float().sum() * 0.0
+                # Model-owned CP (e.g. DSV4) can hook the per-microbatch loss, e.g.
+                # to add a zero-valued full-logits term so every CP rank's backward
+                # reaches all parameters even when its local loss is fully masked
+                # (avoids FSDP2 unused-parameter hangs). See
+                # ``cp_sharder.full_logits_grad_touch``.
+                if is_train and cp_sharder is not None:
+                    local_loss = cp_sharder.finalize_loss(local_loss, out)
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()

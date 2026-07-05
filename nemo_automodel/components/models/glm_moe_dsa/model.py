@@ -333,15 +333,27 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """Attach GLM DSA's packed THD context-parallel batch sharder."""
         from functools import partial  # noqa: PLC0415
 
+        from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
+            CPSharder,
+            contiguous_local_indices,
+            full_logits_grad_touch,
+        )
+
         if getattr(self.backend, "attn", None) != "tilelang":
             raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
 
         return {
-            "_cp_make_batch_fn": partial(
-                make_glm_dsa_packed_cp_batch_and_ctx,
-                num_chunks=int(kwargs.get("num_chunks", 1)),
+            "cp_sharder": CPSharder(
+                shard_batch=partial(
+                    make_glm_dsa_packed_cp_batch_and_ctx,
+                    num_chunks=int(kwargs.get("num_chunks", 1)),
+                ),
+                # Contiguous over the packed THD token axis: rank r keeps
+                # tokens [r * T/cp, (r + 1) * T/cp).
+                local_token_global_indices=contiguous_local_indices,
+                finalize_loss_fn=full_logits_grad_touch,
+                layout="packed_thd",
             ),
-            "_cp_full_logits_grad_touch": True,
         }
 
     def _is_pipeline_parallel_stage(self) -> bool:

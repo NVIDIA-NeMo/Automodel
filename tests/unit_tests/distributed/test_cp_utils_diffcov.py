@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from nemo_automodel.components.distributed import cp_utils as cu
-from nemo_automodel.components.models.gemma4_moe import cp_batch as cm
+from nemo_automodel.components.distributed import cp_sharder as cm
 
 
 class _FakeMesh:
