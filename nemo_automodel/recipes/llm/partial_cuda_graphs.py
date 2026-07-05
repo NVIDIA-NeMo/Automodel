@@ -116,7 +116,7 @@ def _describe_control_value(value: Any) -> str:
     return f"{type_name}({value_repr})"
 
 
-@dataclass
+@dataclass(frozen=True)
 class _CapturedCall:
     """Detached sample inputs and the invariants required for a safe replay."""
 
@@ -244,6 +244,7 @@ class _PartialGraphEntry:
         canonicalizer: _Canonicalizer | None = None,
         capture_input_variants: int = 1,
     ):
+        # Target configuration.
         self.name = name
         self.target = target
         self.canonicalizer = canonicalizer
@@ -251,13 +252,18 @@ class _PartialGraphEntry:
             raise ValueError("capture_input_variants must be positive")
         self.capture_input_variants = capture_input_variants
         self.original_forward = target.forward
+
+        # Recorded input contracts and captured graphs.
         self.captured_call: _CapturedCall | None = None
         self._captured_call_variants: list[_CapturedCall] = []
-        self.adapter: nn.Module | None = None
         self._adapters: tuple[nn.Module, ...] = ()
+
+        # Runtime statistics.
         self.capture_count = 0
         self.replay_count = 0
         self.fallback_count = 0
+
+        # Lifecycle state.
         self._record_hook: Any = None
         self._captured_training: bool | None = None
         self._logged_replay = False
@@ -307,8 +313,6 @@ class _PartialGraphEntry:
         # run while every captured tensor/parameter address is still alive.
         self.target.forward = self.original_forward
         adapters = self._adapters
-        if not adapters and self.adapter is not None:
-            adapters = (self.adapter,)
         for adapter in adapters:
             reset = getattr(adapter, "reset", None)
             if self.capture_count and not callable(reset):
@@ -321,7 +325,6 @@ class _PartialGraphEntry:
             adapter.__dict__.pop("reset", None)
             del reset
 
-        self.adapter = None
         self._adapters = ()
         self.captured_call = None
         self._captured_call_variants.clear()
@@ -345,18 +348,8 @@ class _PartialGraphEntry:
         adapter.train(self.target.training)
         return adapter
 
-    def capture_inputs(
-        self,
-        adapter: nn.Module | None = None,
-        captured_call: _CapturedCall | None = None,
-    ) -> tuple[torch.Tensor, ...]:
+    def capture_inputs(self, captured_call: _CapturedCall) -> tuple[torch.Tensor, ...]:
         """Return the sample surface passed to Transformer Engine."""
-        if adapter is None:
-            adapter = self.adapter
-        if captured_call is None:
-            captured_call = self.captured_call
-        if adapter is None or captured_call is None:
-            raise RuntimeError(f"Partial CUDA graph adapter for {self.name!r} has not been built")
         return captured_call.sample_tensors
 
     def install(self, graphed_adapter: nn.Module | Sequence[nn.Module]) -> None:
@@ -373,7 +366,6 @@ class _PartialGraphEntry:
                 f"Partial CUDA graph target {self.name!r} has {len(captured_calls)} input contracts "
                 f"but {len(adapters)} graphed adapters"
             )
-        self.adapter = adapters[0]
         self._adapters = adapters
         self.capture_count = len(adapters)
         self._captured_training = self.target.training
@@ -751,11 +743,11 @@ class PartialCudaGraphManager:
                 adapter = entry.build_adapter(captured_call)
                 try:
                     result = _get_make_graphed_callables()(
-                        (adapter,),
-                        (entry.capture_inputs(adapter, captured_call),),
+                        modules=(adapter,),
+                        sample_args=(entry.capture_inputs(captured_call),),
+                        # TE runs callable-local forward/backward warmups, separate from training-loop warmup steps.
                         num_warmup_iters=3,
-                        allow_unused_input=True,
-                        sample_kwargs=({},),
+                        # This disables TE FP8/FP4 quantization, not CUDA graph capture.
                         enabled=(False,),
                     )
                 except Exception as error:

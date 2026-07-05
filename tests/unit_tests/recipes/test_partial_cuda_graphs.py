@@ -88,7 +88,8 @@ def _install_fake_graph(monkeypatch):
         def reset(self):
             self.reset_count += 1
 
-    def make_graphed_callables(modules, _sample_args, **kwargs):
+    def make_graphed_callables(modules, sample_args, **kwargs):
+        del sample_args
         captured_kwargs.append(kwargs)
         return tuple(_GraphedAdapter(module) for module in modules)
 
@@ -137,8 +138,6 @@ def test_capture_replays_matching_input_and_falls_back_on_metadata_change(monkey
     assert captured_kwargs == [
         {
             "num_warmup_iters": 3,
-            "allow_unused_input": True,
-            "sample_kwargs": ({},),
             "enabled": (False,),
         }
     ]
