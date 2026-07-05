@@ -38,6 +38,19 @@ from nemo_automodel.shared.import_utils import safe_import
 HAS_LIGER_KERNEL = importlib.util.find_spec("liger_kernel") is not None
 liger_kernel_trf = None  # lazily populated; tests may inject a stub here
 HAS_FA, _ = safe_import("flash_attn")
+# FA3 ships as dist "flash-attn-3" (module flash_attn_interface); FA4 ships as
+# dist "flash-attn-4" but installs into the same "flash_attn" import namespace
+# as FA2 (subpackage flash_attn.cute), so distribution-aware checks are needed
+# rather than plain module imports. transformers >= 4.56 provides them.
+try:
+    from transformers.utils import is_flash_attn_3_available, is_flash_attn_4_available
+
+    HAS_FA3 = is_flash_attn_3_available()
+    HAS_FA4 = is_flash_attn_4_available()
+except ImportError:  # older transformers without FA3/FA4 support
+    HAS_FA3 = False
+    HAS_FA4 = False
+FLASH_ATTN_IMPLEMENTATIONS = ("flash_attention_2", "flash_attention_3", "flash_attention_4")
 DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
 logger = logging.getLogger(__name__)
@@ -257,6 +270,7 @@ def _get_next_fallback_attn(attn_implementation: str) -> str:
         "sdpa",
         "flash_attention_2",
         "flash_attention_3",
+        "flash_attention_4",
     ]
     if attn_implementation in priorities:
         pos = priorities.index(attn_implementation)
@@ -284,12 +298,17 @@ def _apply_preload_overrides(tp_size, cp_size, has_packed_sequence, attn_impleme
 
     if has_packed_sequence:
         if cp_size == 1:
-            assert HAS_FA, "Flash Attention is not available"
-            attn_implementation = "flash_attention_2"
-            logger.warning(
-                "Packed sequence is supported only with Flash Attention. "
-                "Setting model's attn_implementation to flash_attention_2"
-            )
+            # FA2/FA3/FA4 all support varlen packing via transformers'
+            # flash-attention wrapper; keep an explicitly requested version.
+            if attn_implementation not in FLASH_ATTN_IMPLEMENTATIONS:
+                assert HAS_FA or HAS_FA3 or HAS_FA4, "Flash Attention is not available"
+                attn_implementation = (
+                    DEFAULT_ATTN_IMPLEMENTATION if HAS_FA else ("flash_attention_3" if HAS_FA3 else "flash_attention_4")
+                )
+                logger.warning(
+                    "Packed sequence is supported only with Flash Attention. Setting model's attn_implementation to %s",
+                    attn_implementation,
+                )
         else:
             # TODO: support packed sequence with CP size > 1
             raise ValueError("Packed sequence is only supported with CP size 1")
