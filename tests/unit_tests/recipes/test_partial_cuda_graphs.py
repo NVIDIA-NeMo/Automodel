@@ -41,12 +41,22 @@ class _Preprocess(nn.Module):
         return indices >= 0, probabilities
 
 
+class _Attention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q_proj = nn.Linear(4, 4, bias=False)
+        self.o_proj = nn.Linear(4, 4, bias=False)
+        self.attn_module = nn.Module()
+        self.attn_module.fused_attention = nn.Identity()
+
+    def forward(self, hidden_states):
+        return self.o_proj(self.attn_module.fused_attention(self.q_proj(hidden_states)))
+
+
 class _Layer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.self_attn = nn.Module()
-        self.self_attn.attn_module = nn.Module()
-        self.self_attn.attn_module.fused_attention = nn.Identity()
+        self.self_attn = _Attention()
         self.mlp = nn.Module()
         self.mlp.gate = _Router()
         self.mlp.experts = nn.Module()
@@ -54,10 +64,12 @@ class _Layer(nn.Module):
 
 
 class _Model(nn.Module):
-    def __init__(self, *, attention=True, router=True, preprocess=True, layer_count=1):
+    def __init__(self, *, te_dpa=True, attention=False, router=True, preprocess=True, layer_count=1):
         super().__init__()
         self.config = SimpleNamespace(model_type="test_moe")
         cuda_graph_modules = []
+        if te_dpa:
+            cuda_graph_modules.append("te_dpa")
         if attention:
             cuda_graph_modules.append("attn")
         if router:
@@ -119,6 +131,146 @@ def test_module_list_applies_to_every_compatible_layer():
         "test_moe.layers.0.fused_attention",
         "test_moe.layers.1.fused_attention",
     ]
+    manager.close()
+
+
+def test_whole_attention_scope_uses_explicit_parameters_on_single_device(monkeypatch):
+    captured_sample_args = []
+
+    def make_graphed_callables(modules, sample_args, **kwargs):
+        captured_sample_args.append(sample_args)
+        assert kwargs["retain_graph_in_backward"] is True
+        for module in modules:
+            module.reset = lambda: None
+        return modules
+
+    monkeypatch.setattr(partial_graphs, "_get_make_graphed_callables", lambda: make_graphed_callables)
+    model = _Model(te_dpa=False, attention=True, router=False, preprocess=False)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+    assert manager is not None
+    entry = manager.entries[0]
+    model.model.layers["0"].self_attn(torch.ones(2, 4))
+
+    manager.capture()
+
+    assert entry.name == "test_moe.layers.0.attention"
+    assert entry.explicit_parameters is True
+    assert len(captured_sample_args) == 1
+    assert len(captured_sample_args[0][0]) == 3
+    manager.close()
+
+
+def test_explicit_parameter_adapter_matches_eager_forward_and_backward():
+    torch.manual_seed(123)
+    eager_target = _Attention()
+    graph_target = _Attention()
+    graph_target.load_state_dict(eager_target.state_dict())
+    eager_input = torch.randn(2, 4, requires_grad=True)
+    graph_input = eager_input.detach().clone().requires_grad_()
+    captured_call = partial_graphs._CapturedCall.from_call((graph_input,), {})
+    adapter = partial_graphs._ExplicitParameterCallAdapter(graph_target, captured_call)
+
+    eager_output = eager_target(eager_input)
+    graph_output = adapter(*adapter.capture_inputs)
+    torch.testing.assert_close(graph_output, eager_output)
+
+    eager_output.sum().backward()
+    graph_output.sum().backward()
+    torch.testing.assert_close(adapter.capture_inputs[0].grad, eager_input.grad)
+    for (name, eager_parameter), graph_parameter in zip(eager_target.named_parameters(), adapter.capture_parameters):
+        assert graph_parameter.grad is not None, name
+        torch.testing.assert_close(graph_parameter.grad, eager_parameter.grad)
+    assert all(parameter.grad is None for parameter in graph_target.parameters())
+
+
+def test_explicit_parameter_adapter_rejects_replaced_buffer_storage():
+    class _BufferedAttention(_Attention):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("scale", torch.ones(()))
+
+        def forward(self, x):
+            return super().forward(x) * self.scale
+
+    target = _BufferedAttention()
+    captured_call = partial_graphs._CapturedCall.from_call((torch.ones(2, 4),), {})
+    adapter = partial_graphs._ExplicitParameterCallAdapter(target, captured_call)
+    target.scale = torch.full((), 2.0)
+
+    with pytest.raises(RuntimeError, match="buffer storage changed"):
+        adapter.replay_inputs((torch.ones(2, 4),))
+
+
+def test_explicit_parameter_adapter_rejects_parameter_without_local_storage():
+    class _NoStorageParameter(nn.Parameter):
+        def data_ptr(self):
+            raise RuntimeError("no local storage")
+
+    target = _Attention()
+    target.q_proj.weight = _NoStorageParameter(target.q_proj.weight.detach())
+    captured_call = partial_graphs._CapturedCall.from_call((torch.ones(2, 4),), {})
+
+    with pytest.raises(RuntimeError, match="stable local storage"):
+        partial_graphs._ExplicitParameterCallAdapter(target, captured_call)
+
+
+def test_explicit_parameter_adapter_rejects_unmaterialized_parameter_on_replay():
+    class _NoStorageParameter(nn.Parameter):
+        def data_ptr(self):
+            raise RuntimeError("no local storage")
+
+    target = _Attention()
+    captured_call = partial_graphs._CapturedCall.from_call((torch.ones(2, 4),), {})
+    adapter = partial_graphs._ExplicitParameterCallAdapter(target, captured_call)
+    target.q_proj.weight = _NoStorageParameter(target.q_proj.weight.detach())
+
+    with pytest.raises(RuntimeError, match="stable local storage"):
+        adapter.replay_inputs((torch.ones(2, 4),))
+
+
+def test_explicit_parameter_adapter_rejects_changed_parameter_metadata():
+    target = _Attention()
+    captured_call = partial_graphs._CapturedCall.from_call((torch.ones(2, 4),), {})
+    adapter = partial_graphs._ExplicitParameterCallAdapter(target, captured_call)
+    target.q_proj.weight = nn.Parameter(torch.ones(5, 4))
+
+    with pytest.raises(RuntimeError, match="parameter metadata changed"):
+        adapter.replay_inputs((torch.ones(2, 4),))
+
+
+def test_parameter_owner_is_resharded_when_capture_fails(monkeypatch):
+    class _CaptureOwner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.events = []
+
+        def unshard(self, *, async_op):
+            self.events.append(("unshard", async_op))
+
+        def reshard(self):
+            self.events.append(("reshard",))
+
+    owner = _CaptureOwner()
+    target = _Attention()
+    entry = partial_graphs._PartialGraphEntry(
+        name="whole_attention",
+        target=target,
+        explicit_parameters=True,
+        capture_owner=owner,
+    )
+    manager = partial_graphs.PartialCudaGraphManager([entry])
+    manager.start_recording()
+    target(torch.ones(2, 4))
+    monkeypatch.setattr(
+        partial_graphs,
+        "_get_make_graphed_callables",
+        lambda: lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("capture failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="Partial CUDA graph capture failed"):
+        manager.capture()
+
+    assert owner.events == [("unshard", False), ("reshard",)]
     manager.close()
 
 
@@ -198,6 +350,12 @@ def test_missing_eager_sample_fails_closed():
 def test_rejects_router_and_preprocess_with_activation_checkpointing():
     with pytest.raises(RuntimeError, match="cannot recompute across the partial MoE router/preprocess"):
         partial_graphs.PartialCudaGraphManager.from_model_parts([_Model()], activation_checkpointing=True)
+
+
+def test_rejects_whole_attention_with_activation_checkpointing():
+    model = _Model(te_dpa=False, attention=True, router=False, preprocess=False)
+    with pytest.raises(RuntimeError, match="Whole-attention CUDA graphs do not support activation checkpointing"):
+        partial_graphs.PartialCudaGraphManager.from_model_parts([model], activation_checkpointing=True)
 
 
 @pytest.mark.parametrize(

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import enum
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,6 +52,29 @@ def _tensor_metadata(tensor: torch.Tensor) -> tuple[Any, ...]:
         tuple(tensor.stride()),
         tensor.requires_grad,
     )
+
+
+def _named_buffer_storage(target: nn.Module) -> tuple[tuple[Any, ...], ...]:
+    """Return buffer identities and storage properties captured by a graph."""
+    signatures = []
+    for name, buffer in target.named_buffers():
+        try:
+            data_ptr = buffer.data_ptr()
+        except (RuntimeError, TypeError) as error:
+            raise RuntimeError(f"whole-attention buffer {name!r} has no stable local storage") from error
+        signatures.append((name, id(buffer), data_ptr, _tensor_metadata(buffer)))
+    return tuple(signatures)
+
+
+def _require_local_parameter_storage(name: str, parameter: nn.Parameter) -> None:
+    """Reject sharded or otherwise unmaterialized parameters before graph capture."""
+    try:
+        parameter.data_ptr()
+    except (RuntimeError, TypeError) as error:
+        raise RuntimeError(
+            "Whole-attention CUDA graph capture requires materialized parameters with stable local storage; "
+            f"{name!r} is not materialized. Nested FSDP attention ownership is not supported."
+        ) from error
 
 
 def _alias_pattern(tensors: Sequence[torch.Tensor]) -> tuple[int, ...]:
@@ -233,6 +256,108 @@ class _TensorOnlyCallAdapter(nn.Module):
         return self.target(*args, **kwargs)
 
 
+class _ExplicitParameterCallAdapter(nn.Module):
+    """Present module parameters as graph inputs instead of captured module state."""
+
+    def __init__(self, target: nn.Module, captured_call: _CapturedCall) -> None:
+        super().__init__()
+        self.graph_target = target
+        self.__dict__["target"] = target
+        self.captured_call = captured_call
+        self.dynamic_input_count = len(captured_call.sample_tensors)
+
+        named_parameters = tuple(target.named_parameters())
+        if not named_parameters:
+            raise RuntimeError("Whole-attention CUDA graph target has no parameters")
+        all_parameter_names = tuple(name for name, _parameter in target.named_parameters(remove_duplicate=False))
+        if len(all_parameter_names) != len(named_parameters):
+            raise RuntimeError("Whole-attention CUDA graphs do not support tied or aliased parameters")
+        self.parameter_names = tuple(name for name, _parameter in named_parameters)
+        self.parameter_metadata = tuple(_tensor_metadata(parameter) for _name, parameter in named_parameters)
+        self.buffer_storage = _named_buffer_storage(target)
+        capture_parameters = []
+        for name, parameter in named_parameters:
+            if not isinstance(parameter, nn.Parameter):
+                raise RuntimeError(
+                    "Whole-attention CUDA graph capture requires materialized nn.Parameter values; "
+                    f"{name!r} is {type(parameter).__name__}"
+                )
+            _require_local_parameter_storage(name, parameter)
+            clone = parameter.detach().clone(memory_format=torch.preserve_format)
+            clone.requires_grad_(parameter.requires_grad)
+            capture_parameters.append(clone)
+        self.capture_parameters = tuple(capture_parameters)
+
+    def parameters(self, recurse: bool = True) -> Iterator[nn.Parameter]:
+        """Hide the registered target parameters from TE module-parameter discovery."""
+        del recurse
+        return iter(())
+
+    def named_parameters(
+        self,
+        prefix: str = "",
+        recurse: bool = True,
+        remove_duplicate: bool = True,
+    ) -> Iterator[tuple[str, nn.Parameter]]:
+        """Hide the registered target parameters from generic module utilities."""
+        del prefix, recurse, remove_duplicate
+        return iter(())
+
+    @property
+    def capture_inputs(self) -> tuple[torch.Tensor, ...]:
+        """Return dynamic samples followed by graph-owned parameter samples."""
+        return self.captured_call.sample_tensors + self.capture_parameters
+
+    def replay_inputs(self, dynamic_inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+        """Append the currently materialized live parameters for graph replay."""
+        named_parameters = tuple(self.target.named_parameters())
+        parameter_names = tuple(name for name, _parameter in named_parameters)
+        if parameter_names != self.parameter_names:
+            raise RuntimeError(
+                f"whole-attention parameter names changed: expected {self.parameter_names}, got {parameter_names}"
+            )
+        for index, (name, parameter) in enumerate(named_parameters):
+            if not isinstance(parameter, nn.Parameter):
+                raise RuntimeError(
+                    "whole-attention parameters are not materialized for replay: "
+                    f"{name!r} is {type(parameter).__name__}"
+                )
+            _require_local_parameter_storage(name, parameter)
+            actual_metadata = _tensor_metadata(parameter)
+            expected_metadata = self.parameter_metadata[index]
+            if actual_metadata != expected_metadata:
+                raise RuntimeError(
+                    f"whole-attention parameter metadata changed for {name!r}: "
+                    f"expected {expected_metadata}, got {actual_metadata}"
+                )
+        buffer_storage = _named_buffer_storage(self.target)
+        if buffer_storage != self.buffer_storage:
+            raise RuntimeError(
+                f"whole-attention buffer storage changed: expected {self.buffer_storage}, got {buffer_storage}"
+            )
+        return dynamic_inputs + tuple(parameter for _name, parameter in named_parameters)
+
+    def forward(self, *tensor_inputs: torch.Tensor) -> Any:
+        """Run the target with explicit parameter values."""
+        expected_inputs = self.dynamic_input_count + len(self.parameter_names)
+        if len(tensor_inputs) != expected_inputs:
+            raise RuntimeError(f"Expected {expected_inputs} explicit graph inputs, got {len(tensor_inputs)}")
+        dynamic_inputs = tensor_inputs[: self.dynamic_input_count]
+        parameter_inputs = tensor_inputs[self.dynamic_input_count :]
+        args, kwargs = self.captured_call.rebuild(dynamic_inputs)
+        return torch.func.functional_call(
+            self.graph_target,
+            (
+                dict(zip(self.parameter_names, parameter_inputs)),
+                dict(self.graph_target.named_buffers()),
+            ),
+            args,
+            kwargs,
+            tie_weights=False,
+            strict=True,
+        )
+
+
 class _PartialGraphEntry:
     """One graphable module invocation and its replay safety state."""
 
@@ -243,6 +368,9 @@ class _PartialGraphEntry:
         target: nn.Module,
         canonicalizer: _Canonicalizer | None = None,
         capture_input_variants: int = 1,
+        explicit_parameters: bool = False,
+        capture_owner: nn.Module | None = None,
+        retain_graph_in_backward: bool = False,
     ):
         # Target configuration.
         self.name = name
@@ -251,6 +379,9 @@ class _PartialGraphEntry:
         if capture_input_variants <= 0:
             raise ValueError("capture_input_variants must be positive")
         self.capture_input_variants = capture_input_variants
+        self.explicit_parameters = explicit_parameters
+        self.capture_owner = capture_owner
+        self.retain_graph_in_backward = retain_graph_in_backward
         self.original_forward = target.forward
 
         # Recorded input contracts and captured graphs.
@@ -268,6 +399,7 @@ class _PartialGraphEntry:
         self._captured_training: bool | None = None
         self._logged_replay = False
         self._logged_fallback = False
+        self._capture_owner_unsharded = False
         self._closed = False
 
     def _canonicalize(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
@@ -344,13 +476,40 @@ class _PartialGraphEntry:
             captured_call = self.captured_call
         if captured_call is None:
             raise RuntimeError(f"Partial CUDA graph target {self.name!r} was not called during iteration 0")
-        adapter = _TensorOnlyCallAdapter(self.target, captured_call)
+        if self.explicit_parameters:
+            adapter = _ExplicitParameterCallAdapter(self.target, captured_call)
+        else:
+            adapter = _TensorOnlyCallAdapter(self.target, captured_call)
         adapter.train(self.target.training)
         return adapter
 
-    def capture_inputs(self, captured_call: _CapturedCall) -> tuple[torch.Tensor, ...]:
+    def capture_inputs(self, adapter: nn.Module, captured_call: _CapturedCall) -> tuple[torch.Tensor, ...]:
         """Return the sample surface passed to Transformer Engine."""
+        if isinstance(adapter, _ExplicitParameterCallAdapter):
+            return adapter.capture_inputs
         return captured_call.sample_tensors
+
+    def prepare_for_capture(self) -> None:
+        """Materialize FSDP2 parameters before constructing explicit graph inputs."""
+        if self.capture_owner is not None:
+            self.capture_owner.unshard(async_op=False)
+            self._capture_owner_unsharded = True
+            for name, parameter in self.target.named_parameters():
+                if not isinstance(parameter, nn.Parameter):
+                    raise RuntimeError(
+                        "Whole-attention CUDA graph capture requires the selected FSDP owner to materialize "
+                        f"every target parameter; {name!r} remains {type(parameter).__name__}. "
+                        "Nested FSDP attention ownership is not supported."
+                    )
+                _require_local_parameter_storage(name, parameter)
+
+    def finish_capture(self) -> None:
+        """Return an FSDP2 owner to its normal sharded state after capture."""
+        if self.capture_owner is not None and self._capture_owner_unsharded:
+            try:
+                self.capture_owner.reshard()
+            finally:
+                self._capture_owner_unsharded = False
 
     def install(self, graphed_adapter: nn.Module | Sequence[nn.Module]) -> None:
         """Install validated graph replay around the original target forward."""
@@ -399,6 +558,11 @@ class _PartialGraphEntry:
 
             if valid and self.target.training != self._captured_training:
                 valid, reason = False, "training mode changed"
+            if valid and isinstance(adapters[variant_index], _ExplicitParameterCallAdapter):
+                try:
+                    tensors = adapters[variant_index].replay_inputs(tensors)
+                except Exception as error:
+                    valid, reason = False, f"explicit parameter inputs unavailable: {error}"
             if valid:
                 self.replay_count += 1
                 if not self._logged_replay:
@@ -461,6 +625,7 @@ class _DiscoveredBlock:
 
     name: str
     module: nn.Module
+    capture_owner: nn.Module | None
     moe: nn.Module | None
     is_mtp: bool
 
@@ -487,9 +652,15 @@ def _find_moe_module(block: nn.Module) -> nn.Module | None:
     return None
 
 
-def _find_fused_attention(block: _DiscoveredBlock) -> nn.Module | None:
-    """Find the parameterless TE fused-attention boundary in a transformer block."""
+def _find_attention(block: _DiscoveredBlock) -> nn.Module | None:
+    """Find the whole attention module in a transformer block."""
     attention = getattr(block.module, "self_attn", None)
+    return _unwrap_checkpoint_wrappers(attention) if isinstance(attention, nn.Module) else None
+
+
+def _find_te_dpa(block: _DiscoveredBlock) -> nn.Module | None:
+    """Find the parameterless TE fused-attention boundary in a transformer block."""
+    attention = _find_attention(block)
     if isinstance(attention, nn.Module):
         dpa = getattr(attention, "attn_module", None)
         target = getattr(dpa, "fused_attention", None)
@@ -526,13 +697,37 @@ def _require_parameterless_target(module_name: str, block: _DiscoveredBlock, tar
         raise RuntimeError(f"The {module_name} CUDA graph boundary in {block.name} must be parameterless")
 
 
-def _build_attention_entry(
+def _build_whole_attention_entry(
+    block: _DiscoveredBlock,
+    target: nn.Module,
+    _activation_checkpointing: bool,
+) -> _PartialGraphEntry:
+    """Build one whole-attention graph entry with graph-safe explicit parameters."""
+    from torch.distributed.fsdp import FSDPModule
+
+    capture_owner = block.capture_owner if isinstance(block.capture_owner, FSDPModule) else None
+    return _PartialGraphEntry(
+        name=f"{block.name}.attention",
+        target=target,
+        capture_input_variants=1,
+        # PyTorch parameters are explicit inputs even without FSDP. Letting TE
+        # discover them as static module state can keep AccumulateGrad nodes on
+        # the legacy stream and invalidate backward capture.
+        explicit_parameters=True,
+        capture_owner=capture_owner,
+        # TE DPA backward may consume the upstream RoPE graph before the outer
+        # callable backward finishes capturing it.
+        retain_graph_in_backward=True,
+    )
+
+
+def _build_te_dpa_entry(
     block: _DiscoveredBlock,
     target: nn.Module,
     activation_checkpointing: bool,
 ) -> _PartialGraphEntry:
     """Build one TE fused-attention graph entry."""
-    _require_parameterless_target("attn", block, target)
+    _require_parameterless_target("te_dpa", block, target)
     return _PartialGraphEntry(
         name=f"{block.name}.fused_attention",
         target=target,
@@ -577,7 +772,8 @@ class _GraphModuleSpec:
 
 
 _GRAPH_MODULE_SPECS = {
-    "attn": _GraphModuleSpec(_find_fused_attention, _build_attention_entry),
+    "attn": _GraphModuleSpec(_find_attention, _build_whole_attention_entry),
+    "te_dpa": _GraphModuleSpec(_find_te_dpa, _build_te_dpa_entry),
     "moe_router": _GraphModuleSpec(_find_moe_router, _build_moe_router_entry),
     "moe_preprocess": _GraphModuleSpec(_find_moe_preprocess, _build_moe_preprocess_entry),
 }
@@ -585,6 +781,8 @@ _GRAPH_MODULE_SPECS = {
 
 def _discover_blocks(model: nn.Module) -> list[_DiscoveredBlock]:
     """Discover main-stack and MTP blocks using the shared MoE traversal."""
+    from torch.distributed.fsdp import FSDPModule
+
     from nemo_automodel.components.moe.parallelizer import _iter_transformer_and_mtp_blocks
 
     label = _model_label(model)
@@ -592,12 +790,14 @@ def _discover_blocks(model: nn.Module) -> list[_DiscoveredBlock]:
     blocks = []
     for parent_layers, layer_id, wrapped_block in _iter_transformer_and_mtp_blocks(model):
         block = _unwrap_checkpoint_wrappers(wrapped_block)
+        capture_owner = wrapped_block if isinstance(wrapped_block, FSDPModule) else None
         is_mtp = parent_layers is mtp_layers
         scope = "mtp.layers" if is_mtp else "layers"
         blocks.append(
             _DiscoveredBlock(
                 name=f"{label}.{scope}.{layer_id}",
                 module=block,
+                capture_owner=capture_owner,
                 moe=_find_moe_module(block),
                 is_mtp=is_mtp,
             )
@@ -667,6 +867,11 @@ class PartialCudaGraphManager:
                 "pipeline chunks can overwrite static graph buffers with in-flight microbatches"
             )
         if activation_checkpointing:
+            if any("attn" in part.backend.cuda_graph_modules for part in enabled_parts):
+                raise RuntimeError(
+                    "Whole-attention CUDA graphs do not support activation checkpointing; "
+                    "use te_dpa or disable activation checkpointing"
+                )
             if any(
                 "moe_router" in part.backend.cuda_graph_modules or "moe_preprocess" in part.backend.cuda_graph_modules
                 for part in enabled_parts
@@ -739,26 +944,35 @@ class PartialCudaGraphManager:
 
         for entry in self.entries:
             graphed_adapters = []
-            for captured_call in entry.captured_calls():
-                adapter = entry.build_adapter(captured_call)
-                try:
-                    result = _get_make_graphed_callables()(
-                        modules=(adapter,),
-                        sample_args=(entry.capture_inputs(captured_call),),
+            try:
+                entry.prepare_for_capture()
+                for captured_call in entry.captured_calls():
+                    adapter = entry.build_adapter(captured_call)
+                    graph_kwargs = {
                         # TE runs callable-local forward/backward warmups, separate from training-loop warmup steps.
-                        num_warmup_iters=3,
+                        "num_warmup_iters": 3,
                         # This disables TE FP8/FP4 quantization, not CUDA graph capture.
-                        enabled=(False,),
-                    )
-                except Exception as error:
-                    raise RuntimeError(f"Partial CUDA graph capture failed for {entry.name}") from error
-                if not isinstance(result, tuple):
-                    result = (result,)
-                if len(result) != 1:
-                    raise RuntimeError(
-                        f"Transformer Engine returned {len(result)} graphs for partial target {entry.name!r}"
-                    )
-                graphed_adapters.append(result[0])
+                        "enabled": (False,),
+                    }
+                    if entry.retain_graph_in_backward:
+                        graph_kwargs["retain_graph_in_backward"] = True
+                    try:
+                        result = _get_make_graphed_callables()(
+                            modules=(adapter,),
+                            sample_args=(entry.capture_inputs(adapter, captured_call),),
+                            **graph_kwargs,
+                        )
+                    except Exception as error:
+                        raise RuntimeError(f"Partial CUDA graph capture failed for {entry.name}") from error
+                    if not isinstance(result, tuple):
+                        result = (result,)
+                    if len(result) != 1:
+                        raise RuntimeError(
+                            f"Transformer Engine returned {len(result)} graphs for partial target {entry.name!r}"
+                        )
+                    graphed_adapters.append(result[0])
+            finally:
+                entry.finish_capture()
             entry.install(graphed_adapters)
 
         self._captured = True

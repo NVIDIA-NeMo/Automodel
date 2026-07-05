@@ -193,9 +193,11 @@ class BackendConfig:
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
         cuda_graph_modules: Per-layer modules to capture with Transformer Engine,
-            following Megatron Core's ``cuda_graph_modules`` names. AutoModel currently
-            supports ``attn``, ``moe_router``, and ``moe_preprocess``. An empty list
-            disables CUDA graphs. ``moe_preprocess`` requires ``moe_router``.
+            following Megatron Core's ``cuda_graph_modules`` names. AutoModel supports
+            whole ``attn``, ``moe_router``, and ``moe_preprocess`` scopes, plus the
+            AutoModel-specific narrow ``te_dpa`` scope. An empty list disables CUDA
+            graphs. ``moe_preprocess`` requires ``moe_router``; ``attn`` and ``te_dpa``
+            are mutually exclusive.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -231,7 +233,7 @@ class BackendConfig:
     # fullgraph can't trace), so it requires attn="sdpa", linear="torch", rms_norm="torch",
     # rope_fusion=False. Default False.
     compile_attn: bool = False
-    cuda_graph_modules: list[Literal["attn", "moe_router", "moe_preprocess"]] = field(default_factory=list)
+    cuda_graph_modules: list[Literal["attn", "te_dpa", "moe_router", "moe_preprocess"]] = field(default_factory=list)
 
     def __post_init__(self):
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
@@ -271,7 +273,7 @@ class BackendConfig:
             raise TypeError("cuda_graph_modules must be a list")
         if not all(isinstance(module, str) for module in self.cuda_graph_modules):
             raise TypeError("cuda_graph_modules entries must be strings")
-        supported_cuda_graph_modules = {"attn", "moe_router", "moe_preprocess"}
+        supported_cuda_graph_modules = {"attn", "te_dpa", "moe_router", "moe_preprocess"}
         unknown_cuda_graph_modules = set(self.cuda_graph_modules) - supported_cuda_graph_modules
         if unknown_cuda_graph_modules:
             raise ValueError(
@@ -281,12 +283,24 @@ class BackendConfig:
             )
         if len(self.cuda_graph_modules) != len(set(self.cuda_graph_modules)):
             raise ValueError("cuda_graph_modules must not contain duplicates")
-        if "attn" in self.cuda_graph_modules and self.attn != "te":
-            raise ValueError("'attn' in cuda_graph_modules requires attn='te'")
-        if "attn" in self.cuda_graph_modules and self.te_fp8 is not None:
+        attention_graph_modules = {"attn", "te_dpa"}.intersection(self.cuda_graph_modules)
+        if len(attention_graph_modules) > 1:
+            raise ValueError("cuda_graph_modules cannot contain both 'attn' and 'te_dpa'")
+        if attention_graph_modules and self.attn != "te":
+            raise ValueError(f"{sorted(attention_graph_modules)} in cuda_graph_modules requires attn='te'")
+        if "attn" in self.cuda_graph_modules and self.linear != "torch":
+            raise ValueError("'attn' in cuda_graph_modules currently requires linear='torch'")
+        if "attn" in self.cuda_graph_modules and self.rms_norm != "torch":
+            raise ValueError("'attn' in cuda_graph_modules currently requires rms_norm='torch'")
+        if "attn" in self.cuda_graph_modules and self.rope_fusion:
+            raise ValueError("'attn' in cuda_graph_modules currently requires rope_fusion=False")
+        if attention_graph_modules and self.te_fp8 is not None:
             recipe_fp8_dpa = getattr(self.te_fp8.recipe, "fp8_dpa", False)
             if recipe_fp8_dpa:
-                raise ValueError("'attn' in cuda_graph_modules requires BF16 dot-product attention (fp8_dpa=False)")
+                raise ValueError(
+                    f"{sorted(attention_graph_modules)} in cuda_graph_modules requires BF16 dot-product attention "
+                    "(fp8_dpa=False)"
+                )
         if "moe_preprocess" in self.cuda_graph_modules and "moe_router" not in self.cuda_graph_modules:
             raise ValueError("'moe_preprocess' in cuda_graph_modules requires 'moe_router'")
         if "moe_router" in self.cuda_graph_modules and self.fake_balanced_gate:
