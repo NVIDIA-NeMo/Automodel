@@ -149,6 +149,14 @@ optimizer:
   betas: [0.9, 0.95]
   eps: 1.0e-15
   weight_decay: 0.0
+  # foreach=false: on torch>=2.12, AdamW's _foreach_* ops over FSDP2-sharded (DTensor) params
+  # are re-planned by DTensor's sharding propagator every step via the *uncached* path (a
+  # foreach op's list argument isn't cached), leaking OpStrategy/OpSpec + FakeTensor dispatch-
+  # cache entries (~19.6k Python objects/step -> growing gen-2 GC pauses -> throughput sinks
+  # monotonically over a run). Single-tensor ops (foreach=false) hit the sharding cache, so
+  # nothing accumulates; the optimizer is a tiny slice of step time, so the cost is ~0.8%.
+  # Remove once the DTensor foreach path is fixed upstream.
+  foreach: false
 
 lr_scheduler:
   schedule: constant

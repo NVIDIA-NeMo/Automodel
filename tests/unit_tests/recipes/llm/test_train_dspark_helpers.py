@@ -47,11 +47,13 @@ import torch
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm.train_dspark import (
+    TrainDSparkRecipe,
     _apply_draft_activation_checkpointing,
     _apply_target_chat_template,
     _build_dspark_optimizer,
     _extract_mm_kwargs,
     _init_dspark_wandb,
+    _repair_glm_5_2_qk_rope_head_dim,
     _resolve_dspark_optimizer_spec,
     _resolve_reduced_target_layers,
     _resolve_wandb_kwargs,
@@ -405,3 +407,116 @@ def test_extract_mm_kwargs_passes_through_present_media_keys():
 def test_extract_mm_kwargs_ignores_unrelated_keys():
     batch = {"input_ids": torch.zeros(1), "seq_lens": torch.tensor([1, 2]), "doc_remaining": torch.tensor([0])}
     assert _extract_mm_kwargs(batch) == {}
+
+
+# ---------------------------------------------------------------------------
+# GLM-5.2 target config repair + reduced-config forwarding
+# ---------------------------------------------------------------------------
+
+
+def test_optimizer_spec_real_config_node_without_target_defaults_to_adamw():
+    """Regression: ConfigNode.get_as_string raises KeyError for an absent ``_target_``
+    even with a ``None`` default, which crashed every optimizer block omitting it."""
+    cfg = ConfigNode({"lr": 6e-4, "betas": [0.9, 0.95], "weight_decay": 0.0, "warmup_ratio": 0.04})
+    target, kwargs = _resolve_dspark_optimizer_spec(cfg)
+    assert target == "torch.optim.AdamW"
+    assert kwargs["lr"] == 6e-4
+    assert "warmup_ratio" not in kwargs
+
+
+def test_repair_glm_qk_rope_restores_clobbered_value():
+    cfg = SimpleNamespace(qk_rope_head_dim=192)
+    _repair_glm_5_2_qk_rope_head_dim(cfg, {"qk_rope_head_dim": 64, "head_dim": 192})
+    assert cfg.qk_rope_head_dim == 64
+
+
+def test_repair_glm_qk_rope_noop_when_already_matching():
+    cfg = SimpleNamespace(qk_rope_head_dim=64)
+    _repair_glm_5_2_qk_rope_head_dim(cfg, {"qk_rope_head_dim": 64})
+    assert cfg.qk_rope_head_dim == 64
+
+
+def test_repair_glm_qk_rope_noop_when_raw_config_omits_field():
+    cfg = SimpleNamespace(qk_rope_head_dim=192)
+    _repair_glm_5_2_qk_rope_head_dim(cfg, {"head_dim": 192})
+    assert cfg.qk_rope_head_dim == 192
+
+
+_TINY_GLM_CONFIG = {
+    "architectures": ["GlmMoeDsaForCausalLM"],
+    "model_type": "glm_moe_dsa",
+    # head_dim (the attention-kernel head dim) alongside the true qk_rope_head_dim, as
+    # the published GLM-5.2 config ships them; the HF attribute_map (head_dim ->
+    # qk_rope_head_dim) lets the former clobber the latter on load.
+    "head_dim": 24,
+    "qk_rope_head_dim": 8,
+    "qk_nope_head_dim": 16,
+    "qk_head_dim": 24,
+    "q_lora_rank": 32,
+    "kv_lora_rank": 16,
+    "v_head_dim": 24,
+    "hidden_size": 64,
+    "intermediate_size": 48,
+    "moe_intermediate_size": 32,
+    "num_hidden_layers": 8,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "n_routed_experts": 8,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 2,
+    "index_head_dim": 16,
+    "index_n_heads": 2,
+    "index_topk": 8,
+    "max_position_embeddings": 128,
+    "rms_norm_eps": 1e-6,
+    "hidden_act": "silu",
+    "vocab_size": 128,
+}
+
+
+def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeypatch):
+    """Regression: ``from_pretrained`` re-read the checkpoint's own config, silently
+    rebuilding the full-depth target and discarding ``target_num_hidden_layers`` (OOM
+    on one node). The GLM target build must hand the reduced, repaired config to
+    ``from_config`` with ``load_base_model=True``."""
+    import json
+
+    import nemo_automodel.recipes.llm.train_dspark as td
+
+    (tmp_path / "config.json").write_text(json.dumps(_TINY_GLM_CONFIG))
+
+    captured = {}
+
+    def _fake_from_config(config=None, **kwargs):
+        captured["config"] = config
+        captured.update(kwargs)
+        return "target-model"
+
+    monkeypatch.setattr(td, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
+    monkeypatch.setattr(td, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
+
+    recipe = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    recipe.cfg = SimpleNamespace()
+    recipe.device = SimpleNamespace(type="cuda")
+    recipe.compute_dtype = torch.bfloat16
+    recipe.dist_env = SimpleNamespace(world_size=8)
+
+    recipe_cfg = _opt_cfg(target_num_hidden_layers=2)
+    target_config, target_model = recipe._build_glm_5_2_target(str(tmp_path), recipe_cfg, False)
+
+    assert target_model == "target-model"
+    assert captured["config"] is target_config
+    # The reduction survives (from_pretrained would have re-read the 8-layer config).
+    assert target_config.num_hidden_layers == 2
+    # The attribute-map clobber is repaired back to the raw checkpoint value.
+    assert target_config.qk_rope_head_dim == 8
+    assert captured["load_base_model"] is True
+    assert captured["distributed_setup"] == "distributed-setup"
+    assert captured["torch_dtype"] == torch.bfloat16
+
+
+def test_build_glm_5_2_target_requires_cuda(tmp_path):
+    recipe = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    recipe.device = SimpleNamespace(type="cpu")
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        recipe._build_glm_5_2_target(str(tmp_path), _opt_cfg(), False)
