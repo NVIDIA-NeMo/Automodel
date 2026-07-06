@@ -53,6 +53,30 @@ from nemo_automodel.shared.import_utils import safe_import
 HAVE_FLASH_ATTN, _flash_attn = safe_import("flash_attn.flash_attn_interface")
 
 
+def require_flash_attn_version() -> None:
+    """Refuse flash-attn releases the ring was not written against.
+
+    ``_fa_forward`` / ``_fa_backward`` call the private ``_flash_attn_forward`` /
+    ``_flash_attn_backward`` by POSITIONAL args pinned to the 2.8.x layout
+    (``q, k, v, dropout, scale, causal, win_left, win_right, softcap, alibi,
+    return_softmax``). Other 2.x releases reorder or insert params, which would
+    silently bind ``causal`` / ``softmax_scale`` to the wrong slots and train on
+    garbage, so gate the version rather than the mere presence of the package.
+    """
+    if not HAVE_FLASH_ATTN:
+        raise RuntimeError("The context-parallel draft ring requires the flash-attn package.")
+    import flash_attn
+
+    version = getattr(flash_attn, "__version__", "")
+    parts = version.split(".")
+    if not (len(parts) >= 2 and parts[0] == "2" and parts[1].isdigit() and int(parts[1]) >= 8):
+        raise RuntimeError(
+            "The context-parallel draft ring binds flash-attn's private "
+            "_flash_attn_forward/_backward by position against the 2.8.x layout; other releases "
+            f"reorder those params. Found flash-attn {version!r}; install flash-attn>=2.8,<3."
+        )
+
+
 def _fa_forward(q, k, v, softmax_scale, causal, dropout_p=0.0):
     """flash_attn 2.8.3 fwd: returns ``(out[B,S,H,D], lse[B,H,S])``."""
     out, lse, _s_dmask, _rng = _flash_attn._flash_attn_forward(

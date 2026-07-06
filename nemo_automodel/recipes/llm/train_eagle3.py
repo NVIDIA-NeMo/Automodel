@@ -141,13 +141,11 @@ def _validate_cp_gates(
             "(e.g. flash_attention_2, the HF auto-select default when flash-attn is installed) "
             "bypasses the hook, so each rank silently attends only its own shard."
         )
-    from nemo_automodel.components.distributed.ring_attention import HAVE_FLASH_ATTN
+    # The draft ring runs on flash-attn's private kernels pinned to the 2.8.x
+    # positional signature, so check the version here (not just that it imports).
+    from nemo_automodel.components.distributed.ring_attention import require_flash_attn_version
 
-    if not HAVE_FLASH_ATTN:
-        raise RuntimeError(
-            "Context parallelism (cp_size>1) runs the EAGLE-3 draft on the ring FlashAttention "
-            "kernels, which require the flash-attn package. Install flash-attn or set cp_size=1."
-        )
+    require_flash_attn_version()
     # Zig-zag chunks the sequence into 2*cp pieces (rank r owns chunks r and 2*cp-1-r),
     # so it needs divisibility by 2*cp_size; the contiguous shard needs only cp_size.
     divisor = 2 * cp_size if cp_zigzag else cp_size
@@ -281,6 +279,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if self.cached_target_path is None:
             selected_token_ids, selected_token_mask = self._setup_online_target(recipe_cfg, target_path, target_config)
         else:
+            # The cached-target path never builds a cp mesh (only the colocated
+            # target does), so cp_size>1 here would silently fall back to plain DP
+            # -- the draft would train unsharded while the user asked for CP.
+            if int(self.cfg.get("distributed.cp_size", 1) or 1) > 1:
+                raise NotImplementedError(
+                    "Context parallelism (cp_size>1) is not supported with a cached target; the "
+                    "cached path does not build a cp mesh. Use the colocated target or set cp_size=1."
+                )
             selected_token_ids, selected_token_mask = self._setup_cached_target(recipe_cfg, target_config)
 
         draft_config = target_config.to_dict()
@@ -1447,6 +1453,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             # step; rescale by the inverse so the trailing step's gradient
             # is on the same scale as every other step.
             if pending_micro_batches > 0:
+                # Sum the draft grads over cp first (as in the full-window step above);
+                # otherwise the trailing step applies per-rank partial gradients and the
+                # cp replicas of the draft desync permanently from here on.
+                if getattr(self, "cp_group", None) is not None:
+                    self._all_reduce_draft_grads_over_cp()
                 scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                 for p in self.trainer_module.parameters():
                     if p.grad is not None:

@@ -524,11 +524,24 @@ def attach_eagle3_cp_attention(model: nn.Module, cp_group, zigzag: bool = False)
     A no-op ``cp_group`` of size 1 leaves the plain per-rank path in place. With
     ``zigzag=True`` the load-balanced zig-zag ring is used (the inputs must then be
     sharded in zig-zag order); otherwise the contiguous ring.
+
+    Raises if the draft has no :class:`Eagle3LlamaAttention` to route (e.g. the
+    DeepSeek MLA draft): the trainer would still shard/shift the sequence and
+    renormalize the loss while each rank's attention silently saw only its own
+    shard, so context parallelism must be refused rather than run wrong.
     """
+    matched = 0
     for module in model.modules():
         if isinstance(module, Eagle3LlamaAttention):
             module._cp_group = cp_group
             module._cp_zigzag = zigzag
+            matched += 1
+    if matched == 0:
+        raise NotImplementedError(
+            "Context parallelism (cp_size>1) for the EAGLE-3 draft is only implemented for the "
+            f"Eagle3LlamaAttention ring path; {type(model).__name__} exposes no such attention "
+            "module (e.g. the DeepSeek MLA draft). Set cp_size=1 for this draft architecture."
+        )
 
 
 class Eagle3LlamaMLP(nn.Module):
