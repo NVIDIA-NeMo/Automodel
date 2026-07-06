@@ -36,6 +36,16 @@ class StateDictAdapter(ABC):
         """
         return False
 
+    def requires_full_state_dict_init(self) -> bool:
+        """Return whether HF initialization must convert full, unsharded tensors.
+
+        Adapters whose native parameters combine multiple HF tensors cannot
+        always build DCP load destinations from already-sharded DTensors. Such
+        adapters may opt into loading the full HF state dict on each rank,
+        converting it on CPU, and then distributing it into the model.
+        """
+        return False
+
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.

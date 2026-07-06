@@ -1104,6 +1104,34 @@ class TestLoadModelCustomModelGuard:
         mock_load_full.assert_called_once()
         mock_dcp_load.assert_not_called()
 
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    def test_multi_rank_adapter_can_require_full_state_init(self, mock_load_full, mock_load_hf, mock_is_st):
+        """Adapters that combine HF tensors convert before loading sharded parameters."""
+        checkpointer = self._make_checkpointer()
+
+        CustomModel = type("CustomModel", (torch.nn.Module,), {})
+        CustomModel.__module__ = "nemo_automodel.components.models.test.model"
+        model = CustomModel()
+        model.layer = torch.nn.Linear(4, 4)
+        model.state_dict_adapter = MagicMock()
+        model.state_dict_adapter.requires_full_state_dict_init.return_value = True
+        model.state_dict_adapter.from_hf.side_effect = lambda state_dict, **kwargs: state_dict
+        mock_load_hf.return_value = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch.dict("os.environ", {"WORLD_SIZE": "2"}),
+            patch.object(checkpointer, "_do_load") as mock_dcp_load,
+        ):
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        model.state_dict_adapter.from_hf.assert_called_once()
+        mock_load_full.assert_called_once()
+        mock_dcp_load.assert_not_called()
+
 
 class TestLoadModelCheckpointKeySubset:
     """Test allow_checkpoint_key_subset support for torch_save exports."""
@@ -1678,6 +1706,49 @@ class TestOfflineConsolidationScriptAndWarnings:
         )
         with patch("torch.distributed.is_initialized", return_value=False):
             return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    @staticmethod
+    def _native_layout_model():
+        class NativeAdapter:
+            def __init__(self):
+                self.native_checkpoint = None
+
+            def uses_native_checkpoint_layout(self):
+                return True
+
+            def to_hf(self, state_dict, **kwargs):
+                self.native_checkpoint = kwargs.get("native_checkpoint")
+                return state_dict
+
+        model = torch.nn.Linear(4, 4)
+        model.state_dict_adapter = NativeAdapter()
+        return model
+
+    def test_sharded_native_layout_rejects_hf_consolidation_before_save(self, tmp_path):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated="final")
+        model = self._native_layout_model()
+        weights_path = tmp_path / "epoch_0_step_9"
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing._model_has_dtensors", return_value=True),
+            pytest.raises(ValueError, match="checkpoint.save_consolidated=false"),
+        ):
+            checkpointer.save_model(model, str(weights_path), is_final_checkpoint=False)
+
+        assert not weights_path.exists()
+
+    def test_native_safetensors_omit_hf_export_artifacts(self, tmp_path):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=False)
+        model = self._native_layout_model()
+        weights_path = tmp_path / "epoch_0_step_1"
+
+        with patch.object(checkpointer, "_do_save", return_value=None):
+            checkpointer.save_model(model, str(weights_path))
+
+        model_dir = weights_path / "model"
+        assert model.state_dict_adapter.native_checkpoint is True
+        assert not (model_dir / ".hf_metadata").exists()
+        assert not (model_dir / "consolidate.sh").exists()
 
     def test_writes_conservative_consolidate_script(self, tmp_path, caplog):
         checkpointer = self._make_checkpointer(tmp_path, save_consolidated=False)

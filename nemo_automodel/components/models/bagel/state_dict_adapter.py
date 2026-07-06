@@ -191,8 +191,9 @@ def _guard_row_sharded_split(key: str, tensor: Any) -> None:
     if any(getattr(placement, "dim", None) == 0 for placement in placements):
         raise RuntimeError(
             f"Cannot split row-sharded DTensor {key!r} into HF projections without redistributing the full tensor. "
-            "Use BAGEL's native fused DCP layout for checkpoint/resume. Initialize distributed fused models with "
-            "model.init_mode=hf_backbones, and perform HF export from an unsharded/full state dict."
+            "Use BAGEL's native fused DCP layout for checkpoint/resume. Initialize from an HF BAGEL checkpoint "
+            "through model.init_mode=auto, which fuses full CPU tensors before distribution, and perform HF export "
+            "from an unsharded/full state dict."
         )
 
 
@@ -313,6 +314,10 @@ class BagelStateDictAdapter(StateDictAdapter):
 
     def uses_native_checkpoint_layout(self) -> bool:
         """Return whether DCP should preserve the model's fused parameter layout."""
+        return self._uses_fused_projections()
+
+    def requires_full_state_dict_init(self) -> bool:
+        """Fuse HF projections before distributing them into sharded parameters."""
         return self._uses_fused_projections()
 
     def _qkv_split_sizes(self) -> tuple[int, int, int]:

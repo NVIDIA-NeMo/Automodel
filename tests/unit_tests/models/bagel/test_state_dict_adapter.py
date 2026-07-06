@@ -215,6 +215,13 @@ def test_bagel_adapter_native_checkpoint_keeps_fused_tensor_identity():
     assert restored[extra_state_key] is extra_state
 
 
+@pytest.mark.parametrize(("fused", "expected"), [(False, False), (True, True)])
+def test_bagel_adapter_requires_full_state_init_only_for_fused_layout(fused, expected):
+    adapter = _projection_adapter(fused=fused)
+
+    assert adapter.requires_full_state_dict_init() is expected
+
+
 def test_bagel_adapter_rejects_row_sharded_fused_export():
     adapter = _projection_adapter(fused=True)
     key = "model.language_model.model.layers.0.self_attn.qkv_proj.weight"

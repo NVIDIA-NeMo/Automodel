@@ -42,7 +42,8 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-  # Pack Q/K/V and gate/up weights into one projection per group.
+  # Pack Q/K/V and gate/up weights into one projection per group. Under FSDP,
+  # initialization fuses a full CPU state dict on each rank before distribution.
   fused_projections: false
   max_latent_size: 64
   # Set to 0 to encode the whole image batch at once.
@@ -52,6 +53,8 @@ checkpoint:
   enabled: false
   checkpoint_dir: checkpoints/bagel-pretrain-am
   model_save_format: torch_save
+  # Sharded fused checkpoints use a native layout that cannot be consolidated to HF in place.
+  save_consolidated: false
 
 distributed:
   strategy: fsdp2
