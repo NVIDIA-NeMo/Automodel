@@ -1065,7 +1065,12 @@ class TrainDSparkRecipe(BaseRecipe):
             is_final_checkpoint=is_final_checkpoint,
         )
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
-        self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
+        # The checkpointer keys the rng file on dp_rank, but cp peers share a dp_rank
+        # (and, being seeded per dp_rank, hold identical rng state), so every peer would
+        # torch.save the same rng_dp_rank_N.pt and race on a shared FS; let only the
+        # first cp peer write it.
+        if self.cp_mesh is None or self.cp_mesh.get_local_rank() == 0:
+            self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
         if is_rank_0:
             self._save_extra_state(path, epoch=epoch)
