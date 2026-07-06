@@ -15,20 +15,19 @@
 # Single-node optimized DDP config for Llama Nemotron VL 1B retrieval fine-tuning.
 #
 # Runs the same global_batch_size=64 as the multi-node optimized config on a
-# single 8x80GB node: with local_batch_size=2 the recipe derives 4 gradient
-# accumulation steps per optimizer step (64 / (2 * 8) = 4), so training
-# matches the multi-node runs numerically at roughly the same ~70GiB peak
-# memory per GPU. Launch with:
+# single 8x80GB node with local_batch_size=8 (8 x 8 = 64, no gradient
+# accumulation). Vision-tower-scoped activation checkpointing makes the larger
+# per-GPU batch fit at roughly ~80GiB peak per GPU, which is memory-tight, so
+# set the allocator option before launch:
 #
 #   export PYTORCH_ALLOC_CONF=expandable_segments:True
 #   torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py \
 #     --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized_ddp_1node.yaml
 #
-# The allocator option helps local_batch_size=2 fit on 80GB GPUs by reducing
-# CUDA memory fragmentation. If your data or model variant needs more memory,
-# lower local_batch_size (accumulation is re-derived automatically) or enable
-# activation checkpointing (distributed.activation_checkpointing: true) to
-# trade compute for memory.
+# If your data or model variant needs more memory, widen the checkpointing
+# scope (distributed.activation_checkpointing_scope: all) or lower
+# local_batch_size (keep global_batch_size divisible by
+# local_batch_size * num_gpus).
 
 recipe: TrainBiEncoderRecipe
 
@@ -43,7 +42,7 @@ bi_encoder_optimization:
 
 step_scheduler:
   global_batch_size: 64
-  local_batch_size: 2
+  local_batch_size: 8
   ckpt_every_steps: 5000
   val_every_steps: 500
   num_epochs: 1
@@ -128,6 +127,8 @@ distributed:
   static_graph: true
   bucket_cap_mb: 400
   gradient_as_bucket_view: true
+  activation_checkpointing: true
+  activation_checkpointing_scope: vision
 
 # Uncomment and configure for W&B logging.
 wandb:

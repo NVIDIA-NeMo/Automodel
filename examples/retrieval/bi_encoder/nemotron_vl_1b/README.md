@@ -83,37 +83,34 @@ torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config e
 
 ### Training on fewer GPUs (single node)
 
-You do not need 32-64 GPUs to run this workload. The optimized path keeps the same `global_batch_size=64` (and therefore the same training dynamics) on a single node by combining a larger per-GPU batch, gradient accumulation, and optionally activation checkpointing. Reference numbers on 80GB GPUs with the ColPali workload:
+You do not need 32-64 GPUs to run this workload. The optimized path keeps the same `global_batch_size=64` (and therefore the same training dynamics) on a single node by raising the per-GPU batch and enabling activation checkpointing — no gradient accumulation in any of these configurations (`local_batch_size × GPUs = 64` in every row). Reference numbers on 80GB GPUs with the ColPali workload:
 
-| GPUs | local/global batch | Activation ckpt. | Samples/s/GPU | Peak mem/GPU | Approx. epoch (262k samples) |
-| ---: | ---: | --- | ---: | ---: | ---: |
-| 64 (8 nodes) | 1/64 | no | ~1.95 | ~50GiB | ~35m |
-| 32 (4 nodes) | 2/64 | no | ~2.20 | ~70GiB | ~62m |
-| 8 (1 node) | 8/64 | vision tower only | ~2.11 | ~80GiB | ~4.3h |
-| 4 | 16/64 | full model | ~2.05 | ~61GiB | ~8.9h |
+| GPUs | Strategy | local/global batch | Activation ckpt. | Samples/s/GPU | Peak mem/GPU | Approx. epoch (262k samples) |
+| ---: | --- | ---: | --- | ---: | ---: | ---: |
+| 64 (8 nodes) | DDP | 1/64 | no | ~1.95 | ~50GiB | ~35m |
+| 32 (4 nodes) | DDP | 2/64 | no | ~2.20 | ~70GiB | ~62m |
+| 8 (1 node) | DDP | 8/64 | vision tower only | ~2.11 | ~80GiB | ~4.3h |
+| 4 | FSDP2 | 16/64 | full model | ~2.05 | ~61GiB | ~8.9h |
 
 Per-GPU efficiency peaks at the 32-GPU `local_batch_size=2` configuration, and the single-node setups stay close to it (within ~5-7%) even with activation-checkpointing recompute — all three are meaningfully more GPU-hour-efficient than the 64-GPU `local_batch_size=1` run. In other words, dropping to a single node costs wall-clock time but almost no total GPU-hours.
 
-For a single 8-GPU node, use [nemotron_vl_1b_optimized_ddp_1node.yaml](nemotron_vl_1b_optimized_ddp_1node.yaml), which keeps `local_batch_size=2` and derives 4 gradient accumulation steps automatically (`64 / (2 × 8)`), at the same ~70GiB peak memory as the 32-GPU run:
+For a single 8-GPU node, use [nemotron_vl_1b_optimized_ddp_1node.yaml](nemotron_vl_1b_optimized_ddp_1node.yaml): `local_batch_size=8` with vision-tower-scoped activation checkpointing. This run is memory-tight (~80GiB peak), so the allocator option is required:
 
 ```bash
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized_ddp_1node.yaml
 ```
 
-To instead trade compute for memory and fit larger per-GPU batches without gradient accumulation (the 8- and 4-GPU rows above), enable activation checkpointing and raise `local_batch_size`. On 8 GPUs, checkpointing only the vision tower is enough:
+To go down to 4 GPUs, switch to FSDP2 (which shards optimizer and gradient state, freeing the memory the larger batch needs), checkpoint the full model, and raise `local_batch_size` to 16:
 
 ```yaml
 step_scheduler:
   global_batch_size: 64
-  local_batch_size: 8
+  local_batch_size: 16
 
 distributed:
-  strategy: ddp
+  strategy: fsdp2
   activation_checkpointing: true
-  activation_checkpointing_scope: vision
 ```
-
-On 4 GPUs, checkpoint the full model (`activation_checkpointing_scope: all`, the default) with `local_batch_size: 16`.
 
 Activation checkpointing recomputes activations during backward, so each optimizer step is slower, but as the table shows the throughput per GPU stays close to the no-checkpointing runs while cutting the required GPU count by 4-8x. See [Use Gradient (Activation) Checkpointing](https://docs.nvidia.com/nemo/automodel/latest/guides/gradient-checkpointing.html) for scope options.
