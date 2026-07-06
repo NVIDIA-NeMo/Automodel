@@ -39,7 +39,7 @@ import sys
 from typing import Any
 
 import torch
-from transformers import AutoConfig, PretrainedConfig
+from transformers import AutoConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -53,51 +53,33 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
     write_target_weights,
 )
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
-from nemo_automodel.components.datasets.llm.formatting_utils import (
-    _has_chat_template,
-    _resolve_chat_template,
+from nemo_automodel.components.datasets.llm.offline_cache import (
+    dataloader_from_sample,
+    resume_start_sample,
+    write_cache_shards,
 )
 from nemo_automodel.components.speculative.dspark.registry import build_target_layer_ids
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    DEEPSEEK_V4_MODEL_TYPE as _DEEPSEEK_V4_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    GEMMA4_MODEL_TYPES as _GEMMA4_MODEL_TYPES,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    apply_target_chat_template as _apply_target_chat_template,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    read_target_model_type as _read_target_model_type,
+)
 
 logger = logging.getLogger(__name__)
 
-_GEMMA4_MODEL_TYPES = ("gemma4", "gemma4_unified")
-_DEEPSEEK_V4_MODEL_TYPE = "deepseek_v4"
 
-
-def _read_target_model_type(target_path: str, trust_remote_code: bool) -> str:
-    """Return the target HF ``model_type`` without instantiating the model when possible."""
-    try:
-        config_dict, _ = PretrainedConfig.get_config_dict(target_path, trust_remote_code=trust_remote_code)
-        model_type = config_dict.get("model_type")
-        if model_type:
-            return str(model_type)
-    except (OSError, ValueError, KeyError):
-        pass
-    config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
-    return str(getattr(config, "model_type", "") or "")
-
-
-def _apply_target_chat_template(tokenizer, chat_template) -> None:
-    """Attach or validate the chat template used to tokenize messages-format data."""
-    if chat_template is not None:
-        tokenizer.chat_template = _resolve_chat_template(str(chat_template))
-        return
-    if not _has_chat_template(tokenizer):
-        raise ValueError(
-            "The target tokenizer has no chat template and --chat-template was not set. "
-            "DSpark precompute needs the same template that training uses for messages-format data."
-        )
-
-
-def _compute_batch_cache(
-    target_batch, attention_mask: torch.Tensor, cache_dtype: torch.dtype
-) -> dict[str, torch.Tensor]:
+def _compute_batch_cache(target_batch, cache_dtype: torch.dtype) -> dict[str, torch.Tensor]:
     """Convert one captured target batch into cache tensors."""
     return {
         "input_ids": target_batch.input_ids.to(torch.long).cpu(),
-        "attention_mask": attention_mask.to(torch.long).cpu(),
         "loss_mask": target_batch.loss_mask.to(torch.long).cpu(),
         "target_hidden_states": target_batch.target_hidden_states.to(cache_dtype).cpu(),
         "target_last_hidden_states": target_batch.target_last_hidden_states.to(cache_dtype).cpu(),
@@ -123,6 +105,8 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def _ensure_resume_compatible(cache_dir: str, manifest: dict[str, Any], existing_shards: set[int]) -> None:
     """Refuse to resume into shards produced with a different configuration."""
+    if existing_shards:
+        resume_start_sample(existing_shards, int(manifest["shard_size"]))
     if not os.path.exists(manifest_path(cache_dir)):
         if existing_shards:
             raise ValueError(
@@ -218,7 +202,12 @@ def _run(args: argparse.Namespace) -> int:
     }
     if args.resume:
         _ensure_resume_compatible(args.output_dir, manifest, existing)
-    write_target_weights(args.output_dir, target_model.get_input_embeddings(), target_model.get_output_embeddings())
+    write_target_weights(
+        args.output_dir,
+        target_model.get_input_embeddings(),
+        target_model.get_output_embeddings(),
+        dtype=cache_dtype,
+    )
     write_manifest(args.output_dir, manifest)
 
     logger.info(
@@ -230,44 +219,28 @@ def _run(args: argparse.Namespace) -> int:
         args.output_dir,
     )
 
-    shard_index = 0
-    chunks: list[dict[str, torch.Tensor]] = []
-    buffered = 0
+    start_sample = resume_start_sample(existing, args.shard_size) if existing else 0
+    dataloader = dataloader_from_sample(dataloader, start_sample)
 
-    def _flush() -> None:
-        nonlocal shard_index, chunks, buffered
-        if buffered == 0:
-            return
-        if shard_index not in existing:
-            merged = {k: torch.cat([c[k] for c in chunks], dim=0)[: args.shard_size] for k in chunks[0]}
-            path = write_shard(args.output_dir, shard_index, merged)
-            logger.info("Wrote %s (%d samples)", path, merged["input_ids"].shape[0])
-        chunks = []
-        buffered = 0
-        shard_index += 1
-
-    with torch.no_grad():
-        for batch in dataloader:
-            batch_size = batch["input_ids"].shape[0]
-            if shard_index in existing:
-                buffered += batch_size
-                if buffered >= args.shard_size:
-                    chunks = []
-                    buffered -= args.shard_size
-                    shard_index += 1
-                continue
+    def _compute_from_batch(batch):
+        with torch.no_grad():
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             target_batch = target_wrapper.generate_batch(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 loss_mask=batch["loss_mask"],
             )
-            chunks.append(_compute_batch_cache(target_batch, batch["attention_mask"], cache_dtype))
-            buffered += batch_size
-            if buffered >= args.shard_size:
-                _flush()
+            return _compute_batch_cache(target_batch, cache_dtype)
 
-    _flush()
+    write_cache_shards(
+        dataloader=dataloader,
+        output_dir=args.output_dir,
+        shard_size=args.shard_size,
+        start_shard_index=start_sample // args.shard_size,
+        compute_batch=_compute_from_batch,
+        write_shard_fn=write_shard,
+        logger=logger,
+    )
 
     logger.info("Done. Cache written to %s", args.output_dir)
     return 0

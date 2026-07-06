@@ -46,15 +46,12 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 )
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.dspark_cache import (
+    DTYPE_MAP,
     build_cached_dspark_dataloader,
     read_manifest,
     read_target_weight_modules,
 )
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
-from nemo_automodel.components.datasets.llm.formatting_utils import (
-    _has_chat_template,
-    _resolve_chat_template,
-)
 from nemo_automodel.components.datasets.vlm.dspark_collate import build_dspark_vlm_dataloader
 from nemo_automodel.components.distributed.activation_checkpointing import (
     apply_selective_checkpointing_to_layers,
@@ -83,6 +80,24 @@ from nemo_automodel.components.speculative.dspark.registry import (
     resolve_dspark_draft_spec,
 )
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    DEEPSEEK_V4_MODEL_TYPE as _DEEPSEEK_V4_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    GEMMA4_MODEL_TYPES as _GEMMA4_MODEL_TYPES,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    GLM_5_2_MODEL_TYPE as _GLM_5_2_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    MINIMAX_M3_MODEL_TYPES as _MINIMAX_M3_MODEL_TYPES,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    apply_target_chat_template as _apply_target_chat_template,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    read_target_model_type as _read_target_model_type,
+)
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
@@ -98,11 +113,6 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-_GEMMA4_MODEL_TYPES = ("gemma4", "gemma4_unified")
-_MINIMAX_M3_MODEL_TYPES = ("minimax_m3_vl",)
-_DEEPSEEK_V4_MODEL_TYPE = "deepseek_v4"
-_GLM_5_2_MODEL_TYPE = "glm_moe_dsa"
 
 _DSPARK_MM_KEYS = tuple(k for k in VLM_INPUT_KEYS if k != "input_ids")
 
@@ -126,25 +136,6 @@ class _DraftArgs(dict):
             raise AttributeError(key) from exc
 
 
-def _read_target_model_type(target_path: str, trust_remote_code: bool) -> str:
-    """Return the HF ``model_type`` for a target without instantiating the model.
-
-    DeepSeek V4's ``model_type`` ("deepseek_v4") is a custom architecture that stock
-    ``AutoConfig`` may not recognize, so read it straight from the raw config dict
-    (which never requires the type to be registered). Falls back to ``AutoConfig``
-    for any path ``get_config_dict`` cannot resolve.
-    """
-    try:
-        config_dict, _ = PretrainedConfig.get_config_dict(target_path, trust_remote_code=trust_remote_code)
-        model_type = config_dict.get("model_type")
-        if model_type:
-            return str(model_type)
-    except (OSError, ValueError, KeyError):
-        pass
-    config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
-    return str(getattr(config, "model_type", "") or "")
-
-
 def _gather_full_weight_module(module):
     """Return an object exposing a full (non-DTensor) ``.weight`` tensor.
 
@@ -157,30 +148,6 @@ def _gather_full_weight_module(module):
     if weight is not None and hasattr(weight, "full_tensor"):
         return SimpleNamespace(weight=weight.full_tensor())
     return module
-
-
-def _apply_target_chat_template(tokenizer, chat_template):
-    """Attach a chat template to the target tokenizer for messages-format DSpark data.
-
-    DSpark renders ``messages`` rows with the tokenizer's chat template, but some
-    targets (e.g. DeepSeek-V4-Flash) ship none. ``recipe_args.chat_template`` (an
-    inline Jinja string or a path to a template / tokenizer_config json) overrides
-    it; it must match the template the training responses were generated with and
-    should mark the assistant span with ``{% generation %}`` so only those tokens
-    carry loss. If no template is supplied and the tokenizer has none, raise rather
-    than silently producing an empty / wrong loss mask.
-    """
-    if chat_template is not None:
-        tokenizer.chat_template = _resolve_chat_template(str(chat_template))
-        return
-    if not _has_chat_template(tokenizer):
-        raise ValueError(
-            "The target tokenizer has no chat template and recipe_args.chat_template "
-            "was not set. DSpark trains on 'messages'-format data, which needs a chat "
-            "template (e.g. DeepSeek-V4-Flash ships none). Set recipe_args.chat_template "
-            "to an inline Jinja string or a template file that matches how the training "
-            "responses were generated."
-        )
 
 
 def _resolve_wandb_kwargs(wandb_cfg: dict) -> dict | None:
@@ -340,15 +307,56 @@ def _apply_draft_activation_checkpointing(draft_model: torch.nn.Module, mode: bo
 
 
 def _validate_cached_dspark_manifest(
-    cache_dir: str, manifest: dict, target_config, target_layer_ids: list[int]
+    cache_dir: str,
+    manifest: dict,
+    target_config,
+    target_layer_ids: list[int],
+    *,
+    target_model: str,
+    target_model_type: str,
+    seq_length: int,
+    compute_dtype: torch.dtype,
 ) -> None:
-    """Validate that a DSpark offline cache matches the configured target/draft shape."""
+    """Validate that a DSpark offline cache matches the configured target/draft run."""
+    if str(manifest["target_model"]) != str(target_model):
+        raise ValueError(
+            f"DSpark cache at {cache_dir} was built for target_model={manifest['target_model']!r}, "
+            f"but this run configured target_model={target_model!r}. The cache does not match this target."
+        )
+    if str(manifest["target_model_type"]) != str(target_model_type):
+        raise ValueError(
+            f"DSpark cache at {cache_dir} was built for target_model_type={manifest['target_model_type']!r}, "
+            f"but the configured target has model_type={target_model_type!r}."
+        )
     if int(manifest["target_vocab_size"]) != int(target_config.vocab_size):
         raise ValueError(
             f"DSpark cache at {cache_dir} was built for target_vocab_size={manifest['target_vocab_size']}, "
             f"but the configured target has {target_config.vocab_size}. The cache does not match this target."
         )
     hidden_size = int(target_config.hidden_size)
+    if int(manifest["hidden_size"]) != hidden_size:
+        raise ValueError(
+            f"DSpark cache at {cache_dir} was built for hidden_size={manifest['hidden_size']}, "
+            f"but the configured target has hidden_size={hidden_size}."
+        )
+    if int(manifest["num_hidden_layers"]) != int(target_config.num_hidden_layers):
+        raise ValueError(
+            f"DSpark cache at {cache_dir} was built for num_hidden_layers={manifest['num_hidden_layers']}, "
+            f"but the configured target has num_hidden_layers={target_config.num_hidden_layers}."
+        )
+    if int(manifest["seq_length"]) != int(seq_length):
+        raise ValueError(
+            f"DSpark cache at {cache_dir} was built for seq_length={manifest['seq_length']}, "
+            f"but this run configured seq_length={seq_length}."
+        )
+    cache_dtype = DTYPE_MAP.get(str(manifest["dtype"]))
+    if cache_dtype is None:
+        raise ValueError(f"DSpark cache at {cache_dir} has unsupported dtype={manifest['dtype']!r}.")
+    if compute_dtype == torch.float32 and cache_dtype != torch.float32:
+        raise ValueError(
+            f"DSpark cache at {cache_dir} stores dtype={manifest['dtype']}, but CPU cached training "
+            "requires fp32 cache tensors. Regenerate with --dtype fp32 or train on CUDA."
+        )
     expected_hidden_dim = hidden_size * len(target_layer_ids)
     if int(manifest["target_hidden_dim"]) != expected_hidden_dim:
         raise ValueError(
@@ -627,7 +635,16 @@ class TrainDSparkRecipe(BaseRecipe):
                     )
         else:
             manifest = read_manifest(self.cached_target_path)
-            _validate_cached_dspark_manifest(self.cached_target_path, manifest, target_text_config, target_layer_ids)
+            _validate_cached_dspark_manifest(
+                self.cached_target_path,
+                manifest,
+                target_text_config,
+                target_layer_ids,
+                target_model=target_path,
+                target_model_type=target_model_type,
+                seq_length=recipe_cfg.seq_length,
+                compute_dtype=self.compute_dtype,
+            )
             embed_src, head_src = read_target_weight_modules(self.cached_target_path)
             self.train_dataloader = build_cached_dspark_dataloader(
                 cache_dir=self.cached_target_path,
@@ -1208,6 +1225,8 @@ class TrainDSparkRecipe(BaseRecipe):
         """Run one batch through live target capture or the offline cache."""
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         if self.target_wrapper is None:
+            batch["target_hidden_states"] = batch["target_hidden_states"].to(self.compute_dtype)
+            batch["target_last_hidden_states"] = batch["target_last_hidden_states"].to(self.compute_dtype)
             return self.trainer_module(
                 input_ids=batch["input_ids"],
                 target_hidden_states=batch["target_hidden_states"],

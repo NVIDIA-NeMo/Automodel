@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils.data import DataLoader, Dataset
 from transformers import Qwen3Config
 
 from nemo_automodel.components.datasets.llm.dspark_cache import (
@@ -33,6 +34,7 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
     write_shard,
     write_target_weights,
 )
+from nemo_automodel.components.datasets.llm.offline_cache import dataloader_from_sample
 from nemo_automodel.components.speculative.precompute_dspark import (
     _build_parser,
     _compute_batch_cache,
@@ -59,7 +61,6 @@ def _fake_target_batch(batch_size: int = 2, seq_len: int = 5):
 def _write_tiny_cache(cache_dir: str, num_samples: int = 3, shard_size: int = 2, seq_len: int = 4):
     samples = {
         "input_ids": torch.randint(0, _VOCAB, (num_samples, seq_len), dtype=torch.long),
-        "attention_mask": torch.ones(num_samples, seq_len, dtype=torch.long),
         "loss_mask": torch.ones(num_samples, seq_len, dtype=torch.long),
         "target_hidden_states": torch.randn(num_samples, seq_len, _HIDDEN * len(_LAYERS)),
         "target_last_hidden_states": torch.randn(num_samples, seq_len, _HIDDEN),
@@ -88,12 +89,10 @@ def _write_tiny_cache(cache_dir: str, num_samples: int = 3, shard_size: int = 2,
 
 def test_compute_batch_cache_downcasts_only_float_tensors():
     tb = _fake_target_batch()
-    attention_mask = torch.ones_like(tb.input_ids)
-    cache = _compute_batch_cache(tb, attention_mask, cache_dtype=torch.bfloat16)
+    cache = _compute_batch_cache(tb, cache_dtype=torch.bfloat16)
 
     assert set(cache) == set(CACHE_KEYS)
     assert cache["input_ids"].dtype == torch.long
-    assert cache["attention_mask"].dtype == torch.long
     assert cache["loss_mask"].dtype == torch.long
     assert cache["target_hidden_states"].dtype == torch.bfloat16
     assert cache["target_last_hidden_states"].dtype == torch.bfloat16
@@ -159,17 +158,40 @@ def test_target_weights_round_trip(tmp_path):
     cache_dir = str(tmp_path / "cache")
     embed = torch.nn.Embedding(_VOCAB, _HIDDEN)
     head = torch.nn.Linear(_HIDDEN, _VOCAB, bias=False)
-    write_target_weights(cache_dir, embed, head)
+    write_target_weights(cache_dir, embed, head, dtype=torch.bfloat16)
 
     loaded_embed, loaded_head = read_target_weight_modules(cache_dir)
-    torch.testing.assert_close(loaded_embed.weight, embed.weight.detach().float())
-    torch.testing.assert_close(loaded_head.weight, head.weight.detach().float())
+    assert loaded_embed.weight.dtype == torch.bfloat16
+    assert loaded_head.weight.dtype == torch.bfloat16
+    torch.testing.assert_close(loaded_embed.weight, embed.weight.detach().bfloat16())
+    torch.testing.assert_close(loaded_head.weight, head.weight.detach().bfloat16())
 
 
 def test_existing_shard_indices(tmp_path):
     cache_dir = str(tmp_path / "cache")
     _write_tiny_cache(cache_dir, num_samples=3, shard_size=2, seq_len=4)
     assert existing_shard_indices(cache_dir) == {0, 1}
+
+
+def test_dataloader_from_sample_skips_completed_samples_without_loading_them():
+    class _RecordingDataset(Dataset):
+        def __init__(self):
+            self.seen = []
+
+        def __len__(self):
+            return 6
+
+        def __getitem__(self, index):
+            self.seen.append(index)
+            return {"input_ids": torch.tensor([index])}
+
+    dataset = _RecordingDataset()
+    loader = DataLoader(dataset, batch_size=2, shuffle=False)
+    resumed = dataloader_from_sample(loader, start_sample=4)
+
+    batches = list(resumed)
+    assert [batch["input_ids"].view(-1).tolist() for batch in batches] == [[4, 5]]
+    assert dataset.seen == [4, 5]
 
 
 def _args(**overrides):
@@ -216,7 +238,7 @@ def test_precompute_resume_mismatch_does_not_overwrite_target_weights(monkeypatc
     cache_dir = str(tmp_path / "cache")
     old_embed = torch.nn.Embedding(_VOCAB, _HIDDEN)
     old_head = torch.nn.Linear(_HIDDEN, _VOCAB, bias=False)
-    write_target_weights(cache_dir, old_embed, old_head)
+    write_target_weights(cache_dir, old_embed, old_head, dtype=torch.float32)
     samples = _write_tiny_cache(cache_dir, num_samples=1, shard_size=1, seq_len=4)
     write_shard(cache_dir, 0, {k: v[:1] for k, v in samples.items()})
 

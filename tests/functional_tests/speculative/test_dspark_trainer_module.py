@@ -139,8 +139,13 @@ def test_trainer_module_trains_from_offline_cache(tmp_path):
         target_batch = target_wrapper.generate_batch(input_ids, attention_mask, loss_mask)
 
     cache_dir = str(tmp_path / "dspark-cache")
-    write_target_weights(cache_dir, target_wrapper.get_input_embeddings(), target_wrapper.get_output_embeddings())
-    write_shard(cache_dir, 0, _compute_batch_cache(target_batch, attention_mask, cache_dtype=torch.float32))
+    write_target_weights(
+        cache_dir,
+        target_wrapper.get_input_embeddings(),
+        target_wrapper.get_output_embeddings(),
+        dtype=torch.float32,
+    )
+    write_shard(cache_dir, 0, _compute_batch_cache(target_batch, cache_dtype=torch.float32))
     write_manifest(
         cache_dir,
         {

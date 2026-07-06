@@ -532,7 +532,13 @@ def test_build_glm_5_2_target_requires_cuda(tmp_path):
 
 def _cached_manifest(**overrides):
     manifest = {
+        "target_model": "tiny-qwen3",
+        "target_model_type": "qwen3",
         "target_vocab_size": 64,
+        "hidden_size": 32,
+        "num_hidden_layers": 6,
+        "seq_length": 8,
+        "dtype": "fp32",
         "target_hidden_dim": 96,
         "target_last_hidden_dim": 32,
         "target_layer_ids": [1, 3, 5],
@@ -542,19 +548,39 @@ def _cached_manifest(**overrides):
 
 
 def _target_config(**overrides):
-    fields = {"vocab_size": 64, "hidden_size": 32}
+    fields = {"vocab_size": 64, "hidden_size": 32, "num_hidden_layers": 6}
     fields.update(overrides)
     return SimpleNamespace(**fields)
 
 
+def _validate_cached_manifest(manifest=None, target_config=None, target_layer_ids=None, **kwargs):
+    _validate_cached_dspark_manifest(
+        "/cache",
+        _cached_manifest() if manifest is None else manifest,
+        _target_config() if target_config is None else target_config,
+        [1, 3, 5] if target_layer_ids is None else target_layer_ids,
+        target_model=kwargs.pop("target_model", "tiny-qwen3"),
+        target_model_type=kwargs.pop("target_model_type", "qwen3"),
+        seq_length=kwargs.pop("seq_length", 8),
+        compute_dtype=kwargs.pop("compute_dtype", torch.float32),
+    )
+
+
 def test_cached_dspark_manifest_accepts_matching_shapes():
-    _validate_cached_dspark_manifest("/cache", _cached_manifest(), _target_config(), [1, 3, 5])
+    _validate_cached_manifest()
 
 
 @pytest.mark.parametrize(
     "manifest,target_config,target_layer_ids,pattern",
     [
+        (_cached_manifest(target_model="other-qwen3"), _target_config(), [1, 3, 5], "target_model"),
+        (_cached_manifest(target_model_type="llama"), _target_config(), [1, 3, 5], "target_model_type"),
         (_cached_manifest(target_vocab_size=65), _target_config(), [1, 3, 5], "target_vocab_size"),
+        (_cached_manifest(hidden_size=16), _target_config(), [1, 3, 5], "hidden_size"),
+        (_cached_manifest(num_hidden_layers=7), _target_config(), [1, 3, 5], "num_hidden_layers"),
+        (_cached_manifest(seq_length=16), _target_config(), [1, 3, 5], "seq_length"),
+        (_cached_manifest(dtype="int4"), _target_config(), [1, 3, 5], "dtype"),
+        (_cached_manifest(dtype="bf16"), _target_config(), [1, 3, 5], "CPU cached training"),
         (_cached_manifest(target_hidden_dim=64), _target_config(), [1, 3, 5], "target_hidden_dim"),
         (_cached_manifest(target_last_hidden_dim=16), _target_config(), [1, 3, 5], "target_last_hidden_dim"),
         (_cached_manifest(target_layer_ids=[1, 2, 3]), _target_config(), [1, 3, 5], "target_layer_ids"),
@@ -562,7 +588,11 @@ def test_cached_dspark_manifest_accepts_matching_shapes():
 )
 def test_cached_dspark_manifest_rejects_mismatch(manifest, target_config, target_layer_ids, pattern):
     with pytest.raises(ValueError, match=pattern):
-        _validate_cached_dspark_manifest("/cache", manifest, target_config, target_layer_ids)
+        _validate_cached_manifest(manifest, target_config, target_layer_ids)
+
+
+def test_cached_dspark_manifest_accepts_bf16_cache_on_cuda_dtype():
+    _validate_cached_manifest(manifest=_cached_manifest(dtype="bf16"), compute_dtype=torch.bfloat16)
 
 
 def test_recipe_cached_path_does_not_load_target_model(monkeypatch, tmp_path):
@@ -575,13 +605,12 @@ def test_recipe_cached_path_does_not_load_target_model(monkeypatch, tmp_path):
     cache_dir = str(tmp_path / "cache")
     embed = torch.nn.Embedding(vocab_size, hidden_size)
     head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
-    write_target_weights(cache_dir, embed, head)
+    write_target_weights(cache_dir, embed, head, dtype=torch.float32)
     write_shard(
         cache_dir,
         0,
         {
             "input_ids": torch.randint(0, vocab_size, (1, 8), dtype=torch.long),
-            "attention_mask": torch.ones(1, 8, dtype=torch.long),
             "loss_mask": torch.ones(1, 8, dtype=torch.long),
             "target_hidden_states": torch.randn(1, 8, hidden_size * len(target_layer_ids)),
             "target_last_hidden_states": torch.randn(1, 8, hidden_size),
