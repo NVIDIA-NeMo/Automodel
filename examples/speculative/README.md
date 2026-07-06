@@ -155,7 +155,7 @@ recipe_args:
 
 Offline cache is produced by `precompute_eagle3.py`
 (`python -m nemo_automodel.components.speculative.precompute_eagle3 --target-model ... --input-data ... --output-dir ...`),
-then consumed via `cached_target_path`. EAGLE-3 only.
+then consumed via `cached_target_path`. DSpark also supports a text-only offline cache via `precompute_dspark.py` for HF-loadable single-process text targets.
 
 EAGLE drafters learn best when the assistant turns in the training data are
 produced by the **same model** that will serve as the inference target. Most
