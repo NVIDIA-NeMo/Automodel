@@ -37,6 +37,7 @@ import torch
 
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed import cp_utils as cp_utils_mod
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
@@ -357,11 +358,11 @@ def test_forward_backward_step_pp_cp_first_stage_uses_inputs_embeds(monkeypatch)
     }
     seen_cp_batch = {}
 
-    def _make_cp_batch_and_ctx(device_mesh, cp_batch):
+    def _make_cp_batch_and_ctx(device_mesh, cp_batch, *args, **kwargs):
         seen_cp_batch.update(cp_batch)
         return nullcontext, cp_batch
 
-    monkeypatch.setattr(vlm_finetune, "make_cp_batch_and_ctx", _make_cp_batch_and_ctx)
+    monkeypatch.setattr(cp_utils_mod, "make_cp_batch_and_ctx", _make_cp_batch_and_ctx)
     monkeypatch.setattr(vlm_finetune, "stage_vlm_media_for_pp", lambda *args, **kwargs: nullcontext())
 
     loss_buffer = []
@@ -602,7 +603,7 @@ def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
 
     # No-op replacements for the heavy collaborators.
     monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
-    monkeypatch.setattr(vlm_finetune, "make_cp_batch_and_ctx", lambda mesh, batch: (nullcontext, batch))
+    monkeypatch.setattr(cp_utils_mod, "make_cp_batch_and_ctx", lambda mesh, batch, *a, **k: (nullcontext, batch))
     monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
     monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
 
@@ -655,7 +656,7 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
     from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
     monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
-    monkeypatch.setattr(vlm_finetune, "make_cp_batch_and_ctx", lambda mesh, batch: (nullcontext, batch))
+    monkeypatch.setattr(cp_utils_mod, "make_cp_batch_and_ctx", lambda mesh, batch, *a, **k: (nullcontext, batch))
     monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
     monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
 

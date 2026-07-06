@@ -21,6 +21,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.distributed import cp_utils as cp_utils_mod
 from nemo_automodel.components.loss import kd_loss as kd_loss_module
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.recipes.vlm import kd as vlm_kd
@@ -163,11 +164,11 @@ def test_vlm_kd_uses_tp_kd_loss_path(monkeypatch, trivial_pg):
 def test_vlm_kd_cp_prepare_feeds_student_inputs_embeds_to_cp_and_teacher(monkeypatch):
     make_cp_calls = []
 
-    def fake_make_cp_batch_and_ctx(device_mesh, batch):
+    def fake_make_cp_batch_and_ctx(device_mesh, batch, *args, **kwargs):
         make_cp_calls.append((device_mesh, dict(batch)))
         return nullcontext, batch
 
-    monkeypatch.setattr(vlm_kd, "make_cp_batch_and_ctx", fake_make_cp_batch_and_ctx)
+    monkeypatch.setattr(cp_utils_mod, "make_cp_batch_and_ctx", fake_make_cp_batch_and_ctx)
 
     student = _StudentVLM(hidden_size=8)
     teacher = _TeacherVLM(hidden_size=8)
@@ -201,7 +202,9 @@ def test_vlm_kd_cp_prepare_feeds_student_inputs_embeds_to_cp_and_teacher(monkeyp
 
 
 def test_vlm_kd_cp_rejects_teacher_student_hidden_size_mismatch(monkeypatch):
-    monkeypatch.setattr(vlm_kd, "make_cp_batch_and_ctx", lambda *args, **kwargs: pytest.fail("CP sharding skipped"))
+    monkeypatch.setattr(
+        cp_utils_mod, "make_cp_batch_and_ctx", lambda *args, **kwargs: pytest.fail("CP sharding skipped")
+    )
 
     student = _StudentVLM(hidden_size=8)
     teacher = _TeacherVLM(hidden_size=12)

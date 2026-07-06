@@ -51,7 +51,7 @@ from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_cha
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp, wrap_vlm_collate_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
@@ -78,7 +78,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, filter_forward_kwargs
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -890,34 +890,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
     ):
         batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
 
-        # Routed through __call__ so FSDP2 forward pre-hook fires and
-        # unshards the vision tower's weights before the embed/scatter.
-        _model = self.model_parts[0]
-        _cp_active = (
-            self.device_mesh is not None
-            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
-            and self.device_mesh["cp"].size() > 1
+        # Single CP dispatch (magi / model-owned / generic). The pre-embed hook is
+        # routed through __call__ so FSDP2 forward pre-hooks fire and unshard the
+        # vision tower's weights before the embed/scatter.
+        train_ctx, batch, _ = prepare_cp_forward(
+            self.model_parts[0],
+            self.device_mesh,
+            batch,
+            magi=self.magi,
+            domain="vlm",
+            invoke_pre_embed=not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False),
+            drop_mm_inputs=True,
         )
-        if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-            if not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False):
-                mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-                prepared = _model(_pre_embed_only=True, **mm_kwargs)
-                for k in VLM_INPUT_KEYS:
-                    batch.pop(k, None)
-                batch.update(prepared)
-            else:
-                for k in VLM_INPUT_KEYS:
-                    if k != "input_ids":
-                        batch.pop(k, None)
-
-        if self.magi.enabled:
-            # magi manages the language-backbone attention itself (vision stays on
-            # SDPA); skip the torch-native DTensor CP context.
-            train_ctx, batch = self.magi.prepare_vlm_batch(
-                self.model_parts[0], batch
-            )  # pragma: no cover - requires GPU + magi_attention
-        else:
-            train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
 
         if self.pp_enabled:
@@ -1203,22 +1187,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 }
                 num_label_tokens = (batch["labels"] != -100).sum().item()
 
-                _model = self.model_parts[0]
-                _cp_active = (
-                    self.device_mesh is not None
-                    and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
-                    and self.device_mesh["cp"].size() > 1
-                    and not self.pp_enabled
+                train_ctx, batch, _ = prepare_cp_forward(
+                    self.model_parts[0],
+                    self.device_mesh,
+                    batch,
+                    invoke_pre_embed=not self.pp_enabled,
+                    pre_embed_no_grad=True,
                 )
-                if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-                    mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-                    with torch.no_grad():
-                        prepared = _model(_pre_embed_only=True, **mm_kwargs)
-                    for k in VLM_INPUT_KEYS:
-                        batch.pop(k, None)
-                    batch.update(prepared)
-
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
                 labels = batch.pop("labels")
                 with train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)

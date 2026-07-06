@@ -28,10 +28,24 @@ from typing import Any
 import pytest
 import torch
 
+from nemo_automodel.components.distributed import cp_sharder as _cs
+
 # Import module under test
 from nemo_automodel.components.distributed import cp_utils as _cu
-from nemo_automodel.components.distributed import cp_sharder as _cs
 from nemo_automodel.components.models.gemma4_moe import cp_batch as _cm
+
+
+@pytest.fixture(autouse=True)
+def _force_no_dist(monkeypatch):
+    """Pin rank resolution to the dummy mesh's local rank.
+
+    These tests drive CP helpers with fake meshes whose ``get_group`` returns a
+    sentinel, not a real ProcessGroup. If another test in the same pytest worker
+    left ``torch.distributed`` initialized (e.g. a TP correctness test), rank
+    resolution would go through ``dist.get_rank`` instead of
+    ``mesh.get_local_rank`` and shard the wrong slice.
+    """
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
 
 
 class _DummySubMesh:

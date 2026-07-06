@@ -1072,8 +1072,8 @@ def test_forward_backward_step_pp_uses_eval_for_validation(monkeypatch):
 
     # Mock make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch),
     )
 
     # Create a minimal batch
@@ -1106,8 +1106,8 @@ def test_forward_backward_step_pp_uses_step_for_training(monkeypatch):
 
     # Mock make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch),
     )
 
     # Create a minimal batch
@@ -1140,8 +1140,8 @@ def test_forward_backward_step_pp_non_first_stage_uses_eval_for_validation(monke
 
     # Mock make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch),
     )
 
     # Create a minimal batch
@@ -1176,8 +1176,8 @@ def test_forward_backward_step_pp_non_first_stage_uses_step_for_training(monkeyp
 
     # Mock make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch),
     )
 
     # Create a minimal batch
@@ -1238,8 +1238,8 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
 
     # Mock make_cp_batch_and_ctx
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch),
     )
 
     # Mock ScopedRNG
@@ -1298,8 +1298,8 @@ def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch)
     monkeypatch.setattr(recipe, "_dp_allreduce", mock_dp_allreduce)
 
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch),
     )
 
     monkeypatch.setattr(
@@ -2286,7 +2286,7 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
             self.lin = nn.Linear(4, 8192)
             self.prepared = False
 
-        def prepare_model_inputs_for_cp(self, input_ids, **kwargs):
+        def prepare_model_inputs_for_cp(self, batch, **kwargs):
             self.prepared = True
             self.num_chunks = kwargs.get("num_chunks")
             from nemo_automodel.components.distributed.cp_sharder import (
@@ -2304,6 +2304,10 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
             }
 
         def forward(self, **batch):
+            if batch.pop("_pre_embed_only", False):
+                return self.prepare_model_inputs_for_cp(
+                    {"input_ids": batch["input_ids"]}, num_chunks=batch.pop("num_chunks", None)
+                )
             logits = (self.lin(batch["input_ids"].float()) + 50.0).to(torch.float16)
             return SimpleNamespace(logits=logits)
 
@@ -2328,8 +2332,8 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
         return logits.float().mean()
 
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **k: (nullcontext, batch),
+        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *a, **k: (nullcontext, batch),
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_loss", _fake_calc_loss)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_final_hidden_states", lambda out: None)

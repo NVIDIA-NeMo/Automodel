@@ -52,7 +52,7 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DistributedSetup
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -66,7 +66,7 @@ from nemo_automodel.components.training.utils import (
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
-from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, build_model, calculate_loss
 
 logger = logging.getLogger(__name__)
@@ -234,24 +234,18 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             for k, v in batch.items()
         }
 
-        _model = self.model_parts[0]
-        _cp_active = (
-            self.device_mesh is not None
-            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
-            and self.device_mesh["cp"].size() > 1
-            and not self.pp_enabled
-        )
-        if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-            mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-            with torch.no_grad():
-                prepared = _model(_pre_embed_only=True, **mm_kwargs)
+        def _check_teacher_compat(prepared: dict) -> None:
             if "inputs_embeds" in prepared:
                 _validate_cp_pre_embed_teacher_compatibility(prepared["inputs_embeds"], self.teacher_model)
-            for k in VLM_INPUT_KEYS:
-                batch.pop(k, None)
-            batch.update(prepared)
 
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        train_ctx, batch, _ = prepare_cp_forward(
+            self.model_parts[0],
+            self.device_mesh,
+            batch,
+            invoke_pre_embed=not self.pp_enabled,
+            pre_embed_no_grad=True,
+            on_pre_embedded=_check_teacher_compat,
+        )
         labels = batch.pop("labels")
 
         model = self.model_parts[0]

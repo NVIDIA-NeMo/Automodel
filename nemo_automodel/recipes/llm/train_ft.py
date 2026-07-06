@@ -57,7 +57,7 @@ from nemo_automodel.components.datasets.llm.megatron.sampler import create_megat
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.mesh import MeshContext
@@ -1156,34 +1156,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         _use_te_value = _thd_collater
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
         cp_size = getattr(getattr(self, "dist_setup", None), "cp_size", self.cfg.get("distributed.cp_size", 1))
-        cp_sharder = None
-        if self.magi.enabled:
-            train_ctx, batch = self.magi.prepare_llm_batch(  # pragma: no cover - requires GPU + magi_attention
-                self.model_parts[0] if hasattr(self, "model_parts") else None,
-                batch,
-                device_mesh=self.device_mesh,
-                is_thd=_thd_collater,
-                pad_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-                num_chunks=_num_chunks_value,
-            )
-        else:
-            # Model-owned context parallelism: if the model exposes a CP input-prep
-            # hook, let it attach its own batch sharder (a ``CPSharder`` under the
-            # ``cp_sharder`` key) before make_cp_batch_and_ctx shards the batch,
-            # instead of the default load-balanced context_parallel path. Keep a
-            # reference for the per-microbatch ``finalize_loss`` hook below.
-            _model_cp = self.model_parts[0] if hasattr(self, "model_parts") else None
-            if cp_size > 1 and _model_cp is not None and hasattr(_model_cp, "prepare_model_inputs_for_cp"):
-                prepared = _model_cp.prepare_model_inputs_for_cp(batch, num_chunks=_num_chunks_value)
-                cp_sharder = prepared.get("cp_sharder")
-                batch.update(prepared)
-            train_ctx, batch = make_cp_batch_and_ctx(
-                self.device_mesh,
-                batch,
-                use_te=_use_te_value,
-                padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-                num_chunks=_num_chunks_value,
-            )
+        # Single CP dispatch: magi / model-owned (CPSharder) / TE-THD / generic
+        # torch context_parallel. The returned ``cp_sharder`` feeds the
+        # per-microbatch ``finalize_loss`` hook below.
+        train_ctx, batch, cp_sharder = prepare_cp_forward(
+            self.model_parts[0] if hasattr(self, "model_parts") else None,
+            self.device_mesh,
+            batch,
+            magi=self.magi,
+            use_te=_use_te_value,
+            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
+            num_chunks=_num_chunks_value,
+            cp_size=cp_size,
+        )
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 

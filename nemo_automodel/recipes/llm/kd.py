@@ -54,7 +54,7 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DistributedSetup
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
@@ -365,7 +365,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             )
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
+        # KD has not wired model-owned CP; skip the pre-embed hook explicitly.
+        train_ctx, batch, _ = prepare_cp_forward(
+            self.model_parts[0], self.device_mesh, batch, loss_mask=labels, invoke_pre_embed=False
+        )
 
         model = self.model_parts[0]
         sync_ctx = (
@@ -448,12 +451,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             )
             for k, v in batch.items()
         }
-        train_ctx, batch = make_cp_batch_and_ctx(
+        # KD has not wired model-owned CP; skip the pre-embed hook explicitly.
+        train_ctx, batch, _ = prepare_cp_forward(
+            self.model_parts[0],
             self.device_mesh,
             batch,
             use_te=_uses_te_dot_product_attention(self.cfg.model) and _uses_thd_collater(self.cfg.dataloader),
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_get_num_thd_chunks(True, self.cfg),
+            invoke_pre_embed=False,
         )
         labels = batch.pop("labels")
         input_ids = batch.pop("input_ids")
