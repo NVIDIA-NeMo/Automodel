@@ -567,3 +567,33 @@ class TestBackendConfigPartialCudaGraphs:
                 dispatcher="deepep",
                 cuda_graph=CudaGraphConfig(modules=["moe_router", "moe_preprocess"]),
             )
+
+    def test_moe_paged_stash_requires_moe_scope_and_positive_capacity(self):
+        with pytest.raises(ValueError, match="requires 'moe'"):
+            CudaGraphConfig(moe_paged_stash=True)
+        with pytest.raises(ValueError, match="page_size must be a positive integer"):
+            CudaGraphConfig(
+                modules=["moe"],
+                moe_capacity_factor=1.25,
+                moe_paged_stash=True,
+                moe_paged_stash_page_size=0,
+            )
+        for invalid_factor in (0, 0.5, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="buffer_size_factor must be finite and at least 1.0"):
+                CudaGraphConfig(
+                    modules=["moe"],
+                    moe_capacity_factor=1.25,
+                    moe_paged_stash=True,
+                    moe_paged_stash_buffer_size_factor=invalid_factor,
+                )
+
+        config = BackendConfig(
+            experts="te",
+            dispatcher="torch",
+            cuda_graph=CudaGraphConfig(
+                modules=["moe"],
+                moe_capacity_factor=1.25,
+                moe_paged_stash=True,
+            ),
+        )
+        assert config.cuda_graph.moe_paged_stash is True

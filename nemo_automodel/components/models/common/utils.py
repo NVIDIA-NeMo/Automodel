@@ -169,10 +169,19 @@ class CudaGraphConfig:
             number of routed tokens per expert. Required by, and only valid
             with, the ``moe`` graph scope. Capacity limiting may drop routed
             expert assignments when an expert is overloaded.
+        moe_paged_stash: Page explicitly marked TE expert saved activations
+            using iteration-0 runtime token counts. Requires the ``moe`` graph
+            scope and expert inputs that participate in autograd.
+        moe_paged_stash_page_size: Number of token rows per paged-stash page.
+        moe_paged_stash_buffer_size_factor: Multiplicative page-buffer headroom
+            over the iteration-0 observed peak. Must be finite and at least one.
     """
 
     modules: list[Literal["attn", "te_dpa", "moe", "moe_router", "moe_preprocess"]] = field(default_factory=list)
     moe_capacity_factor: float | None = None
+    moe_paged_stash: bool = False
+    moe_paged_stash_page_size: int = 64
+    moe_paged_stash_buffer_size_factor: float = 1.1
 
     def __post_init__(self) -> None:
         """Validate the declarative CUDA-graph configuration."""
@@ -203,6 +212,23 @@ class CudaGraphConfig:
                 raise ValueError("'moe' in cuda_graph.modules requires cuda_graph.moe_capacity_factor")
             if any(scope in self.modules for scope in ("moe_router", "moe_preprocess")):
                 raise ValueError("'moe' in cuda_graph.modules cannot be combined with moe_router or moe_preprocess")
+        if self.moe_paged_stash:
+            if "moe" not in self.modules:
+                raise ValueError("cuda_graph.moe_paged_stash requires 'moe' in cuda_graph.modules")
+            if (
+                isinstance(self.moe_paged_stash_page_size, bool)
+                or not isinstance(self.moe_paged_stash_page_size, int)
+                or self.moe_paged_stash_page_size <= 0
+            ):
+                raise ValueError("cuda_graph.moe_paged_stash_page_size must be a positive integer")
+            factor = self.moe_paged_stash_buffer_size_factor
+            if (
+                isinstance(factor, bool)
+                or not isinstance(factor, (int, float))
+                or not math.isfinite(float(factor))
+                or factor < 1.0
+            ):
+                raise ValueError("cuda_graph.moe_paged_stash_buffer_size_factor must be finite and at least 1.0")
 
 
 @dataclass(kw_only=True)
