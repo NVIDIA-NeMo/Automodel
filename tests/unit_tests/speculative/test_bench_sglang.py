@@ -27,7 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from nemo_automodel.components.speculative import bench_sglang
+from nemo_automodel.components.speculative import bench_common, bench_sglang
 from nemo_automodel.components.speculative.bench_sglang import (
     GenerationConfig,
     WorkloadResult,
@@ -264,20 +264,22 @@ def _fake_aiohttp(session):
 
 
 def _patch_aiohttp(monkeypatch, session):
+    # _chat_completion/_run_workload live in bench_common; _fetch_server_info in bench_sglang.
+    monkeypatch.setattr(bench_common, "_import_aiohttp", lambda: _fake_aiohttp(session))
     monkeypatch.setattr(bench_sglang, "_import_aiohttp", lambda: _fake_aiohttp(session))
 
     # No real backoff sleeps in retry tests.
     async def _no_sleep(_):
         return None
 
-    monkeypatch.setattr(bench_sglang.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(bench_common.asyncio, "sleep", _no_sleep)
 
 
 def test_chat_completion_returns_completion_tokens(monkeypatch):
     session = _FakeSession(post_responses=[_FakeResponse(200, {"usage": {"completion_tokens": 17}})])
     _patch_aiohttp(monkeypatch, session)
     tokens = asyncio.run(
-        bench_sglang._chat_completion(session, "http://x/v1/chat/completions", {}, timeout_s=1.0, max_retries=0)
+        bench_common._chat_completion(session, "http://x/v1/chat/completions", {}, timeout_s=1.0, max_retries=0)
     )
     assert tokens == 17
 
@@ -285,7 +287,7 @@ def test_chat_completion_returns_completion_tokens(monkeypatch):
 def test_chat_completion_missing_usage_returns_zero(monkeypatch):
     session = _FakeSession(post_responses=[_FakeResponse(200, {"choices": []})])
     _patch_aiohttp(monkeypatch, session)
-    tokens = asyncio.run(bench_sglang._chat_completion(session, "http://x", {}, timeout_s=1.0, max_retries=0))
+    tokens = asyncio.run(bench_common._chat_completion(session, "http://x", {}, timeout_s=1.0, max_retries=0))
     assert tokens == 0
 
 
@@ -297,7 +299,7 @@ def test_chat_completion_retries_then_succeeds(monkeypatch):
         ]
     )
     _patch_aiohttp(monkeypatch, session)
-    tokens = asyncio.run(bench_sglang._chat_completion(session, "http://x", {}, timeout_s=1.0, max_retries=2))
+    tokens = asyncio.run(bench_common._chat_completion(session, "http://x", {}, timeout_s=1.0, max_retries=2))
     assert tokens == 5
     assert len(session.post_calls) == 2
 
@@ -306,7 +308,7 @@ def test_chat_completion_raises_after_max_retries(monkeypatch):
     session = _FakeSession(post_responses=[_FakeResponse(503, text="down"), _FakeResponse(503, text="down")])
     _patch_aiohttp(monkeypatch, session)
     with pytest.raises(RuntimeError, match="HTTP 503"):
-        asyncio.run(bench_sglang._chat_completion(session, "http://x", {}, timeout_s=1.0, max_retries=1))
+        asyncio.run(bench_common._chat_completion(session, "http://x", {}, timeout_s=1.0, max_retries=1))
 
 
 def test_chat_completion_does_not_retry_non_retryable_4xx(monkeypatch):
@@ -316,7 +318,7 @@ def test_chat_completion_does_not_retry_non_retryable_4xx(monkeypatch):
     session = _FakeSession(post_responses=[_FakeResponse(404, text="not found")] * 4)
     _patch_aiohttp(monkeypatch, session)
     with pytest.raises(_FakeClientResponseError):
-        asyncio.run(bench_sglang._chat_completion(session, "http://x", {}, timeout_s=1.0, max_retries=3))
+        asyncio.run(bench_common._chat_completion(session, "http://x", {}, timeout_s=1.0, max_retries=3))
     assert len(session.post_calls) == 1
 
 
@@ -408,7 +410,7 @@ def test_load_prompts_caps_and_drops_unusable(monkeypatch):
     )
     # "b" yields no usable prompt and must be skipped; the cap stops at 2.
     monkeypatch.setattr(
-        bench_sglang,
+        bench_common,
         "_extract_prompt_messages",
         lambda m: None if m == "b" else [{"role": "user", "content": m}],
     )

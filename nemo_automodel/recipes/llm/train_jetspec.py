@@ -46,6 +46,13 @@ logger = logging.getLogger(__name__)
 class TrainJetSpecRecipe(TrainDFlashRecipe):
     """Recipe for JetSpec draft-model training: DFlash backbone + causal mask + forward-KL."""
 
+    def _build_dflash_config(self, recipe_cfg, target_layer_ids: list[int]) -> dict:
+        """Stamp ``causal=true``: JetSpec drafts with causal in-block attention, and a serving
+        engine (vLLM reads ``dflash_config.causal``) must match it at inference."""
+        cfg = super()._build_dflash_config(recipe_cfg, target_layer_ids)
+        cfg["causal"] = True
+        return cfg
+
     def _build_target_wrapper(self, target_layer_ids: list[int]) -> HFDFlashTargetModel:
         """Capture the target's full-vocab logits too -- JetSpec distills against them."""
         return HFDFlashTargetModel(
