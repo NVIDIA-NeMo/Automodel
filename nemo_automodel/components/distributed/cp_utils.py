@@ -287,7 +287,6 @@ def prepare_cp_forward(
     batch,
     *,
     magi=None,
-    domain: str = "llm",
     use_te: bool = False,
     padding_token_id: int = 0,
     num_chunks: int = 1,
@@ -310,12 +309,12 @@ def prepare_cp_forward(
         model: The (first) model part, or None (e.g. no-model contexts).
         device_mesh: The full device mesh (``cp``/``tp`` submeshes are read).
         batch: The full-sequence batch; mutated and sharded in place.
-        magi: Optional recipe MagiState. When enabled, batch prep is delegated
-            to ``magi.prepare_llm_batch`` / ``prepare_vlm_batch`` (per
-            ``domain``). For ``domain="llm"`` the model hook is skipped, which
-            mirrors the recipes' historical branching; for ``domain="vlm"``
-            the pre-embed still runs first (vision stays on SDPA under magi).
-        domain: ``"llm"`` or ``"vlm"``; selects the magi prepare method.
+        magi: Optional recipe MagiState, threaded to ``make_cp_batch_and_ctx``
+            where it occupies the same dispatch rung as the TE path. Its
+            recipe domain is bound at ``setup_magi``; for llm-domain magi the
+            model hook is skipped (mirrors the recipes' historical branching),
+            while vlm-domain magi still runs the pre-embed first (vision stays
+            on SDPA under magi).
         use_te: THD-packed collator is active (TE/THD sharding; also magi's
             ``is_thd``).
         padding_token_id: Pad sentinel for ``input_ids``.
@@ -353,7 +352,10 @@ def prepare_cp_forward(
     has_hook = model is not None and hasattr(model, "prepare_model_inputs_for_cp")
     effective_cp_size = cp_size if cp_size is not None else _cp_size(device_mesh)
 
-    if effective_cp_size > 1 and has_hook and (domain == "vlm" or not magi_enabled):
+    # llm-domain magi replaces the whole batch prep (no model has both a CP
+    # hook and magi); vlm-domain magi composes with the vision pre-embed.
+    magi_replaces_hook = magi_enabled and getattr(magi, "domain", "llm") == "llm"
+    if effective_cp_size > 1 and has_hook and not magi_replaces_hook:
         if invoke_pre_embed:
             hook_inputs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
             grad_ctx = torch.no_grad() if pre_embed_no_grad else contextlib.nullcontext()
@@ -375,21 +377,6 @@ def prepare_cp_forward(
                 if k != "input_ids":
                     batch.pop(k, None)
 
-    if magi_enabled:
-        # Duck-typed backend prep: magi owns its llm/vlm split and argument
-        # needs behind one method (see MagiState.prepare_batch); the dispatcher
-        # knows only the (ctx, batch) contract.
-        ctx, batch = magi.prepare_batch(
-            model,
-            batch,
-            device_mesh=device_mesh,
-            domain=domain,
-            is_thd=use_te,
-            pad_id=padding_token_id,
-            num_chunks=num_chunks,
-        )
-        return ctx, batch, cp_sharder
-
     ctx, batch = make_cp_batch_and_ctx(
         device_mesh,
         batch,
@@ -397,6 +384,8 @@ def prepare_cp_forward(
         use_te=use_te,
         padding_token_id=padding_token_id,
         num_chunks=num_chunks,
+        magi=magi,
+        model=model,
     )
     return ctx, batch, cp_sharder
 
@@ -409,10 +398,17 @@ def make_cp_batch_and_ctx(
     padding_token_id: int = 0,
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
+    magi=None,
+    model=None,
 ):
     """
     Build a CP context manager and shards a batch. If the input device_mesh is None or the size
     of the context_parallel submesh is 1, this function is effectively a no-op.
+
+    ``magi`` (an enabled MagiState) selects backend-owned batch prep at the same
+    dispatch rung as the TE path; ``model`` is passed through opaquely for its
+    per-step key/spec stamping. Like the TE prep, it also runs at cp_size <= 1
+    (packing conversion / mask-spec activation).
 
     Args:
         cp_mesh (DeviceMesh): The device mesh for context parallel.
@@ -457,6 +453,19 @@ def make_cp_batch_and_ctx(
             stacklevel=2,
         )
         return cp_make_batch_fn(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
+
+    if magi is not None and getattr(magi, "enabled", False):
+        # Backend-owned prep (MagiAttention): magi manages its own CP transport,
+        # so like the TE path this returns (nullcontext, prepped_batch). All magi
+        # internals (HF-vs-custom, recipe domain, cp group) stay in magi_attn_utils.
+        return nullcontext, magi.make_cp_batch(
+            cp_mesh,
+            batch,
+            padding_token_id=padding_token_id,
+            num_chunks=num_chunks,
+            is_thd=use_te,
+            model=model,
+        )
 
     if use_te:
         return nullcontext, make_cp_batch_for_te(

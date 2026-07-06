@@ -576,7 +576,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # MagiAttention (FFA) backend for the language backbone; the vision tower
         # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
         # model.backend.attn="magi" (custom VLMs, e.g. qwen3_vl_moe).
-        self.magi = setup_magi(self.cfg, self.device_mesh, label="VLM language backbone")
+        self.magi = setup_magi(self.cfg, self.device_mesh, domain="vlm", label="VLM language backbone")
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
@@ -898,7 +898,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.device_mesh,
             batch,
             magi=self.magi,
-            domain="vlm",
             invoke_pre_embed=not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False),
             drop_mm_inputs=True,
         )

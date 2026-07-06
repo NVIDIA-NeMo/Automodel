@@ -730,6 +730,8 @@ class MagiState:
     custom: bool = False  # custom-model factory backend (vs HF attn_implementation)
     cp_group: Optional["dist.ProcessGroup"] = None
     cp_size: int = 1
+    domain: str = "llm"  # recipe domain ("llm" | "vlm"), bound at setup
+    device_mesh: Optional[Any] = None  # full device mesh, bound at setup (cp=1 THD conversion)
 
     @property
     def hf_dispatch(self) -> bool:
@@ -798,42 +800,54 @@ class MagiState:
             batch, _ = magi_prepare_vlm(model, batch, self.cp_group)
         return nullcontext, batch
 
-    def prepare_batch(
+    def make_cp_batch(
         self,
-        model,
+        cp_mesh,
         batch,
         *,
-        device_mesh,
-        domain: str = "llm",
-        is_thd: bool = False,
-        pad_id: int = 0,
+        padding_token_id: int = 0,
         num_chunks: int = 1,
+        is_thd: bool = False,
+        model=None,
     ):
-        """Uniform per-step batch prep entry point (assumes ``enabled``).
+        """Backend-owned per-step batch prep, shaped like ``make_cp_batch_for_te``.
 
-        The single method the CP dispatcher (``cp_utils.prepare_cp_forward``)
-        calls, so magi's llm/vlm split and per-domain argument needs stay in
-        this module instead of leaking into the dispatcher. Returns
-        ``(train_ctx, batch)``; magi does its own CP, so ``train_ctx`` is
-        always ``nullcontext``.
+        Called by ``cp_utils.make_cp_batch_and_ctx`` at the same dispatch rung
+        as the TE path: magi manages its own CP transport, so the context is
+        implicitly ``nullcontext`` and only the prepped batch is returned.
+        Everything recipe-static (domain, cp group, device mesh, HF-vs-custom)
+        was bound at :func:`setup_magi`; ``model`` is passed opaquely for
+        per-step key/spec stamping on attention modules.
 
         Args:
-            model: The model part (attention modules get keys/specs stamped).
+            cp_mesh: The context-parallel submesh. Unused — magi owns its
+                bound ``cp_group``; accepted for signature symmetry with
+                ``make_cp_batch_for_te``.
             batch: The full-sequence batch.
-            device_mesh: The full device mesh (cp=1 THD conversion reads it).
-            domain: ``"llm"`` or ``"vlm"`` recipe domain.
-            is_thd: THD-packed collator is active (llm domain only).
-            pad_id: Pad sentinel for ``input_ids`` (llm domain only).
-            num_chunks: THD chunk count (llm domain only).
+            padding_token_id: Pad sentinel for ``input_ids``.
+            num_chunks: THD chunk count.
+            is_thd: THD-packed collator is active.
+            model: The model part whose attention modules receive keys/specs.
+
+        Returns:
+            The dispatched (magi-sharded) batch.
         """
-        if domain == "vlm":
-            return self.prepare_vlm_batch(model, batch)
-        return self.prepare_llm_batch(
-            model, batch, device_mesh=device_mesh, is_thd=is_thd, pad_id=pad_id, num_chunks=num_chunks
-        )
+        del cp_mesh
+        if self.domain == "vlm":
+            _, batch = self.prepare_vlm_batch(model, batch)
+        else:
+            _, batch = self.prepare_llm_batch(
+                model,
+                batch,
+                device_mesh=self.device_mesh,
+                is_thd=is_thd,
+                pad_id=padding_token_id,
+                num_chunks=num_chunks,
+            )
+        return batch
 
 
-def setup_magi(cfg, device_mesh, *, label: str = "") -> MagiState:
+def setup_magi(cfg, device_mesh, *, domain: str = "llm", label: str = "") -> MagiState:
     """Resolve MagiAttention from config: register the backend and CP group.
 
     Enabled when the model is configured with ``attn_implementation="magi"`` (HF) or
@@ -844,7 +858,7 @@ def setup_magi(cfg, device_mesh, *, label: str = "") -> MagiState:
     custom = str(cfg.get("model.backend.attn", "")) == "magi"
     enabled = custom or str(cfg.get("model.attn_implementation", "")) == "magi"
     if not enabled:
-        return MagiState()
+        return MagiState(domain=domain)
 
     if not is_magi_available():
         raise RuntimeError(
@@ -867,4 +881,6 @@ def setup_magi(cfg, device_mesh, *, label: str = "") -> MagiState:
         "custom-model factory" if custom else "HF backend",
         cp_size,
     )
-    return MagiState(enabled=True, custom=custom, cp_group=cp_group, cp_size=cp_size)
+    return MagiState(
+        enabled=True, custom=custom, cp_group=cp_group, cp_size=cp_size, domain=domain, device_mesh=device_mesh
+    )

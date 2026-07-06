@@ -586,9 +586,9 @@ def test_synthesize_single_document_seq_ids_noop_when_present():
     assert torch.equal(batch["_packed_seq_ids"], existing)
 
 
-def test_prepare_cp_forward_delegates_to_magi_prepare_batch():
-    """The dispatcher must call the uniform MagiState.prepare_batch and never
-    reach the torch-native CP path when magi is enabled."""
+def test_magi_dispatches_at_the_te_rung():
+    """An enabled magi occupies the same make_cp_batch_and_ctx rung as the TE
+    path: (nullcontext, prepped batch), never the torch-native CP context."""
     import contextlib as _ctxlib
     from types import SimpleNamespace
 
@@ -596,10 +596,11 @@ def test_prepare_cp_forward_delegates_to_magi_prepare_batch():
 
     class _FakeMagi:
         enabled = True
+        domain = "llm"
 
-        def prepare_batch(self, model, batch, *, device_mesh, domain, is_thd, pad_id, num_chunks):
-            seen.update(model=model, domain=domain, is_thd=is_thd, pad_id=pad_id, num_chunks=num_chunks)
-            return _ctxlib.nullcontext, {"prepared": True}
+        def make_cp_batch(self, cp_mesh, batch, *, padding_token_id, num_chunks, is_thd, model):
+            seen.update(cp_mesh=cp_mesh, model=model, is_thd=is_thd, pad=padding_token_id, chunks=num_chunks)
+            return {"prepared": True}
 
     model = SimpleNamespace()  # no prepare_model_inputs_for_cp -> hook path skipped
     ctx, batch, sharder = _cu.prepare_cp_forward(
@@ -607,7 +608,6 @@ def test_prepare_cp_forward_delegates_to_magi_prepare_batch():
         _DummyDeviceMesh(cp_size=2, tp_size=1),
         {"input_ids": torch.tensor([[1, 2]])},
         magi=_FakeMagi(),
-        domain="llm",
         use_te=True,
         padding_token_id=7,
         num_chunks=3,
@@ -616,4 +616,8 @@ def test_prepare_cp_forward_delegates_to_magi_prepare_batch():
     assert batch == {"prepared": True}
     assert sharder is None
     assert seen["model"] is model
-    assert (seen["domain"], seen["is_thd"], seen["pad_id"], seen["num_chunks"]) == ("llm", True, 7, 3)
+    assert (seen["is_thd"], seen["pad"], seen["chunks"]) == (True, 7, 3)
+    # magi prep also runs at cp<=1, like the TE path
+    seen.clear()
+    _, batch2 = _cu.make_cp_batch_and_ctx(None, {"input_ids": torch.tensor([[1, 2]])}, magi=_FakeMagi())
+    assert batch2 == {"prepared": True} and seen["cp_mesh"] is None
