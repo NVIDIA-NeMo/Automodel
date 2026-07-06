@@ -123,9 +123,8 @@ distributed:
   bucket_cap_mb: 400
   gradient_as_bucket_view: true
 
-# Uncomment and configure for W&B logging.
-wandb:
-  project: YOUR_WANDB_PROJECT
-  entity: YOUR_WANDB_ENTITY
-  name: nemotron_vl_1b_optimized_ddp_lbs2
-  enable: false
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: nemotron_vl_1b_optimized_ddp_lbs2

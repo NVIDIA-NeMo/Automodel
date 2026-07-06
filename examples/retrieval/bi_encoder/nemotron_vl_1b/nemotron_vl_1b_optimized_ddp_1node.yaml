@@ -130,9 +130,8 @@ distributed:
   activation_checkpointing: true
   activation_checkpointing_scope: vision
 
-# Uncomment and configure for W&B logging.
-wandb:
-  project: YOUR_WANDB_PROJECT
-  entity: YOUR_WANDB_ENTITY
-  name: nemotron_vl_1b_optimized_ddp_1node
-  enable: false
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: nemotron_vl_1b_optimized_ddp_1node
