@@ -802,6 +802,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = False
+        # Pre-embed CP: the model pre-embeds, then the runtime shards the batch.
+        cp_style: str = "pre_embed"
+        cp_layout: str = "torch_load_balanced"
 
     @classmethod
     def from_config(
@@ -949,24 +952,34 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
     def prepare_model_inputs_for_cp(
         self,
-        input_ids: torch.Tensor,
+        batch: dict[str, Any] | torch.Tensor | None = None,
         *,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.Tensor | None = None,
-        image_grid_thw: torch.Tensor | None = None,
-        image_grid_hws: torch.Tensor | None = None,
-        video_grid_thw: torch.Tensor | None = None,
-        mm_token_type_ids: torch.Tensor | None = None,
+        num_chunks: int = 1,
         **kwargs: Any,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, Any]:
         """Build full-sequence multimodal embeddings and mRoPE positions before CP sharding.
 
         The VLM->LM multimodal scatter and mRoPE ``get_rope_index`` must run on the
         *full* (unsharded) sequence; context-parallel sharding then happens on the
         returned ``inputs_embeds`` / ``position_ids`` via ``make_cp_batch_and_ctx``.
+
+        Args:
+            batch: The batch dict (with ``input_ids`` and optional multimodal
+                keys); legacy per-key kwargs are also accepted for now.
+            num_chunks: Number of chunks for load-balanced CP sharding.
         """
+        from nemo_automodel.components.distributed.cp_sharder import normalize_prepare_cp_args  # noqa: PLC0415
+
+        batch = normalize_prepare_cp_args(batch, kwargs)
+        input_ids = batch.get("input_ids")
+        attention_mask = batch.get("attention_mask")
+        position_ids = batch.get("position_ids")
+        pixel_values = batch.get("pixel_values")
+        pixel_values_videos = batch.get("pixel_values_videos")
+        image_grid_thw = batch.get("image_grid_thw")
+        image_grid_hws = batch.get("image_grid_hws")
+        video_grid_thw = batch.get("video_grid_thw")
+        mm_token_type_ids = batch.get("mm_token_type_ids")
         if input_ids is None:
             raise ValueError("Qwen3.5 dense CP pre-embedding requires input_ids.")
 
@@ -1048,17 +1061,23 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         **kwargs: Any,
     ) -> Qwen3_5CausalLMOutputWithPast:
         if kwargs.pop("_pre_embed_only", False):
-            return self.prepare_model_inputs_for_cp(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                mm_token_type_ids=mm_token_type_ids,
-                **kwargs,
-            )
+            num_chunks = kwargs.pop("num_chunks", 1)
+            cp_batch: dict[str, Any] = {
+                key: value
+                for key, value in {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "pixel_values": pixel_values,
+                    "pixel_values_videos": pixel_values_videos,
+                    "image_grid_thw": image_grid_thw,
+                    "video_grid_thw": video_grid_thw,
+                    "mm_token_type_ids": mm_token_type_ids,
+                    **kwargs,
+                }.items()
+                if value is not None
+            }
+            return self.prepare_model_inputs_for_cp(cp_batch, num_chunks=num_chunks)
 
         effective_use_cache = False if use_cache is None and self.training else use_cache
         kwargs = dict(kwargs)

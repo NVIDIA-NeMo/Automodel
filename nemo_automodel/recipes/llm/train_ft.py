@@ -1174,9 +1174,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # reference for the per-microbatch ``finalize_loss`` hook below.
             _model_cp = self.model_parts[0] if hasattr(self, "model_parts") else None
             if cp_size > 1 and _model_cp is not None and hasattr(_model_cp, "prepare_model_inputs_for_cp"):
-                prepared = _model_cp.prepare_model_inputs_for_cp(
-                    input_ids=batch["input_ids"], num_chunks=_num_chunks_value
-                )
+                prepared = _model_cp.prepare_model_inputs_for_cp(batch, num_chunks=_num_chunks_value)
                 cp_sharder = prepared.get("cp_sharder")
                 batch.update(prepared)
             train_ctx, batch = make_cp_batch_and_ctx(

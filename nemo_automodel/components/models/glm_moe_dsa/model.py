@@ -265,6 +265,9 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
+        # Model-owned CP: GLM DSA shards its packed THD batch itself.
+        cp_style: str = "model_owned"
+        cp_layout: str = "packed_thd"
 
     @classmethod
     def from_config(
@@ -329,15 +332,29 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """GLM DSA TileLang kernels require validation to use the THD packed layout."""
         return getattr(self.backend, "attn", None) == "tilelang"
 
-    def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
-        """Attach GLM DSA's packed THD context-parallel batch sharder."""
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any] | torch.Tensor | None = None,
+        *,
+        num_chunks: int = 1,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Attach GLM DSA's packed THD context-parallel batch sharder.
+
+        Args:
+            batch: The batch dict; legacy per-key kwargs are also accepted for now.
+            num_chunks: Number of chunks for load-balanced CP sharding.
+        """
         from functools import partial  # noqa: PLC0415
 
         from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
             CPSharder,
             contiguous_local_indices,
             full_logits_grad_touch,
+            normalize_prepare_cp_args,
         )
+
+        batch = normalize_prepare_cp_args(batch, kwargs)
 
         if getattr(self.backend, "attn", None) != "tilelang":
             raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
@@ -346,7 +363,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             "cp_sharder": CPSharder(
                 shard_batch=partial(
                     make_glm_dsa_packed_cp_batch_and_ctx,
-                    num_chunks=int(kwargs.get("num_chunks", 1)),
+                    num_chunks=int(num_chunks),
                 ),
                 # Contiguous over the packed THD token axis: rank r keeps
                 # tokens [r * T/cp, (r + 1) * T/cp).
@@ -452,6 +469,14 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             output_hidden_states: When set (single-process), carry final hidden states on the output.
             **attn_kwargs: Additional arguments forwarded to the base model.
         """
+        # Model-owned context-parallel input prep. The recipe routes the batch
+        # through ``__call__(_pre_embed_only=True)`` before CP sharding so the model
+        # can attach its own ``cp_sharder`` (see ``prepare_model_inputs_for_cp``).
+        if attn_kwargs.pop("_pre_embed_only", False):
+            return self.prepare_model_inputs_for_cp(
+                {"input_ids": input_ids}, num_chunks=attn_kwargs.pop("num_chunks", 1)
+            )
+
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None

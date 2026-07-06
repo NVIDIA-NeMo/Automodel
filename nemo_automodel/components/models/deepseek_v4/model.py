@@ -619,6 +619,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
+        # Model-owned CP: DSV4 shards the batch itself with a contiguous layout.
+        cp_style: str = "model_owned"
+        cp_layout: str = "contiguous"
 
     @classmethod
     def from_config(
@@ -792,7 +795,13 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             embeds.append(self.model.embed_tokens(cur_input_ids))
         return tuple(embeds)
 
-    def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any] | torch.Tensor | None = None,
+        *,
+        num_chunks: int = 1,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         """Model-owned context-parallel batch prep (Miles-style contiguous shard).
 
         Returns a ``CPSharder`` (under the ``"cp_sharder"`` batch key) so
@@ -810,7 +819,10 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             CPSharder,
             contiguous_local_indices,
             full_logits_grad_touch,
+            normalize_prepare_cp_args,
         )
+
+        batch = normalize_prepare_cp_args(batch, kwargs)
 
         return {
             "cp_sharder": CPSharder(
@@ -839,7 +851,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # through ``__call__(_pre_embed_only=True)`` before CP sharding so the model
         # can attach its own ``_cp_make_batch_fn`` (see ``prepare_model_inputs_for_cp``).
         if attn_kwargs.pop("_pre_embed_only", False):
-            return self.prepare_model_inputs_for_cp(input_ids=input_ids)
+            return self.prepare_model_inputs_for_cp({"input_ids": input_ids})
 
         if output_hidden_states is None:
             output_hidden_states = getattr(getattr(self, "config", None), "output_hidden_states", False)

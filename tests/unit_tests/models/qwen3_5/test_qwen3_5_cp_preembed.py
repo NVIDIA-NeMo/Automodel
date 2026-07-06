@@ -253,10 +253,11 @@ class TestForwardPreEmbedDispatch:
 
         captured = {}
 
-        def _fake_prepare(*, input_ids, attention_mask=None, position_ids=None, pixel_values=None, **kwargs):
-            captured["input_ids"] = input_ids
-            captured["pixel_values"] = pixel_values
-            captured["kwargs"] = kwargs
+        def _fake_prepare(batch, *, num_chunks=1, **kwargs):
+            captured["input_ids"] = batch.get("input_ids")
+            captured["pixel_values"] = batch.get("pixel_values")
+            # non-named forward params (e.g. image_grid_hws) ride in the batch dict now
+            captured["kwargs"] = {k: v for k, v in batch.items() if k not in ("input_ids", "pixel_values")}
             return sentinel
 
         model.prepare_model_inputs_for_cp = _fake_prepare

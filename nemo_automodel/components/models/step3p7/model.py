@@ -325,6 +325,9 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
+        # Pre-embed CP: the model pre-embeds, then the runtime shards the batch.
+        cp_style: str = "pre_embed"
+        cp_layout: str = "torch_load_balanced"
 
     @classmethod
     def from_config(
@@ -487,15 +490,26 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
 
     def prepare_model_inputs_for_cp(
         self,
-        input_ids: torch.Tensor,
+        batch: dict[str, Any] | torch.Tensor | None = None,
         *,
-        pixel_values: torch.Tensor | None = None,
-        patch_pixel_values: torch.Tensor | None = None,
-        num_patches: torch.Tensor | list[int] | tuple[int, ...] | None = None,
-        image_embeds: torch.Tensor | None = None,
-        **_: Any,
-    ) -> dict[str, torch.Tensor]:
-        """Merge vision features into token embeddings before CP sequence sharding."""
+        num_chunks: int = 1,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Merge vision features into token embeddings before CP sequence sharding.
+
+        Args:
+            batch: The batch dict (with ``input_ids`` and optional multimodal
+                keys); legacy per-key kwargs are also accepted for now.
+            num_chunks: Number of chunks for load-balanced CP sharding.
+        """
+        from nemo_automodel.components.distributed.cp_sharder import normalize_prepare_cp_args  # noqa: PLC0415
+
+        batch = normalize_prepare_cp_args(batch, kwargs)
+        input_ids = batch.get("input_ids")
+        pixel_values = batch.get("pixel_values")
+        patch_pixel_values = batch.get("patch_pixel_values")
+        num_patches = batch.get("num_patches")
+        image_embeds = batch.get("image_embeds")
         multimodal_embeddings = self.model.get_multimodal_embeddings(
             pixel_values=pixel_values,
             patch_pixel_values=patch_pixel_values,
@@ -527,7 +541,11 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         if kwargs.pop("_pre_embed_only", False):
             if input_ids is None:
                 raise ValueError("Step3p7 CP pre-embedding requires input_ids.")
-            return self.prepare_model_inputs_for_cp(input_ids=input_ids, **kwargs)
+            num_chunks = kwargs.pop("num_chunks", 1)
+            cp_batch: dict[str, Any] = {
+                key: value for key, value in {"input_ids": input_ids, **kwargs}.items() if value is not None
+            }
+            return self.prepare_model_inputs_for_cp(cp_batch, num_chunks=num_chunks)
 
         is_pp_stage = self._is_pipeline_parallel_stage()
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled

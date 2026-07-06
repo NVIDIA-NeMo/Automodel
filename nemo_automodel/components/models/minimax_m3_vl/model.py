@@ -404,6 +404,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
+        # Pre-embed CP: the model pre-embeds, then the runtime shards the batch.
+        cp_style: str = "pre_embed"
+        cp_layout: str = "torch_load_balanced"
 
     @classmethod
     def from_config(
@@ -604,14 +607,11 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
 
     def prepare_model_inputs_for_cp(
         self,
-        input_ids: torch.Tensor,
+        batch: dict[str, Any] | torch.Tensor | None = None,
         *,
-        pixel_values: torch.Tensor | None = None,
-        image_grid_thw=None,
-        pixel_values_videos: torch.Tensor | None = None,
-        video_grid_thw=None,
-        **_: Any,
-    ) -> dict[str, torch.Tensor]:
+        num_chunks: int = 1,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         """Merge vision features into token embeddings BEFORE context-parallel sequence
         sharding.
 
@@ -620,7 +620,20 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         un-sharded sequence; the returned ``inputs_embeds`` is then sequence-sharded by the
         recipe. Mirrors ``step3p7``/``kimi_k25_vl``. Defining this method is also the opt-in
         signal the recipe checks (``hasattr(model, "prepare_model_inputs_for_cp")``).
+
+        Args:
+            batch: The batch dict (with ``input_ids`` and optional multimodal
+                keys); legacy per-key kwargs are also accepted for now.
+            num_chunks: Number of chunks for load-balanced CP sharding.
         """
+        from nemo_automodel.components.distributed.cp_sharder import normalize_prepare_cp_args  # noqa: PLC0415
+
+        batch = normalize_prepare_cp_args(batch, kwargs)
+        input_ids = batch.get("input_ids")
+        pixel_values = batch.get("pixel_values")
+        image_grid_thw = batch.get("image_grid_thw")
+        pixel_values_videos = batch.get("pixel_values_videos")
+        video_grid_thw = batch.get("video_grid_thw")
         inputs_embeds = self._embed_and_splice(
             input_ids,
             pixel_values=pixel_values,
@@ -654,13 +667,18 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         if kwargs.pop("_pre_embed_only", False):
             if input_ids is None:
                 raise ValueError("MiniMax M3 VL CP pre-embedding requires input_ids.")
-            return self.prepare_model_inputs_for_cp(
-                input_ids,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                pixel_values_videos=pixel_values_videos,
-                video_grid_thw=video_grid_thw,
-            )
+            cp_batch = {
+                key: value
+                for key, value in {
+                    "input_ids": input_ids,
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                    "pixel_values_videos": pixel_values_videos,
+                    "video_grid_thw": video_grid_thw,
+                }.items()
+                if value is not None
+            }
+            return self.prepare_model_inputs_for_cp(cp_batch, num_chunks=kwargs.pop("num_chunks", 1))
 
         is_pp_stage = self._is_pipeline_parallel_stage()
 

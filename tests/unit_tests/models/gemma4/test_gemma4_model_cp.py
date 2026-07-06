@@ -247,7 +247,7 @@ def test_forward_pre_embed_only_routes_to_prepare(monkeypatch):
     cfg.image_token_id = 42
     model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
     sentinel = {"inputs_embeds": torch.zeros(1)}
-    monkeypatch.setattr(model, "prepare_model_inputs_for_cp", lambda **kw: sentinel)
+    monkeypatch.setattr(model, "prepare_model_inputs_for_cp", lambda *a, **kw: sentinel)
     out = model(input_ids=torch.tensor([[1, 2, 3]]), _pre_embed_only=True)
     assert out is sentinel
 
