@@ -667,11 +667,11 @@ class MoE(nn.Module):
         local_fixed_te_moe = (
             backend.experts == "te"
             and backend.cuda_graph_moe_capacity_factor is not None
-            and get_world_size_safe() == 1
+            and backend.dispatcher == "torch"
         )
         if local_fixed_te_moe:
-            # EP=1 bring-up for the full post-router MoE graph. GroupedExpertsTE
-            # owns a local fixed-capacity dispatcher when no EP mesh is present.
+            # EP=1 fixed-capacity execution uses local TE experts even when the
+            # surrounding transformer block is sharded over a data-parallel FSDP2 mesh.
             self.experts = GroupedExpertsTE(
                 config,
                 backend=backend,

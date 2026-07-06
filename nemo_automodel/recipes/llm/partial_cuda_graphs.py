@@ -803,10 +803,14 @@ def _build_moe_execution_entry(
     _activation_checkpointing: bool,
 ) -> _PartialGraphEntry:
     """Build one fixed-capacity post-router MoE graph entry."""
+    from torch.distributed.fsdp import FSDPModule
+
+    capture_owner = block.capture_owner if isinstance(block.capture_owner, FSDPModule) else None
     return _PartialGraphEntry(
         name=f"{block.name}.moe",
         target=target,
         explicit_parameters=True,
+        capture_owner=capture_owner,
         retain_graph_in_backward=True,
     )
 

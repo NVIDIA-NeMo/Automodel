@@ -123,6 +123,20 @@ class TestBackendConfigExpertsDispatcherValidation:
         assert config.experts == "te"
         assert config.dispatcher == "hybridep"
 
+    def test_combined_attention_and_moe_graphs_are_valid(self):
+        config = BackendConfig(
+            attn="te",
+            linear="torch",
+            rms_norm="torch",
+            rope_fusion=False,
+            experts="te",
+            dispatcher="torch",
+            cuda_graph_modules=["attn", "moe"],
+            cuda_graph_moe_capacity_factor=1.0,
+        )
+
+        assert config.cuda_graph_modules == ["attn", "moe"]
+
     def test_full_moe_graph_rejects_legacy_deepep(self):
         with pytest.raises(ValueError, match="requires dispatcher='torch' or 'hybridep'"):
             BackendConfig(
