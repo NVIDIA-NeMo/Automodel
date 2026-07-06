@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -33,6 +34,8 @@ except ImportError:
 
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.megatron.moe_utils import (
+    permute,
+    unpermute,
     weighted_bias_geglu_impl,
     weighted_bias_swiglu_impl,
 )
@@ -907,6 +910,8 @@ class GroupedExpertsTE(nn.Module):
         down_linear (GroupedLinear): Down projection.
     """
 
+    _supports_full_moe_cuda_graph = True
+
     def __init__(
         self,
         config: MoEConfig,
@@ -945,6 +950,7 @@ class GroupedExpertsTE(nn.Module):
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
+        self.cuda_graph_moe_capacity_factor = backend.cuda_graph_moe_capacity_factor if backend is not None else None
 
         # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
         # Non-gated (ReLU²): out_features = moe_inter_dim
@@ -982,6 +988,7 @@ class GroupedExpertsTE(nn.Module):
         self.ep_mesh = None
         self.moe_mesh = None
         self.ep_rank = 0
+        self.ep_size = 1
 
     def _get_stacked_weight(self, linear: "GroupedLinear", transpose: bool = False) -> torch.Tensor:
         weights = []
@@ -1273,6 +1280,146 @@ class GroupedExpertsTE(nn.Module):
         self.fp8_padding = Fp8Padding(self.num_local_experts)
         self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
 
+    def _cuda_graph_source_expert_capacity(self, num_tokens: int) -> int:
+        """Return the fixed number of assignments retained per source expert."""
+        if self.cuda_graph_moe_capacity_factor is None:
+            raise RuntimeError("MoE CUDA graph capacity is not configured")
+        capacity = math.ceil(
+            num_tokens
+            * self.config.n_activated_experts
+            * self.cuda_graph_moe_capacity_factor
+            / self.config.n_routed_experts
+        )
+        if capacity <= 0 or capacity > num_tokens:
+            raise RuntimeError(
+                "MoE CUDA graph expert capacity must be in [1, num_tokens]; "
+                f"got capacity={capacity}, num_tokens={num_tokens}"
+            )
+        return capacity
+
+    def _local_drop_and_pad_metadata(
+        self,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert top-k routing to a dense map while retaining routing gradients."""
+        num_tokens = indices.size(0)
+        valid = token_mask.unsqueeze(-1) & (indices >= 0) & (indices < self.config.n_routed_experts)
+        safe_indices = indices.clamp(min=0, max=self.config.n_routed_experts - 1)
+
+        routing_counts = torch.zeros(
+            (num_tokens, self.config.n_routed_experts),
+            dtype=torch.int32,
+            device=indices.device,
+        ).scatter_add(1, safe_indices, valid.to(torch.int32))
+        routing_map = routing_counts > 0
+        routing_probs = torch.zeros(
+            (num_tokens, self.config.n_routed_experts),
+            dtype=torch.float32,
+            device=weights.device,
+        ).scatter_add(1, safe_indices, weights.float() * valid)
+        return routing_map, routing_probs
+
+    def _forward_local_cuda_graph_moe(
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run local dispatch, fixed-capacity TE experts, and combine at EP=1."""
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        if FP8GlobalStateManager.is_fp8_enabled():
+            raise RuntimeError("The initial full MoE CUDA graph path supports BF16 TE GroupedLinear only")
+        if self.ep_size != 1 or self.token_dispatcher is not None:
+            raise RuntimeError("Local MoE CUDA graph dispatch requires EP=1")
+
+        capacity = self._cuda_graph_source_expert_capacity(x.size(0))
+        routing_map, routing_probs = self._local_drop_and_pad_metadata(token_mask, weights, indices)
+        num_permuted_tokens = capacity * self.num_local_experts
+        permuted_hidden, permuted_probs, sorted_indices = permute(
+            x,
+            routing_map,
+            probs=routing_probs,
+            num_out_tokens=num_permuted_tokens,
+            fused=False,
+            drop_and_pad=True,
+        )
+        assert permuted_probs is not None
+        output2 = self._forward_fixed_capacity_te_experts(
+            permuted_hidden,
+            permuted_probs,
+            tokens_per_local_expert=capacity,
+        )
+
+        return unpermute(
+            output2,
+            sorted_indices,
+            restore_shape=x.shape,
+            fused=False,
+            drop_and_pad=True,
+        )
+
+    def _forward_hybridep_cuda_graph_moe(
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run fixed-capacity HybridEP dispatch, local TE experts, and combine."""
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        if FP8GlobalStateManager.is_fp8_enabled():
+            raise RuntimeError("The initial full MoE CUDA graph path supports BF16 TE GroupedLinear only")
+        if self.ep_size <= 1 or self.token_dispatcher is None:
+            raise RuntimeError("HybridEP MoE CUDA graph dispatch requires EP>1")
+        if self.dispatcher_backend != "hybridep":
+            raise RuntimeError("Full MoE CUDA graphs with EP>1 require dispatcher='hybridep'")
+
+        source_capacity = self._cuda_graph_source_expert_capacity(x.size(0))
+        self.token_dispatcher.set_cuda_graph_expert_capacity(source_capacity)
+        indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
+        permuted_hidden, _tokens_per_expert, permuted_probs = self.token_dispatcher.token_permutation2(
+            hidden_states=x,
+            num_local_tokens=x.size(0),
+            token_probs=weights,
+            token_indices=indices,
+        )
+        output = self._forward_fixed_capacity_te_experts(
+            permuted_hidden,
+            permuted_probs,
+            tokens_per_local_expert=source_capacity * self.ep_size,
+        )
+        return self.token_dispatcher.token_unpermutation(output)
+
+    def _forward_fixed_capacity_te_experts(
+        self,
+        hidden_states: torch.Tensor,
+        permuted_probs: torch.Tensor,
+        *,
+        tokens_per_local_expert: int,
+    ) -> torch.Tensor:
+        """Execute TE GroupedLinear with an identical static split for each local expert."""
+        permuted_probs = permuted_probs.unsqueeze(-1)
+        splits = [tokens_per_local_expert] * self.num_local_experts
+        output1 = self.gate_up_linear(hidden_states, splits)
+        output1 = self.expert_activation(output1, permuted_probs)
+        output2 = self.down_linear(output1, splits)
+        if self.expert_bias:
+            down_bias = self._get_stacked_bias(self.down_linear)
+            if down_bias is not None:
+                split_tensor = torch.full(
+                    (self.num_local_experts,),
+                    tokens_per_local_expert,
+                    dtype=torch.int64,
+                    device=output2.device,
+                )
+                output2 = _apply_bias(output2, down_bias, split_tensor, permuted_probs - 1.0)
+        return output2
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1296,6 +1443,11 @@ class GroupedExpertsTE(nn.Module):
         assert self.config.n_routed_experts % self.ep_size == 0, (
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
+
+        if self.cuda_graph_moe_capacity_factor is not None:
+            if self.ep_size == 1:
+                return self._forward_local_cuda_graph_moe(x, token_mask, weights, indices)
+            return self._forward_hybridep_cuda_graph_moe(x, token_mask, weights, indices)
 
         indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
 

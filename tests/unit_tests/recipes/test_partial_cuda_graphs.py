@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 import nemo_automodel.recipes.llm.partial_cuda_graphs as partial_graphs
+from nemo_automodel.components.moe.experts import GroupedExpertsTE
 
 
 class _RouterCore(nn.Module):
@@ -53,18 +54,28 @@ class _Attention(nn.Module):
         return self.o_proj(self.attn_module.fused_attention(self.q_proj(hidden_states)))
 
 
+class _MoeExecution(GroupedExpertsTE):
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.weight = nn.Parameter(torch.eye(4))
+        self.token_dispatcher = SimpleNamespace(hybridep_metadata_processor=_Preprocess())
+
+    def forward(self, hidden_states, token_mask, weights, indices):
+        del token_mask, weights, indices
+        return hidden_states @ self.weight
+
+
 class _Layer(nn.Module):
     def __init__(self):
         super().__init__()
         self.self_attn = _Attention()
         self.mlp = nn.Module()
         self.mlp.gate = _Router()
-        self.mlp.experts = nn.Module()
-        self.mlp.experts.token_dispatcher = SimpleNamespace(hybridep_metadata_processor=_Preprocess())
+        self.mlp.experts = _MoeExecution()
 
 
 class _Model(nn.Module):
-    def __init__(self, *, te_dpa=True, attention=False, router=True, preprocess=True, layer_count=1):
+    def __init__(self, *, te_dpa=True, attention=False, moe=False, router=True, preprocess=True, layer_count=1):
         super().__init__()
         self.config = SimpleNamespace(model_type="test_moe")
         cuda_graph_modules = []
@@ -72,6 +83,8 @@ class _Model(nn.Module):
             cuda_graph_modules.append("te_dpa")
         if attention:
             cuda_graph_modules.append("attn")
+        if moe:
+            cuda_graph_modules.append("moe")
         if router:
             cuda_graph_modules.append("moe_router")
         if preprocess:
@@ -158,6 +171,36 @@ def test_whole_attention_scope_uses_explicit_parameters_on_single_device(monkeyp
     assert entry.explicit_parameters is True
     assert len(captured_sample_args) == 1
     assert len(captured_sample_args[0][0]) == 3
+    manager.close()
+
+
+def test_full_moe_scope_uses_explicit_parameters(monkeypatch):
+    captured_sample_args = []
+
+    def make_graphed_callables(modules, sample_args, **kwargs):
+        captured_sample_args.append(sample_args)
+        assert kwargs["retain_graph_in_backward"] is True
+        for module in modules:
+            module.reset = lambda: None
+        return modules
+
+    monkeypatch.setattr(partial_graphs, "_get_make_graphed_callables", lambda: make_graphed_callables)
+    model = _Model(te_dpa=False, moe=True, router=False, preprocess=False)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+    assert manager is not None
+    entry = manager.entries[0]
+    model.model.layers["0"].mlp.experts(
+        torch.ones(2, 4),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.long),
+    )
+
+    manager.capture()
+
+    assert entry.name == "test_moe.layers.0.moe"
+    assert entry.explicit_parameters is True
+    assert len(captured_sample_args[0][0]) == 5
     manager.close()
 
 
@@ -441,6 +484,12 @@ def test_rejects_router_and_preprocess_with_activation_checkpointing():
 def test_rejects_whole_attention_with_activation_checkpointing():
     model = _Model(te_dpa=False, attention=True, router=False, preprocess=False)
     with pytest.raises(RuntimeError, match="Whole-attention CUDA graphs do not support activation checkpointing"):
+        partial_graphs.PartialCudaGraphManager.from_model_parts([model], activation_checkpointing=True)
+
+
+def test_rejects_full_moe_with_activation_checkpointing():
+    model = _Model(te_dpa=False, moe=True, router=False, preprocess=False)
+    with pytest.raises(RuntimeError, match="Full MoE CUDA graphs do not support activation checkpointing"):
         partial_graphs.PartialCudaGraphManager.from_model_parts([model], activation_checkpointing=True)
 
 

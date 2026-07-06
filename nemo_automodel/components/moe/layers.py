@@ -664,7 +664,23 @@ class MoE(nn.Module):
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
             self.gate.use_routing_core = "moe_router" in backend.cuda_graph_modules
-        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
+        local_fixed_te_moe = (
+            backend.experts == "te"
+            and backend.cuda_graph_moe_capacity_factor is not None
+            and get_world_size_safe() == 1
+        )
+        if local_fixed_te_moe:
+            # EP=1 bring-up for the full post-router MoE graph. GroupedExpertsTE
+            # owns a local fixed-capacity dispatcher when no EP mesh is present.
+            self.experts = GroupedExpertsTE(
+                config,
+                backend=backend,
+                dispatcher_backend=backend.dispatcher,
+                dispatcher_num_sms=backend.dispatcher_num_sms,
+                dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
+            )
+        elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
             warnings.warn(
                 f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "
                 "Expert parallelism requires multiple GPUs. Falling back to standard GroupedExperts.",
