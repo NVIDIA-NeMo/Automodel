@@ -60,26 +60,6 @@ def _unwrap_model_for_attrs(model):
     return getattr(model, "module", model)
 
 
-def _materialize_metric_value(value):
-    if isinstance(value, torch.Tensor):
-        if value.numel() == 1:
-            value = value.detach().cpu().item()
-        else:
-            value = value.detach().cpu()
-    return value
-
-
-def _materialize_metrics_for_logging(log_data: MetricsSample) -> MetricsSample:
-    log_data.metrics = {key: _materialize_metric_value(value) for key, value in log_data.metrics.items()}
-    return log_data
-
-
-def _format_metric_for_log(value, spec: str) -> str:
-    if isinstance(value, torch.Tensor):
-        return "<tensor>" if value.numel() != 1 else format(value.detach().cpu().item(), spec)
-    return format(value, spec)
-
-
 def _get_autocast_ctx(distributed_config):
     """Return the optional recipe-level autocast context."""
     autocast_dtype = getattr(distributed_config, "autocast_dtype", None)
@@ -488,9 +468,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
         )
         self.loss_average_window = deque(maxlen=self.step_scheduler.loss_average_window_steps)
-        self.log_every_steps = int(self.cfg.get("log_every_steps", 1))
-        if self.log_every_steps <= 0:
-            raise ValueError(f"log_every_steps must be greater than 0, got {self.log_every_steps}")
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.load_checkpoint(restore_from)
@@ -513,16 +490,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 # The step scheduler yields a list of batches for gradient accumulation
                 for batches in self.step_scheduler:
                     train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                    log_every_steps = getattr(self, "log_every_steps", 1)
-                    should_log_step = (
-                        log_every_steps == 1
-                        or self.step_scheduler.step % log_every_steps == 0
-                        or self.step_scheduler.is_last_step
-                    )
-                    if should_log_step:
-                        train_log_data = _materialize_metrics_for_logging(train_log_data)
-                        self.log_train_metrics(train_log_data)
-                        self._update_progress_bar(pbar, train_log_data.metrics)
+                    self.log_train_metrics(train_log_data)
+                    self._update_progress_bar(pbar, train_log_data.metrics)
 
                     val_loss = None
                     if self.step_scheduler.is_val_step and self.val_dataloader is not None:
@@ -701,11 +670,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
         elapsed = time.perf_counter() - self.timestamp
         self.timestamp = time.perf_counter()
         mem_allocated = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+        if isinstance(grad_norm, torch.Tensor):
+            grad_norm = grad_norm.detach().item()
 
         metrics = {
-            "loss": reporting_loss,
-            "loss_avg_window": average_loss,
-            "grad_norm": grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+            "loss": reporting_loss.item(),
+            "loss_avg_window": average_loss.item(),
+            "grad_norm": grad_norm,
             "lr": lr,
             "mem": mem_allocated,
             "time_per_step": elapsed,
@@ -808,15 +779,15 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.metric_logger_train.log(log_data)
 
         logging.info(
-            "step {} | epoch {} | loss {} | loss_avg_window {} | grad_norm {} | lr {} | mem {} GiB | time {}s".format(
+            "step {} | epoch {} | loss {:.4f} | loss_avg_window {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s".format(
                 log_data.step,
                 log_data.epoch,
-                _format_metric_for_log(log_data.metrics["loss"], ".4f"),
-                _format_metric_for_log(log_data.metrics["loss_avg_window"], ".4f"),
-                _format_metric_for_log(log_data.metrics["grad_norm"], ".4f"),
-                _format_metric_for_log(log_data.metrics["lr"], ".2e"),
-                _format_metric_for_log(log_data.metrics["mem"], ".2f"),
-                _format_metric_for_log(log_data.metrics["time_per_step"], ".2f"),
+                log_data.metrics["loss"],
+                log_data.metrics["loss_avg_window"],
+                log_data.metrics["grad_norm"],
+                log_data.metrics["lr"],
+                log_data.metrics["mem"],
+                log_data.metrics["time_per_step"],
             )
         )
 
