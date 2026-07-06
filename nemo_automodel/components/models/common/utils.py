@@ -204,6 +204,12 @@ class BackendConfig:
             number of routed tokens per expert. Required by, and only valid with,
             the ``moe`` graph scope. Capacity limiting may drop routed expert
             assignments when an expert is overloaded.
+        cuda_graph_moe_paged_stash: Page explicitly marked TE expert saved activations
+            using iteration-0 runtime token counts. Requires the ``moe`` graph scope
+            and expert inputs that participate in autograd.
+        cuda_graph_moe_paged_stash_page_size: Number of token rows per paged-stash page.
+        cuda_graph_moe_paged_stash_buffer_size_factor: Multiplicative page-buffer headroom
+            over the iteration-0 observed peak. Must be finite and at least one.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -243,6 +249,9 @@ class BackendConfig:
         default_factory=list
     )
     cuda_graph_moe_capacity_factor: float | None = None
+    cuda_graph_moe_paged_stash: bool = False
+    cuda_graph_moe_paged_stash_page_size: int = 64
+    cuda_graph_moe_paged_stash_buffer_size_factor: float = 1.1
 
     def __post_init__(self):
         # TEMPORARY: force TE fused RoPE off globally. The fused kernel computes cos/sin
@@ -292,6 +301,18 @@ class BackendConfig:
                 raise ValueError("cuda_graph_modules='moe' currently supports BF16 TE GroupedLinear only")
             if any(scope in self.cuda_graph_modules for scope in ("moe_router", "moe_preprocess")):
                 raise ValueError("cuda_graph_modules='moe' cannot be combined with moe_router or moe_preprocess")
+        if self.cuda_graph_moe_paged_stash:
+            if "moe" not in self.cuda_graph_modules:
+                raise ValueError("cuda_graph_moe_paged_stash requires 'moe' in cuda_graph_modules")
+            if (
+                isinstance(self.cuda_graph_moe_paged_stash_page_size, bool)
+                or not isinstance(self.cuda_graph_moe_paged_stash_page_size, int)
+                or self.cuda_graph_moe_paged_stash_page_size <= 0
+            ):
+                raise ValueError("cuda_graph_moe_paged_stash_page_size must be a positive integer")
+            factor = self.cuda_graph_moe_paged_stash_buffer_size_factor
+            if isinstance(factor, bool) or not isinstance(factor, (int, float)) or factor <= 0:
+                raise ValueError("cuda_graph_moe_paged_stash_buffer_size_factor must be positive")
 
         # enable_deepep was removed. It is no longer honored; warn (once, on rank 0) if a stale
         # config still sets it so the user migrates to explicit dispatcher/experts. The field is

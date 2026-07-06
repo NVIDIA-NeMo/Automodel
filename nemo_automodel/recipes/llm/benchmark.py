@@ -344,6 +344,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 # Gradient accumulation loop
                 num_label_tokens = 0
                 loss_buffer = []
+                iteration_batches = []
                 prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
                 for ga_step_idx in range(ga_steps):
@@ -352,6 +353,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
                     # Get batch from dataloader
                     batch = next(dataloader_iter)
+                    iteration_batches.append(batch)
                     torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
 
                     # Accumulate label tokens locally
@@ -371,6 +373,12 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
                     if ga_step_idx == 0:
                         prepare_after_first_microbatch()
+
+                loss_buffer = self._rerun_after_paged_stash_overflow(
+                    iteration_batches,
+                    num_label_tokens=None,
+                    loss_buffer=loss_buffer,
+                )
 
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):

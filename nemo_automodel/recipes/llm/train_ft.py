@@ -449,6 +449,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # eager optimizer step has supplied representative runtime inputs.
         self.partial_cuda_graph_manager = None
         self._partial_cuda_graph_capture_pending = False
+        self._partial_cuda_graph_paged_stash_enabled = False
+        self._partial_cuda_graph_paged_stash_reruns = 0
 
     # ------------------ build phase ------------------
     def _create_distributed_setup(self) -> DistributedSetup:
@@ -801,6 +803,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             pipeline_parallel=bool(self.pp_enabled),
         )
         self._partial_cuda_graph_capture_pending = self.partial_cuda_graph_manager is not None
+        enabled_parts = [
+            part
+            for part in self.model_parts
+            if bool(getattr(getattr(part, "backend", None), "cuda_graph_moe_paged_stash", False))
+        ]
+        self._partial_cuda_graph_paged_stash_enabled = bool(enabled_parts)
+        if self._partial_cuda_graph_paged_stash_enabled and self.partial_cuda_graph_manager is None:
+            raise RuntimeError("MoE paged stash requires an active partial CUDA graph manager")
 
     def _capture_partial_cuda_graphs_after_eager_step(self) -> None:
         """Capture once, after a complete eager forward/backward/optimizer step."""
@@ -809,7 +819,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not getattr(self, "_partial_cuda_graph_capture_pending", False):
             return
         assert self.partial_cuda_graph_manager is not None
+        if getattr(self, "_partial_cuda_graph_paged_stash_enabled", False):
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            stash_manager = get_paged_stash_manager()
+            stash_manager.prepare()
+            logger.info("Partial MoE paged stash prepared: %s", stash_manager.diagnostics())
         self.partial_cuda_graph_manager.capture()
+        if getattr(self, "_partial_cuda_graph_paged_stash_enabled", False):
+            stash_manager.finish_iteration()
         self._partial_cuda_graph_capture_pending = False
 
     def _close_partial_cuda_graphs(self) -> None:
@@ -817,10 +835,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         manager = getattr(self, "partial_cuda_graph_manager", None)
         if manager is None:
             self._partial_cuda_graph_capture_pending = False
+            if getattr(self, "_partial_cuda_graph_paged_stash_enabled", False):
+                from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+                get_paged_stash_manager().close()
+            self._partial_cuda_graph_paged_stash_enabled = False
             return
         manager.close()
         self.partial_cuda_graph_manager = None
         self._partial_cuda_graph_capture_pending = False
+        if getattr(self, "_partial_cuda_graph_paged_stash_enabled", False):
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            get_paged_stash_manager().close()
+        self._partial_cuda_graph_paged_stash_enabled = False
 
     def _collect_moe_load_balance(self):
         """Collect MoE load balance metrics with DP all-reduce.
@@ -1179,6 +1207,65 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
         return tensor
 
+    def _run_forward_backward_batches(self, batches, *, num_label_tokens: int | None) -> list[torch.Tensor]:
+        """Run one complete gradient-accumulation forward/backward schedule."""
+        loss_buffer: list[torch.Tensor] = []
+        num_batches = len(batches)
+        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+        for index, batch in enumerate(batches):
+            if index == num_batches - 1:
+                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+            self._forward_backward_step(
+                index,
+                batch,
+                loss_buffer=loss_buffer,
+                num_label_tokens=num_label_tokens,
+                num_batches=num_batches,
+            )
+            if index == 0:
+                prepare_after_first_microbatch()
+        return loss_buffer
+
+    def _rerun_after_paged_stash_overflow(
+        self,
+        batches,
+        *,
+        num_label_tokens: int | None,
+        loss_buffer: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """Globally discard an overflowing graph attempt and rerun the whole step eagerly."""
+        if not getattr(self, "_partial_cuda_graph_paged_stash_enabled", False):
+            return loss_buffer
+
+        from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+        stash_manager = get_paged_stash_manager()
+        if not stash_manager.is_active:
+            return loss_buffer
+        overflow = stash_manager.check_overflow()
+        if overflow is None:
+            raise RuntimeError("Active partial MoE paged stash has no overflow flag")
+        overflow_ranks = overflow.reshape(-1)[0].ne(0).to(dtype=torch.int32)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(overflow_ranks, op=torch.distributed.ReduceOp.SUM)
+        if int(overflow_ranks.item()) == 0:
+            stash_manager.finish_iteration()
+            return loss_buffer
+
+        logger.warning(
+            "Discarding partial CUDA graph gradients and rerunning the whole step eagerly after paged-stash "
+            "overflow on %d ranks",
+            int(overflow_ranks.item()),
+        )
+        self._partial_cuda_graph_paged_stash_reruns += 1
+
+        # Graphs reference the page buffers, so destroy them before disabling
+        # the stash. No clipping or optimizer action has happened yet.
+        self._close_partial_cuda_graphs()
+        for optimizer in self.optimizer:
+            optimizer.zero_grad()
+        return self._run_forward_backward_batches(batches, num_label_tokens=num_label_tokens)
+
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
 
@@ -1212,8 +1299,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 float(self._get_dp_group_size(include_cp=True))
             )
 
-        loss_buffer = []
-
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = torch.tensor(
             sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
@@ -1221,19 +1306,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        num_batches = len(batches)
-        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
-
-        for i, batch in enumerate(batches):
-            if i == num_batches - 1:
-                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
-
-            self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
-            )
-
-            if i == 0:
-                prepare_after_first_microbatch()
+        loss_buffer = self._run_forward_backward_batches(batches, num_label_tokens=num_label_tokens)
+        loss_buffer = self._rerun_after_paged_stash_overflow(
+            batches,
+            num_label_tokens=num_label_tokens,
+            loss_buffer=loss_buffer,
+        )
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,

@@ -538,6 +538,37 @@ class TestBackendConfigPartialCudaGraphs:
                 cuda_graph_modules=["moe_router", "moe_preprocess"],
             )
 
+    def test_moe_paged_stash_requires_moe_scope_and_positive_capacity(self):
+        with pytest.raises(ValueError, match="requires 'moe'"):
+            BackendConfig(cuda_graph_moe_paged_stash=True)
+        with pytest.raises(ValueError, match="page_size must be a positive integer"):
+            BackendConfig(
+                experts="te",
+                dispatcher="torch",
+                cuda_graph_modules=["moe"],
+                cuda_graph_moe_capacity_factor=1.25,
+                cuda_graph_moe_paged_stash=True,
+                cuda_graph_moe_paged_stash_page_size=0,
+            )
+        with pytest.raises(ValueError, match="buffer_size_factor must be positive"):
+            BackendConfig(
+                experts="te",
+                dispatcher="torch",
+                cuda_graph_modules=["moe"],
+                cuda_graph_moe_capacity_factor=1.25,
+                cuda_graph_moe_paged_stash=True,
+                cuda_graph_moe_paged_stash_buffer_size_factor=0,
+            )
+
+        config = BackendConfig(
+            experts="te",
+            dispatcher="torch",
+            cuda_graph_modules=["moe"],
+            cuda_graph_moe_capacity_factor=1.25,
+            cuda_graph_moe_paged_stash=True,
+        )
+        assert config.cuda_graph_moe_paged_stash is True
+
 
 class TestBackendConfigRopeFusionDisabled:
     """TE fused RoPE is temporarily force-disabled globally in __post_init__ (see #3027)."""

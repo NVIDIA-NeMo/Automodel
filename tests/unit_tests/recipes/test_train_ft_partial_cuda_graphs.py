@@ -20,6 +20,7 @@ import pytest
 import torch
 from torch import nn
 
+import nemo_automodel.components.moe.paged_stash as paged_stash
 import nemo_automodel.recipes.llm.partial_cuda_graphs as partial_graphs
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
@@ -84,6 +85,55 @@ def test_failed_capture_remains_pending_for_fail_closed_shutdown():
         recipe._capture_partial_cuda_graphs_after_eager_step()
 
     assert recipe._partial_cuda_graph_capture_pending is True
+
+
+def test_paged_stash_is_prepared_before_partial_capture(monkeypatch):
+    events = []
+    stash = SimpleNamespace(
+        prepare=lambda: events.append("prepare"),
+        finish_iteration=lambda: events.append("finish"),
+        diagnostics=lambda: {},
+    )
+    monkeypatch.setattr(paged_stash, "get_paged_stash_manager", lambda: stash)
+    recipe = _bare_recipe()
+    recipe.partial_cuda_graph_manager = SimpleNamespace(capture=lambda: events.append("capture"))
+    recipe._partial_cuda_graph_capture_pending = True
+    recipe._partial_cuda_graph_paged_stash_enabled = True
+
+    recipe._capture_partial_cuda_graphs_after_eager_step()
+
+    assert events == ["prepare", "capture", "finish"]
+
+
+def test_paged_stash_overflow_closes_graph_discards_gradients_and_reruns(monkeypatch):
+    events = []
+    stash = SimpleNamespace(
+        is_active=True,
+        check_overflow=lambda: torch.ones(1, dtype=torch.int64),
+        close=lambda: events.append("stash-close"),
+    )
+    monkeypatch.setattr(paged_stash, "get_paged_stash_manager", lambda: stash)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    recipe = _bare_recipe()
+    recipe.partial_cuda_graph_manager = SimpleNamespace(close=lambda: events.append("graph-close"))
+    recipe._partial_cuda_graph_capture_pending = False
+    recipe._partial_cuda_graph_paged_stash_enabled = True
+    recipe._partial_cuda_graph_paged_stash_reruns = 0
+    recipe.optimizer = [SimpleNamespace(zero_grad=lambda: events.append("zero-grad"))]
+    recipe._run_forward_backward_batches = lambda batches, num_label_tokens: (
+        events.append(("rerun", batches, num_label_tokens)) or [torch.tensor(2.0)]
+    )
+
+    result = recipe._rerun_after_paged_stash_overflow(
+        ["same-batch"],
+        num_label_tokens=7,
+        loss_buffer=[torch.tensor(1.0)],
+    )
+
+    assert events == ["graph-close", "stash-close", "zero-grad", ("rerun", ["same-batch"], 7)]
+    assert result[0].item() == 2.0
+    assert recipe._partial_cuda_graph_paged_stash_reruns == 1
+    assert recipe.partial_cuda_graph_manager is None
 
 
 def test_training_loop_captures_after_first_complete_step_and_closes():
