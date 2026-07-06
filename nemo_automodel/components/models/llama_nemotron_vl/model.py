@@ -3,441 +3,55 @@
 
 import inspect
 import math
-import re
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import transformers
 from torch.nn import CrossEntropyLoss
 from transformers import AutoConfig, AutoProcessor, PreTrainedModel
-from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
     LlamaDecoderLayer,
-    eager_attention_forward,
 )
 from transformers.models.llama.modeling_llama import (
     LlamaModel as HFLlamaModel,
 )
-from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import SiglipVisionModel
-from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, logging
+from transformers.utils import logging
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
-from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding as OptimizedLlamaRotaryEmbedding,
 )
-from nemo_automodel.components.models.llama.rope_utils import (
-    apply_rotary_pos_emb as _apply_rotary_pos_emb,
+from nemo_automodel.components.models.llama_nemotron_vl.config import (
+    LlamaBidirectionalConfig,
+    LlamaNemotronVLConfig,
 )
-from nemo_automodel.components.models.llama.rope_utils import (
-    apply_rotary_pos_emb_fused as _apply_rotary_pos_emb_fused,
+from nemo_automodel.components.models.llama_nemotron_vl.layers import (
+    FusedTESiglipEncoderLayer,
+    FusedTESiglipTransformerLayer,
+    OptimizedFusedTERMSNormMLP,
+    OptimizedFusedTERMSNormQKV,
+    OptimizedLlamaAttention,
+    OptimizedLlamaDecoderLayer,
+    OptimizedLlamaMLP,
+    disable_unused_siglip_pooling_head_grad,
+    replace_llama_mlp_with_te_fused,
+    replace_llama_qkv_with_te_fused,
+    replace_siglip_encoder_layers_with_te_fused,
 )
-from nemo_automodel.shared.import_utils import safe_import_te
-from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+from nemo_automodel.components.models.llama_nemotron_vl.state_dict_adapter import (
+    LlamaNemotronVLEncoderStateDictAdapter,
+)
 
 logger = logging.get_logger(__name__)
-
-
-def _delete_module_attr(module: nn.Module, name: str) -> None:
-    if hasattr(module, name):
-        delattr(module, name)
-
-
-def _require_transformer_engine(feature_name: str) -> None:
-    te_available, _ = safe_import_te()
-    if not te_available:
-        raise RuntimeError(
-            f"{feature_name} requires Transformer Engine, but transformer_engine could not be imported. "
-            "Disable the corresponding use_te_fused_* option or run in an environment with a working "
-            "Transformer Engine installation."
-        )
-
-
-# ============================================================================
-# Bidirectional LLaMA Configuration
-# ============================================================================
-
-
-class LlamaBidirectionalConfig(LlamaConfig):
-    """Configuration for bidirectional (non-causal) LLaMA model."""
-
-    model_type = "llama_bidirec"
-
-    def __init__(
-        self,
-        pooling="avg",
-        temperature=1.0,
-        **kwargs,
-    ):
-        self.pooling = pooling
-        self.temperature = temperature
-        super().__init__(
-            **kwargs,
-        )
-
-
-# ============================================================================
-# LlamaNemotronVL Configuration Classes
-# ============================================================================
-
-
-class LlamaNemotronVLConfig(PretrainedConfig):
-    """
-    Base configuration for vision-language models combining vision and language components.
-    This serves as the foundation for LlamaNemotronVL configurations.
-    """
-
-    model_type = "llama_nemotron_vl"
-    is_composition = True
-    # is_composition was renamed to has_no_defaults_at_init in transformers 4.52.1
-    # In PR https://github.com/huggingface/transformers/pull/36263
-    has_no_defaults_at_init = True
-    # Declare sub-configs so transformers can propagate per-backbone attn_implementation
-    # e.g. from_pretrained(attn_implementation={"vision_config": "sdpa", "llm_config": "flash_attention_2"})
-    sub_configs = {"vision_config": SiglipVisionConfig, "llm_config": LlamaBidirectionalConfig}
-
-    def __init__(
-        self,
-        vision_config=None,
-        llm_config=None,
-        use_backbone_lora=0,
-        use_llm_lora=0,
-        select_layer=-1,
-        force_image_size=None,
-        downsample_ratio=0.5,
-        template=None,
-        dynamic_image_size=False,
-        use_thumbnail=False,
-        min_dynamic_patch=1,
-        max_dynamic_patch=6,
-        mlp_checkpoint=True,
-        pre_feature_reduction=False,
-        keep_aspect_ratio=False,
-        vocab_size=-1,
-        q_max_length: Optional[int] = 512,
-        p_max_length: Optional[int] = 10240,
-        query_prefix: str = "query:",
-        passage_prefix: str = "passage:",
-        pooling: str = "last",
-        bidirectional_attention: bool = False,
-        max_input_tiles: int = 2,
-        img_context_token_id: int = 128258,  # tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
-        **kwargs,
-    ):
-        if vision_config is not None:
-            if vision_config["model_type"] == "siglip_vision_model":
-                self.vision_config = SiglipVisionConfig(**vision_config)
-            else:
-                raise ValueError("Unsupported model_type: {}".format(vision_config["model_type"]))
-
-        if llm_config is not None:
-            if llm_config["architectures"][0] in {
-                "LlamaBidirectionalModel",
-                "LlamaBidirectionalForSequenceClassification",
-            }:
-                self.llm_config = LlamaBidirectionalConfig(**llm_config)
-            else:
-                raise ValueError("Unsupported architecture: {}".format(llm_config["architectures"][0]))
-            self.vocab_size = self.llm_config.vocab_size
-        self.use_backbone_lora = use_backbone_lora
-        self.use_llm_lora = use_llm_lora
-        self.select_layer = select_layer
-        self.force_image_size = force_image_size
-        self.downsample_ratio = downsample_ratio
-        self.template = template
-        self.dynamic_image_size = dynamic_image_size
-        self.use_thumbnail = use_thumbnail
-        self.min_dynamic_patch = min_dynamic_patch
-        self.max_dynamic_patch = max_dynamic_patch
-        self.mlp_checkpoint = mlp_checkpoint
-        self.pre_feature_reduction = pre_feature_reduction
-        self.keep_aspect_ratio = keep_aspect_ratio
-
-        self.q_max_length = q_max_length
-        self.p_max_length = p_max_length
-        self.query_prefix = query_prefix
-        self.passage_prefix = passage_prefix
-        self.pooling = pooling
-        self.bidirectional_attention = bidirectional_attention
-        self.img_context_token_id = img_context_token_id
-        self.max_input_tiles = max_input_tiles
-        super().__init__(**kwargs)
-
-
-def _get_config_value(config, name: str, default=None):
-    if isinstance(config, dict):
-        return config.get(name, default)
-    return getattr(config, name, default)
-
-
-def _pop_to(state_dict: dict, source: str, target: str) -> None:
-    value = state_dict.pop(source, None)
-    if value is not None:
-        state_dict[target] = value
-
-
-def _cat_from(state_dict: dict, sources: tuple[str, ...], target: str) -> None:
-    values = [state_dict.pop(source, None) for source in sources]
-    if all(value is not None for value in values):
-        state_dict[target] = torch.cat(values, dim=0)
-        return
-    for source, value in zip(sources, values, strict=True):
-        if value is not None:
-            state_dict[source] = value
-
-
-def _filter_converted_pairs(pairs: list[tuple[str, Any]], exclude_key_regex: str | None) -> list[tuple[str, Any]]:
-    if exclude_key_regex is None:
-        return pairs
-    return [(key, value) for key, value in pairs if not re.match(exclude_key_regex, key)]
-
-
-def _get_siglip_vision_transformer(model: nn.Module) -> nn.Module | None:
-    """Return the SigLIP transformer for nested and flattened HF layouts."""
-    vision_model = getattr(model, "vision_model", None)
-    nested = getattr(vision_model, "vision_model", None)
-    if getattr(nested, "encoder", None) is not None or getattr(nested, "head", None) is not None:
-        return nested
-    if getattr(vision_model, "encoder", None) is not None or getattr(vision_model, "head", None) is not None:
-        return vision_model
-    return None
-
-
-def _get_siglip_state_prefix(model: nn.Module) -> str:
-    """Return the state-dict prefix for the active SigLIP layout."""
-    vision_model = getattr(model, "vision_model", None)
-    if getattr(getattr(vision_model, "vision_model", None), "encoder", None) is not None:
-        return "vision_model.vision_model"
-    if getattr(vision_model, "encoder", None) is not None:
-        return "vision_model"
-    return "vision_model.vision_model"
-
-
-class LlamaNemotronVLEncoderStateDictAdapter(EncoderStateDictAdapter):
-    """HF-compatible state-dict adapter for optimized LlamaNemotron VL retrieval checkpoints."""
-
-    def __init__(self, model: "LlamaNemotronVLModel"):
-        super().__init__()
-        self.llm_config = model.config.llm_config
-        self.vision_config = model.config.vision_config
-        self.use_te_fused_llama_mlp = getattr(model, "_nemo_use_te_fused_llama_mlp", False)
-        self.use_te_fused_llama_qkv = getattr(model, "_nemo_use_te_fused_llama_qkv", False)
-        self.use_te_fused_siglip_layer = getattr(model, "_nemo_use_te_fused_siglip_layer", False)
-        self.vision_state_prefix = _get_siglip_state_prefix(model)
-
-    def to_hf(self, state_dict, **kwargs):
-        hf_state_dict = {}
-        for fqn, tensor in state_dict.items():
-            for key, value in self.convert_single_tensor_to_hf(fqn, tensor, **kwargs):
-                hf_state_dict[key] = value
-        return hf_state_dict
-
-    def from_hf(self, hf_state_dict, device_mesh=None, **kwargs):
-        optimized_state_dict = dict(hf_state_dict)
-        self._hf_to_optimized(optimized_state_dict)
-        return super().from_hf(optimized_state_dict, device_mesh=device_mesh, **kwargs)
-
-    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
-        key = self._strip_model_prefix(fqn)
-        if key is None:
-            return []
-
-        converted = self._optimized_single_tensor_to_hf(key, tensor)
-        return _filter_converted_pairs(converted, kwargs.get("exclude_key_regex"))
-
-    def _llama_sizes(self) -> tuple[int, int, int, int]:
-        hidden_size = _get_config_value(self.llm_config, "hidden_size")
-        num_attention_heads = _get_config_value(self.llm_config, "num_attention_heads")
-        num_key_value_heads = _get_config_value(self.llm_config, "num_key_value_heads", num_attention_heads)
-        head_dim = _get_config_value(self.llm_config, "head_dim", hidden_size // num_attention_heads)
-        intermediate_size = _get_config_value(self.llm_config, "intermediate_size")
-        return (
-            num_attention_heads * head_dim,
-            num_key_value_heads * head_dim,
-            num_key_value_heads * head_dim,
-            intermediate_size,
-        )
-
-    def _optimized_single_tensor_to_hf(self, key: str, tensor: Any) -> list[tuple[str, Any]]:
-        q_size, k_size, v_size, intermediate_size = self._llama_sizes()
-        layer_match = re.match(
-            r"^language_model\.layers\.(\d+)\.(self_attn\.pre_attention_qkv|mlp)\.fused\.(.+)$",
-            key,
-        )
-        if layer_match:
-            layer_idx, fused_module, suffix = layer_match.groups()
-            prefix = f"language_model.layers.{layer_idx}."
-            if self.use_te_fused_llama_qkv and fused_module == "self_attn.pre_attention_qkv":
-                if suffix == "layer_norm_weight":
-                    return [(f"{prefix}input_layernorm.weight", tensor)]
-                if suffix == "weight":
-                    q, k, v = tensor.split((q_size, k_size, v_size), dim=0)
-                    return [
-                        (f"{prefix}self_attn.q_proj.weight", q),
-                        (f"{prefix}self_attn.k_proj.weight", k),
-                        (f"{prefix}self_attn.v_proj.weight", v),
-                    ]
-                if suffix == "bias":
-                    q, k, v = tensor.split((q_size, k_size, v_size), dim=0)
-                    return [
-                        (f"{prefix}self_attn.q_proj.bias", q),
-                        (f"{prefix}self_attn.k_proj.bias", k),
-                        (f"{prefix}self_attn.v_proj.bias", v),
-                    ]
-            if self.use_te_fused_llama_mlp and fused_module == "mlp":
-                if suffix == "layer_norm_weight":
-                    return [(f"{prefix}post_attention_layernorm.weight", tensor)]
-                if suffix == "fc1_weight":
-                    gate, up = tensor.split((intermediate_size, intermediate_size), dim=0)
-                    return [(f"{prefix}mlp.gate_proj.weight", gate), (f"{prefix}mlp.up_proj.weight", up)]
-                if suffix == "fc1_bias":
-                    gate, up = tensor.split((intermediate_size, intermediate_size), dim=0)
-                    return [(f"{prefix}mlp.gate_proj.bias", gate), (f"{prefix}mlp.up_proj.bias", up)]
-                if suffix == "fc2_weight":
-                    return [(f"{prefix}mlp.down_proj.weight", tensor)]
-                if suffix == "fc2_bias":
-                    return [(f"{prefix}mlp.down_proj.bias", tensor)]
-
-        vision_match = re.match(r"^(vision_model(?:\.vision_model)?)\.encoder\.layers\.(\d+)\.mlp\.fused\.(.+)$", key)
-        if self.use_te_fused_siglip_layer and vision_match:
-            vision_prefix, layer_idx, suffix = vision_match.groups()
-            prefix = f"{vision_prefix}.encoder.layers.{layer_idx}."
-            hidden_size = _get_config_value(self.vision_config, "hidden_size")
-            if suffix == "self_attention.layernorm_qkv.layer_norm_weight":
-                return [(f"{prefix}layer_norm1.weight", tensor)]
-            if suffix == "self_attention.layernorm_qkv.layer_norm_bias":
-                return [(f"{prefix}layer_norm1.bias", tensor)]
-            if suffix == "self_attention.layernorm_qkv.weight":
-                q, k, v = tensor.split((hidden_size, hidden_size, hidden_size), dim=0)
-                return [
-                    (f"{prefix}self_attn.q_proj.weight", q),
-                    (f"{prefix}self_attn.k_proj.weight", k),
-                    (f"{prefix}self_attn.v_proj.weight", v),
-                ]
-            if suffix == "self_attention.layernorm_qkv.bias":
-                q, k, v = tensor.split((hidden_size, hidden_size, hidden_size), dim=0)
-                return [
-                    (f"{prefix}self_attn.q_proj.bias", q),
-                    (f"{prefix}self_attn.k_proj.bias", k),
-                    (f"{prefix}self_attn.v_proj.bias", v),
-                ]
-            if suffix == "self_attention.proj.weight":
-                return [(f"{prefix}self_attn.out_proj.weight", tensor)]
-            if suffix == "self_attention.proj.bias":
-                return [(f"{prefix}self_attn.out_proj.bias", tensor)]
-            if suffix == "layernorm_mlp.layer_norm_weight":
-                return [(f"{prefix}layer_norm2.weight", tensor)]
-            if suffix == "layernorm_mlp.layer_norm_bias":
-                return [(f"{prefix}layer_norm2.bias", tensor)]
-            if suffix == "layernorm_mlp.fc1_weight":
-                return [(f"{prefix}mlp.fc1.weight", tensor)]
-            if suffix == "layernorm_mlp.fc1_bias":
-                return [(f"{prefix}mlp.fc1.bias", tensor)]
-            if suffix == "layernorm_mlp.fc2_weight":
-                return [(f"{prefix}mlp.fc2.weight", tensor)]
-            if suffix == "layernorm_mlp.fc2_bias":
-                return [(f"{prefix}mlp.fc2.bias", tensor)]
-
-        return [(key, tensor)]
-
-    def _hf_to_optimized(self, state_dict: dict) -> None:
-        _, _, _, intermediate_size = self._llama_sizes()
-        for layer_idx in range(_get_config_value(self.llm_config, "num_hidden_layers", 0)):
-            prefix = f"language_model.layers.{layer_idx}."
-            if self.use_te_fused_llama_qkv:
-                fused_prefix = f"{prefix}self_attn.pre_attention_qkv.fused."
-                _pop_to(state_dict, f"{prefix}input_layernorm.weight", f"{fused_prefix}layer_norm_weight")
-                _cat_from(
-                    state_dict,
-                    (
-                        f"{prefix}self_attn.q_proj.weight",
-                        f"{prefix}self_attn.k_proj.weight",
-                        f"{prefix}self_attn.v_proj.weight",
-                    ),
-                    f"{fused_prefix}weight",
-                )
-                _cat_from(
-                    state_dict,
-                    (
-                        f"{prefix}self_attn.q_proj.bias",
-                        f"{prefix}self_attn.k_proj.bias",
-                        f"{prefix}self_attn.v_proj.bias",
-                    ),
-                    f"{fused_prefix}bias",
-                )
-            if self.use_te_fused_llama_mlp:
-                fused_prefix = f"{prefix}mlp.fused."
-                _pop_to(state_dict, f"{prefix}post_attention_layernorm.weight", f"{fused_prefix}layer_norm_weight")
-                _cat_from(
-                    state_dict,
-                    (f"{prefix}mlp.gate_proj.weight", f"{prefix}mlp.up_proj.weight"),
-                    f"{fused_prefix}fc1_weight",
-                )
-                _cat_from(
-                    state_dict,
-                    (f"{prefix}mlp.gate_proj.bias", f"{prefix}mlp.up_proj.bias"),
-                    f"{fused_prefix}fc1_bias",
-                )
-                if f"{fused_prefix}fc1_weight" in state_dict:
-                    assert state_dict[f"{fused_prefix}fc1_weight"].shape[0] == 2 * intermediate_size
-                _pop_to(state_dict, f"{prefix}mlp.down_proj.weight", f"{fused_prefix}fc2_weight")
-                _pop_to(state_dict, f"{prefix}mlp.down_proj.bias", f"{fused_prefix}fc2_bias")
-
-        if self.use_te_fused_siglip_layer:
-            self._siglip_hf_to_optimized(state_dict)
-
-    def _siglip_hf_to_optimized(self, state_dict: dict) -> None:
-        for layer_idx in range(_get_config_value(self.vision_config, "num_hidden_layers", 0)):
-            prefix = f"{self.vision_state_prefix}.encoder.layers.{layer_idx}."
-            fused_prefix = f"{prefix}mlp.fused."
-            _pop_to(
-                state_dict,
-                f"{prefix}layer_norm1.weight",
-                f"{fused_prefix}self_attention.layernorm_qkv.layer_norm_weight",
-            )
-            _pop_to(
-                state_dict,
-                f"{prefix}layer_norm1.bias",
-                f"{fused_prefix}self_attention.layernorm_qkv.layer_norm_bias",
-            )
-            _cat_from(
-                state_dict,
-                (
-                    f"{prefix}self_attn.q_proj.weight",
-                    f"{prefix}self_attn.k_proj.weight",
-                    f"{prefix}self_attn.v_proj.weight",
-                ),
-                f"{fused_prefix}self_attention.layernorm_qkv.weight",
-            )
-            _cat_from(
-                state_dict,
-                (
-                    f"{prefix}self_attn.q_proj.bias",
-                    f"{prefix}self_attn.k_proj.bias",
-                    f"{prefix}self_attn.v_proj.bias",
-                ),
-                f"{fused_prefix}self_attention.layernorm_qkv.bias",
-            )
-            _pop_to(state_dict, f"{prefix}self_attn.out_proj.weight", f"{fused_prefix}self_attention.proj.weight")
-            _pop_to(state_dict, f"{prefix}self_attn.out_proj.bias", f"{fused_prefix}self_attention.proj.bias")
-            _pop_to(state_dict, f"{prefix}layer_norm2.weight", f"{fused_prefix}layernorm_mlp.layer_norm_weight")
-            _pop_to(state_dict, f"{prefix}layer_norm2.bias", f"{fused_prefix}layernorm_mlp.layer_norm_bias")
-            _pop_to(state_dict, f"{prefix}mlp.fc1.weight", f"{fused_prefix}layernorm_mlp.fc1_weight")
-            _pop_to(state_dict, f"{prefix}mlp.fc1.bias", f"{fused_prefix}layernorm_mlp.fc1_bias")
-            _pop_to(state_dict, f"{prefix}mlp.fc2.weight", f"{fused_prefix}layernorm_mlp.fc2_weight")
-            _pop_to(state_dict, f"{prefix}mlp.fc2.bias", f"{fused_prefix}layernorm_mlp.fc2_bias")
 
 
 # Check if native create_bidirectional_mask exists (transformers >= 5.0)
@@ -515,6 +129,7 @@ def split_model(model_path, device):
 
 
 def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_type: str) -> torch.Tensor:
+    """Pool token-level hidden states into sequence embeddings using the given strategy."""
     last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
 
     if pool_type == "avg":
@@ -704,248 +319,6 @@ class LlamaBidirectionalModel(HFLlamaModel):
         )
 
 
-class OptimizedLlamaAttention(nn.Module):
-    """Local LLaMA attention used only by the optimized Nemotron VL retriever path."""
-
-    def __init__(self, config: LlamaConfig, layer_idx: int, backend: BackendConfig):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
-        self.is_causal = False
-        self.rope_fusion = getattr(backend, "rope_fusion", False)
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-
-        self.q_proj = initialize_linear_module(
-            backend.linear,
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            bias=config.attention_bias,
-            dtype=dtype,
-        )
-        self.k_proj = initialize_linear_module(
-            backend.linear,
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-            dtype=dtype,
-        )
-        self.v_proj = initialize_linear_module(
-            backend.linear,
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-            dtype=dtype,
-        )
-        self.o_proj = initialize_linear_module(
-            backend.linear,
-            self.num_key_value_groups * config.num_key_value_heads * self.head_dim,
-            config.hidden_size,
-            bias=config.attention_bias,
-            dtype=dtype,
-        )
-        self.pre_attention_qkv: nn.Module | None = None
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None,
-        past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        if self.pre_attention_qkv is not None:
-            q, k, v = self.pre_attention_qkv(hidden_states)
-        else:
-            q = self.q_proj(hidden_states)
-            k = self.k_proj(hidden_states)
-            v = self.v_proj(hidden_states)
-
-        query_states = q.view(hidden_shape).transpose(1, 2)
-        key_states = k.view(hidden_shape).transpose(1, 2)
-        value_states = v.view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings[:2]
-        if self.rope_fusion and len(position_embeddings) == 3:
-            query_states, key_states = _apply_rotary_pos_emb_fused(query_states, key_states, position_embeddings[2])
-        else:
-            query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
-
-
-class OptimizedLlamaMLP(nn.Module):
-    """Local SwiGLU MLP for the optimized VL-only LLaMA backend."""
-
-    def __init__(self, config: LlamaConfig, backend: BackendConfig):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.gate_proj = initialize_linear_module(
-            backend.linear, self.hidden_size, self.intermediate_size, bias=config.mlp_bias, dtype=dtype
-        )
-        self.up_proj = initialize_linear_module(
-            backend.linear, self.hidden_size, self.intermediate_size, bias=config.mlp_bias, dtype=dtype
-        )
-        self.down_proj = initialize_linear_module(
-            backend.linear, self.intermediate_size, self.hidden_size, bias=config.mlp_bias, dtype=dtype
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-
-class OptimizedFusedTERMSNormMLP(nn.Module):
-    """Transformer Engine RMSNorm + SwiGLU replacement for the local optimized LLaMA MLP."""
-
-    def __init__(self, source_norm: nn.Module, source_mlp: OptimizedLlamaMLP, eps: float):
-        super().__init__()
-        _require_transformer_engine(type(self).__name__)
-        from transformer_engine.pytorch import LayerNormMLP
-
-        norm_weight = source_norm.weight
-        gate_proj = source_mlp.gate_proj
-        up_proj = source_mlp.up_proj
-        down_proj = source_mlp.down_proj
-        gate_bias = getattr(gate_proj, "bias", None)
-        use_bias = gate_bias is not None and gate_bias.numel() > 0
-        self.fused = LayerNormMLP(
-            hidden_size=source_mlp.hidden_size,
-            ffn_hidden_size=source_mlp.intermediate_size,
-            eps=eps,
-            normalization="RMSNorm",
-            activation="swiglu",
-            bias=use_bias,
-            params_dtype=norm_weight.dtype,
-            device=norm_weight.device,
-        )
-        with torch.no_grad():
-            self.fused.layer_norm_weight.copy_(norm_weight)
-            self.fused.fc1_weight.copy_(torch.cat([gate_proj.weight, up_proj.weight], dim=0))
-            self.fused.fc2_weight.copy_(down_proj.weight)
-            if use_bias:
-                self.fused.fc1_bias.copy_(torch.cat([gate_proj.bias, up_proj.bias], dim=0))
-                self.fused.fc2_bias.copy_(down_proj.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fused(x)
-
-
-class OptimizedFusedTERMSNormQKV(nn.Module):
-    """Transformer Engine RMSNorm + concatenated QKV projection for the local optimized LLaMA attention."""
-
-    def __init__(self, source_norm: nn.Module, source_attn: OptimizedLlamaAttention, eps: float):
-        super().__init__()
-        _require_transformer_engine(type(self).__name__)
-        from transformer_engine.pytorch import LayerNormLinear
-
-        norm_weight = source_norm.weight
-        q_proj = source_attn.q_proj
-        k_proj = source_attn.k_proj
-        v_proj = source_attn.v_proj
-        q_size = q_proj.out_features
-        k_size = k_proj.out_features
-        v_size = v_proj.out_features
-        q_bias = getattr(q_proj, "bias", None)
-        use_bias = q_bias is not None and q_bias.numel() > 0
-        self.sizes = (q_size, k_size, v_size)
-        self.fused = LayerNormLinear(
-            in_features=source_attn.config.hidden_size,
-            out_features=q_size + k_size + v_size,
-            eps=eps,
-            normalization="RMSNorm",
-            bias=use_bias,
-            params_dtype=norm_weight.dtype,
-            device=norm_weight.device,
-        )
-        with torch.no_grad():
-            self.fused.layer_norm_weight.copy_(norm_weight)
-            self.fused.weight.copy_(torch.cat([q_proj.weight, k_proj.weight, v_proj.weight], dim=0))
-            if use_bias:
-                self.fused.bias.copy_(torch.cat([q_proj.bias, k_proj.bias, v_proj.bias], dim=0))
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        qkv = self.fused(x)
-        return qkv.split(self.sizes, dim=-1)
-
-
-class OptimizedLlamaDecoderLayer(nn.Module):
-    """Local LLaMA decoder layer used only by the optimized Nemotron VL retriever path."""
-
-    def __init__(self, config: LlamaConfig, layer_idx: int, backend: BackendConfig):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.self_attn = OptimizedLlamaAttention(config=config, layer_idx=layer_idx, backend=backend)
-        self.mlp = OptimizedLlamaMLP(config=config, backend=backend)
-        self.input_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
-        )
-        self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        use_cache: bool | None = False,
-        cache_position: torch.LongTensor | None = None,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
-        residual = hidden_states
-        if getattr(self, "input_layernorm", None) is not None:
-            hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        if getattr(self, "post_attention_layernorm", None) is not None:
-            hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        return residual + hidden_states
-
-
 class OptimizedLlamaBidirectionalModel(PreTrainedModel):
     """Self-contained optimized LLaMA stack for Nemotron VL retrieval only."""
 
@@ -1130,195 +503,6 @@ def replace_language_model_with_custom_llama(
         len(extra_state_missing),
     )
     return True
-
-
-def replace_llama_mlp_with_te_fused(model: nn.Module) -> int:
-    """Fuse post-attention RMSNorm and SwiGLU in the custom LLaMA stack."""
-    _require_transformer_engine("use_te_fused_mlp")
-    language_model = getattr(model, "language_model", None)
-    layers = getattr(language_model, "layers", None)
-    if layers is None:
-        return 0
-
-    fused_count = 0
-    for layer in layers:
-        norm = getattr(layer, "post_attention_layernorm", None)
-        mlp = getattr(layer, "mlp", None)
-        if norm is None or mlp is None or isinstance(mlp, OptimizedFusedTERMSNormMLP):
-            continue
-        if not hasattr(mlp, "gate_proj") or not hasattr(mlp, "up_proj") or not hasattr(mlp, "down_proj"):
-            continue
-
-        fused = OptimizedFusedTERMSNormMLP(norm, mlp, eps=language_model.config.rms_norm_eps)
-        _delete_module_attr(layer, "post_attention_layernorm")
-        layer.mlp = fused
-        fused_count += 1
-
-    logger.info("Fused custom LLaMA post-attention RMSNorm + SwiGLU layers: %d", fused_count)
-    if fused_count:
-        model._nemo_use_te_fused_llama_mlp = True
-    return fused_count
-
-
-def replace_llama_qkv_with_te_fused(model: nn.Module) -> int:
-    """Fuse custom LLaMA input RMSNorm and Q/K/V projections with TE."""
-    _require_transformer_engine("use_te_fused_qkv")
-    language_model = getattr(model, "language_model", None)
-    layers = getattr(language_model, "layers", None)
-    if layers is None:
-        return 0
-
-    fused_count = 0
-    for layer in layers:
-        norm = getattr(layer, "input_layernorm", None)
-        attention = getattr(layer, "self_attn", None)
-        if norm is None or attention is None or getattr(attention, "pre_attention_qkv", None) is not None:
-            continue
-        if not all(hasattr(attention, name) for name in ("q_proj", "k_proj", "v_proj")):
-            continue
-
-        fused = OptimizedFusedTERMSNormQKV(norm, attention, eps=language_model.config.rms_norm_eps)
-        _delete_module_attr(layer, "input_layernorm")
-        attention.pre_attention_qkv = fused
-        attention.q_proj = None
-        attention.k_proj = None
-        attention.v_proj = None
-        fused_count += 1
-
-    logger.info("Fused custom LLaMA input RMSNorm + QKV layers: %d", fused_count)
-    if fused_count:
-        model._nemo_use_te_fused_llama_qkv = True
-    return fused_count
-
-
-class FusedTESiglipTransformerLayer(nn.Module):
-    """Transformer Engine implementation of one complete SigLIP encoder layer."""
-
-    def __init__(self, source_layer: nn.Module):
-        super().__init__()
-        _require_transformer_engine(type(self).__name__)
-        from transformer_engine.pytorch import TransformerLayer
-
-        source_attn = source_layer.self_attn
-        source_norm = source_layer.layer_norm1
-        source_mlp = source_layer.mlp
-        norm_weight = source_norm.weight
-        self.fused = TransformerLayer(
-            hidden_size=source_layer.embed_dim,
-            ffn_hidden_size=source_mlp.fc1.out_features,
-            num_attention_heads=source_attn.num_heads,
-            kv_channels=source_attn.head_dim,
-            layernorm_epsilon=source_norm.eps,
-            hidden_dropout=0.0,
-            attention_dropout=source_attn.dropout,
-            self_attn_mask_type="no_mask",
-            normalization="LayerNorm",
-            activation="gelu",
-            bias=True,
-            fuse_qkv_params=True,
-            qkv_weight_interleaved=False,
-            attn_input_format="bshd",
-            params_dtype=norm_weight.dtype,
-            device=norm_weight.device,
-        )
-
-        with torch.no_grad():
-            fused_qkv = self.fused.self_attention.layernorm_qkv
-            fused_mlp = self.fused.layernorm_mlp
-            fused_qkv.layer_norm_weight.copy_(source_norm.weight)
-            fused_qkv.layer_norm_bias.copy_(source_norm.bias)
-            fused_qkv.weight.copy_(
-                torch.cat(
-                    [source_attn.q_proj.weight, source_attn.k_proj.weight, source_attn.v_proj.weight],
-                    dim=0,
-                )
-            )
-            fused_qkv.bias.copy_(
-                torch.cat(
-                    [source_attn.q_proj.bias, source_attn.k_proj.bias, source_attn.v_proj.bias],
-                    dim=0,
-                )
-            )
-            self.fused.self_attention.proj.weight.copy_(source_attn.out_proj.weight)
-            self.fused.self_attention.proj.bias.copy_(source_attn.out_proj.bias)
-            fused_mlp.layer_norm_weight.copy_(source_layer.layer_norm2.weight)
-            fused_mlp.layer_norm_bias.copy_(source_layer.layer_norm2.bias)
-            fused_mlp.fc1_weight.copy_(source_mlp.fc1.weight)
-            fused_mlp.fc1_bias.copy_(source_mlp.fc1.bias)
-            fused_mlp.fc2_weight.copy_(source_mlp.fc2.weight)
-            fused_mlp.fc2_bias.copy_(source_mlp.fc2.bias)
-
-    def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        return self.fused(
-            hidden_states,
-            attention_mask=None,
-            self_attn_mask_type="no_mask",
-            window_size=(-1, -1),
-        )
-
-
-class FusedTESiglipEncoderLayer(nn.Module):
-    """Stock-compatible wrapper for a full TE SigLIP encoder layer."""
-
-    def __init__(self, source_layer: nn.Module):
-        super().__init__()
-        self.embed_dim = source_layer.embed_dim
-        # Keep the active fused block under a standard child name so the
-        # generic DDP/FSDP activation-checkpointing path can wrap it.
-        self.mlp = FusedTESiglipTransformerLayer(source_layer)
-
-    def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        return self.mlp(hidden_states, *args, **kwargs)
-
-
-def replace_siglip_encoder_layers_with_te_fused(model: nn.Module) -> int:
-    """Replace loaded HF SigLIP encoder layers with full TE TransformerLayer equivalents."""
-    select_layer = getattr(model, "select_layer", getattr(getattr(model, "config", None), "select_layer", -1))
-    if select_layer != -1:
-        raise ValueError(
-            "use_te_fused_siglip_layer currently requires LlamaNemotronVL select_layer=-1. "
-            "The TE SigLIP wrapper does not preserve intermediate hidden-state recording."
-        )
-    _require_transformer_engine("use_te_fused_siglip_layer")
-    vision_transformer = _get_siglip_vision_transformer(model)
-    encoder = getattr(vision_transformer, "encoder", None)
-    layers = getattr(encoder, "layers", None)
-    if layers is None:
-        return 0
-
-    replaced = 0
-    for idx, layer in enumerate(layers):
-        if not all(hasattr(layer.self_attn, name) for name in ("q_proj", "k_proj", "v_proj", "out_proj")):
-            continue
-        layers[idx] = FusedTESiglipEncoderLayer(layer)
-        replaced += 1
-
-    logger.info("Replaced SigLIP encoder layers with TE TransformerLayer: layers=%d", replaced)
-    if replaced:
-        model._nemo_use_te_fused_siglip_layer = True
-    return replaced
-
-
-def disable_unused_siglip_pooling_head_grad(model: nn.Module) -> int:
-    """Disable the unused SigLIP pooling head for retrieval feature extraction."""
-    vision_transformer = _get_siglip_vision_transformer(model)
-    pooling_head = getattr(vision_transformer, "head", None)
-    if pooling_head is None:
-        return 0
-
-    # Retrieval consumes only ``last_hidden_state``. Avoid launching the
-    # pooling head while retaining its parameters for checkpoint compatibility.
-    if hasattr(vision_transformer, "use_head"):
-        vision_transformer.use_head = False
-
-    disabled = 0
-    for param in pooling_head.parameters():
-        if param.requires_grad:
-            param.requires_grad_(False)
-            disabled += param.numel()
-
-    logger.info("Disabled unused SigLIP pooling head gradients: parameters=%d", disabled)
-    return disabled
 
 
 # ============================================================================
@@ -1672,7 +856,24 @@ def _register_with_hf_auto_classes():
 _register_with_hf_auto_classes()
 
 __all__ = [
-    "LlamaNemotronVLModel",
+    "FusedTESiglipEncoderLayer",
+    "FusedTESiglipTransformerLayer",
+    "LlamaBidirectionalConfig",
+    "LlamaBidirectionalModel",
     "LlamaNemotronVLConfig",
+    "LlamaNemotronVLEncoderStateDictAdapter",
+    "LlamaNemotronVLModel",
     "ModelClass",
+    "OptimizedFusedTERMSNormMLP",
+    "OptimizedFusedTERMSNormQKV",
+    "OptimizedLlamaAttention",
+    "OptimizedLlamaBidirectionalModel",
+    "OptimizedLlamaDecoderLayer",
+    "OptimizedLlamaMLP",
+    "disable_unused_siglip_pooling_head_grad",
+    "pool",
+    "replace_language_model_with_custom_llama",
+    "replace_llama_mlp_with_te_fused",
+    "replace_llama_qkv_with_te_fused",
+    "replace_siglip_encoder_layers_with_te_fused",
 ]

@@ -187,7 +187,7 @@ def tiny_model(monkeypatch, processor):
 
 @pytest.fixture
 def fake_transformer_engine(monkeypatch):
-    import nemo_automodel.components.models.llama_nemotron_vl.model as model_module
+    import nemo_automodel.components.models.llama_nemotron_vl.layers as layers_module
 
     class FakeLayerNormLinear(nn.Module):
         def __init__(
@@ -296,7 +296,7 @@ def fake_transformer_engine(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "transformer_engine", te_module)
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", te_pytorch)
-    monkeypatch.setattr(model_module, "safe_import_te", lambda: (True, te_module))
+    monkeypatch.setattr(layers_module, "safe_import_te", lambda: (True, te_module))
     return te_pytorch
 
 
