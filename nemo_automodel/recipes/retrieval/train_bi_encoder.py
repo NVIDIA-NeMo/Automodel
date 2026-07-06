@@ -646,7 +646,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
             num_label_tokens=None,  # Not applicable for encoder
             dp_group_size=self._get_dp_group_size(include_cp=True),
             use_torch_clip_grad_norm=isinstance(self.distributed_config, DDPConfig),
-            return_tensor=True,
         )
 
         self.checkpointer.maybe_wait_for_staging()
@@ -670,8 +669,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
         elapsed = time.perf_counter() - self.timestamp
         self.timestamp = time.perf_counter()
         mem_allocated = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
-        if isinstance(grad_norm, torch.Tensor):
-            grad_norm = grad_norm.detach().item()
 
         metrics = {
             "loss": reporting_loss.item(),
