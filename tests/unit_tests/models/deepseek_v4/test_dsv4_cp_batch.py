@@ -475,13 +475,13 @@ def test_contiguous_shard_requires_labels():
 # --------------------------------------------------------------------------- #
 # DeepseekV4ForCausalLM CP-prep hook                                           #
 # --------------------------------------------------------------------------- #
-def test_prepare_model_inputs_for_cp_returns_make_batch_fn_and_flag():
+def test_prepare_model_inputs_for_cp_returns_make_batch_fn():
     # The method only reads self.config, so a lightweight stand-in suffices.
     cfg = SimpleNamespace(compress_ratios=[0, 4, 128])
     fake_self = SimpleNamespace(config=cfg, backend=SimpleNamespace(dispatcher="hybridep"))
     prepared = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, input_ids=torch.arange(8).view(1, 8))
 
-    assert prepared["_cp_full_logits_grad_touch"] is True
+    assert set(prepared) == {"_cp_make_batch_fn"}
     fn = prepared["_cp_make_batch_fn"]
     # the partial binds the config-derived per-rank multiple (lcm(8,128) == 128)
     assert fn.keywords["pad_multiple"] == 128
@@ -503,7 +503,7 @@ def test_forward_pre_embed_only_branch_delegates_to_prepare():
         fake_self, input_ids=input_ids
     )
     out = DeepseekV4ForCausalLM.forward(fake_self, torch.arange(8).view(1, 8), _pre_embed_only=True)
-    assert out["_cp_full_logits_grad_touch"] is True
+    assert set(out) == {"_cp_make_batch_fn"}
     assert out["_cp_make_batch_fn"].keywords["pad_multiple"] == 8
     assert out["_cp_make_batch_fn"].keywords["sync_packed_length"] is False
 

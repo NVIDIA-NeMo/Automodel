@@ -340,7 +340,6 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 make_glm_dsa_packed_cp_batch_and_ctx,
                 num_chunks=int(kwargs.get("num_chunks", 1)),
             ),
-            "_cp_full_logits_grad_touch": True,
         }
 
     def _is_pipeline_parallel_stage(self) -> bool:

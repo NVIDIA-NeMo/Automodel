@@ -2324,10 +2324,8 @@ class TestRunValidationToolCallEval:
         (1, True, True),
     ],
 )
-def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch, cp_size, uses_thd, supports_thd):
-    """Non-PP step: the model-owned CP hook attaches its batch prep, and the
-    ``_cp_full_logits_grad_touch`` flag adds the zero-valued full-logits term so
-    backward still reaches every parameter."""
+def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, supports_thd):
+    """Non-PP training invokes model-owned batch preparation for CP or native THD."""
     from contextlib import nullcontext
 
     cfg = ConfigNode(
@@ -2357,18 +2355,16 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch, cp_size,
     class _CPModel(nn.Module):
         def __init__(self):
             super().__init__()
-            # Wide output + large magnitude in fp16 so a naive (low-precision)
-            # logits.sum() overflows to inf; the grad touch must promote to fp32.
-            self.lin = nn.Linear(4, 8192)
+            self.lin = nn.Linear(4, 8)
             self.prepared = False
 
         def prepare_model_inputs_for_cp(self, input_ids, **kwargs):
             self.prepared = True
             self.num_chunks = kwargs.get("num_chunks")
-            return {"_cp_full_logits_grad_touch": True}
+            return {}
 
         def forward(self, **batch):
-            logits = (self.lin(batch["input_ids"].float()) + 50.0).to(torch.float16)
+            logits = self.lin(batch["input_ids"].float())
             return SimpleNamespace(logits=logits)
 
     model = _CPModel()
@@ -2389,8 +2385,7 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch, cp_size,
     def _fake_calc_loss(loss_fn, *, logits, labels, model, hidden_states, lm_weight, num_label_tokens):
         captured["logits_is_tensor"] = isinstance(logits, torch.Tensor)
         assert lm_weight is None
-        # finite base loss (fp32) so any non-finiteness must come from the grad touch
-        return logits.float().mean()
+        return logits.mean()
 
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
@@ -2408,10 +2403,9 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch, cp_size,
     )
 
     assert model.prepared is True
+    assert model.num_chunks == 1
     assert captured["logits_is_tensor"]
     assert len(loss_buffer) == 1
-    # the fp32-promoted grad touch must not poison the loss with inf/nan
     assert torch.isfinite(loss_buffer[0]).all()
-    # the grad-touch kept the full logits in the graph, so backward populated grads
     assert model.lin.weight.grad is not None
     assert torch.isfinite(model.lin.weight.grad).all()

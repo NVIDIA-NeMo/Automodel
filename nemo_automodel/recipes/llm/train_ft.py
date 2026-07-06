@@ -1296,16 +1296,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         cu_seqlens=batch.get("cu_seqlens"),
                         lm_weight=shared_lm_weight,
                     )
-                # Model-owned CP (e.g. DSV4) can request a zero-valued full-logits
-                # term so every CP rank's backward reaches all parameters even when
-                # its local loss is fully masked (avoids FSDP2 unused-parameter hangs).
-                if is_train and batch.get("_cp_full_logits_grad_touch"):
-                    logits = getattr(out, "logits", out)
-                    if isinstance(logits, torch.Tensor):
-                        # Promote to fp32 before summing: bf16 logits over a large
-                        # vocab (e.g. DSV4's 129280) overflow to inf, and inf * 0.0
-                        # would be nan, poisoning local_loss and the backward pass.
-                        local_loss = local_loss + logits.float().sum() * 0.0
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
