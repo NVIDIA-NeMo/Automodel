@@ -27,6 +27,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
+    GroupedExpertsTE,
     _apply_bias,
     _permute_tokens_for_grouped_mm,
     _torch_mm_experts_fwd,
@@ -1035,6 +1036,42 @@ class TestNonGatedActivations:
             swiglu_config.n_routed_experts,
             swiglu_config.dim,
             swiglu_config.moe_inter_dim * 2,
+        )
+
+
+class TestGroupedExpertsTECudaGraphMetadata:
+    def _make_experts(self, config, capacity_factor=1.0):
+        experts = GroupedExpertsTE.__new__(GroupedExpertsTE)
+        torch.nn.Module.__init__(experts)
+        experts.config = config
+        experts.cuda_graph_moe_capacity_factor = capacity_factor
+        return experts
+
+    def test_capacity_is_derived_from_fixed_input_shape(self, moe_config):
+        experts = self._make_experts(moe_config, capacity_factor=1.25)
+
+        assert experts._cuda_graph_source_expert_capacity(16) == 5
+
+    def test_capacity_rejects_more_slots_than_source_tokens(self, moe_config):
+        experts = self._make_experts(moe_config, capacity_factor=5.0)
+
+        with pytest.raises(RuntimeError, match="must be in"):
+            experts._cuda_graph_source_expert_capacity(2)
+
+    def test_local_metadata_masks_padding_and_preserves_weight_gradients(self, moe_config):
+        experts = self._make_experts(moe_config)
+        token_mask = torch.tensor([True, False, True])
+        indices = torch.tensor([[0, 2], [1, 3], [2, 4]])
+        weights = torch.tensor([[0.6, 0.4], [0.7, 0.3], [0.8, 0.2]], requires_grad=True)
+
+        routing_map, routing_probs = experts._local_drop_and_pad_metadata(token_mask, weights, indices)
+
+        assert routing_map.nonzero().tolist() == [[0, 0], [0, 2], [2, 2], [2, 4]]
+        torch.testing.assert_close(routing_probs.sum(), torch.tensor(2.0))
+        routing_probs.sum().backward()
+        torch.testing.assert_close(
+            weights.grad,
+            torch.tensor([[1.0, 1.0], [0.0, 0.0], [1.0, 1.0]]),
         )
 
 
