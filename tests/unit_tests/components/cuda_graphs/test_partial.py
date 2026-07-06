@@ -265,6 +265,27 @@ def test_explicit_parameter_adapter_matches_eager_forward_and_backward():
     assert all(parameter.grad is None for parameter in graph_target.parameters())
 
 
+def test_explicit_parameter_adapter_uses_fresh_parameter_storage():
+    target = _Attention()
+    graph_input = torch.randn(2, 4, requires_grad=True)
+    captured_call = partial_graphs._CapturedCall.from_call((graph_input,), {})
+    adapter = partial_graphs._ExplicitParameterCallAdapter(target, captured_call)
+
+    target_parameters = tuple(target.parameters())
+    assert adapter.cloned_parameter_bytes == sum(
+        parameter.untyped_storage().nbytes() for parameter in target_parameters
+    )
+    assert all(capture is not target for capture, target in zip(adapter.capture_parameters, target_parameters))
+    assert all(
+        capture.data_ptr() != target.data_ptr()
+        for capture, target in zip(adapter.capture_parameters, target_parameters)
+    )
+
+    adapter(*adapter.capture_inputs).sum().backward()
+    assert all(parameter.grad is not None for parameter in adapter.capture_parameters)
+    assert all(parameter.grad is None for parameter in target_parameters)
+
+
 def test_explicit_parameter_adapter_rejects_replaced_buffer_storage():
     class _BufferedAttention(_Attention):
         def __init__(self):
@@ -356,7 +377,62 @@ def test_parameter_owner_is_resharded_when_capture_fails(monkeypatch):
     manager.close()
 
 
-def test_capture_failure_resets_staged_graphs_and_keeps_all_targets_eager(monkeypatch):
+def test_all_parameter_owners_are_resharded_before_shared_capture(monkeypatch):
+    events = []
+
+    class _CaptureOwner(nn.Module):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+            self.unsharded = False
+
+        def unshard(self, *, async_op):
+            assert async_op is False
+            self.unsharded = True
+            events.append((self.name, "unshard"))
+
+        def reshard(self):
+            self.unsharded = False
+            events.append((self.name, "reshard"))
+
+    owners = (_CaptureOwner("layer0"), _CaptureOwner("layer1"))
+    targets = (_Attention(), _Attention())
+    entries = [
+        partial_graphs._PartialGraphEntry(
+            name=f"attention.{index}",
+            target=target,
+            pool_group="attn",
+            explicit_parameters=True,
+            capture_owner=owner,
+        )
+        for index, (target, owner) in enumerate(zip(targets, owners))
+    ]
+
+    def make_graphed_callables(modules, sample_args, **kwargs):
+        del sample_args, kwargs
+        assert all(not owner.unsharded for owner in owners)
+        for module in modules:
+            module.reset = lambda: None
+        return modules
+
+    monkeypatch.setattr(partial_graphs, "_get_make_graphed_callables", lambda: make_graphed_callables)
+    manager = partial_graphs.PartialCudaGraphManager(entries)
+    manager.start_recording()
+    for target in targets:
+        target(torch.ones(2, 4))
+
+    manager.capture()
+
+    assert events == [
+        ("layer0", "unshard"),
+        ("layer0", "reshard"),
+        ("layer1", "unshard"),
+        ("layer1", "reshard"),
+    ]
+    manager.close()
+
+
+def test_later_capture_group_failure_resets_earlier_graph_and_keeps_eager_forward(monkeypatch):
     reset_adapters = []
     capture_count = 0
 
@@ -365,20 +441,19 @@ def test_capture_failure_resets_staged_graphs_and_keeps_all_targets_eager(monkey
         del sample_args, kwargs
         capture_count += 1
         if capture_count == 2:
-            raise RuntimeError("second target failed")
-        adapter = modules[0]
-        adapter.reset = lambda: reset_adapters.append(adapter)
-        return (adapter,)
+            raise RuntimeError("second scope failed")
+        for module in modules:
+            module.reset = lambda module=module: reset_adapters.append(module)
+        return modules
 
     monkeypatch.setattr(partial_graphs, "_get_make_graphed_callables", lambda: make_graphed_callables)
     targets = (nn.Identity(), nn.Identity())
     original_forwards = tuple(target.forward for target in targets)
-    manager = partial_graphs.PartialCudaGraphManager(
-        [
-            partial_graphs._PartialGraphEntry(name=f"target.{index}", target=target)
-            for index, target in enumerate(targets)
-        ]
-    )
+    entries = [
+        partial_graphs._PartialGraphEntry(name=f"scope.{index}", target=target, pool_group=f"scope{index}")
+        for index, target in enumerate(targets)
+    ]
+    manager = partial_graphs.PartialCudaGraphManager(entries)
     manager.start_recording()
     for target in targets:
         target(torch.ones(2, 3))
@@ -441,6 +516,41 @@ def test_graph_helper_fails_with_actionable_error_when_te_is_unavailable(monkeyp
         partial_graphs._get_make_graphed_callables()
 
 
+def test_malformed_te_result_resets_every_returned_graph(monkeypatch):
+    reset_adapters = []
+
+    def make_graphed_callables(modules, sample_args, **kwargs):
+        del sample_args, kwargs
+        returned = (*modules, nn.Identity())
+
+        def reset(module):
+            reset_adapters.append(module)
+            if module is returned[0]:
+                raise RuntimeError("first reset failed")
+
+        for module in returned:
+            module.reset = lambda module=module: reset(module)
+        return returned
+
+    monkeypatch.setattr(partial_graphs, "_get_make_graphed_callables", lambda: make_graphed_callables)
+    targets = (nn.Identity(), nn.Identity())
+    entries = [
+        partial_graphs._PartialGraphEntry(name=f"attention.{index}", target=target, pool_group="attn")
+        for index, target in enumerate(targets)
+    ]
+    manager = partial_graphs.PartialCudaGraphManager(entries)
+    manager.start_recording()
+    for target in targets:
+        target(torch.ones(2, 3))
+
+    with pytest.raises(RuntimeError, match="one nn.Module graph for every partial target"):
+        manager.capture()
+
+    assert len(reset_adapters) == 3
+    assert manager.stats() == {"captured": 0, "replayed": 0, "fallback": 0}
+    manager.close()
+
+
 def test_capture_replays_matching_input_and_falls_back_on_metadata_change(monkeypatch):
     captured_kwargs = _install_fake_graph(monkeypatch)
     target = nn.Identity()
@@ -461,6 +571,93 @@ def test_capture_replays_matching_input_and_falls_back_on_metadata_change(monkey
         }
     ]
     manager.close()
+
+
+def test_capture_batches_layers_into_one_te_call_per_scope(monkeypatch):
+    captured_groups = []
+
+    def make_graphed_callables(modules, sample_args, **kwargs):
+        captured_groups.append((modules, sample_args, kwargs))
+        for module in modules:
+            module.reset = lambda: None
+        return modules
+
+    monkeypatch.setattr(partial_graphs, "_get_make_graphed_callables", lambda: make_graphed_callables)
+    model = _Model(te_dpa=False, attention=True, moe=True, router=False, preprocess=False, layer_count=2)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+    assert manager is not None
+    for layer in model.model.layers.values():
+        layer.self_attn(torch.ones(2, 4))
+        layer.mlp.experts(
+            torch.ones(2, 4),
+            torch.ones(2, dtype=torch.bool),
+            torch.ones(2, 2),
+            torch.zeros(2, 2, dtype=torch.long),
+        )
+
+    manager.capture()
+
+    assert len(captured_groups) == 2
+    assert [len(modules) for modules, _sample_args, _kwargs in captured_groups] == [2, 2]
+    attention_modules, moe_modules = (modules for modules, _sample_args, _kwargs in captured_groups)
+    layers = tuple(model.model.layers.values())
+    assert tuple(module.target for module in attention_modules) == tuple(layer.self_attn for layer in layers)
+    assert tuple(module.target for module in moe_modules) == tuple(layer.mlp.experts for layer in layers)
+    assert [kwargs["enabled"] for _modules, _sample_args, kwargs in captured_groups] == [
+        (False, False),
+        (False, False),
+    ]
+    assert all(kwargs["retain_graph_in_backward"] is True for _modules, _sample_args, kwargs in captured_groups)
+    manager.close()
+
+
+def test_pooled_entry_fails_closed_instead_of_skipping_replay(monkeypatch):
+    _install_fake_graph(monkeypatch)
+    targets = (nn.Identity(), nn.Identity())
+    entries = [
+        partial_graphs._PartialGraphEntry(name=f"attention.{index}", target=target, pool_group="attn")
+        for index, target in enumerate(targets)
+    ]
+    manager = partial_graphs.PartialCudaGraphManager(entries)
+    manager.start_recording()
+    for target in targets:
+        target(torch.ones(2, 3))
+    manager.capture()
+
+    with pytest.raises(RuntimeError, match="cannot fall back independently"):
+        targets[0](torch.ones(3, 3))
+
+    assert entries[0].fallback_count == 0
+    manager.close()
+
+
+def test_cuda_memory_state_splits_normal_and_private_pools(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 700)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 1000)
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_snapshot",
+        lambda: [
+            {"segment_pool_id": (0, 0), "allocated_size": 400, "total_size": 600},
+            {"segment_pool_id": (3, 4), "allocated_size": 300, "total_size": 400},
+        ],
+    )
+
+    state = partial_graphs._cuda_memory_state()
+
+    assert state == partial_graphs._CudaMemoryState(
+        normal_allocated=400,
+        normal_reserved=600,
+        private_allocated=300,
+        private_reserved=400,
+    )
+
+
+def test_tensor_bytes_counts_shared_storage_once():
+    storage = torch.empty(16, dtype=torch.float32)
+
+    assert partial_graphs._tensor_bytes((storage[:8], storage[8:])) == storage.untyped_storage().nbytes()
 
 
 def test_capture_preserves_alias_and_non_tensor_control_contract(monkeypatch):
