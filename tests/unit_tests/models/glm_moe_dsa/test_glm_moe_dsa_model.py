@@ -21,7 +21,7 @@ import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
-# Mock fast_hadamard_transform before importing deepseek_v32 modules
+# Mock fast_hadamard_transform before importing GLM DSA modules
 try:
     import fast_hadamard_transform  # noqa: F401
 except ImportError:
@@ -140,10 +140,10 @@ class TestBlock:
         freqs_cis = torch.randn(batch, seq_len, config.qk_rope_head_dim // 2, device=device)
 
         with (
-            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block.self_attn, "forward", return_value=(torch.zeros_like(x), None)) as mock_attn,
             patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
-            out = block(x, freqs_cis=freqs_cis)
+            out, _ = block(x, freqs_cis=freqs_cis)
 
         assert out.shape == x.shape
         mock_attn.assert_called_once()
@@ -158,7 +158,7 @@ class TestBlock:
         attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.bool, device=device)
 
         with (
-            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)),
+            patch.object(block.self_attn, "forward", return_value=(torch.zeros_like(x), None)),
             patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask)
@@ -178,7 +178,7 @@ class TestBlock:
         padding_mask = torch.tensor([[0, 0, 1]], dtype=torch.bool, device=device)
 
         with (
-            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)),
+            patch.object(block.self_attn, "forward", return_value=(torch.zeros_like(x), None)),
             patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask, padding_mask=padding_mask)
@@ -277,9 +277,9 @@ class TestGlmMoeDsaModel:
         input_ids = torch.randint(0, config.vocab_size, (batch, seq_len))
 
         with patch.object(
-            Block, "forward", side_effect=lambda *_, **__: torch.randn(batch, seq_len, config.hidden_size)
+            Block, "forward", side_effect=lambda *_, **__: (torch.randn(batch, seq_len, config.hidden_size), None)
         ) as mock_block:
-            out = model(input_ids)
+            out, _topk = model(input_ids)
 
         assert out.shape == (batch, seq_len, config.hidden_size)
         assert mock_block.call_count == config.num_hidden_layers
@@ -292,7 +292,7 @@ class TestGlmMoeDsaModel:
         with patch("nemo_automodel.components.models.glm_moe_dsa.model.freqs_cis_from_position_ids") as mock_freqs:
             mock_freqs.return_value = torch.randn(batch, seq_len, config.qk_rope_head_dim // 2)
             with patch.object(
-                Block, "forward", side_effect=lambda *_, **__: torch.randn(batch, seq_len, config.hidden_size)
+                Block, "forward", side_effect=lambda *_, **__: (torch.randn(batch, seq_len, config.hidden_size), None)
             ):
                 model(input_ids)
 
@@ -308,8 +308,8 @@ class TestGlmMoeDsaModel:
         input_ids = torch.randint(0, config.vocab_size, (batch, seq_len))
         position_ids = torch.arange(seq_len).unsqueeze(0)
 
-        with patch.object(Block, "forward", return_value=torch.zeros(batch, seq_len, config.hidden_size)):
-            out = model(input_ids, position_ids=position_ids)
+        with patch.object(Block, "forward", return_value=(torch.zeros(batch, seq_len, config.hidden_size), None)):
+            out, _topk = model(input_ids, position_ids=position_ids)
 
         assert out.shape == (batch, seq_len, config.hidden_size)
 
@@ -338,7 +338,7 @@ class TestGlmMoeDsaForCausalLM:
         with patch.object(
             model.model,
             "forward",
-            return_value=torch.randn(batch, seq_len, config.hidden_size, device=device).to(torch.bfloat16),
+            return_value=(torch.randn(batch, seq_len, config.hidden_size, device=device).to(torch.bfloat16), None),
         ):
             out = model(input_ids)
 
@@ -356,7 +356,7 @@ class TestGlmMoeDsaForCausalLM:
             patch.object(
                 model.model,
                 "forward",
-                return_value=torch.randn(seq_len, config.hidden_size, device=device).to(torch.bfloat16),
+                return_value=(torch.randn(seq_len, config.hidden_size, device=device).to(torch.bfloat16), None),
             ),
         ):
             mock_squeeze.return_value = (input_ids.squeeze(0), None, None, {"qkv_format": "thd"})
@@ -461,3 +461,122 @@ class TestGlmMoeDsaClassmethods:
 
         assert hasattr(dsa_mod, "ModelClass")
         assert dsa_mod.ModelClass is GlmMoeDsaForCausalLM
+
+
+class TestIndexShare:
+    """GLM IndexShare: "shared" layers reuse the previous "full" layer's top-k selection."""
+
+    def test_absent_indexer_types_keeps_full_indexer_every_layer(self, config, backend_config):
+        # GLM-5.1 carries no `indexer_types`; every layer must own a full indexer (no sharing).
+        assert getattr(config, "indexer_types", None) in (None, ["full"] * config.num_hidden_layers)
+        for layer_idx in range(config.num_hidden_layers):
+            block = Block(layer_idx, config, _make_moe_config(config), backend_config)
+            assert block.skip_topk is False
+            assert block.self_attn.indexer is not None
+
+    def test_indexer_types_assigns_full_and_shared(self, config, backend_config):
+        config.indexer_types = ["full", "shared", "full", "shared"]
+        expected_skip = [False, True, False, True]
+        for layer_idx, skip in enumerate(expected_skip):
+            block = Block(layer_idx, config, _make_moe_config(config), backend_config)
+            assert block.skip_topk is skip
+            assert (block.self_attn.indexer is None) is skip
+
+    def test_shared_mla_requires_prev_topk(self, config, backend_config, device):
+        from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA
+
+        mla = GlmMoeDsaMLA(config, backend_config, skip_topk=True).to(device)
+        assert mla.indexer is None
+
+        x = torch.randn(1, 3, config.hidden_size, device=device).to(torch.bfloat16)
+        freqs_cis = torch.randn(1, 3, config.qk_rope_head_dim // 2, device=device)
+        with pytest.raises(ValueError, match="Shared DSA layers"):
+            mla(x, freqs_cis=freqs_cis, return_topk_indices=True)
+
+    def test_model_threads_topk_indices_across_layers(self, config, backend_config):
+        config.indexer_types = ["full", "shared", "full", "shared"]
+        model = GlmMoeDsaModel(config, backend=backend_config)
+        batch, seq_len = 1, 4
+        input_ids = torch.randint(0, config.vocab_size, (batch, seq_len))
+
+        seen_prev = []
+
+        def fake_forward(self, x, *, freqs_cis, attention_mask=None, padding_mask=None, prev_topk_indices=None, **kw):
+            seen_prev.append(prev_topk_indices)
+            # Return a per-layer sentinel selection so the threading is observable.
+            return x, f"topk-{self.layer_idx}"
+
+        with patch.object(Block, "forward", new=fake_forward):
+            model(input_ids)
+
+        # Layer 0 starts from None; each later layer receives the previous layer's returned selection.
+        assert seen_prev == [None, "topk-0", "topk-1", "topk-2"]
+
+    def test_model_forward_seeds_and_returns_topk(self, config, backend_config):
+        # GlmMoeDsaModel.forward must seed the loop from prev_topk_indices (PP carry-in) and
+        # return the running selection (PP carry-out).
+        config.indexer_types = ["shared", "shared", "shared", "shared"]
+        model = GlmMoeDsaModel(config, backend=backend_config)
+        seen_prev = []
+
+        def fake_forward(self, x, *, freqs_cis, attention_mask=None, padding_mask=None, prev_topk_indices=None, **kw):
+            seen_prev.append(prev_topk_indices)
+            return x, prev_topk_indices  # pass the carried selection straight through
+
+        input_ids = torch.randint(0, config.vocab_size, (1, 4))
+        with patch.object(Block, "forward", new=fake_forward):
+            hidden, out_topk = model(input_ids, prev_topk_indices="carry-in")
+
+        assert seen_prev[0] == "carry-in"  # first (shared) layer received the carried selection
+        assert out_topk == "carry-in"  # and it is returned for the next stage
+
+    def test_get_pipeline_stage_metas_threads_topk(self, config, backend_config):
+        model = GlmMoeDsaForCausalLM(config, backend=backend_config)
+        mbs, seq_len = 2, 16
+        topk = min(config.index_topk, seq_len)
+
+        # First stage: input_ids in; (hidden, topk) out (non-last, since the full model here owns
+        # both embed and lm_head, lm_head-present means last — so emulate first+non-last by dropping lm_head).
+        first_in, first_out = model.get_pipeline_stage_metas(
+            is_first=True, microbatch_size=mbs, seq_len=seq_len, dtype=torch.bfloat16
+        )
+        assert len(first_in) == 1 and first_in[0].shape == (mbs, seq_len)  # input_ids
+        # last-stage outputs (this full model owns lm_head): logits only
+        assert len(first_out) == 1 and first_out[0].shape == (mbs, seq_len, config.vocab_size)
+
+        # Emulate a middle stage: no embed_tokens, no lm_head -> hidden+topk in and out.
+        model.lm_head = None
+        mid_in, mid_out = model.get_pipeline_stage_metas(
+            is_first=False, microbatch_size=mbs, seq_len=seq_len, dtype=torch.bfloat16
+        )
+        # Top-k carry crosses the pipeline boundary as float32 (recv buffers must be grad-capable);
+        # forward() casts it back to int64 on receipt.
+        assert len(mid_in) == 2
+        assert mid_in[0].shape == (mbs, seq_len, config.hidden_size)
+        assert mid_in[1].shape == (mbs, seq_len, topk) and mid_in[1].dtype == torch.float32
+        assert len(mid_out) == 2
+        assert mid_out[0].shape == (mbs, seq_len, config.hidden_size)
+        assert mid_out[1].shape == (mbs, seq_len, topk) and mid_out[1].dtype == torch.float32
+
+    def test_pp_stage_topk_carry_dtype_roundtrip(self, config, backend_config):
+        # A non-first/non-last PP stage receives a float32 carry, casts it to int64 before the
+        # inner model, and emits the running selection back as float32.
+        model = GlmMoeDsaForCausalLM(config, backend=backend_config)
+        model.model.embed_tokens = None  # not first stage
+        model.lm_head = None  # not last stage
+
+        captured = {}
+
+        def fake_model_forward(input_ids, *, prev_topk_indices=None, **kw):
+            captured["prev_dtype"] = None if prev_topk_indices is None else prev_topk_indices.dtype
+            hidden = torch.zeros(1, 4, config.hidden_size)
+            topk = torch.zeros(1, 4, 8, dtype=torch.int64)
+            return hidden, topk
+
+        with patch.object(model.model, "forward", new=fake_model_forward):
+            carry_in = torch.zeros(1, 4, 8, dtype=torch.float32)
+            out = model(torch.zeros(1, 4, config.hidden_size), carry_in)
+
+        assert captured["prev_dtype"] == torch.int64  # carry-in cast float32 -> int64 before model
+        assert isinstance(out, tuple) and len(out) == 2
+        assert out[1].dtype == torch.float32  # carry-out emitted as float32

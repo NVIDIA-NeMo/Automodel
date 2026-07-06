@@ -20,14 +20,16 @@ from tools.lint_example_yamls import lint_yaml_text
 
 def test_linter_accepts_valid_example_recipe():
     errors = lint_yaml_text(
-        "\n".join([
-            "recipe: TrainFinetuneRecipeForNextTokenPrediction",
-            "model:",
-            "  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained",
-            "ci:",
-            "  recipe_owner: test",
-            "",
-        ]),
+        "\n".join(
+            [
+                "recipe: TrainFinetuneRecipeForNextTokenPrediction",
+                "model:",
+                "  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained",
+                "ci:",
+                "  recipe_owner: test",
+                "",
+            ]
+        ),
         Path("examples/llm_finetune/valid.yaml"),
         Path.cwd(),
     )
@@ -60,6 +62,49 @@ def test_linter_requires_ci_last():
     )
 
     assert any("`ci` section must be the last" in error.message for error in errors)
+
+
+def test_linter_rejects_wandb_without_enable_false():
+    errors = lint_yaml_text(
+        "\n".join(
+            [
+                "recipe: TrainFinetuneRecipeForNextTokenPrediction",
+                "model:",
+                "  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained",
+                "wandb:",
+                "  project: my-project",
+                "ci:",
+                "  recipe_owner: test",
+                "",
+            ]
+        ),
+        Path("examples/llm_finetune/with_wandb.yaml"),
+        Path.cwd(),
+    )
+
+    assert any("must set `enable: false`" in error.message for error in errors)
+
+
+def test_linter_accepts_wandb_with_enable_false():
+    errors = lint_yaml_text(
+        "\n".join(
+            [
+                "recipe: TrainFinetuneRecipeForNextTokenPrediction",
+                "model:",
+                "  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained",
+                "wandb:",
+                "  enable: false",
+                "  project: my-project",
+                "ci:",
+                "  recipe_owner: test",
+                "",
+            ]
+        ),
+        Path("examples/llm_finetune/with_wandb.yaml"),
+        Path.cwd(),
+    )
+
+    assert not any("wandb" in error.message for error in errors)
 
 
 def test_linter_rejects_duplicate_top_level_keys():

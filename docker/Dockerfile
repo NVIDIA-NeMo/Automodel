@@ -38,15 +38,15 @@ ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Address CVE-2025-68973; install ffmpeg dev libs for torchcodec source build
+# Address CVE-2025-68973
 RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
-    apt-get install -y --no-install-recommends ffmpeg libavdevice-dev pkg-config && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv
-ENV UV_VERSION="0.10.11"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+# Install uv; drop the base image's own /usr/local/bin copy (vulnerable rustls-webpki)
+ENV UV_VERSION="0.11.24"
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
+    rm -f /usr/local/bin/uv /usr/local/bin/uvx
 ENV PATH="/root/.local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_CACHE_DIR=/opt/uv_cache
@@ -75,29 +75,40 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install HybridEP
-## Dependency: RDMA Core
-RUN git clone https://github.com/linux-rdma/rdma-core.git && \
-    cd rdma-core && git checkout tags/v60.0 && sh build.sh
-ENV RDMA_CORE_HOME=/opt/rdma-core/build
-## Use stub of libnvidia-ml-dev during build only
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends libnvidia-ml-dev
+# Install HybridEP / DeepEP. Build with apt rdma-core v60 (so build==runtime libibverbs)
+# and RDMA_CORE_HOME symlinked to the system install; create the libnvshmem_host.so->.so.3
+# symlink required for DeepEP fabric handle ops; use the nvshmem wheel 3.6.5 and pin
+# DEEPEP_COMMIT to 42144303 (== 17cfb817 + DeepEP #638), which pads the HybridEP
+# max_num_of_tokens_per_rank up to the combine-kernel chunk size so a per-rank token
+# count that is not a multiple of 64 (e.g. 672) no longer fails the combine-kernel
+# static_assert (MAX_NUM_OF_TOKENS_PER_RANK % NUM_OF_TOKENS_PER_CHUNK == 0).
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG DEEPEP_COMMIT=7febc6e25660af0f54d95dd781ecdcd62265ecca
-RUN git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+ARG DEEPEP_COMMIT=42144303752422ade37f24bca9e2dde12df70e09
 ENV HYBRID_EP_MULTINODE=1
-RUN cd DeepEP && \
+ENV RDMA_CORE_HOME=/opt/rdma-core/build
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
+RUN apt-get update && apt-get install -y --allow-change-held-packages \
+        rdma-core libibverbs-dev && \
+    apt-get clean && \
+    ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH) && \
+    test -f /usr/lib/${ARCH_LIB}/libmlx5.so || \
+        ln -sf /usr/lib/${ARCH_LIB}/libmlx5.so.1 /usr/lib/${ARCH_LIB}/libmlx5.so && \
+    mkdir -p ${RDMA_CORE_HOME} && \
+    ln -sfn /usr/include ${RDMA_CORE_HOME}/include && \
+    ln -sfn /usr/lib/${ARCH_LIB} ${RDMA_CORE_HOME}/lib && \
+    git clone https://github.com/deepseek-ai/DeepEP.git && \
+    cd DeepEP && \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
-    pip install --no-cache-dir nvidia-nvshmem-cu13==3.4.5 && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 pip install --no-build-isolation . && \
-    apt-get purge -y libnvidia-ml-dev && \
-    apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/* && \
-    rm -rf /opt/deepep.patch && \
-    cd / && rm -rf DeepEP rdma-core
+    pip install --no-cache-dir nvidia-nvshmem-cu13==3.6.5 && \
+    NVSHMEM_LIB_PATH=$(pip show nvidia-nvshmem-cu13 | grep "Location:" | cut -d' ' -f2)/nvidia/nvshmem/lib && \
+    ln -sf ${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3 ${NVSHMEM_LIB_PATH}/libnvshmem_host.so && \
+    apt-get update && apt-get install -y --no-install-recommends libnvidia-ml-dev && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
+    apt-get purge -y libnvidia-ml-dev && apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* /opt/deepep.patch && \
+    cd / && rm -rf DeepEP
 
 # Install Bitsandbytes
 ARG INSTALL_BITSANDBYTES=True
@@ -127,14 +138,20 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
 # Address base image CVE
 RUN pip install "aiohttp>=3.13.3" \
         "black>=26.3.1" \
+        "GitPython>=3.1.50" \
         "jaraco-context>=6.1.0" \
+        "jupyter-server>=2.18.0" \
+        "jupyterlab>=4.5.7" \
+        "mistune>=3.2.1" \
         "nbconvert>=7.17.0" \
+        "notebook>=7.5.6" \
         "onnx>=1.21.0" \
         "pillow>=12.2.0" \
         "protobuf>=6.33.5" \
         "setuptools>=80.10.2" \
         "tornado>=6.5.5" \
-        "urllib3>=2.6.0" && \
+        "urllib3>=2.7.0" && \
+    pip uninstall -y nvidia-dali-cuda130 wandb && \
     rm -rf /opt/pytorch/pytorch/third_party/onnx
 
 FROM automodel_dep as automodel_final
@@ -155,11 +172,6 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
     fi && \
     uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS --no-cache
 
-# Rebuild torchcodec from source to match the container's PyTorch ABI
-RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
-    pip install --no-build-isolation --force-reinstall --no-deps \
-        git+https://github.com/pytorch/torchcodec.git@v0.8.0
-
 # MXFP8 MoE training (experts="torch_mm_mxfp8"): the NGC PyTorch base does not bundle
 # torchao and uv-pytorch.toml gates it off (sys_platform=='never'), so `uv sync` skips
 # it. Install explicitly AFTER the sync so it is not pruned.
@@ -171,7 +183,7 @@ RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
 # omit the kernels and MXFP8 would fall back to bf16 at runtime. setup.py has no
 # x86-only gate and cross-compiles the sm_100a kernels from the CUDA toolkit version
 # (build_for_sm100a = CUDA>=12.8; base is CUDA 13.x), so source builds on both arches.
-# --no-build-isolation reuses the container's torch ABI (same as the torchcodec rebuild).
+# --no-build-isolation reuses the container's torch ABI.
 # Pin v0.17.0 (NOT v0.14.1): v0.14.1's forward quantizes via EAGER unfused to_mx (no CUDA
 # kernel, ~49ms/iter) — a ~2.5x regression vs bf16. v0.17.0's forward is fully kernelized
 # (triton_to_mxfp8_dim0 for both activation and weight + device-side scale swizzle); it is

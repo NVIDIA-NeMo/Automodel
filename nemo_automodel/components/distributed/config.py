@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
 # Type aliases for API signatures.
-ActivationCheckpointingMode = Union[bool, Literal["selective"]]
+ActivationCheckpointingMode = Union[bool, Literal["full", "selective"]]
 DistributedStrategyConfig = Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]
 # Backwards-compatible alias for external / type-checking references.
 DistributedConfig = DistributedStrategyConfig
@@ -73,6 +73,7 @@ class DistributedSetup:
         moe_parallel_config: "MoEParallelizerConfig | dict | None" = None,
         activation_checkpointing: ActivationCheckpointingMode = False,
         world_size: int | None = None,
+        timeout_minutes: int | None = None,
     ) -> "DistributedSetup":
         """Create a resolved distributed setup from sizes and policy configs.
 
@@ -110,6 +111,7 @@ class DistributedSetup:
             strategy_config,
             parallelism_sizes=parallelism_sizes,
             world_size=world_size,
+            timeout_minutes=timeout_minutes,
         )
 
         return cls(
@@ -125,7 +127,11 @@ class DistributedSetup:
 class MoEParallelizerConfig:
     """Configuration for MoE model parallelization (EP + FSDP settings)."""
 
-    ignore_router_for_ac: bool = False
+    # Default True: under activation checkpointing the MoE router output must be saved
+    # rather than recomputed. Recomputing the router can route a different number of tokens
+    # per expert than the forward pass, which makes torch.utils.checkpoint raise a
+    # CheckpointError on the backward recompute.
+    ignore_router_for_ac: bool = True
     reshard_after_forward: bool = False
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
     wrap_outer_model: bool = True
@@ -172,14 +178,17 @@ class FSDP2Config:
             ``output_dtype=float32`` in mp_policy to keep the residual stream in fp32
             while running matmuls in lower precision.  Set to ``None`` to disable.
             Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
-        activation_checkpointing (bool | "selective"): Enable activation checkpointing. ``True`` keeps the existing
-            full activation checkpointing behavior. ``"selective"`` wraps transformer blocks with PyTorch selective
-            activation checkpointing.
+        activation_checkpointing (bool | "full" | "selective"): Enable activation checkpointing. ``True`` or
+            ``"full"`` keeps the existing full activation checkpointing behavior. ``"selective"`` wraps transformer
+            blocks with PyTorch selective activation checkpointing.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
         reshard_after_forward (Optional[bool]): Override layer-level FSDP2 resharding.
-            If ``None`` (default), AutoModel reshards all but the last layer outside
-            pipeline parallelism. Set ``False`` for a ZeRO-2-like benchmark where
-            gathered parameters stay resident after forward.
+            ``None`` preserves AutoModel's heuristic: pipeline-parallel layers do
+            not reshard after forward, while non-pipeline layers reshard all but
+            the last layer. Set ``False`` for a ZeRO-2-like benchmark where
+            gathered parameters stay resident after forward. Set ``True`` to force
+            resharding everywhere, including pipeline-parallel layers, which may
+            reduce throughput by adding per-microbatch all-gathers.
         enable_async_tensor_parallel (bool): Enable async tensor parallelism via
             ``torch._inductor.config._micro_pipeline_tp``.  Overlaps ReduceScatter with
             compute in row-parallel layers.  Requires ``sequence_parallel=True`` (forced
@@ -298,10 +307,12 @@ class DDPConfig:
     Only dp_size is relevant (inferred from world_size).
 
     Attributes:
-        activation_checkpointing (bool): Enable activation checkpointing if True.
+        activation_checkpointing (bool | "full" | "selective"): Enable activation checkpointing. ``True`` or
+            ``"full"`` keeps the existing full activation checkpointing behavior. ``"selective"`` wraps transformer
+            blocks with PyTorch selective activation checkpointing.
+        broadcast_buffers (bool): Synchronize module buffers before each forward.
         find_unused_parameters (bool): Forwarded to PyTorch DDP for models with
             conditionally unused trainable parameters.
-        broadcast_buffers (bool): Synchronize module buffers before each forward.
         static_graph (bool): Tell DDP the used/unused parameter set is stable.
         bucket_cap_mb (Optional[float]): DDP gradient bucket size in MiB. ``None`` uses PyTorch's default.
         gradient_as_bucket_view (bool): Make gradients views into DDP buckets after the first iteration.
@@ -310,7 +321,7 @@ class DDPConfig:
             Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
     """
 
-    activation_checkpointing: bool = False
+    activation_checkpointing: ActivationCheckpointingMode = False
     broadcast_buffers: bool = False
     find_unused_parameters: bool = False
     static_graph: bool = False

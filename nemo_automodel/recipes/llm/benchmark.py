@@ -72,9 +72,24 @@ def _infer_vocab_size(model_cfg):
         model_config = config_cls.from_pretrained(config_section.pretrained_model_name_or_path)
 
     if model_config is None:
-        model_config = AutoConfig.from_pretrained(
-            config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
-        )
+        try:
+            model_config = AutoConfig.from_pretrained(
+                config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+            )
+        except Exception as exc:
+            # Step-3.5 publishes MTP layer metadata in ``layer_types`` in addition
+            # to its transformer-layer count.  Newer Transformers validates those
+            # lengths while loading a config even though benchmark setup only needs
+            # ``vocab_size``.  Reuse the tokenizer compatibility patch, then retry.
+            message = str(exc)
+            if "num_hidden_layers" not in message or "layer_types" not in message:
+                raise
+            from nemo_automodel._transformers.v4_patches.layer_types import relax_layer_types_validator
+
+            relax_layer_types_validator()
+            model_config = AutoConfig.from_pretrained(
+                config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+            )
 
     if hasattr(model_config, "vocab_size"):
         return model_config.vocab_size
@@ -240,14 +255,24 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if mtp_cfg is None or not getattr(mtp_cfg, "enabled", False) or layers is None:
                 continue
             block_types = [getattr(s, "block_type", "moe") for s in layers]
-            flops = _nemotronh_mtp_flops(
-                mp.config,
-                global_batch_size,
-                seq_len,
-                mtp_cfg.num_layers,
-                block_types,
-                mtp_cfg.use_repeated_layer,
-            )
+            try:
+                flops = _nemotronh_mtp_flops(
+                    mp.config,
+                    global_batch_size,
+                    seq_len,
+                    mtp_cfg.num_layers,
+                    block_types,
+                    mtp_cfg.use_repeated_layer,
+                )
+            except AttributeError as exc:
+                if self.dist_env.is_main:
+                    logger.warning(
+                        "Skipping MTP head FLOPs for %s because the Nemotron-H FLOPs formula "
+                        "does not support this config: %s",
+                        type(mp.config).__name__,
+                        exc,
+                    )
+                continue
             if self.dist_env.is_main:
                 logger.info(
                     f"MTP head FLOPs: N={mtp_cfg.num_layers} repeated={mtp_cfg.use_repeated_layer} "

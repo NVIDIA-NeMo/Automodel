@@ -1,6 +1,7 @@
 seed: 42
 
 wandb:
+  enable: false
   project: qwen-image-lora-finetuning
   mode: online
   name: qwen_image_lora_run_1

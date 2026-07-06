@@ -60,6 +60,7 @@ except ModuleNotFoundError:
     Qwen3_5MoeVisionRotaryEmbedding = _make_missing("Qwen3_5MoeVisionRotaryEmbedding")
     HFQwen3_5MoeModel = _make_missing("Qwen3_5MoeModel")
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule, roll_tensor
@@ -753,6 +754,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
                     sub_cfg.torch_dtype = top_dtype
 
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         # Initialize HF parent (creates self.model, self.lm_head, vision encoder, etc.)
         super().__init__(config)
 
@@ -800,9 +802,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Keep the SSM-gating params (A_log/dt_bias) — isolated in each
         # linear_attn ``_fp32_params`` holder at construction — in fp32 storage
-        # even when the model's bulk dtype is bf16, matching the intrinsically-fp32
-        # dtype Qwen3.5 checkpoints store them in. cast_model_to_dtype() (called
-        # from initialize_weights) honors this list.
+        # even when the model's bulk dtype is bf16. cast_model_to_dtype() (called
+        # from initialize_weights) honors this AutoModel training-storage contract.
         keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
         if "_fp32_params" not in keep_fp32:
             keep_fp32.append("_fp32_params")
@@ -819,6 +820,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 self.model.language_model.moe_config,
                 self.backend,
                 dtype=dtype,
+                pretrained_model_name_or_path=getattr(config, "_name_or_path", None)
+                or getattr(config, "name_or_path", None),
             )
 
         # Wrap vision rotary embedding with fp32-safe version

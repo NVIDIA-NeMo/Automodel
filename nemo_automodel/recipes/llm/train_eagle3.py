@@ -117,6 +117,28 @@ def _validate_cp_gates(cp_size: int, backend: str, packed_sequence_size: int) ->
         )
 
 
+def _validate_tp_gates(tp_size: int, backend: str, cp_size: int) -> None:
+    """Reject tensor-parallel combinations the EAGLE-3 target path cannot honor.
+
+    TP shards only the colocated target (the FSDP2 parallelize plan column/row
+    shards its linears and makes the lm_head logits a vocab-sharded ``DTensor``,
+    which the target wrapper gathers). It is therefore meaningless with the remote
+    backend (the target runs out-of-process), and combined TP+CP is not yet wired:
+    the CP gather path does not handle a TP-sharded (DTensor) sequence.
+    """
+    if tp_size > 1 and backend != "colocated":
+        raise NotImplementedError(
+            "Tensor parallelism (tp_size>1) is only supported with the colocated target backend; "
+            f"the {backend!r} backend runs the target out-of-process."
+        )
+    if tp_size > 1 and cp_size > 1:
+        raise NotImplementedError(
+            "Tensor parallelism (tp_size>1) combined with context parallelism (cp_size>1) is not "
+            "yet supported; the CP sequence gather does not handle a TP-sharded target output. "
+            "Set tp_size=1 or cp_size=1."
+        )
+
+
 def _best_effort(label: str, fn) -> None:
     """Run a teardown step, logging (never raising) on failure so one failed step
     does not abort the rest of cleanup."""
@@ -238,6 +260,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # T x T causal block (Eagle3LlamaAttention merges FA's softmax_lse
         # with the diagonal-extension columns in log space).
         draft_config["attn_implementation"] = recipe_cfg.get("draft_attn_implementation", "eager")
+        # EAGLE-3.1 drafter-side toggles. ``fc_norm`` adds one RMSNorm per aux
+        # hidden-state chunk before ``model.fc``; ``norm_output`` routes the
+        # post-``norm`` hidden state into ``compute_logits``. The draft reads
+        # both from its config (default False), so they must be copied from
+        # ``recipe_args`` into the draft config -- and thereby serialized into
+        # the draft ``config.json`` -- for the flags to take effect at train
+        # and serve time alike.
+        draft_config["fc_norm"] = bool(recipe_cfg.get("fc_norm", False))
+        draft_config["norm_output"] = bool(recipe_cfg.get("norm_output", False))
         # P-EAGLE (parallel drafting). When enabled, the draft registers a
         # learnable ``mask_hidden`` placeholder and the trainer predicts all
         # ``num_depths`` draft tokens in a single COD-subsampled parallel forward
@@ -404,30 +435,46 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         """
         # ``target_model_backend`` selects where the frozen target runs:
         #   - ``colocated`` (default): load the target on this GPU and capture
-        #     supervision in-process.
+        #     supervision in-process via the HuggingFace forward.
+        #   - ``sglang``: like ``colocated`` but the in-process forward runs
+        #     through SGLang's ModelRunner, which is substantially faster than
+        #     the HF eager forward for mainstream architectures.
+        #   - ``vllm``: like ``sglang`` but the in-process forward runs through
+        #     vLLM (via its native ``extract_hidden_states`` path); supervision is
+        #     numerically equivalent to the co-located HF backend.
         #   - ``remote``: the target runs as a standalone server (see
         #     ``serve_target``); this process only holds the draft and pulls
         #     precomputed supervision over HTTP + NCCL. No target weights are
         #     loaded here, which frees the training GPU's memory.
         backend = recipe_cfg.get("target_model_backend", "colocated")
-        # Sequence packing is colocated-only (the remote server does not yet honor
-        # per-document masking).
+        if backend not in ("colocated", "sglang", "vllm", "remote"):
+            raise ValueError(
+                f"Unknown target_model_backend={backend!r}; expected 'colocated', 'sglang', 'vllm', or 'remote'."
+            )
+        # Sequence packing is colocated-only: neither the remote server nor the
+        # SGLang runner honors per-document masking (SGLang treats each row as one
+        # full causal sequence), so a packed row would leak supervision across
+        # document boundaries.
         packed_sequence_size = recipe_cfg.get("packed_sequence_size", 0)
-        if packed_sequence_size > 0 and backend == "remote":
+        if packed_sequence_size > 0 and backend != "colocated":
             raise NotImplementedError(
                 "packed_sequence_size > 0 is only supported with the colocated target backend; "
-                "the remote backend does not yet propagate per-document masking."
+                f"the {backend!r} backend does not propagate per-document masking."
             )
-        # Context parallelism gates (read from config: the cp submesh is only
-        # built later, inside the colocated path).
+        # Context- and tensor-parallel gates (read from config: the cp/tp
+        # submeshes are only built later, inside the colocated path).
         cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
+        tp_size = int(self.cfg.get("distributed.tp_size", 1) or 1)
         _validate_cp_gates(cp_size, backend, packed_sequence_size)
+        _validate_tp_gates(tp_size, backend, cp_size)
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
-        elif backend == "colocated":
+        elif backend == "sglang":
+            self._setup_sglang_target(recipe_cfg, target_path)
+        elif backend == "vllm":
+            self._setup_vllm_target(recipe_cfg, target_path)
+        else:  # colocated
             self._setup_colocated_target(recipe_cfg, target_path)
-        else:
-            raise ValueError(f"Unknown target_model_backend={backend!r}; expected 'colocated' or 'remote'.")
 
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
@@ -508,6 +555,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             # Capture the cp/dp submeshes: the target forward runs CP on "cp",
             # while the draft DDP group, dataloader sampler, and checkpointer key
             # on "dp" (cp ranks within a dp group share data and draft weights).
+            # Tensor parallelism (distributed.tp_size>1) needs no submesh here: the
+            # target's linears are sharded in place by ``from_pretrained`` below
+            # (its FSDP2 parallelize plan), the wrapper gathers the resulting
+            # vocab-sharded logits, and the flattened "dp" axis already excludes
+            # the "tp" axis so the draft and sampler replicate across TP ranks.
             self.cp_mesh = _submesh_or_none(self.device_mesh, "cp")
             self.dp_mesh = _submesh_or_none(self.device_mesh, "dp")
             target_kwargs.update(
@@ -527,6 +579,82 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
             cp_mesh=self.cp_mesh,
+        )
+
+    def _setup_sglang_target(self, recipe_cfg, target_path):
+        """Co-located SGLang target: serve the frozen target through SGLang on this GPU.
+
+        Same supervision contract as ``colocated`` (full-vocab logits shipped to
+        the trainer, draft-vocab projection trainer-side), but the target forward
+        runs through SGLang's ModelRunner. SGLang carves its weight + KV pool out
+        of this GPU up front (``mem_fraction_static``), and the draft trains in
+        the remainder.
+        """
+        if self.device.type != "cuda":
+            raise ValueError("target_model_backend='sglang' requires CUDA; use 'colocated' for CPU runs.")
+        if self.dist_env.world_size > 1:
+            # SGLang's global parallel state requires world_size == tp_size * pp_size,
+            # so per-rank tp=1 runners cannot share a multi-rank training process
+            # group. Multi-GPU runs split target and draft onto separate processes
+            # instead: ``serve_target --engine sglang`` + ``target_model_backend='remote'``.
+            raise ValueError(
+                "target_model_backend='sglang' supports single-process training only; "
+                "for multi-GPU runs serve the target separately (serve_target --engine sglang) "
+                "and set target_model_backend='remote'."
+            )
+        from nemo_automodel.components.speculative.eagle.sglang_target import SGLangEagle3TargetModel
+
+        sglang_args = recipe_cfg.get("sglang_args", None) or {}
+        sglang_kwargs = sglang_args.to_dict() if hasattr(sglang_args, "to_dict") else dict(sglang_args)
+        # SGLang's ServerArgs default (~0.88 of GPU memory) would starve the
+        # draft's optimizer states and activations; default to half the GPU and
+        # let ``recipe_args.sglang_args.mem_fraction_static`` override.
+        sglang_kwargs.setdefault("mem_fraction_static", 0.5)
+        self.target_model = None
+        self.target_wrapper = SGLangEagle3TargetModel.from_pretrained(
+            target_path,
+            aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
+            dtype=self.compute_dtype,
+            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
+            **sglang_kwargs,
+        )
+
+    def _setup_vllm_target(self, recipe_cfg, target_path):
+        """Co-located vLLM target: serve the frozen target through vLLM on this GPU.
+
+        Same supervision contract as ``colocated`` (full-vocab logits shipped to
+        the trainer, draft-vocab projection trainer-side), but the target forward
+        runs through vLLM's ``extract_hidden_states`` path. vLLM carves its weight
+        + KV pool out of this GPU up front (``gpu_memory_utilization``), and the
+        draft trains in the remainder.
+        """
+        if self.device.type != "cuda":
+            raise ValueError("target_model_backend='vllm' requires CUDA; use 'colocated' for CPU runs.")
+        if self.dist_env.world_size > 1:
+            # vLLM owns its own engine process group, so per-rank tp=1 engines
+            # cannot share a multi-rank training process group. Multi-GPU runs
+            # split target and draft onto separate processes instead:
+            # ``serve_target --engine vllm`` + ``target_model_backend='remote'``.
+            raise ValueError(
+                "target_model_backend='vllm' supports single-process training only; "
+                "for multi-GPU runs serve the target separately (serve_target --engine vllm) "
+                "and set target_model_backend='remote'."
+            )
+        from nemo_automodel.components.speculative.eagle.vllm_target import VLLMEagle3TargetModel
+
+        vllm_args = recipe_cfg.get("vllm_args", None) or {}
+        vllm_kwargs = vllm_args.to_dict() if hasattr(vllm_args, "to_dict") else dict(vllm_args)
+        # vLLM's default (~0.9 of GPU memory) would starve the draft's optimizer
+        # states and activations; default to half the GPU and let
+        # ``recipe_args.vllm_args.gpu_memory_utilization`` override.
+        vllm_kwargs.setdefault("gpu_memory_utilization", 0.5)
+        self.target_model = None
+        self.target_wrapper = VLLMEagle3TargetModel.from_pretrained(
+            target_path,
+            aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
+            dtype=self.compute_dtype,
+            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
+            **vllm_kwargs,
         )
 
     def _setup_remote_target(self, recipe_cfg):
@@ -747,6 +875,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         train_loss: float | None = None,
         val_loss: dict[str, float] | None = None,
         best_metric_key: str = "default",
+        is_final_checkpoint: bool = False,
     ) -> None:
         """Persist draft model, optimizer, scheduler, RNG, and EAGLE-3 meta.
 
@@ -754,6 +883,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         ``nn.Module`` attributes (frozen target, target wrapper, trainer module wrapping
         the draft) — only ``draft_model`` should be persisted as the main model. The
         EAGLE-3 vocab mapping tensors ride along through ``_save_extra_state``.
+
+        ``is_final_checkpoint`` is computed by the caller (this hand-rolled loop
+        has no ``step_scheduler`` for the checkpointer to infer it from);
+        ``save_consolidated: final`` exports HF safetensors only when it is True.
         """
         checkpointer = getattr(self, "checkpointer", None)
         if checkpointer is None or not checkpointer.config.enabled:
@@ -801,8 +934,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if is_dist_initialized:
             dist.barrier()
 
-        step_scheduler = getattr(self, "step_scheduler", None)
-        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
         draft_model = self._module().draft_model
         self.checkpointer.save_model(
             draft_model,
@@ -852,12 +983,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         every = getattr(self, "ckpt_every_steps", None)
         if every is None or every <= 0 or self.runtime.global_step % every != 0:
             return False
+        total_optim_steps = getattr(self, "total_optim_steps", None)
+        is_final_checkpoint = total_optim_steps is not None and self.runtime.global_step >= total_optim_steps
         self.save_checkpoint(
             epoch=epoch,
             step=self.runtime.global_step,
             train_loss=None,
             val_loss=None,
             best_metric_key="val_loss",
+            is_final_checkpoint=is_final_checkpoint,
         )
         self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
         return True
@@ -886,6 +1020,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             train_loss=None,
             val_loss=None,
             best_metric_key="val_loss",
+            is_final_checkpoint=True,
         )
         self._log_saved_checkpoint("final", completed_epochs, gs)
         return True
@@ -1254,6 +1389,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     train_loss=None,
                     val_loss=val_loss_dict,
                     best_metric_key="val_loss",
+                    is_final_checkpoint=epoch + 1 >= self.num_epochs,
                 )
                 self._log_saved_checkpoint("epoch", epoch + 1, self.runtime.global_step)
 

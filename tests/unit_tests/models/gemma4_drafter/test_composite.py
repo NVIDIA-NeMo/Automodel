@@ -113,6 +113,8 @@ def _build_tiny_base(device: torch.device, dtype: torch.dtype):
         torch_dtype=_dtype_str(dtype),
     )
     cfg = Gemma4Config(text_config=text_cfg)
+    cfg._attn_implementation = "eager"
+    cfg.text_config._attn_implementation = "eager"
     model = Gemma4ForConditionalGeneration(cfg).to(device=device, dtype=dtype)
     model.eval()
     return model, text_cfg
@@ -152,6 +154,8 @@ def _build_tiny_drafter(base_text_cfg, device: torch.device, dtype: torch.dtype)
         text_config=draft_text,
         backbone_hidden_size=base_text_cfg.hidden_size,
     )
+    cfg._attn_implementation = "eager"
+    cfg.text_config._attn_implementation = "eager"
     model = Gemma4AssistantForCausalLM(cfg).to(device=device, dtype=dtype)
     model.eval()
     return model, draft_text

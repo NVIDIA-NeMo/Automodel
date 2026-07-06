@@ -29,6 +29,17 @@ def _shift_left_with_zero(tensor: torch.Tensor) -> torch.Tensor:
     return torch.cat((tensor[:, 1:], tail), dim=1)
 
 
+def _to_full_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialise a (possibly tensor-parallel) tensor as a plain local tensor.
+
+    With a tensor-parallel target the lm_head is column-parallel, so its logits
+    come back as a vocab-sharded ``DTensor``. The draft consumes plain tensors,
+    so gather the full tensor before handing it on. A no-op for an already-plain
+    (unsharded or pure-FSDP-replicated) tensor.
+    """
+    return tensor.full_tensor() if hasattr(tensor, "full_tensor") else tensor
+
+
 @dataclass
 class EagleTargetBatch:
     """Target-model outputs needed by the EAGLE-1 / EAGLE-2 trainer."""
@@ -83,7 +94,11 @@ class HFEagleTargetModel:
         # ``last_hidden_state``; AutoModel custom backbones return the
         # bare hidden tensor.
         hidden_states = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
-        logits = self.model.lm_head(hidden_states)
+        # A tensor-parallel target has a column-parallel lm_head, so its logits
+        # are a vocab-sharded DTensor; gather to a full tensor for the draft. The
+        # hidden states stay replicated under the default (non sequence-parallel)
+        # plan, so they need no gather. No-op without TP.
+        logits = _to_full_tensor(self.model.lm_head(hidden_states))
         return EagleTargetBatch(
             input_hidden_states=hidden_states,
             target_hidden_states=_shift_left_with_zero(hidden_states),

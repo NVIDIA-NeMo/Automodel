@@ -20,6 +20,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -232,6 +233,16 @@ class Qwen3MoeModel(nn.Module):
 
 
 class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    # Skip patch_hf_model_for_pp: this model's own forward already handles
+    # pipeline-parallel stage routing (embed_tokens/norm/lm_head are None off the
+    # owning stage; hidden states arrive in the input_ids slot) AND context
+    # parallelism + THD via the native freqs_cis path
+    # (position_ids_to_freqs_cis + apply_rotary_emb_qk with cu_seqlens/cp_*).
+    # The generic HF pipeline forward assumes the HF rotary API
+    # (rotary_emb(x, position_ids) -> cos/sin) and crashes on the freqs_cis /
+    # THD / CP path, so it must not clobber our forward.
+    _pp_keep_self_forward: bool = True
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -270,6 +281,7 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3MoeModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)

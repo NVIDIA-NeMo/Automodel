@@ -210,7 +210,7 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
 
 def apply_ac(
     model: nn.Module,
-    ignore_router: bool = False,
+    ignore_router: bool = True,
     hidden_size: int | None = None,
     num_experts: int | None = None,
     selective: bool = False,
@@ -219,7 +219,9 @@ def apply_ac(
 
     Args:
         model: The model to apply activation checkpointing to.
-        ignore_router: If True, uses selective checkpointing that saves router outputs.
+        ignore_router: If True (the default), saves the MoE router output so the dispatch
+            is not recomputed under activation checkpointing (avoids a CheckpointError from
+            non-deterministic re-routing on recompute). If False, a warning is emitted.
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
         num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
             first, then falls back to model.config attributes.
@@ -228,6 +230,16 @@ def apply_ac(
             ``ignore_router``; the shared policy already saves expert-parallel communication
             collectives and ``topk``, so it composes with expert parallelism.
     """
+    if not selective and not ignore_router:
+        logger.warning(
+            "Activation checkpointing is enabled with ignore_router_for_ac=False. The MoE "
+            "router/dispatch will be recomputed in the backward pass, which can route a "
+            "different number of tokens per expert than the forward pass and crash with "
+            "torch.utils.checkpoint.CheckpointError ('Recomputed values ... have different "
+            "metadata'). Set ignore_router_for_ac=True (the default) to save the router "
+            "output and keep routing consistent across recompute."
+        )
+
     if selective:
         # Reuse the dense FSDP2 selective policy so the save-op set (attention,
         # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
@@ -316,9 +328,7 @@ def apply_ac(
     for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
         if mtp_repeated and id(block) in mtp_block_ids:
             continue
-        if ignore_router and hasattr(block, "set_activation_checkpointing"):
-            block.set_activation_checkpointing(True)
-        elif ignore_router:
+        if ignore_router:
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
@@ -564,14 +574,16 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
 
     # Route each attention block's CP setup by capability:
     #   * TE DotProductAttention -> TE's own context-parallel group;
-    #   * a module exposing setup_cp_attention (e.g. Gemma4's p2p ring) -> installs
-    #     its own CP attention + mask handling (model-owned, like TE/DSV4).
+    #   * a module exposing setup_cp_attention (e.g. Gemma4's p2p ring or MiniMax
+    #     M3's block-sparse DSA) -> installs its own CP attention + mask handling
+    #     (model-owned, like TE/DSV4).
     # Any other (non-TE, non-model-owned) attention is not supported under CP here.
     for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
         if layer_type in ("full_attention", "sliding_attention"):
-            attn_module = getattr(block.self_attn, "attn_module", None)
+            self_attn = block.self_attn
+            attn_module = getattr(self_attn, "attn_module", None)
             if isinstance(attn_module, DotProductAttention):
                 attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
                 attn_module.set_context_parallel_group(
@@ -580,15 +592,15 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                     _get_cp_stream(),
                     cp_comm_type=attn_cp_comm_type,
                 )
-            elif hasattr(block.self_attn, "setup_cp_attention"):
+            elif hasattr(self_attn, "setup_cp_attention"):
                 # Model-owned CP attention (e.g. Gemma4's p2p ring): the model
                 # installs its own SDPA hook + mask handling.
-                block.self_attn.setup_cp_attention(cp_mesh)
+                self_attn.setup_cp_attention(cp_mesh)
             else:
                 logger.warning(
                     "Skipping CP setup for block with unsupported attention module "
                     "(neither TE DotProductAttention nor model-owned setup_cp_attention): %s",
-                    type(attn_module).__name__ if attn_module is not None else type(block.self_attn).__name__,
+                    type(attn_module).__name__ if attn_module is not None else type(self_attn).__name__,
                 )
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
@@ -630,7 +642,7 @@ def parallelize_model(
     ep_axis_name: str | None = None,
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool | str = False,
-    ignore_router_for_ac: bool = False,
+    ignore_router_for_ac: bool = True,
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
