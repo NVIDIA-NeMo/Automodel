@@ -81,4 +81,36 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized_ddp_lbs2.yaml
 ```
 
-If you use fewer GPUs and want to keep the same global batch size, either use gradient accumulation or enable activation checkpointing to fit a larger per-GPU batch.
+### Training on fewer GPUs (single node)
+
+You do not need 32-64 GPUs to run this workload. The optimized path keeps the same `global_batch_size=64` (and therefore the same training dynamics) on a single node by combining a larger per-GPU batch, gradient accumulation, and optionally activation checkpointing. Reference numbers on 80GB GPUs with the ColPali workload:
+
+| GPUs | local/global batch | Activation ckpt. | Samples/s/GPU | Peak mem/GPU | Approx. epoch (262k samples) |
+| ---: | ---: | --- | ---: | ---: | ---: |
+| 64 (8 nodes) | 1/64 | no | ~1.95 | ~50GiB | ~35m |
+| 32 (4 nodes) | 2/64 | no | ~2.20 | ~70GiB | ~62m |
+| 8 (1 node) | 8/64 | vision tower only | ~2.11 | ~80GiB | ~4.3h |
+| 4 | 16/64 | full model | ~2.05 | ~61GiB | ~8.9h |
+
+Note that per-GPU efficiency (samples/s/GPU) is *highest* on the smaller setups: fewer ranks means larger per-GPU batches and less relative communication, so a single node is the most GPU-hour-efficient way to run this recipe — the trade-off is wall-clock time.
+
+For a single 8-GPU node, use [nemotron_vl_1b_optimized_ddp_1node.yaml](nemotron_vl_1b_optimized_ddp_1node.yaml), which keeps `local_batch_size=2` and derives 4 gradient accumulation steps automatically (`64 / (2 × 8)`), at the same ~70GiB peak memory as the 32-GPU run:
+
+```bash
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized_ddp_1node.yaml
+```
+
+To instead trade compute for memory and fit larger per-GPU batches without gradient accumulation (the 8- and 4-GPU rows above), enable activation checkpointing and raise `local_batch_size`:
+
+```yaml
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 8   # 8 GPUs; use 16 for 4 GPUs
+
+distributed:
+  strategy: ddp
+  activation_checkpointing: true
+```
+
+Activation checkpointing recomputes activations during backward, so each optimizer step is slower, but as the table shows the throughput per GPU stays close to the no-checkpointing runs while cutting the required GPU count by 4-8x. The vision-tower-scoped checkpointing used in the 8-GPU row requires the VL activation-checkpointing scoping fix that lands separately; until it is available, use full activation checkpointing (`activation_checkpointing: true`) or the gradient-accumulation config above.
