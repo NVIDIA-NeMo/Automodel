@@ -270,28 +270,20 @@ def _pad_position_ids_seq_dim_(position_ids: torch.Tensor, seq_dim: int, pad_len
     return torch.cat((position_ids, last_position + increments), dim=seq_dim)
 
 
-def _synthesize_single_document_seq_ids(batch: dict, primary_key: str, seq_len: int) -> None:
-    """Materialize the trivial single-document ``_packed_seq_ids`` map.
+def convert_attention_mask_to_padding_mask(batch: dict) -> None:
+    """Pop ``attention_mask`` and derive ``padding_mask`` (True == pad) in place.
 
-    Collates emit ``_packed_seq_ids`` only when 2+ documents are packed, but
-    manual CP attention mask builders need document boundaries even for one
-    document (1 = real token, 0 = pad). Derived from ``padding_mask`` when
-    present, else all-ones. A no-op when ``_packed_seq_ids`` already exists.
-
-    Args:
-        batch: The CP batch dict; mutated in place to add ``_packed_seq_ids``.
-        primary_key: ``"input_ids"`` or ``"inputs_embeds"`` (selects batch / device).
-        seq_len: The pre-pad sequence length.
+    Preserves padding semantics for modules such as MoE routers after the
+    attention mask is stripped for CP. Idempotent: a no-op when
+    ``padding_mask`` already exists or there is no ``attention_mask``.
     """
-    if "_packed_seq_ids" in batch:
-        return
-    primary = batch[primary_key]
-    padding_mask = batch.get("padding_mask")
-    if padding_mask is not None:
-        # padding_mask is [B, S], True == pad -> real-token map is its inverse.
-        batch["_packed_seq_ids"] = (~padding_mask.bool()).to(torch.long)
-    else:
-        batch["_packed_seq_ids"] = torch.ones((primary.shape[0], seq_len), dtype=torch.long, device=primary.device)
+    attention_mask = batch.pop("attention_mask", None)
+    if attention_mask is not None and "padding_mask" not in batch:
+        if attention_mask.ndim == 4:
+            diagonal = torch.diagonal(attention_mask[:, 0], dim1=-2, dim2=-1)
+            batch["padding_mask"] = diagonal.logical_not() if attention_mask.dtype == torch.bool else diagonal != 0
+        else:
+            batch["padding_mask"] = attention_mask.bool().logical_not()
 
 
 def _prepare_manual_cp_batch(cp_mesh, tp_mesh, batch, loss_mask):
@@ -302,13 +294,7 @@ def _prepare_manual_cp_batch(cp_mesh, tp_mesh, batch, loss_mask):
     injects/normalizes ``position_ids``, and resolves ``labels`` (falling back
     to ``loss_mask``).
     """
-    attention_mask = batch.pop("attention_mask", None)
-    if attention_mask is not None and "padding_mask" not in batch:
-        if attention_mask.ndim == 4:
-            diagonal = torch.diagonal(attention_mask[:, 0], dim1=-2, dim2=-1)
-            batch["padding_mask"] = diagonal.logical_not() if attention_mask.dtype == torch.bool else diagonal != 0
-        else:
-            batch["padding_mask"] = attention_mask.bool().logical_not()
+    convert_attention_mask_to_padding_mask(batch)
 
     has_inputs_embeds = "inputs_embeds" in batch
     has_input_ids = "input_ids" in batch
@@ -352,7 +338,6 @@ def shard_batch_contiguous(
     pad_multiple: int = 1,
     extra_seq_keys: dict[str, int] | None = None,
     extra_pad_values: dict[str, Any] | None = None,
-    synthesize_packed_seq_ids: bool = True,
 ):
     """Prepare and contiguously shard a batch for model-owned CP.
 
@@ -373,8 +358,6 @@ def shard_batch_contiguous(
         extra_seq_keys: Model-specific per-token batch keys to pad and shard,
             mapped to their sequence dim (e.g. Gemma4 vision group ids).
         extra_pad_values: Pad sentinels for ``extra_seq_keys`` (default 0).
-        synthesize_packed_seq_ids: Materialize the trivial single-document
-            ``_packed_seq_ids`` map needed by manual CP attention mask builders.
 
     Returns:
         ``(contextlib.nullcontext, batch)`` — transport lives in the model's
@@ -396,7 +379,6 @@ def shard_batch_contiguous(
         pad_multiple=pad_multiple,
         extra_seq_keys=extra_seq_keys,
         extra_pad_values=extra_pad_values,
-        synthesize_packed_seq_ids=synthesize_packed_seq_ids,
     )
 
 
@@ -414,15 +396,8 @@ def _make_contiguous_shard_cp_batch(
     pad_multiple: int = 1,
     extra_seq_keys: dict[str, int] | None = None,
     extra_pad_values: dict[str, Any] | None = None,
-    synthesize_packed_seq_ids: bool = True,
 ):
     cp_size = cp_mesh.size()
-    if synthesize_packed_seq_ids:
-        # Manual CP attention mask builders need per-document boundaries
-        # (`_packed_seq_ids`) even for a single sequence; the collates emit it
-        # only for 2+ packed docs, so synthesize the trivial map here.
-        _synthesize_single_document_seq_ids(batch, primary_key, seq_len)
-
     # Batch-resident sequence tensors, each sharded on seq dim 1 with its own pad
     # sentinel. ``position_ids``/``labels``/``loss_mask`` are sharded too but handled
     # separately below (special pad logic, or carried as locals rather than in the
@@ -431,9 +406,6 @@ def _make_contiguous_shard_cp_batch(
     seq_pad_values = {
         "input_ids": padding_token_id,
         "inputs_embeds": 0,
-        "mm_token_type_ids": 0,
-        "_packed_seq_ids": 0,
-        "per_layer_inputs": 0,
         "padding_mask": True,
     }
     known_sequence_keys = set(seq_pad_values) | {"labels", "position_ids", "loss_mask"}

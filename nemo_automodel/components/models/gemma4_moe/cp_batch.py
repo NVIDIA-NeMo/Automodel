@@ -19,18 +19,61 @@ Contiguously shards the sequence across CP ranks (each rank keeps one
 over the shards. It performs no collective -- the transport lives in Gemma4's
 attention (see ``cp_attention.py``).
 
-The implementation is the shared contiguous sharder in
-``components/distributed/cp_sharder.py``; this module binds Gemma4's
-model-specific arguments (vision-group-id metadata, ``_packed_seq_ids``
-synthesis). Gemma4's ``prepare_model_inputs_for_cp`` exposes it through the
-``CPSharder`` it returns under the ``"cp_sharder"`` batch key, which
-``cp_utils.make_cp_batch_and_ctx`` invokes in place of the default
+The generic slicing lives in ``components/distributed/cp_sharder.py``; this
+module owns everything Gemma4-specific: the ``_packed_seq_ids`` synthesis its
+manual CP attention mask builder needs, and the Gemma4 per-token batch keys
+(``mm_token_type_ids``, ``per_layer_inputs``) that must be padded and sharded
+alongside the sequence. Gemma4's ``prepare_model_inputs_for_cp`` exposes it
+through the ``CPSharder`` it returns under the ``"cp_sharder"`` batch key,
+which ``cp_utils.make_cp_batch_and_ctx`` invokes in place of the default
 load-balanced ``context_parallel`` path.
 """
 
 from typing import Any
 
-from nemo_automodel.components.distributed.cp_sharder import shard_batch_contiguous
+import torch
+
+from nemo_automodel.components.distributed.cp_sharder import (
+    convert_attention_mask_to_padding_mask,
+    shard_batch_contiguous,
+)
+
+# Gemma4 per-token batch keys sharded alongside the sequence, with their seq
+# dims and pad sentinels (0 keeps MoE routers and mask builders inert on pads).
+_GEMMA4_SEQ_KEYS: dict[str, int] = {
+    "mm_token_type_ids": 1,
+    "per_layer_inputs": 1,
+    "_packed_seq_ids": 1,
+}
+_GEMMA4_PAD_VALUES: dict[str, Any] = {
+    "mm_token_type_ids": 0,
+    "per_layer_inputs": 0,
+    "_packed_seq_ids": 0,
+}
+
+
+def _synthesize_single_document_seq_ids(batch: dict, seq_len: int) -> None:
+    """Materialize the trivial single-document ``_packed_seq_ids`` map.
+
+    Collates emit ``_packed_seq_ids`` only when 2+ documents are packed, but
+    Gemma4's manual CP attention mask builder needs document boundaries even
+    for one document (1 = real token, 0 = pad). Derived from ``padding_mask``
+    when present, else all-ones. A no-op when ``_packed_seq_ids`` already
+    exists (genuinely packed input).
+
+    Args:
+        batch: The CP batch dict; mutated in place to add ``_packed_seq_ids``.
+        seq_len: The pre-pad sequence length.
+    """
+    if "_packed_seq_ids" in batch:
+        return
+    primary = batch["inputs_embeds"] if "inputs_embeds" in batch else batch["input_ids"]
+    padding_mask = batch.get("padding_mask")
+    if padding_mask is not None:
+        # padding_mask is [B, S], True == pad -> real-token map is its inverse.
+        batch["_packed_seq_ids"] = (~padding_mask.bool()).to(torch.long)
+    else:
+        batch["_packed_seq_ids"] = torch.ones((primary.shape[0], seq_len), dtype=torch.long, device=primary.device)
 
 
 def make_contiguous_shard_cp_batch_and_ctx(
@@ -46,17 +89,23 @@ def make_contiguous_shard_cp_batch_and_ctx(
     """Prepare and contiguously shard a batch for Gemma4's ring CP.
 
     Exposed as ``CPSharder.shard_batch`` by Gemma4's ``_cp_shard_batch``;
-    ``cp_utils.make_cp_batch_and_ctx`` invokes it. Runs the shared pre-shard
-    prep, then keeps one contiguous sequence slice per CP rank (no collective;
-    the transport lives in Gemma4's own ring attention).
+    ``cp_utils.make_cp_batch_and_ctx`` invokes it. Synthesizes the
+    ``_packed_seq_ids`` boundary map, then delegates to the shared contiguous
+    sharder with Gemma4's per-token keys, keeping one contiguous sequence
+    slice per CP rank (no collective; the transport lives in Gemma4's own
+    ring attention).
     """
+    # Derive padding_mask before the synthesis reads it; the shared prep's own
+    # conversion is idempotent afterwards.
+    convert_attention_mask_to_padding_mask(batch)
+    primary = batch["inputs_embeds"] if "inputs_embeds" in batch else batch["input_ids"]
+    _synthesize_single_document_seq_ids(batch, primary.shape[1])
     return shard_batch_contiguous(
         cp_mesh,
         tp_mesh,
         batch,
         loss_mask=loss_mask,
         padding_token_id=padding_token_id,
-        extra_seq_keys=extra_seq_keys,
-        extra_pad_values=extra_pad_values,
-        synthesize_packed_seq_ids=True,
+        extra_seq_keys={**_GEMMA4_SEQ_KEYS, **(extra_seq_keys or {})},
+        extra_pad_values={**_GEMMA4_PAD_VALUES, **(extra_pad_values or {})},
     )

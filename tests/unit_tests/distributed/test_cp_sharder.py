@@ -171,7 +171,6 @@ def test_shard_batch_contiguous_respects_pad_multiple():
         batch,
         padding_token_id=9,
         pad_multiple=4,
-        synthesize_packed_seq_ids=False,
     )
     assert ctx is contextlib.nullcontext
     assert out["input_ids"].shape == (1, 4)
@@ -197,4 +196,5 @@ def test_shard_batch_contiguous_extra_seq_keys():
     )
     assert out["vision_ids"].shape == (1, 4)
     torch.testing.assert_close(out["vision_ids"], torch.arange(4).view(1, 4))
-    assert "_packed_seq_ids" in out  # default synthesize_packed_seq_ids=True
+    # model-specific keys (e.g. _packed_seq_ids) are the owning model's business
+    assert "_packed_seq_ids" not in out

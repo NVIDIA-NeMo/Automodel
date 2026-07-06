@@ -176,7 +176,6 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
         loss_mask=loss_mask,
         padding_token_id=padding_token_id,
         pad_multiple=int(pad_multiple or 2),
-        synthesize_packed_seq_ids=False,
     )
     # Hand the CP process group to the model forward (read from attn_kwargs) so
     # DSV4 attention all-gathers K/V across CP ranks. Not a tensor -> not sharded.

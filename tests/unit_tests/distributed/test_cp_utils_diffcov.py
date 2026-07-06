@@ -183,8 +183,9 @@ def test_make_contiguous_shard_pads_and_slices_all_keys():
         "per_layer_inputs": torch.randn(1, seq, d),
         "padding_mask": torch.zeros(1, seq, dtype=torch.bool),
         "vision_extra": torch.zeros(1, seq, dtype=torch.long),
-        "_cp_metadata_seq_dims": {"vision_extra": 1},
-        "_cp_metadata_pad_values": {"vision_extra": 0},
+        # model-specific per-token keys ride the generic metadata mechanism
+        "_cp_metadata_seq_dims": {"vision_extra": 1, "mm_token_type_ids": 1, "per_layer_inputs": 1},
+        "_cp_metadata_pad_values": {"vision_extra": 0, "mm_token_type_ids": 0, "per_layer_inputs": 0},
     }
     labels = torch.zeros(1, seq, dtype=torch.long)
     position_ids = torch.arange(seq).unsqueeze(0)
@@ -208,7 +209,6 @@ def test_make_contiguous_shard_pads_and_slices_all_keys():
     assert out["padding_mask"].shape == (1, 4)
     assert out["vision_extra"].shape == (1, 4)
     assert out["loss_mask"].shape == (1, 4)
-    assert out["_packed_seq_ids"].shape == (1, 4)
 
 
 def test_make_contiguous_shard_uses_dist_rank_when_initialized():
