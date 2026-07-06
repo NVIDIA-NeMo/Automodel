@@ -67,6 +67,12 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
     GEMMA4_MODEL_TYPES as _GEMMA4_MODEL_TYPES,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
+    GLM_5_2_MODEL_TYPE as _GLM_5_2_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    MINIMAX_M3_MODEL_TYPES as _MINIMAX_M3_MODEL_TYPES,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
     apply_target_chat_template as _apply_target_chat_template,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
@@ -74,6 +80,12 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+_UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES = (
+    _DEEPSEEK_V4_MODEL_TYPE,
+    _GLM_5_2_MODEL_TYPE,
+    *_MINIMAX_M3_MODEL_TYPES,
+)
 
 
 def _compute_batch_cache(target_batch, cache_dtype: torch.dtype) -> dict[str, torch.Tensor]:
@@ -141,10 +153,10 @@ def _run(args: argparse.Namespace) -> int:
     compute_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     model_type = _read_target_model_type(args.target_model, args.trust_remote_code)
-    if model_type == _DEEPSEEK_V4_MODEL_TYPE:
+    if model_type in _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES:
         raise ValueError(
             "precompute_dspark currently supports HF-loadable single-process targets. "
-            "DeepSeek V4 targets need the distributed online training path."
+            f"model_type={model_type!r} targets need the distributed or multimodal online training path."
         )
 
     target_config = AutoConfig.from_pretrained(args.target_model, trust_remote_code=args.trust_remote_code)

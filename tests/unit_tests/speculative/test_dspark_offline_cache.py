@@ -236,6 +236,33 @@ def test_parser_accepts_required_args():
     assert args.dtype == "bf16"
 
 
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "glm_moe_dsa", "minimax_m3_vl"])
+def test_precompute_rejects_targets_that_need_specialized_online_loading(monkeypatch, tmp_path, model_type):
+    import nemo_automodel.components.speculative.precompute_dspark as precompute_dspark
+
+    monkeypatch.setattr(precompute_dspark, "_read_target_model_type", lambda *_args, **_kwargs: model_type)
+    monkeypatch.setattr(
+        precompute_dspark.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: pytest.fail("unsupported targets should be rejected before loading config"),
+    )
+    args = _build_parser().parse_args(
+        [
+            "--target-model",
+            "special-target",
+            "--input-data",
+            "data.jsonl",
+            "--output-dir",
+            str(tmp_path / "cache"),
+            "--device",
+            "cpu",
+        ]
+    )
+
+    with pytest.raises(ValueError, match=f"model_type='{model_type}'"):
+        _run(args)
+
+
 def test_resume_compatibility_rejects_manifest_mismatch(tmp_path):
     cache_dir = str(tmp_path / "cache")
     _write_tiny_cache(cache_dir, num_samples=2, shard_size=2, seq_len=4)
