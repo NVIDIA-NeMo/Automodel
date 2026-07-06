@@ -93,8 +93,8 @@ def write_target_weights(
         raise ValueError("Target output embeddings / lm_head do not expose a .weight tensor.")
     save_file, _ = load_safetensors(_CACHE_NAME)
     tensors = {
-        "embed_tokens.weight": embed_weight.detach().to(dtype).cpu().contiguous(),
-        "lm_head.weight": head_weight.detach().to(dtype).cpu().contiguous(),
+        "embed_tokens.weight": embed_weight.detach().to(dtype).cpu().contiguous().clone(),
+        "lm_head.weight": head_weight.detach().to(dtype).cpu().contiguous().clone(),
     }
     return atomic_write(_target_weights_path(cache_dir), lambda tmp: save_file(tensors, tmp))
 

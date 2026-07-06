@@ -167,6 +167,21 @@ def test_target_weights_round_trip(tmp_path):
     torch.testing.assert_close(loaded_head.weight, head.weight.detach().bfloat16())
 
 
+def test_target_weights_round_trip_with_tied_cpu_fp32_weights(tmp_path):
+    cache_dir = str(tmp_path / "cache")
+    embed = torch.nn.Embedding(_VOCAB, _HIDDEN)
+    head = torch.nn.Linear(_HIDDEN, _VOCAB, bias=False)
+    head.weight = embed.weight
+
+    write_target_weights(cache_dir, embed, head, dtype=torch.float32)
+
+    loaded_embed, loaded_head = read_target_weight_modules(cache_dir)
+    assert loaded_embed.weight.dtype == torch.float32
+    assert loaded_head.weight.dtype == torch.float32
+    torch.testing.assert_close(loaded_embed.weight, embed.weight.detach())
+    torch.testing.assert_close(loaded_head.weight, embed.weight.detach())
+
+
 def test_existing_shard_indices(tmp_path):
     cache_dir = str(tmp_path / "cache")
     _write_tiny_cache(cache_dir, num_samples=3, shard_size=2, seq_len=4)
