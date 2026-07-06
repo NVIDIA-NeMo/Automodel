@@ -101,6 +101,21 @@ def create_context_parallel_ctx(
     )
 
 
+def _shard_grad_buffer_for_cp(buffer: torch.Tensor, seq_dim: int, cp_mesh: DeviceMesh) -> torch.Tensor:
+    """Shard a gradient-bearing buffer with CP's head-tail load-balancing order."""
+    cp_size = cp_mesh.size()
+    num_chunks = 2 * cp_size
+    seq_len = buffer.shape[seq_dim]
+    if seq_len % num_chunks != 0:
+        raise ValueError(f"CP sequence length {seq_len} must be divisible by {num_chunks}")
+
+    chunk_size = seq_len // num_chunks
+    cp_rank = cp_mesh.get_local_rank()
+    head_chunk = buffer.narrow(seq_dim, cp_rank * chunk_size, chunk_size)
+    tail_chunk = buffer.narrow(seq_dim, (num_chunks - cp_rank - 1) * chunk_size, chunk_size)
+    return torch.cat((head_chunk, tail_chunk), dim=seq_dim)
+
+
 def make_target_cp_ctx(cp_mesh: DeviceMesh, input_ids, position_ids=None):
     """Build a context-parallel context for a frozen target forward.
 
@@ -442,6 +457,19 @@ def make_cp_batch_and_ctx(
         # downstream consumer reading from the dict sees the padded shape.
         for idx, key in batch_buffer_keys.items():
             batch[key] = cp_buffers[idx]
+
+    # PyTorch's legacy context_parallel buffers API shards in place with
+    # ``resize_``/``copy_``. ``resize_`` rejects tensors that require gradients,
+    # and detaching inputs_embeds here would silently stop gradients to trainable
+    # embeddings and multimodal towers. Apply the same default head-tail shard
+    # out of place so autograd remains connected, then let context_parallel
+    # mutate only the integer/mask buffers.
+    primary_seq_tensor = cp_buffers[0]
+    if primary_seq_tensor.requires_grad:
+        batch[primary_key] = _shard_grad_buffer_for_cp(primary_seq_tensor, cp_seq_dims[0], cp_mesh)
+        cp_no_restore_buffers.remove(primary_seq_tensor)
+        cp_buffers = cp_buffers[1:]
+        cp_seq_dims = cp_seq_dims[1:]
 
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,

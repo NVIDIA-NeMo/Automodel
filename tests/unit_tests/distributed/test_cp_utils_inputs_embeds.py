@@ -33,8 +33,9 @@ from nemo_automodel.components.distributed import cp_utils as _cu
 
 
 class _DummySubMesh:
-    def __init__(self, size: int):
+    def __init__(self, size: int, local_rank: int = 0):
         self._size = size
+        self._local_rank = local_rank
 
     def size(self) -> int:
         return self._size
@@ -42,11 +43,14 @@ class _DummySubMesh:
     def get_group(self):
         return None
 
+    def get_local_rank(self) -> int:
+        return self._local_rank
+
 
 class _DummyDeviceMesh(dict):
-    def __init__(self, cp_size: int, tp_size: int):
+    def __init__(self, cp_size: int, tp_size: int, cp_rank: int = 0):
         super().__init__()
-        self["cp"] = _DummySubMesh(cp_size)
+        self["cp"] = _DummySubMesh(cp_size, cp_rank)
         self["tp"] = _DummySubMesh(tp_size)
         self.mesh_dim_names = ["cp", "tp"]
 
@@ -96,6 +100,34 @@ def test_inputs_embeds_path_uses_embeds_as_primary_seq_tensor(monkeypatch):
     cp_buffers = captured["cp_buffers"]
     assert cp_buffers[0] is inputs_embeds, "primary cp buffer must be inputs_embeds"
     assert cp_buffers[1] is labels
+
+
+def test_inputs_embeds_with_grad_is_sharded_out_of_place(monkeypatch):
+    """Grad-bearing embeds must bypass context_parallel's in-place resize."""
+    captured = {}
+
+    def _fake_create_ctx(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
+    monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: "ctx")
+
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1, cp_rank=1)
+    full_sequence = torch.arange(8.0, requires_grad=True)
+    inputs_embeds = full_sequence.view(1, 8, 1)
+    batch = {
+        "inputs_embeds": inputs_embeds,
+        "labels": torch.arange(8).view(1, 8),
+    }
+
+    _cu.make_cp_batch_and_ctx(device_mesh, batch)
+
+    assert all(not buffer.requires_grad for buffer in captured["cp_buffers"])
+    assert torch.equal(batch["inputs_embeds"].flatten(), torch.tensor([2.0, 3.0, 4.0, 5.0]))
+
+    batch["inputs_embeds"].sum().backward()
+    assert torch.equal(full_sequence.grad, torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0]))
 
 
 def test_input_ids_path_unchanged(monkeypatch):
