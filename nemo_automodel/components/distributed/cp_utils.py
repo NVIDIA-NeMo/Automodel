@@ -298,8 +298,8 @@ def attach_cp_kv_gather_hooks(model: torch.nn.Module, cp_mesh) -> None:
 
     _original_sdpa = F_module.scaled_dot_product_attention
     # The global causal mask depends only on the shard geometry (seq_local, cp
-    # rank/size), which is constant across layers and steps, so build it once and
-    # reuse it rather than reallocating an ``[S_local, S]`` bool tensor per layer.
+    # rank/size), which is constant across layers and steps, so build the additive
+    # ``[S_local, S]`` float mask once and reuse it rather than per layer.
     _mask_cache: dict = {}
 
     @torch._dynamo.disable
@@ -335,31 +335,32 @@ def attach_cp_kv_gather_hooks(model: torch.nn.Module, cp_mesh) -> None:
         k_full = torch.cat(k_parts, dim=2)
         v_full = torch.cat(v_parts, dim=2)
         # Global causal mask: local query at global position ``cp_rank*seq_local + i``
-        # attends to every key position ``j`` up to and including it. Cached on the
-        # shard geometry (constant across layers/steps).
-        mask_key = (seq_local, k_full.shape[2], query.device)
+        # attends to every key position ``j`` up to and including it. Built as an
+        # additive FLOAT (0 / -inf) mask, not a boolean one: a bool mask under GQA
+        # rejects the fused kernels and lands on MATH, which materializes the full
+        # ``[H, S/cp, S]`` fp32 score matrix (tens of GB at the long contexts CP is
+        # meant for). Cached on the shard geometry (constant across layers/steps).
+        mask_key = (seq_local, k_full.shape[2], query.dtype, query.device)
         mask = _mask_cache.get(mask_key)
         if mask is None:
             q_pos = torch.arange(seq_local, device=query.device) + cp_rank * seq_local
             k_pos = torch.arange(k_full.shape[2], device=query.device)
-            mask = q_pos[:, None] >= k_pos[None, :]
+            mask = torch.zeros(seq_local, k_full.shape[2], dtype=query.dtype, device=query.device)
+            mask.masked_fill_(q_pos[:, None] < k_pos[None, :], float("-inf"))
             _mask_cache[mask_key] = mask
-        # The target's forward may run inside an sdpa_kernel context that excludes
-        # MATH (e.g. [FLASH, EFFICIENT]); flash/efficient reject a boolean mask with
-        # GQA, so pin a MATH-inclusive context for this gather attention.
+        # Expand the gathered K/V heads to Q's head count so ``enable_gqa`` is off: the
+        # memory-efficient kernel rejects GQA combined with an explicit mask, but takes
+        # a float mask once the heads match (keeping the O(S^2) scores tiled, not
+        # materialized). The extra K/V copy is only O(S).
+        if enable_gqa and k_full.shape[1] != query.shape[1]:
+            rep = query.shape[1] // k_full.shape[1]
+            k_full = k_full.repeat_interleave(rep, dim=1)
+            v_full = v_full.repeat_interleave(rep, dim=1)
+        # Prefer the memory-efficient kernel; MATH stays only as a correctness fallback.
         from torch.nn.attention import SDPBackend, sdpa_kernel
 
         with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
-            return _original_sdpa(
-                query,
-                k_full,
-                v_full,
-                attn_mask=mask,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=scale,
-                enable_gqa=enable_gqa,
-            )
+            return _original_sdpa(query, k_full, v_full, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=scale)
 
     def _pre_hook(module, args, kwargs):
         F_module.scaled_dot_product_attention = _cp_gather_sdpa
