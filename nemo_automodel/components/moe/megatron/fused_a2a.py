@@ -101,6 +101,9 @@ _DEEPEP_V2_HANDLE_TENSOR_FIELDS = (
     "dst_buffer_slot_idx",
     "token_metadata_at_forward",
     "channel_linked_list",
+    # DeepEP >= 2.1.0 (099d5f2): consumed by cached dispatch in the combine
+    # backward; absent on older revs, tolerated via getattr default.
+    "num_unaligned_recv_tokens_per_expert",
 )
 
 
@@ -225,6 +228,14 @@ def init_deepep_v2_buffer(
         return
 
     _warmup_deepep_v2_group(group)
+    # GDAKI allocates num_allocated_qps * num_scaleout_ranks * 2 QPs per rank. The
+    # library default (65/129) is independent of EP size and overflows the NIC QP
+    # pool at high scaleout (DOCA_ERROR_FULL, e.g. EP256 / 32 nodes). Allow an
+    # explicit cap; 0 / unset keeps the library default.
+    elastic_kwargs = {}
+    num_allocated_qps = int(os.environ.get("DISPATCHER_NUM_ALLOCATED_QPS", "0") or "0")
+    if num_allocated_qps > 0:
+        elastic_kwargs["num_allocated_qps"] = num_allocated_qps
     _deepep_v2_buffer = ElasticBuffer(
         group,
         num_max_tokens_per_rank=num_max_tokens_per_rank,
@@ -232,6 +243,7 @@ def init_deepep_v2_buffer(
         num_topk=num_topk,
         num_gpu_timeout_secs=300,
         explicitly_destroy=True,
+        **elastic_kwargs,
     )
 
 
@@ -239,7 +251,7 @@ def _save_deepep_v2_handle(ctx, handle) -> None:
     """Save ElasticBuffer handle tensors for non-reentrant checkpoint replay."""
     ctx.handle = handle
     ctx.handle_tensor_fields = tuple(
-        field for field in _DEEPEP_V2_HANDLE_TENSOR_FIELDS if getattr(handle, field) is not None
+        field for field in _DEEPEP_V2_HANDLE_TENSOR_FIELDS if getattr(handle, field, None) is not None
     )
     ctx.save_for_backward(*(getattr(handle, field) for field in ctx.handle_tensor_fields))
 
