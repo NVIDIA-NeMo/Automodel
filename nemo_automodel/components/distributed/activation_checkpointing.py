@@ -99,6 +99,22 @@ def _default_compute_intensive_ops() -> tuple:
         return ()
 
 
+def _ffpa_forward_ops() -> tuple:
+    """FFPA forward ops (dense + varlen); import the CuTeDSL kernel so they register first, else ``()``.
+
+    Their ops register only on that import, which otherwise lands after this
+    save-set is frozen -- hence the eager import rather than a bare resolve.
+    """
+    try:
+        import ffpa_attn.cute  # noqa: F401
+    except Exception:
+        return ()
+    return (
+        _resolve_op_attr(torch.ops, "ffpa_attn._fwd_cute.default"),
+        _resolve_op_attr(torch.ops, "ffpa_attn._varlen_fwd_cute.default"),
+    )
+
+
 def _build_selective_ac_save_ops() -> frozenset:
     """Build the set of ops whose activations are always saved under selective AC.
 
@@ -131,6 +147,8 @@ def _build_selective_ac_save_ops() -> frozenset:
         _resolve_op_attr(torch, "_higher_order_ops.flex_attention"),
         _resolve_op_attr(torch, "_higher_order_ops.inductor_compiled_code"),
         _resolve_op_attr(torch.ops, "torch_attn._varlen_attn.default"),
+        # FFPA forward ops (head_dim=512 Gemma4 full attention).
+        *_ffpa_forward_ops(),
     )
 
     # Communication ops whose outputs should be saved to avoid re-communication.

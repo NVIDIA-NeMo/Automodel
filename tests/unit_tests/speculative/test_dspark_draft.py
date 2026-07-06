@@ -207,3 +207,32 @@ def test_loss_decreases_on_fixed_batch():
         losses.append(loss.item())
 
     assert losses[-1] < losses[0], f"loss did not decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"
+
+
+def test_rope_inv_freq_stays_fp32_after_bf16_cast():
+    """``model.to(bf16)`` must not round the RoPE frequencies.
+
+    The serving runtime keeps an fp32 RoPE cache; a bf16-rounded ``inv_freq``
+    dephases with absolute position, so the train/inference RoPE would diverge
+    (worse with longer context) and erode draft acceptance. The draft recomputes
+    fresh fp32 frequencies after any cast that would round them.
+    """
+    model = _build_model()  # fp32
+    ref = model.rotary_emb.inv_freq.detach().clone().float()
+
+    model = model.to(torch.bfloat16)
+    inv_freq = model.rotary_emb.inv_freq
+    # Without the fp32 pin this buffer would be bf16 (its frequencies rounded).
+    assert inv_freq.dtype == torch.float32
+    # Recomputed fresh in fp32, not a bf16 round-trip (bf16 rel. error ~1e-2).
+    assert torch.allclose(inv_freq, ref, rtol=1e-6, atol=1e-8)
+    # The pin is rope-only: the rest of the model still casts to bf16.
+    assert next(model.layers[0].parameters()).dtype == torch.bfloat16
+
+
+def test_rope_inv_freq_fp32_survives_chained_casts():
+    model = _build_model()
+    ref = model.rotary_emb.inv_freq.detach().clone().float()
+    model = model.to(torch.float16).to(torch.bfloat16)
+    assert model.rotary_emb.inv_freq.dtype == torch.float32
+    assert torch.allclose(model.rotary_emb.inv_freq, ref, rtol=1e-6, atol=1e-8)

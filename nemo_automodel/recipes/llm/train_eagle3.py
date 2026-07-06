@@ -260,6 +260,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # T x T causal block (Eagle3LlamaAttention merges FA's softmax_lse
         # with the diagonal-extension columns in log space).
         draft_config["attn_implementation"] = recipe_cfg.get("draft_attn_implementation", "eager")
+        # EAGLE-3.1 drafter-side toggles. ``fc_norm`` adds one RMSNorm per aux
+        # hidden-state chunk before ``model.fc``; ``norm_output`` routes the
+        # post-``norm`` hidden state into ``compute_logits``. The draft reads
+        # both from its config (default False), so they must be copied from
+        # ``recipe_args`` into the draft config -- and thereby serialized into
+        # the draft ``config.json`` -- for the flags to take effect at train
+        # and serve time alike.
+        draft_config["fc_norm"] = bool(recipe_cfg.get("fc_norm", False))
+        draft_config["norm_output"] = bool(recipe_cfg.get("norm_output", False))
         # P-EAGLE (parallel drafting). When enabled, the draft registers a
         # learnable ``mask_hidden`` placeholder and the trainer predicts all
         # ``num_depths`` draft tokens in a single COD-subsampled parallel forward
@@ -866,6 +875,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         train_loss: float | None = None,
         val_loss: dict[str, float] | None = None,
         best_metric_key: str = "default",
+        is_final_checkpoint: bool = False,
     ) -> None:
         """Persist draft model, optimizer, scheduler, RNG, and EAGLE-3 meta.
 
@@ -873,6 +883,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         ``nn.Module`` attributes (frozen target, target wrapper, trainer module wrapping
         the draft) — only ``draft_model`` should be persisted as the main model. The
         EAGLE-3 vocab mapping tensors ride along through ``_save_extra_state``.
+
+        ``is_final_checkpoint`` is computed by the caller (this hand-rolled loop
+        has no ``step_scheduler`` for the checkpointer to infer it from);
+        ``save_consolidated: final`` exports HF safetensors only when it is True.
         """
         checkpointer = getattr(self, "checkpointer", None)
         if checkpointer is None or not checkpointer.config.enabled:
@@ -920,8 +934,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if is_dist_initialized:
             dist.barrier()
 
-        step_scheduler = getattr(self, "step_scheduler", None)
-        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
         draft_model = self._module().draft_model
         self.checkpointer.save_model(
             draft_model,
@@ -971,12 +983,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         every = getattr(self, "ckpt_every_steps", None)
         if every is None or every <= 0 or self.runtime.global_step % every != 0:
             return False
+        total_optim_steps = getattr(self, "total_optim_steps", None)
+        is_final_checkpoint = total_optim_steps is not None and self.runtime.global_step >= total_optim_steps
         self.save_checkpoint(
             epoch=epoch,
             step=self.runtime.global_step,
             train_loss=None,
             val_loss=None,
             best_metric_key="val_loss",
+            is_final_checkpoint=is_final_checkpoint,
         )
         self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
         return True
@@ -1005,6 +1020,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             train_loss=None,
             val_loss=None,
             best_metric_key="val_loss",
+            is_final_checkpoint=True,
         )
         self._log_saved_checkpoint("final", completed_epochs, gs)
         return True
@@ -1373,6 +1389,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     train_loss=None,
                     val_loss=val_loss_dict,
                     best_metric_key="val_loss",
+                    is_final_checkpoint=epoch + 1 >= self.num_epochs,
                 )
                 self._log_saved_checkpoint("epoch", epoch + 1, self.runtime.global_step)
 

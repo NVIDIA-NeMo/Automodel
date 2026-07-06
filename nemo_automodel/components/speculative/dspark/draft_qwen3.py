@@ -37,6 +37,7 @@ from nemo_automodel.components.speculative.dspark.common import (
     build_eval_mask,
     create_noise_embed,
     create_position_ids,
+    pin_rope_inv_freq_fp32,
     sample_anchor_positions,
 )
 from nemo_automodel.components.speculative.dspark.markov_head import build_markov_head
@@ -248,6 +249,17 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                 input_dim += config.markov_rank
             self.confidence_head = AcceptRatePredictor(input_dim=input_dim)
         self.post_init()
+
+    def _apply(self, fn, recurse: bool = True):
+        """Keep the RoPE ``inv_freq`` buffer in fp32 across dtype casts.
+
+        ``model.to(bfloat16)`` (the training build path) would otherwise round
+        ``inv_freq`` to bf16 and dephase RoPE with absolute position, eroding
+        draft acceptance (see ``pin_rope_inv_freq_fp32``).
+        """
+        module = super()._apply(fn, recurse=recurse)
+        pin_rope_inv_freq_fp32(getattr(self, "rotary_emb", None))
+        return module
 
     def initialize_embeddings_and_head(
         self,

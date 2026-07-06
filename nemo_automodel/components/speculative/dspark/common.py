@@ -217,6 +217,47 @@ def create_noise_embed(
     return embed_tokens(noise_ids)
 
 
+def pin_rope_inv_freq_fp32(rotary_emb: Optional[nn.Module]) -> None:
+    """Keep a RoPE module's ``inv_freq`` buffers in fp32 after a dtype cast.
+
+    ``module.to(bfloat16)`` (the training build path) rounds the rotary
+    ``inv_freq`` buffers to bf16. The rounded frequencies dephase with absolute
+    position, so the train/inference RoPE diverges (worse with longer context)
+    and draft acceptance erodes, while the serving runtime keeps an fp32 RoPE
+    cache. A bf16 round-trip cannot be undone by upcasting, so recompute fresh
+    fp32 frequencies from a fresh rotary module built off the same config (the
+    same values HF derives on the fp32 paths) and copy them back in.
+
+    Works for both the single-buffer layout (``inv_freq`` / ``original_inv_freq``,
+    e.g. Qwen3) and the per-layer-type layout where each frequency buffer is named
+    ``<layer_type>_inv_freq`` (e.g. Gemma4). No-op when every frequency buffer is
+    already fp32 or on a meta device.
+    """
+    if rotary_emb is None:
+        return
+    # Match both ``inv_freq``/``original_inv_freq`` and ``<layer_type>_inv_freq``.
+    rounded = {
+        name: buf
+        for name, buf in rotary_emb.named_buffers(recurse=False)
+        if name.endswith("inv_freq")
+        and buf is not None
+        and buf.is_floating_point()
+        and not buf.is_meta
+        and buf.dtype != torch.float32
+    }
+    if not rounded:
+        return
+    config = getattr(rotary_emb, "config", None)
+    if config is None:
+        return
+    # Rebuild a fresh module of the same type to recompute the frequencies in
+    # fp32; upcasting the rounded buffers in place cannot recover the lost bits.
+    fresh = type(rotary_emb)(config)
+    for name, fresh_buf in fresh.named_buffers(recurse=False):
+        if name in rounded:
+            setattr(rotary_emb, name, fresh_buf.to(device=rounded[name].device, dtype=torch.float32))
+
+
 __all__ = [
     "DSparkForwardOutput",
     "AcceptRatePredictor",
@@ -227,4 +268,5 @@ __all__ = [
     "build_eval_mask",
     "create_position_ids",
     "create_noise_embed",
+    "pin_rope_inv_freq_fp32",
 ]
