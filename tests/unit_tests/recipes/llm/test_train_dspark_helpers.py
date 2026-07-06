@@ -570,10 +570,18 @@ def test_cached_dspark_manifest_accepts_matching_shapes():
     _validate_cached_manifest()
 
 
+def test_cached_dspark_manifest_warns_on_target_path_mismatch(caplog):
+    caplog.set_level("WARNING")
+    _validate_cached_manifest(
+        manifest=_cached_manifest(target_model="/precompute/path/to/target"),
+        target_model="/training/path/to/target",
+    )
+    assert "raw paths can differ across machines" in caplog.text
+
+
 @pytest.mark.parametrize(
     "manifest,target_config,target_layer_ids,pattern",
     [
-        (_cached_manifest(target_model="other-qwen3"), _target_config(), [1, 3, 5], "target_model"),
         (_cached_manifest(target_model_type="llama"), _target_config(), [1, 3, 5], "target_model_type"),
         (_cached_manifest(target_vocab_size=65), _target_config(), [1, 3, 5], "target_vocab_size"),
         (_cached_manifest(hidden_size=16), _target_config(), [1, 3, 5], "hidden_size"),
@@ -687,7 +695,7 @@ def test_recipe_cached_path_does_not_load_target_model(monkeypatch, tmp_path):
     monkeypatch.setattr(
         train_dspark_module.NeMoAutoTokenizer,
         "from_pretrained",
-        lambda *_args, **_kwargs: _tok(chat_template=JINJA),
+        lambda *_args, **_kwargs: _tok(chat_template=None),
     )
     monkeypatch.setattr(
         train_dspark_module.NeMoAutoModelForCausalLM,

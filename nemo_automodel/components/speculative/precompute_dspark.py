@@ -198,6 +198,8 @@ def _run(args: argparse.Namespace) -> int:
     num_samples = len(dataloader.dataset)
     hidden_size = int(target_text_config.hidden_size)
 
+    # The manifest guards resume for tensor-shaping target/cache settings. If dataset
+    # or tokenization inputs change, use a fresh output directory instead of --resume.
     manifest = {
         "target_model": args.target_model,
         "target_model_type": model_type,

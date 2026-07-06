@@ -319,9 +319,13 @@ def _validate_cached_dspark_manifest(
 ) -> None:
     """Validate that a DSpark offline cache matches the configured target/draft run."""
     if str(manifest["target_model"]) != str(target_model):
-        raise ValueError(
-            f"DSpark cache at {cache_dir} was built for target_model={manifest['target_model']!r}, "
-            f"but this run configured target_model={target_model!r}. The cache does not match this target."
+        logger.warning(
+            "DSpark cache at %s was built for target_model=%r, but this run configured target_model=%r. "
+            "Continuing because raw paths can differ across machines; structural cache fields will still be "
+            "validated.",
+            cache_dir,
+            manifest["target_model"],
+            target_model,
         )
     if str(manifest["target_model_type"]) != str(target_model_type):
         raise ValueError(
@@ -416,10 +420,13 @@ class TrainDSparkRecipe(BaseRecipe):
             )
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(target_path, trust_remote_code=trust_remote_code)
-        # DSpark renders 'messages'-format data with the tokenizer's chat template;
-        # some targets (e.g. DeepSeek-V4-Flash) ship none, so recipe_args.chat_template
-        # supplies / overrides it (see the helper for the matching + loss-span rules).
-        _apply_target_chat_template(self.tokenizer, recipe_cfg.get("chat_template", None))
+        chat_template = recipe_cfg.get("chat_template", None)
+        # Online DSpark renders 'messages'-format data here and needs the tokenizer's
+        # chat template. Offline cached training consumes already-tokenized cache
+        # tensors, so a missing template should not block training; still apply an
+        # explicit override so saved checkpoints carry the requested tokenizer state.
+        if self.cached_target_path is None or chat_template is not None:
+            _apply_target_chat_template(self.tokenizer, chat_template)
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
         if is_deepseek_v4_target:
