@@ -204,6 +204,26 @@ def test_full_moe_scope_uses_explicit_parameters(monkeypatch):
     manager.close()
 
 
+def test_full_moe_scope_uses_the_fsdp_block_as_capture_owner(monkeypatch):
+    class _FSDPBlock(nn.Module):
+        pass
+
+    monkeypatch.setattr(torch.distributed.fsdp, "FSDPModule", _FSDPBlock)
+    owner = _FSDPBlock()
+    target = _MoeExecution()
+    block = partial_graphs._DiscoveredBlock(
+        name="test.layers.0",
+        module=owner,
+        capture_owner=owner,
+        moe=None,
+        is_mtp=False,
+    )
+
+    entry = partial_graphs._build_moe_execution_entry(block, target, False)
+
+    assert entry.capture_owner is owner
+
+
 def test_explicit_parameter_adapter_matches_eager_forward_and_backward():
     torch.manual_seed(123)
     eager_target = _Attention()
