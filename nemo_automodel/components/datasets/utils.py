@@ -18,6 +18,8 @@ from typing import Optional
 import torch
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
+from nemo_automodel.shared.utils import dtype_from_str
+
 try:
     from transformers.masking_utils import create_bidirectional_mask
 
@@ -230,17 +232,24 @@ def add_causal_masks_to_batch(batch_dict, model_config):
     return batch_dict
 
 
-def _torch_dtype_from_config(value, default=torch.float32):
-    if isinstance(value, torch.dtype):
-        return value
-    if isinstance(value, str):
-        name = value.rsplit(".", 1)[-1]
-        return getattr(torch, name, default)
-    return default
+def create_bidirectional_mask_for_batch(
+    model_config,
+    attention_mask: torch.Tensor | None,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    """Create a bidirectional encoder mask from a batched 2D attention mask.
 
+    Args:
+        model_config: HuggingFace model config of the encoder consuming the mask.
+        attention_mask: Batched 2D padding mask; higher-rank masks pass through unchanged.
+        device: Device for the returned mask. Defaults to ``attention_mask.device``.
+        dtype: Mask dtype. Defaults to the dtype recorded in ``model_config``.
 
-def create_bidirectional_mask_for_batch(model_config, attention_mask, device=None, dtype=None):
-    """Create a bidirectional encoder mask from a batched 2D attention mask."""
+    Returns:
+        The mask in the format expected by the config's attention implementation,
+        or ``None`` when no masking is needed.
+    """
     if attention_mask is None:
         return None
     if attention_mask.dim() > 2:
@@ -249,8 +258,9 @@ def create_bidirectional_mask_for_batch(model_config, attention_mask, device=Non
     if device is None:
         device = attention_mask.device
     if dtype is None:
-        dtype = _torch_dtype_from_config(
-            getattr(model_config, "torch_dtype", None) or getattr(model_config, "dtype", None)
+        dtype = dtype_from_str(
+            getattr(model_config, "torch_dtype", None) or getattr(model_config, "dtype", None),
+            default=torch.float32,
         )
     attention_mask = attention_mask.to(device=device)
 
@@ -270,8 +280,20 @@ def create_bidirectional_mask_for_batch(model_config, attention_mask, device=Non
     return _prepare_4d_attention_mask(attention_mask, dtype)
 
 
-def add_bidirectional_masks_to_retrieval_batch(batch_dict, model_config, dtype=None):
-    """Add q_/d_ bidirectional masks to a retrieval batch."""
+def add_bidirectional_masks_to_retrieval_batch(
+    batch_dict: dict, model_config, dtype: torch.dtype | None = None
+) -> dict:
+    """Add q_/d_ bidirectional masks to a retrieval batch.
+
+    Args:
+        batch_dict: Collated retrieval batch with ``q_``/``d_``-prefixed tensors.
+        model_config: HuggingFace model config of the encoder consuming the masks.
+        dtype: Mask dtype forwarded to :func:`create_bidirectional_mask_for_batch`.
+
+    Returns:
+        The same ``batch_dict`` with ``*_bidirectional_mask`` and
+        ``*_bidirectional_mask_precomputed`` entries added in place.
+    """
     for prefix in ("q_", "d_"):
         attention_key = f"{prefix}attention_mask"
         if attention_key not in batch_dict:

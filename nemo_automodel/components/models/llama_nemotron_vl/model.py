@@ -546,7 +546,7 @@ def _replace_image_token_embeddings(
     input_ids: torch.Tensor,
     vit_embeds: torch.Tensor,
     img_context_token_id: int,
-    image_token_indices: Optional[torch.Tensor] = None,
+    image_token_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Replace image placeholder token embeddings with vision embeddings."""
     batch_size, seq_len, hidden_size = input_embeds.shape
@@ -1104,13 +1104,15 @@ def replace_language_model_with_custom_llama(
     dtype = parameter.dtype if parameter is not None else buffer.dtype if buffer is not None else None
 
     new_language_model = OptimizedLlamaBidirectionalModel(old_language_model.config, backend=backend)
+    # assign=True adopts the old tower's tensors in place of the freshly
+    # initialized ones, so the swap never holds a second copy of the weights
+    # on device; the .to() below only moves buffers absent from the state dict.
+    missing, unexpected = new_language_model.load_state_dict(old_language_model.state_dict(), strict=False, assign=True)
     if device is not None:
         if dtype is not None and dtype.is_floating_point:
             new_language_model = new_language_model.to(device=device, dtype=dtype)
         else:
             new_language_model = new_language_model.to(device=device)
-
-    missing, unexpected = new_language_model.load_state_dict(old_language_model.state_dict(), strict=False)
     extra_state_missing = [key for key in missing if key.endswith("._extra_state")]
     real_missing = [key for key in missing if key not in extra_state_missing]
     if real_missing or unexpected:
@@ -1507,8 +1509,8 @@ class LlamaNemotronVLModel(PreTrainedModel):
         return_dict: Optional[bool] = None,
         num_patches_list: Optional[List[torch.Tensor]] = None,
         run_dummy_vision: Optional[bool] = None,
-        image_token_indices: Optional[torch.LongTensor] = None,
-        bidirectional_mask: Optional[torch.Tensor] = None,
+        image_token_indices: torch.LongTensor | None = None,
+        bidirectional_mask: torch.Tensor | None = None,
         bidirectional_mask_precomputed: bool = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict

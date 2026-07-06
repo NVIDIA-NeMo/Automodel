@@ -25,6 +25,7 @@ import torch.nn.functional as F
 import wandb
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from transformers import PretrainedConfig
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -252,9 +253,9 @@ def build_dataloader(
     batch_size=None,
     dp_rank=0,
     dp_world_size=1,
-    precompute_bidirectional_mask=False,
-    bidirectional_mask_model_config=None,
-    bidirectional_mask_dtype=None,
+    precompute_bidirectional_mask: bool = False,
+    bidirectional_mask_model_config: PretrainedConfig | None = None,
+    bidirectional_mask_dtype: torch.dtype | None = None,
 ):
     """Build a DataLoader for encoder training."""
     with ScopedRNG(seed=seed, ranked=True):

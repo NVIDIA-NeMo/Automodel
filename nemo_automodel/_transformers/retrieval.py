@@ -26,6 +26,10 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICA
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.components.checkpoint.checkpointing import (
+    _materialize_to_hf_views_for_save,
+    _maybe_adapt_state_dict_to_hf,
+)
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
 
@@ -328,13 +332,8 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
         return
 
     logger.info(f"Saving encoder model to {save_directory}")
-    state_dict = model.state_dict()
-    adapter = getattr(model, "state_dict_adapter", None)
-    if adapter is not None:
-        state_dict = adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*")
-        for key, value in list(state_dict.items()):
-            if isinstance(value, torch.Tensor) and not value.is_contiguous():
-                state_dict[key] = value.contiguous()
+    state_dict = _maybe_adapt_state_dict_to_hf(model, model.state_dict())
+    _materialize_to_hf_views_for_save(state_dict)
     model.model.save_pretrained(save_directory, state_dict=state_dict)
 
 
