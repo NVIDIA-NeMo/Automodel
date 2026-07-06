@@ -140,6 +140,7 @@ def test_whole_attention_scope_uses_explicit_parameters_on_single_device(monkeyp
     def make_graphed_callables(modules, sample_args, **kwargs):
         captured_sample_args.append(sample_args)
         assert kwargs["retain_graph_in_backward"] is True
+        assert kwargs["num_warmup_iters"] == 3
         for module in modules:
             module.reset = lambda: None
         return modules

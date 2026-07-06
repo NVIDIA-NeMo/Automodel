@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size
+from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size, main
 
 
 class ConfigNamespace(SimpleNamespace):
@@ -75,8 +75,12 @@ def patch_torch_distributed_for_benchmark():
 
 
 @pytest.fixture
-def mock_config():
+def mock_config(monkeypatch):
     """Create a mock configuration for testing."""
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained",
+        lambda *_args, **_kwargs: SimpleNamespace(vocab_size=50257),
+    )
     config = ConfigNamespace(
         benchmark=SimpleNamespace(
             warmup_steps=10,
@@ -108,8 +112,10 @@ def mock_config():
 
 
 @pytest.fixture
-def mock_recipe(mock_config):
+def mock_recipe(mock_config, monkeypatch):
     """Create a mock benchmarking recipe instance."""
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", MagicMock())
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", MagicMock())
     with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
         recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
         recipe.cfg = mock_config
@@ -460,6 +466,7 @@ class TestBenchmarkingRecipeRunBenchmark:
     def test_run_benchmark_optimizer_step_per_iteration(self, mock_recipe):
         """Test that optimizer step is called once per iteration."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
+        mock_recipe._capture_partial_cuda_graphs_after_eager_step = MagicMock()
 
         # Mock _forward_backward_step to append loss to loss_buffer
         def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
@@ -498,6 +505,7 @@ class TestBenchmarkingRecipeRunBenchmark:
 
             # Should be called 30 times (once per iteration)
             assert mock_recipe.optimizer[0].step.call_count == 30
+            assert mock_recipe._capture_partial_cuda_graphs_after_eager_step.call_count == 30
 
     def test_run_benchmark_calls_gc_hook_per_iteration(self, mock_recipe):
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
@@ -563,6 +571,23 @@ class TestBenchmarkingRecipeHelpers:
         with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
             with pytest.raises(AttributeError):
                 BenchmarkingRecipeForNextTokenPrediction(config_without_benchmark)
+
+    def test_main_closes_partial_cuda_graphs_when_setup_fails(self):
+        recipe = MagicMock()
+        recipe.setup.side_effect = RuntimeError("setup failed")
+
+        with (
+            patch("nemo_automodel.recipes.llm.benchmark.parse_args_and_load_config", return_value=MagicMock()),
+            patch(
+                "nemo_automodel.recipes.llm.benchmark.BenchmarkingRecipeForNextTokenPrediction",
+                return_value=recipe,
+            ),
+            pytest.raises(RuntimeError, match="setup failed"),
+        ):
+            main("config.yaml")
+
+        recipe.run_benchmark.assert_not_called()
+        recipe._close_partial_cuda_graphs.assert_called_once_with()
 
 
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
