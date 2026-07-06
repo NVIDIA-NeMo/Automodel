@@ -798,6 +798,40 @@ class MagiState:
             batch, _ = magi_prepare_vlm(model, batch, self.cp_group)
         return nullcontext, batch
 
+    def prepare_batch(
+        self,
+        model,
+        batch,
+        *,
+        device_mesh,
+        domain: str = "llm",
+        is_thd: bool = False,
+        pad_id: int = 0,
+        num_chunks: int = 1,
+    ):
+        """Uniform per-step batch prep entry point (assumes ``enabled``).
+
+        The single method the CP dispatcher (``cp_utils.prepare_cp_forward``)
+        calls, so magi's llm/vlm split and per-domain argument needs stay in
+        this module instead of leaking into the dispatcher. Returns
+        ``(train_ctx, batch)``; magi does its own CP, so ``train_ctx`` is
+        always ``nullcontext``.
+
+        Args:
+            model: The model part (attention modules get keys/specs stamped).
+            batch: The full-sequence batch.
+            device_mesh: The full device mesh (cp=1 THD conversion reads it).
+            domain: ``"llm"`` or ``"vlm"`` recipe domain.
+            is_thd: THD-packed collator is active (llm domain only).
+            pad_id: Pad sentinel for ``input_ids`` (llm domain only).
+            num_chunks: THD chunk count (llm domain only).
+        """
+        if domain == "vlm":
+            return self.prepare_vlm_batch(model, batch)
+        return self.prepare_llm_batch(
+            model, batch, device_mesh=device_mesh, is_thd=is_thd, pad_id=pad_id, num_chunks=num_chunks
+        )
+
 
 def setup_magi(cfg, device_mesh, *, label: str = "") -> MagiState:
     """Resolve MagiAttention from config: register the backend and CP group.

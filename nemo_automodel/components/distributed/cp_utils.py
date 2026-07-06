@@ -376,17 +376,18 @@ def prepare_cp_forward(
                     batch.pop(k, None)
 
     if magi_enabled:
-        if domain == "vlm":
-            ctx, batch = magi.prepare_vlm_batch(model, batch)  # pragma: no cover - requires GPU + magi_attention
-        else:
-            ctx, batch = magi.prepare_llm_batch(  # pragma: no cover - requires GPU + magi_attention
-                model,
-                batch,
-                device_mesh=device_mesh,
-                is_thd=use_te,
-                pad_id=padding_token_id,
-                num_chunks=num_chunks,
-            )
+        # Duck-typed backend prep: magi owns its llm/vlm split and argument
+        # needs behind one method (see MagiState.prepare_batch); the dispatcher
+        # knows only the (ctx, batch) contract.
+        ctx, batch = magi.prepare_batch(
+            model,
+            batch,
+            device_mesh=device_mesh,
+            domain=domain,
+            is_thd=use_te,
+            pad_id=padding_token_id,
+            num_chunks=num_chunks,
+        )
         return ctx, batch, cp_sharder
 
     ctx, batch = make_cp_batch_and_ctx(

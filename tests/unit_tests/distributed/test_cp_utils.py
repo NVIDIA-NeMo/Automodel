@@ -584,3 +584,36 @@ def test_synthesize_single_document_seq_ids_noop_when_present():
     batch = {"input_ids": torch.zeros(1, 6, dtype=torch.long), "_packed_seq_ids": existing}
     _cm._synthesize_single_document_seq_ids(batch, 6)
     assert torch.equal(batch["_packed_seq_ids"], existing)
+
+
+def test_prepare_cp_forward_delegates_to_magi_prepare_batch():
+    """The dispatcher must call the uniform MagiState.prepare_batch and never
+    reach the torch-native CP path when magi is enabled."""
+    import contextlib as _ctxlib
+    from types import SimpleNamespace
+
+    seen = {}
+
+    class _FakeMagi:
+        enabled = True
+
+        def prepare_batch(self, model, batch, *, device_mesh, domain, is_thd, pad_id, num_chunks):
+            seen.update(model=model, domain=domain, is_thd=is_thd, pad_id=pad_id, num_chunks=num_chunks)
+            return _ctxlib.nullcontext, {"prepared": True}
+
+    model = SimpleNamespace()  # no prepare_model_inputs_for_cp -> hook path skipped
+    ctx, batch, sharder = _cu.prepare_cp_forward(
+        model,
+        _DummyDeviceMesh(cp_size=2, tp_size=1),
+        {"input_ids": torch.tensor([[1, 2]])},
+        magi=_FakeMagi(),
+        domain="llm",
+        use_te=True,
+        padding_token_id=7,
+        num_chunks=3,
+    )
+    assert ctx is _ctxlib.nullcontext
+    assert batch == {"prepared": True}
+    assert sharder is None
+    assert seen["model"] is model
+    assert (seen["domain"], seen["is_thd"], seen["pad_id"], seen["num_chunks"]) == ("llm", True, 7, 3)
