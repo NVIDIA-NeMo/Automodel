@@ -132,7 +132,7 @@ class FakeLM(nn.Module):
         self.linear = nn.Linear(hidden, hidden)
         self.saved = []
 
-    def save_pretrained(self, out_dir):
+    def save_pretrained(self, out_dir, state_dict=None):
         self.saved.append(out_dir)
 
 
