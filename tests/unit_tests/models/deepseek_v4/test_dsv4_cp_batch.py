@@ -173,6 +173,27 @@ def test_contiguous_shard_rank0_slice():
     torch.testing.assert_close(out["input_ids"], torch.arange(0, 4).view(1, 4))
 
 
+def test_cp_size_one_native_thd_preserves_packed_batch_without_padding():
+    batch = {
+        "input_ids": torch.arange(8).view(1, 8),
+        "labels": torch.arange(8).view(1, 8),
+        "attention_mask": torch.tensor([[1, 1, 1, 0, 1, 1, 0, 0]]),
+        "seq_lens": torch.tensor([[3, 2]]),
+        "seq_lens_padded": torch.tensor([[4, 4]]),
+    }
+    expected = {key: value.clone() for key, value in batch.items()}
+
+    ctx, out = _shard(batch, cp_size=1, local_rank=0, pad_multiple=8, padding_token_id=99)
+
+    assert ctx is contextlib.nullcontext
+    assert out["qkv_format"] == "thd"
+    assert "_dsv4_cp_group" not in out
+    assert "packed_seq_ids" not in out
+    assert "padding_mask" not in out
+    for key, value in expected.items():
+        torch.testing.assert_close(out[key], value)
+
+
 def test_contiguous_shard_pads_to_divisor():
     # seq=5, cp_size=2, pad_multiple=2 -> divisor=2*max(2,2)=4 -> pad to 8.
     batch = {"input_ids": torch.arange(5).view(1, 5), "labels": torch.arange(5).view(1, 5)}
@@ -220,8 +241,8 @@ def test_contiguous_shard_attention_mask_4d_to_padding_mask():
         "labels": torch.arange(seq).view(1, seq),
         "attention_mask": attn,
     }
-    _, out = _shard(batch, cp_size=1, local_rank=0)
-    torch.testing.assert_close(out["padding_mask"], torch.tensor([[False, False, True, True]]))
+    _, out = _shard(batch, cp_size=2, local_rank=1)
+    torch.testing.assert_close(out["padding_mask"], torch.tensor([[True, True]]))
 
 
 def test_contiguous_shard_attention_mask_4d_bool():
@@ -234,8 +255,8 @@ def test_contiguous_shard_attention_mask_4d_bool():
         "labels": torch.arange(seq).view(1, seq),
         "attention_mask": attn,
     }
-    _, out = _shard(batch, cp_size=1, local_rank=0)
-    torch.testing.assert_close(out["padding_mask"], torch.tensor([[False, False, False, True]]))
+    _, out = _shard(batch, cp_size=2, local_rank=1)
+    torch.testing.assert_close(out["padding_mask"], torch.tensor([[False, True]]))
 
 
 def test_contiguous_shard_inputs_embeds_path():

@@ -449,14 +449,25 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     ``pad_multiple`` is the required *per-CP-rank* shard multiple (from
     ``dsv4_cp_local_seq_multiple``); the global sequence is padded so it is divisible
     by ``cp_size`` and each local shard is divisible by ``pad_multiple`` (>= 2).
+    At CP size one, the native THD route only marks packed input as THD and leaves
+    its tensors and packing metadata unchanged.
     """
     import contextlib
 
     cp_size = cp_mesh.size()
+    packed = batch.get("qkv_format") == "thd" or "seq_lens" in batch or "cu_seqlens" in batch
+    if cp_size <= 1:
+        if packed:
+            batch["qkv_format"] = "thd"
+        if "labels" not in batch and loss_mask is not None:
+            batch["labels"] = loss_mask
+        elif loss_mask is not None:
+            batch["loss_mask"] = loss_mask
+        return contextlib.nullcontext, batch
+
     local_multiple = max(int(pad_multiple or 2), 2)
     divisor = cp_size * local_multiple
 
-    packed = batch.get("qkv_format") == "thd" or "seq_lens" in batch or "cu_seqlens" in batch
     if "cu_seqlens" in batch and "seq_lens" not in batch:
         raise NotImplementedError(
             "DeepSeek V4 model-owned packed CP expects BSHD packed metadata (`seq_lens`); "

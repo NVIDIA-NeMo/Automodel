@@ -443,17 +443,13 @@ def build_dataloader(
                 logger.info(f"Configured neat packing for attn_implementation={_attn_impl}")
             else:
                 # "thd" — existing packing logic
-                # Native THD models perform their own CP alignment after collation.
-                # Generic per-document CP padding would change pack boundaries and
-                # make otherwise equivalent CP sizes train on different samples.
-                packing_cp_size = 1 if bool(getattr(model, "supports_thd", False)) else cp_size
                 ds = pack_dataset(
                     ds,
                     split=cfg_ds.split,
                     packed_sequence_size=packed_sequence_size,
                     max_packs=getattr(cfg_ps, "max_packs", None),
                     padding_idx=getattr(tokenizer, "pad_token_id", 0),
-                    cp_size=packing_cp_size,
+                    cp_size=cp_size,
                 )
 
         if isinstance(ds, MegatronPretraining):

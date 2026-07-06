@@ -643,8 +643,8 @@ def test_build_dataloader_prepacked_sequence_skips_recipe_packing(monkeypatch):
     assert ds._shuffle_calls == []
 
 
-@pytest.mark.parametrize(("supports_thd", "expected_cp_size"), [(True, 1), (False, 2)])
-def test_build_dataloader_native_thd_owns_cp_packing_alignment(monkeypatch, supports_thd, expected_cp_size):
+@pytest.mark.parametrize("supports_thd", [True, False])
+def test_build_dataloader_packing_uses_configured_cp_size(monkeypatch, supports_thd):
     captured = {}
 
     def fake_pack_dataset(dataset, **kwargs):
@@ -692,7 +692,7 @@ def test_build_dataloader_native_thd_owns_cp_packing_alignment(monkeypatch, supp
     )
 
     assert dl == "dl"
-    assert captured["cp_size"] == expected_cp_size
+    assert captured["cp_size"] == 2
 
 
 class _FlagCM(AbstractContextManager):
