@@ -299,6 +299,9 @@ def _source_load_run_id() -> str:
 
     master_port = os.environ.get("MASTER_PORT", "unknown")
     world_size = os.environ.get("WORLD_SIZE", "1")
+    # Local fallback is intended for single-node torchrun/debug runs. Multi-node
+    # non-SLURM launches should provide a meaningful TORCHELASTIC_RUN_ID so all
+    # nodes agree on the same marker path.
     return _sanitize_sync_id(f"local_ppid_{os.getppid()}_port_{master_port}_world_{world_size}")
 
 
@@ -306,7 +309,6 @@ def _source_load_sync_paths(cfg) -> tuple[Path, Path, Path]:
     """Return sync directory and done/fail paths for pre-init source-load parity."""
     checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
     sync_dir = checkpoint_dir.parent / f".source_load_parity_{_source_load_run_id()}"
-    sync_dir.mkdir(parents=True, exist_ok=True)
     return sync_dir, sync_dir / "done", sync_dir / "fail"
 
 
@@ -326,6 +328,8 @@ def _wait_for_source_load_rank0(done_path: Path, fail_path: Path) -> None:
 def _cleanup_source_load_sync(cfg) -> None:
     """Best-effort cleanup of pre-init source-load sync markers."""
     sync_dir, done_path, fail_path = _source_load_sync_paths(cfg)
+    if not sync_dir.exists():
+        return
     for path in (done_path, fail_path):
         path.unlink(missing_ok=True)
     try:
@@ -344,10 +348,11 @@ def _prepare_source_load_reference(
 ) -> tuple[torch.Tensor, bool | None, bool | None] | None:
     """Compute raw HF source-load reference logits before trainer construction."""
     if _preinit_world_size() > 1:
-        _, done_path, fail_path = _source_load_sync_paths(cfg)
+        sync_dir, done_path, fail_path = _source_load_sync_paths(cfg)
         if _preinit_global_rank() != 0:
             _wait_for_source_load_rank0(done_path, fail_path)
             return None
+        sync_dir.mkdir(parents=True, exist_ok=True)
         done_path.unlink(missing_ok=True)
         fail_path.unlink(missing_ok=True)
     else:
