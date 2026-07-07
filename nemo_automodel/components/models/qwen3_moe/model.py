@@ -49,12 +49,12 @@ class Block(nn.Module):
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
 
         # Qwen3-MoE sparsifies every decoder_sparse_step layer, unless in mlp_only_layers
-        self.is_moe_layer = (
+        is_moe_layer = (
             (layer_idx not in getattr(config, "mlp_only_layers", []))
             and (getattr(config, "num_experts", 0) > 0)
             and ((layer_idx + 1) % getattr(config, "decoder_sparse_step", 1) == 0)
         )
-        if self.is_moe_layer:
+        if is_moe_layer:
             self.mlp = MoE(moe_config, backend)
         else:
             self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
@@ -92,8 +92,12 @@ class Block(nn.Module):
         return x
 
     def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if not self.is_moe_layer:
+        # Activation checkpointing wraps the MLP, so inspect the inner module
+        # to select the call signature while still invoking the wrapper.
+        mlp = getattr(self.mlp, "_checkpoint_wrapped_module", self.mlp)
+        if isinstance(mlp, MLP):
             return self.mlp(x)
+        assert isinstance(mlp, MoE)
         return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):

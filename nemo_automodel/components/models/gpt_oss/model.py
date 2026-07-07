@@ -48,7 +48,6 @@ class Block(nn.Module):
         self.self_attn = GptOssAttention(
             config, backend, use_sliding_attention=config.layer_types[layer_idx] == "sliding_attention"
         )
-        self.is_moe_layer = True
         self.mlp = MoE(moe_config, backend)
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.input_layernorm = initialize_rms_norm_module(
@@ -82,8 +81,6 @@ class Block(nn.Module):
         return x
 
     def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if not self.is_moe_layer:
-            return self.mlp(x)
         return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):

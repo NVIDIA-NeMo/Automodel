@@ -22,7 +22,7 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gpt_oss.model import Block, GptOssForCausalLM, GptOssModel
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.moe.layers import MoE
 
 
 @pytest.fixture
@@ -195,41 +195,17 @@ class TestBlock:
                 padding_mask = kwargs.get("padding_mask")
             assert padding_mask is not None
 
-    def test_mlp_handling_regular_mlp(self, gpt_config, backend_config, device):
-        """Test _mlp method with regular MLP."""
-        # Create a config that would result in regular MLP
-        moe_config = MoEConfig(
-            dim=128,
-            inter_dim=256,
-            moe_inter_dim=256,
-            n_routed_experts=0,
-            n_shared_experts=1,
-            n_activated_experts=1,
-            n_expert_groups=1,
-            n_limited_groups=1,
-            train_gate=True,
-            gate_bias_update_factor=0,
-            score_func="softmax",
-            route_scale=1.0,
-            aux_loss_coeff=0.01,
-            norm_topk_prob=False,
-            expert_bias=True,
-            router_bias=True,
-            expert_activation="quick_geglu",
-            activation_alpha=1.702,
-            activation_limit=7.0,
-        )
-
+    def test_mlp_forwards_padding_mask_to_moe(self, gpt_config, moe_config, backend_config, device):
+        """Test that GPT-OSS always invokes its MoE with the padding mask."""
         block = Block(0, gpt_config, moe_config, backend_config)
-
-        # Manually replace with regular MLP for testing
-        block.is_moe_layer = False
-        block.mlp = MLP(dim=128, inter_dim=256, backend="torch")
         block = block.to(device)
-
         x = torch.randn(2, 8, 128, dtype=torch.bfloat16, device=device)
-        output = block._mlp(x, padding_mask=None)
+        padding_mask = torch.zeros(2, 8, dtype=torch.bool, device=device)
 
+        with patch.object(block.mlp, "forward", return_value=torch.zeros_like(x)) as mock_moe:
+            output = block._mlp(x, padding_mask)
+
+        mock_moe.assert_called_once_with(x, padding_mask)
         assert output.shape == x.shape
         assert output.device == device
 
