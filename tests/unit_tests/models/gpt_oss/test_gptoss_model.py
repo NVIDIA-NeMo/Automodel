@@ -195,20 +195,6 @@ class TestBlock:
                 padding_mask = kwargs.get("padding_mask")
             assert padding_mask is not None
 
-    def test_mlp_forwards_padding_mask_to_moe(self, gpt_config, moe_config, backend_config, device):
-        """Test that GPT-OSS always invokes its MoE with the padding mask."""
-        block = Block(0, gpt_config, moe_config, backend_config)
-        block = block.to(device)
-        x = torch.randn(2, 8, 128, dtype=torch.bfloat16, device=device)
-        padding_mask = torch.zeros(2, 8, dtype=torch.bool, device=device)
-
-        with patch.object(block.mlp, "forward", return_value=torch.zeros_like(x)) as mock_moe:
-            output = block._mlp(x, padding_mask)
-
-        mock_moe.assert_called_once_with(x, padding_mask)
-        assert output.shape == x.shape
-        assert output.device == device
-
     def test_init_weights(self, gpt_config, moe_config, backend_config, device):
         """Test Block weight initialization."""
         block = Block(0, gpt_config, moe_config, backend_config)

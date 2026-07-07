@@ -14,7 +14,6 @@
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
@@ -44,14 +43,38 @@ class _RecordingMoE(MoE):
         return torch.zeros_like(x)
 
 
-@pytest.mark.parametrize("block_cls", [GptOssBlock, Qwen3MoeBlock])
-def test_moe_dispatch_uses_wrapped_module_type(block_cls):
+class _ZeroAttention(nn.Module):
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        return torch.zeros_like(x)
+
+
+def test_gpt_oss_forwards_to_checkpoint_wrapped_moe():
+    x = torch.randn(2, 3, 8)
+    padding_mask = torch.ones(2, 3, dtype=torch.bool)
+    mlp = _RecordingMoE()
+    block = SimpleNamespace(
+        self_attn=_ZeroAttention(),
+        input_layernorm=nn.Identity(),
+        post_attention_layernorm=nn.Identity(),
+        mlp=checkpoint_wrapper(mlp),
+    )
+
+    output = GptOssBlock.forward(block, x, freqs_cis=torch.empty(0), padding_mask=padding_mask)
+
+    assert output.shape == x.shape
+    torch.testing.assert_close(output, x)
+    assert len(mlp.calls) == 1
+    torch.testing.assert_close(mlp.calls[0][0], x)
+    assert mlp.calls[0][1] is padding_mask
+
+
+def test_qwen3_moe_dispatch_uses_wrapped_module_type():
     x = torch.randn(2, 3, 8)
     padding_mask = torch.ones(2, 3, dtype=torch.bool)
     mlp = _RecordingMoE()
     block = SimpleNamespace(mlp=checkpoint_wrapper(mlp))
 
-    output = block_cls._mlp(block, x, padding_mask)
+    output = Qwen3MoeBlock._mlp(block, x, padding_mask)
 
     assert output.shape == x.shape
     assert len(mlp.calls) == 1
