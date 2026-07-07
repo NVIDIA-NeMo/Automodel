@@ -1191,7 +1191,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     self.device_mesh,
                     batch,
                     invoke_pre_embed=not self.pp_enabled,
-                    pre_embed_no_grad=True,
                 )
                 labels = batch.pop("labels")
                 with train_ctx():

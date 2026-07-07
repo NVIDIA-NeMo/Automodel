@@ -243,7 +243,6 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             self.device_mesh,
             batch,
             invoke_pre_embed=not self.pp_enabled,
-            pre_embed_no_grad=True,
             on_pre_embedded=_check_teacher_compat,
         )
         labels = batch.pop("labels")

@@ -294,7 +294,6 @@ def prepare_cp_forward(
     cp_size: Optional[int] = None,
     invoke_pre_embed: bool = True,
     drop_mm_inputs: bool = False,
-    pre_embed_no_grad: bool = False,
     on_pre_embedded=None,
 ):
     """Single CP dispatch for a training/eval forward: hook -> backend -> (ctx, batch, sharder).
@@ -328,8 +327,6 @@ def prepare_cp_forward(
         drop_mm_inputs: When the hook exists but ``invoke_pre_embed`` is False
             (PP non-first VLM stages), drop multimodal keys except
             ``input_ids`` so stage forwards see only text inputs.
-        pre_embed_no_grad: Run the pre-embed under ``torch.no_grad()``
-            (eval / KD student prep).
         on_pre_embedded: Optional callback receiving the hook's output dict
             before it is merged into the batch (e.g. KD teacher-compat check).
 
@@ -358,9 +355,7 @@ def prepare_cp_forward(
     if effective_cp_size > 1 and has_hook and not magi_replaces_hook:
         if invoke_pre_embed:
             hook_inputs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-            grad_ctx = torch.no_grad() if pre_embed_no_grad else contextlib.nullcontext()
-            with grad_ctx:
-                prepared = model(_pre_embed_only=True, num_chunks=num_chunks, **hook_inputs)
+            prepared = model(_pre_embed_only=True, num_chunks=num_chunks, **hook_inputs)
             if on_pre_embedded is not None:
                 on_pre_embedded(prepared)
             # Pre-embed hooks that return full-sequence ``inputs_embeds`` supersede

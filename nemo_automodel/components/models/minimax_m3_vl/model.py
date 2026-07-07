@@ -637,12 +637,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
         )
-        # Detach: the recipe hands this to torch's context_parallel, which shards
-        # buffers via in-place resize_() and rejects tensors that require grad. The
-        # sharded buffer is fed back into forward() (which rebuilds the autograd graph
-        # from there), and the embeddings/vision tower are frozen for CP runs, so
-        # detaching here loses no gradient.
-        return {"inputs_embeds": inputs_embeds.detach()}
+        return {"inputs_embeds": inputs_embeds}
 
     def forward(
         self,
