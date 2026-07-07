@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU source-load parity tests for force-HF remote-code models."""
+"""CPU source-load parity tests for force-HF source loads."""
 
 from __future__ import annotations
 
@@ -88,6 +88,16 @@ def _is_aliased(model: torch.nn.Module) -> bool:
     return model.lm_head.weight.data_ptr() == model.get_input_embeddings().weight.data_ptr()
 
 
+@pytest.fixture
+def single_torch_thread():
+    previous_num_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous_num_threads)
+
+
 def _write_tiny_remote_checkpoint(model_dir: Path, *, tie_word_embeddings: bool) -> Path:
     model_dir.mkdir()
     module_path = model_dir / "modeling_tiny_remote.py"
@@ -125,6 +135,30 @@ def _write_tiny_remote_checkpoint(model_dir: Path, *, tie_word_embeddings: bool)
     return model_dir
 
 
+def _write_tiny_mistral_checkpoint(model_dir: Path, *, tie_word_embeddings: bool) -> Path:
+    config_module = pytest.importorskip("transformers.models.mistral.configuration_mistral")
+    MistralConfig = config_module.MistralConfig
+
+    config = MistralConfig(
+        vocab_size=29,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        tie_word_embeddings=tie_word_embeddings,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    torch.manual_seed(1234)
+    model = AutoModelForCausalLM.from_config(config, attn_implementation="eager")
+    assert _is_aliased(model) is tie_word_embeddings
+    model.save_pretrained(model_dir, safe_serialization=False)
+    return model_dir
+
+
 @pytest.mark.parametrize("tie_word_embeddings", [False, True])
 def test_force_hf_remote_code_source_load_matches_raw_hf(tmp_path: Path, tie_word_embeddings: bool):
     """NeMo force-HF source load should match the raw HF model for list-form tied-key remote code."""
@@ -154,5 +188,44 @@ def test_force_hf_remote_code_source_load_matches_raw_hf(tmp_path: Path, tie_wor
     with torch.no_grad():
         hf_logits = hf_model(input_ids=input_ids).logits
         nemo_logits = nemo_model(input_ids=input_ids).logits
+
+    torch.testing.assert_close(nemo_logits, hf_logits, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tie_word_embeddings", [False, True])
+def test_force_hf_native_mistral_source_load_matches_raw_hf(
+    tmp_path: Path,
+    tie_word_embeddings: bool,
+    single_torch_thread,
+):
+    """NeMo force-HF source load should match raw HF for a native Mistral causal LM."""
+    model_dir = _write_tiny_mistral_checkpoint(tmp_path / "tiny_mistral", tie_word_embeddings=tie_word_embeddings)
+
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_dir,
+        torch_dtype=torch.float32,
+        attn_implementation="eager",
+    ).eval()
+    is_custom_model, nemo_model = _init_model(
+        NeMoAutoModelForCausalLM,
+        str(model_dir),
+        attn_implementation="eager",
+        torch_dtype=torch.float32,
+        quantization_config=None,
+        force_hf=True,
+    )
+    nemo_model.eval()
+
+    assert is_custom_model is False
+    assert _is_aliased(nemo_model) is tie_word_embeddings
+    assert _is_aliased(hf_model) is tie_word_embeddings
+    torch.testing.assert_close(nemo_model.get_input_embeddings().weight, hf_model.get_input_embeddings().weight)
+    torch.testing.assert_close(nemo_model.lm_head.weight, hf_model.lm_head.weight)
+
+    input_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6]], dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+    with torch.no_grad():
+        hf_logits = hf_model(input_ids=input_ids, attention_mask=attention_mask).logits
+        nemo_logits = nemo_model(input_ids=input_ids, attention_mask=attention_mask).logits
 
     torch.testing.assert_close(nemo_logits, hf_logits, rtol=0, atol=0)
