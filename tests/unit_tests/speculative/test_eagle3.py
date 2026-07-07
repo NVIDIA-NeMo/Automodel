@@ -281,16 +281,22 @@ def test_eagle3_trainer_runs_multi_step_ttt():
 
 
 def test_simulated_accept_length_hand_values():
-    """The chain formula must match hand-computed expectations."""
-    # Perfect draft: every step accepted -> 1 bonus + ttt_steps drafted.
+    """The prefix-survival formula must match hand-computed expectations."""
+    # Perfect draft: every chain survives every depth -> 1 bonus + ttt_steps.
     tau = simulated_accept_length(torch.tensor([4.0, 4.0, 4.0]), torch.tensor([4.0, 4.0, 4.0]))
     assert tau.item() == pytest.approx(4.0)
-    # acc = [0.5, 0.5] -> 1 + 0.5 + 0.25.
-    tau = simulated_accept_length(torch.tensor([2.0, 1.0]), torch.tensor([4.0, 2.0]))
+    # Survival rates [0.5, 0.25] -> 1 + 0.5 + 0.25.
+    tau = simulated_accept_length(torch.tensor([2.0, 1.0]), torch.tensor([4.0, 4.0]))
     assert tau.item() == pytest.approx(1.75)
-    # A step with no supervised positions truncates the chain there:
-    # acc = [0.5, 0, 0.9-ish] -> 1 + 0.5 + 0 + 0.
-    tau = simulated_accept_length(torch.tensor([2.0, 0.0, 9.0]), torch.tensor([4.0, 0.0, 10.0]))
+    # Depth correlation is preserved: with both depths 50% accurate,
+    # coincident hits (the same 2 chains survive depth 2) accept more than
+    # disjoint hits (no chain survives depth 2).
+    tau = simulated_accept_length(torch.tensor([2.0, 2.0]), torch.tensor([4.0, 4.0]))
+    assert tau.item() == pytest.approx(2.0)
+    tau = simulated_accept_length(torch.tensor([2.0, 0.0]), torch.tensor([4.0, 4.0]))
+    assert tau.item() == pytest.approx(1.5)
+    # A step with no supervised positions contributes zero.
+    tau = simulated_accept_length(torch.tensor([2.0, 0.0, 0.0]), torch.tensor([4.0, 0.0, 10.0]))
     assert tau.item() == pytest.approx(1.5)
     # Hopeless draft: nothing accepted beyond the bonus token.
     tau = simulated_accept_length(torch.tensor([0.0, 0.0]), torch.tensor([4.0, 4.0]))
@@ -298,7 +304,7 @@ def test_simulated_accept_length_hand_values():
 
 
 def test_eagle3_trainer_reports_per_step_counts():
-    """The trainer must expose per-TTT-step counts consistent with its aggregates."""
+    """The trainer must expose prefix-hit and loss-mask-based valid counts."""
     torch.manual_seed(0)
     draft = _build_tiny_draft_model()
     config = draft.config
@@ -331,19 +337,72 @@ def test_eagle3_trainer_reports_per_step_counts():
             target_logits=target_logits,
         )
 
-    assert metrics.step_correct is not None and metrics.step_valid is not None
-    assert metrics.step_correct.shape == (ttt_steps,)
+    assert metrics.step_prefix_hits is not None and metrics.step_valid is not None
+    assert metrics.step_prefix_hits.shape == (ttt_steps,)
     assert metrics.step_valid.shape == (ttt_steps,)
-    # The per-step counts must reproduce the aggregate accuracy and valid count.
-    assert metrics.step_valid.sum().item() == metrics.valid_tokens.item()
-    expected_acc = metrics.step_correct.sum().item() / max(metrics.step_valid.sum().item(), 1.0)
-    assert metrics.accuracy.item() == pytest.approx(expected_acc)
-    # Shifting rolls one supervised position out per step, so counts never grow.
-    step_valid = metrics.step_valid.tolist()
-    assert all(a >= b for a, b in zip(step_valid, step_valid[1:]))
-    assert (metrics.step_correct <= metrics.step_valid).all()
-    tau = simulated_accept_length(metrics.step_correct, metrics.step_valid)
+    # The denominator follows the shifted loss mask, ignoring draft-vocab
+    # coverage: with a full loss mask, one position rolls out per step.
+    assert metrics.step_valid.tolist() == [batch_size * seq_len, batch_size * (seq_len - 1), batch_size * (seq_len - 2)]
+    # The coverage-filtered aggregate can only be smaller.
+    assert metrics.valid_tokens.item() <= metrics.step_valid.sum().item()
+    # Prefix hits are AND-accumulated per slot, so they never grow with depth
+    # and never exceed the supervised count.
+    step_prefix_hits = metrics.step_prefix_hits.tolist()
+    assert all(a >= b for a, b in zip(step_prefix_hits, step_prefix_hits[1:]))
+    assert (metrics.step_prefix_hits <= metrics.step_valid).all()
+    tau = simulated_accept_length(metrics.step_prefix_hits, metrics.step_valid)
     assert 1.0 <= tau.item() <= 1.0 + ttt_steps
+
+
+def test_eagle3_trainer_counts_out_of_vocab_targets_as_rejections():
+    """Targets outside the draft vocabulary stay in the acceptance denominator.
+
+    Serving must reject a target token the compressed draft vocabulary cannot
+    emit, so such positions count as chain breaks. Excluding them (as the CE
+    ``position_mask`` does) would bias tau upward whenever vocabulary
+    coverage is below 100%.
+    """
+    torch.manual_seed(0)
+    draft = _build_tiny_draft_model()
+    config = draft.config
+
+    selected_token_ids = torch.arange(config.draft_vocab_size, dtype=torch.long)
+    selected_token_mask = torch.zeros(config.vocab_size, dtype=torch.bool)
+    selected_token_mask[selected_token_ids] = True
+
+    trainer = Eagle3TrainerModule(
+        draft,
+        selected_token_ids=selected_token_ids,
+        selected_token_mask=selected_token_mask,
+        ttt_steps=1,
+    )
+
+    batch_size, seq_len = 1, 8
+    input_ids = torch.randint(0, config.draft_vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    loss_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    aux_hidden_states = torch.randn(batch_size, seq_len, config.hidden_size * 3)
+    # Force the target's greedy token out of the draft vocabulary on the last
+    # four positions; the first four stay in-vocabulary.
+    target_logits = torch.randn(batch_size, seq_len, config.vocab_size)
+    target_logits[:, :4, : config.draft_vocab_size] += 100.0
+    target_logits[:, 4:, config.draft_vocab_size] += 100.0
+
+    with torch.no_grad():
+        metrics = trainer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            aux_hidden_states=aux_hidden_states,
+            target_logits=target_logits,
+        )
+
+    # CE supervision sees only the four covered positions ...
+    assert metrics.valid_tokens.item() == 4
+    # ... but the acceptance denominator keeps all eight, and the four
+    # out-of-vocabulary targets can never be hits.
+    assert metrics.step_valid.tolist() == [seq_len]
+    assert metrics.step_prefix_hits.item() <= 4
 
 
 def test_eagle3_trainer_single_vs_multi_step_first_step_matches():

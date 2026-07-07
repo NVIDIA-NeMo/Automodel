@@ -53,10 +53,10 @@ class _FakeDraftModel(nn.Module):
 class _FakeTrainerModule(nn.Module):
     """Fake trainer whose metrics carry fixed per-TTT-step counts.
 
-    ``step_correct=[2,1]`` / ``step_valid=[4,2]`` give per-step accuracies
-    ``[0.5, 0.5]`` and thus ``tau = 1 + 0.5 + 0.25 = 1.75`` for any window.
-    With ``with_step_counts=False`` the metrics omit the fields entirely,
-    modeling the P-EAGLE trainer.
+    ``step_prefix_hits=[2,1]`` / ``step_valid=[4,4]`` give prefix survival
+    rates ``[0.5, 0.25]`` and thus ``tau = 1 + 0.5 + 0.25 = 1.75`` for any
+    window. With ``with_step_counts=False`` the metrics omit the fields
+    entirely, modeling the P-EAGLE trainer.
     """
 
     def __init__(self, with_step_counts: bool = True):
@@ -73,8 +73,8 @@ class _FakeTrainerModule(nn.Module):
             valid_tokens=torch.tensor(6),
         )
         if self.with_step_counts:
-            metrics.step_correct = torch.tensor([2.0, 1.0])
-            metrics.step_valid = torch.tensor([4.0, 2.0])
+            metrics.step_prefix_hits = torch.tensor([2.0, 1.0])
+            metrics.step_valid = torch.tensor([4.0, 4.0])
         return metrics
 
 
@@ -178,16 +178,16 @@ def test_window_tau_sim_empty_window():
 
 
 def test_window_tau_sim_value():
-    tau = _window_tau_sim(torch.tensor([2.0, 1.0]), torch.tensor([4.0, 2.0]))
+    tau = _window_tau_sim(torch.tensor([2.0, 1.0]), torch.tensor([4.0, 4.0]))
     assert tau == pytest.approx(1.75)
 
 
 def test_window_tau_sim_does_not_mutate_buffers():
-    correct = torch.tensor([2.0, 1.0])
-    valid = torch.tensor([4.0, 2.0])
-    _window_tau_sim(correct, valid)
-    assert correct.tolist() == [2.0, 1.0]
-    assert valid.tolist() == [4.0, 2.0]
+    hits = torch.tensor([2.0, 1.0])
+    valid = torch.tensor([4.0, 4.0])
+    _window_tau_sim(hits, valid)
+    assert hits.tolist() == [2.0, 1.0]
+    assert valid.tolist() == [4.0, 4.0]
 
 
 # ---------------------------------------------------------------------------
