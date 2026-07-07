@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict
 import torch
 
 if TYPE_CHECKING:
-    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.bagel.backend import BagelBackendConfig
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +218,7 @@ def build_bagel_from_hf_backbones(
     vae_config: Dict[str, int] | None,
     meta_init: bool = False,
     load_backbone_weights: bool = True,
-    backend: BackendConfig | None = None,
+    backend: BagelBackendConfig | None = None,
 ) -> torch.nn.Module:
     """Build BAGEL from upstream Qwen/SigLIP backbone configs."""
     from transformers import Qwen2Config

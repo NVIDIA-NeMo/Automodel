@@ -50,9 +50,8 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
-from nemo_automodel.components.models.bagel.backend import default_bagel_backend
+from nemo_automodel.components.models.bagel.backend import BagelBackendConfig
 from nemo_automodel.components.models.common import (
-    BackendConfig,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
@@ -96,7 +95,7 @@ def _flash_attn_varlen(*args, **kwargs):
 
 
 def _initialize_linear(
-    backend: BackendConfig,
+    backend: BagelBackendConfig,
     in_features: int,
     out_features: int,
     *,
@@ -162,7 +161,7 @@ class Qwen2RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-def _initialize_rms_norm(backend: BackendConfig, hidden_size: int, eps: float) -> nn.Module:
+def _initialize_rms_norm(backend: BagelBackendConfig, hidden_size: int, eps: float) -> nn.Module:
     """Construct the selected RMSNorm while preserving BAGEL's torch baseline."""
     if backend.rms_norm == "torch_fp32":
         return Qwen2RMSNorm(hidden_size, eps=eps)
@@ -178,7 +177,7 @@ def _apply_qk_norm(
     norm: nn.Module,
     hidden_states: torch.Tensor,
     *,
-    backend: BackendConfig,
+    backend: BagelBackendConfig,
     eps: float,
 ) -> torch.Tensor:
     """Keep BAGEL's explicit FP32 inference QK-norm contract with TE enabled."""
@@ -316,9 +315,9 @@ def apply_rotary_pos_emb(
 class Qwen2MLP(nn.Module):
     """SwiGLU MLP with an independently configurable linear backend."""
 
-    def __init__(self, config: Qwen2Config, backend: Optional[BackendConfig] = None) -> None:
+    def __init__(self, config: Qwen2Config, backend: Optional[BagelBackendConfig] = None) -> None:
         super().__init__()
-        self.backend = backend or default_bagel_backend()
+        self.backend = backend or BagelBackendConfig()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = _initialize_linear(self.backend, self.hidden_size, self.intermediate_size, bias=False)
@@ -327,9 +326,7 @@ class Qwen2MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        gate = self.gate_proj(hidden_state)
-        up = self.up_proj(hidden_state)
-        return self.down_proj(self.act_fn(gate) * up)
+        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
 
 # ---------------------------------------------------------------------------
@@ -376,12 +373,12 @@ class _PackedAttentionBase(nn.Module):
         self,
         config: Qwen2Config,
         layer_idx: Optional[int] = None,
-        backend: Optional[BackendConfig] = None,
+        backend: Optional[BagelBackendConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.backend = backend or default_bagel_backend()
+        self.backend = backend or BagelBackendConfig()
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -400,13 +397,14 @@ class _PackedAttentionBase(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.q_size = self.num_heads * self.head_dim
-        self.k_size = self.num_key_value_heads * self.head_dim
-        self.v_size = self.num_key_value_heads * self.head_dim
-        self.q_proj = _initialize_linear(self.backend, self.hidden_size, self.q_size, bias=True)
-        self.k_proj = _initialize_linear(self.backend, self.hidden_size, self.k_size, bias=True)
-        self.v_proj = _initialize_linear(self.backend, self.hidden_size, self.v_size, bias=True)
-        self.o_proj = _initialize_linear(self.backend, self.q_size, self.hidden_size, bias=False)
+        self.q_proj = _initialize_linear(self.backend, self.hidden_size, self.num_heads * self.head_dim, bias=True)
+        self.k_proj = _initialize_linear(
+            self.backend, self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.v_proj = _initialize_linear(
+            self.backend, self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.o_proj = _initialize_linear(self.backend, self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
 
 class PackedAttention(_PackedAttentionBase):
@@ -416,7 +414,7 @@ class PackedAttention(_PackedAttentionBase):
         self,
         config: Qwen2Config,
         layer_idx: Optional[int] = None,
-        backend: Optional[BackendConfig] = None,
+        backend: Optional[BagelBackendConfig] = None,
     ) -> None:
         super().__init__(config, layer_idx, backend=backend)
         if getattr(config, "qk_norm", False):
@@ -438,12 +436,9 @@ class PackedAttention(_PackedAttentionBase):
         attention_mask,
         packed_position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        q = self.q_proj(packed_sequence)
-        k = self.k_proj(packed_sequence)
-        v = self.v_proj(packed_sequence)
-        packed_query_states = q.reshape(-1, self.num_heads, self.head_dim)
-        packed_key_states = k.reshape(-1, self.num_key_value_heads, self.head_dim)
-        packed_value_states = v.reshape(-1, self.num_key_value_heads, self.head_dim)
+        packed_query_states = self.q_proj(packed_sequence).reshape(-1, self.num_heads, self.head_dim)
+        packed_key_states = self.k_proj(packed_sequence).reshape(-1, self.num_key_value_heads, self.head_dim)
+        packed_value_states = self.v_proj(packed_sequence).reshape(-1, self.num_key_value_heads, self.head_dim)
 
         packed_query_states = _apply_qk_norm(
             self.q_norm, packed_query_states, backend=self.backend, eps=self.config.rms_norm_eps
@@ -510,12 +505,9 @@ class PackedAttention(_PackedAttentionBase):
         update_past_key_values: bool = True,
         is_causal: bool = True,
     ) -> Tuple[torch.Tensor, Optional[NaiveCache]]:
-        q = self.q_proj(packed_query_sequence)
-        k = self.k_proj(packed_query_sequence)
-        v = self.v_proj(packed_query_sequence)
-        packed_query_states = q.reshape(-1, self.num_heads, self.head_dim)
-        packed_key_states = k.reshape(-1, self.num_key_value_heads, self.head_dim)
-        packed_value_states = v.reshape(-1, self.num_key_value_heads, self.head_dim)
+        packed_query_states = self.q_proj(packed_query_sequence).reshape(-1, self.num_heads, self.head_dim)
+        packed_key_states = self.k_proj(packed_query_sequence).reshape(-1, self.num_key_value_heads, self.head_dim)
+        packed_value_states = self.v_proj(packed_query_sequence).reshape(-1, self.num_key_value_heads, self.head_dim)
 
         packed_query_states = _apply_qk_norm(
             self.q_norm, packed_query_states, backend=self.backend, eps=self.config.rms_norm_eps
@@ -580,7 +572,7 @@ class PackedAttentionMoT(_PackedAttentionBase):
         self,
         config: Qwen2Config,
         layer_idx: Optional[int] = None,
-        backend: Optional[BackendConfig] = None,
+        backend: Optional[BagelBackendConfig] = None,
     ) -> None:
         super().__init__(config, layer_idx, backend=backend)
         if getattr(config, "qk_norm", False):
@@ -594,21 +586,18 @@ class PackedAttentionMoT(_PackedAttentionBase):
             self.q_norm_moe_gen = nn.Identity()
             self.k_norm_moe_gen = nn.Identity()
 
-        self.q_proj_moe_gen = _initialize_linear(self.backend, self.hidden_size, self.q_size, bias=True)
-        self.k_proj_moe_gen = _initialize_linear(self.backend, self.hidden_size, self.k_size, bias=True)
-        self.v_proj_moe_gen = _initialize_linear(self.backend, self.hidden_size, self.v_size, bias=True)
-        self.o_proj_moe_gen = _initialize_linear(self.backend, self.q_size, self.hidden_size, bias=False)
-
-    def _project_qkv(
-        self, hidden_states: torch.Tensor, *, moe_gen: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if moe_gen:
-            return (
-                self.q_proj_moe_gen(hidden_states),
-                self.k_proj_moe_gen(hidden_states),
-                self.v_proj_moe_gen(hidden_states),
-            )
-        return self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
+        self.q_proj_moe_gen = _initialize_linear(
+            self.backend, self.hidden_size, self.num_heads * self.head_dim, bias=True
+        )
+        self.k_proj_moe_gen = _initialize_linear(
+            self.backend, self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.v_proj_moe_gen = _initialize_linear(
+            self.backend, self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.o_proj_moe_gen = _initialize_linear(
+            self.backend, self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
 
     def forward(self, *args, **kwargs):
         if self.training:
@@ -628,21 +617,27 @@ class PackedAttentionMoT(_PackedAttentionBase):
         packed_sequence_gen = packed_sequence[packed_gen_token_indexes]
         freeze_und = getattr(self.config, "freeze_und", False)
 
-        q = packed_sequence.new_zeros((packed_sequence.shape[0], self.q_size))
-        k = packed_sequence.new_zeros((packed_sequence.shape[0], self.k_size))
-        v = packed_sequence.new_zeros((packed_sequence.shape[0], self.v_size))
-        q_und, k_und, v_und = self._project_qkv(packed_sequence_und)
-        q_gen, k_gen, v_gen = self._project_qkv(packed_sequence_gen, moe_gen=True)
-        _index_put_matching_dtype(q, packed_und_token_indexes, q_und)
-        _index_put_matching_dtype(q, packed_gen_token_indexes, q_gen)
-        _index_put_matching_dtype(k, packed_und_token_indexes, k_und)
-        _index_put_matching_dtype(k, packed_gen_token_indexes, k_gen)
-        _index_put_matching_dtype(v, packed_und_token_indexes, v_und)
-        _index_put_matching_dtype(v, packed_gen_token_indexes, v_gen)
+        packed_query_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_heads * self.head_dim))
+        packed_key_states = packed_sequence.new_zeros(
+            (packed_sequence.shape[0], self.num_key_value_heads * self.head_dim)
+        )
+        packed_value_states = packed_sequence.new_zeros(
+            (packed_sequence.shape[0], self.num_key_value_heads * self.head_dim)
+        )
+        _index_put_matching_dtype(packed_query_states, packed_und_token_indexes, self.q_proj(packed_sequence_und))
+        _index_put_matching_dtype(
+            packed_query_states, packed_gen_token_indexes, self.q_proj_moe_gen(packed_sequence_gen)
+        )
+        _index_put_matching_dtype(packed_key_states, packed_und_token_indexes, self.k_proj(packed_sequence_und))
+        _index_put_matching_dtype(packed_key_states, packed_gen_token_indexes, self.k_proj_moe_gen(packed_sequence_gen))
+        _index_put_matching_dtype(packed_value_states, packed_und_token_indexes, self.v_proj(packed_sequence_und))
+        _index_put_matching_dtype(
+            packed_value_states, packed_gen_token_indexes, self.v_proj_moe_gen(packed_sequence_gen)
+        )
 
-        packed_query_states = q.view(-1, self.num_heads, self.head_dim)
-        packed_key_states = k.view(-1, self.num_key_value_heads, self.head_dim)
-        packed_value_states = v.view(-1, self.num_key_value_heads, self.head_dim)
+        packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
+        packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
+        packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
         if freeze_und:
             packed_value_states[packed_und_token_indexes] = packed_value_states[packed_und_token_indexes].detach()
 
@@ -767,10 +762,11 @@ class PackedAttentionMoT(_PackedAttentionBase):
         packed_text_indexes: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[NaiveCache]]:
         if mode == "und":
-            q, k, v = self._project_qkv(packed_query_sequence)
-            packed_query_states = q.reshape(-1, self.num_heads, self.head_dim)
-            packed_key_states = k.reshape(-1, self.num_key_value_heads, self.head_dim)
-            packed_value_states = v.reshape(-1, self.num_key_value_heads, self.head_dim)
+            packed_query_states = self.q_proj(packed_query_sequence).reshape(-1, self.num_heads, self.head_dim)
+            packed_key_states = self.k_proj(packed_query_sequence).reshape(-1, self.num_key_value_heads, self.head_dim)
+            packed_value_states = self.v_proj(packed_query_sequence).reshape(
+                -1, self.num_key_value_heads, self.head_dim
+            )
             packed_query_states = _apply_qk_norm(
                 self.q_norm, packed_query_states, backend=self.backend, eps=self.config.rms_norm_eps
             )
@@ -782,21 +778,37 @@ class PackedAttentionMoT(_PackedAttentionBase):
             packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
             packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
 
-            q = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.q_size))
-            k = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.k_size))
-            v = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.v_size))
-            q_text, k_text, v_text = self._project_qkv(packed_text_query_sequence)
-            q_vae, k_vae, v_vae = self._project_qkv(packed_vae_query_sequence, moe_gen=True)
-            _index_put_matching_dtype(q, packed_text_indexes, q_text)
-            _index_put_matching_dtype(q, packed_vae_token_indexes, q_vae)
-            _index_put_matching_dtype(k, packed_text_indexes, k_text)
-            _index_put_matching_dtype(k, packed_vae_token_indexes, k_vae)
-            _index_put_matching_dtype(v, packed_text_indexes, v_text)
-            _index_put_matching_dtype(v, packed_vae_token_indexes, v_vae)
+            packed_query_states = packed_query_sequence.new_zeros(
+                (packed_query_sequence.shape[0], self.num_heads * self.head_dim)
+            )
+            packed_key_states = packed_query_sequence.new_zeros(
+                (packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim)
+            )
+            packed_value_states = packed_query_sequence.new_zeros(
+                (packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim)
+            )
+            _index_put_matching_dtype(packed_query_states, packed_text_indexes, self.q_proj(packed_text_query_sequence))
+            _index_put_matching_dtype(
+                packed_query_states,
+                packed_vae_token_indexes,
+                self.q_proj_moe_gen(packed_vae_query_sequence),
+            )
+            _index_put_matching_dtype(packed_key_states, packed_text_indexes, self.k_proj(packed_text_query_sequence))
+            _index_put_matching_dtype(
+                packed_key_states,
+                packed_vae_token_indexes,
+                self.k_proj_moe_gen(packed_vae_query_sequence),
+            )
+            _index_put_matching_dtype(packed_value_states, packed_text_indexes, self.v_proj(packed_text_query_sequence))
+            _index_put_matching_dtype(
+                packed_value_states,
+                packed_vae_token_indexes,
+                self.v_proj_moe_gen(packed_vae_query_sequence),
+            )
 
-            packed_query_states = q.view(-1, self.num_heads, self.head_dim)
-            packed_key_states = k.view(-1, self.num_key_value_heads, self.head_dim)
-            packed_value_states = v.view(-1, self.num_key_value_heads, self.head_dim)
+            packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
+            packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
+            packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
 
             packed_query_states = packed_query_states.to(torch.float32)
             _index_put_matching_dtype(
@@ -917,10 +929,10 @@ class Qwen2DecoderLayer(nn.Module):
         self,
         config: Qwen2Config,
         layer_idx: Optional[int] = None,
-        backend: Optional[BackendConfig] = None,
+        backend: Optional[BagelBackendConfig] = None,
     ) -> None:
         super().__init__()
-        self.backend = backend or default_bagel_backend()
+        self.backend = backend or BagelBackendConfig()
         self.hidden_size = config.hidden_size
 
         self.self_attn = PackedAttention(config, layer_idx, backend=self.backend)
@@ -1000,10 +1012,10 @@ class Qwen2MoTDecoderLayer(nn.Module):
         config: Qwen2Config,
         layer_idx: Optional[int] = None,
         attn_module: type = PackedAttentionMoT,
-        backend: Optional[BackendConfig] = None,
+        backend: Optional[BagelBackendConfig] = None,
     ) -> None:
         super().__init__()
-        self.backend = backend or default_bagel_backend()
+        self.backend = backend or BagelBackendConfig()
         self.hidden_size = config.hidden_size
         self.freeze_und = getattr(config, "freeze_und", False)
 
@@ -1191,9 +1203,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
     created for the final RMSNorm.
     """
 
-    def __init__(self, config: Qwen2Config, backend: Optional[BackendConfig] = None) -> None:
+    def __init__(self, config: Qwen2Config, backend: Optional[BagelBackendConfig] = None) -> None:
         super().__init__(config)
-        self.backend = backend or default_bagel_backend()
+        self.backend = backend or BagelBackendConfig()
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         layer_module_name = getattr(config, "layer_module", "Qwen2DecoderLayer")
@@ -1355,9 +1367,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
 
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config: Qwen2Config, backend: Optional[BackendConfig] = None) -> None:
+    def __init__(self, config: Qwen2Config, backend: Optional[BagelBackendConfig] = None) -> None:
         super().__init__(config)
-        self.backend = backend or default_bagel_backend()
+        self.backend = backend or BagelBackendConfig()
         self.model = Qwen2Model(config, backend=self.backend)
         self.vocab_size = config.vocab_size
         self.lm_head = _initialize_linear(

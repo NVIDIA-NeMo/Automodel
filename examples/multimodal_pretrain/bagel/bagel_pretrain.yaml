@@ -35,13 +35,10 @@ model:
   tie_word_embeddings: false
   copy_init_moe: true
   torch_dtype: float32
-  # BAGEL attention remains packed FlexAttention with unfused RoPE. Linear
-  # and RMSNorm modules can independently use torch or Transformer Engine.
+  # Set linear and rms_norm to "te" to enable Transformer Engine.
   backend:
-    attn: flex
     linear: torch
     rms_norm: torch_fp32
-    rope_fusion: false
   max_latent_size: 64
   # Set to 0 to encode the whole image batch at once.
   vae_encode_micro_batch_size: 1

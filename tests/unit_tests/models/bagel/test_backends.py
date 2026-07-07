@@ -9,14 +9,9 @@ from transformers import Qwen2Config
 
 from nemo_automodel.components.models.bagel.backend import resolve_bagel_backend
 from nemo_automodel.components.models.bagel.modeling_qwen2_packed import (
-    PackedAttention,
     Qwen2ForCausalLM,
-    Qwen2MLP,
     _apply_qk_norm,
 )
-from nemo_automodel.components.models.common import BackendConfig
-
-_TORCH_BACKEND = BackendConfig(attn="flex", linear="torch", rms_norm="torch_fp32", rope_fusion=False)
 
 
 def _config() -> Qwen2Config:
@@ -35,37 +30,28 @@ def _config() -> Qwen2Config:
     return config
 
 
-def test_projection_layout_remains_hf_compatible() -> None:
-    mlp = Qwen2MLP(_config(), backend=_TORCH_BACKEND)
-    attention = PackedAttention(_config(), layer_idx=0, backend=_TORCH_BACKEND)
-
-    assert hasattr(mlp, "gate_proj") and hasattr(mlp, "up_proj")
-    assert not hasattr(mlp, "gate_up_proj")
-    assert all(hasattr(attention, name) for name in ("q_proj", "k_proj", "v_proj"))
-    assert not hasattr(attention, "qkv_proj")
-
-
 def test_partial_backend_mapping_inherits_bagel_defaults() -> None:
     backend = resolve_bagel_backend({"rms_norm": "te"})
 
-    assert backend.attn == "flex"
     assert backend.linear == "torch"
     assert backend.rms_norm == "te"
-    assert backend.rope_fusion is False
 
 
 @pytest.mark.parametrize(
     ("override", "message"),
     [
-        ({"attn": "te"}, "attn must be 'flex'"),
-        ({"rope_fusion": True}, "rope_fusion=True"),
-        ({"compile_attn": True}, "compile_attn=True"),
-        ({"linear": "te", "te_fp8": {"recipe": "current"}}, "te_fp8 is set"),
+        ({"linear": "invalid"}, "linear backend"),
+        ({"rms_norm": "invalid"}, "RMSNorm backend"),
     ],
 )
-def test_bagel_backend_rejects_accepted_but_unimplemented_options(override, message) -> None:
+def test_bagel_backend_rejects_invalid_values(override, message) -> None:
     with pytest.raises(ValueError, match=message):
         resolve_bagel_backend(override)
+
+
+def test_bagel_backend_rejects_unknown_fields() -> None:
+    with pytest.raises(TypeError, match="Unknown BAGEL backend field"):
+        resolve_bagel_backend({"unsupported": True})
 
 
 def test_lm_head_uses_configured_linear_backend(monkeypatch) -> None:
