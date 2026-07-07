@@ -52,6 +52,7 @@ from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppre
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
     HFEagle3TargetModel,
+    simulated_accept_length,
 )
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
 from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
@@ -79,6 +80,30 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
         value = value / dist.get_world_size()
     return value
+
+
+def _all_reduce_sum(value: torch.Tensor) -> torch.Tensor:
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+    return value
+
+
+def _window_tau_sim(step_correct: torch.Tensor | None, step_valid: torch.Tensor | None) -> float | None:
+    """Simulated accept length over a metrics window, reduced across ranks.
+
+    ``step_correct`` / ``step_valid`` are the window's accumulated per-TTT-step
+    hit / supervised counts (``None`` when the trainer does not report them,
+    e.g. P-EAGLE). Counts are extensive, so they are sum-reduced across ranks
+    before forming the per-step accuracies; every rank must therefore call
+    this at the same point. Returns ``None`` when there is nothing to report.
+    """
+    if step_correct is None or step_valid is None:
+        return None
+    correct = _all_reduce_sum(step_correct.clone())
+    valid = _all_reduce_sum(step_valid.clone())
+    if valid.sum().item() <= 0:
+        return None
+    return simulated_accept_length(correct, valid).item()
 
 
 def _submesh_or_none(device_mesh, name: str):
@@ -1130,17 +1155,31 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         total_loss = torch.zeros((), device=self.device)
         total_acc = torch.zeros((), device=self.device)
         total_batches = torch.zeros((), device=self.device)
+        total_step_correct: torch.Tensor | None = None
+        total_step_valid: torch.Tensor | None = None
         with torch.no_grad():
             for batch in self.val_dataloader:
                 metrics = self._forward_batch(batch)
                 total_loss = total_loss + metrics.loss.detach()
                 total_acc = total_acc + metrics.accuracy.detach()
                 total_batches = total_batches + 1
+                step_correct = getattr(metrics, "step_correct", None)
+                if step_correct is not None:
+                    if total_step_correct is None:
+                        total_step_correct = torch.zeros_like(step_correct, dtype=torch.float32)
+                        total_step_valid = torch.zeros_like(total_step_correct)
+                    total_step_correct += step_correct.float()
+                    total_step_valid += metrics.step_valid.float()
         total_loss = _all_reduce_mean(total_loss)
         total_acc = _all_reduce_mean(total_acc)
         total_batches = _all_reduce_mean(total_batches)
+        tau_sim = _window_tau_sim(total_step_correct, total_step_valid)
         self.trainer_module.train()
-        return (total_loss / total_batches.clamp_min(1.0), total_acc / total_batches.clamp_min(1.0))
+        return (
+            total_loss / total_batches.clamp_min(1.0),
+            total_acc / total_batches.clamp_min(1.0),
+            tau_sim,
+        )
 
     def _wandb_log(self, data: dict, step: int) -> None:
         """Log a metrics dict to W&B when a run is active (rank 0)."""
@@ -1217,6 +1256,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
 
             running_loss = torch.zeros((), device=self.device)
             running_acc = torch.zeros((), device=self.device)
+            # Per-TTT-step hit/valid counts for the simulated accept length;
+            # allocated lazily on the first batch that reports them (P-EAGLE
+            # metrics do not) so ttt_steps never has to be threaded here.
+            running_step_correct: torch.Tensor | None = None
+            running_step_valid: torch.Tensor | None = None
             running_steps = 0
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -1253,6 +1297,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
 
                 running_loss = running_loss + metrics.loss.detach()
                 running_acc = running_acc + metrics.accuracy.detach()
+                step_correct = getattr(metrics, "step_correct", None)
+                if step_correct is not None:
+                    if running_step_correct is None:
+                        running_step_correct = torch.zeros_like(step_correct, dtype=torch.float32)
+                        running_step_valid = torch.zeros_like(running_step_correct)
+                    running_step_correct += step_correct.float()
+                    running_step_valid += metrics.step_valid.float()
                 running_steps += 1
                 batches_processed = batch_idx + 1
                 pending_micro_batches += 1
@@ -1271,34 +1322,42 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     if self.runtime.global_step % self.log_every_steps == 0:
                         mean_loss = _all_reduce_mean(running_loss / max(running_steps, 1))
                         mean_acc = _all_reduce_mean(running_acc / max(running_steps, 1))
+                        tau_sim = _window_tau_sim(running_step_correct, running_step_valid)
                         current_lr = self.lr_scheduler.get_last_lr()[0]
                         if self.dist_env.is_main:
                             if pbar is not None:
-                                pbar.set_postfix(
-                                    loss=f"{mean_loss.item():.4f}",
-                                    acc=f"{mean_acc.item():.4f}",
-                                    lr=f"{current_lr:.2e}",
-                                )
+                                postfix = {
+                                    "loss": f"{mean_loss.item():.4f}",
+                                    "acc": f"{mean_acc.item():.4f}",
+                                    "lr": f"{current_lr:.2e}",
+                                }
+                                if tau_sim is not None:
+                                    postfix["tau"] = f"{tau_sim:.2f}"
+                                pbar.set_postfix(**postfix)
                             logger.info(
-                                "epoch=%s step=%s train_loss=%.6f train_acc=%.6f lr=%.3e",
+                                "epoch=%s step=%s train_loss=%.6f train_acc=%.6f%s lr=%.3e",
                                 epoch,
                                 self.runtime.global_step,
                                 mean_loss.item(),
                                 mean_acc.item(),
+                                "" if tau_sim is None else f" train_tau_sim={tau_sim:.4f}",
                                 current_lr,
                             )
-                            self._wandb_log(
-                                {
-                                    "train/loss": mean_loss.item(),
-                                    "train/accuracy": mean_acc.item(),
-                                    "train/lr": current_lr,
-                                    "train/grad_norm": float(grad_norm),
-                                    "train/epoch": epoch,
-                                },
-                                step=self.runtime.global_step,
-                            )
+                            wandb_data = {
+                                "train/loss": mean_loss.item(),
+                                "train/accuracy": mean_acc.item(),
+                                "train/lr": current_lr,
+                                "train/grad_norm": float(grad_norm),
+                                "train/epoch": epoch,
+                            }
+                            if tau_sim is not None:
+                                wandb_data["train/tau_sim"] = tau_sim
+                            self._wandb_log(wandb_data, step=self.runtime.global_step)
                         running_loss.zero_()
                         running_acc.zero_()
+                        if running_step_correct is not None:
+                            running_step_correct.zero_()
+                            running_step_valid.zero_()
                         running_steps = 0
 
             # Flush the trailing partial accumulation window. When
@@ -1332,28 +1391,33 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 if running_steps > 0:
                     mean_loss = _all_reduce_mean(running_loss / max(running_steps, 1))
                     mean_acc = _all_reduce_mean(running_acc / max(running_steps, 1))
+                    tau_sim = _window_tau_sim(running_step_correct, running_step_valid)
                     current_lr = self.lr_scheduler.get_last_lr()[0]
                     if self.dist_env.is_main:
                         logger.info(
-                            "epoch=%s step=%s train_loss=%.6f train_acc=%.6f lr=%.3e (trailing flush)",
+                            "epoch=%s step=%s train_loss=%.6f train_acc=%.6f%s lr=%.3e (trailing flush)",
                             epoch,
                             self.runtime.global_step,
                             mean_loss.item(),
                             mean_acc.item(),
+                            "" if tau_sim is None else f" train_tau_sim={tau_sim:.4f}",
                             current_lr,
                         )
-                        self._wandb_log(
-                            {
-                                "train/loss": mean_loss.item(),
-                                "train/accuracy": mean_acc.item(),
-                                "train/lr": current_lr,
-                                "train/grad_norm": float(grad_norm),
-                                "train/epoch": epoch,
-                            },
-                            step=self.runtime.global_step,
-                        )
+                        wandb_data = {
+                            "train/loss": mean_loss.item(),
+                            "train/accuracy": mean_acc.item(),
+                            "train/lr": current_lr,
+                            "train/grad_norm": float(grad_norm),
+                            "train/epoch": epoch,
+                        }
+                        if tau_sim is not None:
+                            wandb_data["train/tau_sim"] = tau_sim
+                        self._wandb_log(wandb_data, step=self.runtime.global_step)
                     running_loss.zero_()
                     running_acc.zero_()
+                    if running_step_correct is not None:
+                        running_step_correct.zero_()
+                        running_step_valid.zero_()
                     running_steps = 0
 
             if self.dist_env.is_main:
@@ -1367,21 +1431,23 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             eval_metrics = self._run_eval()
             val_loss_dict: dict[str, float] | None = None
             if eval_metrics is not None:
+                val_loss, val_acc, val_tau_sim = eval_metrics
                 val_loss_dict = {
-                    "val_loss": eval_metrics[0].item(),
-                    "val_accuracy": eval_metrics[1].item(),
+                    "val_loss": val_loss.item(),
+                    "val_accuracy": val_acc.item(),
                 }
                 if self.dist_env.is_main:
                     logger.info(
-                        "epoch=%s val_loss=%.6f val_acc=%.6f",
+                        "epoch=%s val_loss=%.6f val_acc=%.6f%s",
                         epoch,
                         val_loss_dict["val_loss"],
                         val_loss_dict["val_accuracy"],
+                        "" if val_tau_sim is None else f" val_tau_sim={val_tau_sim:.4f}",
                     )
-                    self._wandb_log(
-                        {"val/loss": val_loss_dict["val_loss"], "val/accuracy": val_loss_dict["val_accuracy"]},
-                        step=self.runtime.global_step,
-                    )
+                    wandb_data = {"val/loss": val_loss_dict["val_loss"], "val/accuracy": val_loss_dict["val_accuracy"]}
+                    if val_tau_sim is not None:
+                        wandb_data["val/tau_sim"] = val_tau_sim
+                    self._wandb_log(wandb_data, step=self.runtime.global_step)
             if getattr(self, "save_checkpoint_every_epoch", False):
                 self.save_checkpoint(
                     epoch=epoch + 1,

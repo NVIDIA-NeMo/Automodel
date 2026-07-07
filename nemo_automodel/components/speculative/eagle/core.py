@@ -46,11 +46,38 @@ def _compute_target_distribution(
 
 @dataclass
 class Eagle3StepMetrics:
-    """Aggregated metrics from one EAGLE-3 training step."""
+    """Aggregated metrics from one EAGLE-3 training step.
+
+    ``step_correct`` / ``step_valid`` are ``[ttt_steps]`` per-TTT-step top-1 hit
+    and supervised-position counts, kept unreduced so the recipe can accumulate
+    them over a logging window and derive the simulated accept length
+    (:func:`simulated_accept_length`). The P-EAGLE trainer, whose depths are
+    drafted in parallel from one anchor rather than as a TTT chain, leaves
+    them ``None``.
+    """
 
     loss: torch.Tensor
     accuracy: torch.Tensor
     valid_tokens: torch.Tensor
+    step_correct: torch.Tensor | None = None
+    step_valid: torch.Tensor | None = None
+
+
+def simulated_accept_length(step_correct: torch.Tensor, step_valid: torch.Tensor) -> torch.Tensor:
+    """Expected accepted tokens per speculative round, from per-TTT-step accuracies.
+
+    Models greedy chain drafting: step ``i``'s top-1 accuracy ``acc_i``
+    approximates the probability that the ``i``-th drafted token is accepted
+    given every earlier one was, so the expectation is
+    ``1 + sum_k prod_{i<=k} acc_i``. The leading 1 counts the token the target
+    itself emits on every verification round, matching the ``accept_length``
+    convention of the serving benchmarks (``1 + accepted/drafts``). A step
+    with no supervised positions gets zero accuracy from the ``clamp_min``,
+    conservatively truncating the chain there. This is a training-time proxy
+    for greedy chain decoding; engine tree drafting typically accepts more.
+    """
+    acc = step_correct.float() / step_valid.float().clamp_min(1.0)
+    return 1.0 + acc.cumprod(dim=0).sum()
 
 
 class Eagle3TrainerModule(nn.Module):
@@ -143,8 +170,8 @@ class Eagle3TrainerModule(nn.Module):
             )
 
         running_loss = hidden_states.new_zeros(())
-        running_correct = hidden_states.new_zeros(())
-        running_valid = hidden_states.new_zeros(())
+        step_correct_parts: list[torch.Tensor] = []
+        step_valid_parts: list[torch.Tensor] = []
 
         cur_input_ids = input_ids
         cur_position_mask = position_mask
@@ -193,8 +220,8 @@ class Eagle3TrainerModule(nn.Module):
 
             valid_mask = step_position_mask.squeeze(-1).bool()
             correct = (logits.argmax(dim=-1) == cur_target_probs.argmax(dim=-1)) & valid_mask
-            running_correct = running_correct + correct.sum()
-            running_valid = running_valid + valid_mask.sum()
+            step_correct_parts.append(correct.sum())
+            step_valid_parts.append(valid_mask.sum())
 
             if step_idx + 1 < self.ttt_steps:
                 cur_input_ids = _shift_left_with_zero(cur_input_ids)
@@ -202,5 +229,14 @@ class Eagle3TrainerModule(nn.Module):
                 cur_target_probs = _shift_left_with_zero(cur_target_probs)
 
         avg_loss = running_loss / weight_sum
-        accuracy = running_correct / running_valid.clamp_min(1.0)
-        return Eagle3StepMetrics(loss=avg_loss, accuracy=accuracy, valid_tokens=running_valid)
+        step_correct = torch.stack(step_correct_parts).detach()
+        step_valid = torch.stack(step_valid_parts).detach()
+        running_valid = step_valid.sum()
+        accuracy = step_correct.sum() / running_valid.clamp_min(1.0)
+        return Eagle3StepMetrics(
+            loss=avg_loss,
+            accuracy=accuracy,
+            valid_tokens=running_valid,
+            step_correct=step_correct,
+            step_valid=step_valid,
+        )
