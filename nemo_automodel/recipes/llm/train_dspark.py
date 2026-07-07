@@ -1338,6 +1338,11 @@ class TrainDSparkRecipe(BaseRecipe):
                 running_ce = 0.0
                 running_l1 = 0.0
                 running_conf = 0.0
+                running_accept = 0.0
+                running_tau = 0.0
+                running_conf_abs_err = 0.0
+                running_conf_bias = 0.0
+                running_conf_cumprod_bias = 0.0
                 running_micro = 0
                 epoch_loss = 0.0
                 micro_step = 0
@@ -1360,6 +1365,11 @@ class TrainDSparkRecipe(BaseRecipe):
                     running_ce += metrics.ce_loss.detach().item()
                     running_l1 += metrics.l1_loss.detach().item()
                     running_conf += metrics.confidence_loss.detach().item()
+                    running_accept += metrics.accept_rate.detach().item()
+                    running_tau += metrics.tau.detach().item()
+                    running_conf_abs_err += metrics.confidence_abs_error.detach().item()
+                    running_conf_bias += metrics.confidence_bias.detach().item()
+                    running_conf_cumprod_bias += metrics.confidence_cumprod_bias.detach().item()
                     running_micro += 1
                     epoch_loss += metrics.loss.detach().item()
                     micro_step += 1
@@ -1378,23 +1388,42 @@ class TrainDSparkRecipe(BaseRecipe):
                         self._maybe_save_step_checkpoint(epoch_idx)
 
                         if self.runtime.global_step % self.log_every_steps == 0:
-                            # One collective: window sums of loss + its three terms and the
-                            # micro-batch count, summed across DP ranks, then divided -> global means.
+                            # One collective: window sums of the loss terms and the acceptance
+                            # diagnostics plus the micro-batch count, summed across DP ranks,
+                            # then divided -> global means.
                             window = self._dp_allreduce(
                                 torch.tensor(
-                                    [running_loss, running_ce, running_l1, running_conf, float(running_micro)],
+                                    [
+                                        running_loss,
+                                        running_ce,
+                                        running_l1,
+                                        running_conf,
+                                        running_accept,
+                                        running_tau,
+                                        running_conf_abs_err,
+                                        running_conf_bias,
+                                        running_conf_cumprod_bias,
+                                        float(running_micro),
+                                    ],
                                     device=self.device,
                                     dtype=torch.float32,
                                 )
                             ).tolist()
-                            count = max(1.0, window[4])
+                            count = max(1.0, window[-1])
                             avg = {
                                 "loss": window[0] / count,
                                 "ce_loss": window[1] / count,
                                 "l1_loss": window[2] / count,
                                 "confidence_loss": window[3] / count,
+                                "accept_rate": window[4] / count,
+                                "tau": window[5] / count,
+                                "confidence_abs_error": window[6] / count,
+                                "confidence_bias": window[7] / count,
+                                "confidence_cumprod_bias": window[8] / count,
                             }
                             running_loss = running_ce = running_l1 = running_conf = 0.0
+                            running_accept = running_tau = 0.0
+                            running_conf_abs_err = running_conf_bias = running_conf_cumprod_bias = 0.0
                             running_micro = 0
                             if self.dist_env.is_main:
                                 current_lr = self.lr_scheduler.get_last_lr()[0]
@@ -1412,6 +1441,11 @@ class TrainDSparkRecipe(BaseRecipe):
                                         "train/ce_loss": avg["ce_loss"],
                                         "train/tv_loss": avg["l1_loss"],
                                         "train/confidence_loss": avg["confidence_loss"],
+                                        "train/accept_rate": avg["accept_rate"],
+                                        "train/tau": avg["tau"],
+                                        "train/confidence_abs_error": avg["confidence_abs_error"],
+                                        "train/confidence_bias": avg["confidence_bias"],
+                                        "train/confidence_cumprod_bias": avg["confidence_cumprod_bias"],
                                         "train/lr": current_lr,
                                         "train/mem_gib": mem,
                                         "train/epoch": epoch_idx,
@@ -1421,13 +1455,16 @@ class TrainDSparkRecipe(BaseRecipe):
                                 if pbar is not None:
                                     pbar.set_postfix(loss=f"{avg['loss']:.4f}", lr=f"{current_lr:.2e}")
                                 logger.info(
-                                    "step %d | epoch %d | loss %.4f | ce %.4f | tv %.4f | conf %.4f | lr %.2e | mem %.2f GiB",
+                                    "step %d | epoch %d | loss %.4f | ce %.4f | tv %.4f | conf %.4f | "
+                                    "accept %.3f | tau %.2f | lr %.2e | mem %.2f GiB",
                                     self.runtime.global_step,
                                     epoch_idx,
                                     avg["loss"],
                                     avg["ce_loss"],
                                     avg["l1_loss"],
                                     avg["confidence_loss"],
+                                    avg["accept_rate"],
+                                    avg["tau"],
                                     current_lr,
                                     mem,
                                 )
