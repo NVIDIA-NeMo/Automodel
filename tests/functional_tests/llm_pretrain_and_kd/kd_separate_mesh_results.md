@@ -28,6 +28,14 @@ context, and pipeline parallelism as shown below.
 Every value is finite. For every row, the reported total loss agrees with
 `0.5 * CE loss + 0.5 * KD loss` within `1e-5`.
 
+## Example configurations
+
+The corresponding user-facing four-GPU configurations are:
+
+- `examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_tp2.yaml`
+- `examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_cp2.yaml`
+- `examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_pp2.yaml`
+
 ## Commands
 
 The TP2 run used the fixture defaults:
