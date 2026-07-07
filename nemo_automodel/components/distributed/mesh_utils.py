@@ -15,6 +15,7 @@
 """Device mesh construction and access utilities for distributed training."""
 
 import datetime
+import itertools
 from dataclasses import dataclass, field
 
 import torch
@@ -64,6 +65,7 @@ def _create_device_meshes(
     *,
     world_size: int,
     timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
 ) -> tuple[DeviceMesh | None, DeviceMesh | None]:
     """Create raw device meshes based on distributed config type."""
     if (
@@ -78,6 +80,7 @@ def _create_device_meshes(
             parallelism,
             world_size=world_size,
             timeout_minutes=timeout_minutes,
+            ranks=ranks,
         )
     elif isinstance(strategy_config, MegatronFSDPConfig):
         _require_size_one("megatron_fsdp", parallelism.pp_size, "pipeline parallelism")
@@ -86,6 +89,7 @@ def _create_device_meshes(
             parallelism,
             world_size=world_size,
             timeout_minutes=timeout_minutes,
+            ranks=ranks,
         )
         return mesh, None
     elif isinstance(strategy_config, DDPConfig):
@@ -124,16 +128,45 @@ def _mesh_device_type() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _init_named_mesh(spec: _MeshSpec, *, timeout_minutes: int | None = None) -> DeviceMesh:
+def _init_named_mesh(
+    spec: _MeshSpec,
+    *,
+    timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
+) -> DeviceMesh:
     _validate_mesh_spec(spec)
     device_type = _mesh_device_type()
-    device_mesh = init_device_mesh(
-        device_type=device_type,
-        mesh_shape=spec.shape,
-        mesh_dim_names=spec.axes,
-        backend_override=_nccl_backend_override(spec.axes, device_type=device_type, timeout_minutes=timeout_minutes),
-    )
-    _register_flattened_axes(device_mesh, spec.flattened_axes, timeout_minutes=timeout_minutes)
+    backend_override = _nccl_backend_override(spec.axes, device_type=device_type, timeout_minutes=timeout_minutes)
+    if ranks is None:
+        device_mesh = init_device_mesh(
+            device_type=device_type,
+            mesh_shape=spec.shape,
+            mesh_dim_names=spec.axes,
+            backend_override=backend_override,
+        )
+    else:
+        expected_size = 1
+        for size in spec.shape:
+            expected_size *= size
+        if len(ranks) != expected_size:
+            raise ValueError(f"mesh ranks ({len(ranks)}) must match mesh size ({expected_size})")
+        if len(set(ranks)) != len(ranks):
+            raise ValueError("mesh ranks must be unique")
+        device_mesh = DeviceMesh(
+            device_type=device_type,
+            mesh=torch.tensor(ranks, dtype=torch.int64).reshape(spec.shape),
+            mesh_dim_names=spec.axes,
+            backend_override=backend_override,
+        )
+    if ranks is None:
+        _register_flattened_axes(device_mesh, spec.flattened_axes, timeout_minutes=timeout_minutes)
+    else:
+        _register_flattened_axes_for_rank_subset(
+            device_mesh,
+            spec,
+            ranks=ranks,
+            timeout_minutes=timeout_minutes,
+        )
     return device_mesh
 
 
@@ -190,11 +223,62 @@ def _register_flattened_axes(
         device_mesh._flatten_mapping.setdefault(flattened_axis, flattened_mesh)
 
 
+def _register_flattened_axes_for_rank_subset(
+    device_mesh: DeviceMesh,
+    spec: _MeshSpec,
+    *,
+    ranks: list[int] | tuple[int, ...],
+    timeout_minutes: int | None,
+) -> None:
+    """Register flattened axes without slicing a mesh on non-member ranks.
+
+    PyTorch cannot slice an explicit ``DeviceMesh`` on ranks outside that mesh.
+    Separate-model jobs still need every global rank to create process groups in
+    the same order, so construct each flattened subgroup explicitly and retain
+    the subgroup local to the current rank.
+    """
+    if not spec.flattened_axes:
+        return
+    if not hasattr(device_mesh, "_flatten_mapping"):
+        device_mesh._flatten_mapping = {}
+
+    rank_tensor = torch.tensor(ranks, dtype=torch.int64).reshape(spec.shape)
+    current_rank = dist.get_rank()
+    for flattened_axis, source_axes in spec.flattened_axes.items():
+        source_indices = tuple(spec.axes.index(axis) for axis in source_axes)
+        other_indices = tuple(index for index in range(len(spec.axes)) if index not in source_indices)
+        other_shapes = tuple(spec.shape[index] for index in other_indices)
+        local_ranks = None
+        local_group = None
+        first_ranks = None
+        for other_coordinate in itertools.product(*(range(size) for size in other_shapes)):
+            index = [slice(None)] * len(spec.axes)
+            for axis_index, coordinate in zip(other_indices, other_coordinate):
+                index[axis_index] = coordinate
+            subgroup_ranks = rank_tensor[tuple(index)].reshape(-1).tolist()
+            first_ranks = first_ranks or subgroup_ranks
+            group = dist.new_group(ranks=subgroup_ranks)
+            if current_rank in subgroup_ranks:
+                local_ranks = subgroup_ranks
+                local_group = group
+
+        flat_ranks = local_ranks or first_ranks
+        flattened_mesh = DeviceMesh(
+            device_mesh.device_type,
+            mesh=torch.tensor(flat_ranks, dtype=torch.int64),
+            mesh_dim_names=(flattened_axis,),
+            _init_backend=False,
+        )
+        flattened_mesh._dim_group_names = [local_group.group_name] if local_group is not None else []
+        device_mesh._flatten_mapping.setdefault(flattened_axis, flattened_mesh)
+
+
 def _create_fsdp2_device_mesh(
     parallelism: ParallelismSizes,
     *,
     world_size: int,
     timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
 ) -> tuple[DeviceMesh, DeviceMesh | None]:
     """Create the FSDP2 root mesh and optional MoE mesh."""
     tp_size = _degree(parallelism.tp_size)
@@ -241,6 +325,7 @@ def _create_fsdp2_device_mesh(
             },
         ),
         timeout_minutes=timeout_minutes,
+        ranks=ranks,
     )
 
     moe_mesh = None
@@ -260,6 +345,7 @@ def _create_megatron_fsdp_device_mesh(
     *,
     world_size: int,
     timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
 ) -> DeviceMesh:
     """Create the Megatron FSDP mesh."""
     tp_size = _degree(parallelism.tp_size)
@@ -279,6 +365,7 @@ def _create_megatron_fsdp_device_mesh(
             flattened_axes={MeshAxisName.DP_CP: (MeshAxisName.DP, MeshAxisName.CP)} if cp_size > 1 else {},
         ),
         timeout_minutes=timeout_minutes,
+        ranks=ranks,
     )
 
 

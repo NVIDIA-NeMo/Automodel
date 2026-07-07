@@ -390,6 +390,7 @@ class Checkpointer:
         tp_rank: int,
         pp_rank: int,
         moe_mesh: Optional[DeviceMesh] = None,
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
         """
         Initialize the checkpointer.
@@ -400,12 +401,14 @@ class Checkpointer:
             tp_rank: Tensor parallel rank for the current process.
             pp_rank: Pipeline parallel rank for the current process.
             moe_mesh: Optional device mesh used for MoE when adapting state dicts.
+            process_group: Process group used for distributed checkpoint collectives.
         """
         self.config = config
         self.moe_mesh = moe_mesh
         self.dp_rank = dp_rank
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
+        self.process_group = process_group
 
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
@@ -453,7 +456,7 @@ class Checkpointer:
         should_write_consolidated = _should_write_consolidated_safetensors(self.config, is_final_checkpoint)
         consolidated_dir = os.path.join(model_dir, "consolidated") if should_write_consolidated else None
         hf_metadata_dir = os.path.join(model_dir, ".hf_metadata") if _should_write_hf_metadata(self.config) else None
-        _ensure_dirs(model_dir, consolidated_dir, hf_metadata_dir)
+        _ensure_dirs(model_dir, consolidated_dir, hf_metadata_dir, process_group=self.process_group)
 
         # Because this call lies outside of the dcp save call, we need to consolidate on all ranks on the main process
         # of all ranks, which lies on the critical path. Therefore, we can only do this outside of async mode.
@@ -541,7 +544,7 @@ class Checkpointer:
             scheduler: Optional LR scheduler to include.
         """
         optimizer_path = os.path.join(weights_path, "optim")
-        _ensure_dirs(optimizer_path)
+        _ensure_dirs(optimizer_path, process_group=self.process_group)
         optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
         state_dict = optimizer_state.state_dict()
         self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
@@ -1054,7 +1057,7 @@ class Checkpointer:
             path: Path to save stateful object
         """
         state_dir = os.path.join(path, state_name)
-        _ensure_dirs(state_dir)
+        _ensure_dirs(state_dir, process_group=self.process_group)
         if self.tp_rank == 0 and self.pp_rank == 0:
             torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"))
 
@@ -1083,16 +1086,20 @@ class Checkpointer:
         DTensor metadata and writes all shards correctly.
         """
         state_dir = os.path.join(path, state_name)
-        _ensure_dirs(state_dir)
+        _ensure_dirs(state_dir, process_group=self.process_group)
         state_dict = state.state_dict()
         planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
-        dcp.save(state_dict, checkpoint_id=state_dir, planner=planner)
+        process_group = getattr(self, "process_group", None)
+        process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
+        dcp.save(state_dict, checkpoint_id=state_dir, planner=planner, **process_group_kwargs)
 
     def load_distributed_state(self, state: Any, state_name: str, path: str) -> None:
         """Load a custom stateful object previously saved with DCP."""
         state_dir = os.path.join(path, state_name)
         state_dict = state.state_dict()
-        dcp.load(state_dict, checkpoint_id=state_dir)
+        process_group = getattr(self, "process_group", None)
+        process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
+        dcp.load(state_dict, checkpoint_id=state_dir, **process_group_kwargs)
         state.load_state_dict(state_dict)
 
     def close(self) -> None:
@@ -1132,7 +1139,9 @@ class Checkpointer:
             state_dict = _load_safetensors(_adapter_path(path))
         else:
             storage_reader = _maybe_msc_reader(path, storage_reader)
-            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
+            process_group = getattr(self, "process_group", None)
+            process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
+            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader, **process_group_kwargs)
         return state_dict
 
     def _do_save(
@@ -1181,7 +1190,15 @@ class Checkpointer:
             )
             ctx.staging_active = True
         else:
-            dcp.save(state_dict, checkpoint_id=path, storage_writer=storage_writer, planner=planner)
+            process_group = getattr(self, "process_group", None)
+            process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
+            dcp.save(
+                state_dict,
+                checkpoint_id=path,
+                storage_writer=storage_writer,
+                planner=planner,
+                **process_group_kwargs,
+            )
         return ret
 
     def _maybe_write_offline_consolidation_script(self, model_dir: str) -> None:
@@ -1585,7 +1602,7 @@ def save_config(config: dict[str, Any], weights_path: str) -> None:
             yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
 
-def _ensure_dirs(*dirs: Optional[str]) -> None:
+def _ensure_dirs(*dirs: Optional[str], process_group: Optional[torch.distributed.ProcessGroup] = None) -> None:
     """
     Create directories on all ranks and synchronize across ranks.
 
@@ -1597,7 +1614,7 @@ def _ensure_dirs(*dirs: Optional[str]) -> None:
             if not is_cloud_path(d):
                 os.makedirs(d, exist_ok=True)
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=process_group)
 
 
 def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:

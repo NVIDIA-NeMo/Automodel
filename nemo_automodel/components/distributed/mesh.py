@@ -29,12 +29,13 @@ YAML / dict parsing belongs in the recipe layer — see
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Sequence, Tuple
 
 from nemo_automodel.components.distributed.config import DistributedStrategyConfig
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 
 if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
 
 
@@ -109,6 +110,7 @@ class MeshContext:
     # runtime mesh references
     device_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
     moe_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
+    process_group: Optional["ProcessGroup"] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _validate_mesh_axis_names(self)
@@ -191,6 +193,7 @@ class MeshContext:
         *,
         world_size: int | None = None,
         timeout_minutes: int | None = None,
+        ranks: Sequence[int] | None = None,
     ) -> "MeshContext":
         """Build a topology-only :class:`MeshContext` from parallelism sizes.
 
@@ -203,6 +206,8 @@ class MeshContext:
                 distributed environment.
             timeout_minutes: Optional timeout for process groups created by
                 ``DeviceMesh`` axes.
+            ranks: Optional ordered global ranks to use for the mesh. When
+                omitted, the mesh uses every rank in the default process group.
         """
         if world_size is None:
             world_size = get_world_size_safe()
@@ -216,6 +221,7 @@ class MeshContext:
             parallelism_sizes,
             world_size=world_size,
             timeout_minutes=timeout_minutes,
+            ranks=ranks,
         )
         return cls.from_meshes(device_mesh, moe_mesh)
 

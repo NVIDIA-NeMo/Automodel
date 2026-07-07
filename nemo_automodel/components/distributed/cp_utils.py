@@ -219,6 +219,7 @@ def make_cp_batch_and_ctx(
     padding_token_id: int = 0,
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
+    extra_seq_buffers: dict[str, int] | None = None,
 ):
     """
     Build a CP context manager and shards a batch. If the input device_mesh is None or the size
@@ -257,6 +258,8 @@ def make_cp_batch_and_ctx(
         return cp_make_batch_fn(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
 
     if use_te:
+        if extra_seq_buffers:
+            raise ValueError("extra_seq_buffers are not supported by the TE THD context-parallel path")
         return nullcontext, make_cp_batch_for_te(
             cp_mesh,
             batch,
@@ -333,6 +336,15 @@ def make_cp_batch_and_ctx(
         cp_buffers.append(padding_mask)
         cp_seq_dims.append(1)
         cp_no_restore_buffers.add(padding_mask)
+
+    for key, seq_dim in (extra_seq_buffers or {}).items():
+        if key not in batch:
+            raise KeyError(f"Extra CP sequence buffer {key!r} is missing from the batch")
+        buffer = batch[key]
+        batch_buffer_keys[len(cp_buffers)] = key
+        cp_buffers.append(buffer)
+        cp_seq_dims.append(seq_dim)
+        cp_no_restore_buffers.add(buffer)
 
     # Pad sequence length to be divisible by 2 * cp_size (required by
     # context_parallel load balancing). The inputs_embeds path can hit

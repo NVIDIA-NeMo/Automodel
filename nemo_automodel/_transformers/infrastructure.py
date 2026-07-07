@@ -462,6 +462,7 @@ def apply_model_infrastructure(
         0,
         0,
         getattr(model_wrapper, "moe_mesh", None),
+        process_group=getattr(mesh, "process_group", None),
     )
 
     # Handle checkpointer config updates if checkpointer is provided
@@ -592,6 +593,11 @@ def apply_model_infrastructure(
         model_parts = model.parts if hasattr(model, "parts") else [model]
         lora_a_init = getattr(peft_config, "lora_A_init", None)
         for mp in model_parts:
+            if autopipeline is not None and load_base_model:
+                # PP stages own different modules, so HF random initialization can issue
+                # a different number of DTensor RNG collectives on each stage. Every
+                # parameter is about to be populated from the pretrained checkpoint.
+                mp._skip_init_weights_on_load = True
             checkpointer.initialize_model_weights(mp, init_device, peft_init_method=lora_a_init)
 
     # Load the checkpoint if pretrained weights are needed and weren't already loaded
