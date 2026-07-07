@@ -116,17 +116,26 @@ def _copy_qwen_mot_weights_from_und(language_model) -> int:
     return copied
 
 
-def _uses_fused_qwen_projections(language_model) -> bool:
-    """Return whether the target Qwen module tree expects fused projection keys."""
-    fused_suffixes = (
+def _qwen_projection_fusion_layout(language_model) -> tuple[bool, bool]:
+    """Return the target Qwen module tree's ``(fused_qkv, fused_gate_up)`` layout."""
+    qkv_suffixes = (
         "self_attn.qkv_proj.weight",
         "self_attn.qkv_proj_moe_gen.weight",
+    )
+    gate_up_suffixes = (
         "mlp.gate_up_proj.weight",
         "mlp_moe_gen.gate_up_proj.weight",
     )
-    return any(
-        _normalize_wrapped_param_name(name).endswith(fused_suffixes) for name, _ in language_model.named_parameters()
+    parameter_names = [_normalize_wrapped_param_name(name) for name, _ in language_model.named_parameters()]
+    return (
+        any(name.endswith(qkv_suffixes) for name in parameter_names),
+        any(name.endswith(gate_up_suffixes) for name in parameter_names),
     )
+
+
+def _uses_fused_qwen_projections(language_model) -> bool:
+    """Return whether either Qwen projection group is fused."""
+    return any(_qwen_projection_fusion_layout(language_model))
 
 
 def _load_qwen_backbone_into_bagel(model, llm_path: str, *, copy_init_moe: bool) -> None:
@@ -135,13 +144,20 @@ def _load_qwen_backbone_into_bagel(model, llm_path: str, *, copy_init_moe: bool)
 
     logger.info("Loading Qwen backbone from %s", llm_path)
     state_dict = _load_hf_state_dict(llm_path)
-    if _uses_fused_qwen_projections(model.model.language_model):
+    fuse_qkv, fuse_gate_up = _qwen_projection_fusion_layout(model.model.language_model)
+    if fuse_qkv or fuse_gate_up:
         from nemo_automodel.components.models.bagel.state_dict_adapter import fuse_qwen_split_projections
 
         before_count = len(state_dict)
-        fuse_qwen_split_projections(state_dict)
+        fuse_qwen_split_projections(
+            state_dict,
+            fuse_qkv=fuse_qkv,
+            fuse_gate_up=fuse_gate_up,
+        )
         logger.info(
-            "HF-backbone Qwen projection fusion: %d -> %d tensor(s)",
+            "HF-backbone Qwen projection fusion (qkv=%s, gate_up=%s): %d -> %d tensor(s)",
+            fuse_qkv,
+            fuse_gate_up,
             before_count,
             len(state_dict),
         )
@@ -268,7 +284,16 @@ def build_bagel_from_hf_backbones(
     llm_config.qk_norm = bool(model_cfg.get("llm_qk_norm", True))
     llm_config.tie_word_embeddings = bool(model_cfg.get("tie_word_embeddings", False))
     llm_config.freeze_und = bool(model_cfg.get("freeze_und", False))
-    llm_config.fused_projections = bool(model_cfg.get("fused_projections", False))
+    fused_projections = bool(model_cfg.get("fused_projections", False))
+    fused_qkv_projections = model_cfg.get("fused_qkv_projections", None)
+    fused_gate_up_projections = model_cfg.get("fused_gate_up_projections", None)
+    llm_config.fused_qkv_projections = (
+        fused_projections if fused_qkv_projections is None else bool(fused_qkv_projections)
+    )
+    llm_config.fused_gate_up_projections = (
+        fused_projections if fused_gate_up_projections is None else bool(fused_gate_up_projections)
+    )
+    llm_config.fused_projections = bool(llm_config.fused_qkv_projections and llm_config.fused_gate_up_projections)
 
     vit_config = _load_siglip_vision_config(vit_path) if visual_und else None
 

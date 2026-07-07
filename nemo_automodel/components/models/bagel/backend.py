@@ -78,9 +78,15 @@ def resolve_bagel_backend(backend: Any = None) -> BackendConfig:
     return resolved
 
 
-def bagel_backend_summary(backend: BackendConfig, *, fused_projections: bool) -> str:
+def bagel_backend_summary(
+    backend: BackendConfig,
+    *,
+    fused_qkv_projections: bool,
+    fused_gate_up_projections: bool,
+) -> str:
     """Return the user-facing subset of backend choices BAGEL consumes."""
     return (
         f"attn={backend.attn}, linear={backend.linear}, rms_norm={backend.rms_norm}, "
-        f"rope_fusion={backend.rope_fusion}, fused_projections={fused_projections}"
+        f"rope_fusion={backend.rope_fusion}, fused_qkv_projections={fused_qkv_projections}, "
+        f"fused_gate_up_projections={fused_gate_up_projections}"
     )

@@ -329,8 +329,11 @@ class Qwen2MLP(nn.Module):
         self.backend = backend or default_bagel_backend()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.fused_projections = bool(getattr(config, "fused_projections", False))
-        if self.fused_projections:
+        fused_gate_up = getattr(config, "fused_gate_up_projections", None)
+        self.fused_gate_up_projections = bool(
+            getattr(config, "fused_projections", False) if fused_gate_up is None else fused_gate_up
+        )
+        if self.fused_gate_up_projections:
             self.gate_up_proj = _initialize_linear(
                 self.backend,
                 self.hidden_size,
@@ -342,10 +345,10 @@ class Qwen2MLP(nn.Module):
             self.up_proj = _initialize_linear(self.backend, self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = _initialize_linear(self.backend, self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._use_fused_swiglu = self.fused_projections and config.hidden_act in {"silu", "swish"}
+        self._use_fused_swiglu = self.fused_gate_up_projections and config.hidden_act in {"silu", "swish"}
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        if self.fused_projections:
+        if self.fused_gate_up_projections:
             gate_up = self.gate_up_proj(hidden_state)
             if self._use_fused_swiglu:
                 return self.down_proj(_fused_swiglu(gate_up))
@@ -406,7 +409,10 @@ class _PackedAttentionBase(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.backend = backend or default_bagel_backend()
-        self.fused_projections = bool(getattr(config, "fused_projections", False))
+        fused_qkv = getattr(config, "fused_qkv_projections", None)
+        self.fused_qkv_projections = bool(
+            getattr(config, "fused_projections", False) if fused_qkv is None else fused_qkv
+        )
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -428,7 +434,7 @@ class _PackedAttentionBase(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.k_size = self.num_key_value_heads * self.head_dim
         self.v_size = self.num_key_value_heads * self.head_dim
-        if self.fused_projections:
+        if self.fused_qkv_projections:
             self.qkv_proj = _initialize_linear(
                 self.backend,
                 self.hidden_size,
@@ -471,7 +477,7 @@ class PackedAttention(_PackedAttentionBase):
         attention_mask,
         packed_position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        if self.fused_projections:
+        if self.fused_qkv_projections:
             packed_qkv = self.qkv_proj(packed_sequence)
             q, k, v = packed_qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
         else:
@@ -547,7 +553,7 @@ class PackedAttention(_PackedAttentionBase):
         update_past_key_values: bool = True,
         is_causal: bool = True,
     ) -> Tuple[torch.Tensor, Optional[NaiveCache]]:
-        if self.fused_projections:
+        if self.fused_qkv_projections:
             packed_qkv = self.qkv_proj(packed_query_sequence)
             q, k, v = packed_qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
         else:
@@ -635,7 +641,7 @@ class PackedAttentionMoT(_PackedAttentionBase):
             self.q_norm_moe_gen = nn.Identity()
             self.k_norm_moe_gen = nn.Identity()
 
-        if self.fused_projections:
+        if self.fused_qkv_projections:
             self.qkv_proj_moe_gen = _initialize_linear(
                 self.backend,
                 self.hidden_size,
@@ -651,7 +657,7 @@ class PackedAttentionMoT(_PackedAttentionBase):
     def _project_qkv(
         self, hidden_states: torch.Tensor, *, moe_gen: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.fused_projections:
+        if self.fused_qkv_projections:
             projection = self.qkv_proj_moe_gen if moe_gen else self.qkv_proj
             return projection(hidden_states).split([self.q_size, self.k_size, self.v_size], dim=-1)
         if moe_gen:
@@ -680,7 +686,7 @@ class PackedAttentionMoT(_PackedAttentionBase):
         packed_sequence_gen = packed_sequence[packed_gen_token_indexes]
         freeze_und = getattr(self.config, "freeze_und", False)
 
-        if self.fused_projections:
+        if self.fused_qkv_projections:
             packed_qkv = packed_sequence.new_zeros((packed_sequence.shape[0], self.q_size + self.k_size + self.v_size))
             _index_put_matching_dtype(packed_qkv, packed_und_token_indexes, self.qkv_proj(packed_sequence_und))
             _index_put_matching_dtype(packed_qkv, packed_gen_token_indexes, self.qkv_proj_moe_gen(packed_sequence_gen))
@@ -704,7 +710,7 @@ class PackedAttentionMoT(_PackedAttentionBase):
         packed_query_states = q.view(-1, self.num_heads, self.head_dim)
         packed_key_states = k.view(-1, self.num_key_value_heads, self.head_dim)
         packed_value_states = v.view(-1, self.num_key_value_heads, self.head_dim)
-        if freeze_und and not self.fused_projections:
+        if freeze_und and not self.fused_qkv_projections:
             packed_value_states[packed_und_token_indexes] = packed_value_states[packed_und_token_indexes].detach()
 
         packed_query_states_ = packed_query_states.new_zeros(packed_query_states.shape)
@@ -843,7 +849,7 @@ class PackedAttentionMoT(_PackedAttentionBase):
             packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
             packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
 
-            if self.fused_projections:
+            if self.fused_qkv_projections:
                 packed_qkv = packed_query_sequence.new_zeros(
                     (packed_query_sequence.shape[0], self.q_size + self.k_size + self.v_size)
                 )

@@ -46,12 +46,14 @@ from nemo_automodel.components.models.bagel.modeling_siglip_navit import SiglipV
 def _coerce_text_config(cfg: Union[Dict[str, Any], Qwen2Config, None]) -> Qwen2Config:
     """Coerce ``cfg`` into a ``Qwen2Config`` with BAGEL's extra attributes set.
 
-    BAGEL adds four attributes to Qwen2Config that aren't part of stock
+    BAGEL adds projection-layout attributes to Qwen2Config that aren't part of stock
     transformers:
     * ``qk_norm`` (bool, default True for BAGEL-7B-MoT)
     * ``layer_module`` (``"Qwen2DecoderLayer"`` or ``"Qwen2MoTDecoderLayer"``)
     * ``freeze_und`` (bool, default False)
-    * ``fused_projections`` (bool, default False)
+    * ``fused_projections`` (legacy bool enabling both fused groups)
+    * ``fused_qkv_projections`` (bool, defaulting to ``fused_projections``)
+    * ``fused_gate_up_projections`` (bool, defaulting to ``fused_projections``)
 
     We also ensure ``pad_token_id`` is populated. Some checkpoint configs omit
     it, and transformers 5.x raises ``AttributeError`` on missing config attrs.
@@ -71,8 +73,12 @@ def _coerce_text_config(cfg: Union[Dict[str, Any], Qwen2Config, None]) -> Qwen2C
         cfg.layer_module = "Qwen2DecoderLayer"
     if not hasattr(cfg, "freeze_und"):
         cfg.freeze_und = False
-    if not hasattr(cfg, "fused_projections"):
-        cfg.fused_projections = False
+    legacy_fused = bool(getattr(cfg, "fused_projections", False))
+    if getattr(cfg, "fused_qkv_projections", None) is None:
+        cfg.fused_qkv_projections = legacy_fused
+    if getattr(cfg, "fused_gate_up_projections", None) is None:
+        cfg.fused_gate_up_projections = legacy_fused
+    cfg.fused_projections = bool(cfg.fused_qkv_projections and cfg.fused_gate_up_projections)
 
     # pad_token_id: Qwen2Config's default is None, which Qwen2Model tolerates
     # (nn.Embedding accepts padding_idx=None). The packed training path reads
@@ -117,6 +123,8 @@ class BagelConfig(PretrainedConfig):
         visual_gen: bool = False,
         stage: Union[int, str, None] = None,
         fused_projections: Optional[bool] = None,
+        fused_qkv_projections: Optional[bool] = None,
+        fused_gate_up_projections: Optional[bool] = None,
         llm_path: str = "",
         vit_path: str = "",
         vae_path: str = "",
@@ -148,6 +156,10 @@ class BagelConfig(PretrainedConfig):
         self.text_config = _coerce_text_config(text_config)
         if fused_projections is not None:
             self.fused_projections = fused_projections
+        if fused_qkv_projections is not None:
+            self.fused_qkv_projections = fused_qkv_projections
+        if fused_gate_up_projections is not None:
+            self.fused_gate_up_projections = fused_gate_up_projections
         self.vision_config = _coerce_vision_config(vision_config)
 
         # VAE config is a bare dict: it only carries the autoencoder
@@ -200,12 +212,39 @@ class BagelConfig(PretrainedConfig):
 
     @property
     def fused_projections(self) -> bool:
-        """Forward the recipe-level projection layout to the text config."""
-        return bool(getattr(self.text_config, "fused_projections", False))
+        """Return whether both QKV and gate/up projection groups are fused."""
+        return self.fused_qkv_projections and self.fused_gate_up_projections
 
     @fused_projections.setter
     def fused_projections(self, value: bool) -> None:
-        self.text_config.fused_projections = bool(value)
+        enabled = bool(value)
+        self.text_config.fused_projections = enabled
+        self.text_config.fused_qkv_projections = enabled
+        self.text_config.fused_gate_up_projections = enabled
+
+    @property
+    def fused_qkv_projections(self) -> bool:
+        """Return whether attention Q/K/V projections use one packed linear."""
+        return bool(getattr(self.text_config, "fused_qkv_projections", False))
+
+    @fused_qkv_projections.setter
+    def fused_qkv_projections(self, value: bool) -> None:
+        self.text_config.fused_qkv_projections = bool(value)
+        self.text_config.fused_projections = bool(
+            self.text_config.fused_qkv_projections and getattr(self.text_config, "fused_gate_up_projections", False)
+        )
+
+    @property
+    def fused_gate_up_projections(self) -> bool:
+        """Return whether MLP gate/up projections use one packed linear."""
+        return bool(getattr(self.text_config, "fused_gate_up_projections", False))
+
+    @fused_gate_up_projections.setter
+    def fused_gate_up_projections(self, value: bool) -> None:
+        self.text_config.fused_gate_up_projections = bool(value)
+        self.text_config.fused_projections = bool(
+            getattr(self.text_config, "fused_qkv_projections", False) and self.text_config.fused_gate_up_projections
+        )
 
     @property
     def vit_config(self) -> Optional[SiglipVisionConfig]:
@@ -223,6 +262,8 @@ class BagelConfig(PretrainedConfig):
         output = super().to_dict()
         output.pop("_bagel_vit_select_layer_applied", None)
         output["fused_projections"] = self.fused_projections
+        output["fused_qkv_projections"] = self.fused_qkv_projections
+        output["fused_gate_up_projections"] = self.fused_gate_up_projections
         output["text_config"] = self.text_config.to_dict() if self.text_config is not None else None
         output["vision_config"] = self.vision_config.to_dict() if self.vision_config is not None else None
         return output

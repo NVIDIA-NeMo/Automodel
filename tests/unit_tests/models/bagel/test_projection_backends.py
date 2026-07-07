@@ -8,7 +8,7 @@ import torch.nn as nn
 from transformers import Qwen2Config
 
 from nemo_automodel.components.models.bagel.backend import resolve_bagel_backend
-from nemo_automodel.components.models.bagel.hf_backbone_loader import _uses_fused_qwen_projections
+from nemo_automodel.components.models.bagel.hf_backbone_loader import _qwen_projection_fusion_layout
 from nemo_automodel.components.models.bagel.modeling_qwen2_packed import (
     PackedAttention,
     Qwen2ForCausalLM,
@@ -20,7 +20,12 @@ from nemo_automodel.components.models.common import BackendConfig
 _TORCH_BACKEND = BackendConfig(attn="flex", linear="torch", rms_norm="torch_fp32", rope_fusion=False)
 
 
-def _config(*, fused: bool) -> Qwen2Config:
+def _config(
+    *,
+    fused: bool = False,
+    fused_qkv: bool | None = None,
+    fused_gate_up: bool | None = None,
+) -> Qwen2Config:
     config = Qwen2Config(
         vocab_size=32,
         hidden_size=64,
@@ -34,13 +39,15 @@ def _config(*, fused: bool) -> Qwen2Config:
     )
     config.qk_norm = True
     config.fused_projections = fused
+    config.fused_qkv_projections = fused if fused_qkv is None else fused_qkv
+    config.fused_gate_up_projections = fused if fused_gate_up is None else fused_gate_up
     return config
 
 
 def test_mlp_projection_fusion_is_configurable_and_numerically_equivalent() -> None:
     torch.manual_seed(7)
     split = Qwen2MLP(_config(fused=False), backend=_TORCH_BACKEND)
-    fused = Qwen2MLP(_config(fused=True), backend=_TORCH_BACKEND)
+    fused = Qwen2MLP(_config(fused_gate_up=True), backend=_TORCH_BACKEND)
     with torch.no_grad():
         fused.gate_up_proj.weight.copy_(torch.cat([split.gate_proj.weight, split.up_proj.weight], dim=0))
         fused.down_proj.weight.copy_(split.down_proj.weight)
@@ -55,7 +62,7 @@ def test_mlp_projection_fusion_is_configurable_and_numerically_equivalent() -> N
 def test_attention_projection_fusion_uses_q_k_v_row_order() -> None:
     torch.manual_seed(11)
     split = PackedAttention(_config(fused=False), layer_idx=0, backend=_TORCH_BACKEND)
-    fused = PackedAttention(_config(fused=True), layer_idx=0, backend=_TORCH_BACKEND)
+    fused = PackedAttention(_config(fused_qkv=True), layer_idx=0, backend=_TORCH_BACKEND)
     with torch.no_grad():
         fused.qkv_proj.weight.copy_(torch.cat([split.q_proj.weight, split.k_proj.weight, split.v_proj.weight], dim=0))
         fused.qkv_proj.bias.copy_(torch.cat([split.q_proj.bias, split.k_proj.bias, split.v_proj.bias], dim=0))
@@ -71,11 +78,14 @@ def test_attention_projection_fusion_uses_q_k_v_row_order() -> None:
     assert hasattr(fused, "qkv_proj") and not hasattr(fused, "q_proj")
 
 
-@pytest.mark.parametrize(("fused_projections", "expected"), [(False, False), (True, True)])
-def test_hf_backbone_loader_detects_target_projection_layout(fused_projections, expected) -> None:
-    model = Qwen2ForCausalLM(_config(fused=fused_projections), backend=_TORCH_BACKEND)
+@pytest.mark.parametrize("fused_qkv,fused_gate_up", [(False, False), (True, False), (False, True), (True, True)])
+def test_hf_backbone_loader_detects_target_projection_layout(fused_qkv, fused_gate_up) -> None:
+    model = Qwen2ForCausalLM(
+        _config(fused_qkv=fused_qkv, fused_gate_up=fused_gate_up),
+        backend=_TORCH_BACKEND,
+    )
 
-    assert _uses_fused_qwen_projections(model) is expected
+    assert _qwen_projection_fusion_layout(model) == (fused_qkv, fused_gate_up)
 
 
 def test_partial_backend_mapping_inherits_bagel_defaults() -> None:
@@ -137,15 +147,15 @@ def test_te_qk_norm_keeps_explicit_fp32_inference_path() -> None:
     torch.testing.assert_close(output, expected)
 
 
-@pytest.mark.parametrize("fused_projections", [False, True])
-def test_te_mot_forward_backward_smoke(fused_projections) -> None:
+@pytest.mark.parametrize("fused_qkv,fused_gate_up", [(False, False), (True, False), (False, True), (True, True)])
+def test_te_mot_forward_backward_smoke(fused_qkv, fused_gate_up) -> None:
     pytest.importorskip("transformer_engine")
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
 
     from nemo_automodel.components.models.bagel.modeling_qwen2_packed import Qwen2MoTDecoderLayer
 
-    config = _config(fused=fused_projections)
+    config = _config(fused_qkv=fused_qkv, fused_gate_up=fused_gate_up)
     config.freeze_und = False
     backend = resolve_bagel_backend({"linear": "te", "rms_norm": "te"})
     layer = Qwen2MoTDecoderLayer(config, layer_idx=0, backend=backend).to(

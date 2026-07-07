@@ -237,7 +237,8 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
                 "Resolved BAGEL backend: %s",
                 bagel_backend_summary(
                     self.backend,
-                    fused_projections=config.fused_projections,
+                    fused_qkv_projections=config.fused_qkv_projections,
+                    fused_gate_up_projections=config.fused_gate_up_projections,
                 ),
             )
         self.model = BagelModel(config, backend=self.backend)

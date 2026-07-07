@@ -57,13 +57,20 @@ def test_bagel_adapter_unroots_am_keys_when_saving():
     assert converted["language_model.model.embed_tokens.weight"] is weight
 
 
-def _projection_adapter(*, fused: bool) -> BagelStateDictAdapter:
+def _projection_adapter(
+    *,
+    fused: bool = False,
+    fused_qkv: bool | None = None,
+    fused_gate_up: bool | None = None,
+) -> BagelStateDictAdapter:
     text_config = SimpleNamespace(
         hidden_size=8,
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=2,
         fused_projections=fused,
+        fused_qkv_projections=fused if fused_qkv is None else fused_qkv,
+        fused_gate_up_projections=fused if fused_gate_up is None else fused_gate_up,
     )
     return BagelStateDictAdapter(config=SimpleNamespace(text_config=text_config), stage="stage1")
 
@@ -111,19 +118,25 @@ def test_bagel_adapter_keeps_split_projections_when_fusion_is_disabled():
     assert not any("qkv_proj" in key or "gate_up_proj" in key for key in converted)
 
 
-def test_bagel_adapter_fused_projection_round_trip_is_exact():
+@pytest.mark.parametrize("fused_qkv,fused_gate_up", [(False, False), (True, False), (False, True), (True, True)])
+def test_bagel_adapter_projection_layout_round_trip_is_exact(fused_qkv, fused_gate_up):
     state = _split_projection_state()
-    adapter = _projection_adapter(fused=True)
+    adapter = _projection_adapter(fused_qkv=fused_qkv, fused_gate_up=fused_gate_up)
 
     converted = adapter.from_hf(state)
 
-    qkv = converted["model.language_model.model.layers.0.self_attn.qkv_proj.weight"]
-    gate_up = converted["model.language_model.model.layers.0.mlp.gate_up_proj.weight"]
-    assert qkv.shape == (16, 8)
-    assert gate_up.shape == (32, 8)
-    torch.testing.assert_close(qkv[:8], state["language_model.model.layers.0.self_attn.q_proj.weight"])
-    torch.testing.assert_close(qkv[8:12], state["language_model.model.layers.0.self_attn.k_proj.weight"])
-    torch.testing.assert_close(qkv[12:], state["language_model.model.layers.0.self_attn.v_proj.weight"])
+    qkv_key = "model.language_model.model.layers.0.self_attn.qkv_proj.weight"
+    gate_up_key = "model.language_model.model.layers.0.mlp.gate_up_proj.weight"
+    assert (qkv_key in converted) is fused_qkv
+    assert (gate_up_key in converted) is fused_gate_up
+    if fused_qkv:
+        qkv = converted[qkv_key]
+        assert qkv.shape == (16, 8)
+        torch.testing.assert_close(qkv[:8], state["language_model.model.layers.0.self_attn.q_proj.weight"])
+        torch.testing.assert_close(qkv[8:12], state["language_model.model.layers.0.self_attn.k_proj.weight"])
+        torch.testing.assert_close(qkv[12:], state["language_model.model.layers.0.self_attn.v_proj.weight"])
+    if fused_gate_up:
+        assert converted[gate_up_key].shape == (32, 8)
 
     restored = adapter.to_hf(converted)
     assert set(restored) == set(state)
@@ -140,6 +153,20 @@ def test_bagel_adapter_splits_fused_checkpoint_for_split_model():
     assert set(converted) == {f"model.{key}" for key in state}
     for key, tensor in state.items():
         torch.testing.assert_close(converted[f"model.{key}"], tensor)
+
+
+@pytest.mark.parametrize("fused_qkv,fused_gate_up", [(True, False), (False, True)])
+def test_bagel_adapter_converts_fused_checkpoint_to_partial_layout(fused_qkv, fused_gate_up):
+    state = _split_projection_state()
+    fused_state = _projection_adapter(fused=True).from_hf(state)
+
+    converted = _projection_adapter(fused_qkv=fused_qkv, fused_gate_up=fused_gate_up).from_hf(fused_state)
+
+    assert ("model.language_model.model.layers.0.self_attn.qkv_proj.weight" in converted) is fused_qkv
+    assert ("model.language_model.model.layers.0.mlp.gate_up_proj.weight" in converted) is fused_gate_up
+    restored = _projection_adapter(fused_qkv=fused_qkv, fused_gate_up=fused_gate_up).to_hf(converted)
+    for key, tensor in state.items():
+        torch.testing.assert_close(restored[key], tensor)
 
 
 def test_bagel_adapter_does_not_fuse_siglip_attention_projections():
@@ -215,9 +242,12 @@ def test_bagel_adapter_native_checkpoint_keeps_fused_tensor_identity():
     assert restored[extra_state_key] is extra_state
 
 
-@pytest.mark.parametrize(("fused", "expected"), [(False, False), (True, True)])
-def test_bagel_adapter_requires_full_state_init_only_for_fused_layout(fused, expected):
-    adapter = _projection_adapter(fused=fused)
+@pytest.mark.parametrize(
+    "fused_qkv,fused_gate_up,expected",
+    [(False, False, False), (True, False, True), (False, True, True), (True, True, True)],
+)
+def test_bagel_adapter_requires_full_state_init_for_any_fused_layout(fused_qkv, fused_gate_up, expected):
+    adapter = _projection_adapter(fused_qkv=fused_qkv, fused_gate_up=fused_gate_up)
 
     assert adapter.requires_full_state_dict_init() is expected
 

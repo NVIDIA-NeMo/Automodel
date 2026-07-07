@@ -34,9 +34,11 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-  # Pack Q/K/V and gate/up weights into one projection per group. Under FSDP,
-  # initialization fuses a full CPU state dict on each rank before distribution.
+  # Convenience switch for packing both Q/K/V and gate/up projections. The
+  # nullable per-group overrides inherit this value when left unset.
   fused_projections: false
+  fused_qkv_projections: null
+  fused_gate_up_projections: null
   # Optional override. If omitted, the recipe uses ae.safetensors from the
   # local checkpoint directory or downloads it from the same HF repo. When
   # checkpointing is enabled, ae.safetensors is copied into each checkpoint
