@@ -226,7 +226,7 @@ def _hf_source_load_kwargs(
 
 
 def _lm_head_embedding_aliased(model) -> bool | None:
-    """Return lm_head/input-embedding aliasing when both weights are present."""
+    """Return lm_head/input-embedding aliasing when real local storage is inspectable."""
     lm_head = getattr(model, "lm_head", None)
     get_input_embeddings = getattr(model, "get_input_embeddings", None)
     if lm_head is None or get_input_embeddings is None:
@@ -234,7 +234,18 @@ def _lm_head_embedding_aliased(model) -> bool | None:
     embeddings = get_input_embeddings()
     if embeddings is None or not hasattr(lm_head, "weight") or not hasattr(embeddings, "weight"):
         return None
-    return lm_head.weight.data_ptr() == embeddings.weight.data_ptr()
+    lm_head_weight = lm_head.weight
+    embedding_weight = embeddings.weight
+    if isinstance(lm_head_weight, DTensor) or isinstance(embedding_weight, DTensor):
+        return None
+    try:
+        lm_head_ptr = lm_head_weight.data_ptr()
+        embedding_ptr = embedding_weight.data_ptr()
+    except RuntimeError:
+        return None
+    if lm_head_ptr == 0 or embedding_ptr == 0:
+        return None
+    return lm_head_ptr == embedding_ptr
 
 
 def _explicit_tie_word_embeddings(config) -> bool | None:
@@ -247,13 +258,8 @@ def _explicit_tie_word_embeddings(config) -> bool | None:
     return None if tie_word_embeddings is None else bool(tie_word_embeddings)
 
 
-def _release_model_memory(*models) -> None:
+def _release_model_memory() -> None:
     """Release standalone model memory between source-load parity phases."""
-    for model in models:
-        try:
-            model.cpu()
-        except Exception:
-            pass
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -273,13 +279,35 @@ def _preinit_world_size() -> int:
     return int(os.environ.get("WORLD_SIZE", "1"))
 
 
-def _source_load_sync_paths(cfg) -> tuple[Path, Path]:
-    """Return done/fail marker paths for pre-init source-load parity synchronization."""
+def _sanitize_sync_id(value: str) -> str:
+    """Return a filesystem-friendly sync identifier."""
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
+
+
+def _source_load_run_id() -> str:
+    """Return a launch-scoped ID shared by ranks for pre-init file sync."""
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    if slurm_job_id:
+        slurm_step_id = os.environ.get("SLURM_STEP_ID", "step")
+        slurm_restart_count = os.environ.get("SLURM_RESTART_COUNT", "0")
+        return _sanitize_sync_id(f"slurm_{slurm_job_id}_{slurm_step_id}_{slurm_restart_count}")
+
+    torch_run_id = os.environ.get("TORCHELASTIC_RUN_ID")
+    if torch_run_id and torch_run_id.lower() not in ("local", "none", "default"):
+        restart_count = os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")
+        return _sanitize_sync_id(f"torchelastic_{torch_run_id}_{restart_count}")
+
+    master_port = os.environ.get("MASTER_PORT", "unknown")
+    world_size = os.environ.get("WORLD_SIZE", "1")
+    return _sanitize_sync_id(f"local_ppid_{os.getppid()}_port_{master_port}_world_{world_size}")
+
+
+def _source_load_sync_paths(cfg) -> tuple[Path, Path, Path]:
+    """Return sync directory and done/fail paths for pre-init source-load parity."""
     checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
-    run_id = os.environ.get("SLURM_JOB_ID") or os.environ.get("TORCHELASTIC_RUN_ID") or "local"
-    sync_dir = checkpoint_dir.parent / f".source_load_parity_{run_id}"
+    sync_dir = checkpoint_dir.parent / f".source_load_parity_{_source_load_run_id()}"
     sync_dir.mkdir(parents=True, exist_ok=True)
-    return sync_dir / "done", sync_dir / "fail"
+    return sync_dir, sync_dir / "done", sync_dir / "fail"
 
 
 def _wait_for_source_load_rank0(done_path: Path, fail_path: Path) -> None:
@@ -295,6 +323,17 @@ def _wait_for_source_load_rank0(done_path: Path, fail_path: Path) -> None:
     raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 source-load parity")
 
 
+def _cleanup_source_load_sync(cfg) -> None:
+    """Best-effort cleanup of pre-init source-load sync markers."""
+    sync_dir, done_path, fail_path = _source_load_sync_paths(cfg)
+    for path in (done_path, fail_path):
+        path.unlink(missing_ok=True)
+    try:
+        sync_dir.rmdir()
+    except OSError:
+        pass
+
+
 def _prepare_source_load_reference(
     cfg,
     input_ids: list[int],
@@ -305,7 +344,7 @@ def _prepare_source_load_reference(
 ) -> tuple[torch.Tensor, bool | None, bool | None] | None:
     """Compute raw HF source-load reference logits before trainer construction."""
     if _preinit_world_size() > 1:
-        done_path, fail_path = _source_load_sync_paths(cfg)
+        _, done_path, fail_path = _source_load_sync_paths(cfg)
         if _preinit_global_rank() != 0:
             _wait_for_source_load_rank0(done_path, fail_path)
             return None
@@ -760,6 +799,9 @@ def test_checkpoint_robustness():
         )
         for model_part in trainer.model_parts:
             model_part.train()
+        _barrier()
+        if _rank0():
+            _cleanup_source_load_sync(cfg)
         _barrier()
 
     trainer.run_train_validation_loop()
