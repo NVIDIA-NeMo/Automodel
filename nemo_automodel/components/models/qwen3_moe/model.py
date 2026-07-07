@@ -49,12 +49,12 @@ class Block(nn.Module):
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
 
         # Qwen3-MoE sparsifies every decoder_sparse_step layer, unless in mlp_only_layers
-        is_moe_layer = (
+        self.is_moe_layer = (
             (layer_idx not in getattr(config, "mlp_only_layers", []))
             and (getattr(config, "num_experts", 0) > 0)
             and ((layer_idx + 1) % getattr(config, "decoder_sparse_step", 1) == 0)
         )
-        if is_moe_layer:
+        if self.is_moe_layer:
             self.mlp = MoE(moe_config, backend)
         else:
             self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
@@ -92,11 +92,9 @@ class Block(nn.Module):
         return x
 
     def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
+        if not self.is_moe_layer:
             return self.mlp(x)
-        else:
-            assert isinstance(self.mlp, MoE)
-            return self.mlp(x, padding_mask)
+        return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):

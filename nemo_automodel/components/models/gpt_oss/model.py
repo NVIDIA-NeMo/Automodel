@@ -35,7 +35,7 @@ from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding,
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -48,6 +48,7 @@ class Block(nn.Module):
         self.self_attn = GptOssAttention(
             config, backend, use_sliding_attention=config.layer_types[layer_idx] == "sliding_attention"
         )
+        self.is_moe_layer = True
         self.mlp = MoE(moe_config, backend)
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.input_layernorm = initialize_rms_norm_module(
@@ -81,11 +82,9 @@ class Block(nn.Module):
         return x
 
     def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
+        if not self.is_moe_layer:
             return self.mlp(x)
-        else:
-            assert isinstance(self.mlp, MoE)
-            return self.mlp(x, padding_mask)
+        return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):

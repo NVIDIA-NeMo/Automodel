@@ -149,6 +149,7 @@ class TestBlock:
 
     def test_mlp_wrapper_handles_mlp_instance(self, qwen_config, backend_config):
         block = Block(layer_idx=0, config=qwen_config, moe_config=magic_moe_config(qwen_config), backend=backend_config)
+        block.is_moe_layer = False
         block.mlp = MLP(dim=qwen_config.hidden_size, inter_dim=qwen_config.intermediate_size, backend="torch")
         x = torch.randn(2, 4, qwen_config.hidden_size).to(torch.bfloat16)
 

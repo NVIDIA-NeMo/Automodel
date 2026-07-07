@@ -223,6 +223,7 @@ class TestBlock:
         block = Block(0, gpt_config, moe_config, backend_config)
 
         # Manually replace with regular MLP for testing
+        block.is_moe_layer = False
         block.mlp = MLP(dim=128, inter_dim=256, backend="torch")
         block = block.to(device)
 
