@@ -95,6 +95,7 @@ lr_scheduler:
 ci:
   recipe_owner: adil-a
   time: "00:20:00"
+  known_issue_id: AM-153
   checkpoint_robustness:
     check_source_load_parity: true
     kl_threshold: 5e-3
