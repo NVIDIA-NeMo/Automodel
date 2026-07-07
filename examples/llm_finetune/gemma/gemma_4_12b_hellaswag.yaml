@@ -89,3 +89,13 @@ optimizer:
 
 ci:
   recipe_owner: HuiyingLi
+  time: "00:30:00"
+  checkpoint_robustness:
+    check_source_load_parity: true
+    hf_kl_threshold: 1e-2
+    source_load_kl_threshold: 1e-2
+    source_load_cosine_threshold: 0.9995
+    tokenizer_name: google/gemma-4-12B
+    hf_device_map_auto: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 64
