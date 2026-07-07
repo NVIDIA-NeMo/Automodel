@@ -842,7 +842,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # through ``__call__(_pre_embed_only=True)`` before CP sharding so the model
         # can attach its own ``_cp_make_batch_fn`` (see ``prepare_model_inputs_for_cp``).
         if attn_kwargs.pop("_pre_embed_only", False):
-            return self.prepare_model_inputs_for_cp({"input_ids": input_ids})
+            return self.prepare_model_inputs_for_cp(
+                attn_kwargs.pop("_cp_batch"), num_chunks=attn_kwargs.pop("num_chunks", 1)
+            )
 
         if output_hidden_states is None:
             output_hidden_states = getattr(getattr(self, "config", None), "output_hidden_states", False)

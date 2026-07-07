@@ -851,6 +851,9 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     ) -> dict[str, Any]:
         """Build full-sequence multimodal embeddings and mRoPE positions before CP sharding.
 
+        Removes the raw input keys it consumed from ``batch``; the dispatcher merges
+        the returned entries on top.
+
         Args:
             batch: The batch dict (with ``input_ids`` and optional multimodal
                 keys).
@@ -925,7 +928,24 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             position_ids, rope_deltas = self.model.get_rope_index(input_ids, **rope_kwargs)
             self.model.rope_deltas = rope_deltas
 
-        return {"inputs_embeds": inputs_embeds, "position_ids": position_ids}
+        # Consumed into inputs_embeds; returned as None so the dispatcher
+        # removes them from the batch (the hook may receive a copy of the
+        # batch dict when FSDP2 casts forward kwargs, so in-place pops are
+        # not reliable; the return channel is).
+        consumed = {
+            key: None
+            for key in (
+                "input_ids",
+                "pixel_values",
+                "pixel_values_videos",
+                "image_grid_thw",
+                "image_grid_hws",
+                "video_grid_thw",
+                "mm_token_type_ids",
+            )
+        }
+
+        return {**consumed, "inputs_embeds": inputs_embeds, "position_ids": position_ids}
 
     def forward(
         self,
@@ -941,18 +961,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         **kwargs: Any,
     ):
         if kwargs.pop("_pre_embed_only", False):
-            num_chunks = kwargs.pop("num_chunks", 1)
-            cp_batch: dict[str, Any] = {
-                key: value
-                for key, value in {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "position_ids": position_ids,
-                    **kwargs,
-                }.items()
-                if value is not None
-            }
-            return self.prepare_model_inputs_for_cp(cp_batch, num_chunks=num_chunks)
+            return self.prepare_model_inputs_for_cp(kwargs.pop("_cp_batch"), num_chunks=kwargs.pop("num_chunks", 1))
 
         # Resolve from the text/decoder sub-config for this VL model.
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config

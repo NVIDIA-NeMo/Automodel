@@ -773,6 +773,9 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         its local slice of input_ids. Returns a dict so future per-layer inputs
         can ride alongside ``inputs_embeds``.
 
+        Removes the raw input keys it consumed from ``batch``; the dispatcher merges
+        the returned entries on top.
+
         Args:
             batch: The batch dict (with ``input_ids`` and optional multimodal
                 keys).
@@ -844,7 +847,24 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                     ].to(inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.reshape(B_s, N_s, C_s)
 
-        return {"inputs_embeds": inputs_embeds}
+        # Consumed into inputs_embeds; returned as None so the dispatcher
+        # removes them from the batch (the hook may receive a copy of the
+        # batch dict when FSDP2 casts forward kwargs, so in-place pops are
+        # not reliable; the return channel is).
+        consumed = {
+            key: None
+            for key in (
+                "input_ids",
+                "pixel_values",
+                "image_flags",
+                "imgs_sizes",
+                "pixel_values_videos",
+                "sound_features",
+                "sound_attention_mask",
+            )
+        }
+
+        return {**consumed, "inputs_embeds": inputs_embeds}
 
     def prepare_inputs_embeds_for_cp(
         self,
@@ -943,20 +963,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # weights, but does NOT want the LM forward to run. Returns a dict with
         # at least ``inputs_embeds``.
         if _pre_embed_only:
-            cp_batch = {
-                key: value
-                for key, value in {
-                    "input_ids": input_ids,
-                    "pixel_values": pixel_values,
-                    "image_flags": image_flags,
-                    "imgs_sizes": imgs_sizes,
-                    "pixel_values_videos": pixel_values_videos,
-                    "sound_features": sound_features,
-                    "sound_attention_mask": sound_attention_mask,
-                }.items()
-                if value is not None
-            }
-            return self.prepare_model_inputs_for_cp(cp_batch, num_chunks=kwargs.pop("num_chunks", 1))
+            return self.prepare_model_inputs_for_cp(kwargs.pop("_cp_batch"), num_chunks=kwargs.pop("num_chunks", 1))
 
         # Caller pre-supplied inputs_embeds (CP path: prepare_inputs_embeds_for_cp
         # ran the multimodal scatter on the un-sharded sequence before

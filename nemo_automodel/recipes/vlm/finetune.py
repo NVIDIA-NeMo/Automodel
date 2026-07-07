@@ -78,7 +78,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -893,13 +893,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Single CP dispatch (magi / model-owned / generic). The pre-embed hook is
         # routed through __call__ so FSDP2 forward pre-hooks fire and unshard the
         # vision tower's weights before the embed/scatter.
+        _pre_embed_here = not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False)
+        _cp_active = (
+            self.device_mesh is not None
+            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
+            and self.device_mesh["cp"].size() > 1
+        )
+        if _cp_active and not _pre_embed_here and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp"):
+            # PP stages without embeddings never pre-embed; drop the raw
+            # multimodal inputs so stage forwards see only text inputs.
+            for k in VLM_INPUT_KEYS:
+                if k != "input_ids":
+                    batch.pop(k, None)
         train_ctx, batch, _ = prepare_cp_forward(
             self.model_parts[0],
             self.device_mesh,
             batch,
             magi=self.magi,
-            invoke_pre_embed=not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False),
-            drop_mm_inputs=True,
+            invoke_pre_embed=_pre_embed_here,
         )
         labels = batch.pop("labels")
 

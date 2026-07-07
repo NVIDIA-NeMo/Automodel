@@ -73,7 +73,7 @@ class TestPrepareModelInputsForCP:
         out = model.prepare_model_inputs_for_cp({"input_ids": input_ids})
 
         # seq_index is derived inside the CP linear-attn layer, not here.
-        assert set(out) == {"inputs_embeds", "position_ids"}
+        assert {k for k, v in out.items() if v is not None} == {"inputs_embeds", "position_ids"}
         assert out["inputs_embeds"].shape == (1, 4, 4)
         # position_ids came from get_rope_index (mRoPE [3, B, S]).
         assert out["position_ids"].shape == (3, 1, 4)
@@ -126,6 +126,20 @@ class TestPrepareModelInputsForCP:
         # token 6 -> image (1), token 8 -> video (2), others 0.
         assert captured["mm_token_type_ids"].tolist() == [[0, 1, 0, 2]]
 
+    def test_consumed_keys_removed_from_batch(self):
+        """Consumed keys come back as None markers for the dispatcher to remove."""
+        model = _build_model()
+        batch = {
+            "input_ids": torch.tensor([[5, 6, 7, 8]]),
+            "mm_token_type_ids": torch.zeros(1, 4, dtype=torch.long),
+            "position_ids": torch.zeros(3, 1, 4, dtype=torch.long),
+        }
+        out = model.prepare_model_inputs_for_cp(batch)
+        assert out["input_ids"] is None
+        assert out["mm_token_type_ids"] is None
+        # position_ids is not consumed into embeds and must survive.
+        assert "position_ids" in batch
+
 
 class TestForwardPreEmbedDispatch:
     def test_pre_embed_only_dispatches_to_prepare(self):
@@ -144,7 +158,11 @@ class TestForwardPreEmbedDispatch:
 
         input_ids = torch.tensor([[5, 6, 7, 8]])
         pixel_values = torch.randn(4, 8)
-        out = model.forward(input_ids=input_ids, _pre_embed_only=True, pixel_values=pixel_values)
+        # The dispatcher hands the whole batch dict through the _cp_batch kwarg.
+        out = model.forward(
+            _pre_embed_only=True,
+            _cp_batch={"input_ids": input_ids, "pixel_values": pixel_values},
+        )
 
         assert out is sentinel
         assert torch.equal(captured["input_ids"], input_ids)

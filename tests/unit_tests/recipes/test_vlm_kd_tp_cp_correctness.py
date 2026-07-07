@@ -57,12 +57,15 @@ class _StudentVLM(nn.Module):
         return self.embedding
 
     def prepare_model_inputs_for_cp(self, batch, **kwargs):
-        return {"inputs_embeds": self.embedding(batch["input_ids"])}
+        # Production contract: consumed raw inputs are returned as None so the
+        # dispatcher removes them (the hook may receive a copy of the batch).
+        return {"inputs_embeds": self.embedding(batch["input_ids"]), "input_ids": None, "pixel_values": None}
 
     def forward(self, _pre_embed_only: bool = False, input_ids=None, inputs_embeds=None, **kwargs):
         if _pre_embed_only:
-            self.pre_embed_calls.append(dict(kwargs, input_ids=input_ids))
-            return self.prepare_model_inputs_for_cp({"input_ids": input_ids, **kwargs})
+            cp_batch = kwargs.pop("_cp_batch")
+            self.pre_embed_calls.append(dict(cp_batch))
+            return self.prepare_model_inputs_for_cp(cp_batch)
 
         self.forward_calls.append({"input_ids": input_ids, "inputs_embeds": inputs_embeds, **kwargs})
         if inputs_embeds is None:

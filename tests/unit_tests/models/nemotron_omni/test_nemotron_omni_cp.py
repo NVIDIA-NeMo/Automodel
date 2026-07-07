@@ -217,6 +217,20 @@ def test_prepare_model_inputs_for_cp_sound_skipped_when_no_sound_encoder():
     assert torch.equal(out, expected)
 
 
+def test_prepare_model_inputs_for_cp_removes_consumed_keys_from_batch():
+    """Consumed raw inputs come back as None markers for the dispatcher to remove."""
+    model = _make_omni_stub()
+    batch = {
+        "input_ids": torch.tensor([[1, IMG_TOKEN_ID, IMG_TOKEN_ID, 4]]),
+        "pixel_values": torch.zeros(2, 3, 4, 4),
+        "image_flags": torch.tensor([[1], [1]]),
+    }
+    out = model.prepare_model_inputs_for_cp(batch)
+    assert out["input_ids"] is None
+    assert out["pixel_values"] is None
+    assert out["image_flags"] is None
+
+
 # -----------------------------------------------------------------------------
 # prepare_inputs_embeds_for_cp (thin wrapper)
 # -----------------------------------------------------------------------------
@@ -269,11 +283,14 @@ def test_forward_pre_embed_only_returns_dict_from_prepare_model_inputs_for_cp(mo
 
     model.language_model.forward = _llm_must_not_run  # would also catch __call__
 
+    # The dispatcher hands the whole batch dict through the _cp_batch kwarg.
     out = model.forward(
-        input_ids=torch.tensor([[1, IMG_TOKEN_ID, 3]]),
-        pixel_values=torch.zeros(1, 3, 4, 4),
-        image_flags=torch.tensor([[1]]),
         _pre_embed_only=True,
+        _cp_batch={
+            "input_ids": torch.tensor([[1, IMG_TOKEN_ID, 3]]),
+            "pixel_values": torch.zeros(1, 3, 4, 4),
+            "image_flags": torch.tensor([[1]]),
+        },
     )
     assert isinstance(out, dict)
     assert "inputs_embeds" in out

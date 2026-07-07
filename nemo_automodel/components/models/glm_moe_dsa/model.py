@@ -468,7 +468,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # can attach its own ``cp_sharder`` (see ``prepare_model_inputs_for_cp``).
         if attn_kwargs.pop("_pre_embed_only", False):
             return self.prepare_model_inputs_for_cp(
-                {"input_ids": input_ids}, num_chunks=attn_kwargs.pop("num_chunks", 1)
+                attn_kwargs.pop("_cp_batch"), num_chunks=attn_kwargs.pop("num_chunks", 1)
             )
 
         output_hidden_states = (

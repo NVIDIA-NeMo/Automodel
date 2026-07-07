@@ -2189,12 +2189,20 @@ class _CPPreEmbedModel(torch.nn.Module):
     def prepare_model_inputs_for_cp(self, *args, **kwargs):
         raise AssertionError("prepare_model_inputs_for_cp should be invoked through model.__call__")
 
-    def forward(self, *, input_ids=None, mm_token_type_ids=None, _pre_embed_only=False, **kwargs):
+    def forward(self, *, _pre_embed_only=False, **kwargs):
         assert _pre_embed_only is True
+        # Production contract: read the live batch from _cp_batch, remove the
+        # raw inputs consumed into inputs_embeds.
+        cp_batch = kwargs["_cp_batch"]
+        input_ids = cp_batch["input_ids"]
+        mm_token_type_ids = cp_batch.get("mm_token_type_ids")
+        consumed = {k: None for k in ("input_ids", "pixel_values", "mm_token_type_ids", "image_position_ids")}
+        cp_batch.pop("image_position_ids", None)
         batch, seq = input_ids.shape
         inputs_embeds = self.scale * torch.ones(batch, seq, 4)
         per_layer_inputs = self.scale * torch.ones(batch, seq, 2, 3)
         prepared = {
+            **consumed,
             "inputs_embeds": inputs_embeds,
             "per_layer_inputs": per_layer_inputs,
         }

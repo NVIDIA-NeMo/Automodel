@@ -496,12 +496,17 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
     ) -> dict[str, Any]:
         """Merge vision features into token embeddings before CP sequence sharding.
 
+        Removes the raw input keys it consumed from ``batch``; the dispatcher merges
+        the returned entries on top.
+
         Args:
             batch: The batch dict (with ``input_ids`` and optional multimodal
                 keys).
             num_chunks: Number of chunks for load-balanced CP sharding.
         """
         input_ids = batch.get("input_ids")
+        if input_ids is None:
+            raise ValueError("Step3p7 CP pre-embedding requires input_ids.")
         pixel_values = batch.get("pixel_values")
         patch_pixel_values = batch.get("patch_pixel_values")
         num_patches = batch.get("num_patches")
@@ -513,7 +518,14 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             image_embeds=image_embeds,
         )
         inputs_embeds = self.model.prepare_inputs_embeds(input_ids, multimodal_embeddings)
-        return {"inputs_embeds": inputs_embeds}
+        # Consumed into inputs_embeds; returned as None so the dispatcher
+        # removes them from the batch (the hook may receive a copy of the
+        # batch dict when FSDP2 casts forward kwargs, so in-place pops are
+        # not reliable; the return channel is).
+        consumed = {
+            key: None for key in ("input_ids", "pixel_values", "patch_pixel_values", "num_patches", "image_embeds")
+        }
+        return {**consumed, "inputs_embeds": inputs_embeds}
 
     def forward(
         self,
@@ -535,13 +547,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         )
 
         if kwargs.pop("_pre_embed_only", False):
-            if input_ids is None:
-                raise ValueError("Step3p7 CP pre-embedding requires input_ids.")
-            num_chunks = kwargs.pop("num_chunks", 1)
-            cp_batch: dict[str, Any] = {
-                key: value for key, value in {"input_ids": input_ids, **kwargs}.items() if value is not None
-            }
-            return self.prepare_model_inputs_for_cp(cp_batch, num_chunks=num_chunks)
+            return self.prepare_model_inputs_for_cp(kwargs.pop("_cp_batch"), num_chunks=kwargs.pop("num_chunks", 1))
 
         is_pp_stage = self._is_pipeline_parallel_stage()
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled

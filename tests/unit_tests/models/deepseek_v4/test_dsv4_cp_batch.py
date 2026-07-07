@@ -295,10 +295,14 @@ def test_forward_pre_embed_only_branch_delegates_to_prepare():
     # before any model compute, so a fake self exercises it without a build.
     cfg = SimpleNamespace(compress_ratios=[4])
     fake_self = SimpleNamespace(config=cfg)
-    fake_self.prepare_model_inputs_for_cp = lambda batch: DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(
-        fake_self, batch
+    fake_self.prepare_model_inputs_for_cp = lambda batch, **kwargs: DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(
+        fake_self, batch, **kwargs
     )
-    out = DeepseekV4ForCausalLM.forward(fake_self, torch.arange(8).view(1, 8), _pre_embed_only=True)
+    # The dispatcher hands the whole batch dict through the _cp_batch kwarg;
+    # forward's positional input_ids is unused by the interception.
+    out = DeepseekV4ForCausalLM.forward(
+        fake_self, None, _pre_embed_only=True, _cp_batch={"input_ids": torch.arange(8).view(1, 8)}
+    )
     assert out["cp_sharder"].shard_batch.keywords["pad_multiple"] == 8
 
 

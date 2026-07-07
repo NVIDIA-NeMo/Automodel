@@ -293,7 +293,6 @@ def prepare_cp_forward(
     loss_mask=None,
     cp_size: Optional[int] = None,
     invoke_pre_embed: bool = True,
-    drop_mm_inputs: bool = False,
     on_pre_embedded=None,
 ):
     """Single CP dispatch for a training/eval forward: hook -> backend -> (ctx, batch, sharder).
@@ -324,9 +323,6 @@ def prepare_cp_forward(
         invoke_pre_embed: Invoke the model hook when CP is active. Recipes pass
             False for PP stages without embeddings and for KD paths that never
             wired model-owned CP.
-        drop_mm_inputs: When the hook exists but ``invoke_pre_embed`` is False
-            (PP non-first VLM stages), drop multimodal keys except
-            ``input_ids`` so stage forwards see only text inputs.
         on_pre_embedded: Optional callback receiving the hook's output dict
             before it is merged into the batch (e.g. KD teacher-compat check).
 
@@ -335,7 +331,6 @@ def prepare_cp_forward(
         ``CPSharder`` when a model-owned hook attached one (consumed by the
         recipe's ``finalize_loss``), else None.
     """
-    from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS  # noqa: PLC0415
 
     def _cp_size(mesh):
         if mesh is None:
@@ -352,25 +347,25 @@ def prepare_cp_forward(
     # llm-domain magi replaces the whole batch prep (no model has both a CP
     # hook and magi); vlm-domain magi composes with the vision pre-embed.
     magi_replaces_hook = magi_enabled and getattr(magi, "domain", "llm") == "llm"
-    if effective_cp_size > 1 and has_hook and not magi_replaces_hook:
-        if invoke_pre_embed:
-            hook_inputs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-            prepared = model(_pre_embed_only=True, num_chunks=num_chunks, **hook_inputs)
-            if on_pre_embedded is not None:
-                on_pre_embedded(prepared)
-            # Pre-embed hooks that return full-sequence ``inputs_embeds`` supersede
-            # the raw (multimodal) inputs, which must not reach the sharded forward.
-            # Sharder-only hooks (e.g. DSV4/GLM, which embed internally) return no
-            # ``inputs_embeds``; their batch — including ``input_ids`` — stays intact.
-            if "inputs_embeds" in prepared:
-                for k in VLM_INPUT_KEYS:
-                    batch.pop(k, None)
-            cp_sharder = prepared.get("cp_sharder")
-            batch.update(prepared)
-        elif drop_mm_inputs:
-            for k in VLM_INPUT_KEYS:
-                if k != "input_ids":
-                    batch.pop(k, None)
+    if effective_cp_size > 1 and has_hook and not magi_replaces_hook and invoke_pre_embed:
+        # The whole batch rides through __call__ as an opaque kwarg; the model
+        # reads the keys it needs and removes the raw inputs it consumed (its
+        # returned entries are merged on top). Sharder-only hooks (DSV4/GLM)
+        # consume nothing; their batch — including ``input_ids`` — stays intact.
+        prepared = model(_pre_embed_only=True, _cp_batch=batch, num_chunks=num_chunks)
+        if on_pre_embedded is not None:
+            on_pre_embedded(prepared)
+        cp_sharder = prepared.get("cp_sharder")
+        # Merge the hook's return: a None value marks a raw input the hook
+        # consumed (e.g. into inputs_embeds) — remove it so it cannot reach
+        # the sharded forward. The return channel is used (not in-place pops)
+        # because FSDP2's forward-kwargs cast can hand the hook a copy of the
+        # batch dict.
+        for key, value in prepared.items():
+            if value is None:
+                batch.pop(key, None)
+            else:
+                batch[key] = value
 
     ctx, batch = make_cp_batch_and_ctx(
         device_mesh,

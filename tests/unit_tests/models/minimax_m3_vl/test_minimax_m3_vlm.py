@@ -169,8 +169,14 @@ def test_prepare_model_inputs_for_cp(vlm_model):
     ids[0, 5 : 5 + n_tokens] = IMAGE_TOKEN_INDEX
     hidden = vlm_model.config.text_config.hidden_size
     with torch.no_grad():
-        prepared = vlm_model(ids, pixel_values=pixel_values, image_grid_thw=grid_thw, _pre_embed_only=True)
-        assert isinstance(prepared, dict) and set(prepared) == {"inputs_embeds"}
+        # The dispatcher hands the whole batch dict through the _cp_batch kwarg;
+        # consumed raw inputs come back as None markers.
+        cp_batch = {"input_ids": ids, "pixel_values": pixel_values, "image_grid_thw": grid_thw}
+        prepared = vlm_model(_pre_embed_only=True, _cp_batch=cp_batch)
+        assert prepared["input_ids"] is None
+        assert prepared["pixel_values"] is None
+        assert prepared["image_grid_thw"] is None
+        assert isinstance(prepared, dict) and {k for k, v in prepared.items() if v is not None} == {"inputs_embeds"}
         embeds = prepared["inputs_embeds"]
         assert embeds.shape == (1, 16, hidden) and torch.isfinite(embeds).all()
         # (a) equals the reference embed + vision splice

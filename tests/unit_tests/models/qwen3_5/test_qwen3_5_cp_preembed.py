@@ -78,7 +78,7 @@ class TestPrepareModelInputsForCP:
         out = model.prepare_model_inputs_for_cp({"input_ids": input_ids})
 
         # CP linear-attn recovers token order internally; only embeds + positions here.
-        assert set(out) == {"inputs_embeds", "position_ids"}
+        assert {k for k, v in out.items() if v is not None} == {"inputs_embeds", "position_ids"}
         assert out["inputs_embeds"].shape == (1, 4, 4)
         # position_ids came from get_rope_index (mRoPE [3, B, S]).
         assert out["position_ids"].shape == (3, 1, 4)
@@ -149,6 +149,20 @@ class TestPrepareModelInputsForCP:
         # token 6 -> image (1), token 8 -> video (2), others 0.
         assert captured["mm_token_type_ids"].tolist() == [[0, 1, 0, 2]]
 
+    def test_consumed_keys_removed_from_batch(self):
+        """Consumed keys come back as None markers for the dispatcher to remove."""
+        model = _build_model()
+        batch = {
+            "input_ids": torch.tensor([[5, 6, 7, 8]]),
+            "mm_token_type_ids": torch.zeros(1, 4, dtype=torch.long),
+            "position_ids": torch.zeros(3, 1, 4, dtype=torch.long),
+        }
+        out = model.prepare_model_inputs_for_cp(batch)
+        assert out["input_ids"] is None
+        assert out["mm_token_type_ids"] is None
+        # position_ids is not consumed into embeds and must survive.
+        assert "position_ids" in batch
+
 
 class TestPopStagedVlmMedia:
     def test_drops_orphaned_image_media(self):
@@ -196,8 +210,8 @@ class TestPopStagedVlmMedia:
         )
 
         feat = torch.full((1, 4), 8.0)  # one image token, hidden=4
-        model.model.get_image_features = (
-            lambda pixel_values, image_grid_thw=None, return_dict=True: types.SimpleNamespace(pooler_output=[feat])
+        model.model.get_image_features = lambda pixel_values, image_grid_thw=None, return_dict=True: (
+            types.SimpleNamespace(pooler_output=[feat])
         )
 
         def _mask(input_ids, *, inputs_embeds=None, image_features=None, video_features=None):
@@ -227,10 +241,8 @@ class TestPopStagedVlmMedia:
         model = _build_model(video_token_id=88)
 
         feat = torch.full((1, 4), 3.0)  # one video token, hidden=4
-        model.model.get_video_features = (
-            lambda pixel_values_videos, video_grid_thw=None, return_dict=True: types.SimpleNamespace(
-                pooler_output=[feat]
-            )
+        model.model.get_video_features = lambda pixel_values_videos, video_grid_thw=None, return_dict=True: (
+            types.SimpleNamespace(pooler_output=[feat])
         )
 
         def _mask(input_ids, *, inputs_embeds=None, image_features=None, video_features=None):
@@ -272,12 +284,14 @@ class TestForwardPreEmbedDispatch:
 
         input_ids = torch.tensor([[5, 6, 7, 8]])
         pixel_values = torch.randn(4, 8)
-        # image_grid_hws is not a named forward param, so it rides in **kwargs.
+        # The dispatcher hands the whole batch dict through the _cp_batch kwarg.
         out = model.forward(
-            input_ids=input_ids,
             _pre_embed_only=True,
-            pixel_values=pixel_values,
-            image_grid_hws=torch.tensor([[2, 2]]),
+            _cp_batch={
+                "input_ids": input_ids,
+                "pixel_values": pixel_values,
+                "image_grid_hws": torch.tensor([[2, 2]]),
+            },
         )
 
         assert out is sentinel

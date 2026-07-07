@@ -293,17 +293,24 @@ def test_prepare_model_inputs_for_cp_and_pre_embed_only_error():
     input_ids = torch.tensor([[1, 31, 2]])
     image_embeds = torch.randn(1, 8)
 
-    result = wrapper.prepare_model_inputs_for_cp({"input_ids": input_ids, "image_embeds": image_embeds})
-    assert set(result) == {"inputs_embeds"}
+    batch = {"input_ids": input_ids, "image_embeds": image_embeds}
+    result = wrapper.prepare_model_inputs_for_cp(batch)
+    assert {k for k, v in result.items() if v is not None} == {"inputs_embeds"}
     assert result["inputs_embeds"].shape == (1, 3, 8)
+    # Consumed raw inputs come back as None markers for the dispatcher to remove.
+    assert result["input_ids"] is None
+    assert result["image_embeds"] is None
 
-    assert wrapper(input_ids=input_ids, image_embeds=image_embeds, _pre_embed_only=True)["inputs_embeds"].shape == (
+    # The dispatcher hands the whole batch dict through the _cp_batch kwarg.
+    assert wrapper(_pre_embed_only=True, _cp_batch={"input_ids": input_ids, "image_embeds": image_embeds})[
+        "inputs_embeds"
+    ].shape == (
         1,
         3,
         8,
     )
     with pytest.raises(ValueError, match="CP pre-embedding requires input_ids"):
-        wrapper(_pre_embed_only=True)
+        wrapper(_pre_embed_only=True, _cp_batch={})
 
 
 def test_forward_consumes_pp_vlm_chunks_and_drops_mismatched_masks(monkeypatch):

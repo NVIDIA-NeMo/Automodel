@@ -1071,17 +1071,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         **kwargs: Any,
     ):
         if _pre_embed_only:
-            cp_batch = {
-                key: value
-                for key, value in {
-                    "input_ids": input_ids,
-                    "pixel_values": pixel_values,
-                    "image_position_ids": image_position_ids,
-                    "mm_token_type_ids": mm_token_type_ids,
-                }.items()
-                if value is not None
-            }
-            return self.prepare_model_inputs_for_cp(cp_batch)
+            return self.prepare_model_inputs_for_cp(kwargs.pop("_cp_batch"), num_chunks=kwargs.pop("num_chunks", 1))
 
         output_hidden_states = (
             output_hidden_states
@@ -1328,6 +1318,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     ) -> dict[str, Any]:
         """Prepare Gemma4 embeddings on the full sequence before CP sharding.
 
+        Removes the raw input keys it consumed from ``batch``; the dispatcher merges
+        the returned entries on top.
+
         Args:
             batch: The batch dict (with ``input_ids`` and optional multimodal
                 keys).
@@ -1370,7 +1363,13 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             prepared_inputs["inputs_embeds"] = inputs_embeds.masked_scatter(image_mask, image_features)
 
-        return prepared_inputs
+        # Consumed into inputs_embeds; returned as None so the dispatcher
+        # removes them from the batch (the hook may receive a copy of the
+        # batch dict when FSDP2 casts forward kwargs, so in-place pops are
+        # not reliable; the return channel is).
+        consumed = {key: None for key in ("input_ids", "pixel_values", "image_position_ids", "mm_token_type_ids")}
+
+        return {**consumed, **prepared_inputs}
 
     def prepare_inputs_embeds_for_cp(
         self,

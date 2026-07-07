@@ -52,11 +52,13 @@ def _train_cp_prepare(_model, batch, *, pp_enabled=False, has_first_stage=True):
     if not hasattr(_model, "prepare_model_inputs_for_cp"):
         return batch
     if not pp_enabled or has_first_stage:
-        mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-        prepared = _model(_pre_embed_only=True, **mm_kwargs)
-        for k in VLM_INPUT_KEYS:
-            batch.pop(k, None)
-        batch.update(prepared)
+        prepared = _model(_pre_embed_only=True, _cp_batch=batch, num_chunks=1)
+        # dispatcher contract: None values mark consumed keys -> removed
+        for k, v in prepared.items():
+            if v is None:
+                batch.pop(k, None)
+            else:
+                batch[k] = v
     else:
         for k in VLM_INPUT_KEYS:
             if k != "input_ids":
@@ -80,9 +82,19 @@ class _SpyVLM:
         return self.prepared
 
     def __call__(self, *, _pre_embed_only=False, **kwargs):
-        self.calls.append({"_pre_embed_only": _pre_embed_only, **kwargs})
+        record = {"_pre_embed_only": _pre_embed_only, **kwargs}
+        if isinstance(record.get("_cp_batch"), dict):
+            # snapshot: the dispatcher mutates the live batch after this call
+            record["_cp_batch"] = dict(record["_cp_batch"])
+        self.calls.append(record)
         if _pre_embed_only:
-            return self.prepared
+            # Mirror the production contract: consumed raw inputs are returned
+            # as None markers so the dispatcher removes them from the batch.
+            # This spy "consumes" every input key it received except loss/mask
+            # bookkeeping (a real model lists exactly what it embedded).
+            cp_batch = kwargs.get("_cp_batch") or {}
+            consumed = {k: None for k in cp_batch if k not in ("labels", "attention_mask", "position_ids")}
+            return {**consumed, **self.prepared}
         raise AssertionError("recipe must use _pre_embed_only=True for the CP prepare step")
 
 
@@ -105,9 +117,9 @@ def test_train_cp_prepare_routes_through_call_with_pre_embed_only_flag():
 
     assert len(model.calls) == 1
     assert model.calls[0]["_pre_embed_only"] is True
-    # input_ids and pixel_values should have been forwarded as kwargs
-    assert "input_ids" in model.calls[0]
-    assert "pixel_values" in model.calls[0]
+    # the whole batch rides through the opaque _cp_batch kwarg
+    assert "input_ids" in model.calls[0]["_cp_batch"]
+    assert "pixel_values" in model.calls[0]["_cp_batch"]
     # The returned batch contains inputs_embeds (not input_ids)
     assert "inputs_embeds" in out_batch
     assert torch.equal(out_batch["inputs_embeds"], inputs_embeds)
@@ -115,8 +127,8 @@ def test_train_cp_prepare_routes_through_call_with_pre_embed_only_flag():
 
 
 def test_train_cp_prepare_pops_all_vlm_input_keys_from_batch():
-    """All keys in VLM_INPUT_KEYS that were in the batch must be popped after
-    the prepare step. Other keys (labels, attention_mask, etc.) must remain."""
+    """Keys the model declares consumed (returned as None) must be removed
+    after the prepare step. Other keys (labels, attention_mask, etc.) remain."""
     model = _SpyVLM(prepared={"inputs_embeds": torch.zeros(1, 4, 8)})
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 4]]),
@@ -136,9 +148,9 @@ def test_train_cp_prepare_pops_all_vlm_input_keys_from_batch():
     assert "attention_mask" in out_batch
 
 
-def test_train_cp_prepare_only_passes_keys_that_are_present():
-    """``mm_kwargs`` filter uses ``batch.get(k) is not None`` so missing or None
-    multimodal keys are not forwarded as kwargs."""
+def test_train_cp_prepare_passes_the_whole_batch_opaquely():
+    """The hook receives the batch dict itself (no framework-side key filter):
+    the model — not a central registry — decides which keys it reads."""
     model = _SpyVLM()
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 4]]),
@@ -147,12 +159,8 @@ def test_train_cp_prepare_only_passes_keys_that_are_present():
     }
     _train_cp_prepare(model, batch)
 
-    call_kwargs = model.calls[0]
-    # input_ids should be present
-    assert "input_ids" in call_kwargs
-    # No spurious None-valued multimodal kwargs
-    for k in ("pixel_values", "sound_features", "pixel_values_videos"):
-        assert k not in call_kwargs
+    cp_batch = model.calls[0]["_cp_batch"]
+    assert set(cp_batch) == {"input_ids", "labels"}
 
 
 def test_train_cp_prepare_skipped_when_model_has_no_prepare_model_inputs_for_cp():
@@ -235,8 +243,8 @@ def test_train_cp_prepare_pp_first_stage_preembeds_inputs():
 
     assert len(model.calls) == 1
     assert model.calls[0]["_pre_embed_only"] is True
-    assert "patch_pixel_values" in model.calls[0]
-    assert "num_patches" in model.calls[0]
+    assert "patch_pixel_values" in model.calls[0]["_cp_batch"]
+    assert "num_patches" in model.calls[0]["_cp_batch"]
     assert "inputs_embeds" in out_batch
     assert "input_ids" not in out_batch
     assert "pixel_values" not in out_batch

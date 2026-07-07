@@ -248,7 +248,8 @@ def test_forward_pre_embed_only_routes_to_prepare(monkeypatch):
     model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
     sentinel = {"inputs_embeds": torch.zeros(1)}
     monkeypatch.setattr(model, "prepare_model_inputs_for_cp", lambda *a, **kw: sentinel)
-    out = model(input_ids=torch.tensor([[1, 2, 3]]), _pre_embed_only=True)
+    # The dispatcher hands the whole batch dict through the _cp_batch kwarg.
+    out = model(_pre_embed_only=True, _cp_batch={"input_ids": torch.tensor([[1, 2, 3]])})
     assert out is sentinel
 
 
@@ -476,6 +477,25 @@ def test_prepare_model_inputs_threads_per_layer_inputs(monkeypatch):
     prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[1, 42, 3, 4]])})
     assert "per_layer_inputs" in prepared
     assert prepared["per_layer_inputs"].shape == (1, 4, 8)
+
+
+def test_prepare_model_inputs_removes_consumed_keys_from_batch(monkeypatch):
+    """The hook mutates ``batch`` in place, dropping the raw inputs it consumed.
+    ``mm_token_type_ids`` is popped from the input but re-emitted in the output dict."""
+    cfg = _cfg()
+    cfg.image_token_id = 42
+    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
+    monkeypatch.setattr(model, "_prepare_per_layer_inputs_for_cp", lambda ids, mask: None)
+    batch = {
+        "input_ids": torch.tensor([[1, 42, 3, 4]]),
+        "mm_token_type_ids": torch.tensor([[0, 1, 0, 0]]),
+    }
+    prepared = model.prepare_model_inputs_for_cp(batch)
+    assert prepared["input_ids"] is None
+    assert prepared["pixel_values"] is None
+    # mm_token_type_ids is consumed but re-emitted as an output, so the real
+    # value (not the None consumed-marker) wins in the returned dict.
+    assert prepared["mm_token_type_ids"] is not None
 
 
 # ---------------------------------------------------------------------------
