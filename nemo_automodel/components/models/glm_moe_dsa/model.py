@@ -334,15 +334,14 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def prepare_model_inputs_for_cp(
         self,
-        batch: dict[str, Any] | torch.Tensor | None = None,
+        batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-        **kwargs: Any,
     ) -> dict[str, Any]:
         """Attach GLM DSA's packed THD context-parallel batch sharder.
 
         Args:
-            batch: The batch dict; legacy per-key kwargs are also accepted for now.
+            batch: The batch dict.
             num_chunks: Number of chunks for load-balanced CP sharding.
         """
         from functools import partial  # noqa: PLC0415
@@ -350,10 +349,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
             CPSharder,
             contiguous_local_indices,
-            normalize_prepare_cp_args,
         )
-
-        batch = normalize_prepare_cp_args(batch, kwargs)
 
         if getattr(self.backend, "attn", None) != "tilelang":
             raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")

@@ -81,7 +81,6 @@ from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.distributed.cp_sharder import (
     CPSharder,
     contiguous_local_indices,
-    normalize_prepare_cp_args,
 )
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -1323,19 +1322,17 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
     def prepare_model_inputs_for_cp(
         self,
-        batch: dict[str, Any] | torch.Tensor | None = None,
+        batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-        **kwargs: Any,
     ) -> dict[str, Any]:
         """Prepare Gemma4 embeddings on the full sequence before CP sharding.
 
         Args:
             batch: The batch dict (with ``input_ids`` and optional multimodal
-                keys); legacy per-key kwargs are also accepted for now.
+                keys).
             num_chunks: Number of chunks for load-balanced CP sharding.
         """
-        batch = normalize_prepare_cp_args(batch, kwargs)
         input_ids = batch.get("input_ids")
         pixel_values = batch.get("pixel_values")
         image_position_ids = batch.get("image_position_ids")

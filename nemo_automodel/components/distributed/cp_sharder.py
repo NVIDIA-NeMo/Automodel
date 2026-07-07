@@ -45,39 +45,6 @@ import torch
 import torch.distributed as dist
 
 
-def normalize_prepare_cp_args(batch, kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Normalize ``prepare_model_inputs_for_cp`` arguments to the batch-dict form.
-
-    The unified hook signature is ``prepare_model_inputs_for_cp(batch, *,
-    num_chunks=1)``. Legacy callers passed per-key kwargs
-    (``input_ids=..., pixel_values=...``); accept those for one release with a
-    deprecation warning and repack them into a batch dict.
-
-    Args:
-        batch: The batch dict (new form), or a positional ``input_ids`` tensor
-            or None (legacy forms).
-        kwargs: Remaining keyword arguments from the hook call; treated as
-            legacy per-key batch entries when ``batch`` is not a dict.
-
-    Returns:
-        The batch dict the hook body should read from.
-    """
-    if isinstance(batch, dict):
-        return batch
-    import warnings  # noqa: PLC0415
-
-    warnings.warn(
-        "Calling prepare_model_inputs_for_cp with per-key kwargs (input_ids=..., ...) is deprecated; "
-        "pass the batch dict instead: prepare_model_inputs_for_cp(batch, num_chunks=...).",
-        DeprecationWarning,
-        stacklevel=3,
-    )
-    legacy = {key: value for key, value in kwargs.items() if value is not None}
-    if batch is not None:
-        legacy["input_ids"] = batch
-    return legacy
-
-
 def _cp_rank(cp_mesh) -> int:
     """Resolve this rank's index within the CP submesh (0 without distributed)."""
     if dist.is_available() and dist.is_initialized():

@@ -29,7 +29,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nemo_automodel.components.models.deepseek_v4 import cp as cpmod
 from nemo_automodel.components.models.deepseek_v4.cp import (
     dsv4_cp_enabled,
     dsv4_cp_local_seq_multiple,
@@ -276,7 +275,7 @@ def test_prepare_model_inputs_for_cp_returns_make_batch_fn_and_flag():
     # The method only reads self.config, so a lightweight stand-in suffices.
     cfg = SimpleNamespace(compress_ratios=[0, 4, 128])
     fake_self = SimpleNamespace(config=cfg)
-    prepared = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, input_ids=torch.arange(8).view(1, 8))
+    prepared = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, {"input_ids": torch.arange(8).view(1, 8)})
 
     sharder = prepared["cp_sharder"]
     assert sharder.layout == "contiguous"
@@ -296,8 +295,8 @@ def test_forward_pre_embed_only_branch_delegates_to_prepare():
     # before any model compute, so a fake self exercises it without a build.
     cfg = SimpleNamespace(compress_ratios=[4])
     fake_self = SimpleNamespace(config=cfg)
-    fake_self.prepare_model_inputs_for_cp = lambda input_ids: DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(
-        fake_self, input_ids=input_ids
+    fake_self.prepare_model_inputs_for_cp = lambda batch: DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(
+        fake_self, batch
     )
     out = DeepseekV4ForCausalLM.forward(fake_self, torch.arange(8).view(1, 8), _pre_embed_only=True)
     assert out["cp_sharder"].shard_batch.keywords["pad_multiple"] == 8

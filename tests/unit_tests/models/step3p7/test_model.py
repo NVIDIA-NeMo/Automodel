@@ -293,7 +293,7 @@ def test_prepare_model_inputs_for_cp_and_pre_embed_only_error():
     input_ids = torch.tensor([[1, 31, 2]])
     image_embeds = torch.randn(1, 8)
 
-    result = wrapper.prepare_model_inputs_for_cp(input_ids, image_embeds=image_embeds)
+    result = wrapper.prepare_model_inputs_for_cp({"input_ids": input_ids, "image_embeds": image_embeds})
     assert set(result) == {"inputs_embeds"}
     assert result["inputs_embeds"].shape == (1, 3, 8)
 

@@ -1122,7 +1122,7 @@ def test_glm_dsa_prepare_model_inputs_for_cp_requires_tilelang():
     model = GlmMoeDsaForCausalLM(config, backend=backend)
 
     with pytest.raises(NotImplementedError, match="backend.attn='tilelang'"):
-        model.prepare_model_inputs_for_cp(input_ids=torch.arange(8).view(1, 8))
+        model.prepare_model_inputs_for_cp({"input_ids": torch.arange(8).view(1, 8)})
 
 
 def test_mla_tilelang_sparse_attention_rejects_bshd_without_kernels():

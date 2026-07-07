@@ -490,21 +490,17 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
 
     def prepare_model_inputs_for_cp(
         self,
-        batch: dict[str, Any] | torch.Tensor | None = None,
+        batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-        **kwargs: Any,
     ) -> dict[str, Any]:
         """Merge vision features into token embeddings before CP sequence sharding.
 
         Args:
             batch: The batch dict (with ``input_ids`` and optional multimodal
-                keys); legacy per-key kwargs are also accepted for now.
+                keys).
             num_chunks: Number of chunks for load-balanced CP sharding.
         """
-        from nemo_automodel.components.distributed.cp_sharder import normalize_prepare_cp_args  # noqa: PLC0415
-
-        batch = normalize_prepare_cp_args(batch, kwargs)
         input_ids = batch.get("input_ids")
         pixel_values = batch.get("pixel_values")
         patch_pixel_values = batch.get("patch_pixel_values")

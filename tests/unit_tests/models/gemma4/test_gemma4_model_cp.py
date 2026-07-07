@@ -227,7 +227,7 @@ def test_init_derives_pad_token_id_from_eos_list():
 def test_prepare_model_inputs_requires_input_ids():
     model = Gemma4ForConditionalGeneration(_cfg(), backend=_backend())
     with pytest.raises(ValueError, match="requires input_ids"):
-        model.prepare_model_inputs_for_cp(input_ids=None)
+        model.prepare_model_inputs_for_cp({"input_ids": None})
 
 
 def test_prepare_inputs_embeds_for_cp_delegates():
@@ -237,7 +237,7 @@ def test_prepare_inputs_embeds_for_cp_delegates():
     ids = torch.tensor([[1, 42, 3, 4]])
     # prepare_inputs_embeds_for_cp returns just the inputs_embeds tensor
     embeds = model.prepare_inputs_embeds_for_cp(input_ids=ids)
-    expected = model.prepare_model_inputs_for_cp(input_ids=ids)["inputs_embeds"]
+    expected = model.prepare_model_inputs_for_cp({"input_ids": ids})["inputs_embeds"]
     assert isinstance(embeds, torch.Tensor)
     assert embeds.shape == expected.shape
 
@@ -473,7 +473,7 @@ def test_prepare_model_inputs_threads_per_layer_inputs(monkeypatch):
     cfg.image_token_id = 42
     model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
     monkeypatch.setattr(model, "_prepare_per_layer_inputs_for_cp", lambda ids, mask: torch.zeros(1, 4, 8))
-    prepared = model.prepare_model_inputs_for_cp(input_ids=torch.tensor([[1, 42, 3, 4]]))
+    prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[1, 42, 3, 4]])})
     assert "per_layer_inputs" in prepared
     assert prepared["per_layer_inputs"].shape == (1, 4, 8)
 
@@ -598,7 +598,7 @@ def test_cp_shard_batch_installs_ring_then_delegates(monkeypatch):
 
 def test_prepare_model_inputs_attaches_cp_shard_batch_fn():
     model = Gemma4ForConditionalGeneration(_cfg(enable_moe_block=False), backend=_backend()).to(torch.bfloat16)
-    prepared = model.prepare_model_inputs_for_cp(input_ids=torch.tensor([[1, 2, 3, 4]]))
+    prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[1, 2, 3, 4]])})
     # The model attaches its own bound batch-sharding callable (model-owned install seam).
     assert prepared["cp_sharder"].shard_batch == model._cp_shard_batch
 

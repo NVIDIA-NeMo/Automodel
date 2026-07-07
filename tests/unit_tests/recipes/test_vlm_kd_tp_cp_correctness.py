@@ -56,13 +56,13 @@ class _StudentVLM(nn.Module):
     def get_input_embeddings(self):
         return self.embedding
 
-    def prepare_model_inputs_for_cp(self, **kwargs):
-        return {"inputs_embeds": self.embedding(kwargs["input_ids"])}
+    def prepare_model_inputs_for_cp(self, batch, **kwargs):
+        return {"inputs_embeds": self.embedding(batch["input_ids"])}
 
     def forward(self, _pre_embed_only: bool = False, input_ids=None, inputs_embeds=None, **kwargs):
         if _pre_embed_only:
             self.pre_embed_calls.append(dict(kwargs, input_ids=input_ids))
-            return self.prepare_model_inputs_for_cp(input_ids=input_ids, **kwargs)
+            return self.prepare_model_inputs_for_cp({"input_ids": input_ids, **kwargs})
 
         self.forward_calls.append({"input_ids": input_ids, "inputs_embeds": inputs_embeds, **kwargs})
         if inputs_embeds is None:

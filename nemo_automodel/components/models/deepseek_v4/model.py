@@ -797,10 +797,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def prepare_model_inputs_for_cp(
         self,
-        batch: dict[str, Any] | torch.Tensor | None = None,
+        batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-        **kwargs: Any,
     ) -> dict[str, Any]:
         """Model-owned context-parallel batch prep (Miles-style contiguous shard).
 
@@ -815,10 +814,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
             CPSharder,
             contiguous_local_indices,
-            normalize_prepare_cp_args,
         )
-
-        batch = normalize_prepare_cp_args(batch, kwargs)
 
         return {
             "cp_sharder": CPSharder(

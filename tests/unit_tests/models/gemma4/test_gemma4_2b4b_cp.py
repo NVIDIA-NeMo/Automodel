@@ -241,7 +241,7 @@ def test_prepare_model_inputs_threads_real_per_layer_inputs():
     cfg.image_token_id = 99
     model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.float32)
     ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
-    prepared = model.prepare_model_inputs_for_cp(input_ids=ids)
+    prepared = model.prepare_model_inputs_for_cp({"input_ids": ids})
     assert "per_layer_inputs" in prepared
     pli = prepared["per_layer_inputs"]
     # [B, S, num_hidden_layers, hidden_size_per_layer_input]
