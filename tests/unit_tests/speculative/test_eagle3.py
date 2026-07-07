@@ -340,8 +340,9 @@ def test_eagle3_trainer_reports_per_step_counts():
     assert metrics.step_prefix_hits is not None and metrics.step_valid is not None
     assert metrics.step_prefix_hits.shape == (ttt_steps,)
     assert metrics.step_valid.shape == (ttt_steps,)
-    # The denominator follows the shifted loss mask, ignoring draft-vocab
-    # coverage: with a full loss mask, one position rolls out per step.
+    # The denominator AND-accumulates the shifted loss masks (ignoring
+    # draft-vocab coverage); a full loss mask makes them nested, so one
+    # position rolls out per step.
     assert metrics.step_valid.tolist() == [batch_size * seq_len, batch_size * (seq_len - 1), batch_size * (seq_len - 2)]
     # The coverage-filtered aggregate can only be smaller.
     assert metrics.valid_tokens.item() <= metrics.step_valid.sum().item()
@@ -352,6 +353,53 @@ def test_eagle3_trainer_reports_per_step_counts():
     assert (metrics.step_prefix_hits <= metrics.step_valid).all()
     tau = simulated_accept_length(metrics.step_prefix_hits, metrics.step_valid)
     assert 1.0 <= tau.item() <= 1.0 + ttt_steps
+
+
+def test_eagle3_trainer_prefix_valid_follows_gappy_loss_mask():
+    """Numerator and denominator must cover the same chain population.
+
+    A chain whose earlier depth is unsupervised (prompt tokens, gappy
+    multi-turn loss masks) can never be a prefix hit, so it must leave the
+    denominator too; counting only the current step's mask would report such
+    chains as misses and deflate tau even for a perfect draft.
+    """
+    torch.manual_seed(0)
+    draft = _build_tiny_draft_model()
+    config = draft.config
+
+    selected_token_ids = torch.arange(config.draft_vocab_size, dtype=torch.long)
+    selected_token_mask = torch.zeros(config.vocab_size, dtype=torch.bool)
+    selected_token_mask[selected_token_ids] = True
+
+    ttt_steps = 3
+    trainer = Eagle3TrainerModule(
+        draft,
+        selected_token_ids=selected_token_ids,
+        selected_token_mask=selected_token_mask,
+        ttt_steps=ttt_steps,
+    )
+
+    batch_size, seq_len = 1, 8
+    input_ids = torch.randint(0, config.draft_vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    # Prompt-style mask: the first two positions are unsupervised.
+    loss_mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1]], dtype=torch.long)
+    aux_hidden_states = torch.randn(batch_size, seq_len, config.hidden_size * 3)
+    target_logits = torch.randn(batch_size, seq_len, config.vocab_size)
+
+    with torch.no_grad():
+        metrics = trainer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            aux_hidden_states=aux_hidden_states,
+            target_logits=target_logits,
+        )
+
+    # AND-accumulated shifted masks: [00111111] -> &[01111110] -> &[11111100].
+    # Per-current-step counts would be [6, 7, 6] instead.
+    assert metrics.step_valid.tolist() == [6, 5, 4]
+    assert (metrics.step_prefix_hits <= metrics.step_valid).all()
 
 
 def test_eagle3_trainer_counts_out_of_vocab_targets_as_rejections():

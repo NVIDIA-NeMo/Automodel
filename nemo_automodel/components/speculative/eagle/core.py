@@ -52,15 +52,17 @@ class Eagle3StepMetrics:
     counts for the simulated accept length (:func:`simulated_accept_length`):
     ``step_prefix_hits[k]`` counts positions whose greedy draft chain is still
     fully correct through depth ``k + 1`` (top-1 hit at every step ``<= k``),
-    and ``step_valid[k]`` counts positions supervised at step ``k`` under the
-    shifted loss/document mask. ``step_valid`` deliberately does NOT exclude
-    positions whose target token falls outside the compressed draft
-    vocabulary: serving must reject those tokens (the draft cannot emit
-    them), so they count as chain breaks instead of dropping out of the
-    denominator. Both are kept unreduced so the recipe can accumulate them
-    over a logging window. The P-EAGLE trainer, whose depths are drafted in
-    parallel from one anchor rather than as a TTT chain, leaves them
-    ``None``.
+    and ``step_valid[k]`` counts positions supervised at every step ``<= k``
+    under the shifted loss/document masks, so numerator and denominator cover
+    the same chain population (a chain with an unsupervised earlier depth,
+    e.g. from a gappy multi-turn loss mask, can never be a hit and must not
+    count as a miss). ``step_valid`` deliberately does NOT exclude positions
+    whose target token falls outside the compressed draft vocabulary: serving
+    must reject those tokens (the draft cannot emit them), so they count as
+    chain breaks instead of dropping out of the denominator. Both are kept
+    unreduced so the recipe can accumulate them over a logging window. The
+    P-EAGLE trainer, whose depths are drafted in parallel from one anchor
+    rather than as a TTT chain, leaves them ``None``.
     """
 
     loss: torch.Tensor
@@ -191,10 +193,15 @@ class Eagle3TrainerModule(nn.Module):
         cur_hidden_states = hidden_states
         # Simulated-accept-length state (see Eagle3StepMetrics). The TTT shift
         # keeps slot ``j`` anchored to the same chain across steps (step ``k``
-        # at slot ``j`` drafts depth ``k + 1`` from anchor ``j``), so
-        # ``prefix_correct`` can AND per-step hits at the same slot index.
+        # at slot ``j`` drafts depth ``k + 1`` from anchor ``j``), so per-step
+        # hits and validity can be ANDed at the same slot index. Numerator and
+        # denominator must cover the same chain population: ``prefix_valid``
+        # drops a chain as soon as any of its depths is unsupervised (gappy
+        # loss masks make the per-step masks non-nested), since
+        # ``prefix_correct`` can never score such a chain.
         cur_loss_mask = loss_mask.bool()
         prefix_correct: torch.Tensor | None = None
+        prefix_valid: torch.Tensor | None = None
 
         # EAGLE-3 TTT KV cache: a pair of lists [K_list, V_list] that the
         # attention layer appends to on every step. Re-created per batch.
@@ -244,8 +251,9 @@ class Eagle3TrainerModule(nn.Module):
             running_valid = running_valid + valid_mask.sum()
 
             prefix_correct = correct if prefix_correct is None else prefix_correct & correct
+            prefix_valid = chain_valid if prefix_valid is None else prefix_valid & chain_valid
             step_prefix_parts.append(prefix_correct.sum())
-            step_valid_parts.append(chain_valid.sum())
+            step_valid_parts.append(prefix_valid.sum())
 
             if step_idx + 1 < self.ttt_steps:
                 cur_input_ids = _shift_left_with_zero(cur_input_ids)
