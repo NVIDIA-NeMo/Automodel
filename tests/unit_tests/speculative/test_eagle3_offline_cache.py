@@ -30,7 +30,7 @@ import pytest
 import torch
 from transformers import LlamaConfig
 
-from nemo_automodel.components.datasets.llm import eagle3_cache as ec
+from nemo_automodel.components.datasets.llm import offline_cache as oc
 from nemo_automodel.components.datasets.llm.eagle3_cache import (
     CACHE_KEYS,
     CachedEagle3Dataset,
@@ -345,7 +345,7 @@ def test_cache_dataset_rejects_missing_shards(tmp_path):
     manifest.pop("format_version", None)
     manifest["num_samples"] = 99
     write_manifest(cache_dir, manifest)
-    with pytest.raises(ValueError, match="shard files"):
+    with pytest.raises(ValueError, match="shard indices"):
         CachedEagle3Dataset(cache_dir)
 
 
@@ -629,9 +629,9 @@ def test_write_shard_missing_fields_raises(tmp_path):
 
 
 def test_load_safetensors_missing_raises(monkeypatch):
-    monkeypatch.setattr(ec, "safe_import_from", lambda *a, **k: (False, None))
+    monkeypatch.setattr(oc, "safe_import_from", lambda *a, **k: (False, None))
     with pytest.raises(ImportError, match="safetensors"):
-        ec._load_safetensors()
+        oc.load_safetensors("EAGLE-3")
 
 
 def test_trainer_module_rejects_nonpositive_ttt_steps():

@@ -17,7 +17,9 @@
 import pytest
 
 from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import DeepseekV4DSparkModel
+from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_glm_5_2 import Glm5_2DSparkModel
+from nemo_automodel.components.speculative.dspark.draft_minimax_m3 import MiniMaxM3DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_qwen3 import Qwen3DSparkModel
 from nemo_automodel.components.speculative.dspark.registry import (
     build_target_layer_ids,
@@ -36,6 +38,15 @@ def test_resolve_deepseek_v4():
 
 def test_resolve_glm_5_2():
     assert resolve_dspark_draft_spec(["GlmMoeDsaForCausalLM"]).draft_cls is Glm5_2DSparkModel
+
+
+def test_resolve_gemma4():
+    assert resolve_dspark_draft_spec(["Gemma4ForConditionalGeneration"]).draft_cls is Gemma4DSparkModel
+    assert resolve_dspark_draft_spec(["Gemma4UnifiedForConditionalGeneration"]).draft_cls is Gemma4DSparkModel
+
+
+def test_resolve_minimax_m3():
+    assert resolve_dspark_draft_spec(["MiniMaxM3SparseForConditionalGeneration"]).draft_cls is MiniMaxM3DSparkModel
 
 
 def test_resolve_unsupported_raises():

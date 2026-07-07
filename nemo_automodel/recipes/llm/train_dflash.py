@@ -340,7 +340,10 @@ class TrainDFlashRecipe(BaseRecipe):
             block_size=self.block_size,
             attention_backend=attention_backend,
             num_anchors=int(recipe_cfg.get("num_anchors", 512)),
-            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
+            # Paper default (Appendix A.1) for the shipped block_size=16 configs;
+            # matches DFlashDecayLoss's own default. Set null explicitly in YAML
+            # to disable the position decay (uniform weighting).
+            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", 7.0),
         )
 
     def _run_trainer_step(self, target_batch):
