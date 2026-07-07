@@ -124,6 +124,7 @@ _GEN_RES = _compile(GEN_PATTERNS)
 _VAE_RES = _compile(VAE_PATTERNS)
 _EXTRA_STATE_RES = _compile(EXTRA_STATE_PATTERNS)
 
+
 def _matches_any(key: str, patterns: list[re.Pattern]) -> bool:
     return any(p.search(key) is not None for p in patterns)
 
