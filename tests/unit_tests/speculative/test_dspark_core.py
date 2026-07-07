@@ -62,7 +62,7 @@ def _build_draft():
     return model
 
 
-def test_trainer_module_forward_returns_finite_metrics():
+def _forward_once():
     trainer = DSparkTrainerModule(
         _build_draft(), loss_decay_gamma=4.0, ce_loss_alpha=0.1, l1_loss_alpha=0.9, confidence_head_alpha=1.0
     )
@@ -70,12 +70,36 @@ def test_trainer_module_forward_returns_finite_metrics():
     gen = torch.Generator().manual_seed(0)
     with torch.no_grad():
         torch.manual_seed(1234)
-        out = trainer(
+        return trainer(
             input_ids=torch.randint(0, VOCAB, (b, s), generator=gen),
             target_hidden_states=torch.randn(b, s, len(TARGET_LAYER_IDS) * HIDDEN, generator=gen),
             loss_mask=torch.ones(b, s, dtype=torch.uint8),
             target_last_hidden_states=torch.randn(b, s, HIDDEN, generator=gen),
         )
+
+
+def test_trainer_module_forward_returns_finite_metrics():
+    out = _forward_once()
     assert isinstance(out, DSparkStepMetrics)
-    for term in (out.loss, out.ce_loss, out.l1_loss, out.confidence_loss):
+    for term in (
+        out.loss,
+        out.ce_loss,
+        out.l1_loss,
+        out.confidence_loss,
+        out.accept_rate,
+        out.tau,
+        out.confidence_abs_error,
+        out.confidence_bias,
+        out.confidence_cumprod_bias,
+    ):
         assert torch.isfinite(term).all()
+
+
+def test_acceptance_diagnostics_have_expected_ranges():
+    out = _forward_once()
+    # Acceptance probability is a masked mean of clamped [0, 1] TV rates.
+    assert 0.0 <= out.accept_rate.item() <= 1.0
+    # Expected accepted block length counts the anchor plus a non-negative prefix.
+    assert out.tau.item() >= 1.0
+    # Calibration error is an absolute deviation; the signed bias may go either way.
+    assert out.confidence_abs_error.item() >= 0.0

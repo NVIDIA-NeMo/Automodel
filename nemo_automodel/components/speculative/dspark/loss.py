@@ -113,6 +113,60 @@ def _compute_local_l1_term(
     return l1_loss_num, l1_loss_den
 
 
+def _collect_acceptance_diagnostics(
+    *,
+    outputs: DSparkForwardOutput,
+    accept_rate_3d: Optional[torch.Tensor],
+    loss_weight_mask: torch.Tensor,
+    has_confidence: bool,
+) -> dict[str, torch.Tensor]:
+    """Per-batch numerator/denominator sums for the acceptance diagnostics.
+
+    ``accept_rate_3d`` is the TV-derived per-token acceptance probability. Sums
+    are returned unreduced; the caller forms local ratios and the recipe averages
+    them across the log window and the data-parallel group, matching how the
+    CE/TV/confidence losses are already logged. Returns zeros when no teacher
+    signal is available (``accept_rate_3d is None``).
+    """
+    zero = outputs.draft_logits.new_zeros((), dtype=torch.float32)
+    terms = {
+        "accept_rate_num": zero,
+        "accept_rate_den": zero,
+        "tau_num": zero,
+        "tau_den": zero,
+        "confidence_abs_error_num": zero,
+        "confidence_bias_num": zero,
+        "confidence_cumprod_bias_num": zero,
+        "confidence_diag_den": zero,
+    }
+    if accept_rate_3d is None:
+        return terms
+
+    eval_mask = outputs.eval_mask.to(torch.float32)
+    valid_accept_rate = accept_rate_3d * eval_mask
+    terms["accept_rate_num"] = valid_accept_rate.sum()
+    terms["accept_rate_den"] = eval_mask.sum()
+
+    # Expected accepted prefix length per block: a draft token survives only when
+    # every earlier token in its block is also accepted, hence the running product
+    # over the block. The +1 counts the verified anchor token that seeds the block.
+    valid_blocks = (outputs.block_keep_mask & outputs.eval_mask.any(dim=-1)).to(torch.float32)
+    tau_per_block = valid_accept_rate.cumprod(dim=-1).sum(dim=-1) + 1.0
+    terms["tau_num"] = (tau_per_block * valid_blocks).sum()
+    terms["tau_den"] = valid_blocks.sum()
+
+    if has_confidence and outputs.confidence_pred is not None:
+        confidence_probs = outputs.confidence_pred.float().sigmoid()
+        confidence_error = confidence_probs - accept_rate_3d
+        terms["confidence_abs_error_num"] = (confidence_error.abs() * loss_weight_mask).sum()
+        terms["confidence_bias_num"] = (confidence_error * loss_weight_mask).sum()
+        confidence_prefix = (confidence_probs * eval_mask).cumprod(dim=-1)
+        target_prefix = (accept_rate_3d * eval_mask).cumprod(dim=-1)
+        terms["confidence_cumprod_bias_num"] = ((confidence_prefix - target_prefix) * loss_weight_mask).sum()
+        terms["confidence_diag_den"] = loss_weight_mask.sum()
+    return terms
+
+
 def _collect_local_terms(
     *,
     outputs: DSparkForwardOutput,
@@ -152,6 +206,7 @@ def _collect_local_terms(
             draft_logits=draft_logits,
             aligned_target_logits=aligned_target_logits,
         )
+    accept_rate_3d = _compute_accept_rate_3d(l1_dist_per_token)
     if l1_loss_alpha > 0:
         l1_loss_num, l1_loss_den = _compute_local_l1_term(
             l1_dist_per_token=l1_dist_per_token,
@@ -164,7 +219,6 @@ def _collect_local_terms(
     confidence_loss_num = zero
     confidence_loss_den = zero
     if has_confidence:
-        accept_rate_3d = _compute_accept_rate_3d(l1_dist_per_token)
         assert accept_rate_3d is not None, "aligned_target_logits is required when the confidence head is enabled."
         confidence_targets = accept_rate_3d.detach()
         confidence_errors = (
@@ -186,6 +240,15 @@ def _collect_local_terms(
         "confidence_loss_num": confidence_loss_num,
         "confidence_loss_den": confidence_loss_den,
     }
+    with torch.no_grad():
+        loss_terms.update(
+            _collect_acceptance_diagnostics(
+                outputs=outputs,
+                accept_rate_3d=accept_rate_3d,
+                loss_weight_mask=loss_weight_mask,
+                has_confidence=has_confidence,
+            )
+        )
     return loss_terms, has_confidence
 
 
@@ -258,6 +321,12 @@ def compute_dspark_loss(
             "ce_loss": local_ce_loss.detach(),
             "l1_loss": local_l1_loss.detach(),
             "confidence_loss": local_confidence_loss.detach(),
+            "accept_rate": loss_terms["accept_rate_num"] / (loss_terms["accept_rate_den"] + 1e-6),
+            "tau": loss_terms["tau_num"] / (loss_terms["tau_den"] + 1e-6),
+            "confidence_abs_error": loss_terms["confidence_abs_error_num"] / (loss_terms["confidence_diag_den"] + 1e-6),
+            "confidence_bias": loss_terms["confidence_bias_num"] / (loss_terms["confidence_diag_den"] + 1e-6),
+            "confidence_cumprod_bias": loss_terms["confidence_cumprod_bias_num"]
+            / (loss_terms["confidence_diag_den"] + 1e-6),
         }
         return backward_loss, terms
     return backward_loss

@@ -34,12 +34,23 @@ from nemo_automodel.components.speculative.dspark.loss import compute_dspark_los
 
 @dataclass
 class DSparkStepMetrics:
-    """Per-step training outputs for the DSpark draft (loss + its three terms)."""
+    """Per-step training outputs for the DSpark draft.
+
+    Beyond the loss and its three terms, this carries acceptance diagnostics that
+    the recipe logs: ``accept_rate`` (mean per-token acceptance probability),
+    ``tau`` (expected accepted block length), and the confidence-head calibration
+    error/bias against the measured acceptance rate.
+    """
 
     loss: torch.Tensor
     ce_loss: torch.Tensor
     l1_loss: torch.Tensor
     confidence_loss: torch.Tensor
+    accept_rate: torch.Tensor
+    tau: torch.Tensor
+    confidence_abs_error: torch.Tensor
+    confidence_bias: torch.Tensor
+    confidence_cumprod_bias: torch.Tensor
 
 
 class DSparkTrainerModule(nn.Module):
@@ -88,6 +99,11 @@ class DSparkTrainerModule(nn.Module):
             ce_loss=terms["ce_loss"],
             l1_loss=terms["l1_loss"],
             confidence_loss=terms["confidence_loss"],
+            accept_rate=terms["accept_rate"],
+            tau=terms["tau"],
+            confidence_abs_error=terms["confidence_abs_error"],
+            confidence_bias=terms["confidence_bias"],
+            confidence_cumprod_bias=terms["confidence_cumprod_bias"],
         )
 
 
