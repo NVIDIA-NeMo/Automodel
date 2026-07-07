@@ -273,15 +273,12 @@ def test_contiguous_shard_requires_labels():
 # DeepseekV4ForCausalLM CP-prep hook                                           #
 # --------------------------------------------------------------------------- #
 def test_prepare_model_inputs_for_cp_returns_make_batch_fn_and_flag():
-    from nemo_automodel.components.distributed.cp_sharder import full_logits_grad_touch
-
     # The method only reads self.config, so a lightweight stand-in suffices.
     cfg = SimpleNamespace(compress_ratios=[0, 4, 128])
     fake_self = SimpleNamespace(config=cfg)
     prepared = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, input_ids=torch.arange(8).view(1, 8))
 
     sharder = prepared["cp_sharder"]
-    assert sharder.finalize_loss_fn is full_logits_grad_touch
     assert sharder.layout == "contiguous"
     fn = sharder.shard_batch
     # the partial binds the config-derived per-rank multiple (lcm(8,128) == 128)
@@ -303,7 +300,6 @@ def test_forward_pre_embed_only_branch_delegates_to_prepare():
         fake_self, input_ids=input_ids
     )
     out = DeepseekV4ForCausalLM.forward(fake_self, torch.arange(8).view(1, 8), _pre_embed_only=True)
-    assert out["cp_sharder"].finalize_loss_fn is not None
     assert out["cp_sharder"].shard_batch.keywords["pad_multiple"] == 8
 
 

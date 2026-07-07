@@ -350,7 +350,6 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
             CPSharder,
             contiguous_local_indices,
-            full_logits_grad_touch,
             normalize_prepare_cp_args,
         )
 
@@ -368,7 +367,6 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 # Contiguous over the packed THD token axis: rank r keeps
                 # tokens [r * T/cp, (r + 1) * T/cp).
                 local_token_global_indices=contiguous_local_indices,
-                finalize_loss_fn=full_logits_grad_touch,
                 layout="packed_thd",
             ),
         }

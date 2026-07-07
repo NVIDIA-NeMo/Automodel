@@ -806,19 +806,15 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         Returns a ``CPSharder`` (under the ``"cp_sharder"`` batch key) so
         ``cp_utils.make_cp_batch_and_ctx`` delegates CP sharding back to this
-        model: the sharding callable has the config-derived per-rank shard
-        multiple bound, and ``finalize_loss`` keeps the full logits in the
-        autograd graph so every CP rank's backward reaches all parameters even
-        when its local loss is fully masked. DSV4 embeds internally, so (unlike
-        VLM models) this does not pre-embed -- it leaves ``input_ids`` for the
-        sharding callable.
+        model, with the config-derived per-rank shard multiple bound. DSV4
+        embeds internally, so (unlike VLM models) this does not pre-embed --
+        it leaves ``input_ids`` for the sharding callable.
         """
         from functools import partial  # noqa: PLC0415
 
         from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
             CPSharder,
             contiguous_local_indices,
-            full_logits_grad_touch,
             normalize_prepare_cp_args,
         )
 
@@ -831,7 +827,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     pad_multiple=dsv4_cp_local_seq_multiple(self.config),
                 ),
                 local_token_global_indices=contiguous_local_indices,
-                finalize_loss_fn=full_logits_grad_touch,
                 layout="contiguous",
             ),
         }

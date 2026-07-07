@@ -129,33 +129,6 @@ def test_sharder_override_slots_win():
     assert sharder.gather_token_tensor(_FakeMesh(2), torch.randn(1, 4)) is marker
 
 
-def test_sharder_finalize_loss_identity_by_default():
-    sharder = cs.CPSharder(
-        shard_batch=lambda *a, **k: (contextlib.nullcontext, {}),
-        local_token_global_indices=cs.contiguous_local_indices,
-    )
-    loss = torch.tensor(1.5)
-    assert sharder.finalize_loss(loss, outputs=None) is loss
-
-
-def test_full_logits_grad_touch_promotes_to_fp32():
-    # fp16 logits large enough that a naive half-precision sum overflows to inf;
-    # the touch must promote to fp32 so loss + 0.0 * sum stays finite, while the
-    # logits stay in the autograd graph.
-    logits = torch.full((1, 4, 8192), 50.0, dtype=torch.float16, requires_grad=True)
-    out = type("Out", (), {"logits": logits})()
-    loss = cs.full_logits_grad_touch(torch.tensor(2.0), out)
-    assert torch.isfinite(loss)
-    torch.testing.assert_close(loss, torch.tensor(2.0))
-    loss.backward()
-    assert logits.grad is not None
-
-
-def test_full_logits_grad_touch_noop_without_tensor_logits():
-    loss = torch.tensor(3.0)
-    assert cs.full_logits_grad_touch(loss, outputs=object()) is loss
-
-
 # ---------------------------------------------------------------------------
 # shard_batch_contiguous: pad_multiple + packed-seq-ids flags
 # ---------------------------------------------------------------------------

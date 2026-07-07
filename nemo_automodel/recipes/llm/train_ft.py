@@ -1157,8 +1157,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
         cp_size = getattr(getattr(self, "dist_setup", None), "cp_size", self.cfg.get("distributed.cp_size", 1))
         # Single CP dispatch: magi / model-owned (CPSharder) / TE-THD / generic
-        # torch context_parallel. The returned ``cp_sharder`` feeds the
-        # per-microbatch ``finalize_loss`` hook below.
+        # torch context_parallel.
         train_ctx, batch, cp_sharder = prepare_cp_forward(
             self.model_parts[0] if hasattr(self, "model_parts") else None,
             self.device_mesh,
@@ -1278,13 +1277,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         cu_seqlens=batch.get("cu_seqlens"),
                         lm_weight=shared_lm_weight,
                     )
-                # Model-owned CP (e.g. DSV4) can hook the per-microbatch loss, e.g.
-                # to add a zero-valued full-logits term so every CP rank's backward
-                # reaches all parameters even when its local loss is fully masked
-                # (avoids FSDP2 unused-parameter hangs). See
-                # ``cp_sharder.full_logits_grad_touch``.
-                if is_train and cp_sharder is not None:
-                    local_loss = cp_sharder.finalize_loss(local_loss, out)
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()

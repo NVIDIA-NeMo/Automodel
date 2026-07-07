@@ -171,20 +171,6 @@ def gather_token_tensor_by_indices(
     return _reorder_gathered_token_tensor(parts, index_parts, seq_dim=seq_dim)
 
 
-def full_logits_grad_touch(loss: torch.Tensor, outputs: Any) -> torch.Tensor:
-    """Add a zero-valued full-logits term so backward reaches all parameters.
-
-    Model-owned CP with fully masked local labels would otherwise leave
-    parameters without gradients and hang FSDP2. Logits are promoted to fp32
-    before summing: bf16 logits over a large vocab overflow to inf, and
-    ``inf * 0.0`` would poison the loss with nan.
-    """
-    logits = getattr(outputs, "logits", outputs)
-    if isinstance(logits, torch.Tensor):
-        loss = loss + logits.float().sum() * 0.0
-    return loss
-
-
 @dataclass
 class CPSharder:
     """Model-owned CP layout description consumed by the framework.
@@ -202,8 +188,6 @@ class CPSharder:
         gather_token_tensor_fn: Optional override for
             :meth:`gather_token_tensor`; default synthesized from
             ``local_token_global_indices``.
-        finalize_loss_fn: Optional per-microbatch loss hook, e.g.
-            :func:`full_logits_grad_touch`.
         layout: Diagnostic label; never branched on by framework code.
     """
 
@@ -211,7 +195,6 @@ class CPSharder:
     local_token_global_indices: Callable[..., torch.Tensor]
     shard_token_tensor_fn: Callable[..., torch.Tensor] | None = None
     gather_token_tensor_fn: Callable[..., torch.Tensor] | None = None
-    finalize_loss_fn: Callable[[torch.Tensor, Any], torch.Tensor] | None = None
     layout: str = "custom"
 
     def shard_token_tensor(self, cp_mesh, tensor: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
@@ -231,12 +214,6 @@ class CPSharder:
         padded_seq_len = tensor.shape[seq_dim] * cp_mesh.size()
         indices = self.local_token_global_indices(cp_mesh, padded_seq_len, tensor.device)
         return gather_token_tensor_by_indices(cp_mesh, tensor, indices, seq_dim=seq_dim)
-
-    def finalize_loss(self, loss: torch.Tensor, outputs: Any) -> torch.Tensor:
-        """Apply the model's per-microbatch loss hook (identity by default)."""
-        if self.finalize_loss_fn is not None:
-            return self.finalize_loss_fn(loss, outputs)
-        return loss
 
 
 # ---------------------------------------------------------------------------

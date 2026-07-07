@@ -2248,10 +2248,9 @@ class TestRunValidationToolCallEval:
         assert out.metrics["tool_call/has_call"] == 0.0
 
 
-def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
-    """Non-PP step: the model-owned CP hook attaches its CPSharder, and its
-    ``finalize_loss`` grad touch adds the zero-valued full-logits term so
-    backward still reaches every parameter."""
+def test_forward_backward_step_model_owned_cp_hook(monkeypatch):
+    """Non-PP step: the model-owned CP hook is invoked through __call__
+    (cp_size > 1 + hasattr) and its CPSharder rides the batch into dispatch."""
     from contextlib import nullcontext
 
     cfg = ConfigNode(
@@ -2281,8 +2280,6 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
     class _CPModel(nn.Module):
         def __init__(self):
             super().__init__()
-            # Wide output + large magnitude in fp16 so a naive (low-precision)
-            # logits.sum() overflows to inf; the grad touch must promote to fp32.
             self.lin = nn.Linear(4, 8192)
             self.prepared = False
 
@@ -2292,14 +2289,12 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
             from nemo_automodel.components.distributed.cp_sharder import (
                 CPSharder,
                 contiguous_local_indices,
-                full_logits_grad_touch,
             )
 
             return {
                 "cp_sharder": CPSharder(
                     shard_batch=lambda cp_mesh, tp_mesh, batch, **k: (nullcontext, batch),
                     local_token_global_indices=contiguous_local_indices,
-                    finalize_loss_fn=full_logits_grad_touch,
                 )
             }
 
@@ -2349,8 +2344,7 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
     assert model.prepared is True  # cp_size>1 + hasattr -> hook body ran
     assert captured["logits_is_tensor"]
     assert len(loss_buffer) == 1
-    # the fp32-promoted grad touch must not poison the loss with inf/nan
     assert torch.isfinite(loss_buffer[0]).all()
-    # the grad-touch kept the full logits in the graph, so backward populated grads
+    # backward through the local loss populated grads
     assert model.lin.weight.grad is not None
     assert torch.isfinite(model.lin.weight.grad).all()
