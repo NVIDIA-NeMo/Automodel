@@ -27,6 +27,7 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
     CACHE_KEYS,
     CachedDSparkDataset,
     build_cached_dspark_dataloader,
+    compute_batch_cache,
     existing_shard_indices,
     read_manifest,
     read_target_weight_modules,
@@ -37,7 +38,6 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
 from nemo_automodel.components.datasets.llm.offline_cache import dataloader_from_sample
 from nemo_automodel.components.speculative.precompute_dspark import (
     _build_parser,
-    _compute_batch_cache,
     _ensure_resume_compatible,
     _run,
     _validate_args,
@@ -89,7 +89,7 @@ def _write_tiny_cache(cache_dir: str, num_samples: int = 3, shard_size: int = 2,
 
 def test_compute_batch_cache_downcasts_only_float_tensors():
     tb = _fake_target_batch()
-    cache = _compute_batch_cache(tb, cache_dtype=torch.bfloat16)
+    cache = compute_batch_cache(tb, cache_dtype=torch.bfloat16)
 
     assert set(cache) == set(CACHE_KEYS)
     assert cache["input_ids"].dtype == torch.long

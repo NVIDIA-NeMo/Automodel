@@ -45,7 +45,10 @@ from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.datasets.llm.dspark_cache import (
     DTYPE_MAP,
+    build_cache_manifest,
+    compute_batch_cache,
     existing_shard_indices,
+    manifest_mismatch_fields,
     manifest_path,
     read_manifest,
     write_manifest,
@@ -88,16 +91,6 @@ _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES = (
 )
 
 
-def _compute_batch_cache(target_batch, cache_dtype: torch.dtype) -> dict[str, torch.Tensor]:
-    """Convert one captured target batch into cache tensors."""
-    return {
-        "input_ids": target_batch.input_ids.to(torch.long).cpu(),
-        "loss_mask": target_batch.loss_mask.to(torch.long).cpu(),
-        "target_hidden_states": target_batch.target_hidden_states.to(cache_dtype).cpu(),
-        "target_last_hidden_states": target_batch.target_last_hidden_states.to(cache_dtype).cpu(),
-    }
-
-
 def _validate_args(args: argparse.Namespace) -> None:
     """Reject invalid CLI values before loading the target model."""
     if args.batch_size < 1:
@@ -126,10 +119,8 @@ def _ensure_resume_compatible(cache_dir: str, manifest: dict[str, Any], existing
                 "cannot be verified. Delete the directory and start fresh."
             )
         return
-    recorded = read_manifest(cache_dir)
-    recorded.pop("format_version", None)
-    if recorded != manifest:
-        mismatched = sorted(k for k in recorded.keys() | manifest.keys() if recorded.get(k) != manifest.get(k))
+    mismatched = manifest_mismatch_fields(read_manifest(cache_dir), manifest)
+    if mismatched:
         raise ValueError(
             f"--resume was requested for {cache_dir}, but the recorded manifest does not match the current "
             f"run configuration (mismatched fields: {mismatched}). Re-run with the original settings, or "
@@ -155,8 +146,10 @@ def _run(args: argparse.Namespace) -> int:
     model_type = _read_target_model_type(args.target_model, args.trust_remote_code)
     if model_type in _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES:
         raise ValueError(
-            "precompute_dspark currently supports HF-loadable single-process targets. "
-            f"model_type={model_type!r} targets need the distributed or multimodal online training path."
+            "precompute_dspark supports HF-loadable single-process targets only. "
+            f"model_type={model_type!r}: DeepSeek V4 / GLM-5.2 targets use the distributed offline precompute "
+            "(python -m nemo_automodel.recipes.llm.precompute_dspark_dist); MiniMax M3 is multimodal and the "
+            "DSpark cache schema is text-only, so it needs the online training path."
         )
 
     target_config = AutoConfig.from_pretrained(args.target_model, trust_remote_code=args.trust_remote_code)
@@ -196,24 +189,19 @@ def _run(args: argparse.Namespace) -> int:
         mask_reasoning_content=args.mask_reasoning_content,
     )
     num_samples = len(dataloader.dataset)
-    hidden_size = int(target_text_config.hidden_size)
 
     # The manifest guards resume for tensor-shaping target/cache settings. If dataset
     # or tokenization inputs change, use a fresh output directory instead of --resume.
-    manifest = {
-        "target_model": args.target_model,
-        "target_model_type": model_type,
-        "target_vocab_size": int(target_text_config.vocab_size),
-        "hidden_size": hidden_size,
-        "num_hidden_layers": num_target_layers,
-        "seq_length": args.seq_length,
-        "dtype": args.dtype,
-        "num_samples": num_samples,
-        "shard_size": args.shard_size,
-        "target_hidden_dim": hidden_size * len(target_wrapper.target_layer_ids),
-        "target_last_hidden_dim": hidden_size,
-        "target_layer_ids": list(target_wrapper.target_layer_ids),
-    }
+    manifest = build_cache_manifest(
+        target_model=args.target_model,
+        target_model_type=model_type,
+        target_text_config=target_text_config,
+        seq_length=args.seq_length,
+        dtype=args.dtype,
+        num_samples=num_samples,
+        shard_size=args.shard_size,
+        target_layer_ids=list(target_wrapper.target_layer_ids),
+    )
     if args.resume:
         _ensure_resume_compatible(args.output_dir, manifest, existing)
     write_target_weights(
@@ -244,7 +232,7 @@ def _run(args: argparse.Namespace) -> int:
                 attention_mask=batch["attention_mask"],
                 loss_mask=batch["loss_mask"],
             )
-            return _compute_batch_cache(target_batch, cache_dtype)
+            return compute_batch_cache(target_batch, cache_dtype)
 
     write_cache_shards(
         dataloader=dataloader,

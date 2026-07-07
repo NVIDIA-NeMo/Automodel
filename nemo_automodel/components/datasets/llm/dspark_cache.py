@@ -62,6 +62,60 @@ CACHE_KEYS = (
 DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
 
+def compute_batch_cache(target_batch, cache_dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    """Convert one captured DSpark target batch into the on-disk cache tensors.
+
+    Shared by the single-process and distributed precompute entry points so both
+    producers emit byte-identical cache fields (``CACHE_KEYS``).
+    """
+    return {
+        "input_ids": target_batch.input_ids.to(torch.long).cpu(),
+        "loss_mask": target_batch.loss_mask.to(torch.long).cpu(),
+        "target_hidden_states": target_batch.target_hidden_states.to(cache_dtype).cpu(),
+        "target_last_hidden_states": target_batch.target_last_hidden_states.to(cache_dtype).cpu(),
+    }
+
+
+def build_cache_manifest(
+    *,
+    target_model: str,
+    target_model_type: str,
+    target_text_config,
+    seq_length: int,
+    dtype: str,
+    num_samples: int,
+    shard_size: int,
+    target_layer_ids: list[int],
+) -> dict[str, Any]:
+    """Assemble the DSpark cache manifest.
+
+    Single source of the manifest schema: both precompute entry points call this, and
+    ``train_dspark`` validates cached training against these fields, so adding or
+    renaming a field here is the one place the contract changes.
+    """
+    hidden_size = int(target_text_config.hidden_size)
+    return {
+        "target_model": target_model,
+        "target_model_type": target_model_type,
+        "target_vocab_size": int(target_text_config.vocab_size),
+        "hidden_size": hidden_size,
+        "num_hidden_layers": int(target_text_config.num_hidden_layers),
+        "seq_length": seq_length,
+        "dtype": dtype,
+        "num_samples": num_samples,
+        "shard_size": shard_size,
+        "target_hidden_dim": hidden_size * len(target_layer_ids),
+        "target_last_hidden_dim": hidden_size,
+        "target_layer_ids": list(target_layer_ids),
+    }
+
+
+def manifest_mismatch_fields(recorded: dict[str, Any], manifest: dict[str, Any]) -> list[str]:
+    """Return the manifest keys whose values differ, ignoring ``format_version``."""
+    recorded = {k: v for k, v in recorded.items() if k != "format_version"}
+    return sorted(k for k in recorded.keys() | manifest.keys() if recorded.get(k) != manifest.get(k))
+
+
 def write_manifest(cache_dir: str, manifest: dict) -> str:
     """Persist the DSpark cache manifest."""
     return _write_manifest(cache_dir, manifest, _FORMAT_VERSION)
@@ -160,8 +214,11 @@ __all__ = [
     "CACHE_KEYS",
     "DTYPE_MAP",
     "CachedDSparkDataset",
+    "build_cache_manifest",
     "build_cached_dspark_dataloader",
+    "compute_batch_cache",
     "existing_shard_indices",
+    "manifest_mismatch_fields",
     "manifest_path",
     "read_manifest",
     "read_target_weight_modules",
