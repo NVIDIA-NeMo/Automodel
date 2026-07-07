@@ -57,6 +57,7 @@ ci:
     hf_kl_threshold: 1e-3
     tokenizer_name: org/model
     check_source_load_parity: true  # Optional. Compare raw HF source load vs constructed trainer before training
+    hf_device_map_auto: true      # Optional. Use for large HF reference loads that do not fit on one GPU
     no_check_resume: true         # Skip phase 6 (training resumption)
     # See checkpoint robustness section for all options
 ```
@@ -75,9 +76,14 @@ When `checkpoint_robustness` is present, the robustness test runs after the fine
 Phase 5 is the most expensive (two additional training passes). Use `no_check_resume: true` to skip it.
 
 Use source-load parity for recipes where the initial HF checkpoint load is itself part of the contract, especially
-remote-code, force-HF, custom model, or tied/untied `lm_head` paths. Large reference models should set
-`hf_device_map_auto: true` so the raw HF reference load can shard before it is released. Tune
-`source_load_kl_threshold` and `source_load_cosine_threshold` only when backend or dtype differences are expected.
+remote-code, force-HF, custom model, or tied/untied `lm_head` paths. The raw HF reference model is loaded only long
+enough to capture logits and is released before the trainer model is constructed.
+
+For large reference models, set `hf_device_map_auto: true` so HF can use `device_map="auto"` instead of placing the
+whole reference load on one rank's GPU. This is intentionally opt-in rather than the default: small models should keep
+the simpler single-device HF load for deterministic behavior, while large models (for example 9B+ or configs that
+already require multi-GPU HF reloads) should enable it to avoid rank-0 OOM. Tune `source_load_kl_threshold` and
+`source_load_cosine_threshold` only when backend or dtype differences are expected.
 
 `ci.time` must cover both finetune and robustness. Estimated overhead:
 - ~30% with `no_check_resume: true`
