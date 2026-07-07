@@ -295,22 +295,20 @@ def _wait_for_source_load_rank0(done_path: Path, fail_path: Path) -> None:
     raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 source-load parity")
 
 
-def _run_source_load_parity(
+def _prepare_source_load_reference(
     cfg,
     input_ids: list[int],
     *,
-    source_load_kl_threshold: float,
-    source_load_cosine_threshold: float,
     trust_remote_code: bool,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
-) -> None:
-    """Compare original HF source load against NeMoAuto source load before training."""
+) -> tuple[torch.Tensor, bool | None, bool | None] | None:
+    """Compute raw HF source-load reference logits before trainer construction."""
     if _preinit_world_size() > 1:
         done_path, fail_path = _source_load_sync_paths(cfg)
         if _preinit_global_rank() != 0:
             _wait_for_source_load_rank0(done_path, fail_path)
-            return
+            return None
         done_path.unlink(missing_ok=True)
         fail_path.unlink(missing_ok=True)
     else:
@@ -318,14 +316,12 @@ def _run_source_load_parity(
         fail_path = None
 
     if _preinit_global_rank() != 0:
-        return
+        return None
 
     try:
-        _run_source_load_parity_rank0(
+        result = _prepare_source_load_reference_rank0(
             cfg,
             input_ids,
-            source_load_kl_threshold=source_load_kl_threshold,
-            source_load_cosine_threshold=source_load_cosine_threshold,
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
@@ -337,24 +333,22 @@ def _run_source_load_parity(
     else:
         if done_path is not None:
             done_path.write_text("ok\n")
+        return result
 
 
-def _run_source_load_parity_rank0(
+def _prepare_source_load_reference_rank0(
     cfg,
     input_ids: list[int],
     *,
-    source_load_kl_threshold: float,
-    source_load_cosine_threshold: float,
     trust_remote_code: bool,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
-) -> None:
-    """Rank-0 implementation of source-load parity."""
+) -> tuple[torch.Tensor, bool | None, bool | None]:
+    """Rank-0 implementation of raw HF source-load reference capture."""
     from contextlib import nullcontext
 
     from transformers import AutoModelForCausalLM
 
-    from nemo_automodel._transformers import NeMoAutoModelForCausalLM
     from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 
     apply_cache_compatibility_patches()
@@ -382,7 +376,7 @@ def _run_source_load_parity_rank0(
     except ImportError:
         no_meta = nullcontext()
 
-    print(f"\n[Phase 0] Source-load parity: raw HF vs NeMoAuto for {original_pretrained_path}")
+    print(f"\n[Phase 0] Source-load reference: raw HF for {original_pretrained_path}")
     with no_meta:
         if "device_map" in hf_kwargs:
             hf_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
@@ -402,43 +396,54 @@ def _run_source_load_parity_rank0(
     explicit_tie_word_embeddings = _explicit_tie_word_embeddings(hf_model.config)
     del hf_model
     _release_model_memory()
+    return hf_logits, hf_aliased, explicit_tie_word_embeddings
 
-    nemo_model = NeMoAutoModelForCausalLM.from_pretrained(**model_kwargs).to(device)
-    nemo_logits = _get_logits(nemo_model, input_ids, device)
-    nemo_aliased = _lm_head_embedding_aliased(nemo_model)
-    del nemo_model
-    _release_model_memory()
 
-    assert hf_logits.shape == nemo_logits.shape, (
-        f"Source-load parity shape mismatch: HF logits {hf_logits.shape} vs NeMoAuto logits {nemo_logits.shape}"
+def _compare_source_load_parity(
+    source_reference: tuple[torch.Tensor, bool | None, bool | None] | None,
+    candidate_logits: torch.Tensor,
+    candidate_model,
+    *,
+    source_load_kl_threshold: float,
+    source_load_cosine_threshold: float,
+) -> None:
+    """Compare the raw HF source-load reference against the constructed trainer model."""
+    candidate_aliased = _lm_head_embedding_aliased(candidate_model)
+    if not _rank0():
+        return
+
+    assert source_reference is not None, "rank 0 source-load reference was not captured"
+    hf_logits, hf_aliased, explicit_tie_word_embeddings = source_reference
+    assert hf_logits.shape == candidate_logits.shape, (
+        f"Source-load parity shape mismatch: HF logits {hf_logits.shape} vs trainer logits {candidate_logits.shape}"
     )
-    kl_source = _kl_divergence_from_logits(hf_logits, nemo_logits)
+    kl_source = _kl_divergence_from_logits(hf_logits, candidate_logits)
     max_kl_source = kl_source.max().item()
-    cosine_source = _cosine_similarity_from_logits(hf_logits, nemo_logits)
+    cosine_source = _cosine_similarity_from_logits(hf_logits, candidate_logits)
     print(
-        f"[Phase 0] Source-load max KL: {max_kl_source:.6e} "
+        f"[Phase 0] Source-load vs constructed-trainer max KL: {max_kl_source:.6e} "
         f"(threshold: {source_load_kl_threshold:.6e}); cosine={cosine_source:.8f} "
         f"(threshold: {source_load_cosine_threshold:.8f}); "
-        f"hf_aliased={hf_aliased}; nemo_aliased={nemo_aliased}; "
+        f"hf_aliased={hf_aliased}; trainer_aliased={candidate_aliased}; "
         f"tie_word_embeddings={explicit_tie_word_embeddings}"
     )
 
     assert max_kl_source <= source_load_kl_threshold, (
-        f"KL divergence between original HF source load and NeMoAuto source load too large: "
+        f"KL divergence between original HF source load and constructed trainer model too large: "
         f"max per-token KL = {max_kl_source:.6e} > threshold {source_load_kl_threshold:.6e}"
     )
     assert cosine_source >= source_load_cosine_threshold, (
-        f"Cosine similarity between original HF source load and NeMoAuto source load too low: "
+        f"Cosine similarity between original HF source load and constructed trainer model too low: "
         f"cosine = {cosine_source:.8f} < threshold {source_load_cosine_threshold:.8f}"
     )
-    if hf_aliased is not None and nemo_aliased is not None:
-        assert hf_aliased == nemo_aliased, (
-            f"Source-load lm_head aliasing mismatch: HF aliased={hf_aliased}, NeMoAuto aliased={nemo_aliased}"
+    if hf_aliased is not None and candidate_aliased is not None:
+        assert hf_aliased == candidate_aliased, (
+            f"Source-load lm_head aliasing mismatch: HF aliased={hf_aliased}, trainer aliased={candidate_aliased}"
         )
-    if explicit_tie_word_embeddings is not None and nemo_aliased is not None:
-        assert nemo_aliased == explicit_tie_word_embeddings, (
-            f"NeMoAuto source-load lm_head aliasing does not match config.tie_word_embeddings="
-            f"{explicit_tie_word_embeddings}: aliased={nemo_aliased}"
+    if explicit_tie_word_embeddings is not None and candidate_aliased is not None:
+        assert candidate_aliased == explicit_tie_word_embeddings, (
+            f"Constructed trainer lm_head aliasing does not match config.tie_word_embeddings="
+            f"{explicit_tie_word_embeddings}: aliased={candidate_aliased}"
         )
 
 
@@ -726,22 +731,37 @@ def test_checkpoint_robustness():
     input_ids = _get_input_ids(tokenizer_name)
     cfg = parse_args_and_load_config()
 
+    source_load_reference = None
     if check_source_load_parity:
-        _run_source_load_parity(
+        source_load_reference = _prepare_source_load_reference(
             cfg,
             input_ids,
-            source_load_kl_threshold=source_load_kl_threshold,
-            source_load_cosine_threshold=source_load_cosine_threshold,
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
         )
         _barrier()
 
-    # Phase 1: Train and checkpoint
+    # Phase 1: Construct the training model, optionally compare it against the
+    # raw HF source-load reference, then train and checkpoint.
     torch.cuda.reset_peak_memory_stats()
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
+
+    if check_source_load_parity:
+        device = next(trainer.model_parts[0].parameters()).device
+        trainer_source_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+        _compare_source_load_parity(
+            source_load_reference,
+            trainer_source_logits,
+            trainer.model_parts[0],
+            source_load_kl_threshold=source_load_kl_threshold,
+            source_load_cosine_threshold=source_load_cosine_threshold,
+        )
+        for model_part in trainer.model_parts:
+            model_part.train()
+        _barrier()
+
     trainer.run_train_validation_loop()
 
     # Memory tracking after training

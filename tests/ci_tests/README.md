@@ -56,7 +56,7 @@ ci:
   checkpoint_robustness:          # Optional. Enable robustness testing
     hf_kl_threshold: 1e-3
     tokenizer_name: org/model
-    check_source_load_parity: true  # Optional. Compare raw HF source load vs NeMoAuto before training
+    check_source_load_parity: true  # Optional. Compare raw HF source load vs constructed trainer before training
     no_check_resume: true         # Skip phase 6 (training resumption)
     # See checkpoint robustness section for all options
 ```
@@ -65,7 +65,7 @@ ci:
 
 When `checkpoint_robustness` is present, the robustness test runs after the finetune under the same SLURM allocation. It trains for 5 steps, saves a checkpoint, then validates through:
 
-0. **Source-load parity** (optional) -- With `check_source_load_parity: true`, compare raw HF source load vs NeMoAuto source load before training starts
+0. **Source-load parity** (optional) -- With `check_source_load_parity: true`, capture logits from the raw HF source load, release the HF model, construct the normal trainer model, then compare the constructed pre-training model against those HF logits
 1. **Reference logits** -- Capture logits before teardown
 2. **AutoModel reload** -- Reload from consolidated checkpoint, verify KL = 0
 3. **HF reload** -- Load into vanilla `transformers`/`peft`, verify KL below `hf_kl_threshold`
@@ -75,8 +75,9 @@ When `checkpoint_robustness` is present, the robustness test runs after the fine
 Phase 5 is the most expensive (two additional training passes). Use `no_check_resume: true` to skip it.
 
 Use source-load parity for recipes where the initial HF checkpoint load is itself part of the contract, especially
-remote-code, force-HF, custom model, or tied/untied `lm_head` paths. Tune `source_load_kl_threshold` and
-`source_load_cosine_threshold` only when backend or dtype differences are expected.
+remote-code, force-HF, custom model, or tied/untied `lm_head` paths. Large reference models should set
+`hf_device_map_auto: true` so the raw HF reference load can shard before it is released. Tune
+`source_load_kl_threshold` and `source_load_cosine_threshold` only when backend or dtype differences are expected.
 
 `ci.time` must cover both finetune and robustness. Estimated overhead:
 - ~30% with `no_check_resume: true`
