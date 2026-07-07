@@ -453,42 +453,55 @@ def _compare_source_load_parity(
 ) -> None:
     """Compare the raw HF source-load reference against the constructed trainer model."""
     candidate_aliased = _lm_head_embedding_aliased(candidate_model)
-    if not _rank0():
-        return
+    failure_message = None
+    if _rank0():
+        try:
+            assert source_reference is not None, "rank 0 source-load reference was not captured"
+            hf_logits, hf_aliased, explicit_tie_word_embeddings = source_reference
+            assert hf_logits.shape == candidate_logits.shape, (
+                f"Source-load parity shape mismatch: HF logits {hf_logits.shape} vs trainer logits "
+                f"{candidate_logits.shape}"
+            )
+            kl_source = _kl_divergence_from_logits(hf_logits, candidate_logits)
+            max_kl_source = kl_source.max().item()
+            cosine_source = _cosine_similarity_from_logits(hf_logits, candidate_logits)
+            print(
+                f"[Phase 0] Source-load vs constructed-trainer max KL: {max_kl_source:.6e} "
+                f"(threshold: {source_load_kl_threshold:.6e}); cosine={cosine_source:.8f} "
+                f"(threshold: {source_load_cosine_threshold:.8f}); "
+                f"hf_aliased={hf_aliased}; trainer_aliased={candidate_aliased}; "
+                f"tie_word_embeddings={explicit_tie_word_embeddings}"
+            )
 
-    assert source_reference is not None, "rank 0 source-load reference was not captured"
-    hf_logits, hf_aliased, explicit_tie_word_embeddings = source_reference
-    assert hf_logits.shape == candidate_logits.shape, (
-        f"Source-load parity shape mismatch: HF logits {hf_logits.shape} vs trainer logits {candidate_logits.shape}"
-    )
-    kl_source = _kl_divergence_from_logits(hf_logits, candidate_logits)
-    max_kl_source = kl_source.max().item()
-    cosine_source = _cosine_similarity_from_logits(hf_logits, candidate_logits)
-    print(
-        f"[Phase 0] Source-load vs constructed-trainer max KL: {max_kl_source:.6e} "
-        f"(threshold: {source_load_kl_threshold:.6e}); cosine={cosine_source:.8f} "
-        f"(threshold: {source_load_cosine_threshold:.8f}); "
-        f"hf_aliased={hf_aliased}; trainer_aliased={candidate_aliased}; "
-        f"tie_word_embeddings={explicit_tie_word_embeddings}"
-    )
+            assert max_kl_source <= source_load_kl_threshold, (
+                f"KL divergence between original HF source load and constructed trainer model too large: "
+                f"max per-token KL = {max_kl_source:.6e} > threshold {source_load_kl_threshold:.6e}"
+            )
+            assert cosine_source >= source_load_cosine_threshold, (
+                f"Cosine similarity between original HF source load and constructed trainer model too low: "
+                f"cosine = {cosine_source:.8f} < threshold {source_load_cosine_threshold:.8f}"
+            )
+            if hf_aliased is not None and candidate_aliased is not None:
+                assert hf_aliased == candidate_aliased, (
+                    f"Source-load lm_head aliasing mismatch: HF aliased={hf_aliased}, "
+                    f"trainer aliased={candidate_aliased}"
+                )
+            if explicit_tie_word_embeddings is not None and candidate_aliased is not None:
+                assert candidate_aliased == explicit_tie_word_embeddings, (
+                    f"Constructed trainer lm_head aliasing does not match config.tie_word_embeddings="
+                    f"{explicit_tie_word_embeddings}: aliased={candidate_aliased}"
+                )
+        except Exception:
+            failure_message = traceback.format_exc()
 
-    assert max_kl_source <= source_load_kl_threshold, (
-        f"KL divergence between original HF source load and constructed trainer model too large: "
-        f"max per-token KL = {max_kl_source:.6e} > threshold {source_load_kl_threshold:.6e}"
-    )
-    assert cosine_source >= source_load_cosine_threshold, (
-        f"Cosine similarity between original HF source load and constructed trainer model too low: "
-        f"cosine = {cosine_source:.8f} < threshold {source_load_cosine_threshold:.8f}"
-    )
-    if hf_aliased is not None and candidate_aliased is not None:
-        assert hf_aliased == candidate_aliased, (
-            f"Source-load lm_head aliasing mismatch: HF aliased={hf_aliased}, trainer aliased={candidate_aliased}"
-        )
-    if explicit_tie_word_embeddings is not None and candidate_aliased is not None:
-        assert candidate_aliased == explicit_tie_word_embeddings, (
-            f"Constructed trainer lm_head aliasing does not match config.tie_word_embeddings="
-            f"{explicit_tie_word_embeddings}: aliased={candidate_aliased}"
-        )
+    # Avoid leaving non-zero ranks blocked at the next barrier when rank 0 detects
+    # a Phase 0 mismatch.
+    if dist.is_initialized():
+        payload = [failure_message]
+        dist.broadcast_object_list(payload, src=0)
+        failure_message = payload[0]
+    if failure_message is not None:
+        raise AssertionError(failure_message)
 
 
 def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
