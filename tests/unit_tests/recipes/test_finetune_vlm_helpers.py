@@ -419,8 +419,8 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
         return torch.tensor(1.0, requires_grad=True)
 
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-        lambda device_mesh, batch: (lambda: nullcontext(), batch),
+        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
@@ -1535,8 +1535,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline()
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
 
         batch = {
@@ -1563,8 +1563,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
 
         batch_size = 4
@@ -1624,8 +1624,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
 
         batch_size = 4
@@ -1679,8 +1679,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
 
         batch_size = 4
@@ -1763,8 +1763,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
 
         batch_size = 4
@@ -1808,8 +1808,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
 
         image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3]])
@@ -1874,8 +1874,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
 
         batch_size = 4
@@ -1914,8 +1914,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
 
         batch_size = 4
@@ -1962,8 +1962,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = pp
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
 
         batch = {
@@ -1991,8 +1991,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = pp
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
 
         batch = {
@@ -2028,8 +2028,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = pp
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
 
         batch = {
@@ -2217,7 +2217,7 @@ class TestForwardBackwardStepNonPP:
 
         mm_token_type_ids = torch.tensor([[1, 1, 0, 0]])
 
-        def _capture_cp_batch(device_mesh, batch, loss_mask=None):
+        def _capture_cp_batch(device_mesh, batch, loss_mask=None, **kwargs):
             assert "input_ids" not in batch
             assert "pixel_values" not in batch
             assert "image_position_ids" not in batch
@@ -2228,7 +2228,7 @@ class TestForwardBackwardStepNonPP:
             raise _CPPreEmbedStop
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
             _capture_cp_batch,
         )
 
@@ -2255,7 +2255,7 @@ class TestForwardBackwardStepNonPP:
         non_pp_recipe = _create_non_pp_recipe(model)
         non_pp_recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=2)
 
-        def _capture_cp_batch(device_mesh, batch, loss_mask=None):
+        def _capture_cp_batch(device_mesh, batch, loss_mask=None, **kwargs):
             assert "input_ids" not in batch
             assert "pixel_values" not in batch
             assert "image_position_ids" not in batch
@@ -2265,7 +2265,7 @@ class TestForwardBackwardStepNonPP:
             raise _CPPreEmbedStop
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
             _capture_cp_batch,
         )
 
@@ -2326,8 +2326,8 @@ class TestForwardBackwardStepNonPP:
         non_pp_recipe.__dict__["loss_fn"] = FusedLinearCrossEntropy()
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
         monkeypatch.setattr(
             "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
@@ -2373,8 +2373,8 @@ class TestForwardBackwardStepNonPP:
         non_pp_recipe.__dict__["loss_fn"] = FusedLinearCrossEntropy()
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
         monkeypatch.setattr(
             "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
@@ -2416,8 +2416,8 @@ class TestForwardBackwardStepNonPP:
         non_pp_recipe.__dict__["loss_fn"] = MaskedCrossEntropy()
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
         monkeypatch.setattr(
             "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
@@ -2459,8 +2459,8 @@ class TestForwardBackwardStepNonPP:
         non_pp_recipe.__dict__["loss_fn"] = MaskedCrossEntropy()
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
 
         batch = {
@@ -2493,8 +2493,8 @@ class TestForwardBackwardStepNonPP:
         non_pp_recipe.__dict__["loss_fn"] = MaskedCrossEntropy()
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
         )
 
         # Batch with nested dict (like attention_mask dict)

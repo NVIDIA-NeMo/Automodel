@@ -1107,10 +1107,11 @@ def test_glm_dsa_prepare_model_inputs_for_cp_binds_batch_sharder():
     backend = BackendConfig(attn="tilelang", linear="torch", rms_norm="torch", rope_fusion=False)
     model = GlmMoeDsaForCausalLM(config, backend=backend)
 
-    prepared = model.prepare_model_inputs_for_cp(input_ids=torch.arange(8).view(1, 8), num_chunks=3)
+    prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.arange(8).view(1, 8)}, num_chunks=3)
 
-    assert prepared["_cp_full_logits_grad_touch"] is True
-    fn = prepared["_cp_make_batch_fn"]
+    sharder = prepared["cp_sharder"]
+    assert sharder.layout == "packed_thd"
+    fn = sharder.shard_batch
     assert fn.func is cp_mod.make_glm_dsa_packed_cp_batch_and_ctx
     assert fn.keywords["num_chunks"] == 3
 
