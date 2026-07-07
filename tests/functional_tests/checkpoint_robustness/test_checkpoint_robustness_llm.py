@@ -227,6 +227,10 @@ def _hf_source_load_kwargs(
 
 def _lm_head_embedding_aliased(model) -> bool | None:
     """Return lm_head/input-embedding aliasing when real local storage is inspectable."""
+    # FSDP2/TP wrappers may expose distinct local storages for logically tied
+    # parameters, so only use this as a real storage check before sharding.
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        return None
     lm_head = getattr(model, "lm_head", None)
     get_input_embeddings = getattr(model, "get_input_embeddings", None)
     if lm_head is None or get_input_embeddings is None:
