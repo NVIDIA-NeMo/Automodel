@@ -25,6 +25,10 @@ tokenizer:
   pretrained_model_name_or_path: Qwen/Qwen2.5-7B-Instruct
 
 model:
+  # Set linear and rms_norm to "te" to enable Transformer Engine.
+  backend:
+    linear: torch
+    rms_norm: torch_fp32
   init_mode: hf_backbones
   stage: 2
   llm_path: Qwen/Qwen2.5-7B-Instruct
@@ -35,10 +39,6 @@ model:
   tie_word_embeddings: false
   copy_init_moe: true
   torch_dtype: float32
-  # Set linear and rms_norm to "te" to enable Transformer Engine.
-  backend:
-    linear: torch
-    rms_norm: torch_fp32
   max_latent_size: 64
   # Set to 0 to encode the whole image batch at once.
   vae_encode_micro_batch_size: 1

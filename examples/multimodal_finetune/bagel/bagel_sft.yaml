@@ -23,14 +23,14 @@ dist_env:
   timeout_minutes: 30
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForMultimodalLM.from_pretrained
-  pretrained_model_name_or_path: ByteDance-Seed/BAGEL-7B-MoT
-  torch_dtype: float32
-  stage: 2
   # Set linear and rms_norm to "te" to enable Transformer Engine.
   backend:
     linear: torch
     rms_norm: torch_fp32
+  _target_: nemo_automodel.NeMoAutoModelForMultimodalLM.from_pretrained
+  pretrained_model_name_or_path: ByteDance-Seed/BAGEL-7B-MoT
+  torch_dtype: float32
+  stage: 2
   # Optional override. If omitted, the recipe uses ae.safetensors from the
   # local checkpoint directory or downloads it from the same HF repo. When
   # checkpointing is enabled, ae.safetensors is copied into each checkpoint
