@@ -18,7 +18,7 @@ Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
     [--kl_threshold <float>] [--hf_kl_threshold <float>]
     [--cross_tp_size <int>] [--cross_tp_kl_threshold <float>]
     [--tokenizer_name <str>]
-    [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
+    [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
     [--max_vram_gb <float>] [--max_cpu_gb <float>]
 """
 
@@ -27,6 +27,8 @@ from __future__ import annotations
 import gc
 import os
 import sys
+import time
+import traceback
 from pathlib import Path
 
 import datasets
@@ -40,7 +42,9 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _reinit_non_persistent_buffers,
 )
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+from nemo_automodel.shared.utils import dtype_from_str
 
 datasets.disable_caching()
 
@@ -61,9 +65,12 @@ def _extract_custom_args(argv):
         "--max_vram_gb",
         "--max_cpu_gb",
         "--resume_loss_threshold",
+        "--source_load_cosine_threshold",
+        "--source_load_kl_threshold",
     }
     boolean_keys = {
         "--trust_remote_code",
+        "--check_source_load_parity",
         "--check_fused_qkv_keys",
         "--check_phantom_keys",
         "--check_resume",
@@ -140,6 +147,299 @@ def _kl_divergence_from_logits(reference_logits: torch.Tensor, candidate_logits:
     ref_log_probs = F.log_softmax(reference_logits.float(), dim=-1).reshape(-1, vocab_size)
     cand_log_probs = F.log_softmax(candidate_logits.float(), dim=-1).reshape(-1, vocab_size)
     return F.kl_div(cand_log_probs, ref_log_probs, reduction="none", log_target=True).sum(-1)
+
+
+def _cosine_similarity_from_logits(reference_logits: torch.Tensor, candidate_logits: torch.Tensor) -> float:
+    """Cosine similarity over flattened float32 logits."""
+    return F.cosine_similarity(reference_logits.flatten().float(), candidate_logits.flatten().float(), dim=0).item()
+
+
+def _materialize_config_value(value):
+    """Convert a config value into the object that recipe instantiation would pass as a kwarg."""
+    if isinstance(value, ConfigNode):
+        if hasattr(value, "_target_"):
+            return value.instantiate()
+        return {
+            k: _materialize_config_value(v)
+            for k, v in value.__dict__.items()
+            if k not in ("raise_on_missing_attr", "_raw_config", "_original_strings")
+        }
+    if isinstance(value, list):
+        return [_materialize_config_value(v) for v in value]
+    return value
+
+
+def _model_kwargs_from_config(model_cfg: ConfigNode) -> dict:
+    """Return kwargs from the recipe model config without invoking the model target."""
+    return {
+        k: _materialize_config_value(v)
+        for k, v in model_cfg.__dict__.items()
+        if k not in ("_target_", "raise_on_missing_attr", "_raw_config", "_original_strings")
+    }
+
+
+def _resolve_source_load_dtype(model_kwargs: dict) -> torch.dtype:
+    """Mirror NeMoAuto's practical source-load dtype default for the HF reference model."""
+    torch_dtype = model_kwargs.get("torch_dtype", "auto")
+    if torch_dtype == "auto":
+        return torch.bfloat16
+    if isinstance(torch_dtype, str):
+        return dtype_from_str(torch_dtype)
+    return torch_dtype
+
+
+def _hf_source_load_kwargs(
+    model_kwargs: dict,
+    *,
+    source_dtype: torch.dtype,
+    trust_remote_code: bool,
+    experts_implementation: str | None,
+    device: torch.device,
+    hf_device_map_auto: bool,
+) -> dict:
+    """Build the HF-safe subset of recipe model kwargs for the source-load reference."""
+    hf_allowed_keys = {
+        "attn_implementation",
+        "config",
+        "quantization_config",
+        "revision",
+        "token",
+        "trust_remote_code",
+    }
+    hf_kwargs = {k: v for k, v in model_kwargs.items() if k in hf_allowed_keys}
+    hf_kwargs["torch_dtype"] = source_dtype
+    hf_kwargs["trust_remote_code"] = trust_remote_code or bool(hf_kwargs.get("trust_remote_code", False))
+    if trust_remote_code and "attn_implementation" not in hf_kwargs:
+        hf_kwargs["attn_implementation"] = "flash_attention_2"
+    if experts_implementation and not trust_remote_code:
+        hf_kwargs["experts_implementation"] = experts_implementation
+        hf_kwargs["trust_remote_code"] = False
+    if hf_device_map_auto:
+        hf_kwargs["device_map"] = "auto"
+    if (
+        "device_map" not in hf_kwargs
+        and not hf_kwargs["trust_remote_code"]
+        and hf_kwargs.get("quantization_config") is None
+    ):
+        hf_kwargs["device_map"] = {"": device}
+    return hf_kwargs
+
+
+def _lm_head_embedding_aliased(model) -> bool | None:
+    """Return lm_head/input-embedding aliasing when both weights are present."""
+    lm_head = getattr(model, "lm_head", None)
+    get_input_embeddings = getattr(model, "get_input_embeddings", None)
+    if lm_head is None or get_input_embeddings is None:
+        return None
+    embeddings = get_input_embeddings()
+    if embeddings is None or not hasattr(lm_head, "weight") or not hasattr(embeddings, "weight"):
+        return None
+    return lm_head.weight.data_ptr() == embeddings.weight.data_ptr()
+
+
+def _explicit_tie_word_embeddings(config) -> bool | None:
+    """Return an explicit tie_word_embeddings flag from a top-level or text config."""
+    tie_word_embeddings = getattr(config, "tie_word_embeddings", None)
+    if tie_word_embeddings is not None:
+        return bool(tie_word_embeddings)
+    text_config = getattr(config, "text_config", None)
+    tie_word_embeddings = getattr(text_config, "tie_word_embeddings", None)
+    return None if tie_word_embeddings is None else bool(tie_word_embeddings)
+
+
+def _release_model_memory(*models) -> None:
+    """Release standalone model memory between source-load parity phases."""
+    for model in models:
+        try:
+            model.cpu()
+        except Exception:
+            pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _preinit_global_rank() -> int:
+    """Return the torchrun global rank before torch.distributed is initialized."""
+    if dist.is_initialized():
+        return dist.get_rank()
+    return int(os.environ.get("RANK", "0"))
+
+
+def _preinit_world_size() -> int:
+    """Return the torchrun world size before torch.distributed is initialized."""
+    if dist.is_initialized():
+        return dist.get_world_size()
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _source_load_sync_paths(cfg) -> tuple[Path, Path]:
+    """Return done/fail marker paths for pre-init source-load parity synchronization."""
+    checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
+    run_id = os.environ.get("SLURM_JOB_ID") or os.environ.get("TORCHELASTIC_RUN_ID") or "local"
+    sync_dir = checkpoint_dir.parent / f".source_load_parity_{run_id}"
+    sync_dir.mkdir(parents=True, exist_ok=True)
+    return sync_dir / "done", sync_dir / "fail"
+
+
+def _wait_for_source_load_rank0(done_path: Path, fail_path: Path) -> None:
+    """Wait for rank 0 to finish source-load parity before process-group init."""
+    timeout_s = int(os.environ.get("SOURCE_LOAD_PARITY_TIMEOUT_SECONDS", "1800"))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if done_path.exists():
+            return
+        if fail_path.exists():
+            raise RuntimeError(f"Rank 0 source-load parity failed:\n{fail_path.read_text()}")
+        time.sleep(5)
+    raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 source-load parity")
+
+
+def _run_source_load_parity(
+    cfg,
+    input_ids: list[int],
+    *,
+    source_load_kl_threshold: float,
+    source_load_cosine_threshold: float,
+    trust_remote_code: bool,
+    experts_implementation: str | None,
+    hf_device_map_auto: bool,
+) -> None:
+    """Compare original HF source load against NeMoAuto source load before training."""
+    if _preinit_world_size() > 1:
+        done_path, fail_path = _source_load_sync_paths(cfg)
+        if _preinit_global_rank() != 0:
+            _wait_for_source_load_rank0(done_path, fail_path)
+            return
+        done_path.unlink(missing_ok=True)
+        fail_path.unlink(missing_ok=True)
+    else:
+        done_path = None
+        fail_path = None
+
+    if _preinit_global_rank() != 0:
+        return
+
+    try:
+        _run_source_load_parity_rank0(
+            cfg,
+            input_ids,
+            source_load_kl_threshold=source_load_kl_threshold,
+            source_load_cosine_threshold=source_load_cosine_threshold,
+            trust_remote_code=trust_remote_code,
+            experts_implementation=experts_implementation,
+            hf_device_map_auto=hf_device_map_auto,
+        )
+    except Exception:
+        if fail_path is not None:
+            fail_path.write_text(traceback.format_exc())
+        raise
+    else:
+        if done_path is not None:
+            done_path.write_text("ok\n")
+
+
+def _run_source_load_parity_rank0(
+    cfg,
+    input_ids: list[int],
+    *,
+    source_load_kl_threshold: float,
+    source_load_cosine_threshold: float,
+    trust_remote_code: bool,
+    experts_implementation: str | None,
+    hf_device_map_auto: bool,
+) -> None:
+    """Rank-0 implementation of source-load parity."""
+    from contextlib import nullcontext
+
+    from transformers import AutoModelForCausalLM
+
+    from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+    from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+
+    apply_cache_compatibility_patches()
+
+    model_kwargs = _model_kwargs_from_config(cfg.model)
+    original_pretrained_path = model_kwargs.get("pretrained_model_name_or_path")
+    assert original_pretrained_path is not None, "source-load parity requires model.pretrained_model_name_or_path"
+    source_dtype = _resolve_source_load_dtype(model_kwargs)
+    trust_remote_code = trust_remote_code or bool(model_kwargs.get("trust_remote_code", False))
+
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    hf_kwargs = _hf_source_load_kwargs(
+        model_kwargs,
+        source_dtype=source_dtype,
+        trust_remote_code=trust_remote_code,
+        experts_implementation=experts_implementation,
+        device=device,
+        hf_device_map_auto=hf_device_map_auto,
+    )
+
+    try:
+        from nemo_automodel._transformers.model_init import no_hf_meta_device
+
+        no_meta = no_hf_meta_device() if trust_remote_code else nullcontext()
+    except ImportError:
+        no_meta = nullcontext()
+
+    print(f"\n[Phase 0] Source-load parity: raw HF vs NeMoAuto for {original_pretrained_path}")
+    with no_meta:
+        if "device_map" in hf_kwargs:
+            hf_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+        else:
+            hf_model = _fix_meta_rotary_embeddings(
+                AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+            ).to(device)
+    _reinit_rotary_per_module(hf_model, device)
+    if trust_remote_code:
+        from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
+
+        if should_fix_rotary_embeddings([hf_model]):
+            fix_rotary_embeddings([hf_model])
+
+    hf_logits = _get_logits(hf_model, input_ids, device)
+    hf_aliased = _lm_head_embedding_aliased(hf_model)
+    explicit_tie_word_embeddings = _explicit_tie_word_embeddings(hf_model.config)
+    del hf_model
+    _release_model_memory()
+
+    nemo_model = NeMoAutoModelForCausalLM.from_pretrained(**model_kwargs).to(device)
+    nemo_logits = _get_logits(nemo_model, input_ids, device)
+    nemo_aliased = _lm_head_embedding_aliased(nemo_model)
+    del nemo_model
+    _release_model_memory()
+
+    assert hf_logits.shape == nemo_logits.shape, (
+        f"Source-load parity shape mismatch: HF logits {hf_logits.shape} vs NeMoAuto logits {nemo_logits.shape}"
+    )
+    kl_source = _kl_divergence_from_logits(hf_logits, nemo_logits)
+    max_kl_source = kl_source.max().item()
+    cosine_source = _cosine_similarity_from_logits(hf_logits, nemo_logits)
+    print(
+        f"[Phase 0] Source-load max KL: {max_kl_source:.6e} "
+        f"(threshold: {source_load_kl_threshold:.6e}); cosine={cosine_source:.8f} "
+        f"(threshold: {source_load_cosine_threshold:.8f}); "
+        f"hf_aliased={hf_aliased}; nemo_aliased={nemo_aliased}; "
+        f"tie_word_embeddings={explicit_tie_word_embeddings}"
+    )
+
+    assert max_kl_source <= source_load_kl_threshold, (
+        f"KL divergence between original HF source load and NeMoAuto source load too large: "
+        f"max per-token KL = {max_kl_source:.6e} > threshold {source_load_kl_threshold:.6e}"
+    )
+    assert cosine_source >= source_load_cosine_threshold, (
+        f"Cosine similarity between original HF source load and NeMoAuto source load too low: "
+        f"cosine = {cosine_source:.8f} < threshold {source_load_cosine_threshold:.8f}"
+    )
+    if hf_aliased is not None and nemo_aliased is not None:
+        assert hf_aliased == nemo_aliased, (
+            f"Source-load lm_head aliasing mismatch: HF aliased={hf_aliased}, NeMoAuto aliased={nemo_aliased}"
+        )
+    if explicit_tie_word_embeddings is not None and nemo_aliased is not None:
+        assert nemo_aliased == explicit_tie_word_embeddings, (
+            f"NeMoAuto source-load lm_head aliasing does not match config.tie_word_embeddings="
+            f"{explicit_tie_word_embeddings}: aliased={nemo_aliased}"
+        )
 
 
 def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
@@ -419,12 +719,27 @@ def test_checkpoint_robustness():
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
     skip_hf_reload = bool(custom_args.get("skip_hf_reload", False))
+    check_source_load_parity = bool(custom_args.get("check_source_load_parity", False))
+    source_load_kl_threshold = float(custom_args.get("source_load_kl_threshold", hf_kl_threshold))
+    source_load_cosine_threshold = float(custom_args.get("source_load_cosine_threshold", "0.9999"))
 
     input_ids = _get_input_ids(tokenizer_name)
+    cfg = parse_args_and_load_config()
+
+    if check_source_load_parity:
+        _run_source_load_parity(
+            cfg,
+            input_ids,
+            source_load_kl_threshold=source_load_kl_threshold,
+            source_load_cosine_threshold=source_load_cosine_threshold,
+            trust_remote_code=trust_remote_code,
+            experts_implementation=experts_implementation,
+            hf_device_map_auto=hf_device_map_auto,
+        )
+        _barrier()
 
     # Phase 1: Train and checkpoint
     torch.cuda.reset_peak_memory_stats()
-    cfg = parse_args_and_load_config()
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
