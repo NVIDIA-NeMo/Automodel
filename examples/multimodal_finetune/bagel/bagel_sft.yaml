@@ -34,11 +34,6 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-  # Convenience switch for packing both Q/K/V and gate/up projections. The
-  # nullable per-group overrides inherit this value when left unset.
-  fused_projections: false
-  fused_qkv_projections: null
-  fused_gate_up_projections: null
   # Optional override. If omitted, the recipe uses ae.safetensors from the
   # local checkpoint directory or downloads it from the same HF repo. When
   # checkpointing is enabled, ae.safetensors is copied into each checkpoint
@@ -52,8 +47,6 @@ checkpoint:
   enabled: false
   checkpoint_dir: checkpoints/bagel-sft-am
   model_save_format: torch_save
-  # Sharded fused checkpoints use a native layout that cannot be consolidated to HF in place.
-  save_consolidated: false
 
 distributed:
   strategy: fsdp2

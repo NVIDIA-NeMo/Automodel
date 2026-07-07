@@ -235,11 +235,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             logger.info(
                 "Resolved BAGEL backend: %s",
-                bagel_backend_summary(
-                    self.backend,
-                    fused_qkv_projections=config.fused_qkv_projections,
-                    fused_gate_up_projections=config.fused_gate_up_projections,
-                ),
+                bagel_backend_summary(self.backend),
             )
         self.model = BagelModel(config, backend=self.backend)
         _convert_patch_embedding_for_packed_vit(self.model, config)
@@ -349,12 +345,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
 
         model = cls(cfg, backend=backend)
 
-        sd = load_bagel_checkpoint_state_dict(
-            str(path),
-            stage=stage_int,
-            strict=strict,
-            config=cfg,
-        )
+        sd = load_bagel_checkpoint_state_dict(str(path), stage=stage_int, strict=strict)
         missing, unexpected = model.load_state_dict(sd, strict=False)
         if missing:
             # vit_pos_embed.pos_embed is frozen-init'd; missing keys are

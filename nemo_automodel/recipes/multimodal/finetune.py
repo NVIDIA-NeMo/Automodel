@@ -667,7 +667,6 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 pp_rank=self._get_pp_rank(),
                 moe_mesh=self.moe_mesh,
             )
-            self.checkpointer.validate_model_checkpointing(self.model)
 
         self.best_metric_key = "default"
         self.max_grad_norm = float(self.cfg.get("clip_grad_norm.max_norm", 1.0))

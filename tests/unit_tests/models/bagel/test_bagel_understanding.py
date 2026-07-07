@@ -62,33 +62,7 @@ def test_bagel_stage1_config_drops_generation_path() -> None:
     assert cfg.text_config.layer_module == "Qwen2DecoderLayer"
 
 
-def test_bagel_config_forwards_fused_projection_overrides_to_text_config() -> None:
-    from nemo_automodel.components.models.bagel.configuration import BagelConfig
-
-    cfg = BagelConfig(fused_projections=True)
-
-    assert cfg.fused_projections is True
-    assert cfg.text_config.fused_projections is True
-    assert cfg.fused_qkv_projections is True
-    assert cfg.fused_gate_up_projections is True
-
-    partial = BagelConfig(
-        fused_projections=True,
-        fused_qkv_projections=False,
-        fused_gate_up_projections=True,
-    )
-    assert partial.fused_projections is False
-    assert partial.text_config.fused_projections is False
-    assert partial.fused_qkv_projections is False
-    assert partial.fused_gate_up_projections is True
-
-    restored = BagelConfig.from_dict(partial.to_dict())
-    assert restored.fused_projections is False
-    assert restored.fused_qkv_projections is False
-    assert restored.fused_gate_up_projections is True
-
-
-def test_bagel_from_pretrained_passes_config_to_projection_adapter(monkeypatch, tmp_path) -> None:
+def test_bagel_from_pretrained_passes_backend_to_model(monkeypatch, tmp_path) -> None:
     import nemo_automodel.components.models.bagel.model as bagel_model
 
     config = SimpleNamespace(stage=None)
@@ -120,5 +94,5 @@ def test_bagel_from_pretrained_passes_config_to_projection_adapter(monkeypatch, 
     backend = {"linear": "te"}
     bagel_model.BagelForUnifiedMultimodal.from_pretrained(tmp_path, stage=2, backend=backend)
 
-    assert captured["config"] is config
     assert captured["backend"] is backend
+    assert captured["stage"] == 2

@@ -42,11 +42,6 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-  # Convenience switch for packing both Q/K/V and gate/up projections. The
-  # nullable per-group overrides inherit this value when left unset.
-  fused_projections: false
-  fused_qkv_projections: null
-  fused_gate_up_projections: null
   max_latent_size: 64
   # Set to 0 to encode the whole image batch at once.
   vae_encode_micro_batch_size: 1
@@ -55,8 +50,6 @@ checkpoint:
   enabled: false
   checkpoint_dir: checkpoints/bagel-pretrain-am
   model_save_format: torch_save
-  # Sharded fused checkpoints use a native layout that cannot be consolidated to HF in place.
-  save_consolidated: false
 
 distributed:
   strategy: fsdp2

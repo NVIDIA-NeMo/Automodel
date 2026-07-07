@@ -299,20 +299,6 @@ def _should_write_consolidated_safetensors(config: CheckpointingConfig, is_final
     return config.save_consolidated == SaveConsolidatedMode.FINAL and is_final_checkpoint
 
 
-def _uses_native_checkpoint_layout(model_part: nn.Module) -> bool:
-    """Whether a model adapter requests native DCP keys for save/resume."""
-    adapter = getattr(model_part, "state_dict_adapter", None)
-    callback = getattr(adapter, "uses_native_checkpoint_layout", None)
-    return bool(callable(callback) and callback())
-
-
-def _requires_full_state_dict_init(model_part: nn.Module) -> bool:
-    """Whether an adapter must transform full HF tensors before sharding."""
-    adapter = getattr(model_part, "state_dict_adapter", None)
-    callback = getattr(adapter, "requires_full_state_dict_init", None)
-    return bool(callable(callback) and callback())
-
-
 def _get_original_hf_index_total_size(config: CheckpointingConfig) -> int | None:
     """Return the original HF safetensors index total size, if available."""
     try:
@@ -437,23 +423,6 @@ class Checkpointer:
             self._addons.append(PeftAddon())
         _warn_if_inline_consolidation_enabled(self.config)
 
-    def validate_model_checkpointing(self, model: nn.Module | list[nn.Module]) -> None:
-        """Reject HF consolidation that cannot transform a sharded native layout."""
-        if not _should_write_hf_metadata(self.config):
-            return
-        if self.config.save_consolidated == SaveConsolidatedMode.FALSE:
-            return
-
-        model_parts = ModelState(model, self.config.is_peft).model
-        for model_part in model_parts:
-            if _uses_native_checkpoint_layout(model_part) and _model_has_dtensors(model_part):
-                adapter_name = type(model_part.state_dict_adapter).__name__
-                raise ValueError(
-                    f"{adapter_name} uses a native sharded checkpoint layout that cannot be consolidated into "
-                    "Hugging Face safetensors during checkpoint save. Set checkpoint.save_consolidated=false. "
-                    "Export to HF only from an unsharded/full state dict."
-                )
-
     @torch.no_grad()
     def save_model(
         self,
@@ -479,19 +448,11 @@ class Checkpointer:
             tokenizer: Optional tokenizer to save with consolidated artifacts.
             is_final_checkpoint: Whether this save is the final scheduled training checkpoint.
         """
-        model_state = ModelState(model, self.config.is_peft)
-        model_part = model_state.model[0]
-        adapter_uses_native_layout = _uses_native_checkpoint_layout(model_part)
-        self.validate_model_checkpointing(model)
-
-        # Create the model directories. Native checkpoints intentionally omit
-        # HF export metadata because the offline consolidator is adapter-unaware.
+        # Create the model directories
         model_dir = os.path.join(weights_path, "model")
         should_write_consolidated = _should_write_consolidated_safetensors(self.config, is_final_checkpoint)
-        use_native_checkpoint_layout = adapter_uses_native_layout and not should_write_consolidated
-        should_write_hf_metadata = _should_write_hf_metadata(self.config) and not use_native_checkpoint_layout
         consolidated_dir = os.path.join(model_dir, "consolidated") if should_write_consolidated else None
-        hf_metadata_dir = os.path.join(model_dir, ".hf_metadata") if should_write_hf_metadata else None
+        hf_metadata_dir = os.path.join(model_dir, ".hf_metadata") if _should_write_hf_metadata(self.config) else None
         _ensure_dirs(model_dir, consolidated_dir, hf_metadata_dir)
 
         # Because this call lies outside of the dcp save call, we need to consolidate on all ranks on the main process
@@ -502,41 +463,31 @@ class Checkpointer:
             should_write_consolidated and not self.config.is_async and not self.config.single_rank_consolidation
         )
 
+        model_state = ModelState(model, self.config.is_peft)
         state_dict = model_state.state_dict()
 
-        # Convert custom models to HF layout unless their adapter explicitly
-        # preserves a fused native layout for ordinary DCP checkpoint/resume.
+        # Convert to HF format if using custom model implementations.
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
             quantization=False,
             device_mesh=self.moe_mesh,
             v4_compatible=self.config.v4_compatible,
-            native_checkpoint=use_native_checkpoint_layout,
         )
         # MoE adapters return non-contiguous views; safetensors.save rejects those.
         _materialize_to_hf_views_for_save(state_dict)
         # Build the consolidated model.safetensors.index.json if needed
-        if should_write_hf_metadata:
-            fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
-            fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, state_dict)
-            _warn_if_large_inline_consolidation(
-                self.config,
-                state_dict,
-                fqn_to_file_index_mapping,
-                is_final_checkpoint,
-            )
-        else:
-            fqn_to_file_index_mapping = None
-            fqn_to_dtype_mapping = None
+        fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
+        fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, state_dict)
+        _warn_if_large_inline_consolidation(
+            self.config,
+            state_dict,
+            fqn_to_file_index_mapping,
+            is_final_checkpoint,
+        )
 
         # Run pre-saves for addons e.g., PEFT or consolidated HF safetensors
-        active_addons = [
-            addon
-            for addon in self._addons
-            if should_write_hf_metadata or not isinstance(addon, ConsolidatedHFAddon)
-        ]
-        for addon in active_addons:
+        for addon in self._addons:
             addon.pre_save(
                 model_state=model_state,
                 model_path=model_dir,
@@ -549,15 +500,14 @@ class Checkpointer:
                 original_model_path=self._get_original_model_path(model_state),
                 v4_compatible=self.config.v4_compatible,
             )
-        if should_write_hf_metadata:
-            self._maybe_write_offline_consolidation_script(model_dir)
+        self._maybe_write_offline_consolidation_script(model_dir)
 
         storage_writer = self._get_storage_writer(
             consolidated_dir, fqn_to_file_index_mapping, fqn_to_dtype_mapping, model_dir, consolidate_on_all_ranks
         )
         self._model_ctx.future = self._do_save(state_dict, model_dir, storage_writer)
 
-        for addon in active_addons:
+        for addon in self._addons:
             addon.post_save(consolidated_path=consolidated_dir, hf_metadata_path=hf_metadata_dir)
 
         if consolidate_on_all_ranks:
@@ -575,8 +525,7 @@ class Checkpointer:
                     _maybe_rename_index_for_diffusers(consolidated_dir)
             if is_rank_0():
                 logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
-        if should_write_hf_metadata:
-            self._maybe_log_final_offline_consolidation_hint(model_dir, is_final_checkpoint)
+        self._maybe_log_final_offline_consolidation_hint(model_dir, is_final_checkpoint)
 
     @torch.no_grad()
     def save_optimizer(
@@ -654,8 +603,7 @@ class Checkpointer:
 
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
         model_type = getattr(getattr(model_state.model[0], "config", None), "model_type", None)
-        state_dict_adapter = getattr(model_state.model[0], "state_dict_adapter", None)
-        has_state_dict_adapter = state_dict_adapter is not None
+        has_state_dict_adapter = hasattr(model_state.model[0], "state_dict_adapter")
 
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
@@ -696,7 +644,6 @@ class Checkpointer:
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
         single_device_custom_safetensors = is_safetensors and _is_custom_model(model_state.model[0]) and world_size == 1
-        adapter_requires_full_state_init = is_safetensors and _requires_full_state_dict_init(model_state.model[0])
         if (
             is_init_step
             and len(model_state.model) == 1
@@ -704,7 +651,6 @@ class Checkpointer:
                 _is_bin_checkpoint(model_path)
                 or (is_safetensors and not _is_custom_model(model_state.model[0]))
                 or single_device_custom_safetensors
-                or adapter_requires_full_state_init
             )
         ):
             t0 = time.monotonic()
@@ -768,7 +714,6 @@ class Checkpointer:
         storage_reader = self._get_storage_reader(
             model_path, reader_key_mapping, is_init_step=is_init_step, is_safetensors=is_safetensors
         )
-        use_native_checkpoint_layout = not is_init_step and _uses_native_checkpoint_layout(model_state.model[0])
 
         # MoE adapters return views into model storage; DCP writes safetensors
         # data straight through them and from_hf skips the rebuild.
@@ -777,7 +722,6 @@ class Checkpointer:
             state_dict,
             quantization=self.config.dequantize_base_checkpoint,
             device_mesh=self.moe_mesh,
-            native_checkpoint=use_native_checkpoint_layout,
         )
 
         compat_tied_lm_head_source_key: str | None = None
@@ -874,12 +818,7 @@ class Checkpointer:
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
-        state_dict = _maybe_adapt_state_dict_from_hf(
-            model_state.model[0],
-            state_dict,
-            moe_mesh=self.moe_mesh,
-            native_checkpoint=use_native_checkpoint_layout,
-        )
+        state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
         loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
         # MoE experts load in-place via strided views into model storage (DCP writes through
@@ -2331,10 +2270,7 @@ def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optio
 
 
 def _maybe_adapt_state_dict_from_hf(
-    model_part: nn.Module,
-    state_dict: dict[str, torch.Tensor],
-    moe_mesh: Optional[DeviceMesh] = None,
-    **kwargs,
+    model_part: nn.Module, state_dict: dict[str, torch.Tensor], moe_mesh: Optional[DeviceMesh] = None
 ) -> dict[str, torch.Tensor]:
     """
     Custom models use state dict adapters to convert the state dict from the Hugging Face format to the native format.
@@ -2343,5 +2279,5 @@ def _maybe_adapt_state_dict_from_hf(
     if adapter:
         ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
         ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh
-        return adapter.from_hf(state_dict, device_mesh=ep_mesh, **kwargs)
+        return adapter.from_hf(state_dict, device_mesh=ep_mesh)
     return state_dict
