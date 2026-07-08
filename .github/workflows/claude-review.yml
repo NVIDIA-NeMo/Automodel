@@ -69,7 +69,21 @@ jobs:
             both `to_dict()` and `from_dict()` serialization paths;
           - missing NVIDIA copyright headers on new Python files, missing
             Google-style docstrings on new public APIs, or production diagnostics
-            written with `print()` instead of `logging.getLogger(__name__)`.
+            written with `print()` instead of `logging.getLogger(__name__)`;
+          - new or materially changed public annotations that use legacy
+            `Optional[T]`, `Union[X, Y]`, or `typing.List`/`Dict`/`Tuple` syntax
+            instead of `T | None`, `X | Y`, and built-in generics. Do not request
+            unrelated annotation cleanup outside the changed signature;
+          - ambiguous public signatures: boolean-trap parameters, multiple
+            same-typed positional runtime arguments that should be keyword-only,
+            or long anonymous tuple returns that need a named typed result.
+        - Quality-gate bypasses introduced or expanded by changed code. Flag new
+          `# noqa`, `# type: ignore`, `# pragma: no cover`, blanket warning
+          suppression, `pytest.skip`/`xfail`, or additions to Ruff, `ty`, coverage,
+          or import-linter exception lists unless the smallest possible scope and
+          a concrete compatibility limitation are documented. Temporary exceptions
+          also need a tracked removal condition. Do not flag generated, vendored,
+          or repository-owned backport code merely for preserving upstream markers.
         - Test-quality regressions in changed tests, including unguarded foreign
           `setattr()` on config dataclasses, tests that only reproduce the
           implementation instead of asserting behavior, or GPU functional tests
@@ -115,6 +129,53 @@ jobs:
           - `build(...)` should return the component owned by that config and keep
             backend/model dispatch behind the config or component boundary. Do not
             add `**kwargs` as an untyped escape hatch for runtime arguments;
+          - config `build(...)` methods must preserve declarative config state:
+            they must not write resolved devices, process groups, modules, or other
+            runtime objects back onto the config, and repeated builds must not
+            depend on a prior call. Prefer keyword-only runtime arguments when
+            positional arguments would be ambiguous.
+        - Minimal public API surface. Treat names exported from package
+          `__init__.py`/`__all__`, public functions, classes, methods and properties,
+          config/YAML keys, CLI flags, registry hooks, and supported call signatures
+          as long-lived compatibility obligations. For public API added or expanded
+          by the PR:
+          - require a concrete current caller or use case that cannot be served by
+            an existing public contract. Flag convenience wrappers that only
+            forward, aliases or alternate spellings, duplicate entry points,
+            speculative flags/modes/extension hooks, and public re-exports of
+            implementation helpers. Prefer one canonical typed entry point and keep
+            its implementation private;
+          - reject `**kwargs`, untyped `dict`, stringly typed dispatch, or broad
+            parameter bags that make the API accept states no current caller needs.
+            Prefer the smallest explicit typed parameter set; adding a parameter to
+            an existing API is a compatibility and maintenance cost, not a default;
+          - when a new API replaces an old one, require removal or an explicit,
+            tested deprecation/migration path instead of keeping both indefinitely.
+            Flag incompatible changes to existing config keys, defaults, signatures,
+            exports, or registries without a migration path;
+          - flag cross-module imports of underscored/private names and lazy
+            `__getattr__` proxy APIs added only to widen discoverability. Do not
+            flag signatures imposed by PyTorch/HuggingFace or compatibility shims
+            with a demonstrated external consumer and bounded removal plan.
+          Every API-surface finding must identify the unnecessary long-lived
+          obligation and the smaller existing or proposed contract that replaces it.
+        - PyTorch module semantics in changed production code:
+          - modules should implement `forward()` rather than override
+            `nn.Module.__call__`, and callers should invoke `module(...)` rather
+            than `module.forward(...)` so hooks and framework behavior run;
+          - child modules, parameters, and persistent tensors must be registered
+            through module attributes, `ModuleList`/`ModuleDict`, `ParameterList`,
+            or `register_buffer()` as appropriate, rather than hidden in plain
+            containers that break state dicts or device/dtype movement;
+          - flag `.data` mutation that can bypass autograd; prefer `torch.no_grad()`
+            with `copy_()`. Exempt tightly controlled initialization, checkpoint,
+            or upstream-compatibility code only when the safety invariant is clear.
+        - Exception semantics in changed library code. Flag `assert` used for user,
+          config, or runtime validation; `sys.exit()` below CLI entry points; broad
+          replacement exceptions that discard the original cause; and exception
+          types/messages that do not identify the invalid input or failed operation.
+          Prefer a specific exception and preserve translation context with
+          `raise ... from exc`. Developer-only invariant assertions are acceptable.
         - Recipe / component boundary violations in files under
           `nemo_automodel/recipes/`. Recipes are thin orchestrators: they should
           compose `config.build(...)` results through public component APIs, not
@@ -173,6 +234,11 @@ jobs:
             cleanup.
           - Import-time side effects or monkeypatching of third-party
             (HuggingFace / torch) globals at module import.
+          - Dead or concealed code paths: commented-out code, unused private
+            helpers/config flags, untracked `TODO`/`FIXME`, placeholder `pass` or
+            `NotImplementedError` shims presented as supported behavior, or local
+            imports used only to conceal a circular dependency. Require removal,
+            tracked follow-up, or a corrected ownership/dependency boundary.
           - Speculative abstraction or indirection: new wrappers, registries,
             configuration switches, or extension points with no current caller
             or concrete variation, especially when they obscure a short explicit
@@ -181,6 +247,14 @@ jobs:
           registries keyed on `model_type`, and composing mixins at construction
           time. These keep the codebase checkable by `ty` instead of relying on
           runtime introspection.
+        - Async and logging lifecycle regressions in changed library code. Flag
+          blocking I/O inside `async` functions, fire-and-forget tasks without
+          awaited completion/cancellation and failure handling, or unbounded
+          concurrency around external work. Flag library calls to
+          `logging.basicConfig()`, root-logger mutation, duplicate handler setup,
+          eager f-string formatting in hot logging paths, or structured context
+          that can expose credentials. Require timeouts only where a changed async
+          operation can otherwise wait indefinitely on an external boundary.
 
         Do NOT comment on:
         - Style preferences or formatting beyond the explicit repository

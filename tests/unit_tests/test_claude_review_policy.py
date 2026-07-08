@@ -53,6 +53,16 @@ def test_review_workflow_has_bounded_trigger_and_dependencies():
         ("config-owned construction", "config objects must own component construction"),
         ("runtime build arguments", "must be explicit, typed `build(...)` arguments"),
         ("no free builders", "Flag new free-standing `build_*` helper functions"),
+        ("config build purity", "must preserve declarative config state"),
+        ("modern annotations", "legacy `Optional[T]`, `Union[X, Y]`"),
+        ("quality-gate bypass", "Quality-gate bypasses introduced or expanded"),
+        ("minimal API surface", "Minimal public API surface"),
+        ("API compatibility cost", "long-lived compatibility obligations"),
+        ("canonical API", "Prefer one canonical typed entry point"),
+        ("PyTorch module semantics", "PyTorch module semantics"),
+        ("exception semantics", "Exception semantics in changed library code"),
+        ("dead code", "Dead or concealed code paths"),
+        ("async lifecycle", "Async and logging lifecycle regressions"),
         ("test config mutation", "unguarded foreign"),
         ("stable shared semantics", "require stable shared semantics and ownership"),
         ("resource ownership", "Unclear state or resource ownership"),
@@ -73,3 +83,4 @@ def test_review_prompt_does_not_reintroduce_known_false_positive():
     assert _normalize("new or modified public functions") not in _normalize(prompt)
     assert _normalize("Do not require annotation cleanup") in _normalize(prompt)
     assert _normalize("(and the `build_*` builders)") not in _normalize(prompt)
+    assert _normalize("deterministic seeds") not in _normalize(prompt)
