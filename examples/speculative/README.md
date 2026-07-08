@@ -167,11 +167,17 @@ path). This is for adapting an existing draft to a new domain or dataset:
 point `recipe_args.draft_weights_path` at the consolidated safetensors export
 of a trained draft to warm-start the base weights (adapters over a randomly
 initialized draft are pointless; `draft_weights_path` also works without
-`peft:` for full-FT continued training). Merge the adapters into the base
-draft before serving. Not supported with `parallel_drafting` (P-EAGLE trains
-`mask_hidden` and the embeddings, which the LoRA freeze would lock), with
-`fp8:`, or in the DFlash-family / DSpark recipes (their drafts carry trainable
-non-LoRA heads that the freeze would silently lock). See
+`peft:` for full-FT continued training). With a compressed draft vocab the
+base run's token mapping must be reused via `selected_token_ids_path` (the
+frozen `lm_head` rows are tied to it); a differing mapping fails fast at
+load. The FINAL checkpoint of a LoRA run additionally exports the merged
+draft to `model/consolidated` (serve-ready, same layout as full-FT runs), so
+no external merge step is needed. Not supported with `parallel_drafting`
+(P-EAGLE trains `mask_hidden` and the embeddings, which the LoRA freeze would
+lock), with `freeze_embeddings: false` (same freeze conflict), with `fp8:`,
+or in the DFlash-family / DSpark / EAGLE-1/2 recipes (rejected explicitly;
+their drafts carry trainable non-LoRA heads that the freeze would silently
+lock, and only EAGLE-3 implements the warm start). See
 `eagle3/qwen3_eagle3_lora.yaml`.
 
 ## Target backends

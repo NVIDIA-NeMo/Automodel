@@ -802,12 +802,11 @@ class TrainDSparkRecipe(BaseRecipe):
         self.trainer_module = trainer_module
         # FP8 + FSDP2 float8 all-gather: amortize the per-parameter dynamic-scale
         # computation into one call after each optimizer step (mirrors train_ft).
-        cfg_fp8 = self.cfg.get("fp8", None)
-        self._precompute_fp8_scales = bool(
-            cfg_fp8 is not None
-            and cfg_fp8.get("enabled", False)
-            and cfg_fp8.get("precompute_float8_dynamic_scale_for_fsdp", False)
-            and self.parallel_strategy == "fsdp2"
+        # apply_fp8_to_model already resolved whether per-step scale precompute
+        # applies (enabled + tensorwise + fp8 all-gather) onto the draft module;
+        # reuse that instead of re-deriving from raw YAML.
+        self._precompute_fp8_scales = self.parallel_strategy == "fsdp2" and bool(
+            getattr(self.draft_model, "precompute_float8_dynamic_scale_for_fsdp", False)
         )
 
         opt_cfg = self.cfg.optimizer

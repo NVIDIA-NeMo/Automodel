@@ -28,10 +28,14 @@ recipe_args:
   # LoRA adapts an EXISTING draft; point this at the consolidated safetensors
   # export of a previously trained draft. A full-FT run writes checkpoints
   # under `checkpoints/epoch_*_step_*/model/consolidated`, with
-  # `checkpoints/LATEST` symlinked to the newest one. The base run's
-  # draft-vocab mapping must be reused (same selected_token_ids /
-  # draft_vocab_size); a differing mapping fails fast at load.
+  # `checkpoints/LATEST` symlinked to the newest one.
   draft_weights_path: ./outputs/eagle3_qwen3_8b_perfectblend/checkpoints/LATEST/model/consolidated
+  # REQUIRED with draft_weights_path + compressed vocab: reuse the BASE run's
+  # cached token mapping. Set the same path in the base run's config so its
+  # mapping is cached here; without it this run rescans the (different)
+  # adaptation dataset, derives a different mapping, and the warm start fails
+  # fast at load (the frozen lm_head rows are tied to the base mapping).
+  selected_token_ids_path: ./outputs/eagle3_qwen3_8b_perfectblend/draft_token_map.pt
 
 # LoRA draft adaptation (same PeftConfig surface as the SFT recipes). The base
 # draft is frozen; only lora_A/lora_B train, and checkpoints store adapters

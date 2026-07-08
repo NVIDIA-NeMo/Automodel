@@ -139,6 +139,16 @@ def test_raise_if_peft_configured_rejects_peft():
         raise_if_peft_configured(_Cfg({"peft": _peft_node()}), "TrainDSparkRecipe")
 
 
+def test_raise_if_peft_configured_rejects_draft_weights_path():
+    cfg = _Cfg({"recipe_args": _Cfg({"draft_weights_path": "/some/draft"})})
+    with pytest.raises(ValueError, match="draft_weights_path"):
+        raise_if_peft_configured(cfg, "TrainDFlashRecipe")
+
+
+def test_raise_if_peft_configured_allows_empty_recipe_args():
+    raise_if_peft_configured(_Cfg({"recipe_args": _Cfg()}), "TrainDFlashRecipe")
+
+
 # ---------------------------------------------------------------------------
 # _apply_draft_peft_and_fp8 (EAGLE-3)
 # ---------------------------------------------------------------------------
@@ -187,6 +197,13 @@ def test_peft_no_matched_modules_raises():
         _apply_draft_peft_and_fp8(_TinyDraft(), cfg, parallel_drafting=False)
 
 
+def test_peft_rejected_with_trainable_embeddings():
+    """An explicit freeze_embeddings: false cannot be honored under the LoRA global freeze."""
+    cfg = _Cfg({"peft": _peft_node()})
+    with pytest.raises(ValueError, match="freeze_embeddings"):
+        _apply_draft_peft_and_fp8(_TinyDraft(), cfg, parallel_drafting=False, freeze_embeddings=False)
+
+
 # ---------------------------------------------------------------------------
 # _load_draft_weights
 # ---------------------------------------------------------------------------
@@ -214,17 +231,25 @@ def test_load_draft_weights_from_single_file(tmp_path):
     torch.testing.assert_close(dst.q_proj.weight, src.q_proj.weight)
 
 
-def test_load_draft_weights_partial_overlap_warns_but_loads(tmp_path, caplog):
+def test_load_draft_weights_missing_keys_raise(tmp_path):
+    """An incomplete warm-start checkpoint must be a hard error, not a warning."""
     src = _TinyDraft()
     state = dict(src.state_dict())
     state.pop("fc.weight")  # missing on disk
+    _save_tiny_state(tmp_path / "model.safetensors", state)
+    with pytest.raises(ValueError, match="missing"):
+        _load_draft_weights(_TinyDraft(), str(tmp_path))
+
+
+def test_load_draft_weights_unexpected_keys_warn_but_load(tmp_path, caplog):
+    src = _TinyDraft()
+    state = dict(src.state_dict())
     state["extra.weight"] = torch.zeros(2, 2)  # unexpected on disk
     _save_tiny_state(tmp_path / "model.safetensors", state)
     dst = _TinyDraft()
     with caplog.at_level("WARNING"):
         _load_draft_weights(dst, str(tmp_path))
     torch.testing.assert_close(dst.q_proj.weight, src.q_proj.weight)
-    assert any("not found" in r.message for r in caplog.records)
     assert any("unused" in r.message for r in caplog.records)
 
 
@@ -318,6 +343,37 @@ def test_save_checkpoint_without_peft_forwards_none(tmp_path):
     recipe = _saving_recipe(tmp_path)
     recipe.save_checkpoint(epoch=0, step=1)
     assert recipe.checkpointer.save_model.call_args.kwargs["peft_config"] is None
+
+
+def test_merged_lora_state_dict_folds_adapters():
+    """Merged weights equal base + (alpha/dim) * B @ A, with lora_* keys dropped."""
+    from nemo_automodel.recipes.llm.train_eagle3 import _merged_lora_state_dict
+
+    model = _TinyDraft()
+    base_weight = model.q_proj.weight.detach().clone()
+    _apply_draft_peft_and_fp8(model, _Cfg({"peft": _peft_node()}), parallel_drafting=False)
+    # lora_B initializes to zeros (merge would be a no-op); set both factors explicitly.
+    with torch.no_grad():
+        model.q_proj.lora_A.weight.normal_()
+        model.q_proj.lora_B.weight.normal_()
+
+    merged = _merged_lora_state_dict(model)
+
+    assert all("lora_" not in k for k in merged)
+    expected = base_weight + (model.q_proj.lora_B.weight @ model.q_proj.lora_A.weight) * model.q_proj.scale
+    torch.testing.assert_close(merged["q_proj.weight"], expected)
+    torch.testing.assert_close(merged["fc.weight"], model.fc.weight)
+
+
+def test_save_checkpoint_final_lora_exports_merged_draft(tmp_path):
+    """The final checkpoint of a LoRA run must leave a serve-ready merged export."""
+    recipe = _saving_recipe(tmp_path)
+    recipe.peft_config = PeftConfig(target_modules=["q_proj"])
+    with patch("nemo_automodel.recipes.llm.train_eagle3._export_merged_lora_draft") as mock_export:
+        recipe.save_checkpoint(epoch=0, step=1, is_final_checkpoint=False)
+        mock_export.assert_not_called()
+        recipe.save_checkpoint(epoch=0, step=2, is_final_checkpoint=True)
+        mock_export.assert_called_once()
 
 
 def test_lora_draft_adapter_save_writes_adapter_files(tmp_path):

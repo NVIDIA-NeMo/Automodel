@@ -14,12 +14,11 @@
 
 """Tests for parallel_styles.py - LoRA-aware tensor parallel strategies."""
 
-from unittest.mock import MagicMock, patch
-
+from unittest.mock import MagicMock, Mock, patch, call
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import DeviceMesh, Replicate, Shard
+from torch.distributed.tensor import DTensor, DeviceMesh, Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
@@ -27,12 +26,13 @@ from torch.distributed.tensor.parallel import (
 )
 
 from nemo_automodel.components.distributed.parallel_styles import (
+    _distribute_param,
     ColwiseParallelLora,
     RowwiseParallelLora,
     SequenceParallelLora,
-    _distribute_param,
     translate_to_lora,
 )
+
 
 # ==================== Fixtures ====================
 

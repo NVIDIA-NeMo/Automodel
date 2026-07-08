@@ -22,6 +22,7 @@ import torch
 from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext
 from nemo_automodel.components.flow_matching.adapters.flux import FluxAdapter
 
+
 # =============================================================================
 # TestFluxAdapterPackLatents
 # =============================================================================

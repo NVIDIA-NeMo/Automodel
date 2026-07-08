@@ -169,16 +169,29 @@ def apply_flash_attention_compile_fix():
 
 
 def _resolve_compile_kwargs(config: CompileConfig) -> Dict[str, Any]:
-    """Translate a CompileConfig into torch.compile keyword arguments."""
+    """Translate a CompileConfig into torch.compile keyword arguments.
+
+    ``torch.compile`` is keyword-only, rejects unknown kwargs, and treats
+    ``mode`` and ``options`` as mutually exclusive -- inductor options must go
+    through the ``options`` dict, not be flattened into the call. A non-empty
+    ``CompileConfig.options`` therefore replaces ``mode``, and combining
+    options with a non-default mode is an explicit error.
+    """
     options_dict = config.options.to_dict() if hasattr(config.options, "to_dict") else dict(config.options)
     compile_kwargs: Dict[str, Any] = {
-        "mode": config.mode,
         "fullgraph": config.fullgraph,
         "dynamic": config.dynamic,
     }
+    if options_dict:
+        if config.mode and config.mode != "default":
+            raise ValueError(
+                "CompileConfig.mode and CompileConfig.options are mutually exclusive in torch.compile; set only one."
+            )
+        compile_kwargs["options"] = options_dict
+    else:
+        compile_kwargs["mode"] = config.mode
     if config.backend is not None:
         compile_kwargs["backend"] = config.backend
-    compile_kwargs.update(options_dict)
     return compile_kwargs
 
 

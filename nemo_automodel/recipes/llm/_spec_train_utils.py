@@ -65,16 +65,25 @@ def apply_draft_compile(draft_model: nn.Module, cfg_compile: Any) -> None:
 
 
 def raise_if_peft_configured(cfg: Any, recipe_name: str) -> None:
-    """Fail fast when a ``peft:`` block is set on a recipe that does not support it.
+    """Fail fast on EAGLE-3-only draft knobs set on a recipe that does not support them.
 
-    The DFlash-family and DSpark drafts register trainable non-LoRA modules on
-    the draft itself (Domino's ``prefix_gru``/``embed_proj``, DSpark's Markov and
-    confidence heads); LoRA's freeze-everything-but-adapters contract would
-    silently freeze them, so reject the config instead of ignoring it.
+    ``peft:``: the DFlash-family and DSpark drafts register trainable non-LoRA
+    modules on the draft itself (Domino's ``prefix_gru``/``embed_proj``, DSpark's
+    Markov and confidence heads); LoRA's freeze-everything-but-adapters contract
+    would silently freeze them, so reject the config instead of ignoring it.
+    ``recipe_args.draft_weights_path``: only the EAGLE-3 recipe implements the
+    warm-start load; a silently ignored knob would train from random init while
+    the user believes the draft was warm-started.
     """
     if cfg.get("peft", None) is not None:
         raise ValueError(
             f"peft is not supported by {recipe_name}; LoRA draft training is only available in the EAGLE-3 recipe."
+        )
+    recipe_args = cfg.get("recipe_args", None)
+    if recipe_args is not None and recipe_args.get("draft_weights_path", None):
+        raise ValueError(
+            f"recipe_args.draft_weights_path is not supported by {recipe_name}; the draft warm start is only "
+            "available in the EAGLE-3 recipe."
         )
 
 

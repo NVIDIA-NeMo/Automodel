@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib.util
 import sys
 import types
-from unittest.mock import Mock, patch
-
+import importlib.util
 import pytest
 import torch
+from unittest.mock import Mock, patch, MagicMock
 
 # Check if fast_hadamard_transform is available
 HADAMARD_AVAILABLE = False
@@ -33,13 +32,13 @@ except ImportError:
         mock_hadamard.hadamard_transform = lambda x, scale: x
         sys.modules['fast_hadamard_transform'] = mock_hadamard
 
-from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
 from nemo_automodel.components.models.deepseek_v32.layers import (
     DeepseekV32Indexer,
     DeepseekV32MLA,
     _rotate_activation,
 )
+from nemo_automodel.components.models.common import BackendConfig
 
 # Skip Transformer Engine tests by default unless explicitly enabled
 TE_AVAILABLE = False

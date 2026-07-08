@@ -16,6 +16,7 @@
 import logging
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from nemo_automodel.components.distributed import megatron_fsdp as mfsdp

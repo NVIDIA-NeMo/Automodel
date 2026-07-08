@@ -24,6 +24,7 @@ from nemo_automodel.components.datasets.diffusion.mock_dataloader import (
     mock_collate_fn,
 )
 
+
 # =============================================================================
 # TestMockWanDataset
 # =============================================================================

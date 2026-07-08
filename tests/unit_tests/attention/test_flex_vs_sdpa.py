@@ -13,9 +13,8 @@
 # limitations under the License.
 
 import math
-
-import pytest
 import torch
+import pytest
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
 
@@ -71,7 +70,7 @@ def _flex_forward_from_qkm(Q, K, V, S_vec, sm_scale, sliding_window=0, device=No
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_flex_attention_matches_sdpa():
     torch.manual_seed(123)
-    device = "cuda:0"
+    device = f"cuda:0"
     dtype = torch.bfloat16
 
     S = 64

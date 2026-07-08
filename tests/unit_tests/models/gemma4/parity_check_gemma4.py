@@ -35,6 +35,7 @@ from transformers import AutoModelForImageTextToText, AutoTokenizer
 
 from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
+
 SEQ_LEN = 16
 
 
@@ -197,7 +198,7 @@ def main() -> None:
             hf_lm_out = hf_lm(input_ids=input_ids).last_hidden_state
             nemo_lm_out = nemo_lm(input_ids=input_ids).last_hidden_state
         lm_diff = (hf_lm_out.float() - nemo_lm_out.float()).abs()
-        print("\n  Language-model hidden-state parity:")
+        print(f"\n  Language-model hidden-state parity:")
         print(f"    max  |diff| : {lm_diff.max().item():.6f}")
         print(f"    mean |diff| : {lm_diff.mean().item():.6f}")
         if lm_diff.max().item() < 0.01:
@@ -213,7 +214,7 @@ def main() -> None:
                 hf_manual_logits = torch.tanh(hf_manual_logits / softcap) * softcap
                 nemo_manual_logits = torch.tanh(nemo_manual_logits / softcap) * softcap
         manual_diff = (hf_manual_logits.float() - nemo_manual_logits.float()).abs()
-        print("\n  Manual lm_head parity from language_model outputs:")
+        print(f"\n  Manual lm_head parity from language_model outputs:")
         print(f"    max  |diff| : {manual_diff.max().item():.6f}")
         print(f"    mean |diff| : {manual_diff.mean().item():.6f}")
 

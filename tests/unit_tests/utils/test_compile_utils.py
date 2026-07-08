@@ -15,6 +15,7 @@
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch.nn as nn
 
 # Disable torch.compile for testing to avoid compilation overhead
@@ -339,7 +340,7 @@ class TestCompileModel:
     @patch("nemo_automodel.components.utils.compile_utils.apply_flash_attention_compile_fix")
     @patch("nemo_automodel.components.utils.compile_utils.torch.compile")
     def test_compile_with_options(self, mock_torch_compile, mock_fa_fix, mock_configure):
-        """Test compilation with custom options."""
+        """Options go through torch.compile's `options` dict (never flattened), replacing `mode`."""
         config = CompileConfig(
             enabled=True, mode="default", fullgraph=True, dynamic=True, options={"some_option": "value"}
         )
@@ -349,9 +350,17 @@ class TestCompileModel:
         result = compile_model(self.model, config)
 
         mock_torch_compile.assert_called_once_with(
-            self.model, mode="default", fullgraph=True, dynamic=True, some_option="value"
+            self.model, fullgraph=True, dynamic=True, options={"some_option": "value"}
         )
         assert result is mock_compiled_model
+
+    def test_options_with_non_default_mode_raises(self):
+        """torch.compile treats mode and options as mutually exclusive; reject the combination."""
+        from nemo_automodel.components.utils.compile_utils import _resolve_compile_kwargs
+
+        config = CompileConfig(enabled=True, mode="max-autotune", options={"some_option": "value"})
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            _resolve_compile_kwargs(config)
 
 
 class TestCompileModuleInplace:
