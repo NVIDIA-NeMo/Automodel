@@ -54,7 +54,7 @@ class ModelCapabilities:
         supports_cp: Context parallelism.
         supports_pp: Pipeline parallelism.
         supports_ep: Expert parallelism (MoE).
-        supports_thd: Native THD packed-sequence inputs.
+        supports_thd: THD packed-sequence inputs.
     """
 
     supports_tp: bool = False
