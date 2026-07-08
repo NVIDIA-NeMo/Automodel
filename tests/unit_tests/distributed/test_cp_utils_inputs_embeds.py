@@ -170,17 +170,18 @@ def test_inputs_embeds_grad_sharding_uses_cp_submesh_rank_under_hsdp(monkeypatch
 
 def test_inputs_embeds_with_grad_and_cp_padding_preserves_global_token_mean(monkeypatch):
     """Uneven valid-token counts across padded CP shards must not bias gradients."""
-    cp_size = 2
-    sequence_length = 6
+    # Stress the production padding branch with 200 appended rows. CP=128
+    # requires a multiple of 256 (2 * cp_size), so 56 valid rows become 256.
+    # This leaves 72 CP ranks with no valid labels at all.
+    cp_size = 128
+    sequence_length = 56
+    padded_sequence_length = 256
+    padding_length = padded_sequence_length - sequence_length
     hidden_size = 3
     initial_weight = torch.arange(sequence_length * hidden_size, dtype=torch.float64).view(sequence_length, hidden_size)
     initial_weight = initial_weight / 13.0
     input_ids = torch.arange(sequence_length).unsqueeze(0)
     full_labels = torch.arange(sequence_length).unsqueeze(0)
-    shard_indices = (
-        torch.tensor([0, 1, 6, 7]),
-        torch.tensor([2, 3, 4, 5]),
-    )
 
     local_losses = []
     scaled_local_gradients = []
@@ -206,13 +207,17 @@ def test_inputs_embeds_with_grad_and_cp_padding_preserves_global_token_mean(monk
 
         # The grad-bearing primary tensor is already sharded out of place. The
         # ordinary labels remain in PyTorch's buffer list; independently apply
-        # the known head-tail indices to model what the real CP context does.
+        # the same head-tail indices that the real CP context uses.
         padded_labels = captured["cp_buffers"][0]
-        local_labels = padded_labels.index_select(1, shard_indices[cp_rank])
-        expected_labels = torch.tensor([[0, 1, -100, -100]]) if cp_rank == 0 else torch.tensor([[2, 3, 4, 5]])
-        assert torch.equal(local_labels, expected_labels)
+        assert padded_labels.shape == (1, padded_sequence_length)
+        assert torch.count_nonzero(padded_labels[:, sequence_length:] != -100) == 0
+        assert padded_labels[:, sequence_length:].numel() == padding_length
+
+        shard_indices = torch.tensor([cp_rank, 2 * cp_size - cp_rank - 1])
+        local_labels = padded_labels.index_select(1, shard_indices)
 
         local_inputs = batch["inputs_embeds"]
+        assert local_inputs.shape == (1, 2, hidden_size)
         local_inputs.retain_grad()
         valid = local_labels != -100
         per_token_loss = (local_inputs.sum(dim=-1) + 0.75).square()
