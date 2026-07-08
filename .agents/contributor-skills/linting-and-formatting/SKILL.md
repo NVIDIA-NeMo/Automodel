@@ -121,37 +121,9 @@ modify it. Use the current year (2026).
 7. **Optional imports** guarded with `safe_import()`
 8. **No cross-component imports** between `components/` subdirectories
 
-## Code Smells to Flag
+## Automated Review
 
-Flag these when a change **introduces or expands** them. Do not flag
-pre-existing patterns in untouched code — the goal is to stop new debt from
-landing, not to relitigate the whole tree.
-
-1. **Defensive type-probing instead of types.** New `getattr(obj, "x", default)`
-   / `hasattr(obj, "x")` chains (especially on HF configs or models) used to
-   branch behavior, behavioral dispatch on `type(x).__name__ == "..."` or
-   class-name → value lookup tables, or capability sniffing via
-   `inspect.signature(...).parameters`. Prefer a typed attribute / dataclass
-   field, a registry keyed on `model_type`, or an explicit `Protocol`/flag.
-2. **Runtime `obj.__class__ = ...` reassignment** to inject mixins or behavior —
-   it breaks `isinstance`, pickling, and type checking. Select the class at
-   construction time instead.
-3. **God functions/files and signature bloat.** A new function over ~150 lines,
-   a new file over ~800 lines, a parameter list longer than ~8, or `**kwargs`
-   passthrough that hides the real contract. Split it; use explicit params or a
-   typed config object.
-4. **Copy-paste duplication** across model families, recipes, or
-   `state_dict_adapter.py` files — cloning an existing `Block`, train loop, or
-   weight-mapping table with only minor edits instead of reusing a shared base
-   class/mixin.
-5. **Error-swallowing.** New broad `except Exception:` or `except: pass` that
-   hides failures without logging or re-raising.
-6. **Untyped public APIs.** `Any` / `dict` / `**kwargs` used as an ad-hoc struct
-   where a dataclass / `TypedDict` fits.
-7. **Import-time side effects or monkeypatching** of third-party (HuggingFace /
-   torch) globals at module import.
-
-The preferred alternatives — typed config dataclasses, `Protocol`s, registries
-keyed on `model_type`, and composing mixins at construction time — keep the
-codebase checkable by `ty` (see `[tool.ty]` in `pyproject.toml`) instead of
-relying on runtime introspection.
+The review-only maintainability heuristics and thresholds live in
+`.github/workflows/claude-review.yml`. Keep repository-wide coding rules here
+and automated-review prompt policy there so the detailed checklist has one
+source of truth.

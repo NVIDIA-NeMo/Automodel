@@ -8,28 +8,46 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
-  id-token: write
 
 jobs:
   claude-review:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@v0.88.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@0aeb3fffafb8917eccdce94fea160557db4bafab # v1.7.1
     with:
+      model: ${{ vars.CLAUDE_MODEL }}
       prompt: |
         Mandatory workflow — never skip or reorder:
         1. Read the PR diff first.
-        2. Based on the changed files and areas, identify relevant skills from skills/<name>/SKILL.md.
+        2. Based on the changed files and areas, identify relevant skills from
+           `.claude/skills/<name>/SKILL.md`.
            Common skill names: linting-and-formatting, testing, cicd, build-and-dependency,
-           model-onboarding, recipe-development, distributed-training, parity-testing, launcher-config.
+           nemo-automodel-model-onboarding, nemo-automodel-recipe-development,
+           nemo-automodel-distributed-training, parity-testing, and
+           nemo-automodel-launcher-config.
         3. Read the SKILL.md files for all relevant areas using the Read tool.
         4. Only then perform the review using the skill context.
 
         You are doing a light code review. Keep it concise and actionable.
+        Review only behavior introduced or expanded by the PR. Inspect enough
+        surrounding code to verify each finding, and do not report a pattern
+        based only on a filename or isolated diff hunk.
 
         Focus ONLY on:
         - Critical bugs or logic errors
         - Typos in code, comments, or strings
         - Missing or insufficient test coverage for changed code
         - Outdated or inaccurate documentation affected by the changes
+        - Violations of repository-wide Python invariants in changed code:
+          - missing type annotations on new or modified public functions and
+            methods, or ad-hoc `Any` / `dict` / `**kwargs` structures where a
+            dataclass, `TypedDict`, `Protocol`, or explicit parameters fit;
+          - optional dependencies imported without `safe_import()` from
+            `nemo_automodel.shared.import_utils`, including raw
+            `try/except ImportError` or mock/stub fallbacks in production code;
+          - new cross-component imports between directories under
+            `nemo_automodel/components/`;
+          - missing NVIDIA copyright headers on new Python files, missing
+            Google-style docstrings on new public APIs, or production diagnostics
+            written with `print()` instead of `logging.getLogger(__name__)`.
         - ModelCapabilities staleness on existing model classes. When a PR adds
           a new parallelism axis (TP, CP, PP, or EP) to a model class that was
           already onboarded — e.g. it adds a `tp_plan`/`_pp_plan`, wires
@@ -77,39 +95,51 @@ jobs:
             calling it from the recipe.
         - Code smells introduced by this diff. Only flag patterns the PR ADDS or
           expands in changed lines — never pre-existing patterns in untouched
-          code. Keep each comment to one concrete, actionable suggestion:
+          code. Keep each comment to one concrete, actionable suggestion. When
+          recommending typed dispatch or reuse, name the specific contract or
+          existing abstraction that should replace the new pattern:
           - Defensive type-probing instead of types: new `getattr(obj, "x",
             default)` / `hasattr(obj, "x")` chains (especially on HF configs or
-            models) used to branch behavior, new behavioral dispatch on
-            `type(x).__name__ == "..."` or class-name -> value lookup tables, or
-            capability sniffing via `inspect.signature(...).parameters`. Prefer a
-            typed attribute / dataclass field, a registry keyed on `model_type`,
-            or an explicit `Protocol`/flag.
+            models) used for behavioral dispatch, dispatch on
+            `type(x).__name__ == "..."` or class-name → value lookup tables, or
+            capability sniffing via `inspect.signature(...).parameters`. A single
+            compatibility check at a third-party boundary is not enough to flag;
+            require a repeated or expanding dispatch pattern. Prefer a typed
+            attribute, dataclass field, registry keyed on `model_type`, or an
+            explicit `Protocol`/capability flag.
           - Runtime `obj.__class__ = ...` reassignment to inject mixins or
             behavior — it breaks `isinstance`, pickling, and type checking.
-            Prefer selecting the class at construction time.
-          - God functions/files or signature bloat: a new function over ~80
-            lines, a new file over ~800 lines, a parameter list longer than ~8,
-            or `**kwargs` passthrough that hides the real contract. Prefer
-            splitting and explicit params / a typed config object.
-          - Copy-paste duplication: a new model family, recipe, or
-            `state_dict_adapter.py` that clones an existing `Block`, train loop,
-            or weight-mapping table with only minor edits instead of reusing a
-            shared base class/mixin.
+            Select the class at construction time instead.
+          - God functions/files and signature bloat: a new production function
+            over ~150 lines, a new production file over ~800 lines, a parameter
+            list longer than ~8, or multi-layer `**kwargs` passthrough that hides
+            the real contract. Exclude generated code, declarative data tables,
+            tests, and signatures imposed by an upstream framework. Split real
+            responsibilities; use explicit parameters or a typed config object.
+          - Copy-paste duplication across model families, recipes, or
+            `state_dict_adapter.py` files — cloning an existing `Block`, train
+            loop, or weight-mapping table with only minor edits instead of
+            reusing a shared base class/mixin. Cite the duplicated implementation
+            so the recommendation is verifiable.
           - Error-swallowing: new broad `except Exception:` or `except: pass`
             that hides failures without logging or re-raising.
-          - Untyped public APIs: new public functions/methods missing type
-            hints, or `Any` / `dict` / `**kwargs` used as an ad-hoc struct where
-            a dataclass / `TypedDict` fits.
-          - `print()` for diagnostics instead of `logging.getLogger(__name__)`.
-          - Optional dependencies not guarded by `safe_import()` from
-            `nemo_automodel.shared.import_utils` — raw `try/except ImportError`
-            or `MagicMock`/stub fallbacks in non-test code.
+          - Mutable defaults or shared mutable state: list/dict/set defaults in
+            functions, dataclass fields without `default_factory`, or class-level
+            containers unintentionally shared across instances.
           - Import-time side effects or monkeypatching of third-party
             (HuggingFace / torch) globals at module import.
+          - Speculative abstraction or indirection: new wrappers, registries,
+            configuration switches, or extension points with no current caller
+            or concrete variation, especially when they obscure a short explicit
+            flow. Ask for the direct implementation until reuse is demonstrated.
+          Preferred alternatives: typed config dataclasses, `Protocol`s,
+          registries keyed on `model_type`, and composing mixins at construction
+          time. These keep the codebase checkable by `ty` instead of relying on
+          runtime introspection.
 
         Do NOT comment on:
-        - Style preferences or formatting
+        - Style preferences or formatting beyond the explicit repository
+          invariants listed above
         - Minor naming suggestions
         - Pre-existing code smells in code the PR does not touch
         - Large speculative rewrites or architectural opinions beyond the
@@ -122,4 +152,5 @@ jobs:
         It's perfectly acceptable to not have anything to comment on.
         If you do not have anything to comment on, post "LGTM".
     secrets:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      NVIDIA_INFERENCE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
+      NVIDIA_INFERENCE_KEY: ${{ secrets.NVIDIA_INFERENCE_KEY }}
