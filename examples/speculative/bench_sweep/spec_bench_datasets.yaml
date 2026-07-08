@@ -1,0 +1,34 @@
+# Multi-dataset acceptance-length sweep, EAGLE / EAGLE-2 paper suite.
+#
+# This is the SAME list bench_sweep.py ships as its built-in default
+# (nemo_automodel.components.speculative.bench_sweep.DEFAULT_DATASET_PRESETS);
+# kept here as a working example to copy from when building a custom sweep
+# with --datasets-config.
+#
+# Each entry needs exactly one of messages_column (an existing OpenAI-messages
+# list) or prompt_column (a raw text field, wrapped into a single-turn user
+# message -- none of these four datasets ship a messages column natively).
+# max_new_tokens/dataset_name are optional.
+
+datasets:
+  - name: mt_bench
+    input_data: HuggingFaceH4/mt_bench_prompts
+    split: train
+    prompt_column: turns # multi-turn column; the first turn is used
+
+  - name: humaneval
+    input_data: openai/openai_humaneval
+    split: test
+    prompt_column: prompt
+    max_new_tokens: 512 # code completions run longer than chat replies
+
+  - name: gsm8k
+    input_data: openai/gsm8k
+    dataset_name: main
+    split: test
+    prompt_column: question
+
+  - name: alpaca
+    input_data: tatsu-lab/alpaca
+    split: train
+    prompt_column: instruction

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -162,8 +163,30 @@ async def _run_workload(
     )
 
 
+def _extract_prompt_text(value: Any) -> str | None:
+    """Normalize a raw (non-chat) dataset field into a single prompt string.
+
+    Accepts a plain string, or a non-empty list of strings (the first entry is
+    used -- e.g. MT-Bench's multi-turn ``turns`` column, reduced to its first
+    turn). Returns ``None`` for anything else, or a blank/whitespace-only string.
+    """
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value
+
+
 def _load_prompts(args: argparse.Namespace) -> list[list[dict[str, Any]]]:
-    """Load up to ``--num-prompts`` chat prompts (trailing assistant turn dropped)."""
+    """Load up to ``--num-prompts`` chat prompts.
+
+    Reads from ``--prompt-column`` when set (a raw single-turn text field,
+    wrapped into a fresh user message -- for datasets like GSM8K/HumanEval that
+    are not chat-messages-shaped), else from ``--messages-column`` (an existing
+    OpenAI-messages list, trailing assistant turn dropped). ``prompt_column`` is
+    an optional attribute -- callers that only ever use ``messages_column``
+    (the two single-dataset benchmarks' own ``argparse.Namespace``) need not set it.
+    """
     from nemo_automodel.components.datasets.llm.chat_dataset import _load_openai_messages
 
     dataset = _load_openai_messages(
@@ -172,9 +195,14 @@ def _load_prompts(args: argparse.Namespace) -> list[list[dict[str, Any]]]:
         name=args.dataset_name,
         shuffle_seed=args.shuffle_seed,
     )
+    prompt_column = getattr(args, "prompt_column", None)
     prompts: list[list[dict[str, Any]]] = []
     for row in dataset:
-        prompt = _extract_prompt_messages(row[args.messages_column])
+        if prompt_column:
+            text = _extract_prompt_text(row.get(prompt_column))
+            prompt = [{"role": "user", "content": text}] if text is not None else None
+        else:
+            prompt = _extract_prompt_messages(row[args.messages_column])
         if prompt is not None:
             prompts.append(prompt)
         if len(prompts) >= args.num_prompts:
@@ -194,3 +222,21 @@ def _validate_workload_args(args: argparse.Namespace) -> None:
         raise ValueError(f"--max-retries must be >= 0, got {args.max_retries}")
     if args.timeout_s <= 0:
         raise ValueError(f"--timeout-s must be > 0, got {args.timeout_s}")
+
+
+def _report_summary(summary: dict[str, Any] | None, output_json: str | None) -> int:
+    """Print a benchmark summary as JSON, optionally also write it to ``output_json``.
+
+    Shared tail of ``bench_sglang``/``bench_vllm``'s ``_run``: returns exit code
+    ``1`` with nothing printed when ``summary`` is ``None`` (no usable prompts
+    were loaded), else ``0``.
+    """
+    if summary is None:
+        return 1
+    rendered = json.dumps(summary, indent=2)
+    print(rendered)
+    if output_json:
+        with open(output_json, "w") as f:
+            f.write(rendered + "\n")
+        logger.info("Wrote metrics to %s", output_json)
+    return 0
