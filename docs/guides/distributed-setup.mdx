@@ -9,7 +9,7 @@ configured from the `distributed:` section of your config (see
 loaders directly from Python, you describe the same topology and execution
 policies with a single typed object: `DistributedSetup`.
 
-## Quick start
+## Quickstart
 
 Build a `DistributedSetup` and pass it to `from_pretrained` (or `from_config`):
 
@@ -47,17 +47,21 @@ including `NeMoAutoModelForImageTextToText`,
 
 `DistributedSetup.build` resolves a device mesh and the execution policies from
 your requested parallelism sizes. It is intentionally forgiving about input
-types — `strategy` accepts a string or a config object, and the pipeline / MoE
-configs accept either a dataclass or a plain dict.
+types: `strategy` accepts a string or a configuration object, and the pipeline or MoE
+configurations accept either a dataclass or a plain dictionary.
 
-| Argument | Type | Default | Purpose |
+| Argument / Field | Type | Default | Purpose |
 |---|---|---|---|
 | `strategy` | `str \| DistributedStrategyConfig` | `"fsdp2"` | Sharding strategy: `"fsdp2"`, `"ddp"`, or `"megatron_fsdp"` (or a config object such as `FSDP2Config`/`DDPConfig`). |
 | `parallelism_sizes` | `ParallelismSizes \| None` | `None` | Requested parallel dimensions (`tp_size`, `pp_size`, `cp_size`, `ep_size`, `dp_size`, `dp_replicate_size`). `dp_replicate_size` is FSDP2-only. |
 | `pipeline_config` | `PipelineConfig \| dict \| None` | `None` | Pipeline-parallel options; **requires `pp_size > 1`**. |
 | `moe_parallel_config` | `MoEParallelizerConfig \| dict \| None` | `None` | Expert-parallel options; **requires `ep_size > 1`**. |
 | `activation_checkpointing` | `bool \| "full" \| "selective"` | `False` | `True` or `"full"` enables full activation checkpointing; `"selective"` enables selective AC for FSDP2 or DDP. |
+| `activation_checkpointing_scope` | `str \| list[str]` | `"all"` | FSDP2/DDP strategy field that limits generic AC to model parts such as `language`, `vision`, `audio`, or `multimodal`. Expert-parallel MoE configs use a separate MoE AC path. In Python, set it on `FSDP2Config` or `DDPConfig`; in YAML, place it under `distributed:`. See [Use Gradient (Activation) Checkpointing](/guides/gradient-checkpointing#scope-activation-checkpointing). |
 | `world_size` | `int \| None` | `None` | Total ranks; auto-detected from the process group when omitted. |
+
+YAML `distributed:` sections also forward strategy-specific fields to FSDP2 or
+DDP.
 
 `ParallelismSizes` is durable user intent (what you requested). The resolved
 runtime topology lives on `DistributedSetup.mesh_context`
@@ -70,7 +74,7 @@ without `pp_size > 1`, or a `moe_parallel_config` without `ep_size > 1`, raises
 a `ValueError`.
 </Note>
 
-### Plain device mesh shortcut
+### Plain Device Mesh Shortcut
 
 If you only need a topology and no NeMo-specific policies, you can pass a
 pre-created Hugging Face-style `DeviceMesh` directly as `device_mesh=`. NeMo
@@ -91,10 +95,10 @@ Pass either `distributed_setup` **or** `device_mesh`, not both. Use
 `distributed_setup` whenever you need strategy, pipeline, MoE, or
 activation-checkpointing policies.
 
-## Migrating from the per-keyword API
+## Migrate From the Per-Keyword API
 
 Earlier releases accepted a flat set of distributed keywords on
-`from_pretrained` / `from_config`. These are now consolidated into the single
+`from_pretrained` or `from_config`. These are now consolidated into the single
 `distributed_setup` object.
 
 **Before:**
@@ -136,13 +140,9 @@ raise a `TypeError` if passed: `distributed_config`, `moe_config`, `moe_mesh`,
 and that flat size keywords (e.g. `tp_size`) now live on `ParallelismSizes`.
 </Warning>
 
-## See also
+## See Also
 
-- [Configuration](/get-started/configuration) — the equivalent `distributed:`
-  YAML section used by recipes and the CLI.
-- [Pipeline Parallelism](/development/pipeline-parallelism) — the lower-level
-  `AutoPipeline` building blocks for custom training loops.
-- [Gradient Checkpointing](/development/gradient-checkpointing) — full and
-  selective activation checkpointing.
-- [`DistributedSetup`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/distributed/config.py)
-  source.
+- [Configuration](/get-started/configuration): The equivalent `distributed:` YAML section used by recipes and the CLI.
+- [Pipeline Parallelism](/development/pipeline-parallelism): The lower-level `AutoPipeline` building blocks for custom training loops.
+- [Gradient Checkpointing](/development/gradient-checkpointing): Full and selective activation checkpointing.
+- [`DistributedSetup`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/distributed/config.py) source code.

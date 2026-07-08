@@ -15,6 +15,7 @@
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch.nn as nn
 
 # Disable torch.compile for testing to avoid compilation overhead
@@ -241,7 +242,7 @@ class TestPatchPrepareFA2FromPositionIds:
     def test_patch_general_exception(self):
         """Test handling of general exception during patching."""
         # Create a mock that raises an exception when accessed
-        with patch("transformers.modeling_flash_attention_utils", new=None):
+        with patch("transformers.modeling_flash_attention_utils", new=None) as mock_fa_utils:
             result = patch_prepare_fa2_from_position_ids()
             assert result is False
 
@@ -339,7 +340,7 @@ class TestCompileModel:
     @patch("nemo_automodel.components.utils.compile_utils.apply_flash_attention_compile_fix")
     @patch("nemo_automodel.components.utils.compile_utils.torch.compile")
     def test_compile_with_options(self, mock_torch_compile, mock_fa_fix, mock_configure):
-        """Test compilation with custom options."""
+        """Options go through torch.compile's `options` dict (never flattened), replacing `mode`."""
         config = CompileConfig(
             enabled=True, mode="default", fullgraph=True, dynamic=True, options={"some_option": "value"}
         )
@@ -349,6 +350,46 @@ class TestCompileModel:
         result = compile_model(self.model, config)
 
         mock_torch_compile.assert_called_once_with(
-            self.model, mode="default", fullgraph=True, dynamic=True, some_option="value"
+            self.model, fullgraph=True, dynamic=True, options={"some_option": "value"}
         )
         assert result is mock_compiled_model
+
+    def test_options_with_non_default_mode_raises(self):
+        """torch.compile treats mode and options as mutually exclusive; reject the combination."""
+        from nemo_automodel.components.utils.compile_utils import _resolve_compile_kwargs
+
+        config = CompileConfig(enabled=True, mode="max-autotune", options={"some_option": "value"})
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            _resolve_compile_kwargs(config)
+
+
+class TestCompileModuleInplace:
+    """Tests for compile_module_inplace."""
+
+    def test_disabled_is_noop(self):
+        from nemo_automodel.components.utils.compile_utils import compile_module_inplace
+
+        module = nn.Linear(4, 4)
+        compile_module_inplace(module, CompileConfig(enabled=False))
+        assert getattr(module, "_compiled_call_impl", None) is None
+
+    def test_enabled_compiles_in_place(self):
+        from nemo_automodel.components.utils.compile_utils import compile_module_inplace
+
+        module = nn.Linear(4, 4)
+        state_keys_before = list(module.state_dict().keys())
+        compile_module_inplace(module, CompileConfig(enabled=True))
+        # In-place: same object, compiled call installed, state-dict keys unchanged.
+        assert module._compiled_call_impl is not None
+        assert list(module.state_dict().keys()) == state_keys_before
+
+    def test_enabled_forwards_kwargs(self):
+        from nemo_automodel.components.utils.compile_utils import compile_module_inplace
+
+        module = nn.Linear(4, 4)
+        with patch.object(nn.Module, "compile") as mock_compile:
+            compile_module_inplace(
+                module,
+                CompileConfig(enabled=True, mode="max-autotune", fullgraph=True, dynamic=True, backend="inductor"),
+            )
+        mock_compile.assert_called_once_with(mode="max-autotune", fullgraph=True, dynamic=True, backend="inductor")

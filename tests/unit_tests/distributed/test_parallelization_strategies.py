@@ -224,10 +224,12 @@ def mock_distributed_env(monkeypatch):
         raising=False,
     )
 
-    # Mock _extract_model_layers
-    extract_layers_mock = MagicMock(return_value=[])
+    # Mock grouped layer extraction, which is used for both sharding and AC scope filtering.
+    extract_layer_groups_mock = MagicMock(return_value={"language": []})
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer._extract_model_layers", extract_layers_mock, raising=False
+        "nemo_automodel.components.distributed.parallelizer._extract_model_layer_groups",
+        extract_layer_groups_mock,
+        raising=False,
     )
 
     # Mock _get_parallel_plan
@@ -247,7 +249,7 @@ def mock_distributed_env(monkeypatch):
         "parallelize_module": parallelize_module_mock,
         "checkpoint_wrapper": checkpoint_wrapper_mock,
         "apply_fsdp": apply_fsdp_mock,
-        "extract_layers": extract_layers_mock,
+        "extract_layer_groups": extract_layer_groups_mock,
         "get_plan": get_plan_mock,
         "validate_tp": validate_tp_mock,
     }
@@ -300,6 +302,7 @@ class TestDefaultParallelizationStrategy:
             "offload_policy",
             "sequence_parallel",
             "activation_checkpointing",
+            "activation_checkpointing_scope",
             "tp_shard_plan",
             "dp_replicate_mesh_name",
             "dp_shard_cp_mesh_name",
@@ -326,7 +329,7 @@ class TestDefaultParallelizationStrategy:
         assert result is model  # Should return the same model
 
         # Verify key functions were called
-        mock_distributed_env["extract_layers"].assert_called_once_with(model)
+        mock_distributed_env["extract_layer_groups"].assert_called_once_with(model)
         mock_distributed_env["apply_fsdp"].assert_called_once()
         mock_distributed_env["fully_shard"].assert_called()
 
@@ -354,12 +357,12 @@ class TestDefaultParallelizationStrategy:
         mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
 
         # Mock layers with all the attributes that get checkpointed
-        mock_layer = MagicMock()
+        mock_layer = nn.Module()
         mock_layer.mlp = nn.Linear(10, 10)
-        mock_layer.self_attn = MagicMock()
-        mock_layer.input_layernorm = MagicMock()
-        mock_layer.post_attention_layernorm = MagicMock()
-        mock_distributed_env["extract_layers"].return_value = [mock_layer]
+        mock_layer.self_attn = nn.Linear(10, 10)
+        mock_layer.input_layernorm = nn.Linear(10, 10)
+        mock_layer.post_attention_layernorm = nn.Linear(10, 10)
+        mock_distributed_env["extract_layer_groups"].return_value = {"language": [mock_layer]}
 
         model = MockModel()
 
@@ -377,6 +380,8 @@ class TestDefaultParallelizationStrategy:
         expected_calls = [
             call(mock_layer.mlp),
             call(mock_layer.self_attn),
+            call(mock_layer.input_layernorm),
+            call(mock_layer.post_attention_layernorm),
         ]
         checkpoint_wrapper_mock.assert_has_calls(expected_calls, any_order=False)
 
@@ -885,7 +890,7 @@ class TestFsdp2StrategyParallelizeIntegration:
 
         assert result is model
         # Verify that default strategy functions were called
-        mock_distributed_env["extract_layers"].assert_called_once_with(model)
+        mock_distributed_env["extract_layer_groups"].assert_called_once_with(model)
 
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
@@ -947,6 +952,7 @@ class TestFsdp2StrategyParallelizeIntegration:
             "offload_policy",
             "sequence_parallel",
             "activation_checkpointing",
+            "activation_checkpointing_scope",
             "tp_shard_plan",
             "dp_replicate_mesh_name",
             "dp_shard_cp_mesh_name",
