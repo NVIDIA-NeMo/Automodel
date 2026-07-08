@@ -78,7 +78,7 @@ def _to_canonical(caps_obj) -> ModelCapabilities:
         supports_cp=bool(caps_obj.supports_cp),
         supports_pp=bool(caps_obj.supports_pp),
         supports_ep=bool(caps_obj.supports_ep),
-        supports_thd=bool(getattr(caps_obj, "supports_thd", False)),
+        supports_thd=bool(caps_obj.supports_thd),
     )
 
 
