@@ -110,6 +110,9 @@ def _shard_grad_buffer_for_cp(buffer: torch.Tensor, seq_dim: int, cp_mesh: Devic
         raise ValueError(f"CP sequence length {seq_len} must be divisible by {num_chunks}")
 
     chunk_size = seq_len // num_chunks
+    # ``cp_mesh`` is the 1D CP submesh selected from the full device mesh, so
+    # this is the rank within the CP process group even when the root mesh also
+    # has HSDP replicate/shard dimensions.
     cp_rank = cp_mesh.get_local_rank()
     head_chunk = buffer.narrow(seq_dim, cp_rank * chunk_size, chunk_size)
     tail_chunk = buffer.narrow(seq_dim, (num_chunks - cp_rank - 1) * chunk_size, chunk_size)
