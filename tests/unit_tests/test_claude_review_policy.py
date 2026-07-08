@@ -50,6 +50,9 @@ def test_review_workflow_has_bounded_trigger_and_dependencies():
         ("fail closed", "Never post `LGTM` for an incomplete review"),
         ("unsafe deserialization", "unsafe deserialization"),
         ("config round trip", "both `to_dict()` and `from_dict()`"),
+        ("config-owned construction", "config objects must own component construction"),
+        ("runtime build arguments", "must be explicit, typed `build(...)` arguments"),
+        ("no free builders", "Flag new free-standing `build_*` helper functions"),
         ("test config mutation", "unguarded foreign"),
         ("stable shared semantics", "require stable shared semantics and ownership"),
         ("resource ownership", "Unclear state or resource ownership"),
@@ -69,3 +72,4 @@ def test_review_prompt_does_not_reintroduce_known_false_positive():
 
     assert _normalize("new or modified public functions") not in _normalize(prompt)
     assert _normalize("Do not require annotation cleanup") in _normalize(prompt)
+    assert _normalize("(and the `build_*` builders)") not in _normalize(prompt)
