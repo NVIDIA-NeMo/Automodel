@@ -430,19 +430,8 @@ def make_cp_batch_and_ctx(
     # the default load-balanced context_parallel path so the implementation
     # stays with the model.
     cp_sharder = batch.pop("cp_sharder", None)
-    cp_make_batch_fn = batch.pop("_cp_make_batch_fn", None)
     if _get_mesh_size(cp_mesh) > 1 and cp_sharder is not None:
         return cp_sharder.shard_batch(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
-    if _get_mesh_size(cp_mesh) > 1 and cp_make_batch_fn is not None:
-        import warnings
-
-        warnings.warn(
-            "Passing a `_cp_make_batch_fn` batch key is deprecated; return a CPSharder under the "
-            "'cp_sharder' key from prepare_model_inputs_for_cp instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return cp_make_batch_fn(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
 
     if magi is not None and getattr(magi, "enabled", False):
         # Backend-owned prep (MagiAttention): magi manages its own CP transport,
