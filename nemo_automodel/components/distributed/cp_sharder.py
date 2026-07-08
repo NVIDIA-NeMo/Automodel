@@ -266,8 +266,8 @@ def convert_attention_mask_to_padding_mask(batch: dict) -> None:
             batch["padding_mask"] = attention_mask.bool().logical_not()
 
 
-def _prepare_manual_cp_batch(cp_mesh, tp_mesh, batch, loss_mask):
-    """Pre-shard prep for the model-owned CP path.
+def _prepare_contiguous_cp_batch(batch, loss_mask):
+    """Pre-shard prep for the model-owned contiguous CP path.
 
     Converts ``attention_mask`` to a ``padding_mask`` (preserving padding
     semantics for modules such as MoE), selects the primary sequence tensor,
@@ -343,9 +343,7 @@ def shard_batch_contiguous(
         ``(contextlib.nullcontext, batch)`` — transport lives in the model's
         own attention, so no CP context manager is needed.
     """
-    primary_key, seq_len, labels, position_ids, pos_seq_dim, loss_mask = _prepare_manual_cp_batch(
-        cp_mesh, tp_mesh, batch, loss_mask
-    )
+    primary_key, seq_len, labels, position_ids, pos_seq_dim, loss_mask = _prepare_contiguous_cp_batch(batch, loss_mask)
     return _make_contiguous_shard_cp_batch(
         cp_mesh,
         batch,
@@ -417,7 +415,7 @@ def _make_contiguous_shard_cp_batch(
                 metadata_pad_values.get(key, 0),
             )
 
-    # Manual sequence slicing. Every CP rank in the same CP group starts from
+    # Contiguous sequence slicing. Every CP rank in the same CP group starts from
     # the same full batch, then keeps one contiguous sequence shard.
     batch["labels"] = labels
     cp_rank = _cp_rank(cp_mesh)

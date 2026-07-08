@@ -141,32 +141,32 @@ def test_pad_position_ids_extends_monotonically():
 
 
 # ---------------------------------------------------------------------------
-# _prepare_manual_cp_batch branches (model-owned CP prep)
+# _prepare_contiguous_cp_batch branches (model-owned CP prep)
 # ---------------------------------------------------------------------------
-def test_prepare_manual_cp_batch_builds_padding_mask_from_4d_mask():
+def test_prepare_contiguous_cp_batch_builds_padding_mask_from_4d_mask():
     mask = torch.ones(1, 1, 4, 4, dtype=torch.bool)
     batch = {
         "input_ids": torch.zeros(1, 4, dtype=torch.long),
         "labels": torch.zeros(1, 4, dtype=torch.long),
         "attention_mask": mask,
     }
-    cm._prepare_manual_cp_batch(_FakeMesh(size=2), None, batch, None)
+    cm._prepare_contiguous_cp_batch(batch, None)
     assert "padding_mask" in batch and batch["padding_mask"].shape == (1, 4)
 
 
-def test_prepare_manual_cp_batch_labels_from_loss_mask():
+def test_prepare_contiguous_cp_batch_labels_from_loss_mask():
     batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
     loss_mask = torch.ones(1, 4, dtype=torch.long)
     # returns (primary_key, seq_len, labels, position_ids, pos_seq_dim, loss_mask)
-    res = cm._prepare_manual_cp_batch(_FakeMesh(size=2), None, batch, loss_mask)
+    res = cm._prepare_contiguous_cp_batch(batch, loss_mask)
     labels = res[2]
     assert torch.equal(labels, loss_mask)
 
 
-def test_prepare_manual_cp_batch_raises_without_labels():
+def test_prepare_contiguous_cp_batch_raises_without_labels():
     batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
     with pytest.raises(KeyError, match="labels"):
-        cm._prepare_manual_cp_batch(_FakeMesh(size=2), None, batch, None)
+        cm._prepare_contiguous_cp_batch(batch, None)
 
 
 # ---------------------------------------------------------------------------
